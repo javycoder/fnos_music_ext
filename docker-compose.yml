@@ -29,9 +29,9 @@ services:
       dockerfile: Dockerfile
     container_name: fnmusic-musicbox
     ports:
-      - "127.0.0.1:8770:8000"
+      - "0.0.0.0:8770:8000"
     volumes:
-      - musicbox-data:/data
+      - ./musicbox-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
@@ -39,6 +39,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-volumes:
-  musicbox-data:

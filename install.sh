@@ -202,15 +202,20 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "       ${MUSICBOX_REPO}"
     echo "============================================================"
     if [ -z "${MODE}" ]; then
-        echo "请选择安装模式:"
+        echo "【安装模式说明】"
+        echo "  无论选哪种模式，核心代理（fnmusic-ext）均以宿主机 systemd 运行接管 Socket。"
+        echo "  两种模式区别仅在于音源服务（musicdl/musicbox）的部署运行形态："
         if command -v docker >/dev/null 2>&1; then
-            echo "  1) docker  — 音源以容器运行（推荐，与飞牛系统隔离）"
-            echo "  2) host    — 音源以宿主机 Python venv 运行"
-            local_choice="$(prompt "输入 1 或 2" "1")"
+            echo "  1) docker  — [推荐] Docker 容器模式："
+            echo "               通过 compose 运行轻量容器（端口 8768/8770，无特权，数据隔离在 musicbox-data/）"
+            echo "  2) host    — Host 宿主机本地服务模式（纯净无 Docker）："
+            echo "               创建独立 Python venv 并注册为 systemd 服务（监听 127.0.0.1，不污染全局环境）"
+            local_choice="$(prompt "请选择安装模式 (输入 1 或 2)" "1")"
         else
-            echo "  1) docker  — 音源以容器运行（未检测到 Docker，若选此项需先在应用中心安装）"
-            echo "  2) host    — 音源以宿主机 Python venv 运行（推荐当前环境）"
-            local_choice="$(prompt "输入 1 或 2" "2")"
+            echo "  1) docker  — Docker 容器模式（未检测到 Docker，若选此项请先在 fnOS「应用中心」安装 Docker）"
+            echo "  2) host    — [推荐当前环境] Host 宿主机本地服务模式："
+            echo "               纯净无 Docker，通过项目内独立 Python venv 运行并注册为 systemd 服务"
+            local_choice="$(prompt "请选择安装模式 (输入 1 或 2)" "2")"
         fi
         case "${local_choice}" in
             2|host) MODE="host" ;;
@@ -286,7 +291,8 @@ log_info "音源:${SELECTED}"
 log_info "每日推荐: ${ENABLE_RECOMMEND}"
 log_info "项目目录: ${BASE_DIR}"
 
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache"
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" "${BASE_DIR}/musicbox-data"
+chmod 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
 
 MUSICDL_FLAG="false"
 MUSICBOX_FLAG="false"
