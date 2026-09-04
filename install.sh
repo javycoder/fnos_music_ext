@@ -111,6 +111,74 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+precheck_environment() {
+    log_info "==> 开始安装环境预检..."
+    local precheck_failed=0
+
+    # 1. 检查 Python 3 与 venv 模块
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_err "【缺少基础组件】系统未检测到 python3。"
+        log_err "请先执行命令安装：sudo apt-get update && sudo apt-get install -y python3 python3-venv"
+        precheck_failed=1
+    elif ! python3 -c "import venv" >/dev/null 2>&1; then
+        log_err "【缺少基础组件】系统 Python 缺少 venv 模块。"
+        log_err "请先执行命令安装：sudo apt-get update && sudo apt-get install -y python3-venv"
+        precheck_failed=1
+    else
+        log_info "Python 3 与 venv 模块已就绪。"
+    fi
+
+    # 2. 检查 sudo 权限
+    if ! sudo -n true 2>/dev/null; then
+        if [ -t 0 ]; then
+            log_warn "检测到当前操作需要管理员权限，正在请求 sudo 授权..."
+            if ! sudo -v; then
+                log_err "【权限不足】当前用户无法获取管理员 (sudo) 权限，安装无法继续。"
+                precheck_failed=1
+            fi
+        else
+            log_err "【权限不足】非交互模式下需要免密 sudo 权限（sudo -n true 失败）。"
+            precheck_failed=1
+        fi
+    else
+        log_info "管理员 (sudo) 权限已就绪。"
+    fi
+
+    # 3. 检查飞牛音乐运行套接字
+    local target_sock="/var/run/trim_music.socket"
+    local upstream_sock="/var/run/trim_music_upstream.socket"
+    if [ ! -S "${target_sock}" ] && [ ! -S "${upstream_sock}" ]; then
+        log_warn "【前置提醒】未检测到飞牛音乐运行套接字 (${target_sock} 不存在)。"
+        log_warn "请确认已在 fnOS 管理界面 ->「应用中心」，安装并启动【飞牛音乐】应用。"
+        log_warn "（安装向导仍可继续准备音源依赖与配置，但在最后执行 ./extend.sh 启用扩展前必须先启动飞牛音乐）"
+    else
+        log_info "飞牛音乐运行套接字检测正常。"
+    fi
+
+    # 4. 检查 Docker 环境
+    if command -v docker >/dev/null 2>&1; then
+        log_info "Docker 容器环境已就绪。"
+    else
+        log_warn "【提示】系统未检测到 Docker 环境。"
+        if [ "${MODE}" = "docker" ]; then
+            log_err "【缺少组件】当前指定了 Docker 模式，但系统未安装 Docker。"
+            log_err "请先在 fnOS 应用中心安装 Docker，或改用 --mode host 模式。"
+            precheck_failed=1
+        else
+            log_warn "若计划使用 Docker 容器模式运行音源，请先在 fnOS 应用中心安装 Docker；"
+            log_warn "您也可以在向导中选择宿主机 (host) 模式直接通过 Python 虚拟环境运行。"
+        fi
+    fi
+
+    if [ "${precheck_failed}" -ne 0 ]; then
+        log_err "环境预检未通过，请处理上述问题后再试。"
+        exit 1
+    fi
+    log_info "环境预检全部通过。"
+}
+
+precheck_environment
+
 dotenv_escape() {
     printf "%s" "$1" | sed "s/'/'\\\\''/g"
 }
@@ -129,15 +197,21 @@ prompt() {
 
 if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
-    echo " fnmusic-ext 安装配置"
+    echo " fnmusic-ext 安装配置向导"
     echo " 音源: ${MUSICDL_REPO}"
     echo "       ${MUSICBOX_REPO}"
     echo "============================================================"
     if [ -z "${MODE}" ]; then
         echo "请选择安装模式:"
-        echo "  1) docker  — 音源以容器运行（推荐，与飞牛系统隔离）"
-        echo "  2) host    — 音源以宿主机 Python venv 运行"
-        local_choice="$(prompt "输入 1 或 2" "1")"
+        if command -v docker >/dev/null 2>&1; then
+            echo "  1) docker  — 音源以容器运行（推荐，与飞牛系统隔离）"
+            echo "  2) host    — 音源以宿主机 Python venv 运行"
+            local_choice="$(prompt "输入 1 或 2" "1")"
+        else
+            echo "  1) docker  — 音源以容器运行（未检测到 Docker，若选此项需先在应用中心安装）"
+            echo "  2) host    — 音源以宿主机 Python venv 运行（推荐当前环境）"
+            local_choice="$(prompt "输入 1 或 2" "2")"
+        fi
         case "${local_choice}" in
             2|host) MODE="host" ;;
             *) MODE="docker" ;;
@@ -145,12 +219,16 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     fi
     if [ -z "${SOURCES_RAW}" ]; then
         echo "请选择音源（可多选，逗号分隔，至少选一个）:"
-        echo "  1) musicdl   — CharlesPikachu/musicdl（酷我/咪咕）"
-        echo "  2) musicbox  — darknessomi/musicbox（网易云）"
+        echo "  1) musicdl   — 聚合音源（酷我/咪咕等，覆盖热门流行）"
+        echo "  2) musicbox  — 网易云音源（高品质/无损/歌词封面）"
+        echo "  1,2) 全部启用 — 两者兼得，双源并行（推荐）"
         SOURCES_RAW="$(prompt "输入 1 / 2 / 1,2" "1,2")"
     fi
     if [ -z "${ENABLE_RECOMMEND}" ]; then
-        rec_choice="$(prompt "是否开启每日推荐（调用大模型，需 OpenAI 兼容接口）? y/N" "N")"
+        echo "大模型每日推荐歌单（可选选填）:"
+        echo "  支持接入兼容 OpenAI 协议的大模型（如 DeepSeek/GPT/Qwen 等），"
+        echo "  根据播放偏好每天自动生成 20 首推荐新歌。"
+        rec_choice="$(prompt "是否开启每日推荐（需 OpenAI 兼容 API Key）? [y/N]" "N")"
         case "${rec_choice}" in
             y|Y|yes|YES) ENABLE_RECOMMEND="yes" ;;
             *) ENABLE_RECOMMEND="no" ;;
@@ -171,9 +249,10 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             LLM_API_KEY=""
         fi
     fi
-    ext_choice="$(prompt "安装完成后是否立即执行 extend.sh 启用扩展? y/N" "N")"
+    ext_choice="$(prompt "安装配置完成，是否立即执行 extend.sh 启用扩展? [Y/n]" "Y")"
     case "${ext_choice}" in
-        y|Y|yes|YES) RUN_EXTEND=1 ;;
+        n|N|no|NO) RUN_EXTEND=0 ;;
+        *) RUN_EXTEND=1 ;;
     esac
 else
     MODE="${MODE:-docker}"
@@ -403,19 +482,31 @@ python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py
 bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh"
 
 log_info "============================================================"
-log_info "安装配置完成。已启用音源:${SELECTED}"
-log_info "下一步（不会改飞牛系统文件）:"
-log_info "  1. 确认飞牛音乐应用已启动"
-log_info "  2. ./extend.sh     # 一键接管 Unix Socket"
-log_info "  3. ./restore.sh    # 一键还原官方直连"
+log_info "🎉 fnmusic-ext 安装配置完成！已启用音源:${SELECTED}"
+log_info "------------------------------------------------------------"
+log_info "【后续验证与使用指引】"
+if [ "${RUN_EXTEND}" -eq 1 ]; then
+    log_info "即将自动执行 ./extend.sh 进行 Unix Socket 接管与链路自检验收..."
+else
+    log_info "1. 一键启用扩展："
+    log_info "   请在终端运行: ./extend.sh"
+    log_info "   （脚本将自动接管 Unix Socket 并进行链路自检验收，安全零侵入）"
+fi
+log_info "2. 验证搜索与试听："
+log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌曲（例如“晴天”或“周杰伦”），"
+log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
-    log_info "网易云部分曲目可能需要扫码: http://127.0.0.1:8770/api/v1/auth/login/qr.png"
+    log_info "3. 网易云扫码登录（可选）："
+    log_info "   部分网易云 VIP/无损歌曲需要账号凭证，可在局域网浏览器中访问："
+    log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 扫码登录即可。"
 fi
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-    log_info "每日推荐已配置。登录飞牛音乐后，歌单列表顶部会出现「每日推荐」。"
-else
-    log_info "每日推荐未开启。之后可重新运行本脚本填写 LLM 配置。"
+    log_info "4. 大模型每日推荐："
+    log_info "   已成功配置大模型！登录飞牛音乐后，左侧歌单列表顶部会自动出现「每日推荐」。"
 fi
+log_info "5. 状态探测与一键还原："
+log_info "   • 探测健康状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
+log_info "   • 随时一键还原: ./restore.sh (立即恢复官方出厂直连状态)"
 log_info "============================================================"
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
