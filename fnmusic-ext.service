@@ -1,0 +1,24 @@
+# Sample systemd unit
+#
+# Do not copy this file as-is: paths must match the clone directory.
+# ./extend.sh generates /etc/systemd/system/fnmusic-ext.service from the
+# current working tree. Secrets belong in .env (EnvironmentFile), never here.
+
+[Unit]
+Description=fnmusic-ext Proxy Service (Socket Takeover)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fnmusic-ext
+ExecStart=/opt/fnmusic-ext/proxy/run_proxy.sh
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do [ -S /var/run/trim_music.socket ] && chmod 666 /var/run/trim_music.socket && exit 0; sleep 1; done; exit 1'
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=FNMUSIC_HOME=/opt/fnmusic-ext
+EnvironmentFile=-/opt/fnmusic-ext/.env
+
+[Install]
+WantedBy=multi-user.target

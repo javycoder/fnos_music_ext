@@ -1,0 +1,21 @@
+services:
+  musicdl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fnmusic-musicdl
+    ports:
+      - "127.0.0.1:8768:8000"
+    environment:
+      - MUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient
+      - MUSICDL_SEARCH_TIMEOUT=12
+      - MUSICDL_LIMIT_PER_SOURCE=10
+      - MUSICDL_URL_TTL=1800
+      - MUSICDL_CACHE_MAX=3000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
