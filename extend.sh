@@ -32,12 +32,30 @@ is_enabled() {
     esac
 }
 
-if [ -f "${BASE_DIR}/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "${BASE_DIR}/.env"
-    set +a
+if [ ! -f "${BASE_DIR}/.env" ]; then
+    if [ -t 0 ]; then
+        log_warn "检测到尚未完成初次安装配置（未找到 .env 配置文件）。"
+        read -r -p "检测到尚未完成初次安装配置，是否现在启动安装向导 (./install.sh)？[Y/n] " prompt_ans || true
+        case "${prompt_ans:-y}" in
+            y|Y|yes|YES|"")
+                log_info "正在启动安装向导 (./install.sh)..."
+                exec "${BASE_DIR}/install.sh"
+                ;;
+            *)
+                log_err "请先执行 ./install.sh 完成音源与配置安装。"
+                exit 1
+                ;;
+        esac
+    else
+        log_err "请先执行 ./install.sh 完成音源与配置安装。"
+        exit 1
+    fi
 fi
+
+set -a
+# shellcheck disable=SC1091
+source "${BASE_DIR}/.env"
+set +a
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 ENABLE_MUSICDL=0
@@ -185,19 +203,41 @@ except Exception:
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 1/5: 环境预检..."
 
-# 1.1 sudo -n 检查
+# 1.1 检查 Python 3 与 venv 模块
+if ! command -v python3 >/dev/null 2>&1; then
+    log_err "【缺少基础依赖】系统未检测到 python3。"
+    log_err "请先执行以下命令安装基础组件：sudo apt-get update && sudo apt-get install -y python3 python3-venv"
+    exit 1
+fi
+
+if ! python3 -c "import venv" >/dev/null 2>&1; then
+    log_err "【缺少基础依赖】系统 Python 缺少 venv 模块。"
+    log_err "请先执行以下命令安装基础组件：sudo apt-get update && sudo apt-get install -y python3-venv"
+    exit 1
+fi
+
+# 1.2 sudo 权限检查
 if ! sudo -n true 2>/dev/null; then
-    log_err "当前用户无法进行无密码 sudo 授权，请确认当前用户具备 sudo 权限。"
-    exit 1
+    if [ -t 0 ]; then
+        log_warn "需要管理员权限执行扩展配置，正在请求 sudo 授权..."
+        sudo -v || {
+            log_err "管理员权限获取失败，请确认当前用户具备 sudo 权限。"
+            exit 1
+        }
+    else
+        log_err "当前用户无法进行无密码 sudo 授权，请确认当前用户具备 sudo 权限。"
+        exit 1
+    fi
 fi
 
-# 1.2 检查飞牛音乐 socket 文件
+# 1.3 检查飞牛音乐 socket 文件
 if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
-    log_err "未检测到飞牛音乐 socket 文件 (${TARGET_SOCK} 或 ${UPSTREAM_SOCK})，请先启动飞牛音乐应用。"
+    log_err "【前置条件未满足】未检测到飞牛音乐运行套接字。"
+    log_err "请先在 fnOS 管理界面 -> 应用中心，安装并启动【飞牛音乐】应用后，再运行本脚本。"
     exit 1
 fi
 
-# 1.3 检查 / 自动拉起已启用的音源
+# 1.4 检查 / 自动拉起已启用的音源
 ensure_source() {
     local name="$1" url="$2" compose_svc="$3" unit="$4"
     if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
@@ -234,14 +274,14 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     fi
 fi
 
-# 1.4 检查 Python 虚拟环境与依赖
+# 1.5 检查 Python 虚拟环境与依赖
 if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
     log_info "创建 .venv-proxy 虚拟环境..."
     python3 -m venv "${BASE_DIR}/.venv-proxy"
     "${BASE_DIR}/.venv-proxy/bin/pip" install -r "${BASE_DIR}/proxy/requirements.txt" pytest -i https://pypi.tuna.tsinghua.edu.cn/simple
 fi
 
-# 1.5 编译与语法检查
+# 1.6 编译与语法检查
 python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
 bash -n "${BASE_DIR}/proxy/run_proxy.sh"
 
@@ -334,4 +374,18 @@ log_info "============================================================"
 log_info "fnmusic-ext 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
 log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"
+log_info "------------------------------------------------------------"
+log_info "【后续验证与使用指引】"
+log_info "1. 验证搜索与播放："
+log_info "   打开飞牛音乐 Web 端或手机 App，搜索歌曲（如“晴天”或“周杰伦”），"
+log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
+if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+    log_info "2. 网易云扫码登录（可选）："
+    log_info "   若遇到部分网易云 VIP/无损歌曲需登录，可访问："
+    log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 使用网易云 App 扫码登录。"
+fi
+log_info "3. 健康检查与运维："
+log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
+log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"
+log_info "   • 一键还原: ./restore.sh (一键无损切回官方原生直连)"
 log_info "============================================================"

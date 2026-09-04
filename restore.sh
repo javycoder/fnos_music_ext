@@ -43,10 +43,18 @@ log_err() {
 
 log_info "==> 开始还原 fnmusic 原生直连模式..."
 
-# 1. sudo -n 检查
+# 1. sudo 权限检查
 if ! sudo -n true 2>/dev/null; then
-    log_err "当前用户无法进行无密码 sudo 授权，无法执行还原。"
-    exit 1
+    if [ -t 0 ]; then
+        log_warn "需要管理员权限执行还原，正在请求 sudo 授权..."
+        sudo -v || {
+            log_err "管理员权限获取失败，请确认当前用户具备 sudo 权限。"
+            exit 1
+        }
+    else
+        log_err "当前用户无法进行无密码 sudo 授权，无法执行还原。"
+        exit 1
+    fi
 fi
 
 # 2. 停用并禁用代理服务
