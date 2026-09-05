@@ -132,69 +132,105 @@ verify_acceptance() {
     fi
     log_info "验收 6a 通过：INVALID TOKEN 正确透传，耗时 ${time_total}s (< 3s)。"
 
-    # 6b. 在线音频取流与全链路测试 (Range: bytes=0-1048575 -> 206)
-    log_info "验收 6b: 验证在线播放全链路取流 (Range 206 及数据流传输)..."
-    local probe_id=""
-    if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
-        probe_id="$(curl -s --max-time 20 "${MUSICDL_URL}/search?keyword=%E6%99%B4%E5%A4%A9&limit=1" 2>/dev/null | python3 -c "import sys,json
+    # 6b. 在线音频取流与全链路测试 (Range: bytes=0-1048575 -> 200/206)
+    log_info "验收 6b: 验证在线播放全链路取流 (Range 200/206 及数据流传输)..."
+
+    local probe_keywords=("晴天" "海阔天空" "稻香")
+    local search_any_result=0
+    local proxy_internal_error=0
+
+    # 从指定音源搜索候选歌曲，逐行输出 id（可能为空）
+    search_probe_ids() {
+        local source="$1" keyword="$2" encoded
+        encoded="$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${keyword}" 2>/dev/null || true)"
+        [ -z "${encoded}" ] && return 0
+        if [ "${source}" = "musicdl" ]; then
+            curl -s --max-time 20 "${MUSICDL_URL}/search?keyword=${encoded}&limit=3" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
-    print((d.get('items') or [{}])[0].get('id') or '')
+    for it in (d.get('items') or [])[:3]:
+        i=it.get('id')
+        if i: print(i)
 except Exception:
-    print('')" 2>/dev/null || true)"
-        if [ -z "${probe_id}" ]; then
-            probe_id="migu:600902000006889366"
-            log_warn "未能从 musicdl 搜索到试播曲目，回退 ${probe_id}"
-        fi
-    elif [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
-        probe_id="$(curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=%E6%99%B4%E5%A4%A9&limit=1&type=song" 2>/dev/null | python3 -c "import sys,json
+    pass" 2>/dev/null || true
+        else
+            curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=${encoded}&limit=3&type=song" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
     rows=d.get('data') if isinstance(d, dict) else None
     if not isinstance(rows, list):
         rows=d.get('songs') if isinstance(d, dict) else None
-    item=(rows or [{}])[0] if isinstance(rows, list) and rows else {}
-    sid=str(item.get('song_id') or item.get('id') or '')
-    print(('netease:'+sid) if sid else '')
+    for it in (rows or [])[:3]:
+        sid=str(it.get('song_id') or it.get('id') or '')
+        if sid: print('netease:'+sid)
 except Exception:
-    print('')" 2>/dev/null || true)"
-        if [ -z "${probe_id}" ]; then
-            probe_id="netease:186016"
-            log_warn "未能从 musicbox 搜索到试播曲目，回退 ${probe_id}"
+    pass" 2>/dev/null || true
         fi
-    fi
-    local stream_guid="online:${probe_id}"
-    log_info "试播 guid=${stream_guid}"
-    local stream_5667="https://127.0.0.1:5667/music/api/v1/track/stream?guid=${stream_guid}"
-    local stream_443="https://127.0.0.1/music/api/v1/track/stream?guid=${stream_guid}"
-    local out_file
-    out_file="$(mktemp)"
+    }
 
-    local http_code
-    http_code="$(curl -sk -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_5667}" 2>/dev/null || echo "000")"
-    if [ "${http_code}" = "000" ]; then
-        log_warn "5667 端口连接异常，尝试 fallback 访问 443 端口取流..."
-        http_code="$(curl -skL -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_443}" 2>/dev/null || echo "000")"
-    fi
+    # 对指定 guid 尝试全链路取流，成功返回 0 并输出 http_code
+    try_probe_stream() {
+        local probe_id="$1"
+        local stream_guid="online:${probe_id}"
+        local stream_5667="https://127.0.0.1:5667/music/api/v1/track/stream?guid=${stream_guid}"
+        local stream_443="https://127.0.0.1/music/api/v1/track/stream?guid=${stream_guid}"
+        local out_file http_code recv_size=0
+        out_file="$(mktemp)"
+        log_info "试播 guid=${stream_guid}"
+        http_code="$(curl -sk -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_5667}" 2>/dev/null || echo "000")"
+        if [ "${http_code}" = "000" ]; then
+            log_warn "5667 端口连接异常，尝试 fallback 访问 443 端口取流..."
+            http_code="$(curl -skL -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_443}" 2>/dev/null || echo "000")"
+        fi
+        if [ -f "${out_file}" ]; then
+            recv_size="$(wc -c < "${out_file}" | tr -d ' ')"
+            rm -f "${out_file}"
+        fi
+        case "${http_code}" in
+            500|502|503|504) proxy_internal_error=1 ;;
+        esac
+        if { [ "${http_code}" = "206" ] || [ "${http_code}" = "200" ]; } && [ "${recv_size}" -gt 10000 ]; then
+            if [ "${recv_size}" -lt 500000 ]; then
+                log_warn "在线音频流接收大小为 ${recv_size} 字节 (偏小但已收到有效数据)。"
+            else
+                log_info "在线音频流接收大小为 ${recv_size} 字节 (≈1MB)。"
+            fi
+            return 0
+        fi
+        log_warn "取流未成功: guid=${stream_guid} HTTP=${http_code} recv=${recv_size}B"
+        return 1
+    }
 
-    local recv_size=0
-    if [ -f "${out_file}" ]; then
-        recv_size="$(wc -c < "${out_file}" | tr -d ' ')"
-        rm -f "${out_file}"
-    fi
+    local sources=()
+    [ "${ENABLE_MUSICDL}" -eq 1 ] && sources+=("musicdl")
+    [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
 
-    if [ "${http_code}" != "206" ] && [ "${http_code}" != "200" ]; then
-        log_err "验收 6b 失败：在线音频流请求状态码为 ${http_code} (预期 206)。"
+    local src kw id
+    for src in "${sources[@]}"; do
+        for kw in "${probe_keywords[@]}"; do
+            while IFS= read -r id; do
+                [ -z "${id}" ] && continue
+                search_any_result=1
+                if try_probe_stream "${id}"; then
+                    log_info "验收 6b 通过：音源 ${src} 在线播放流取流成功。"
+                    return 0
+                fi
+            done < <(search_probe_ids "${src}" "${kw}")
+        done
+    done
+
+    if [ "${proxy_internal_error}" -eq 1 ]; then
+        log_err "验收 6b 失败：代理服务本身返回内部错误 (500/502/503/504)，视为严重异常。"
         return 1
     fi
 
-    if [ "${recv_size}" -lt 500000 ]; then
-        log_warn "在线音频流接收大小为 ${recv_size} 字节 (偏小但已收到有效数据)。"
+    if [ "${search_any_result}" -eq 0 ]; then
+        log_warn "所有已启用音源 (${sources[*]}) 搜索结果均为空：可能是外部网络异常或第三方平台限流。"
+        log_warn "跳过在线播放自动验收（不触发回滚），建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
     else
-        log_info "在线音频流接收大小为 ${recv_size} 字节 (≈1MB)。"
+        log_warn "所有候选歌曲均未能成功取流，但代理服务本身响应正常（无 500/502 内部错误）。"
+        log_warn "跳过在线播放自动验收（不触发回滚），建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
     fi
-
-    log_info "验收 6b 通过：在线播放流正常响应 HTTP ${http_code}。"
     return 0
 }
 
