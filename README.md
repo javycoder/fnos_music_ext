@@ -68,7 +68,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./extend.sh
 ```
 - **在线听歌**：打开飞牛音乐 Web 端或手机 App，在搜索框输入歌曲名（如“晴天”），直接在线即点即播；
-- **网易云扫码**（若启用了 musicbox）：局域网访问 `http://<NAS_IP>:8770/api/v1/auth/login/qr.png` 扫码登录 VIP/收藏；
+- **网易云扫码**（若启用了 musicbox）：终端运行 `./netease_login.sh`（或 `./install.sh --qr` / `./extend.sh --qr`）进行交互式扫码登录（终端展示 ASCII 二维码、过期自动刷新与状态轮询；局域网亦可访问可选图片 `http://<NAS_IP>:8770/api/v1/auth/login/qr.png`）；
 - **健康检查**：在终端探测各组件连通状态：
   ```bash
   curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
@@ -110,7 +110,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（兼容 OpenAI 规范） |
 | `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key |
 | `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 每日推荐生成模型 |
-| `FNMUSIC_VERSION` | `1.1.0` | 当前安装的版本号 |
+| `FNMUSIC_VERSION` | `1.2.0` | 当前安装的版本号 |
 
 ---
 
