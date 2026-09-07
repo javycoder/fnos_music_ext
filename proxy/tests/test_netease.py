@@ -38,6 +38,7 @@ def setup_netease_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "lyric_field", "data.lyric")
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
     monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
@@ -1070,6 +1071,7 @@ def test_healthz_musicbox_only(monkeypatch):
 def test_healthz_both_sources_down_is_unhealthy(monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 0})

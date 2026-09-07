@@ -48,6 +48,7 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "lyric_field", "data.lyric")
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
     monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)

@@ -72,6 +72,30 @@ _SONG_CACHE: dict[str, dict] = {}
 _STATS = {"searches": 0, "url_resolutions": 0, "errors": 0}
 
 
+def _lenient_json(resp: httpx.Response, tag: str = "") -> dict | list | None:
+    """宽容解析 JSON：第三方接口可能返回 Content-Type text/html 但内容为合法 JSON。"""
+    try:
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        pass
+    text = (resp.text or "").strip()
+    if not text or (not text.startswith("{") and not text.startswith("[")):
+        logger.warning(
+            "%s: upstream returned non-JSON body (HTTP %s, CT %s): %.80s",
+            tag,
+            resp.status_code,
+            resp.headers.get("content-type"),
+            text,
+        )
+        return None
+    import json as _json
+    try:
+        return _json.loads(text)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("%s: json parse failed: %s (%.80s)", tag, e, text)
+        return None
+
+
 def normalize_source(raw: str) -> str:
     return _SOURCE_ALIASES.get((raw or "").strip().lower(), "")
 
@@ -133,13 +157,15 @@ def _kg_hash_for_quality(item: dict, tier: str) -> str:
 # ------------------------------------------------------------------ 酷狗 kg ---
 
 async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+    # 检索更多条目以便剔除收费/VIP曲目后仍能满足 limit 数量
+    fetch_size = max(limit * 3, 20)
     r = await client.get(
         "http://mobilecdn.kugou.com/api/v3/search/song",
         params={
             "keyword": keyword,
             "format": "json",
             "page": 1,
-            "pagesize": max(limit, 5),
+            "pagesize": fetch_size,
             "showtype": 1,
         },
         headers={"User-Agent": UA_MOBILE},
@@ -154,6 +180,12 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         fhash = str(it.get("hash") or "")
         if not fhash:
             continue
+
+        # 可播放性过滤：pay_type != 0 表示收费/VIP 曲目，跳过不返回
+        pay_type = int(it.get("pay_type") or 0)
+        if pay_type != 0:
+            continue
+
         singer = str(it.get("singername") or "")
         title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "")
         sq = str(it.get("sqhash") or "")
@@ -175,9 +207,12 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "hash_hq": hq,
             "hash_sq": sq,
             "mixsongid": str(it.get("mixsongid") or ""),
+            "pay_type": pay_type,
         }
         _cache_put(item)
         items.append(item)
+        if len(items) >= limit:
+            break
     return items
 
 
@@ -187,6 +222,29 @@ async def kg_resolve_url(
     fhash = _kg_hash_for_quality(item or {"hash": identifier}, tier)
     if not fhash:
         return None
+
+    # 1. 主接口：m.kugou.com 移动端 playInfo（免登录可用，返回 128k mp3 直链）
+    try:
+        r = await client.get(
+            "http://m.kugou.com/app/i/getSongInfo.php",
+            params={"cmd": "playInfo", "hash": fhash},
+            headers={"User-Agent": UA_MOBILE},
+            timeout=8.0,
+        )
+        data = _lenient_json(r, f"kg playInfo {fhash}")
+        if isinstance(data, dict) and data.get("errcode") == 0 and data.get("url"):
+            ext = str(data.get("extName") or "mp3").lower().lstrip(".") or "mp3"
+            return {
+                "url": str(data["url"]),
+                "ext": ext,
+                "file_size": int(data.get("fileSize") or 0) or 0,
+                "br": int(data.get("bitRate") or 128) * 1000 if int(data.get("bitRate") or 0) < 1000 else int(data.get("bitRate") or 128000),
+                "headers": dict(KG_HEADERS),
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("kg playInfo %s failed: %s", fhash, e)
+
+    # 2. 备用接口：老版 trackercdn（部分地区/IP 或自建反代可能可用）
     last_err = None
     for host in ("https://trackercdnbj.kugou.com", "http://trackercdn.kugou.com"):
         try:
@@ -194,8 +252,9 @@ async def kg_resolve_url(
                 f"{host}/v1/url",
                 params={"hash": fhash, "pid": 1, "appid": 1010, "behavior": "play"},
                 headers={"User-Agent": UA_MOBILE},
+                timeout=6.0,
             )
-            data = r.json()
+            data = _lenient_json(r, f"kg trackercdn {fhash}")
         except Exception as e:  # noqa: BLE001
             last_err = e
             continue
@@ -208,7 +267,7 @@ async def kg_resolve_url(
                 "headers": dict(KG_HEADERS),
             }
     if last_err:
-        raise last_err
+        logger.warning("kg trackercdn %s last error: %s", fhash, last_err)
     return None
 
 
@@ -283,9 +342,10 @@ _WY_EAPI_HEADER = {
 
 
 async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+    fetch_limit = max(limit * 2, 20)
     r = await client.post(
         "https://music.163.com/api/search/get/web",
-        data={"s": keyword, "type": 1, "offset": 0, "limit": max(limit, 5), "total": "true"},
+        data={"s": keyword, "type": 1, "offset": 0, "limit": fetch_limit, "total": "true"},
         headers={
             "User-Agent": UA_PC,
             "Referer": "https://music.163.com/",
@@ -301,6 +361,12 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         sid = str(it.get("id") or "")
         if not sid:
             continue
+
+        # 可播放性过滤：fee in (0, 8) 为免费/标准音质免费，fee=1(VIP) 或 fee=4(购买专辑) 跳过
+        fee = int(it.get("fee") or 0)
+        if fee not in (0, 8):
+            continue
+
         artists = it.get("artists") or []
         artist = " / ".join(
             str(a.get("name") or "") for a in artists if isinstance(a, dict)
@@ -318,41 +384,70 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "file_size": 0,
             "lyric": "",
             "song_id": sid,
+            "fee": fee,
         }
         _cache_put(item)
         items.append(item)
+        if len(items) >= limit:
+            break
     return items
 
 
 async def wy_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) -> dict | None:
-    if not HAS_CRYPTO:
-        raise RuntimeError("pycryptodome not installed: wy eapi unavailable")
-    br_map = {"lossless": 999000, "high": 320000, "standard": 128000}
-    brs = [br_map[t] for t in _quality_tiers(tier) if t in br_map]
-    eapi_path = "/api/song/enhance/player/url"
-    for br in brs:
-        try:
-            r = await client.post(
-                "https://interface3.music.163.com/eapi/song/enhance/player/url",
-                data={"params": _eapi_params(eapi_path, {"header": dict(_WY_EAPI_HEADER), "ids": [int(identifier)], "br": br})},
-                headers={
-                    "User-Agent": UA_PC,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Cookie": "os=pc; appver=9.1.15; osver=Microsoft-Windows-10",
-                },
-            )
-            data = (r.json() or {}).get("data") or []
-        except Exception:  # noqa: BLE001
-            continue
-        for entry in data:
-            if isinstance(entry, dict) and entry.get("url"):
-                return {
-                    "url": str(entry["url"]),
-                    "ext": "mp3",
-                    "file_size": int(entry.get("size") or 0) or 0,
-                    "br": int(entry.get("br") or 0) or br,
-                    "headers": dict(WY_HEADERS),
-                }
+    # 1. 优先尝试官方 eapi 高音质解析（需 pycryptodome）
+    if HAS_CRYPTO:
+        br_map = {"lossless": 999000, "high": 320000, "standard": 128000}
+        brs = [br_map[t] for t in _quality_tiers(tier) if t in br_map]
+        eapi_path = "/api/song/enhance/player/url"
+        for br in brs:
+            try:
+                r = await client.post(
+                    "https://interface3.music.163.com/eapi/song/enhance/player/url",
+                    data={"params": _eapi_params(eapi_path, {"header": dict(_WY_EAPI_HEADER), "ids": [int(identifier)], "br": br})},
+                    headers={
+                        "User-Agent": UA_PC,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Cookie": "os=pc; appver=9.1.15; osver=Microsoft-Windows-10",
+                    },
+                    timeout=8.0,
+                )
+                data = (r.json() or {}).get("data") or []
+            except Exception:  # noqa: BLE001
+                continue
+            for entry in data:
+                if isinstance(entry, dict) and entry.get("url"):
+                    return {
+                        "url": str(entry["url"]),
+                        "ext": "mp3",
+                        "file_size": int(entry.get("size") or 0) or 0,
+                        "br": int(entry.get("br") or 0) or br,
+                        "headers": dict(WY_HEADERS),
+                    }
+
+    # 2. 备用兜底：网易 outer/url 免登录直链（重定向至真实音频 CDN，先做 Range 探测排除 404 HTML）
+    try:
+        outer_url = f"https://music.163.com/song/media/outer/url?id={identifier}"
+        probe_headers = dict(WY_HEADERS)
+        probe_headers["Range"] = "bytes=0-1"
+        r_probe = await client.get(
+            outer_url,
+            headers=probe_headers,
+            timeout=8.0,
+        )
+        ct = (r_probe.headers.get("content-type") or "").lower()
+        if r_probe.status_code in (200, 206) and "audio" in ct:
+            final_url = str(r_probe.url)
+            cl = int(r_probe.headers.get("content-length") or 0)
+            return {
+                "url": final_url,
+                "ext": "mp3",
+                "file_size": cl,
+                "br": 128000,
+                "headers": dict(WY_HEADERS),
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("wy outer/url fallback %s failed: %s", identifier, e)
+
     return None
 
 
@@ -412,23 +507,31 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
 
 
 async def mg_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) -> dict | None:
-    r = await client.get(
-        "https://music.migu.cn/v3/api/music/audio/player_get_song_info",
-        params={"copyrightId": identifier, "resourceType": "E", "resourceLevel": tier},
-        headers={"User-Agent": UA_PC, "Referer": "https://music.migu.cn/"},
-    )
-    data = (r.json() or {}).get("data") or {}
-    url = str(data.get("play_url") or data.get("url") or "")
-    if not url or url == "https://music.migu.cn/404/error.html":
+    try:
+        r = await client.get(
+            "https://music.migu.cn/v3/api/music/audio/player_get_song_info",
+            params={"copyrightId": identifier, "resourceType": "E", "resourceLevel": tier},
+            headers={"User-Agent": UA_PC, "Referer": "https://music.migu.cn/"},
+            timeout=8.0,
+        )
+        json_obj = _lenient_json(r, f"mg player_get_song_info {identifier}")
+        if not isinstance(json_obj, dict):
+            return None
+        data = json_obj.get("data") or {}
+        url = str(data.get("play_url") or data.get("url") or "")
+        if not url or url == "https://music.migu.cn/404/error.html":
+            return None
+        ext = str(data.get("format_type") or "mp3").lower().lstrip(".") or "mp3"
+        return {
+            "url": url,
+            "ext": "flac" if ext in ("flac", "zq", "sq") else "mp3",
+            "file_size": int(data.get("fileSize") or data.get("overdue_size") or 0) or 0,
+            "br": int(data.get("bitRate") or 0) or 0,
+            "headers": dict(MG_HEADERS),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mg resolve %s failed: %s", identifier, e)
         return None
-    ext = str(data.get("format_type") or "mp3").lower().lstrip(".") or "mp3"
-    return {
-        "url": url,
-        "ext": "flac" if ext in ("flac", "zq", "sq") else "mp3",
-        "file_size": int(data.get("fileSize") or data.get("overdue_size") or 0) or 0,
-        "br": int(data.get("bitRate") or 0) or 0,
-        "headers": dict(MG_HEADERS),
-    }
 
 
 async def mg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
