@@ -27,7 +27,9 @@ NON_INTERACTIVE=0
 ENABLE_RECOMMEND=""
 LLM_BASE_URL=""
 LLM_API_KEY=""
-LLM_MODEL="gpt-4o-mini"
+LLM_MODEL=""
+LLM_MODEL_FROM_CLI=0
+DEFAULT_LLM_MODEL="gpt-4o-mini"
 RUN_EXTEND=0
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
@@ -56,7 +58,7 @@ usage() {
   --disable-recommend    明确关闭每日推荐
   --llm-base-url URL     OpenAI 兼容 Base URL，例如 https://api.openai.com/v1
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
-  --llm-model NAME       模型名，默认 gpt-4o-mini
+  --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
   --qr                   在终端展示网易云登录二维码
   -h, --help             显示帮助
@@ -129,7 +131,9 @@ while [ $# -gt 0 ]; do
             LLM_API_KEY="${2}"; shift 2 ;;
         --llm-model)
             [ $# -ge 2 ] || { log_err "--llm-model 需要模型名参数"; exit 1; }
-            LLM_MODEL="${2}"; shift 2 ;;
+            LLM_MODEL="${2}"
+            LLM_MODEL_FROM_CLI=1
+            shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
         --qr)
             curl -s http://127.0.0.1:8770/api/v1/auth/login/qr || true
@@ -259,6 +263,121 @@ prompt() {
     fi
 }
 
+# 从 OpenAI 兼容接口拉取模型列表（失败返回空；不打印 API Key）
+fetch_llm_models() {
+    local base_url="$1" api_key="$2"
+    local models_url tmp_body http_code
+    base_url="${base_url%/}"
+    models_url="${base_url}/models"
+    tmp_body="$(mktemp)"
+    http_code="$(
+        curl -sS --max-time 15 \
+            -H "Authorization: Bearer ${api_key}" \
+            -H "Content-Type: application/json" \
+            -o "${tmp_body}" -w "%{http_code}" \
+            "${models_url}" 2>/dev/null || echo "000"
+    )"
+    if [ "${http_code}" != "200" ]; then
+        rm -f "${tmp_body}"
+        return 1
+    fi
+    if ! python3 - "${tmp_body}" <<'PY' 2>/dev/null
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+rows = []
+if isinstance(data, dict):
+    raw = data.get("data")
+    if isinstance(raw, list):
+        rows = raw
+    elif isinstance(data.get("models"), list):
+        rows = data["models"]
+elif isinstance(data, list):
+    rows = data
+ids = []
+seen = set()
+for it in rows:
+    mid = ""
+    if isinstance(it, dict):
+        mid = str(it.get("id") or it.get("name") or it.get("model") or "").strip()
+    elif isinstance(it, str):
+        mid = it.strip()
+    if mid and mid not in seen:
+        seen.add(mid)
+        ids.append(mid)
+if not ids:
+    sys.exit(1)
+for mid in ids:
+    print(mid)
+PY
+    then
+        rm -f "${tmp_body}"
+        return 1
+    fi
+    rm -f "${tmp_body}"
+    return 0
+}
+
+# 交互选择模型：优先展示拉取到的列表，失败则手写
+prompt_llm_model() {
+    local base_url="$1" api_key="$2"
+    local models=() line i choice custom def_idx=1
+    log_info "正在从接口拉取可用模型列表..."
+    while IFS= read -r line; do
+        [ -n "${line}" ] && models+=("${line}")
+    done < <(fetch_llm_models "${base_url}" "${api_key}" || true)
+
+    if [ "${#models[@]}" -eq 0 ]; then
+        log_warn "未能自动获取模型列表（接口不可达、鉴权失败或返回格式不兼容）。"
+        LLM_MODEL="$(prompt "请手动输入模型名称" "${DEFAULT_LLM_MODEL}")"
+        LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM_MODEL}}"
+        return 0
+    fi
+
+    local max_show=40 total="${#models[@]}"
+    if [ "${total}" -gt "${max_show}" ]; then
+        log_info "接口返回 ${total} 个模型，列表仅展示前 ${max_show} 个；其余请选 0 自定义输入。"
+    fi
+    echo "可用模型："
+    local show_count="${total}"
+    [ "${show_count}" -gt "${max_show}" ] && show_count="${max_show}"
+    for i in $(seq 0 $((show_count - 1))); do
+        echo "  $((i + 1))) ${models[$i]}"
+    done
+    echo "  0) 自定义输入模型名称"
+    # 默认选第一项；若可见列表含默认模型名则优先
+    for i in $(seq 0 $((show_count - 1))); do
+        if [ "${models[$i]}" = "${DEFAULT_LLM_MODEL}" ]; then
+            def_idx=$((i + 1))
+            break
+        fi
+    done
+    choice="$(prompt "请选择模型编号（0=自定义）" "${def_idx}")"
+    case "${choice}" in
+        0)
+            custom="$(prompt "请输入自定义模型名称" "${DEFAULT_LLM_MODEL}")"
+            LLM_MODEL="${custom:-${DEFAULT_LLM_MODEL}}"
+            ;;
+        ''|*[!0-9]*)
+            log_warn "输入无效，使用默认模型 ${models[$((def_idx - 1))]}。"
+            LLM_MODEL="${models[$((def_idx - 1))]}"
+            ;;
+        *)
+            if [ "${choice}" -ge 1 ] && [ "${choice}" -le "${show_count}" ]; then
+                LLM_MODEL="${models[$((choice - 1))]}"
+            else
+                log_warn "编号超出范围，使用默认模型 ${models[$((def_idx - 1))]}。"
+                LLM_MODEL="${models[$((def_idx - 1))]}"
+            fi
+            ;;
+    esac
+    log_info "已选择模型: ${LLM_MODEL}"
+}
+
 if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
     echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}"
@@ -311,13 +430,17 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             read -r -s -p "LLM API Key（输入不回显，留空则不开启推荐）: " LLM_API_KEY || true
             echo
         fi
-        [ -z "${LLM_MODEL}" ] && LLM_MODEL="$(prompt "LLM 模型名" "gpt-4o-mini")"
-        LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
         if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
             log_warn "未同时提供 Base URL 与 API Key，每日推荐将关闭。"
             ENABLE_RECOMMEND="no"
             LLM_BASE_URL=""
             LLM_API_KEY=""
+            LLM_MODEL=""
+        elif [ "${LLM_MODEL_FROM_CLI}" -eq 1 ] && [ -n "${LLM_MODEL}" ]; then
+            log_info "使用命令行指定的模型: ${LLM_MODEL}"
+        else
+            # 仅在开启推荐且已有 URL/Key 时拉取模型列表并让用户选择
+            prompt_llm_model "${LLM_BASE_URL}" "${LLM_API_KEY}"
         fi
     fi
     ext_choice="$(prompt "安装配置完成，是否立即执行 extend.sh 启用扩展? [Y/n]" "Y")"
@@ -333,10 +456,12 @@ else
             log_err "--enable-recommend 需要同时提供 --llm-base-url 与 --llm-api-key"
             exit 1
         fi
+        LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM_MODEL}}"
     else
         ENABLE_RECOMMEND="no"
         LLM_BASE_URL=""
         LLM_API_KEY=""
+        LLM_MODEL=""
     fi
 fi
 
