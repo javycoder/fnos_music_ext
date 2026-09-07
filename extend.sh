@@ -8,6 +8,8 @@ set -euo pipefail
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICDL_URL="http://127.0.0.1:8768"
@@ -242,7 +244,7 @@ except Exception:
 # ------------------------------------------------------------------------------
 # 1. 预检
 # ------------------------------------------------------------------------------
-log_info "==> 步骤 1/5: 环境预检..."
+log_info "==> 步骤 1/5: 环境预检... (fnmusic-ext v${FNMUSIC_VERSION})"
 
 # 1.1 检查 Python 3 与 venv 模块
 if ! command -v python3 >/dev/null 2>&1; then
@@ -416,7 +418,7 @@ if ! verify_acceptance; then
 fi
 
 log_info "============================================================"
-log_info "fnmusic-ext 扩展已成功部署并生效！"
+log_info "fnmusic-ext v${FNMUSIC_VERSION} 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
 log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"
 log_info "------------------------------------------------------------"

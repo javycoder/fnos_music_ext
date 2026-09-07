@@ -29,7 +29,7 @@ except ImportError:
     logger.warning("curl_cffi not installed, falling back to standard httpx client")
 
 from musicdl import musicdl  # noqa: E402
-from hardening import SearchCache, SourceBreaker, SingleFlight
+from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight
 
 CONF = {
     "sources": [
@@ -50,6 +50,11 @@ CONF = {
     "breaker_cooldown": int(os.environ.get("MUSICDL_BREAKER_COOLDOWN", "120")),
     "search_workers": int(os.environ.get("MUSICDL_SEARCH_WORKERS", "6")),
     "neg_cache_ttl": int(os.environ.get("MUSICDL_NEG_TTL", "30")),
+    # 自适应熔断/降级
+    "slow_degrade_s": float(os.environ.get("MUSICDL_SLOW_DEGRADE_S", "8")),
+    "adaptive_min_timeout": float(os.environ.get("MUSICDL_ADAPTIVE_MIN_TIMEOUT", "3")),
+    "fast_return_items": int(os.environ.get("MUSICDL_FAST_RETURN_ITEMS", "12")),
+    "slow_grace_s": float(os.environ.get("MUSICDL_SLOW_GRACE_S", "2")),
 }
 
 SEARCH_CACHE = SearchCache(
@@ -59,6 +64,12 @@ SEARCH_CACHE = SearchCache(
 SOURCE_BREAKER = SourceBreaker(
     failure_threshold=CONF["breaker_threshold"],
     cooldown=CONF["breaker_cooldown"],
+    slow_threshold_s=CONF["slow_degrade_s"],
+)
+ADAPTIVE = AdaptiveTimeout(
+    base_timeout=CONF["search_timeout"],
+    min_timeout=CONF["adaptive_min_timeout"],
+    slow_latency=CONF["slow_degrade_s"],
 )
 SINGLE_FLIGHT = SingleFlight()
 SOURCE_EXECUTOR = ThreadPoolExecutor(
@@ -165,7 +176,7 @@ async def _refresh_by_keyword(song_id: str) -> dict | None:
             loop.run_in_executor(
                 SOURCE_EXECUTOR, _search_one_source, src_client, entry["keyword"], limit
             ),
-            timeout=CONF["search_timeout"],
+            timeout=ADAPTIVE.timeout_for(src_client),
         )
     except Exception:
         return None
@@ -266,6 +277,7 @@ async def healthz():
         "cache_size": len(_SONG_CACHE),
         "cache_entries": len(SEARCH_CACHE),
         "breaker_open": SOURCE_BREAKER.get_open_sources(),
+        "adaptive_timeouts": ADAPTIVE.stats(),
         "stats": _STATS,
     }
 
@@ -338,13 +350,17 @@ async def search(
 
         async def one(source: str):
             loop = asyncio.get_running_loop()
+            timeout = ADAPTIVE.timeout_for(source)
+            started = time.monotonic()
             try:
                 songs = await asyncio.wait_for(
                     loop.run_in_executor(
                         SOURCE_EXECUTOR, _search_one_source, source, keyword, limit
                     ),
-                    timeout=CONF["search_timeout"],
+                    timeout=timeout,
                 )
+                latency = time.monotonic() - started
+                ADAPTIVE.record_success(source, latency)
                 items = []
                 for song in songs[:limit]:
                     item = _normalize(song, keyword)
@@ -357,11 +373,13 @@ async def search(
                         )
                         items.append(item)
                 if items:
-                    SOURCE_BREAKER.record_success(source)
+                    # 慢响应（超过 slow_degrade_s）计入降级失败，持续慢源会被熔断
+                    SOURCE_BREAKER.record_success(source, latency)
                 return source, items, None
             except asyncio.TimeoutError:
                 SOURCE_BREAKER.record_failure(source)
-                return source, [], f"timeout after {CONF['search_timeout']}s"
+                ADAPTIVE.record_failure(source)
+                return source, [], f"timeout after {timeout:.1f}s"
             except Exception as e:  # 单源失败不影响其他源
                 _STATS["errors"] += 1
                 SOURCE_BREAKER.record_failure(source)
@@ -371,6 +389,7 @@ async def search(
         pending = {asyncio.create_task(one(s), name=s): s for s in active_src_list}
         overall = max(float(CONF["search_timeout"]), 4.0)
         deadline = time.monotonic() + overall
+        skipped_fast_return = False
         while pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -385,15 +404,27 @@ async def search(
                 except Exception as e:  # noqa: BLE001
                     _STATS["errors"] += 1
                     results.append((task.get_name(), [], f"{type(e).__name__}: {e}"))
-            # 已有任意源出结果：再给其余源最多 2 秒，避免慢源拖死整页
-            if any(items for _, items, _ in results):
-                deadline = min(deadline, time.monotonic() + 2.0)
+            if not pending:
+                break
+            total_items = sum(len(items) for _, items, _ in results)
+            # 结果已足够优质：不再等待慢源，立即返回
+            if total_items >= CONF["fast_return_items"]:
+                skipped_fast_return = True
+                break
+            # 已有任意源出结果：再给其余源最多 slow_grace_s 秒，避免慢源拖死整页
+            if total_items > 0:
+                deadline = min(deadline, time.monotonic() + CONF["slow_grace_s"])
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+            skip_reason = "skipped (fast return)" if skipped_fast_return else f"timeout after {overall}s"
             for task, src in pending.items():
-                results.append((src, [], f"timeout after {overall}s"))
+                results.append((src, [], skip_reason))
+                # 被放弃的慢源：收紧自适应超时；若是全局超时放弃，同时计入熔断失败
+                ADAPTIVE.record_failure(src)
+                if not skipped_fast_return:
+                    SOURCE_BREAKER.record_failure(src)
 
         all_items = []
         seen_ids = set()
@@ -408,12 +439,18 @@ async def search(
         else:
             SEARCH_CACHE.put(keyword, sources_key, [], ttl=CONF["neg_cache_ttl"])
 
+        errors = {src: err for src, _, err in results if err}
+        # 被熔断跳过的源也在 errors 中体现
+        for s in raw_src_list:
+            if s not in active_src_list:
+                errors.setdefault(s, "circuit breaker open")
+
         return {
             "ok": True,
             "cached": False,
             "keyword": keyword,
             "items": all_items,
-            "errors": {src: err for src, _, err in results if err},
+            "errors": errors,
         }
 
     return await SINGLE_FLIGHT.run(f"{keyword}|{sources_key}", _do_search)
