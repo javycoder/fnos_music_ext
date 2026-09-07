@@ -60,7 +60,7 @@ usage() {
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
-  --qr                   在终端展示网易云登录二维码
+  --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
 密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
@@ -136,7 +136,7 @@ while [ $# -gt 0 ]; do
             shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
         --qr)
-            curl -s http://127.0.0.1:8770/api/v1/auth/login/qr || true
+            bash "${BASE_DIR}/netease_login.sh"
             exit 0
             ;;
         -h|--help) usage; exit 0 ;;
@@ -830,7 +830,7 @@ fi
 stop_unselected
 
 python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
-bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh"
+bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh" "${BASE_DIR}/netease_login.sh"
 
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
@@ -855,9 +855,9 @@ log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌�
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "3. 网易云扫码登录（可选）："
     log_info "   部分网易云 VIP/无损歌曲需要账号凭证："
-    log_info "   • 终端直接扫码（推荐）: curl -s http://127.0.0.1:8770/api/v1/auth/login/qr"
-    log_info "     （或在终端运行 ./install.sh --qr 或 ./extend.sh --qr 查看）"
-    log_info "   • 局域网浏览器图片: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+    log_info "   • 命令行扫码登录（推荐）: ./install.sh --qr 或 ./netease_login.sh"
+    log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
+    log_info "   • 局域网浏览器图片（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
     log_info "   • 检查登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
@@ -868,6 +868,12 @@ log_info "5. 状态探测与一键还原："
 log_info "   • 探测健康状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 随时一键还原: ./restore.sh (立即恢复官方出厂直连状态)"
 log_info "============================================================"
+
+if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+    log_info ""
+    log_info "==> 检测到已启用网易云音源 (musicbox)，即将进入扫码登录流程..."
+    bash "${BASE_DIR}/netease_login.sh" || true
+fi
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
     exec "${BASE_DIR}/extend.sh" --force

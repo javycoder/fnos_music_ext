@@ -20,7 +20,7 @@ FORCE_RELOAD=0
 for arg in "$@"; do
     case "${arg}" in
         --qr)
-            curl -s "${MUSICBOX_URL}/api/v1/auth/login/qr" || true
+            bash "${BASE_DIR}/netease_login.sh"
             exit 0
             ;;
         --force)
@@ -29,7 +29,7 @@ for arg in "$@"; do
         -h|--help)
             echo "用法: $0 [--force] [--qr]"
             echo "  --force  强制重写 unit 并重启代理（安装改配置后使用）"
-            echo "  --qr     在终端展示网易云登录二维码"
+            echo "  --qr     启动终端网易云扫码登录流程"
             exit 0
             ;;
         *)
@@ -573,9 +573,9 @@ log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌�
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "2. 网易云扫码登录（可选）："
     log_info "   若遇到部分网易云 VIP/无损歌曲需登录："
-    log_info "   • 命令行终端直接扫码: curl -s http://127.0.0.1:8770/api/v1/auth/login/qr"
-    log_info "     （或执行 ./extend.sh --qr 快速显示）"
-    log_info "   • 浏览器图片扫码: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+    log_info "   • 命令行扫码登录（推荐）: ./extend.sh --qr 或 ./netease_login.sh"
+    log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
+    log_info "   • 浏览器图片扫码（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
     log_info "   • 查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 log_info "3. 健康检查与运维："
