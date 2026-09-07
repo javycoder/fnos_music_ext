@@ -17,14 +17,14 @@ def test_version_file_exists_with_semver():
     version_file = REPO_ROOT / "VERSION"
     assert version_file.is_file(), "仓库根目录必须存在 VERSION 文件"
     ver = version_file.read_text(encoding="utf-8").strip()
-    assert ver == "1.0.0"
+    assert ver == "1.0.1"
     parts = ver.split(".")
     assert len(parts) == 3 and all(p.isdigit() for p in parts)
 
 
 def test_get_version_reads_file(monkeypatch):
     monkeypatch.delenv("FNMUSIC_VERSION", raising=False)
-    assert get_version() == "1.0.0"
+    assert get_version() == "1.0.1"
 
 
 def test_get_version_env_override(monkeypatch):

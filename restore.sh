@@ -41,6 +41,47 @@ log_err() {
     echo -e "\033[31m[ERROR]\033[0m $*" >&2
 }
 
+# ------------------------------------------------------------------------------
+# 获取 fnOS 网关 http/https 端口 (读取失败时默认 5666/5667)
+# 输出: "<http_port> <https_port>"
+# ------------------------------------------------------------------------------
+get_fnos_gateway_ports() {
+    cat /usr/trim/etc/network_gateway_setting.conf 2>/dev/null | python3 -c '
+import sys, json, re
+text = sys.stdin.read()
+http_port, https_port = "5666", "5667"
+def scan(obj):
+    global http_port, https_port
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if isinstance(v, (int, str)) and str(v).isdigit():
+                if "https" in kl and "port" in kl:
+                    https_port = str(v)
+                elif "http" in kl and "port" in kl:
+                    http_port = str(v)
+            else:
+                scan(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            scan(it)
+if text.strip():
+    try:
+        scan(json.loads(text))
+    except Exception:
+        pass
+    if http_port == "5666":
+        m = re.search(r"\"?http_port\"?\s*[:=]\s*(\d+)", text)
+        if m:
+            http_port = m.group(1)
+    if https_port == "5667":
+        m = re.search(r"\"?https_port\"?\s*[:=]\s*(\d+)", text)
+        if m:
+            https_port = m.group(1)
+print(http_port, https_port)
+' 2>/dev/null || echo "5666 5667"
+}
+
 log_info "==> 开始还原 fnmusic 原生直连模式..."
 
 # 1. sudo 权限检查
@@ -104,14 +145,20 @@ else
     fi
 fi
 
-# 4. 验证直连恢复
+# 4. 验证直连恢复 (优先 Unix socket 探活，失败再走网关 https 端口 / 443)
 log_info "验证直连链路..."
-url_5667="https://127.0.0.1:5667/music/api/v1/search/track?keyword=test"
-url_443="https://127.0.0.1/music/api/v1/search/track?keyword=test"
+GW_HTTP_PORT=""
+GW_HTTPS_PORT=""
+read -r GW_HTTP_PORT GW_HTTPS_PORT <<< "$(get_fnos_gateway_ports)"
+log_info "fnOS 网关端口: http=${GW_HTTP_PORT} https=${GW_HTTPS_PORT}"
 
-verify_resp="$(curl -sk --max-time 5 "${url_5667}" 2>/dev/null || true)"
+verify_resp="$(curl -s --max-time 5 --unix-socket "${TARGET_SOCK}" "http://localhost/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
 if [ -z "${verify_resp}" ]; then
-    verify_resp="$(curl -skL --max-time 5 "${url_443}" 2>/dev/null || true)"
+    log_warn "socket 探测异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT})..."
+    verify_resp="$(curl -sk --max-time 5 "https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
+fi
+if [ -z "${verify_resp}" ]; then
+    verify_resp="$(curl -skL --max-time 5 "https://127.0.0.1/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
 fi
 
 if echo "${verify_resp}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
