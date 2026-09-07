@@ -11,6 +11,7 @@ from proxy.app import (
     _SEARCH_CACHE,
     fetch_lx_search,
     resolve_lx_url,
+    get_version,
 )
 
 
@@ -196,7 +197,7 @@ def test_ext_healthz_includes_lxmusic():
         rj = resp.json()
         assert rj["lxmusic"] == "ok"
         assert rj["ok"] is True
-        assert rj["version"] == "1.1.0"
+        assert rj["version"] == get_version()
 
 
 def test_ext_healthz_lxmusic_disabled(monkeypatch):
