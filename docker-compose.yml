@@ -1,6 +1,7 @@
 # 可选音源（至少启用一个）
 # musicdl: https://github.com/CharlesPikachu/musicdl
 # musicbox: https://github.com/darknessomi/musicbox
+# lxmusic:  洛雪音乐源（LX Music 风格免登录解析：酷狗/网易/咪咕）
 services:
   musicdl:
     build:
@@ -39,3 +40,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  lxmusic:
+    build:
+      context: ./lxmusic-service
+      dockerfile: Dockerfile
+    container_name: fnmusic-lxmusic
+    ports:
+      - "8772:8000"
+    environment:
+      - LX_SOURCES=kg,wy,mg
+      - LX_SEARCH_TIMEOUT=12
+      - LX_LIMIT_PER_SOURCE=20
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

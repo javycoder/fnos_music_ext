@@ -24,6 +24,14 @@ from pathlib import Path
 
 _LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
+# 第三音源 lxmusic（洛雪音乐源）默认配置：合并时自动识别并安全补齐
+LX_COMMENT = "洛雪音乐源 lxmusic（第三音源，宿主机端口 8772 -> 容器 8000）"
+LX_DEFAULTS: "list[tuple[str, str]]" = [
+    ("FNMUSIC_LX_ENABLED", "true"),
+    ("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
+]
+LX_PREFIX = "FNMUSIC_LX_"
+
 
 def escape_single_quoted(value: str) -> str:
     """转义 .env 单引号包裹值中的单引号（与 install.sh dotenv_escape 一致）。"""
@@ -112,11 +120,39 @@ def merge_env(
     return result, summary
 
 
-def render_env(kv: "list[tuple[str, str]]", header: str = "") -> str:
+def ensure_prefix_defaults(
+    kv: "list[tuple[str, str]]",
+    defaults: "list[tuple[str, str]]" = None,
+    prefix: str = LX_PREFIX,
+) -> "tuple[list[tuple[str, str]], list[str]]":
+    """自动识别并补齐指定前缀（默认 FNMUSIC_LX_*）的缺失配置项。
+
+    已存在的键一律不动（保留用户现有值，包括 false / 自定义 URL），
+    仅追加缺失键；返回 (新列表, 追加的键列表)。
+    """
+    if defaults is None:
+        defaults = LX_DEFAULTS
+    known = {k for k, _ in kv}
+    out = list(kv)
+    added: list[str] = []
+    for key, val in defaults:
+        if key.startswith(prefix) and key not in known:
+            out.append((key, val))
+            added.append(key)
+    return out, added
+
+
+def render_env(
+    kv: "list[tuple[str, str]]",
+    header: str = "",
+    comments: "dict[str, str] | None" = None,
+) -> str:
     lines = []
     if header:
         lines.append(f"# {header}")
     for key, val in kv:
+        if comments and key in comments:
+            lines.append(f"# {comments[key]}")
         lines.append(f"{key}={quote_env_value(val)}")
     return "\n".join(lines) + "\n"
 
@@ -155,7 +191,14 @@ def main(argv: "list[str] | None" = None) -> int:
     explicit = {k.strip() for k in args.explicit.split(",") if k.strip()}
     merged, summary = merge_env(existing_kv, desired_kv, explicit)
 
-    write_env_atomic(args.output, render_env(merged, args.header))
+    # 第三音源 FNMUSIC_LX_* 自动识别：缺失时安全补齐（带注释）
+    merged, lx_added = ensure_prefix_defaults(merged)
+    summary["added"].extend(lx_added)
+
+    write_env_atomic(
+        args.output,
+        render_env(merged, args.header, comments={k: LX_COMMENT for k, _ in LX_DEFAULTS}),
+    )
     if not args.quiet:
         for action in ("added", "updated", "preserved", "custom_kept"):
             keys = summary[action]
