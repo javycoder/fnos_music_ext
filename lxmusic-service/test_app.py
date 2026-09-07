@@ -123,6 +123,18 @@ def test_search_aggregates_sources():
                 },
             )
         if "migu.cn" in str(request.url):
+            if "player_get_song_info" in str(request.url):
+                assert request.url.params.get("copyrightId") == "600902"
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "play_url": "https://migu.test/600902.mp3",
+                            "format_type": "mp3",
+                            "fileSize": 8000000,
+                        }
+                    },
+                )
             assert request.url.params.get("text") == "晴天"
             return httpx.Response(
                 200,

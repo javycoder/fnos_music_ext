@@ -136,3 +136,132 @@ def test_run_musicbox_calls_ensure_xdg_dirs(monkeypatch):
     runner.run_musicbox(["version"])
     assert len(called) == 1
 
+
+def test_musicbox_search_filters_unplayable_songs(monkeypatch):
+    import netease_ext
+
+    # Mock CLI search output: 4 items (free, vip-no-url, trial, empty-url)
+    mock_search_data = {
+        "ok": True,
+        "data": [
+            {"song_id": 101, "song_name": "Free Song", "artist": "Singer", "quality": "exhigh"},
+            {"song_id": 102, "song_name": "VIP Song No URL", "artist": "Singer", "quality": "lossless"},
+            {"song_id": 103, "song_name": "Trial Snippet Song", "artist": "Singer", "quality": "standard"},
+            {"song_id": 104, "song_name": "Dead Song", "artist": "Singer", "quality": "standard"},
+        ],
+    }
+
+    def mock_run_musicbox(args, timeout=30.0):
+        import json
+        return 0, json.dumps(mock_search_data), ""
+
+    # Mock songs_url responses
+    def mock_songs_url(ids):
+        return [
+            {"id": 101, "url": "http://audio.126.net/101.mp3", "code": 200, "fee": 0, "freeTrialInfo": None},
+            {"id": 102, "url": None, "code": 404, "fee": 1, "freeTrialInfo": None},
+            {"id": 103, "url": "http://audio.126.net/103_trial.mp3", "code": 200, "fee": 1, "freeTrialInfo": {"start": 0, "end": 30}},
+            {"id": 104, "url": "", "code": 200, "fee": 0, "freeTrialInfo": None},
+        ]
+
+    class MockApi:
+        def songs_url(self, ids):
+            return mock_songs_url(ids)
+
+        def get_account_info(self):
+            return {"code": 200, "account": None, "profile": None}
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/search", params={"keyword": "test", "type": "song", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        # Only 101 is playable
+        assert len(data["data"]) == 1
+        assert data["data"][0]["song_id"] == 101
+
+
+def test_musicbox_songs_detail_filters_unplayable(monkeypatch):
+    import netease_ext
+
+    def mock_songs_detail(ids):
+        return [
+            {"id": 101, "name": "Free Song", "ar": [{"name": "A"}], "al": {"name": "Album", "picUrl": "http://img/1.jpg"}, "dt": 200000},
+            {"id": 102, "name": "VIP Song", "ar": [{"name": "A"}], "al": {"name": "Album", "picUrl": "http://img/2.jpg"}, "dt": 200000},
+            {"id": 103, "name": "Trial Song", "ar": [{"name": "A"}], "al": {"name": "Album", "picUrl": "http://img/3.jpg"}, "dt": 30000},
+        ]
+
+    def mock_songs_url(ids):
+        return [
+            {"id": 101, "url": "http://audio.126.net/101.mp3", "code": 200, "fee": 0, "freeTrialInfo": None},
+            {"id": 102, "url": None, "code": 404, "fee": 1, "freeTrialInfo": None},
+            {"id": 103, "url": "http://audio.126.net/103_trial.mp3", "code": 200, "fee": 1, "freeTrialInfo": {"start": 0, "end": 30}},
+        ]
+
+    class MockApi:
+        def songs_detail(self, ids):
+            return mock_songs_detail(ids)
+
+        def songs_url(self, ids):
+            return mock_songs_url(ids)
+
+        def get_account_info(self):
+            return {"code": 200, "account": None, "profile": None}
+
+    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/songs/detail", params={"ids": "101,102,103"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        # Only 101 is returned
+        assert len(data["data"]) == 1
+        assert data["data"][0]["song_id"] == 101
+
+
+def test_musicbox_search_logged_in_vip_playable(monkeypatch):
+    import netease_ext
+
+    mock_search_data = {
+        "ok": True,
+        "data": [
+            {"song_id": 201, "song_name": "VIP Song With Perm", "artist": "Singer", "quality": "lossless"},
+            {"song_id": 202, "song_name": "Paid Album Without Perm", "artist": "Singer", "quality": "lossless"},
+        ],
+    }
+
+    def mock_run_musicbox(args, timeout=30.0):
+        import json
+        return 0, json.dumps(mock_search_data), ""
+
+    def mock_songs_url(ids):
+        return [
+            # 201 has full valid url and no trial
+            {"id": 201, "url": "http://audio.126.net/vip_full.mp3", "code": 200, "fee": 1, "freeTrialInfo": None},
+            # 202 has no url (account didn't buy album)
+            {"id": 202, "url": None, "code": 404, "fee": 4, "freeTrialInfo": None},
+        ]
+
+    class MockApi:
+        def songs_url(self, ids):
+            return mock_songs_url(ids)
+
+        def get_account_info(self):
+            # Logged in
+            return {"code": 200, "account": {"id": 12345}, "profile": {"nickname": "VIPUser"}}
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/search", params={"keyword": "test", "type": "song", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["data"]) == 1
+        assert data["data"][0]["song_id"] == 201
+
+

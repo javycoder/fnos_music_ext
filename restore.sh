@@ -211,7 +211,10 @@ fi
 # 6. full 模式额外清理音源
 if [ "${FULL_RESTORE}" -eq 1 ]; then
     log_info "(--full 模式) 停止并移除音源容器与宿主机 unit..."
-    run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>/dev/null || true
+    rm_out=""
+    if ! rm_out="$(run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>&1)"; then
+        log_warn "音源容器移除出现错误（可能部分未删除）: ${rm_out}"
+    fi
     if [ -f "${BASE_DIR}/docker-compose.yml" ]; then
         (cd "${BASE_DIR}" && run_docker compose -f docker-compose.yml down --remove-orphans 2>/dev/null) || true
     fi
@@ -221,7 +224,19 @@ if [ "${FULL_RESTORE}" -eq 1 ]; then
             sudo rm -f "/etc/systemd/system/${unit}.service"
         fi
     done
-    log_info "musicdl / musicbox / lxmusic 已停止并清理 unit。"
+    # 如实校验清理结果：容器可能被其他副本/并发任务重建，绝不静默假成功
+    leftover=""
+    for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+        if run_docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${unit}"; then
+            leftover="${leftover} ${unit}"
+        fi
+    done
+    if [ -n "${leftover}" ]; then
+        log_warn "以下容器仍存在（可能刚被其他副本或并发任务重建）:${leftover}"
+        log_warn "如需彻底清理，请手动执行: docker rm -f${leftover}"
+    else
+        log_info "musicdl / musicbox / lxmusic 容器与宿主机 unit 已清理完毕。"
+    fi
 else
     log_info "默认保留音源容器/unit 与 cache/ 目录。"
 fi

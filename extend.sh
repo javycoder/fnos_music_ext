@@ -150,6 +150,21 @@ run_docker() {
     fi
 }
 
+# 容器名全局固定（fnmusic-*）；若被其他副本/并发任务的容器占用，移除后由当前目录接管
+reclaim_container() {
+    local name="$1" owner=""
+    if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
+        return 0
+    fi
+    owner="$(run_docker container inspect "${name}" \
+        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    log_info "检测到同名容器 ${name}（来自 ${owner:-未知目录}），移除后由当前目录接管..."
+    if ! run_docker rm -f "${name}"; then
+        log_err "无法移除同名容器 ${name}，请手动执行: docker rm -f ${name}"
+        return 1
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 回滚函数 (restore 逻辑)
 # ------------------------------------------------------------------------------
@@ -409,6 +424,7 @@ ensure_source() {
         fi
     fi
     if [ "${mode}" = "docker" ]; then
+        reclaim_container "fnmusic-${name}" || return 1
         run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || true
     else
         if systemctl list-unit-files "${unit}" >/dev/null 2>&1; then

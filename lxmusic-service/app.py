@@ -181,13 +181,23 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         if not fhash:
             continue
 
-        # 可播放性过滤：pay_type != 0 表示收费/VIP 曲目，跳过不返回
+        # 可播放性过滤：
+        # 1. pay_type != 0 表示收费/VIP 曲目，坚决不返回
         pay_type = int(it.get("pay_type") or 0)
         if pay_type != 0:
+            continue
+        # 2. 凡需购买或包月曲目，排除
+        if int(it.get("pkg_price") or 0) != 0 or int(it.get("price") or 0) != 0:
+            continue
+        # 3. 排除仅免费试听片段标记 (is_free_part=1) 及 VIP 拦截 (fail_process=4)
+        if int(it.get("is_free_part") or 0) != 0 or int(it.get("fail_process") or 0) == 4:
             continue
 
         singer = str(it.get("singername") or "")
         title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "")
+        # 4. 标题带有试听片段标记的坚决不返回
+        if any(marker in title for marker in ("(试听)", "（试听）", "试听片段", "片段试听", "试听版")):
+            continue
         sq = str(it.get("sqhash") or "")
         hq = str(it.get("hqhash") or "")
         duration_ms = int(it.get("duration") or 0)  # v3 接口 duration 为毫秒
@@ -367,6 +377,26 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         if fee not in (0, 8):
             continue
 
+        # 排除无版权
+        if it.get("noCopyrightRcmd") is not None and it.get("noCopyrightRcmd") != 0:
+            continue
+
+        # 检查 privilege 状态
+        priv = it.get("privilege")
+        if isinstance(priv, dict):
+            priv_fee = int(priv.get("fee", fee))
+            if priv_fee not in (0, 8):
+                continue
+            if int(priv.get("pl") or 0) <= 0 and int(priv.get("st") or 0) < 0:
+                continue
+            if priv.get("freeTrialPrivilege") and priv.get("freeTrialPrivilege", {}).get("cannotListenReason"):
+                continue
+
+        title = str(it.get("name") or "")
+        # 排除标题含试听片段标记
+        if any(marker in title for marker in ("(试听)", "（试听）", "试听片段", "片段试听", "试听版")):
+            continue
+
         artists = it.get("artists") or []
         artist = " / ".join(
             str(a.get("name") or "") for a in artists if isinstance(a, dict)
@@ -464,21 +494,29 @@ async def wy_resolve_lyric(client: httpx.AsyncClient, identifier: str) -> str:
 # ------------------------------------------------------------------ 咪咕 mg ---
 
 async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+    fetch_size = max(limit * 2, 10)
     r = await client.get(
         "https://c.music.migu.cn/MIGUM2.0/v1.0/content/search_all.do",
-        params={"text": keyword, "pageNo": 1, "pageSize": max(limit, 5), "resource": 1},
+        params={"text": keyword, "pageNo": 1, "pageSize": fetch_size, "resource": 1},
         headers={"User-Agent": UA_MOBILE, "Referer": "https://m.music.migu.cn/"},
     )
     r.raise_for_status()
     data = r.json() or {}
     raw = data.get("songs") or (data.get("songResultData") or {}).get("result") or []
-    items = []
-    for it in raw:
+
+    async def _probe_one(it: dict) -> dict | None:
         if not isinstance(it, dict):
-            continue
+            return None
         cid = str(it.get("copyrightId") or it.get("id") or "")
         if not cid:
-            continue
+            return None
+        title = str(it.get("songName") or "")
+        if any(marker in title for marker in ("(试听)", "（试听）", "试听片段", "片段试听", "试听版")):
+            return None
+        # 排除解析失败、无法直链播放的曲目
+        url_info = await mg_resolve_url(client, cid, "E")
+        if not url_info or not url_info.get("url"):
+            return None
         singers = it.get("singers") or []
         artist = " / ".join(str(s.get("name") or "") for s in singers if isinstance(s, dict))
         album = it.get("albums") or []
@@ -490,19 +528,28 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         item = {
             "id": f"lx:mg:{cid}",
             "lx_source": "mg",
-            "title": str(it.get("songName") or ""),
+            "title": title,
             "artist": artist,
             "album": album_name,
             "duration_s": length_ms / 1000.0,
             "ext": "flac" if tones & {"SQ", "ZQ", "ZQ24"} else "mp3",
             "cover_url": cover,
-            "file_size": 0,
+            "file_size": int(url_info.get("file_size") or 0),
             "lyric": "",
             "lrc_url": str(it.get("lrcUrl") or ""),
             "copyright_id": cid,
         }
         _cache_put(item)
-        items.append(item)
+        return item
+
+    candidates = [it for it in raw if isinstance(it, dict)]
+    probed = await asyncio.gather(*[_probe_one(it) for it in candidates[:fetch_size]], return_exceptions=True)
+    items = []
+    for res in probed:
+        if isinstance(res, dict):
+            items.append(res)
+            if len(items) >= limit:
+                break
     return items
 
 

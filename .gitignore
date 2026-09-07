@@ -27,3 +27,4 @@ __pycache__/
 **/.git.nested/
 TASK_*.md
 .tasks_archive/
+.cursor/
