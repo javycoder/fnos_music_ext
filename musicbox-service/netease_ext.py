@@ -13,6 +13,9 @@ def _get_api():
     if _api_instance is None:
         with _api_lock:
             if _api_instance is None:
+                from runner import ensure_xdg_dirs
+
+                ensure_xdg_dirs()
                 from NEMbox.api import NetEase
 
                 _api_instance = NetEase()
