@@ -65,17 +65,38 @@ class SearchCache:
 
 
 class SourceBreaker:
-    """单个音源的熔断器（连续失败达到阈值开启熔断，cooldown 后自动半开/关闭）。"""
+    """单个音源的熔断器（连续失败达到阈值开启熔断，cooldown 后自动半开/关闭）。
 
-    def __init__(self, failure_threshold: int = 4, cooldown: int = 120) -> None:
+    可选慢响应降级：配置 slow_threshold_s 后，耗时超过该阈值的"成功"响应
+    也计入连续失败，持续慢的源最终会被熔断，避免长期拖慢全局搜索。
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 4,
+        cooldown: int = 120,
+        slow_threshold_s: Optional[float] = None,
+    ) -> None:
         self.failure_threshold = failure_threshold
         self.cooldown = cooldown
+        self.slow_threshold_s = slow_threshold_s
         self._failures: dict[str, int] = {}
         self._opened_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def record_success(self, source: str) -> None:
+    def record_success(self, source: str, latency: Optional[float] = None) -> None:
         with self._lock:
+            if (
+                self.slow_threshold_s is not None
+                and latency is not None
+                and latency > self.slow_threshold_s
+            ):
+                # 慢成功视为降级信号：计入失败而不是重置
+                count = self._failures.get(source, 0) + 1
+                self._failures[source] = count
+                if count >= self.failure_threshold and source not in self._opened_at:
+                    self._opened_at[source] = time.time()
+                return
             self._failures[source] = 0
             self._opened_at.pop(source, None)
 
@@ -113,6 +134,64 @@ class SourceBreaker:
                 self._failures[src] = 0
                 self._opened_at.pop(src, None)
             return sorted(open_list)
+
+
+class AdaptiveTimeout:
+    """单源自适应超时：连续超时/慢响应的源逐步收紧超时，成功后逐步恢复。
+
+    - 超时或慢响应一次：penalty *= shrink_factor（超时被压到 min_timeout 下限）
+    - 正常成功一次：penalty *= recover_factor（逐步回到 base_timeout）
+    目的：慢源每次阻塞的时间越来越短，直至触发 SourceBreaker 熔断。
+    """
+
+    def __init__(
+        self,
+        base_timeout: float = 12.0,
+        min_timeout: float = 3.0,
+        shrink_factor: float = 0.6,
+        recover_factor: float = 1.25,
+        slow_latency: float = 8.0,
+    ) -> None:
+        self.base_timeout = base_timeout
+        self.min_timeout = min_timeout
+        self.shrink_factor = shrink_factor
+        self.recover_factor = recover_factor
+        self.slow_latency = slow_latency
+        self._penalty: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def _floor(self) -> float:
+        return self.min_timeout / self.base_timeout if self.base_timeout > 0 else 0.0
+
+    def timeout_for(self, source: str) -> float:
+        with self._lock:
+            return max(self.min_timeout, self.base_timeout * self._penalty.get(source, 1.0))
+
+    def record_success(self, source: str, latency: float = 0.0) -> None:
+        with self._lock:
+            penalty = self._penalty.get(source)
+            if latency > 0 and latency > self.slow_latency:
+                new = (penalty if penalty is not None else 1.0) * self.shrink_factor
+            elif penalty is not None:
+                new = min(1.0, penalty * self.recover_factor)
+            else:
+                return
+            self._penalty[source] = max(self._floor(), min(1.0, new))
+
+    def record_failure(self, source: str) -> None:
+        with self._lock:
+            cur = self._penalty.get(source, 1.0)
+            self._penalty[source] = max(self._floor(), cur * self.shrink_factor)
+
+    def stats(self) -> dict[str, dict[str, float]]:
+        with self._lock:
+            return {
+                src: {
+                    "timeout": round(max(self.min_timeout, self.base_timeout * p), 2),
+                    "penalty": round(p, 3),
+                }
+                for src, p in sorted(self._penalty.items())
+            }
 
 
 class SingleFlight:

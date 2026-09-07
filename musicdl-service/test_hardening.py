@@ -9,7 +9,7 @@ import pytest
 # 确保能 import 同目录下的 hardening
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hardening import SearchCache, SourceBreaker, SingleFlight
+from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight
 
 
 class TestSearchCache:
@@ -222,6 +222,86 @@ class TestSourceBreaker:
             t.join()
 
         assert not errors
+
+    def test_breaker_slow_success_degradation(self):
+        """慢成功（超过 slow_threshold_s）计入失败，持续慢源被熔断。"""
+        breaker = SourceBreaker(failure_threshold=3, cooldown=60, slow_threshold_s=5.0)
+        breaker.record_success("kuwo", latency=6.0)
+        breaker.record_success("kuwo", latency=7.0)
+        assert not breaker.is_open("kuwo")
+
+        # 第 3 次慢成功触发熔断
+        breaker.record_success("kuwo", latency=6.5)
+        assert breaker.is_open("kuwo")
+
+        # 其他源不受影响
+        assert not breaker.is_open("migu")
+
+    def test_breaker_fast_success_resets_slow_streak(self):
+        breaker = SourceBreaker(failure_threshold=3, cooldown=60, slow_threshold_s=5.0)
+        breaker.record_success("kuwo", latency=6.0)
+        breaker.record_success("kuwo", latency=6.0)
+        # 一次快速成功重置计数
+        breaker.record_success("kuwo", latency=1.0)
+        breaker.record_success("kuwo", latency=6.0)
+        assert not breaker.is_open("kuwo")
+
+    def test_breaker_slow_degradation_disabled_by_default(self):
+        """未配置 slow_threshold_s 时，慢成功依旧重置计数（向后兼容）。"""
+        breaker = SourceBreaker(failure_threshold=2, cooldown=60)
+        for _ in range(10):
+            breaker.record_success("kuwo", latency=999.0)
+        assert not breaker.is_open("kuwo")
+
+
+class TestAdaptiveTimeout:
+    def test_initial_timeout_is_base(self):
+        at = AdaptiveTimeout(base_timeout=12.0, min_timeout=3.0)
+        assert at.timeout_for("kuwo") == 12.0
+        assert at.stats() == {}
+
+    def test_timeout_shrinks_on_failures(self):
+        at = AdaptiveTimeout(base_timeout=12.0, min_timeout=3.0, shrink_factor=0.6)
+        at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(12.0 * 0.6)
+        at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(12.0 * 0.36)
+
+    def test_timeout_has_floor(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=3.0, shrink_factor=0.5)
+        for _ in range(10):
+            at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(3.0)
+
+    def test_timeout_recovers_after_successes(self):
+        at = AdaptiveTimeout(
+            base_timeout=10.0, min_timeout=2.0, shrink_factor=0.5, recover_factor=2.0
+        )
+        at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(5.0)
+        at.record_success("migu", latency=0.5)
+        assert at.timeout_for("migu") == pytest.approx(10.0)
+
+    def test_slow_success_shrinks_timeout(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=2.0, slow_latency=5.0, shrink_factor=0.5)
+        at.record_success("kuwo", latency=6.0)
+        assert at.timeout_for("kuwo") == pytest.approx(5.0)
+        # 快速成功不影响未降级的源
+        at.record_success("migu", latency=0.5)
+        assert at.timeout_for("migu") == pytest.approx(10.0)
+
+    def test_sources_are_isolated(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=2.0, shrink_factor=0.5)
+        at.record_failure("kuwo")
+        at.record_failure("kuwo")
+        assert at.timeout_for("migu") == pytest.approx(10.0)
+
+    def test_stats_reflects_penalty(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=2.0, shrink_factor=0.5)
+        at.record_failure("kuwo")
+        stats = at.stats()
+        assert stats["kuwo"]["timeout"] == pytest.approx(5.0)
+        assert stats["kuwo"]["penalty"] == pytest.approx(0.5)
 
 
 class TestSingleFlight:

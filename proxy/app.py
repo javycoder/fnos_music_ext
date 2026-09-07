@@ -29,8 +29,10 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
+    from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -1248,7 +1250,7 @@ def _conf_log_value(key: str, value: Any) -> Any:
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
-    logger.info("=== fnmusic-ext configuration ===")
+    logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
@@ -1347,6 +1349,7 @@ async def ext_healthz(request: Request):
 
     return {
         "ok": upstream_status == "ok" and source_ok,
+        "version": get_version(),
         "upstream": upstream_status,
         "musicdl": musicdl_status,
         "musicbox": musicbox_status,
