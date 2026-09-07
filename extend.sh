@@ -13,6 +13,11 @@ UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
 
+if [ "${1:-}" = "--qr" ]; then
+    curl -s "${MUSICBOX_URL}/api/v1/auth/login/qr" || true
+    exit 0
+fi
+
 log_info() {
     echo -e "\033[32m[INFO]\033[0m $*"
 }
@@ -305,6 +310,10 @@ if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
     fi
 fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/netease-musicbox"
+    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     if ! ensure_source "musicbox" "${MUSICBOX_URL}" "musicbox" "fnmusic-musicbox.service"; then
         exit 1
     fi
@@ -417,8 +426,11 @@ log_info "   打开飞牛音乐 Web 端或手机 App，搜索歌曲（如“晴�
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "2. 网易云扫码登录（可选）："
-    log_info "   若遇到部分网易云 VIP/无损歌曲需登录，可访问："
-    log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 使用网易云 App 扫码登录。"
+    log_info "   若遇到部分网易云 VIP/无损歌曲需登录："
+    log_info "   • 命令行终端直接扫码: curl -s http://127.0.0.1:8770/api/v1/auth/login/qr"
+    log_info "     （或执行 ./extend.sh --qr 快速显示）"
+    log_info "   • 浏览器图片扫码: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+    log_info "   • 查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"

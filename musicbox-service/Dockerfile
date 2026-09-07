@@ -10,8 +10,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN useradd -m -u 1000 appuser \
-    && mkdir -p /data /data/cache /data/config \
-    && chown -R appuser:appuser /data /app
+    && mkdir -p /data /data/cache/netease-musicbox /data/config/netease-musicbox /data/netease-musicbox \
+    && chown -R appuser:appuser /data /app \
+    && chmod -R 777 /data
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt

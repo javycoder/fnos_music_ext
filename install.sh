@@ -50,6 +50,7 @@ usage() {
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名，默认 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
+  --qr                   在终端展示网易云登录二维码
   -h, --help             显示帮助
 
 密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
@@ -106,6 +107,10 @@ while [ $# -gt 0 ]; do
         --llm-api-key) LLM_API_KEY="${2:-}"; shift 2 ;;
         --llm-model) LLM_MODEL="${2:-}"; shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
+        --qr)
+            curl -s http://127.0.0.1:8770/api/v1/auth/login/qr || true
+            exit 0
+            ;;
         -h|--help) usage; exit 0 ;;
         *) log_err "未知参数: $1"; usage; exit 1 ;;
     esac
@@ -291,8 +296,11 @@ log_info "音源:${SELECTED}"
 log_info "每日推荐: ${ENABLE_RECOMMEND}"
 log_info "项目目录: ${BASE_DIR}"
 
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" "${BASE_DIR}/musicbox-data"
-chmod 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+    "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+    "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+    "${BASE_DIR}/musicbox-data/netease-musicbox"
+chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
 
 MUSICDL_FLAG="false"
 MUSICBOX_FLAG="false"
@@ -414,6 +422,10 @@ install_musicbox_docker() {
         log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
         return 1
     fi
+    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/netease-musicbox"
+    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
     docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
     if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
@@ -426,7 +438,10 @@ install_musicbox_docker() {
 
 install_musicbox_host() {
     log_info "宿主机安装 musicbox 服务（pip 包来自 ${MUSICBOX_REPO}）..."
-    mkdir -p "${BASE_DIR}/musicbox-data/cache" "${BASE_DIR}/musicbox-data/config"
+    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/netease-musicbox"
+    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     if [ ! -x "${BASE_DIR}/.venv-musicbox/bin/python" ]; then
         python3 -m venv "${BASE_DIR}/.venv-musicbox"
     fi
@@ -503,8 +518,11 @@ log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌�
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "3. 网易云扫码登录（可选）："
-    log_info "   部分网易云 VIP/无损歌曲需要账号凭证，可在局域网浏览器中访问："
-    log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 扫码登录即可。"
+    log_info "   部分网易云 VIP/无损歌曲需要账号凭证："
+    log_info "   • 终端直接扫码（推荐）: curl -s http://127.0.0.1:8770/api/v1/auth/login/qr"
+    log_info "     （或在终端运行 ./install.sh --qr 或 ./extend.sh --qr 查看）"
+    log_info "   • 局域网浏览器图片: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+    log_info "   • 检查登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     log_info "4. 大模型每日推荐："
