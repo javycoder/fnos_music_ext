@@ -14,12 +14,14 @@
 2. 禁止 patch trim-music 官方二进制，禁止写入官方 music.db（只读读取 play_history 进行口味分析可以）。
 3. 禁止把 API Key、密码、token 写进源码、测试、README、commit、issue 或 echo 打印到终端日志。所有密钥仅保存在仓库根目录 .env（文件权限 chmod 600）。
 4. 绝对禁止擅自安装 Docker 引擎：fnOS 的 Docker 必须在「应用中心」由系统管理员安装。若环境未安装 Docker，必须选用 Host 宿主机模式，严禁执行 apt-get install docker 等命令。
-5. 核心代理运行原则：无论选择 Docker 模式还是 Host 模式，核心代理服务（fnmusic-ext）都必须由宿主机 systemd（运行在项目根目录 .venv-proxy 独立虚拟环境中）原生管理，负责无侵入接管 /var/run/trim_music.socket。两种模式的区别仅在于「音源服务（musicdl / musicbox）」以何种方式运行与隔离。
+5. 核心代理运行原则：无论选择 Docker 模式还是 Host 模式，核心代理服务（fnmusic-ext）都必须由宿主机 systemd（运行在项目根目录 .venv-proxy 独立虚拟环境中）原生管理，负责无侵入接管 /var/run/trim_music.socket。两种模式的区别仅在于「音源服务（musicdl / musicbox / lxmusic）」以何种方式运行与隔离。
 6. 一键扩展 ./extend.sh 与一键还原 ./restore.sh（含彻底清理 ./restore.sh --full）必须始终保持可用；扩展失败必须安全秒级回滚到官方直连。
 7. 音源组件与端口规划：
-   - musicdl: https://github.com/CharlesPikachu/musicdl（负责酷我/咪咕聚合搜索与直链解析，服务仅监听本地 127.0.0.1:8768 本地回环，不对外暴露）。
-   - musicbox: https://github.com/darknessomi/musicbox（负责网易云高品质解析，Docker 模式下映射 0.0.0.0:8770 绑定所有网络接口，以便局域网内用手机访问 http://<NAS-IP>:8770/api/v1/auth/login/qr.png 进行网易云 App 扫码登录；核心代理内部通过 127.0.0.1:8770 调用；登录凭证持久化隔离在 musicbox-data/）。
-   - 音源可多选、至少选一个。用户未指定时非交互默认仅 musicdl；用户需要网易云或双音源时使用 --sources musicdl,musicbox 或 --sources musicbox。
+   - musicdl: https://github.com/CharlesPikachu/musicdl（酷我/咪咕聚合，127.0.0.1:8768）。
+   - musicbox: https://github.com/darknessomi/musicbox（网易云；Docker/Host 均可映射 0.0.0.0:8770 便于局域网扫码 http://<NAS-IP>:8770/api/v1/auth/login/qr.png；凭证在 musicbox-data/）。
+   - lxmusic: 洛雪风格免登录解析（酷狗/网易/咪咕），127.0.0.1:8772。
+   - 音源可多选、至少选一个（1=musicbox, 2=musicdl, 3=lxmusic）。非交互默认仅 musicdl；三源示例 --sources musicdl,musicbox,lxmusic 或 --sources=1,2,3。
+   - 安装写入 FNMUSIC_DEPLOY_MODE；重装改源会停用未选项；install --extend 会带 --force 重载代理配置。
 
 【自动化部署执行步骤】
 
@@ -35,18 +37,19 @@
   4. Docker / Host 模式决策：
      - 运行 command -v docker 检测 Docker 环境：
        * 若已安装 Docker：采用 --mode docker（推荐，音源在 compose 轻量无特权容器中运行，隔离最彻底）。
-       * 若未安装 Docker：采用 --mode host（使用项目内独立的 .venv-musicdl / .venv-musicbox 虚拟环境运行并注册为 systemd 服务，纯净轻量，零全局依赖污染；切勿擅自安装 Docker）。
+       * 若未安装 Docker：采用 --mode host（使用项目内独立的 .venv-musicdl / .venv-musicbox / .venv-lxmusic 虚拟环境运行并注册为 systemd 服务，纯净轻量，零全局依赖污染；切勿擅自安装 Docker）。
 
 步骤 3：执行安装与一步到位启用（--extend）
 推荐使用 --extend 参数，让 install.sh 在依赖就绪、服务配置完成后自动调用 ./extend.sh 进行 Unix Domain Socket 接管与端到端验收自检，实现安装+接管一步到位：
-  - Docker 模式（推荐，双音源一步到位）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox --extend
-  - Docker 模式（单音源）：
+  - Docker 模式（推荐，三音源一步到位）：
+    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic --extend
+  - Docker 模式（单音源 / 仅洛雪）：
     ./install.sh --non-interactive --mode docker --sources musicdl --extend
-  - Host 模式（宿主机独立 venv，双音源一步到位）：
-    ./install.sh --non-interactive --mode host --sources musicdl,musicbox --extend
+    ./install.sh --non-interactive --mode docker --sources lxmusic --extend
+  - Host 模式（宿主机独立 venv）：
+    ./install.sh --non-interactive --mode host --sources musicdl,musicbox,lxmusic --extend
   - 若用户提供了 OpenAI 兼容的 Base URL 与 API Key，则追加大模型参数（密钥仅写入 .env，禁止 echo 到日志）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox \
+    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic \
       --enable-recommend \
       --llm-base-url '<用户提供的 URL>' \
       --llm-api-key '<用户提供的 KEY>' \
@@ -77,7 +80,7 @@
 【完成汇报规范】
 任务完成后用简短中文输出总结，内容包含：
 1. 部署模式判断（Docker 模式或 Host 模式，及环境预检依据）；
-2. 启用的音源与端口说明（musicdl: 127.0.0.1:8768，musicbox: 0.0.0.0:8770 局域网扫码地址）；
+2. 启用的音源与端口说明（musicdl: 127.0.0.1:8768，musicbox: 0.0.0.0:8770，lxmusic: 127.0.0.1:8772）；
 3. 每日推荐是否开启（严禁复述敏感密钥）；
 4. healthz 接口探测响应 JSON；
 5. extend 链路接管与验收状态。

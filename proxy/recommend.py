@@ -548,6 +548,8 @@ async def _search_keyword(
     musicdl_client: httpx.AsyncClient | None,
     musicbox_client: httpx.AsyncClient | None,
     netease_enabled: bool,
+    lx_client: httpx.AsyncClient | None = None,
+    lx_enabled: bool = False,
 ) -> list[dict]:
     async def _mb() -> list[dict]:
         if not (netease_enabled and musicbox_client):
@@ -609,7 +611,44 @@ async def _search_keyword(
             logger.debug("musicdl recommend search failed: %s", e)
             return []
 
-    jobs = [asyncio.create_task(coro) for coro in (_mb(), _mdl())]
+    async def _lx() -> list[dict]:
+        if not (lx_enabled and lx_client):
+            return []
+        try:
+            r = await lx_client.get(
+                "/api/v1/search",
+                params={"keyword": keyword, "limit": 5},
+                timeout=8.0,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            rows = data.get("items") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                return []
+            out: list[dict] = []
+            for it in rows:
+                if not isinstance(it, dict):
+                    continue
+                tid = str(it.get("id") or "")
+                if not tid:
+                    continue
+                out.append({
+                    "id": tid if tid.startswith("lx:") else f"lx:{tid}",
+                    "source": "lx",
+                    "title": str(it.get("title") or it.get("name") or ""),
+                    "artist": str(it.get("artist") or ""),
+                    "album": str(it.get("album") or ""),
+                    "duration_s": float(it.get("duration_s") or 0) or 0,
+                    "ext": str(it.get("ext") or "mp3") or "mp3",
+                    "cover_url": str(it.get("cover_url") or ""),
+                })
+            return out
+        except Exception as e:
+            logger.debug("lxmusic recommend search failed: %s", e)
+            return []
+
+    jobs = [asyncio.create_task(coro) for coro in (_mb(), _mdl(), _lx())]
     try:
         for fut in asyncio.as_completed(jobs):
             try:
@@ -634,6 +673,8 @@ async def resolve_recommendations(
     limit: int = PLAYLIST_SIZE,
     exclude_guids: set[str] | None = None,
     exclude_ta: set[tuple[str, str]] | None = None,
+    lx_client: httpx.AsyncClient | None = None,
+    lx_enabled: bool = False,
 ) -> list[dict]:
     """把候选歌名检索成可播放的在线 Track，跳过已收藏，凑满 limit 首。"""
     skip_ids = set(exclude_guids or ())
@@ -654,10 +695,16 @@ async def resolve_recommendations(
         artist = rec.get("artist") or ""
         keyword = " ".join(x for x in (artist, title) if x).strip() or title
         async with sem:
-            items = await _search_keyword(keyword, musicdl_client, musicbox_client, netease_enabled)
+            items = await _search_keyword(
+                keyword, musicdl_client, musicbox_client, netease_enabled,
+                lx_client=lx_client, lx_enabled=lx_enabled,
+            )
         if not items and artist:
             async with sem:
-                items = await _search_keyword(artist, musicdl_client, musicbox_client, netease_enabled)
+                items = await _search_keyword(
+                    artist, musicdl_client, musicbox_client, netease_enabled,
+                    lx_client=lx_client, lx_enabled=lx_enabled,
+                )
         if not items:
             return []
         ranked = sorted(items, key=lambda it: _match_score(it, title, artist), reverse=True)
@@ -925,6 +972,8 @@ async def get_or_build_daily(
     netease_enabled: bool,
     extra_seeds: list[dict] | None = None,
     favorite_items: list[dict] | None = None,
+    lx_client: httpx.AsyncClient | None = None,
+    lx_enabled: bool = False,
 ) -> dict:
     day = today_key()
     guid = daily_playlist_guid(day, user_guid)
@@ -978,6 +1027,7 @@ async def get_or_build_daily(
         return await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
+            lx_client=lx_client, lx_enabled=lx_enabled,
         )
 
     async def from_fallback() -> list[dict]:
@@ -985,30 +1035,27 @@ async def get_or_build_daily(
         return await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
+            lx_client=lx_client, lx_enabled=lx_enabled,
         )
 
     tracks = list(existing)
-    jobs = [asyncio.create_task(from_fallback())]
-    if llm_http is not None and llm_enabled():
-        jobs.append(asyncio.create_task(from_llm()))
     t0 = time.monotonic()
-    try:
-        for fut in asyncio.as_completed(jobs):
-            remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
-            if remaining <= 0:
-                break
-            try:
-                chunk = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.debug("daily recommend branch failed: %s", e)
-                continue
+    remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
+    # 启用 LLM 时优先走大模型；失败/超时/不足 20 首再用 fallback 补齐
+    if llm_http is not None and llm_enabled() and remaining > 0 and len(tracks) < PLAYLIST_SIZE:
+        try:
+            chunk = await asyncio.wait_for(from_llm(), timeout=max(remaining, 0.1))
             tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
-            if len(tracks) >= PLAYLIST_SIZE:
-                break
-    finally:
-        for t in jobs:
-            if not t.done():
-                t.cancel()
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.debug("daily recommend llm branch failed: %s", e)
+
+    remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
+    if len(tracks) < PLAYLIST_SIZE and remaining > 0:
+        try:
+            chunk = await asyncio.wait_for(from_fallback(), timeout=max(remaining, 0.1))
+            tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.debug("daily recommend fallback branch failed: %s", e)
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
     cover_id = tracks[0].get("coverId") or tracks[0].get("guid") if tracks else guid

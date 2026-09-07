@@ -373,3 +373,46 @@ def test_lyric_list_from_lxmusic():
         assert track["guid"] == "online:lx:kg:ABCDEF1234567890"
         assert track["title"] == "晴天"
         assert track["audioSpec"]["format"] == "flac"
+
+
+def test_search_without_netease_merges_lx_and_musicdl(monkeypatch):
+    """无 NetEase 时前台 wait/gather 必须正确合并 musicdl + lx（回归 gather 解包 bug）。"""
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "netease_wait_s", 0.5)
+    monkeypatch.setitem(CONF, "search_timeout", 4.0)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if "search/track" in request.url.path:
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"list": [{"guid": "local-1", "title": "本地晴天"}], "total": 1}},
+            )
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    def mdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            return httpx.Response(
+                200,
+                json={"items": [{"id": "migu:1", "source": "migu", "title": "晴天", "artist": "周杰伦", "duration_s": 200, "ext": "mp3"}]},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream_handler), base_url="http://unix")
+    app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(mdl_handler), base_url="http://127.0.0.1:8768")
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(500)),
+        base_url="http://127.0.0.1:8770",
+    )
+    app.state.lx_client = httpx.AsyncClient(transport=httpx.MockTransport(_lx_handler_factory()), base_url="http://127.0.0.1:8772")
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/search/track", params={"keyword": "晴天", "page": 1, "size": 50})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("code") == 0
+        guids = [str(x.get("guid")) for x in (body.get("data") or {}).get("list") or []]
+        assert "local-1" in guids
+        assert any(g.startswith("online:lx:") for g in guids)
+        assert any("migu" in g for g in guids)

@@ -47,7 +47,7 @@ services:
       dockerfile: Dockerfile
     container_name: fnmusic-lxmusic
     ports:
-      - "8772:8000"
+      - "127.0.0.1:8772:8000"
     environment:
       - LX_SOURCES=kg,wy,mg
       - LX_SEARCH_TIMEOUT=12
