@@ -143,11 +143,91 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
     _SEARCH_CACHE[keyword] = entry
 
 
+ONLINE_TRIAL_MARKERS = (
+    "(试听)",
+    "（试听）",
+    "试听片段",
+    "片段试听",
+    "试听版",
+    "[试听]",
+    "【试听】",
+    "- 试听",
+    " - 试听",
+)
+
+
+def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
+    """最终防线校验：过滤无音频流或试听标记的不可播曲目。"""
+    if not isinstance(item, dict):
+        return False
+
+    title = str(item.get("title") or item.get("name") or item.get("song_name") or "").strip()
+    if not title:
+        return False
+
+    if require_id:
+        sid = str(item.get("id") or item.get("song_id") or item.get("guid") or "").strip()
+        if not sid:
+            return False
+
+    # 1. 标题含试听标记
+    if any(marker in title for marker in ONLINE_TRIAL_MARKERS):
+        return False
+
+    # 2. 字段试听标记
+    if item.get("is_trial") is True or item.get("freeTrialInfo") or item.get("freeTrialPrivilege"):
+        return False
+    if int(item.get("is_free_part") or 0) != 0 or int(item.get("fail_process") or 0) == 4:
+        return False
+
+    # 3. 收费/VIP 拦截
+    if int(item.get("pay_type") or 0) != 0:
+        return False
+    if int(item.get("pkg_price") or 0) != 0 or int(item.get("price") or 0) != 0:
+        return False
+    fee = item.get("fee")
+    if fee is not None:
+        try:
+            if int(fee) not in (0, 8):
+                return False
+        except (ValueError, TypeError):
+            pass
+
+    # 4. 显式不可播/无流标记
+    if item.get("unplayable") is True or item.get("playable") is False:
+        return False
+    if item.get("has_stream") is False:
+        return False
+
+    # 5. 音频流直链校验：若带有 download_url 或 url 键，则必须合法可用，绝不能是空串或 404
+    if "download_url" in item:
+        d_url = str(item.get("download_url") or "").strip()
+        if not d_url or not d_url.startswith(("http://", "https://")) or "404/error.html" in d_url or "error.html" in d_url:
+            return False
+    if "url" in item:
+        u = str(item.get("url") or "").strip()
+        if not u or "404/error.html" in u or "error.html" in u:
+            return False
+
+    # 6. 片段时长校验（<=35s 且带有试听迹象）
+    duration = item.get("duration_s") or (item.get("duration") or 0)
+    try:
+        duration_s = float(duration)
+        if 0 < duration_s <= 35 and ("试听" in title or item.get("is_trial")):
+            return False
+    except (ValueError, TypeError):
+        pass
+
+    return True
+
+
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
-    """在线条目合并去重：按 (title, artist) 小写，保留最先出现的（musicbox 优先）。"""
+    """在线条目合并去重：按 (title, artist) 小写，保留最先出现的（musicbox 优先）。同时做可播校验。"""
     seen = set()
     res = []
     for it in items:
+        if not is_playable_online_track(it):
+            continue
         t = str(it.get("title") or it.get("name") or "").strip().lower()
         a = str(it.get("artist") or "").strip().lower()
         if t and a:
@@ -945,6 +1025,9 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
             if isinstance(data, dict):
                 if data.get("errors"):
                     logger.warning("musicdl search partial errors: %s", data.get("errors"))
+                raw_items = data.get("items")
+                if isinstance(raw_items, list):
+                    data["items"] = [it for it in raw_items if is_playable_online_track(it)]
                 return data
     except Exception as e:
         logger.warning("Failed to fetch online search from musicdl: %s", e)
@@ -972,6 +1055,8 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
         song_ids = []
         for it in raw_list:
             if not isinstance(it, dict):
+                continue
+            if not is_playable_online_track(it):
                 continue
             sid = str(it.get("song_id") or it.get("id") or "")
             if not sid:
@@ -1029,7 +1114,7 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
             except Exception as detail_err:
                 logger.warning("Failed to fetch songs detail for %s: %s", keyword, detail_err)
 
-        return items
+        return [it for it in items if is_playable_online_track(it)]
     except Exception as e:
         logger.warning("Failed to fetch musicbox search: %s", e)
         return None
@@ -1058,6 +1143,8 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -
         for it in raw_list:
             if not isinstance(it, dict):
                 continue
+            if not is_playable_online_track(it):
+                continue
             tid = str(it.get("id") or "")
             if not tid:
                 continue
@@ -1083,7 +1170,7 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -
                 "file_size": file_size,
                 "lyric": "",
             })
-        return items
+        return [it for it in items if is_playable_online_track(it)]
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
         return None
@@ -1191,6 +1278,8 @@ def merge_online_tracks(
 
     filtered_online = []
     for online_item in raw_items:
+        if not is_playable_online_track(online_item, require_id=True):
+            continue
         ot = str(online_item.get("title") or online_item.get("name") or "").strip().lower()
         oa = str(online_item.get("artist") or "").strip().lower()
         if ot and oa and (ot, oa) in existing_keys:

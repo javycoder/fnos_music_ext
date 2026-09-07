@@ -154,6 +154,21 @@ run_docker() {
     fi
 }
 
+# 容器名全局固定（fnmusic-*）；若被其他副本/并发任务的容器占用，移除后由当前目录接管
+reclaim_container() {
+    local name="$1" owner=""
+    if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
+        return 0
+    fi
+    owner="$(run_docker container inspect "${name}" \
+        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    log_info "检测到同名容器 ${name}（来自 ${owner:-未知目录}），移除后由当前目录接管..."
+    if ! run_docker rm -f "${name}"; then
+        log_err "无法移除同名容器 ${name}，请手动执行: docker rm -f ${name}"
+        return 1
+    fi
+}
+
 precheck_environment() {
     log_info "==> 开始安装环境预检..."
     local precheck_failed=0
@@ -608,6 +623,7 @@ install_musicdl_docker() {
         return 1
     fi
     log_info "构建并启动 musicdl 容器（基于 ${MUSICDL_REPO}）..."
+    reclaim_container fnmusic-musicdl || return 1
     run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
     if wait_http "http://127.0.0.1:8768/healthz" 60 2; then
         log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
@@ -666,6 +682,7 @@ install_musicbox_docker() {
         "${BASE_DIR}/musicbox-data/netease-musicbox"
     chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
+    reclaim_container fnmusic-musicbox || return 1
     run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
     if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
         log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
@@ -725,6 +742,7 @@ install_lxmusic_docker() {
         return 1
     fi
     log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
+    reclaim_container fnmusic-lxmusic || return 1
     run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
     if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
         log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"

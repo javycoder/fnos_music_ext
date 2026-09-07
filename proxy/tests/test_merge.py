@@ -2000,4 +2000,49 @@ def test_favorite_track_list_official_items_populate_is_favorite_and_empty_handl
         assert items[2]["isFavorite"] is True
 
 
+def test_is_playable_online_track_defense():
+    from proxy.app import is_playable_online_track
+
+    # 1. 试听标题过滤
+    assert not is_playable_online_track({"id": "netease:1", "title": "夜曲 (试听版)"})
+    assert not is_playable_online_track({"id": "netease:2", "title": "晴天（试听）"})
+    assert not is_playable_online_track({"id": "kuwo:3", "title": "花海 - 试听片段"})
+
+    # 2. 试听标记/不可播标记
+    assert not is_playable_online_track({"id": "netease:4", "title": "稻香", "is_trial": True})
+    assert not is_playable_online_track({"id": "netease:5", "title": "稻香", "freeTrialInfo": {"start": 0}})
+    assert not is_playable_online_track({"id": "lx:kg:6", "title": "稻香", "is_free_part": 1})
+    assert not is_playable_online_track({"id": "lx:kg:7", "title": "稻香", "fail_process": 4})
+    assert not is_playable_online_track({"id": "lx:kg:8", "title": "稻香", "pay_type": 1})
+    assert not is_playable_online_track({"id": "lx:kg:9", "title": "稻香", "playable": False})
+    assert not is_playable_online_track({"id": "lx:kg:10", "title": "稻香", "has_stream": False})
+
+    # 3. 直链无流/404过滤
+    assert not is_playable_online_track({"id": "kuwo:11", "title": "七里香", "download_url": ""})
+    assert not is_playable_online_track({"id": "kuwo:12", "title": "七里香", "download_url": "http://err.com/404/error.html"})
+    assert not is_playable_online_track({"id": "kuwo:13", "title": "七里香", "download_url": "ftp://bad.com/1.mp3"})
+
+    # 4. 正常有效可播歌曲
+    assert is_playable_online_track({"id": "netease:100", "title": "晴天", "artist": "周杰伦"})
+    assert is_playable_online_track({"id": "kuwo:101", "title": "晴天", "artist": "周杰伦", "download_url": "http://cdn.com/101.mp3"})
+
+
+def test_merge_online_tracks_filters_unplayable_defense():
+    from proxy.app import merge_online_tracks
+
+    upstream_json = {"code": 0, "msg": "OK", "data": {"list": [], "total": 0}}
+    online_data = [
+        {"id": "netease:1", "title": "枫 (试听)", "artist": "周杰伦", "duration_s": 200},
+        {"id": "kuwo:2", "title": "搁浅", "artist": "周杰伦", "download_url": "", "duration_s": 200},
+        {"id": "kuwo:3", "title": "退后", "artist": "周杰伦", "download_url": "http://cdn.com/3.mp3", "duration_s": 250},
+    ]
+    merged = merge_online_tracks(upstream_json, online_data)
+    items = merged["data"]["list"]
+    # 只有有效且可播的退后 (id=3) 会被合并
+    assert len(items) == 1
+    assert items[0]["guid"] == "online:kuwo:3"
+    assert items[0]["title"] == "退后"
+
+
+
 

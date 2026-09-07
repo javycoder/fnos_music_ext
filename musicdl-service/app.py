@@ -139,27 +139,89 @@ def _normalize(song, keyword: str) -> dict:
     }
 
 
-def _head_probe_sync(url: str, headers: dict) -> bool:
-    """探测直链是否仍有效。优先使用 curl_cffi 模拟 Chrome TLS 指纹。"""
+TRIAL_MARKERS = (
+    "(试听)",
+    "（试听）",
+    "试听片段",
+    "片段试听",
+    "试听版",
+    "[试听]",
+    "【试听】",
+    "- 试听",
+    " - 试听",
+)
+
+
+def _is_candidate_playable(song, item: dict) -> bool:
+    """初筛：检查 identifier、标题试听标记、download_url 存在且非错误页。"""
+    sid = item.get("id") or ""
+    if not sid or sid.endswith(":"):
+        return False
+    title = str(item.get("title") or "")
+    if not title:
+        return False
+    if any(marker in title for marker in TRIAL_MARKERS):
+        return False
+    url = str(item.get("download_url") or "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    if "404/error.html" in url or "error.html" in url:
+        return False
+    return True
+
+
+def _probe_playable_sync(url: str, headers: dict) -> bool:
+    """探测直链是否有效且真实可播放（过滤无效/试听/404直链/HTML错误页）。"""
+    if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return False
+    if "404/error.html" in url or "error.html" in url:
+        return False
+    hdrs = dict(headers or {})
     if HAS_CURL_CFFI:
         try:
             r = curl_requests.head(
                 url,
-                headers=headers,
+                headers=hdrs,
                 impersonate="chrome",
                 allow_redirects=True,
-                timeout=8,
+                timeout=5,
             )
-            return r.status_code in (200, 206)
+            if r.status_code == 405:
+                hdrs["Range"] = "bytes=0-1"
+                r = curl_requests.get(
+                    url,
+                    headers=hdrs,
+                    impersonate="chrome",
+                    allow_redirects=True,
+                    stream=True,
+                    timeout=5,
+                )
+            if r.status_code in (200, 206):
+                ct = (r.headers.get("content-type") or "").lower()
+                if "text/html" in ct:
+                    return False
+                return True
+            return False
         except Exception:
             return False
     else:
         try:
-            with httpx.Client(follow_redirects=True, timeout=8) as cx:
-                r = cx.head(url, headers=headers)
-                return r.status_code in (200, 206)
+            with httpx.Client(follow_redirects=True, timeout=5.0) as cx:
+                r = cx.head(url, headers=hdrs)
+                if r.status_code == 405:
+                    hdrs["Range"] = "bytes=0-1"
+                    r = cx.get(url, headers=hdrs)
+                if r.status_code in (200, 206):
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if "text/html" in ct:
+                        return False
+                    return True
+                return False
         except Exception:
             return False
+
+
+_head_probe_sync = _probe_playable_sync
 
 
 async def _refresh_by_keyword(song_id: str) -> dict | None:
@@ -183,10 +245,16 @@ async def _refresh_by_keyword(song_id: str) -> dict | None:
     for song in songs:
         item = _normalize(song, entry["keyword"])
         if item["id"] == song_id:
+            if not _is_candidate_playable(song, item):
+                continue
+            headers = getattr(song, "default_download_headers", {}) or {}
+            valid = await asyncio.to_thread(_probe_playable_sync, item["download_url"], headers)
+            if not valid:
+                continue
             _cache_put(
                 item,
                 entry["keyword"],
-                getattr(song, "default_download_headers", {}) or {},
+                headers,
                 str(getattr(song, "lyric", "") or ""),
             )
             return _cache_get(song_id)
@@ -352,26 +420,44 @@ async def search(
             loop = asyncio.get_running_loop()
             timeout = ADAPTIVE.timeout_for(source)
             started = time.monotonic()
+            fetch_size = max(limit * 2, 10)
             try:
                 songs = await asyncio.wait_for(
                     loop.run_in_executor(
-                        SOURCE_EXECUTOR, _search_one_source, source, keyword, limit
+                        SOURCE_EXECUTOR, _search_one_source, source, keyword, fetch_size
                     ),
                     timeout=timeout,
                 )
                 latency = time.monotonic() - started
                 ADAPTIVE.record_success(source, latency)
+
+                async def _probe_one(s) -> dict | None:
+                    it = _normalize(s, keyword)
+                    if not _is_candidate_playable(s, it):
+                        return None
+                    hdrs = getattr(s, "default_download_headers", {}) or {}
+                    ok = await asyncio.to_thread(_probe_playable_sync, it["download_url"], hdrs)
+                    if not ok:
+                        return None
+                    return it
+
+                candidates = [s for s in songs if s]
+                probed = await asyncio.gather(
+                    *[_probe_one(s) for s in candidates[:fetch_size]],
+                    return_exceptions=True,
+                )
                 items = []
-                for song in songs[:limit]:
-                    item = _normalize(song, keyword)
-                    if not item["id"].endswith(":"):  # 必须有 identifier
+                for s, res in zip(candidates[:fetch_size], probed):
+                    if isinstance(res, dict) and res.get("id"):
                         _cache_put(
-                            item,
+                            res,
                             keyword,
-                            getattr(song, "default_download_headers", {}) or {},
-                            str(getattr(song, "lyric", "") or ""),
+                            getattr(s, "default_download_headers", {}) or {},
+                            str(getattr(s, "lyric", "") or ""),
                         )
-                        items.append(item)
+                        items.append(res)
+                        if len(items) >= limit:
+                            break
                 if items:
                     # 慢响应（超过 slow_degrade_s）计入降级失败，持续慢源会被熔断
                     SOURCE_BREAKER.record_success(source, latency)

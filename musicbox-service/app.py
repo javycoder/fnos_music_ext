@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from netease_ext import batch_song_details, song_lyric_pair
+from netease_ext import batch_song_details, filter_playable_song_ids, song_lyric_pair
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
@@ -100,7 +100,25 @@ def search(
         raise HTTPException(status_code=400, detail="keyword cannot be empty")
     if type not in SEARCH_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type {type!r}")
-    return exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
+    res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
+    if type == "song" and isinstance(res, dict):
+        raw_list = res.get("data")
+        if isinstance(raw_list, list):
+
+            def _song_id(item: dict) -> int:
+                # 畸形数据（非数字 id）一律归零，零不可能命中 playable 集合
+                try:
+                    return int(item.get("song_id") or item.get("id") or 0)
+                except (ValueError, TypeError):
+                    return 0
+
+            song_ids = [sid for it in raw_list if isinstance(it, dict) for sid in [_song_id(it)] if sid]
+            if song_ids:
+                playable = filter_playable_song_ids(song_ids)
+                res["data"] = [it for it in raw_list if isinstance(it, dict) and _song_id(it) in playable]
+            else:
+                res["data"] = []
+    return res
 
 
 @app.get("/api/v1/song/{song_id}/url")
