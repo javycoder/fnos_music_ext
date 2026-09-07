@@ -679,7 +679,13 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                     if isinstance(l_data, dict):
                         lyric_text = str(l_data.get("lyric") or "").strip()
                         if lyric_text:
-                            write_lyric_cache(guid, lyric_text)
+                            info = await _online_info(request, guid)
+                            write_lyric_cache(
+                                guid,
+                                lyric_text,
+                                title=str((info or {}).get("title") or ""),
+                                artist=str((info or {}).get("artist") or ""),
+                            )
                             return lyric_text
         except Exception as e:
             logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
@@ -1601,37 +1607,49 @@ async def search_track(request: Request):
         entry["task"] = agg_task
         _set_search_cache(keyword, entry)
 
+        def _collect_source_items(*results: Any) -> list[dict]:
+            merged_items: list[dict] = []
+            for res in results:
+                if isinstance(res, Exception) or res is None:
+                    continue
+                if isinstance(res, dict) and isinstance(res.get("items"), list):
+                    merged_items.extend(res.get("items") or [])
+                elif isinstance(res, list):
+                    merged_items.extend(x for x in res if isinstance(x, dict))
+            return deduplicate_online_items(merged_items)
+
         if page == 1:
-            if mb_task:
+            # 统一截止预算：主音源快返回 + 其余已完成源一并合并；单源失败不影响整体
+            wait_budget = float(CONF["netease_wait_s"]) if mb_task else min(float(CONF["search_timeout"]), 4.0)
+            pending = [t for t in (mb_task, mdl_task, lx_task) if t]
+            if pending:
                 try:
-                    mb_res = await asyncio.wait_for(asyncio.shield(mb_task), timeout=CONF["netease_wait_s"])
-                    if isinstance(mb_res, list):
-                        # 短暂等待聚合器（musicdl/lxmusic 并行任务），避免只拿到 musicbox 部分
-                        try:
-                            await asyncio.wait_for(asyncio.shield(agg_task), timeout=1.0)
-                        except Exception:
-                            pass
-                        if not agg_task.done():
-                            entry["items"] = deduplicate_online_items(mb_res)
-                except Exception:
-                    pass
-            elif mdl_task or lx_task:
-                pending = [t for t in (mdl_task, lx_task) if t]
-                try:
-                    done, _ = await asyncio.wait_for(
-                        asyncio.shield(asyncio.gather(*pending, return_exceptions=True)),
-                        timeout=min(float(CONF["search_timeout"]), 4.0),
+                    done, _pending_left = await asyncio.wait(
+                        pending,
+                        timeout=wait_budget,
+                        return_when=asyncio.ALL_COMPLETED,
                     )
-                    if not agg_task.done():
-                        merged_items: list[dict] = []
-                        for res in done:
-                            if isinstance(res, dict) and isinstance(res.get("items"), list):
-                                merged_items.extend(res.get("items") or [])
-                            elif isinstance(res, list):
-                                merged_items.extend(res)
-                        entry["items"] = deduplicate_online_items(merged_items)
                 except Exception:
-                    pass
+                    done = {t for t in pending if t.done()}
+                else:
+                    # wait 超时后仍收集已完成任务
+                    done = {t for t in pending if t.done()}
+                if not agg_task.done():
+                    results: list[Any] = []
+                    for t in pending:
+                        if not t.done():
+                            continue
+                        try:
+                            results.append(t.result())
+                        except Exception as exc:
+                            logger.warning("online search source failed (isolated): %s", exc)
+                    entry["items"] = _collect_source_items(*results)
+                # 再给聚合器极短窗口，尽量并入稍后完成的副源
+                if not agg_task.done() and (mdl_task or lx_task):
+                    try:
+                        await asyncio.wait_for(asyncio.shield(agg_task), timeout=1.0)
+                    except Exception:
+                        pass
         else:
             try:
                 await asyncio.wait_for(asyncio.shield(agg_task), timeout=CONF["late_page_wait_s"])
@@ -1778,6 +1796,7 @@ def stream_tee_response(
                 title = str((info or {}).get("title") or "")
                 artist = str((info or {}).get("artist") or "")
                 album = str((info or {}).get("album") or "")
+                lyric_text = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
                 complete = written >= 1024 and (content_length is None or written == content_length)
                 if complete:
                     dest = library_media_path(guid, title, ext, artist=artist)
@@ -1786,6 +1805,8 @@ def stream_tee_response(
                         adopt_library_perms(dest)
                         remember_media_path(guid, dest)
                         write_audio_tags(dest, title=title, artist=artist, album=album)
+                        if lyric_text.strip():
+                            write_lyric_cache(guid, lyric_text, title=title, artist=artist)
                     except Exception as e:
                         logger.warning("Failed to rename cache file: %s", e)
                         if os.path.exists(part_path):
@@ -2231,7 +2252,8 @@ async def static_cover(request: Request, subpath: str = ""):
     cover = (data or {}).get("cover_url") or ""
     if cover:
         return RedirectResponse(cover, status_code=302)
-    return empty_ok()
+    # 无封面时返回 404，避免把 JSON 当成图片导致客户端裂图
+    return Response(status_code=404)
 
 
 # === online favorites ===
@@ -2608,6 +2630,8 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
             build_track=build_online_track,
             netease_enabled=CONF["netease_enabled"],
             favorite_items=favs,
+            lx_client=get_lx_client(request.app) if CONF.get("lx_enabled", True) else None,
+            lx_enabled=bool(CONF.get("lx_enabled", True)),
         )
     )
     _DAILY_TASKS[key] = task

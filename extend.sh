@@ -14,11 +14,32 @@ TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
+LX_URL="http://127.0.0.1:8772"
+FORCE_RELOAD=0
 
-if [ "${1:-}" = "--qr" ]; then
-    curl -s "${MUSICBOX_URL}/api/v1/auth/login/qr" || true
-    exit 0
-fi
+for arg in "$@"; do
+    case "${arg}" in
+        --qr)
+            curl -s "${MUSICBOX_URL}/api/v1/auth/login/qr" || true
+            exit 0
+            ;;
+        --force)
+            FORCE_RELOAD=1
+            ;;
+        -h|--help)
+            echo "用法: $0 [--force] [--qr]"
+            echo "  --force  强制重写 unit 并重启代理（安装改配置后使用）"
+            echo "  --qr     在终端展示网易云登录二维码"
+            exit 0
+            ;;
+        *)
+            if [ "${arg}" != "" ]; then
+                echo "未知参数: ${arg}"
+                exit 1
+            fi
+            ;;
+    esac
+done
 
 log_info() {
     echo -e "\033[32m[INFO]\033[0m $*"
@@ -106,14 +127,28 @@ source "${BASE_DIR}/.env"
 set +a
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
+LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
+DEPLOY_MODE="${FNMUSIC_DEPLOY_MODE:-}"
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
+ENABLE_LX=0
 is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
 is_enabled "${FNMUSIC_NETEASE_ENABLED:-true}" && ENABLE_MUSICBOX=1
-if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-    log_err "至少需要启用一个音源（FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED）。"
+is_enabled "${FNMUSIC_LX_ENABLED:-false}" && ENABLE_LX=1
+if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
+    log_err "至少需要启用一个音源（FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED）。"
     exit 1
 fi
+
+run_docker() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+        sudo docker "$@"
+    else
+        return 1
+    fi
+}
 
 # ------------------------------------------------------------------------------
 # 回滚函数 (restore 逻辑)
@@ -210,6 +245,19 @@ try:
         if i: print(i)
 except Exception:
     pass" 2>/dev/null || true
+        elif [ "${source}" = "lxmusic" ]; then
+            curl -s --max-time 20 "${LX_URL}/api/v1/search?keyword=${encoded}&limit=3" 2>/dev/null | python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin)
+    rows=d.get('items') if isinstance(d, dict) else None
+    if not isinstance(rows, list):
+        rows=d.get('data') if isinstance(d, dict) else None
+    for it in (rows or [])[:3]:
+        i=str(it.get('id') or '')
+        if i:
+            print(i if i.startswith('lx:') else 'lx:'+i)
+except Exception:
+    pass" 2>/dev/null || true
         else
             curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=${encoded}&limit=3&type=song" 2>/dev/null | python3 -c "import sys,json
 try:
@@ -263,6 +311,7 @@ except Exception:
     local sources=()
     [ "${ENABLE_MUSICDL}" -eq 1 ] && sources+=("musicdl")
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
+    [ "${ENABLE_LX}" -eq 1 ] && sources+=("lxmusic")
 
     local src kw id
     for src in "${sources[@]}"; do
@@ -327,7 +376,7 @@ if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
     exit 1
 fi
 
-# 1.4 检查 / 自动拉起已启用的音源
+# 1.4 检查 / 自动拉起已启用的音源（按 DEPLOY_MODE 只走 docker 或 host，避免双轨冲突）
 ensure_source() {
     local name="$1" url="$2" compose_svc="$3" unit="$4"
     if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
@@ -335,11 +384,22 @@ ensure_source() {
         return 0
     fi
     log_warn "${name} 未就绪，正在拉起..."
-    if command -v docker >/dev/null 2>&1; then
-        docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || true
+    local mode="${DEPLOY_MODE}"
+    if [ -z "${mode}" ]; then
+        if systemctl list-unit-files "${unit}" 2>/dev/null | grep -q "${unit}"; then
+            mode="host"
+        elif command -v docker >/dev/null 2>&1; then
+            mode="docker"
+        else
+            mode="host"
+        fi
     fi
-    if systemctl list-unit-files "${unit}" >/dev/null 2>&1; then
-        sudo systemctl start "${unit}" 2>/dev/null || true
+    if [ "${mode}" = "docker" ]; then
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || true
+    else
+        if systemctl list-unit-files "${unit}" >/dev/null 2>&1; then
+            sudo systemctl start "${unit}" 2>/dev/null || true
+        fi
     fi
     local i
     for i in $(seq 1 60); do
@@ -367,6 +427,11 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
         exit 1
     fi
 fi
+if [ "${ENABLE_LX}" -eq 1 ]; then
+    if ! ensure_source "lxmusic" "${LX_URL}" "lxmusic" "fnmusic-lxmusic.service"; then
+        exit 1
+    fi
+fi
 
 # 1.5 检查 Python 虚拟环境与依赖
 if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
@@ -385,7 +450,9 @@ bash -n "${BASE_DIR}/proxy/run_proxy.sh"
 log_info "==> 步骤 2/5: 幂等性检查..."
 HEALTH_CHECK="$(curl -s --max-time 3 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
 
-if echo "${HEALTH_CHECK}" | grep -q '"upstream":[[:space:]]*"ok"'; then
+if [ "${FORCE_RELOAD}" -eq 1 ]; then
+    log_info "已指定 --force：跳过幂等提前退出，将重写 unit 并重启代理以加载最新 .env。"
+elif echo "${HEALTH_CHECK}" | grep -q '"upstream":[[:space:]]*"ok"'; then
     log_info "检测到代理服务已在运行且上游健康 (处于扩展接管态)。"
     log_info "直接运行验收测试确认状态..."
     if verify_acceptance; then
@@ -413,7 +480,7 @@ Type=simple
 User=root
 WorkingDirectory=${BASE_DIR}
 ExecStart=${BASE_DIR}/proxy/run_proxy.sh
-ExecStartPost=/bin/sh -c 'for i in \$(seq 1 30); do [ -S /var/run/trim_music.socket ] && chmod 666 /var/run/trim_music.socket && exit 0; sleep 1; done; exit 1'
+ExecStartPost=/bin/sh -c 'for i in \$(seq 1 65); do [ -S /var/run/trim_music.socket ] && chmod 666 /var/run/trim_music.socket && exit 0; sleep 1; done; exit 1'
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

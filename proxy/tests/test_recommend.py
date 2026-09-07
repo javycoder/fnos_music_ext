@@ -458,3 +458,47 @@ def test_healthz_includes_llm_flag():
         resp = client.get("/_ext/healthz")
         assert "llm" in resp.json()
         assert resp.json()["llm"] in ("disabled", "enabled")
+
+
+@pytest.mark.anyio
+async def test_get_or_build_daily_prefers_llm_over_fallback(monkeypatch):
+    """启用 LLM 时应先走大模型，不能被 fallback 竞速取消。"""
+    monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("FNMUSIC_LLM_MODEL", "gpt-test")
+    llm_calls = {"n": 0}
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_calls["n"] += 1
+        content = json.dumps([
+            {"title": f"LLM歌{i}", "artist": f"LLM歌手{i}", "dimension": "llm", "reason": "test"}
+            for i in range(30)
+        ])
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        kw = request.url.params.get("keyword") or ""
+        title = kw.split()[-1] if kw else "x"
+        return httpx.Response(
+            200,
+            json={"items": [{"id": f"migu:{abs(hash(kw)) % 100000}", "source": "migu", "title": title, "artist": "A", "duration_s": 180, "ext": "mp3"}]},
+        )
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler), base_url="http://127.0.0.1:9") as llm_client, \
+            httpx.AsyncClient(transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768") as mdl, \
+            httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770") as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-llm-first",
+            musicdl_client=mdl,
+            musicbox_client=mb,
+            llm_http=llm_client,
+            build_track=build_online_track,
+            netease_enabled=False,
+        )
+    assert llm_calls["n"] >= 1
+    assert len(payload["tracks"]) >= 1
+    # 至少部分曲目应来自 LLM 候选标题
+    titles = " ".join(str(t.get("title") or "") for t in payload["tracks"])
+    assert "LLM歌" in titles

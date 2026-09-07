@@ -110,16 +110,26 @@ wait_http() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --mode) MODE="${2:-}"; shift 2 ;;
+        --mode)
+            [ $# -ge 2 ] || { log_err "--mode 需要参数 host|docker"; exit 1; }
+            MODE="${2}"; shift 2 ;;
         --mode=*) MODE="${1#*=}"; shift ;;
-        --sources) SOURCES_RAW="${2:-}"; shift 2 ;;
+        --sources)
+            [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
+            SOURCES_RAW="${2}"; shift 2 ;;
         --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
         --disable-recommend) ENABLE_RECOMMEND="no"; shift ;;
-        --llm-base-url) LLM_BASE_URL="${2:-}"; shift 2 ;;
-        --llm-api-key) LLM_API_KEY="${2:-}"; shift 2 ;;
-        --llm-model) LLM_MODEL="${2:-}"; shift 2 ;;
+        --llm-base-url)
+            [ $# -ge 2 ] || { log_err "--llm-base-url 需要 URL 参数"; exit 1; }
+            LLM_BASE_URL="${2}"; shift 2 ;;
+        --llm-api-key)
+            [ $# -ge 2 ] || { log_err "--llm-api-key 需要 KEY 参数"; exit 1; }
+            LLM_API_KEY="${2}"; shift 2 ;;
+        --llm-model)
+            [ $# -ge 2 ] || { log_err "--llm-model 需要模型名参数"; exit 1; }
+            LLM_MODEL="${2}"; shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
         --qr)
             curl -s http://127.0.0.1:8770/api/v1/auth/login/qr || true
@@ -130,9 +140,28 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+run_docker() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+        sudo docker "$@"
+    else
+        return 1
+    fi
+}
+
 precheck_environment() {
     log_info "==> 开始安装环境预检..."
     local precheck_failed=0
+
+    # 0. curl（健康探测 / 验收 / 二维码均依赖）
+    if ! command -v curl >/dev/null 2>&1; then
+        log_err "【缺少基础组件】系统未检测到 curl。"
+        log_err "请先执行：sudo apt-get update && sudo apt-get install -y curl"
+        precheck_failed=1
+    else
+        log_info "curl 已就绪。"
+    fi
 
     # 1. 检查 Python 3 与 venv 模块
     if ! command -v python3 >/dev/null 2>&1; then
@@ -176,7 +205,15 @@ precheck_environment() {
 
     # 4. 检查 Docker 环境
     if command -v docker >/dev/null 2>&1; then
-        log_info "Docker 容器环境已就绪。"
+        if run_docker info >/dev/null 2>&1; then
+            log_info "Docker 容器环境已就绪。"
+        else
+            log_warn "检测到 docker 命令，但当前用户无法连通 Docker daemon。"
+            if [ "${MODE}" = "docker" ]; then
+                log_err "【权限不足】Docker 模式需要可用的 docker（或 sudo docker）。"
+                precheck_failed=1
+            fi
+        fi
     else
         log_warn "【提示】系统未检测到 Docker 环境。"
         if [ "${MODE}" = "docker" ]; then
@@ -194,6 +231,14 @@ precheck_environment() {
         exit 1
     fi
     log_info "环境预检全部通过。"
+}
+
+ensure_docker_ready() {
+    if ! command -v docker >/dev/null 2>&1 || ! run_docker info >/dev/null 2>&1; then
+        log_err "【缺少组件】已选择 Docker 模式，但 Docker 不可用。"
+        log_err "请先在 fnOS 应用中心安装 Docker，或改用 --mode host。"
+        exit 1
+    fi
 }
 
 precheck_environment
@@ -300,6 +345,9 @@ if [ "${MODE}" != "host" ] && [ "${MODE}" != "docker" ]; then
     log_err "mode 必须是 host 或 docker"
     exit 1
 fi
+if [ "${MODE}" = "docker" ]; then
+    ensure_docker_ready
+fi
 
 parse_sources "${SOURCES_RAW}"
 
@@ -344,6 +392,7 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
+    echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
         echo "FNMUSIC_LLM_API_KEY='$(dotenv_escape "${LLM_API_KEY}")'"
@@ -356,17 +405,21 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
-# 用户本次明确提供了新值的键（音源开关/版本为安装时部署选项，始终采用新值）
-ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION"
+# 用户本次明确提供了新值的键（音源开关/版本/部署模式为安装时部署选项，始终采用新值）
+ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     [ -n "${LLM_BASE_URL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL"
     [ -n "${LLM_API_KEY}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_API_KEY"
     [ -n "${LLM_MODEL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_MODEL"
+else
+    # 关闭推荐时必须显式覆盖，否则 env_merge 会保留旧 Key
+    ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL,FNMUSIC_LLM_API_KEY,FNMUSIC_LLM_MODEL"
 fi
 
 if [ -f "${ENV_PATH}" ]; then
-    PREV_VERSION="$(grep -E "^\s*(export\s+)?FNMUSIC_VERSION=" "${ENV_PATH}" | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]")"
+    PREV_VERSION="$(grep -E "^\s*(export\s+)?FNMUSIC_VERSION=" "${ENV_PATH}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
+    PREV_VERSION="${PREV_VERSION:-}"
     ENV_BACKUP="${ENV_PATH}.bak.$(date +%Y%m%d%H%M%S)"
     cp -p "${ENV_PATH}" "${ENV_BACKUP}"
     if [ -n "${PREV_VERSION}" ] && [ "${PREV_VERSION}" = "${FNMUSIC_VERSION}" ]; then
@@ -430,7 +483,7 @@ install_musicdl_docker() {
         return 1
     fi
     log_info "构建并启动 musicdl 容器（基于 ${MUSICDL_REPO}）..."
-    docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
     if wait_http "http://127.0.0.1:8768/healthz" 60 2; then
         log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
         return 0
@@ -488,7 +541,7 @@ install_musicbox_docker() {
         "${BASE_DIR}/musicbox-data/netease-musicbox"
     chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
-    docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
     if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
         log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
         return 0
@@ -523,7 +576,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=XDG_DATA_HOME=${BASE_DIR}/musicbox-data
 Environment=XDG_CACHE_HOME=${BASE_DIR}/musicbox-data/cache
 Environment=XDG_CONFIG_HOME=${BASE_DIR}/musicbox-data/config
-ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 127.0.0.1 --port 8770
+ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 0.0.0.0 --port 8770
 Restart=always
 RestartSec=5
 
@@ -547,7 +600,7 @@ install_lxmusic_docker() {
         return 1
     fi
     log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
-    docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
     if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
         log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
         return 0
@@ -593,21 +646,35 @@ EOF
     log_warn "lxmusic systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-lxmusic"
 }
 
+clear_opposite_mode() {
+    # 交叉模式切换时清理对侧，避免端口占用冲突
+    if [ "${MODE}" = "docker" ]; then
+        log_info "Docker 模式：停用宿主机音源 systemd unit（若存在）..."
+        for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+            sudo systemctl disable --now "${unit}.service" 2>/dev/null || true
+        done
+    else
+        log_info "Host 模式：停止 Docker 音源容器（若存在）..."
+        run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>/dev/null || true
+    fi
+}
+
 stop_unselected() {
     if [ "${ENABLE_MUSICDL}" -eq 0 ]; then
-        docker rm -f fnmusic-musicdl 2>/dev/null || true
+        run_docker rm -f fnmusic-musicdl 2>/dev/null || true
         sudo systemctl disable --now fnmusic-musicdl.service 2>/dev/null || true
     fi
     if [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-        docker rm -f fnmusic-musicbox 2>/dev/null || true
+        run_docker rm -f fnmusic-musicbox 2>/dev/null || true
         sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
     fi
     if [ "${ENABLE_LX}" -eq 0 ]; then
-        docker rm -f fnmusic-lxmusic 2>/dev/null || true
+        run_docker rm -f fnmusic-lxmusic 2>/dev/null || true
         sudo systemctl disable --now fnmusic-lxmusic.service 2>/dev/null || true
     fi
 }
 
+clear_opposite_mode
 if [ "${MODE}" = "docker" ]; then
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_docker
@@ -660,5 +727,5 @@ log_info "   • 随时一键还原: ./restore.sh (立即恢复官方出厂直�
 log_info "============================================================"
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
-    exec "${BASE_DIR}/extend.sh"
+    exec "${BASE_DIR}/extend.sh" --force
 fi
