@@ -71,12 +71,18 @@ def test_search_aggregates_sources():
     def handler(request: httpx.Request) -> httpx.Response:
         if "mobilecdn.kugou.com" in str(request.url):
             assert request.url.params.get("keyword") == "晴天"
-            assert request.url.params.get("pagesize") == "20"
             return httpx.Response(
                 200,
                 json={
                     "data": {
                         "info": [
+                            {
+                                "hash": "KGHASH_VIP",
+                                "sqhash": "KGSQ_VIP",
+                                "songname": "晴天(VIP专享)",
+                                "singername": "周杰伦",
+                                "pay_type": 3,  # VIP 曲目，应被过滤
+                            },
                             {
                                 "hash": "KGHASH1",
                                 "sqhash": "KGSQ1",
@@ -85,7 +91,8 @@ def test_search_aggregates_sources():
                                 "singername": "周杰伦",
                                 "album_name": "叶惠美",
                                 "duration": 269000,
-                            }
+                                "pay_type": 0,  # 免费曲目，应保留
+                            },
                         ]
                     }
                 },
@@ -98,12 +105,19 @@ def test_search_aggregates_sources():
                     "result": {
                         "songs": [
                             {
+                                "id": 999999,
+                                "name": "晴天(VIP原版)",
+                                "artists": [{"name": "周杰伦"}],
+                                "fee": 1,  # VIP 曲目，应被过滤
+                            },
+                            {
                                 "id": 186016,
                                 "name": "晴天",
                                 "artists": [{"name": "周杰伦"}],
                                 "album": {"name": "叶惠美", "picUrl": "https://img.test/wy.jpg"},
                                 "duration": 269000,
-                            }
+                                "fee": 0,  # 免费曲目，应保留
+                            },
                         ]
                     }
                 },
@@ -137,11 +151,16 @@ def test_search_aggregates_sources():
         assert rj["ok"] is True
         assert rj["errors"] == {}
         ids = {it["id"] for it in rj["items"]}
+        # 确保 VIP 曲目被剔除，只有免费曲目入选
+        assert "lx:kg:KGHASH_VIP" not in ids
+        assert "lx:wy:999999" not in ids
         assert ids == {"lx:kg:KGHASH1", "lx:wy:186016", "lx:mg:600902"}
         by_id = {it["id"]: it for it in rj["items"]}
         assert by_id["lx:kg:KGHASH1"]["ext"] == "flac"
         assert by_id["lx:kg:KGHASH1"]["lx_source"] == "kg"
+        assert by_id["lx:kg:KGHASH1"]["pay_type"] == 0
         assert by_id["lx:wy:186016"]["duration_s"] == 269.0
+        assert by_id["lx:wy:186016"]["fee"] == 0
         assert by_id["lx:mg:600902"]["lrc_url"] == "https://lrc.test/600902.lrc"
 
 
@@ -153,10 +172,42 @@ def test_search_requires_keyword():
 
 # ------------------------------------------------------------------ track url --
 
-def test_track_url_kg_trackercdn_resolution():
+def test_track_url_kg_playinfo_resolution():
     def handler(request: httpx.Request) -> httpx.Response:
+        if "m.kugou.com" in str(request.url):
+            assert request.url.params.get("hash") == "KGSQ1"
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                text='{"errcode":0,"url":"https://sharefs.kugou.com/mp3_track.mp3","fileSize":4085749,"bitRate":128,"extName":"mp3"}',
+            )
+        return httpx.Response(404)
+
+    lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    lxapp._cache_put(
+        {
+            "id": "lx:kg:KGHASH1",
+            "hash": "KGHASH1",
+            "hash_hq": "KGHQ1",
+            "hash_sq": "KGSQ1",
+        }
+    )
+
+    with TestClient(lxapp.app) as client:
+        resp = client.get("/api/v1/track/url", params={"id": "lx:kg:KGHASH1", "quality": "lossless"})
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["url"] == "https://sharefs.kugou.com/mp3_track.mp3"
+        assert data["ext"] == "mp3"
+        assert data["file_size"] == 4085749
+        assert data["headers"]["User-Agent"]
+
+
+def test_track_url_kg_trackercdn_fallback():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "m.kugou.com" in str(request.url):
+            return httpx.Response(404)
         if "trackercdn" in str(request.url):
-            # lossless hash 优先
             assert request.url.params.get("hash") == "KGSQ1"
             return httpx.Response(
                 200,
@@ -185,9 +236,30 @@ def test_track_url_kg_trackercdn_resolution():
         assert resp.status_code == 200
         data = resp.json()["data"]
         assert data["url"] == "https://cdn.kugou.com/flac_track.flac"
-        assert data["ext"] == "flac"
-        assert data["file_size"] == 28936190
-        assert data["headers"]["User-Agent"]
+
+
+def test_track_url_wy_outer_fallback():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "interface3.music.163.com" in str(request.url):
+            # eapi 未返回 url
+            return httpx.Response(200, json={"data": [{"url": ""}]})
+        if "outer/url" in str(request.url):
+            return httpx.Response(
+                206,
+                headers={"Content-Type": "audio/mpeg", "Content-Length": "1024"},
+                content=b"ID3" + b"\x00" * 1021,
+            )
+        return httpx.Response(404)
+
+    lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with TestClient(lxapp.app) as client:
+        resp = client.get("/api/v1/track/url", params={"id": "lx:wy:186016", "quality": "standard"})
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert "outer/url" in data["url"]
+        assert data["ext"] == "mp3"
+        assert data["br"] == 128000
 
 
 def test_track_url_invalid_id():

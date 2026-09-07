@@ -1952,7 +1952,8 @@ async def stream_track(request: Request):
         try:
             stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
             resp = await stream_client.send(stream_req, stream=True)
-            if resp.status_code >= 400:
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if resp.status_code >= 400 or "text/html" in content_type:
                 await resp.aclose()
                 await stream_client.aclose()
                 return JSONResponse(

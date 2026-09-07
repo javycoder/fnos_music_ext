@@ -246,18 +246,22 @@ try:
 except Exception:
     pass" 2>/dev/null || true
         elif [ "${source}" = "lxmusic" ]; then
-            curl -s --max-time 20 "${LX_URL}/api/v1/search?keyword=${encoded}&limit=3" 2>/dev/null | python3 -c "import sys,json
+            # 轮询 kg 与 wy 子源，分别获取候选歌曲，避免单一子源故障导致候选题库全灭
+            local lx_sub
+            for lx_sub in kg wy; do
+                curl -s --max-time 20 "${LX_URL}/api/v1/search?keyword=${encoded}&limit=5&sources=${lx_sub}" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
     rows=d.get('items') if isinstance(d, dict) else None
     if not isinstance(rows, list):
         rows=d.get('data') if isinstance(d, dict) else None
-    for it in (rows or [])[:3]:
+    for it in (rows or [])[:2]:
         i=str(it.get('id') or '')
         if i:
             print(i if i.startswith('lx:') else 'lx:'+i)
 except Exception:
     pass" 2>/dev/null || true
+            done
         else
             curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=${encoded}&limit=3&type=song" 2>/dev/null | python3 -c "import sys,json
 try:
@@ -313,12 +317,15 @@ except Exception:
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
     [ "${ENABLE_LX}" -eq 1 ] && sources+=("lxmusic")
 
-    local src kw id
+    local src kw id first_failed_lx_id=""
     for src in "${sources[@]}"; do
         for kw in "${probe_keywords[@]}"; do
             while IFS= read -r id; do
                 [ -z "${id}" ] && continue
                 search_any_result=1
+                if [ "${src}" = "lxmusic" ] && [ -z "${first_failed_lx_id}" ]; then
+                    first_failed_lx_id="${id}"
+                fi
                 if try_probe_stream "${id}"; then
                     log_info "验收 6b 通过：音源 ${src} 在线播放流取流成功。"
                     return 0
@@ -332,6 +339,13 @@ except Exception:
         log_warn "所有已启用音源 (${sources[*]}) 搜索结果均为空：可能是外部网络异常或第三方平台限流。"
     else
         log_warn "所有候选歌曲均未能成功取流 (外部音源网络波动，不阻断部署)。"
+        if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${first_failed_lx_id}" ]; then
+            local lx_diag
+            lx_diag="$(curl -s --max-time 5 "${LX_URL}/api/v1/track/url?id=${first_failed_lx_id}&quality=standard" 2>/dev/null || echo "")"
+            if [ -n "${lx_diag}" ]; then
+                log_warn "洛雪音源直链诊断 (${first_failed_lx_id}): ${lx_diag}"
+            fi
+        fi
     fi
     log_warn "跳过在线播放自动验收，建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
     return 0
