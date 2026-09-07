@@ -48,7 +48,7 @@ CONF = {
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "true").lower() in ("true", "1", "yes"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
-    "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "2.5")),
+    "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -64,8 +64,8 @@ CONF = {
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
-    "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "300")),
-    "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5")),
+    "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
+    "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5.0")),
     "fav_dir": os.environ.get(
         "FNMUSIC_FAV_DIR", os.path.join(_HOME, "online_favorites")
     ),
@@ -125,8 +125,13 @@ _SEARCH_CACHE: dict[str, dict] = {}
 
 
 def _clean_search_cache() -> None:
-    """写入时若 len(_SEARCH_CACHE) > 200，按 ts 升序砍掉最旧一半。"""
-    if len(_SEARCH_CACHE) > 200:
+    """清理过期缓存，若仍超过容量上限（2000条），按 ts 升序淘汰最旧的一半。"""
+    now = time.time()
+    ttl = CONF.get("search_cache_ttl", 604800.0)
+    expired_keys = [k for k, v in _SEARCH_CACHE.items() if now - v.get("ts", 0) >= ttl]
+    for k in expired_keys:
+        _SEARCH_CACHE.pop(k, None)
+    if len(_SEARCH_CACHE) > 2000:
         sorted_keys = sorted(_SEARCH_CACHE.keys(), key=lambda k: _SEARCH_CACHE[k].get("ts", 0))
         to_remove = sorted_keys[: len(sorted_keys) // 2]
         for k in to_remove:
@@ -1619,8 +1624,8 @@ async def search_track(request: Request):
             return deduplicate_online_items(merged_items)
 
         if page == 1:
-            # 统一截止预算：主音源快返回 + 其余已完成源一并合并；单源失败不影响整体
-            wait_budget = float(CONF["netease_wait_s"]) if mb_task else min(float(CONF["search_timeout"]), 4.0)
+            # 阶段一：等待预算（默认3.0s），若多个源全部或部分在此时间内完成，统一收集合并
+            wait_budget = float(CONF.get("netease_wait_s", 3.0))
             pending = [t for t in (mb_task, mdl_task, lx_task) if t]
             if pending:
                 try:
@@ -1632,24 +1637,51 @@ async def search_track(request: Request):
                 except Exception:
                     done = {t for t in pending if t.done()}
                 else:
-                    # wait 超时后仍收集已完成任务
                     done = {t for t in pending if t.done()}
-                if not agg_task.done():
-                    results: list[Any] = []
-                    for t in pending:
-                        if not t.done():
-                            continue
+
+                if done:
+                    # 3s 内已有音乐源返回：保留原有合并逻辑，并给极短缓冲尽量吸纳刚完成的副源
+                    if not agg_task.done():
+                        results: list[Any] = []
+                        for t in (mb_task, mdl_task, lx_task):
+                            if t and t in done:
+                                try:
+                                    results.append(t.result())
+                                except Exception as exc:
+                                    logger.warning("online search source failed (isolated): %s", exc)
+                        entry["items"] = _collect_source_items(*results)
+                    if not agg_task.done() and (mdl_task or lx_task):
                         try:
-                            results.append(t.result())
-                        except Exception as exc:
-                            logger.warning("online search source failed (isolated): %s", exc)
-                    entry["items"] = _collect_source_items(*results)
-                # 再给聚合器极短窗口，尽量并入稍后完成的副源
-                if not agg_task.done() and (mdl_task or lx_task):
-                    try:
-                        await asyncio.wait_for(asyncio.shield(agg_task), timeout=1.0)
-                    except Exception:
-                        pass
+                            await asyncio.wait_for(asyncio.shield(agg_task), timeout=1.0)
+                        except Exception:
+                            pass
+                else:
+                    # 阶段二：若 3s 内没有任何源返回结果，进入超时外等待（默认 5.0s）
+                    # 在该时间内一旦任何一个在线源返回，马上采用该率先返回的结果
+                    rem_pending = [t for t in pending if not t.done()]
+                    late_wait_s = float(CONF.get("late_page_wait_s", 5.0))
+                    if rem_pending and late_wait_s > 0:
+                        try:
+                            late_done, _ = await asyncio.wait(
+                                rem_pending,
+                                timeout=late_wait_s,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        except Exception:
+                            late_done = {t for t in rem_pending if t.done()}
+                        else:
+                            late_done = {t for t in rem_pending if t.done()}
+
+                        if late_done:
+                            first_results: list[Any] = []
+                            # 优先按已完成任务收集结果
+                            for t in (mb_task, mdl_task, lx_task):
+                                if t and t in late_done:
+                                    try:
+                                        first_results.append(t.result())
+                                    except Exception as exc:
+                                        logger.warning("first completed source failed: %s", exc)
+                            entry["items"] = _collect_source_items(*first_results)
         else:
             try:
                 await asyncio.wait_for(asyncio.shield(agg_task), timeout=CONF["late_page_wait_s"])

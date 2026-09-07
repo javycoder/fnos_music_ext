@@ -49,9 +49,9 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "lx_enabled", False)
-    monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
+    monkeypatch.setitem(CONF, "netease_wait_s", 3.0)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
-    monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
+    monkeypatch.setitem(CONF, "search_cache_ttl", 604800.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
 
     def default_musicbox_handler(request: httpx.Request) -> httpx.Response:
@@ -88,6 +88,10 @@ def test_write_audio_tags_id3(tmp_path):
 
     if not shutil.which("ffmpeg"):
         pytest.skip("ffmpeg not available")
+    try:
+        import mutagen
+    except ImportError:
+        pytest.skip("mutagen not available")
     path = str(tmp_path / "sample.mp3")
     subprocess.run(
         [
@@ -987,6 +991,219 @@ def test_ext_healthz():
         assert rj["upstream"] == "ok"
         assert rj["musicdl"] == "ok"
         assert rj["musicbox"] == "ok"
+
+
+def test_search_track_late_wait_first_source_completed(monkeypatch):
+    """3s 内无任何源返回，进入超时外等待 5s：一旦首个源返回，立刻采用本地+首个结果返回。"""
+    monkeypatch.setitem(CONF, "netease_wait_s", 0.05)  # 模拟阶段一极短超时
+    monkeypatch.setitem(CONF, "late_page_wait_s", 2.0)  # 模拟阶段二等待
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "list": [
+                        {
+                            "guid": "local:101",
+                            "title": "晴天",
+                            "artist": "周杰伦",
+                        }
+                    ],
+                    "total": 1,
+                },
+            },
+        )
+
+    async def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        import asyncio
+        await asyncio.sleep(0.8)  # 极慢，不应该被本次首屏等待
+        return httpx.Response(200, json={"ok": True, "data": []})
+
+    async def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        import asyncio
+        await asyncio.sleep(0.15)  # 率先在超时外阶段返回
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "items": [
+                    {
+                        "id": "kuwo:first_win",
+                        "source": "kuwo",
+                        "title": "晴天 (Live)",
+                        "artist": "刘瑞琦",
+                        "duration_s": 260,
+                        "ext": "mp3",
+                    }
+                ],
+            },
+        )
+
+    async def lx_handler(request: httpx.Request) -> httpx.Response:
+        import asyncio
+        await asyncio.sleep(0.5)  # 慢于 musicdl
+        return httpx.Response(200, json={"ok": True, "items": []})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772"
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20")
+        assert resp.status_code == 200
+        items = resp.json()["data"]["list"]
+        # 本地保持在第一项
+        assert items[0]["guid"] == "local:101"
+        assert items[0]["title"] == "晴天"
+        # 率先返回的 musicdl 被并入
+        assert items[1]["guid"] == "online:kuwo:first_win"
+        assert items[1]["title"] == "晴天 (Live)"
+        assert items[1]["artist"] == "刘瑞琦"
+
+
+def test_search_cache_ttl_default_seven_days():
+    """默认搜索缓存有效期为 7 天 (604800 秒)。"""
+    assert CONF["search_cache_ttl"] == 604800.0
+
+
+def test_search_track_within_budget_keeps_order(monkeypatch):
+    """在阶段一预算内（3s），所有返回的源均保留，并按 本地 > 网易云 > musicdl > 洛雪 排序与去重。"""
+    monkeypatch.setitem(CONF, "netease_wait_s", 1.0)
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "list": [
+                        {
+                            "guid": "local:101",
+                            "title": "晴天",
+                            "artist": "周杰伦",
+                        }
+                    ],
+                    "total": 1,
+                },
+            },
+        )
+
+    async def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": [
+                    {
+                        "song_id": "mb_same",
+                        "song_name": "晴天",
+                        "artist": "周杰伦",  # 与本地重复，应被去重
+                        "album_name": "叶惠美",
+                    },
+                    {
+                        "song_id": "mb_unique",
+                        "song_name": "晴天",
+                        "artist": "网易翻唱歌手",
+                        "album_name": "翻唱合辑",
+                    },
+                ],
+            },
+        )
+
+    async def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "items": [
+                    {
+                        "id": "kuwo:mdl_same",
+                        "source": "kuwo",
+                        "title": "晴天",
+                        "artist": "网易翻唱歌手",  # 与网易云重复，网易云优先
+                        "duration_s": 200,
+                        "ext": "mp3",
+                    },
+                    {
+                        "id": "kuwo:mdl_unique",
+                        "source": "kuwo",
+                        "title": "晴天",
+                        "artist": "Musicdl翻唱歌手",
+                        "duration_s": 210,
+                        "ext": "mp3",
+                    },
+                ],
+            },
+        )
+
+    async def lx_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "items": [
+                    {
+                        "id": "lx:kg:lx_unique",
+                        "source": "lx",
+                        "title": "晴天",
+                        "artist": "洛雪翻唱歌手",
+                        "duration_s": 220,
+                        "ext": "mp3",
+                    }
+                ],
+            },
+        )
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772"
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20")
+        assert resp.status_code == 200
+        items = resp.json()["data"]["list"]
+        # 1. 本地
+        assert items[0]["guid"] == "local:101"
+        assert items[0]["artist"] == "周杰伦"
+        # 2. 网易云
+        assert items[1]["guid"] == "online:netease:mb_unique"
+        assert items[1]["artist"] == "网易翻唱歌手"
+        # 3. Musicdl (去掉了与网易重复的网易翻唱歌手)
+        assert items[2]["guid"] == "online:kuwo:mdl_unique"
+        assert items[2]["artist"] == "Musicdl翻唱歌手"
+        # 4. 洛雪
+        assert items[3]["guid"] == "online:lx:kg:lx_unique"
+        assert items[3]["artist"] == "洛雪翻唱歌手"
+        assert len(items) == 4
+
 
 
 def test_general_passthrough():
