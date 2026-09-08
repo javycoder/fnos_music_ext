@@ -18,9 +18,10 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source code
-COPY app.py /app/app.py
-COPY hardening.py /app/hardening.py
+# Copy application source code（--chown+chmod：镜像权限不依赖构建上下文的 umask/属主）
+COPY --chown=appuser:appuser app.py /app/app.py
+COPY --chown=appuser:appuser hardening.py /app/hardening.py
+RUN chmod 0644 /app/*.py
 
 USER appuser
 

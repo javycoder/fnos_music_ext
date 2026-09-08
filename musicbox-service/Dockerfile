@@ -11,15 +11,17 @@ WORKDIR /app
 
 RUN useradd -m -u 1000 appuser \
     && mkdir -p /data /data/cache/netease-musicbox /data/config/netease-musicbox /data/netease-musicbox \
-    && chown -R appuser:appuser /data /app \
+    && chown -R appuser:appuser /data \
     && chmod -R 777 /data
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py /app/app.py
-COPY runner.py /app/runner.py
-COPY netease_ext.py /app/netease_ext.py
+# --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
+COPY --chown=appuser:appuser app.py /app/app.py
+COPY --chown=appuser:appuser runner.py /app/runner.py
+COPY --chown=appuser:appuser netease_ext.py /app/netease_ext.py
+RUN chmod 0644 /app/*.py
 
 USER appuser
 EXPOSE 8000

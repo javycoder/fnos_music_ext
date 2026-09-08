@@ -11,7 +11,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+# --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
+COPY --chown=appuser:appuser app.py ./
+RUN chmod 0644 /app/*.py
 
 USER appuser
 
