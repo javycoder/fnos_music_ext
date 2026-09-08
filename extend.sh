@@ -467,7 +467,7 @@ fi
 if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
     log_info "创建 .venv-proxy 虚拟环境..."
     python3 -m venv "${BASE_DIR}/.venv-proxy"
-    "${BASE_DIR}/.venv-proxy/bin/pip" install -r "${BASE_DIR}/proxy/requirements.txt" pytest -i https://pypi.tuna.tsinghua.edu.cn/simple
+    "${BASE_DIR}/.venv-proxy/bin/pip" install -r "${BASE_DIR}/proxy/requirements.txt" -i "${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 fi
 
 # 1.6 编译与语法检查

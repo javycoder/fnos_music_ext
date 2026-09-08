@@ -600,7 +600,7 @@ if [ ! -x "${BASE_DIR}/.venv-proxy/bin/python" ]; then
 fi
 log_info "安装代理依赖..."
 "${BASE_DIR}/.venv-proxy/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-"${BASE_DIR}/.venv-proxy/bin/pip" install -q -r "${BASE_DIR}/proxy/requirements.txt" pytest -i "${PIP_INDEX}"
+"${BASE_DIR}/.venv-proxy/bin/pip" install -q -r "${BASE_DIR}/proxy/requirements.txt" -i "${PIP_INDEX}"
 
 install_unit() {
     local src="$1" dest="$2"
