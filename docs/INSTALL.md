@@ -201,3 +201,20 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 ```
 - `ok` 为 `true` 表示上游官方音乐后端连通正常，且至少有一个音源处于工作状态；
 - 未启用的音源会显示为 `"disabled"`。
+
+## 7. 常见问题排查
+
+### 容器日志刷 `PermissionError: [Errno 13] Permission denied: '/app/app.py'`
+
+v1.2.1 及更早版本的已知问题：镜像内源码文件权限继承了仓库检出时的 umask。
+若曾在 umask 077 的环境（root shell、`sudo git clone` 等）下检出仓库，`app.py` 为 600，
+容器内非 root 的 `appuser` 无法读取，uvicorn 启动失败并随 `restart: unless-stopped` 无限重启。
+
+v1.2.2 起已修复（镜像内文件统一 `--chown=appuser` 且权限 644，与宿主机文件权限解耦）。
+升级方法：
+
+```bash
+git pull && ./install.sh
+```
+
+Dockerfile 的变更会使对应构建层缓存失效，重新安装时会自动重建镜像，无需 `--no-cache`。

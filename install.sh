@@ -508,6 +508,13 @@ mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_hi
     "${BASE_DIR}/musicbox-data/netease-musicbox"
 chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
 
+# 归一化服务源码权限：umask 077 环境检出的文件为 600，会导致镜像内 appuser 读不到 app.py
+chmod 0644 \
+    "${BASE_DIR}/musicdl-service/app.py" "${BASE_DIR}/musicdl-service/hardening.py" \
+    "${BASE_DIR}/musicbox-service/app.py" "${BASE_DIR}/musicbox-service/runner.py" \
+    "${BASE_DIR}/musicbox-service/netease_ext.py" "${BASE_DIR}/lxmusic-service/app.py" \
+    2>/dev/null || true
+
 MUSICDL_FLAG="false"
 MUSICBOX_FLAG="false"
 LX_FLAG="false"
