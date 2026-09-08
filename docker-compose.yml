@@ -2,11 +2,20 @@
 # musicdl: https://github.com/CharlesPikachu/musicdl
 # musicbox: https://github.com/darknessomi/musicbox
 # lxmusic:  洛雪音乐源（LX Music 风格免登录解析：酷狗/网易/咪咕）
+#
+# 基础镜像 / pip / apt 源可由根目录 .env 覆盖（FNMUSIC_BASE_IMAGE / FNMUSIC_PIP_INDEX /
+# FNMUSIC_APT_MIRROR），其中基础镜像由 ensure_base_image.sh 自动探测维护：
+# 国内镜像优先直连（绕开 daemon 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）；
+# apt 源默认清华镜像，仅在 musicdl 构建层内临时替换，失败自动回退官方源，最终镜像与宿主机不受影响
 services:
   musicdl:
     build:
       context: ./musicdl-service
       dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn}
     container_name: fnmusic-musicdl
     ports:
       - "127.0.0.1:8768:8000"
@@ -28,6 +37,9 @@ services:
     build:
       context: ./musicbox-service
       dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: fnmusic-musicbox
     ports:
       - "0.0.0.0:8770:8000"
@@ -45,6 +57,9 @@ services:
     build:
       context: ./lxmusic-service
       dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: fnmusic-lxmusic
     ports:
       - "127.0.0.1:8772:8000"

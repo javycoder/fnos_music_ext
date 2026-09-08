@@ -218,3 +218,28 @@ git pull && ./install.sh
 ```
 
 Dockerfile 的变更会使对应构建层缓存失效，重新安装时会自动重建镜像，无需 `--no-cache`。
+
+### 构建时报 `failed to resolve source metadata for python:3.13-slim ... 401 Unauthorized` 或拉取超时
+
+多为 fnOS 等系统在 Docker daemon 全局配置的镜像加速器（如 `docker.fnnas.com`）异常所致：
+BuildKit 解析 `python:3.13-slim` 元数据时会先经过该加速器，失败后不会自动回退官方 Docker Hub，
+`docker compose up --build` 随即失败。
+
+v1.2.3 起安装脚本会在构建前自动探测可用源：**国内镜像优先**（完整镜像源引用直连，绕开 daemon
+加速器，真实拉取验证），逐个尝试 docker.1ms.run / docker.m.daocloud.io / docker.1panel.live /
+hub.rat.dev，全部失败再兜底官方源，结果缓存到 `.env` 的 `FNMUSIC_BASE_IMAGE`。
+全程不修改系统 Docker 配置，仅本应用构建生效。
+
+手动指定（例如自动探测全部失败、或偏好特定镜像源时）：
+
+```bash
+# 方式一：安装时通过环境变量指定
+BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim ./install.sh
+
+# 方式二：写入 .env（之后所有重建自动沿用）
+# FNMUSIC_BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim
+```
+
+自定义国内镜像候选列表：设置环境变量 `FNMUSIC_DOCKER_MIRRORS`（空格分隔，按序尝试）。
+
+Dockerfile 的变更会使对应构建层缓存失效，重新安装时会自动重建镜像，无需 `--no-cache`。
