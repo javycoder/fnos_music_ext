@@ -424,6 +424,15 @@ ensure_source() {
         fi
     fi
     if [ "${mode}" = "docker" ]; then
+        # 基础镜像源保障（国内镜像优先/官方兜底，见 ensure_base_image.sh），整次运行只执行一次
+        if [ "${BASE_IMAGE_ENSURED:-0}" -ne 1 ]; then
+            if bash "${BASE_DIR}/ensure_base_image.sh"; then
+                BASE_IMAGE_ENSURED=1
+            else
+                log_err "基础镜像源探测失败，无法构建容器。"
+                return 1
+            fi
+        fi
         reclaim_container "fnmusic-${name}" || return 1
         run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || true
     else

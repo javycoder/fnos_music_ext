@@ -37,6 +37,8 @@ ENABLE_LX=0
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
+BASE_IMAGE="${BASE_IMAGE:-}"
+DOCKER_IMAGE_MIRRORS="${DOCKER_IMAGE_MIRRORS:-docker.1ms.run docker.m.daocloud.io docker.1panel.live hub.rat.dev}"
 
 log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
 log_warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
@@ -540,6 +542,7 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
     echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
+    echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
         echo "FNMUSIC_LLM_API_KEY='$(dotenv_escape "${LLM_API_KEY}")'"
@@ -824,6 +827,16 @@ stop_unselected() {
     fi
 }
 
+# Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
+# 结果写入 .env 的 FNMUSIC_BASE_IMAGE 供 compose build.args 使用；失败直接退出，不动现有部署
+if [ "${MODE}" = "docker" ]; then
+    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
+        bash "${BASE_DIR}/ensure_base_image.sh"; then
+        log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源，或改用 --mode host。"
+        exit 1
+    fi
+fi
+
 clear_opposite_mode
 if [ "${MODE}" = "docker" ]; then
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
@@ -837,7 +850,7 @@ fi
 stop_unselected
 
 python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
-bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh" "${BASE_DIR}/netease_login.sh"
+bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh" "${BASE_DIR}/netease_login.sh" "${BASE_DIR}/ensure_base_image.sh"
 
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
