@@ -191,8 +191,8 @@ http://<飞牛NAS的IP地址>:8770/api/v1/auth/login/qr.png
 # 探测代理端点健康状态
 curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 
-# 运行本地自动化测试集
-.venv-proxy/bin/python -m pytest proxy/tests -q
+# 运行本地自动化测试集（需先 pip install -r proxy/requirements.txt pytest qrcode pillow）
+python3 -m pytest
 ```
 
 `healthz` 响应正常示例：

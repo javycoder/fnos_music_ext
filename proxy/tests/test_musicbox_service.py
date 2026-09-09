@@ -1,17 +1,27 @@
 import io
 import os
 import sys
+import importlib.util
 from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-# Ensure musicbox-service directory is in sys.path
-MUSICBOX_SERVICE_DIR = str(Path(__file__).resolve().parent.parent.parent / "musicbox-service")
-if MUSICBOX_SERVICE_DIR not in sys.path:
-    sys.path.insert(0, MUSICBOX_SERVICE_DIR)
+# musicbox-service 内部使用裸导入（import runner / from netease_ext import ...），
+# 仍需把服务目录加入 sys.path；但 app 本体以独立模块名加载，
+# 避免与其他服务的顶层 `app` 模块在同一 pytest 会话中冲突
+MUSICBOX_SERVICE_DIR = Path(__file__).resolve().parent.parent.parent / "musicbox-service"
+if str(MUSICBOX_SERVICE_DIR) not in sys.path:
+    sys.path.insert(0, str(MUSICBOX_SERVICE_DIR))
 
 import runner
-from app import app, UpstreamException
+
+_spec = importlib.util.spec_from_file_location("musicbox_service_app", MUSICBOX_SERVICE_DIR / "app.py")
+musicbox_app = importlib.util.module_from_spec(_spec)
+sys.modules["musicbox_service_app"] = musicbox_app
+_spec.loader.exec_module(musicbox_app)
+
+app = musicbox_app.app
+UpstreamException = musicbox_app.UpstreamException
 
 
 def test_ensure_xdg_dirs_creates_all_directories(tmp_path, monkeypatch):
@@ -265,3 +275,137 @@ def test_musicbox_search_logged_in_vip_playable(monkeypatch):
         assert data["data"][0]["song_id"] == 201
 
 
+
+
+# ------------------------------------------------ 未覆盖端点与错误信封补测 ---
+
+def test_healthz_endpoint():
+    with TestClient(app) as client:
+        resp = client.get("/healthz")
+    assert resp.status_code == 200
+    rj = resp.json()
+    assert rj["status"] == "ok"
+    assert "musicbox" in rj["source"]
+
+
+def test_song_url_invalid_quality_rejected():
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/song/123/url", params={"quality": "ultra"})
+    assert resp.status_code == 400
+    assert "Invalid quality" in resp.json()["detail"]
+
+
+def test_song_url_passes_quality_to_cli(monkeypatch):
+    captured = {}
+
+    def mock_run(args, timeout=30.0):
+        captured["args"] = args
+        return 0, '{"url": "http://m.test/a.flac"}', ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/song/123/url", params={"quality": "lossless"})
+    assert resp.status_code == 200
+    assert resp.json()["url"].endswith(".flac")
+    assert captured["args"] == ["song", "url", "123", "--quality", "lossless", "--json"]
+
+
+def test_song_info_artist_album_playlist_cli_args(monkeypatch):
+    captured = []
+
+    def mock_run(args, timeout=30.0):
+        captured.append(args)
+        return 0, '{"ok": true, "data": {"id": 1}}', ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/song/123/info").status_code == 200
+        assert client.get("/api/v1/artist/456", params={"limit": 50}).status_code == 200
+        assert client.get("/api/v1/album/789").status_code == 200
+        assert client.get("/api/v1/playlist/1000").status_code == 200
+    assert captured == [
+        ["song", "info", "123", "--json"],
+        ["artist", "456", "--limit", "50", "--json"],
+        ["album", "789", "--json"],
+        ["playlist", "show", "1000", "--json"],
+    ]
+
+
+def test_song_lyric_ok_and_upstream_error(monkeypatch):
+    monkeypatch.setattr(musicbox_app, "song_lyric_pair", lambda sid: {"lrc": "[00:01]晴天", "tlyric": ""})
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/song/123/lyric")
+    assert resp.status_code == 200
+    rj = resp.json()
+    assert rj["ok"] is True
+    assert rj["data"]["lrc"].startswith("[00:01]")
+
+    def _boom(sid):
+        raise RuntimeError("lyric upstream down")
+
+    monkeypatch.setattr(musicbox_app, "song_lyric_pair", _boom)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/song/123/lyric")
+    assert resp.status_code == 200
+    rj = resp.json()
+    assert rj["ok"] is False
+    assert "lyric upstream down" in rj["error"]
+
+
+def test_auth_status_and_login_check(monkeypatch):
+    captured = {}
+
+    def mock_run(args, timeout=30.0):
+        captured["args"] = args
+        return 0, '{"ok": true, "data": {"logged_in": true}}', ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/status")
+        assert resp.status_code == 200
+        assert resp.json()["data"]["logged_in"] is True
+        assert captured["args"] == ["auth", "status", "--json"]
+
+        # 空 unikey 直接 400，不触达上游
+        resp2 = client.get("/api/v1/auth/login/check", params={"unikey": "   "})
+        assert resp2.status_code == 400
+
+        resp3 = client.get("/api/v1/auth/login/check", params={"unikey": "key-1"})
+        assert resp3.status_code == 200
+        assert captured["args"] == ["auth", "login", "--check", "key-1", "--json"]
+
+
+def test_auth_login_post_builds_qr_url(monkeypatch):
+    def mock_run(args, timeout=30.0):
+        return 0, '{"ok": true, "data": {"unikey": "key-abc", "qr_ascii": "x"}}', ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.post("/api/v1/auth/login")
+    assert resp.status_code == 200
+    payload = resp.json()["data"]
+    assert payload["qr_url"] == "https://music.163.com/login?codekey=key-abc"
+
+
+def test_upstream_failure_maps_to_502(monkeypatch):
+    def mock_run(args, timeout=30.0):
+        return 3, "", "musicbox exploded"
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/status")
+    assert resp.status_code == 502
+    rj = resp.json()
+    assert rj["error"] == "upstream_error"
+    assert rj["exit_code"] == 3
+    assert "musicbox exploded" in rj["stderr"]
+
+
+def test_upstream_timeout_maps_to_504(monkeypatch):
+    def mock_run(args, timeout=30.0):
+        raise runner.MusicboxTimeoutError("musicbox timed out after 30s")
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/status")
+    assert resp.status_code == 504

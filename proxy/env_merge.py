@@ -7,6 +7,7 @@ install.sh 在写入 .env 前先收集“本次安装期望的配置”，再调
   除非该键出现在 explicit（用户本次明确提供了新值）列表中；
 - 新版本引入的新配置项 / 缺失配置项自动安全补齐；
 - 用户手工添加的自定义键原样保留；
+- 用户手写的注释/非赋值行按原顺序去重后保留在文件末尾（合并多次不堆积）；
 - 合并结果原子写入并保持 0600 权限，合并前由调用方负责备份。
 
 CLI:
@@ -146,6 +147,7 @@ def render_env(
     kv: "list[tuple[str, str]]",
     header: str = "",
     comments: "dict[str, str] | None" = None,
+    trailing: "list[str] | None" = None,
 ) -> str:
     lines = []
     if header:
@@ -154,7 +156,39 @@ def render_env(
         if comments and key in comments:
             lines.append(f"# {comments[key]}")
         lines.append(f"{key}={quote_env_value(val)}")
+    if trailing:
+        lines.append("")
+        lines.extend(trailing)
     return "\n".join(lines) + "\n"
+
+
+def preserve_user_comments(
+    lines: "list[str]",
+    header: str = "",
+) -> "list[str]":
+    """筛出应保留的用户手写注释/非赋值行。
+
+    剔除两类工具自生成行（避免合并多次后堆积）：
+    - render_env 写出的文件头注释 ``# {header}``；
+    - FNMUSIC_LX_* 键上方的 LX_COMMENT 注释（渲染时会重新生成）。
+    其余行按原顺序去重（用户写了两遍相同注释也只保留一份）。
+    """
+    auto = set()
+    if header:
+        auto.add(f"# {header}".strip())
+    out: "list[str]" = []
+    seen: "set[str]" = set()
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped or stripped in auto:
+            continue
+        if stripped.lstrip("#").strip() == LX_COMMENT:
+            continue
+        if stripped in seen:
+            continue
+        seen.add(stripped)
+        out.append(stripped)
+    return out
 
 
 def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
@@ -186,7 +220,7 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
-    existing_kv, _others = parse_env_file(args.existing)
+    existing_kv, existing_others = parse_env_file(args.existing)
     desired_kv, _ = parse_env_file(args.desired)
     explicit = {k.strip() for k in args.explicit.split(",") if k.strip()}
     merged, summary = merge_env(existing_kv, desired_kv, explicit)
@@ -195,9 +229,17 @@ def main(argv: "list[str] | None" = None) -> int:
     merged, lx_added = ensure_prefix_defaults(merged)
     summary["added"].extend(lx_added)
 
+    # 用户手写注释不能在升级合并时被静默丢弃：去重后保留在文件末尾
+    kept_comments = preserve_user_comments(existing_others, header=args.header)
+
     write_env_atomic(
         args.output,
-        render_env(merged, args.header, comments={k: LX_COMMENT for k, _ in LX_DEFAULTS}),
+        render_env(
+            merged,
+            args.header,
+            comments={k: LX_COMMENT for k, _ in LX_DEFAULTS},
+            trailing=kept_comments,
+        ),
     )
     if not args.quiet:
         for action in ("added", "updated", "preserved", "custom_kept"):

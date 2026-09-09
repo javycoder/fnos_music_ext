@@ -6,12 +6,26 @@
 import sys
 import time
 import types
+import threading
 import importlib.util
 from pathlib import Path
 
 import pytest
 
 _HERE = Path(__file__).resolve().parent
+
+# 会话收尾信号：让假慢源线程立即结束，避免 30 秒睡眠拖住解释器退出
+_RELEASE_SLOW_SOURCES = threading.Event()
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    _RELEASE_SLOW_SOURCES.wait(seconds)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_slow_source_threads():
+    yield
+    _RELEASE_SLOW_SOURCES.set()
 
 # 在导入 app 之前 stub 掉 musicdl 包（宿主环境未安装，服务跑在 Docker 里）
 _musicdl_stub = types.ModuleType("musicdl")
@@ -78,7 +92,7 @@ def _fake_search_factory(calls: dict, plan: dict):
         if cfg is None:
             return []
         if cfg.get("sleep"):
-            time.sleep(cfg["sleep"])
+            _interruptible_sleep(cfg["sleep"])
         short = app_module._source_short(source)
         return [_FakeSong(cfg["start"] + i, source) for i in range(cfg.get("count", 0))]
 
@@ -176,7 +190,7 @@ def test_timeout_shrinks_adaptively_after_failures(clean_state, monkeypatch):
     def _always_slow(source: str, keyword: str, limit: int) -> list:
         calls.setdefault(source, 0)
         calls[source] += 1
-        time.sleep(30)
+        _interruptible_sleep(30)
         return []
 
     monkeypatch.setattr(app_module, "_search_one_source", _always_slow)
