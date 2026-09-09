@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 = 已验证的最低支持版本；3.13 = 与生产 Docker 镜像一致
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install test dependencies
+        run: >
+          python -m pip install -r proxy/requirements.txt
+          pytest mutagen qrcode pillow pycryptodome
+
+      - name: Shell script syntax check
+        run: >
+          bash -n install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh
+          proxy/run_proxy.sh musicdl-service/smoke_test.sh
+
+      - name: Python compile check
+        run: >
+          python -m py_compile proxy/app.py proxy/recommend.py proxy/env_merge.py proxy/version.py
+          lxmusic-service/app.py musicdl-service/app.py musicdl-service/hardening.py
+          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py
+
+      - name: Run tests
+        run: python -m pytest
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 阶段一：仅报告不阻断（continue-on-error），存量问题另行评估修复
+      - name: shellcheck (report only)
+        continue-on-error: true
+        run: >
+          shellcheck -S error install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh
+          proxy/run_proxy.sh musicdl-service/smoke_test.sh
