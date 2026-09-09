@@ -1,5 +1,7 @@
 # fnmusic-ext 飞牛音乐扩展代理
 
+[![CI](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml)
+
 `fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式增强扩展。通过接管系统后端通信入口，在**完全不修改官方程序与数据库**的前提下，让原生飞牛音乐秒变全能音乐播放器。
 
 ### 🎵 核心带来什么功能？
@@ -12,7 +14,7 @@
 - **多音源自由组合**：
   - [musicbox](https://github.com/darknessomi/musicbox)（网易云高品质解析，支持扫码登录 VIP/收藏）；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等平台聚合）；
-  - **lxmusic**（洛雪风格免登录解析：酷狗 kg / 网易 wy / 咪咕 mg 直链）。
+  - **lxmusic**（洛雪风格免登录解析：酷狗 kg / 网易 wy / 咪咕 mg / QQ tx / 酷我 kw 直链；VIP 曲目经第三方链路解析并 Range 探活验证后才返回——"搜得到必能播"）。
 
 ---
 
@@ -104,13 +106,16 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_MUSICDL_URL` | `http://127.0.0.1:8768` | 聚合音源服务地址 |
 | `FNMUSIC_LX_ENABLED` | `true` | 是否启用洛雪免登录音源 (`lxmusic`) |
 | `FNMUSIC_LX_URL` | `http://127.0.0.1:8772` | 洛雪音源服务地址 |
+| `LX_SOURCES` | `kg,wy,mg,tx,kw` | lxmusic 启用的子源列表（容器/systemd 环境变量） |
+| `LX_THIRD_PARTY` | `1` | lxmusic 第三方解析链路总开关（关闭后退化为官方免登录直连，kw/tx 无结果） |
+| `LX_RESOLVER_TIMEOUT` | `4.0` | 第三方链路单次解析超时（秒） |
 | `FNMUSIC_ONLINE_SOURCES` | `MiguMusicClient,KuwoMusicClient` | musicdl 启用的子平台列表 |
 | `FNMUSIC_SEARCH_TIMEOUT` | `3.0` | 多音源并发搜索常规等待预算（秒） |
 | `FNMUSIC_SEARCH_CACHE_TTL`| `604800` | 搜索结果缓存有效期（默认 7 天） |
 | `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（兼容 OpenAI 规范） |
 | `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key |
 | `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 每日推荐生成模型 |
-| `FNMUSIC_VERSION` | `1.2.0` | 当前安装的版本号 |
+| `FNMUSIC_VERSION` | `1.3.0` | 当前安装的版本号 |
 
 ---
 
@@ -162,8 +167,8 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - 本项目在线音源检索与元数据抓取能力依赖于社区优秀的开源组件：
   - [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)
   - [darknessomi/musicbox](https://github.com/darknessomi/musicbox)
-  - 洛雪音乐（LX Music）社区音源思路（本仓库 `lxmusic-service` 为独立 HTTP 包装实现）
-  在此向上游开源项目的原作者与贡献者致以崇高的敬意。
+  - 洛雪音乐（LX Music）社区音源思路与 [pdone/lx-music-source](https://github.com/pdone/lx-music-source) 社区聚合音源的链路清单思路（本仓库 `lxmusic-service` 为独立 Python 实现，仅移植其多链路回退架构，不包含其脚本代码）
+ 在此向上游开源项目的原作者与贡献者致以崇高的敬意。
 - 本项目仅在本地私有云环境充当**协议中继与数据适配胶水层**，本身不具备任何音源破解或版权规避逻辑，主观上绝无任何侵犯各音乐平台、唱片公司或第三方知识产权的意图。
 
 ### 3. 音频及视听数据版权归属

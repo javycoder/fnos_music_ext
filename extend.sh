@@ -261,9 +261,9 @@ try:
 except Exception:
     pass" 2>/dev/null || true
         elif [ "${source}" = "lxmusic" ]; then
-            # 轮询 kg 与 wy 子源，分别获取候选歌曲，避免单一子源故障导致候选题库全灭
+            # 轮询 kg/wy/mg/kw 子源（tx 探活依赖第三方链路，当前默认无存活链路会返回空，仅作补充探测），避免单一子源故障导致候选题库全灭
             local lx_sub
-            for lx_sub in kg wy; do
+            for lx_sub in kg wy mg kw tx; do
                 curl -s --max-time 20 "${LX_URL}/api/v1/search?keyword=${encoded}&limit=5&sources=${lx_sub}" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
