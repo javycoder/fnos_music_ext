@@ -180,18 +180,19 @@ def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
     if int(item.get("is_free_part") or 0) != 0 or int(item.get("fail_process") or 0) == 4:
         return False
 
-    # 3. 收费/VIP 拦截
-    if int(item.get("pay_type") or 0) != 0:
-        return False
-    if int(item.get("pkg_price") or 0) != 0 or int(item.get("price") or 0) != 0:
-        return False
-    fee = item.get("fee")
-    if fee is not None:
-        try:
-            if int(fee) not in (0, 8):
-                return False
-        except (ValueError, TypeError):
-            pass
+    # 3. 收费/VIP 拦截（verified 条目已由服务端完成"直链解析+Range探活"验证，可播性有实证，跳过收费元数据拦截）
+    if item.get("verified") is not True:
+        if int(item.get("pay_type") or 0) != 0:
+            return False
+        if int(item.get("pkg_price") or 0) != 0 or int(item.get("price") or 0) != 0:
+            return False
+        fee = item.get("fee")
+        if fee is not None:
+            try:
+                if int(fee) not in (0, 8):
+                    return False
+            except (ValueError, TypeError):
+                pass
 
     # 4. 显式不可播/无流标记
     if item.get("unplayable") is True or item.get("playable") is False:
@@ -1169,6 +1170,7 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -
                 "cover_url": str(it.get("cover_url") or ""),
                 "file_size": file_size,
                 "lyric": "",
+                "verified": it.get("verified") is True,
             })
         return [it for it in items if is_playable_online_track(it)]
     except Exception as e:

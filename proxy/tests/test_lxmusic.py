@@ -12,6 +12,7 @@ from proxy.app import (
     fetch_lx_search,
     resolve_lx_url,
     get_version,
+    is_playable_online_track,
 )
 
 
@@ -145,6 +146,78 @@ async def test_fetch_lx_search_mapping():
     assert first["ext"] == "flac"
     assert first["duration_s"] == 269.0
     await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_fetch_lx_search_verified_vip_passes():
+    """verified 条目（服务端已探活实证）绕过收费元数据拦截。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "items": [
+                    {
+                        "id": "lx:kw:228908",
+                        "lx_source": "kw",
+                        "title": "晴天",
+                        "artist": "周杰伦",
+                        "album": "叶惠美",
+                        "duration_s": 269.0,
+                        "ext": "flac",
+                        "cover_url": "",
+                        "file_size": 38210000,
+                        "pay_type": 1,  # VIP 元数据保留
+                        "verified": True,  # 但已探活实证可播
+                    },
+                    {
+                        "id": "lx:wy:999999",
+                        "lx_source": "wy",
+                        "title": "晴天 (未验证VIP)",
+                        "artist": "周杰伦",
+                        "album": "",
+                        "duration_s": 269.0,
+                        "ext": "mp3",
+                        "cover_url": "",
+                        "file_size": 0,
+                        "fee": 1,  # VIP 且未 verified → 仍被拦截
+                    },
+                ],
+                "errors": {},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    items = await fetch_lx_search(client, "晴天", 20)
+    assert [it["id"] for it in items] == ["lx:kw:228908"]
+    assert items[0]["verified"] is True  # 字段透传
+    await client.aclose()
+
+
+# =========================================================================
+# 1b. is_playable_online_track：verified 可播性实证语义
+# =========================================================================
+def test_is_playable_online_track_verified_semantics():
+    base = {"id": "lx:kw:228908", "title": "晴天", "artist": "周杰伦", "duration_s": 269.0}
+
+    # 未 verified 的 VIP/付费条目：保持原有拦截（回归）
+    assert is_playable_online_track({**base, "pay_type": 3}) is False
+    assert is_playable_online_track({**base, "fee": 1}) is False
+    assert is_playable_online_track({**base, "price": 8}) is False
+
+    # verified 条目：服务端已 Range 探活实证可播，跳过收费元数据拦截
+    assert is_playable_online_track({**base, "pay_type": 3, "verified": True}) is True
+    assert is_playable_online_track({**base, "fee": 1, "verified": True}) is True
+
+    # verified 只豁免收费检查；真不可播的防线全部保留
+    assert is_playable_online_track({**base, "pay_type": 3, "verified": True, "title": "晴天 (试听)"}) is False
+    assert is_playable_online_track({**base, "verified": True, "is_trial": True}) is False
+    assert is_playable_online_track({**base, "verified": True, "url": "https://x/404/error.html"}) is False
+    assert is_playable_online_track({**base, "verified": True, "playable": False}) is False
+
+    # 免费条目行为不变
+    assert is_playable_online_track({**base}) is True
 
 
 @pytest.mark.anyio

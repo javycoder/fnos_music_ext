@@ -773,7 +773,7 @@ install_lxmusic_host() {
     unit="$(mktemp)"
     cat > "${unit}" <<EOF
 [Unit]
-Description=fnmusic-ext lxmusic source (LX Music style: kg/wy/mg)
+Description=fnmusic-ext lxmusic source (LX Music style: kg/wy/mg/tx/kw)
 After=network.target
 
 [Service]
@@ -781,7 +781,8 @@ Type=simple
 User=root
 WorkingDirectory=${BASE_DIR}/lxmusic-service
 Environment=PYTHONUNBUFFERED=1
-Environment=LX_SOURCES=kg,wy,mg
+Environment=LX_SOURCES=kg,wy,mg,tx,kw
+Environment=LX_THIRD_PARTY=1
 ExecStart=${BASE_DIR}/.venv-lxmusic/bin/uvicorn app:app --host 127.0.0.1 --port 8772
 Restart=always
 RestartSec=5

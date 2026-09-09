@@ -64,9 +64,10 @@ services:
     ports:
       - "127.0.0.1:8772:8000"
     environment:
-      - LX_SOURCES=kg,wy,mg
+      - LX_SOURCES=kg,wy,mg,tx,kw
       - LX_SEARCH_TIMEOUT=12
       - LX_LIMIT_PER_SOURCE=20
+      - LX_THIRD_PARTY=1
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
