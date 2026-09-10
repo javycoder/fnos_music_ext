@@ -166,6 +166,61 @@ def test_slow_readiness_and_true_deadline(state, servers):
     assert time.monotonic()-start < 0.55
 
 
+def test_readiness_retries_publication_identity_change(state, servers, tmp_path, monkeypatch):
+    servers(state.target, official=True)
+    original = takeover.snapshot(state.target)
+    staged = tmp_path/'staged.sock'
+    servers(staged)
+    proxy = takeover.snapshot(staged)
+    connect = takeover.connect
+    snapshot = takeover.snapshot
+    published = False
+    rejected = []
+
+    def publish_after_connect(path, timeout=0.4):
+        nonlocal published
+        connection, peer = connect(path, timeout)
+        if path == state.target and not published:
+            published = True
+            try:
+                state.publish(staged, proxy)
+            except BaseException:
+                connection.close()
+                raise
+        return connection, peer
+
+    def observe_snapshot(path, timeout=0.9):
+        try:
+            return snapshot(path, timeout)
+        except takeover.Unsafe as exc:
+            rejected.append(str(exc))
+            raise
+
+    monkeypatch.setattr(takeover, 'connect', publish_after_connect)
+    monkeypatch.setattr(takeover, 'snapshot', observe_snapshot)
+    takeover.wait_ready(state, 3)
+    assert rejected == ['socket changed during identity check']
+    assert takeover.snapshot(state.target) == proxy
+    assert takeover.snapshot(state.upstream) == original
+    assert state.load()['proxy'] == proxy
+
+
+def test_readiness_persistent_identity_change_fails_closed(state, monkeypatch):
+    attempts = []
+
+    def changed(path, timeout=0.9):
+        attempts.append(path)
+        raise takeover.Unsafe('socket changed during identity check')
+
+    monkeypatch.setattr(takeover, 'snapshot', changed)
+    with pytest.raises(takeover.Unsafe, match='readiness deadline exceeded: socket changed'):
+        takeover.wait_ready(state, 0.05)
+    assert attempts
+    assert not state.target.exists()
+    assert not state.upstream.exists()
+    assert not state.file.exists()
+
+
 def function(text, name):
     start = text.index(name+'() {')
     return text[start:text.index('\n}', start)+2]+'\n'
@@ -288,12 +343,7 @@ def health(): return {'ok':True, 'upstream':'ok'}
     supervisor = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         if action != 'startup-fail':
-            deadline = time.monotonic()+10
-            while time.monotonic()<deadline and supervisor.poll() is None:
-                if state.file.exists() and takeover.snapshot(state.target)['kind'] == 'proxy':
-                    break
-                time.sleep(0.05)
-            takeover.wait_ready(state, 3)
+            takeover.wait_ready(state, 13)
             if action == 'term':
                 supervisor.terminate()
             else:
