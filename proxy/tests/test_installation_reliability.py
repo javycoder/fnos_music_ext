@@ -1,0 +1,434 @@
+"""Installation tests: real temporary UDS/processes, never host services or .env."""
+import importlib.util
+import itertools
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+import pytest
+
+BASE = Path(__file__).resolve().parents[2]
+spec = importlib.util.spec_from_file_location('takeover', BASE / 'proxy/takeover.py')
+takeover = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(takeover)
+
+SERVER = r'''
+import json, os, socketserver, sys, time
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        data = self.request.recv(4096)
+        if not data: return
+        if b'/_ext/livez ' in data:
+            body = {'service': 'fnmusic-ext', 'pid': os.getpid() + (1 if sys.argv[2]=='wrongpid' else 0)} if sys.argv[2] != 'unknown' else {'code': 99999, 'message': 'INVALID TOKEN'}
+        else:
+            if sys.argv[2] == 'slow': time.sleep(2.6)
+            body = {'ok': sys.argv[2]!='unhealthy', 'upstream': 'ok'}
+        payload = json.dumps(body).encode()
+        try: self.request.sendall(b'HTTP/1.0 200 OK\r\nContent-Length: '+str(len(payload)).encode()+b'\r\n\r\n'+payload)
+        except OSError: pass
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+Server(sys.argv[1], Handler).serve_forever()
+'''
+
+
+@pytest.fixture(autouse=True)
+def test_interpreter_packages(monkeypatch):
+    # Keep test dependencies available while preflight isolates HOME.
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(p for p in sys.path if p and Path(p).is_dir()))
+
+
+@pytest.fixture
+def servers(tmp_path):
+    children = []
+    def start(path, kind='proxy', official=False):
+        python = sys.executable
+        if official:
+            python = str(tmp_path / 'trim-music')
+            if not Path(python).exists():
+                shutil.copy2(sys.executable, python)
+        p = subprocess.Popen([python, '-u', '-c', SERVER, str(path), kind],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        children.append(p)
+        deadline = time.monotonic()+5
+        while not path.exists() and p.poll() is None and time.monotonic()<deadline:
+            time.sleep(0.01)
+        assert p.poll() is None and path.exists()
+        return p
+    yield start
+    for p in children:
+        if p.poll() is None:
+            p.terminate()
+        p.wait(timeout=5)
+
+
+@pytest.fixture
+def state(tmp_path):
+    return takeover.State(tmp_path/'target.sock', tmp_path/'upstream.sock', tmp_path/'state')
+
+
+def test_business_response_is_not_identity(state, servers):
+    servers(state.target, 'unknown')
+    assert takeover.snapshot(state.target)['kind'] == 'unknown'
+    servers(state.upstream, official=True)
+    before = takeover.inode(state.target)
+    with pytest.raises(takeover.Unsafe):
+        state.restore()
+    assert takeover.inode(state.target) == before
+
+
+def test_livez_requires_peer_pid(state, servers):
+    servers(state.target, 'wrongpid')
+    assert takeover.snapshot(state.target)['kind'] == 'unknown'
+
+
+def test_takeover_stale_proxy_restore_and_repeat(state, servers, tmp_path):
+    official = servers(state.target, official=True)
+    original = takeover.snapshot(state.target)
+    staged = tmp_path/'staged.sock'
+    proxy = servers(staged)
+    identity = takeover.snapshot(staged)
+    state.publish(staged, identity)
+    takeover.wait_ready(state, 2)
+    assert takeover.snapshot(state.upstream) == original
+    with pytest.raises(takeover.Unsafe):
+        state.restore()  # never unlink a live listener, even our own
+    proxy.terminate(); proxy.wait(timeout=3)
+    state.restore()
+    state.restore()
+    assert takeover.snapshot(state.target) == original
+    assert official.poll() is None
+
+
+def test_two_official_sockets_are_preserved(state, servers, tmp_path):
+    servers(state.target, official=True)
+    servers(state.upstream, official=True)
+    staged = tmp_path/'staged.sock'
+    servers(staged)
+    before = [takeover.inode(p) for p in (state.target, state.upstream)]
+    with pytest.raises(takeover.Unsafe):
+        state.publish(staged, takeover.snapshot(staged))
+    assert before == [takeover.inode(p) for p in (state.target, state.upstream)]
+
+
+def test_replaced_stale_inode_not_deleted(state, servers):
+    servers(state.upstream, official=True)
+    proxy = servers(state.target)
+    state.remember()
+    proxy.terminate(); proxy.wait(timeout=3)
+    old = state.target.with_suffix('.old')
+    state.target.rename(old)  # hold old inode allocated
+    s = socket.socket(socket.AF_UNIX); s.bind(str(state.target)); s.close()
+    with pytest.raises(takeover.Unsafe):
+        state.restore()
+    assert state.target.exists() and state.upstream.exists()
+
+
+def test_legacy_absent_target_official_upstream_recovers(state, servers):
+    servers(state.upstream, official=True)
+    identity = takeover.snapshot(state.upstream)
+    state.restore()
+    assert takeover.snapshot(state.target) == identity
+
+
+def test_legacy_dead_unrecorded_proxy_preserved(state, servers):
+    servers(state.upstream, official=True)
+    s = socket.socket(socket.AF_UNIX); s.bind(str(state.target)); s.close()
+    with pytest.raises(takeover.Unsafe):
+        state.restore()
+    assert state.target.exists()
+
+
+def test_symlink_is_not_socket(state, servers, tmp_path):
+    other = tmp_path/'other.sock'; servers(other)
+    state.target.symlink_to(other)
+    with pytest.raises(takeover.Unsafe):
+        state.restore()
+    assert state.target.is_symlink()
+
+
+def test_slow_readiness_and_true_deadline(state, servers):
+    servers(state.target, 'slow')
+    with state.lock():
+        state.save({'proxy': takeover.snapshot(state.target)})
+    start = time.monotonic()
+    takeover.wait_ready(state, 4)
+    assert 2.5 < time.monotonic()-start < 4.2
+    start = time.monotonic()
+    with pytest.raises(takeover.Unsafe):
+        takeover.wait_ready(state, 0.3)
+    assert time.monotonic()-start < 0.55
+
+
+def function(text, name):
+    start = text.index(name+'() {')
+    return text[start:text.index('\n}', start)+2]+'\n'
+
+
+COMBINATIONS = [v for v in itertools.product((0, 1), repeat=3) if any(v)]
+
+
+@pytest.mark.parametrize('flags', COMBINATIONS)
+@pytest.mark.parametrize('mode', ['host', 'docker'])
+def test_source_config_and_lifecycle_matrix(tmp_path, flags, mode):
+    # Extract actual shell function definitions; every external action is mocked.
+    install = (BASE/'install.sh').read_text()
+    names = ('musicdl', 'musicbox', 'lxmusic')
+    selected = ','.join(n for n, flag in zip(names, flags) if flag)
+    script = 'set -euo pipefail\nlog_err() { printf "%s\\n" "$*" >&2; }\nlog_info() { :; }\n'
+    script += function(install, 'parse_sources')
+    script += function(install, 'clear_opposite_mode')
+    script += function(install, 'stop_unselected')
+    script += '''remove_owned_container() { printf 'container %s\\n' "$1"; }
+stop_owned_source_unit() { printf 'unit %s\\n' "$1"; }
+'''
+    script += f'MODE={mode}\nparse_sources {selected}\nprintf "flags %s %s %s\\n" "$ENABLE_MUSICDL" "$ENABLE_MUSICBOX" "$ENABLE_LX"\nclear_opposite_mode\nstop_unselected\n'
+    result = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=True)
+    rows = result.stdout.splitlines()
+    assert rows[0] == 'flags '+' '.join(map(str, flags))
+    opposite = 'container' if mode == 'host' else 'unit'
+    for name, flag in zip(names, flags):
+        assert f'{opposite} fnmusic-{name}' in rows
+        if not flag:
+            assert f'unit fnmusic-{name}' in rows and f'container fnmusic-{name}' in rows
+    # Actual app config import under all 14 deployment/source combinations.
+    python = Path(sys.executable)
+    env = os.environ.copy()
+    env.update(FNMUSIC_HOME=str(tmp_path), FNMUSIC_DEPLOY_MODE=mode,
+               FNMUSIC_MUSICDL_ENABLED=str(bool(flags[0])).lower(),
+               FNMUSIC_NETEASE_ENABLED=str(bool(flags[1])).lower(),
+               FNMUSIC_LX_ENABLED=str(bool(flags[2])).lower(), PYTHONDONTWRITEBYTECODE='1')
+    for key in ('FNMUSIC_CACHE_DIR','FNMUSIC_FAV_DIR','FNMUSIC_RECOMMEND_DIR','FNMUSIC_PLAY_HISTORY_DIR','FNMUSIC_LIBRARY_DIR'):
+        env[key] = str(tmp_path/key)
+    env['FNMUSIC_MUSIC_DB'] = str(tmp_path/'unused.db')
+    code = 'import app,json;print(json.dumps([app.CONF[k] for k in ("musicdl_enabled","netease_enabled","lx_enabled")]))'
+    output = subprocess.check_output([str(python), '-B', '-c', code], env=env, cwd=BASE/'proxy', text=True)
+    assert json.loads(output) == list(map(bool, flags))
+
+
+def test_host_install_unit_restarts_and_propagates_failure(tmp_path):
+    install = (BASE/'install.sh').read_text()
+    script = 'set -euo pipefail\n'+function(install, 'install_unit')
+    script += '''log_warn() { :; }; log_err() { :; }
+sudo() { printf '%s\\n' "$*"; if [ "$1 $2" = 'systemctl restart' ]; then return 1; fi; }
+rm() { :; }
+'''
+    script += f'BASE_DIR={tmp_path}\nif install_unit {tmp_path}/src {tmp_path}/unit; then exit 99; fi\n'
+    result = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=True)
+    assert 'systemctl enable unit' in result.stdout
+    assert 'systemctl restart unit' in result.stdout
+    assert '--now' not in result.stdout
+
+
+def test_foreign_container_never_removed(tmp_path):
+    script = f'set -euo pipefail\nsource "{BASE}/proxy/install_common.sh"\nBASE_DIR={tmp_path}\n'
+    script += '''log_err() { :; }
+run_docker() { if [ "$1" = rm ]; then exit 99; fi; if [ "$#" -gt 3 ]; then printf /some/other/checkout; fi; }
+if remove_owned_container fnmusic-lxmusic; then exit 88; fi
+'''
+    subprocess.run(['bash', '-c', script], check=True)
+
+
+def test_unit_uses_canonical_template_and_explicit_interpreters(tmp_path):
+    for script in ('install.sh', 'extend.sh', 'restore.sh', 'proxy/run_proxy.sh', 'proxy/install_common.sh'):
+        subprocess.run(['bash', '-n', str(BASE/script)], check=True)
+    output = subprocess.check_output([sys.executable, str(BASE/'proxy/takeover.py'), 'render-unit', '--base', str(BASE)], text=True)
+    assert '@BASE_DIR@' not in output
+    assert 'ExecStart=/bin/bash ' in output and 'ExecStartPost=/usr/bin/python3 ' in output
+    assert '[ -S ' not in output and 'Restart=no' in output
+
+
+def test_preflight_invalid_config_never_touches_sockets_or_production(tmp_path):
+    base = tmp_path/'checkout'; base.mkdir()
+    (base/'proxy').symlink_to(BASE/'proxy', target_is_directory=True)
+    (base/'.venv-proxy/bin').mkdir(parents=True)
+    (base/'.venv-proxy/bin/python').symlink_to(sys.executable)
+    (base/'.env').write_text("FNMUSIC_ONLINE_LIMIT='secret-invalid-number'\n")
+    result = subprocess.run([sys.executable, str(BASE/'proxy/takeover.py'), 'preflight', '--base', str(base)], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'secret-invalid-number' not in result.stdout+result.stderr
+    assert not (base/'cache').exists()
+
+
+def test_dotenv_is_data_not_executable(tmp_path):
+    (tmp_path/'.env').write_text("FNMUSIC_LLM_API_KEY='one'\\''two'\nMALICIOUS='$(touch SHOULD_NOT_EXIST)'\n")
+    env = takeover.environment(tmp_path)
+    assert env['FNMUSIC_LLM_API_KEY'] == "one'two"
+    assert env['MALICIOUS'] == '$(touch SHOULD_NOT_EXIST)'
+    assert not (tmp_path/'SHOULD_NOT_EXIST').exists()
+
+
+@pytest.mark.parametrize('action', ['term', 'child-kill', 'startup-fail'])
+def test_real_supervisor_signal_and_crash_rollback(state, servers, tmp_path, action):
+    servers(state.target, official=True)
+    original = takeover.snapshot(state.target)
+    base = tmp_path/'checkout'; (base/'proxy').mkdir(parents=True)
+    (base/'.venv-proxy/bin').mkdir(parents=True)
+    (base/'.venv-proxy/bin/python').symlink_to(sys.executable)
+    (base/'proxy/recommend.py').write_text('')
+    app = """import os
+from fastapi import FastAPI
+app = FastAPI()
+@app.get('/_ext/livez')
+def livez(): return {'service':'fnmusic-ext', 'pid':os.getpid()}
+@app.get('/_ext/healthz')
+def health(): return {'ok':True, 'upstream':'ok'}
+"""
+    if action == 'startup-fail':
+        app += "\n@app.on_event('startup')\ndef fail(): raise ValueError('SECRET-never-log')\n"
+    (base/'proxy/app.py').write_text(app)
+    command = [sys.executable, str(BASE/'proxy/takeover.py'), 'run', '--base', str(base),
+               '--target', str(state.target), '--upstream', str(state.upstream), '--state-dir', str(state.directory)]
+    supervisor = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        if action != 'startup-fail':
+            deadline = time.monotonic()+10
+            while time.monotonic()<deadline and supervisor.poll() is None:
+                if state.file.exists() and takeover.snapshot(state.target)['kind'] == 'proxy':
+                    break
+                time.sleep(0.05)
+            takeover.wait_ready(state, 3)
+            if action == 'term':
+                supervisor.terminate()
+            else:
+                os.kill(state.load()['proxy']['process']['pid'], signal.SIGKILL)
+        out, err = supervisor.communicate(timeout=12)
+        assert 'SECRET-never-log' not in out+err
+        assert takeover.snapshot(state.target) == original
+        assert not state.upstream.exists()
+        assert supervisor.returncode == (0 if action == 'term' else 1)
+    finally:
+        if supervisor.poll() is None:
+            supervisor.terminate()
+            supervisor.communicate(timeout=12)
+
+
+def test_official_process_restart_record_mismatch_preserved(state, servers, tmp_path):
+    official = servers(state.upstream, official=True)
+    state.remember()
+    official.terminate(); official.wait(timeout=3)
+    state.upstream.rename(tmp_path/'old.sock')
+    servers(state.upstream, official=True)
+    before = takeover.snapshot(state.upstream)
+    with pytest.raises(takeover.Unsafe): state.remember()
+    with pytest.raises(takeover.Unsafe): state.restore()
+    assert takeover.snapshot(state.upstream) == before
+
+
+def test_record_symlink_and_permissions_rejected(state, tmp_path):
+    with state.lock(): state.save({})
+    state.file.chmod(0o666)
+    with pytest.raises(takeover.Unsafe): state.load()
+    state.file.unlink()
+    other = tmp_path/'other.json'; other.write_text('{}')
+    state.file.symlink_to(other)
+    with pytest.raises(OSError): state.load()
+
+
+def test_preflight_diagnostic_retains_only_exception_class():
+    assert takeover.diagnostic('Traceback:\nValueError: SECRET_URL_AND_KEY') == 'ValueError'
+    assert 'SECRET' not in takeover.diagnostic('SECRET arbitrary output')
+    assert takeover.diagnostic("ModuleNotFoundError: No module named 'uvicorn'") == 'ModuleNotFoundError: missing module uvicorn'
+
+
+def test_safe_child_logs_retain_outcomes_without_credentials(capsys):
+    import io
+    lines = (
+        '2026-09-10 12:00:00,123 [WARNING] fnmusic_proxy: Failed to fetch online search from musicdl: ReadTimeout https://user:PASS@host/path?token=TOKEN api_key=KEY Cookie: COOKIE\n'
+        'INFO:     Application startup complete.\n'
+        '  File "/private/SECRET/path/app.py", line 42, in lifespan\n'
+        "ModuleNotFoundError: No module named 'uvicorn'\n"
+        'ValueError: SECRET_URL_AND_KEY\n'
+        '2026-09-10 12:00:00,124 [INFO] fnmusic_proxy: llm_api_key = KEY\n'
+        '2026-09-10 12:00:00,125 [WARNING] fnmusic_proxy.recommend: llm http 503\n'
+    )
+    takeover.drain_diagnostics(io.StringIO(lines), ('KEY',))
+    output = capsys.readouterr().err
+    assert 'WARNING Failed to fetch online search from musicdl: ReadTimeout' in output
+    assert '2026-09-10 12:00:00,123' in output
+    assert 'INFO Application startup complete.' in output
+    assert 'traceback: app.py:42 in lifespan' in output
+    assert 'missing module uvicorn' in output
+    assert 'WARNING llm http 503' in output
+    assert 'ValueError' in output
+    for secret in ('PASS', 'TOKEN', 'KEY', 'COOKIE', 'SECRET', '/private', 'https://'):
+        assert secret not in output
+
+
+def test_safe_child_logs_discard_oversized_line_tail(capsys):
+    import io
+    oversized = 'x' * 16384 + 'INFO:     Application startup complete.\n'
+    takeover.drain_diagnostics(io.StringIO(oversized))
+    output = capsys.readouterr().err
+    assert 'oversized log line omitted' in output
+    assert 'Application startup' not in output
+
+
+def test_atomic_move_does_not_clobber_occupied_destination(tmp_path):
+    a, b = tmp_path/'a', tmp_path/'b'
+    a.write_text('source'); b.write_text('keep')
+    with pytest.raises(takeover.Unsafe): takeover.move_no_replace(a, b)
+    assert a.read_text() == 'source' and b.read_text() == 'keep'
+
+
+def test_install_lock_reexec_preserves_uid_home_and_overrides(tmp_path):
+    # Real unprivileged flock and re-exec; only privileged preparation is stubbed.
+    common = (BASE/'proxy/install_common.sh').read_text().replace('/run/fnmusic-ext-install/operation.lock', str(tmp_path/'operation.lock'))
+    helper = tmp_path/'common.sh'; helper.write_text(common)
+    script = tmp_path/'install.sh'
+    script.write_text(f"""#!/bin/bash
+set -euo pipefail
+BASE_DIR='{tmp_path}'
+sudo() {{ :; }}
+source '{helper}'
+installation_lock "$@"
+printf '%s|%s|%s|%s' "$(id -u)" "$HOME" "$PIP_INDEX" "$FNMUSIC_CUSTOM_TEST"
+""")
+    env = os.environ.copy()
+    env.update(PIP_INDEX='custom-index', FNMUSIC_CUSTOM_TEST='retained', HOME=str(tmp_path))
+    env.pop('FNMUSIC_INSTALL_LOCK_HELD', None)
+    out = subprocess.check_output(['bash', str(script)], env=env, text=True)
+    assert out == f'{os.getuid()}|{tmp_path}|custom-index|retained'
+
+
+def test_socket_mutation_lock_serializes_processes(state):
+    with state.lock():
+        command = [sys.executable, str(BASE/'proxy/takeover.py'), 'remember', '--target', str(state.target),
+                   '--upstream', str(state.upstream), '--state-dir', str(state.directory)]
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.2)
+        assert child.poll() is None
+    child.communicate(timeout=3)
+    assert child.returncode == 0
+
+
+def test_nested_startup_failure_runs_verified_rollback():
+    extend = (BASE/'extend.sh').read_text()
+    script = 'set -Eeuo pipefail\n'
+    script += function(extend, 'rollback')
+    script += """log_err() { printf 'error\n'; }; log_warn() { printf 'warn\n'; }; log_info() { printf 'info\n'; }
+sudo() { printf 'sudo %s\n' "$*"; }
+takeover() { printf 'takeover %s\n' "$*"; }
+trap rollback ERR INT TERM
+nested_startup() { false; }
+nested_startup
+"""
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert 'takeover remember' in result.stdout
+    assert 'sudo systemctl stop fnmusic-ext.service' in result.stdout
+    assert 'takeover restore' in result.stdout
+    assert result.stdout.index('takeover remember') < result.stdout.index('sudo systemctl stop')
+
+
+def test_official_only_restore_clears_old_record(state, servers):
+    servers(state.target, official=True)
+    with state.lock(): state.save({'proxy': {'inode': [0, 0]}})
+    state.restore()
+    assert 'proxy' not in state.load()

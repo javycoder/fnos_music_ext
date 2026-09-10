@@ -9,7 +9,92 @@ import pytest
 # 确保能 import 同目录下的 hardening
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight
+from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy
+
+
+class TestSourceBulkhead:
+    def test_exhaustion_isolated_until_workers_really_exit(self):
+        slow_sources = [f"slow{i}" for i in range(6)]
+        pool = SourceBulkhead([*slow_sources, "fast"])
+        release = threading.Event()
+        started = {source: threading.Event() for source in slow_sources}
+        futures = []
+
+        def slow(source):
+            started[source].set()
+            assert release.wait(5), "test must release workers"
+            return source
+
+        async def main():
+            # Fill all six slots that formerly exhausted the shared executor.
+            for source in slow_sources:
+                futures.append(pool.submit(source, slow, source))
+            assert all(event.wait(1) for event in started.values())
+            for future in futures:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.wrap_future(future), 0.01)
+            for _ in range(20):
+                for source in slow_sources:
+                    with pytest.raises(SourceBusy):
+                        pool.submit(source, slow, source)
+            assert await pool.run("fast", lambda: "ok", timeout=1) == "ok"
+            assert len(pool._executors) == 7
+            assert all(len(ex._threads) <= 1 for ex in pool._executors.values())
+            assert all(ex._work_queue.qsize() == 0 for ex in pool._executors.values())
+            with pytest.raises(ValueError):
+                pool.submit("unregistered", lambda: None)
+            release.set()
+            for future in futures:
+                await asyncio.wrap_future(future)
+            # Worker completion, unlike waiter cancellation, permits reuse.
+            assert await pool.run("slow0", lambda: "recovered", timeout=1) == "recovered"
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+        assert all(not t.is_alive() for ex in pool._executors.values() for t in ex._threads)
+        with pytest.raises(SourceBusy):
+            pool.submit("fast", lambda: None)
+
+    def test_cancelled_waiter_keeps_admission(self):
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+        def slow():
+            started.set()
+            assert release.wait(5)
+            raise RuntimeError("late failure")
+        async def main():
+            task = asyncio.create_task(pool.run("source", slow, timeout=2))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            with pytest.raises(SourceBusy):
+                await pool.run("source", lambda: None, timeout=1)
+            release.set()
+            while pool._busy:
+                await asyncio.sleep(0.001)
+            assert await pool.run("source", lambda: "ok", timeout=1) == "ok"
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+    def test_exception_releases_slot(self):
+        pool = SourceBulkhead(["source"])
+        def fail():
+            raise RuntimeError("failed")
+        try:
+            with pytest.raises(RuntimeError, match="failed"):
+                pool.submit("source", fail).result(1)
+            assert pool.submit("source", lambda: 1).result(1) == 1
+        finally:
+            pool.shutdown()
 
 
 class TestSearchCache:

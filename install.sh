@@ -19,6 +19,9 @@ set -euo pipefail
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared outer lock is never acquired by systemd service helpers.
+source "${BASE_DIR}/proxy/install_common.sh"
+installation_lock "$@"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 MODE=""
@@ -100,17 +103,7 @@ parse_sources() {
     fi
 }
 
-wait_http() {
-    local url="$1" tries="${2:-60}" delay="${3:-2}"
-    local i
-    for i in $(seq 1 "${tries}"); do
-        if curl -sf --max-time 3 "${url}" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep "${delay}"
-    done
-    return 1
-}
+
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -156,20 +149,6 @@ run_docker() {
     fi
 }
 
-# 容器名全局固定（fnmusic-*）；若被其他副本/并发任务的容器占用，移除后由当前目录接管
-reclaim_container() {
-    local name="$1" owner=""
-    if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
-        return 0
-    fi
-    owner="$(run_docker container inspect "${name}" \
-        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
-    log_info "检测到同名容器 ${name}（来自 ${owner:-未知目录}），移除后由当前目录接管..."
-    if ! run_docker rm -f "${name}"; then
-        log_err "无法移除同名容器 ${name}，请手动执行: docker rm -f ${name}"
-        return 1
-    fi
-}
 
 precheck_environment() {
     log_info "==> 开始安装环境预检..."
@@ -261,6 +240,8 @@ ensure_docker_ready() {
         exit 1
     fi
 }
+
+check_proxy_unit_owner || exit 1
 
 precheck_environment
 
@@ -619,10 +600,15 @@ install_unit() {
         log_warn "或稍后用 sudo cp 该文件到 ${dest}"
         return 1
     fi
-    sudo cp "${src}" "${dest}"
+    if [ -f "${dest}" ] && ! grep -Fq "WorkingDirectory=${BASE_DIR}/" "${dest}"; then
+        log_err "目标 unit 不属于当前目录；拒绝覆盖。"
+        return 1
+    fi
+    sudo cp "${src}" "${dest}" || return 1
     rm -f "${src}"
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$(basename "${dest}")"
+    sudo systemctl daemon-reload || return 1
+    sudo systemctl enable "$(basename "${dest}")" || return 1
+    sudo systemctl restart "$(basename "${dest}")" || return 1
     return 0
 }
 
@@ -672,13 +658,14 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     if ! install_unit "${unit}" /etc/systemd/system/fnmusic-musicdl.service; then
-        return 0
+        return 1
     fi
     if wait_http "http://127.0.0.1:8768/healthz" 30 1; then
         log_info "宿主机 musicdl 已就绪"
         return 0
     fi
     log_warn "musicdl systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicdl"
+    return 1
 }
 
 # --- musicbox ---
@@ -736,13 +723,14 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     if ! install_unit "${unit}" /etc/systemd/system/fnmusic-musicbox.service; then
-        return 0
+        return 1
     fi
     if wait_http "http://127.0.0.1:8770/healthz" 30 1; then
         log_info "宿主机 musicbox 已就绪"
         return 0
     fi
     log_warn "musicbox systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicbox"
+    return 1
 }
 
 # --- lxmusic（洛雪音乐源） ---
@@ -781,8 +769,11 @@ Type=simple
 User=root
 WorkingDirectory=${BASE_DIR}/lxmusic-service
 Environment=PYTHONUNBUFFERED=1
-Environment=LX_SOURCES=kg,wy,mg,tx,kw
+Environment=LX_SOURCES=kg,wy,mg,kw
 Environment=LX_THIRD_PARTY=1
+Environment=LX_SEARCH_TIMEOUT=12
+Environment=LX_LIMIT_PER_SOURCE=20
+EnvironmentFile=-${BASE_DIR}/.env
 ExecStart=${BASE_DIR}/.venv-lxmusic/bin/uvicorn app:app --host 127.0.0.1 --port 8772
 Restart=always
 RestartSec=5
@@ -791,13 +782,14 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     if ! install_unit "${unit}" /etc/systemd/system/fnmusic-lxmusic.service; then
-        return 0
+        return 1
     fi
     if wait_http "http://127.0.0.1:8772/healthz" 30 1; then
         log_info "宿主机 lxmusic 已就绪"
         return 0
     fi
     log_warn "lxmusic systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-lxmusic"
+    return 1
 }
 
 clear_opposite_mode() {
@@ -805,26 +797,28 @@ clear_opposite_mode() {
     if [ "${MODE}" = "docker" ]; then
         log_info "Docker 模式：停用宿主机音源 systemd unit（若存在）..."
         for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-            sudo systemctl disable --now "${unit}.service" 2>/dev/null || true
+            stop_owned_source_unit "${unit}"
         done
     else
         log_info "Host 模式：停止 Docker 音源容器（若存在）..."
-        run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>/dev/null || true
+        for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+            remove_owned_container "${unit}"
+        done
     fi
 }
 
 stop_unselected() {
     if [ "${ENABLE_MUSICDL}" -eq 0 ]; then
-        run_docker rm -f fnmusic-musicdl 2>/dev/null || true
-        sudo systemctl disable --now fnmusic-musicdl.service 2>/dev/null || true
+        remove_owned_container fnmusic-musicdl
+        stop_owned_source_unit fnmusic-musicdl
     fi
     if [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-        run_docker rm -f fnmusic-musicbox 2>/dev/null || true
-        sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
+        remove_owned_container fnmusic-musicbox
+        stop_owned_source_unit fnmusic-musicbox
     fi
     if [ "${ENABLE_LX}" -eq 0 ]; then
-        run_docker rm -f fnmusic-lxmusic 2>/dev/null || true
-        sudo systemctl disable --now fnmusic-lxmusic.service 2>/dev/null || true
+        remove_owned_container fnmusic-lxmusic
+        stop_owned_source_unit fnmusic-lxmusic
     fi
 }
 
@@ -838,6 +832,7 @@ if [ "${MODE}" = "docker" ]; then
     fi
 fi
 
+takeover preflight --base "${BASE_DIR}"
 clear_opposite_mode
 if [ "${MODE}" = "docker" ]; then
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
@@ -850,8 +845,10 @@ else
 fi
 stop_unselected
 
-python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
-bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh" "${BASE_DIR}/netease_login.sh" "${BASE_DIR}/ensure_base_image.sh"
+takeover preflight --base "${BASE_DIR}"
+for script in extend.sh restore.sh proxy/run_proxy.sh proxy/install_common.sh netease_login.sh ensure_base_image.sh; do
+    bash -n "${BASE_DIR}/${script}"
+done
 
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
@@ -897,5 +894,5 @@ if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
 fi
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
-    exec "${BASE_DIR}/extend.sh" --force
+    exec /bin/bash "${BASE_DIR}/extend.sh" --force
 fi

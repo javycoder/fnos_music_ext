@@ -10,7 +10,8 @@
 from __future__ import annotations
 
 import asyncio
-import glob
+import hashlib
+import math
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
+import anyio
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
@@ -124,23 +126,51 @@ _FORMAT_ALIASES = {
 _SEARCH_CACHE: dict[str, dict] = {}
 
 
+def _search_ttl(entry: dict) -> float:
+    # Backend IDs/URLs are memory scoped; positive results revalidate in 5m.
+    if entry.get("partial"):
+        return 30.0
+    if not entry.get("items"):
+        return 10.0
+    return min(float(CONF.get("search_cache_ttl", 604800)), 300.0)
+
+
 def _clean_search_cache() -> None:
-    """清理过期缓存，若仍超过容量上限（2000条），按 ts 升序淘汰最旧的一半。"""
     now = time.time()
-    ttl = CONF.get("search_cache_ttl", 604800.0)
-    expired_keys = [k for k, v in _SEARCH_CACHE.items() if now - v.get("ts", 0) >= ttl]
-    for k in expired_keys:
-        _SEARCH_CACHE.pop(k, None)
+    expired = [k for k, v in _SEARCH_CACHE.items() if now - v.get("accessed", v.get("ts", 0)) >= 900]
     if len(_SEARCH_CACHE) > 2000:
-        sorted_keys = sorted(_SEARCH_CACHE.keys(), key=lambda k: _SEARCH_CACHE[k].get("ts", 0))
-        to_remove = sorted_keys[: len(sorted_keys) // 2]
-        for k in to_remove:
-            _SEARCH_CACHE.pop(k, None)
+        expired += sorted(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k].get("accessed", 0))[:1000]
+    for key in expired:
+        entry = _SEARCH_CACHE.pop(key, {})
+        task = entry.get("task")
+        if task and not task.done():
+            task.cancel()
 
 
 def _set_search_cache(keyword: str, entry: dict) -> None:
     _clean_search_cache()
     _SEARCH_CACHE[keyword] = entry
+
+
+def _source_config() -> dict:
+    return {k: v for k, v in CONF.items() if k.endswith(("_enabled", "_url", "_limit", "_quality")) or k == "online_sources"}
+
+
+def _search_scope(request: Request) -> str:
+    auth = [request.headers.get(k, "") for k in ("cookie", "authorization", "x-trim-music-temp-token")]
+    config = _source_config()
+    filters = sorted((k, v) for k, v in request.query_params.multi_items() if k not in ("page", "q", "query", "keyword"))
+    return hashlib.sha256(json.dumps([auth, config, filters, request.url.path], sort_keys=True).encode()).hexdigest()
+
+
+def _source_enabled(guid: str) -> bool:
+    source = source_from_online_guid(guid)
+    if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled"), True):
+        return False
+    if source not in ("netease", "lx") and CONF.get("online_sources"):
+        selected = {name.strip().lower().removesuffix("musicclient") for name in str(CONF["online_sources"]).split(",")}
+        return source.lower() in selected
+    return True
 
 
 ONLINE_TRIAL_MARKERS = (
@@ -222,22 +252,40 @@ def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
     return True
 
 
+def _same_recording(left: dict, right: dict) -> bool:
+    """Conservative identity: never strip live/remix/version markers."""
+    for key in ("title", "artist", "version"):
+        a, b = (str(x.get(key) or "").strip().casefold() for x in (left, right))
+        if a != b or (key != "version" and not a):
+            return False
+    try:
+        a, b = float(left.get("duration_s") or 0), float(right.get("duration_s") or 0)
+        return math.isfinite(a) and math.isfinite(b) and a > 0 and b > 0 and abs(a - b) <= 2.0
+    except (TypeError, ValueError):
+        return False
+
+
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
-    """在线条目合并去重：按 (title, artist) 小写，保留最先出现的（musicbox 优先）。同时做可播校验。"""
+    """Keep the published representative and strict recording alternatives."""
+    result: list[dict] = []
     seen = set()
-    res = []
-    for it in items:
-        if not is_playable_online_track(it):
+    for item in items:
+        if not is_playable_online_track(item):
             continue
-        t = str(it.get("title") or it.get("name") or "").strip().lower()
-        a = str(it.get("artist") or "").strip().lower()
-        if t and a:
-            key = (t, a)
-            if key in seen:
-                continue
-            seen.add(key)
-        res.append(it)
-    return res
+        guid = online_guid_from_item(item)
+        if guid in seen:
+            continue
+        seen.add(guid)
+        representative = next((x for x in result if _same_recording(x, item)), None)
+        if representative is None:
+            representative = dict(item)
+            representative["_alternatives"] = list(item.get("_alternatives", []))
+            result.append(representative)
+        else:
+            alternatives = representative.setdefault("_alternatives", [])
+            if guid not in {online_guid_from_item(x) for x in alternatives}:
+                alternatives.append({k: v for k, v in item.items() if k != "_alternatives"})
+    return result
 
 
 def play_format_from_ext(ext: str | None) -> str:
@@ -580,7 +628,6 @@ def find_cache_file(guid: str) -> str | None:
     recalled = recalled_media_path(guid)
     if recalled:
         return recalled
-    file_id = online_file_id(guid)
     safe = cache_safe_guid(guid)
     for d in iter_media_dirs():
         if not os.path.isdir(d):
@@ -589,10 +636,6 @@ def find_cache_file(guid: str) -> str | None:
             exact = os.path.join(d, f"{safe}.{ext}")
             if os.path.exists(exact) and os.path.getsize(exact) > 0:
                 return exact
-            pattern = os.path.join(d, f"* - {glob.escape(file_id)}.{ext}")
-            for path in glob.glob(pattern):
-                if os.path.getsize(path) > 0:
-                    return path
     return None
 
 
@@ -608,25 +651,8 @@ def promote_cache_hit(guid: str, audio_path: str) -> str:
             return audio_path
     except Exception:
         return audio_path
-    file_id = online_file_id(guid)
-    ext = os.path.splitext(audio_path)[1] or ".mp3"
-    dest = None
-    if os.path.isdir(lib):
-        for lrc in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.lrc")):
-            dest = os.path.splitext(lrc)[0] + ext
-            break
-    if not dest:
-        return audio_path
-    if not os.path.exists(dest):
-        try:
-            os.makedirs(lib, exist_ok=True)
-            shutil.copy2(audio_path, dest)
-            adopt_library_perms(dest)
-        except Exception as e:
-            logger.warning("Failed to promote cache audio into library: %s", e)
-            return audio_path
-    remember_media_path(guid, dest)
-    return dest
+    # Bare legacy IDs cannot prove source/track identity.
+    return audio_path
 
 
 def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str:
@@ -637,11 +663,6 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str
     if stem:
         return f"{stem}.{ext}"
     lib = detect_library_dir()
-    file_id = online_file_id(guid)
-    if os.path.isdir(lib):
-        for path in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.{ext}")):
-            if os.path.getsize(path) > 0:
-                return path
     os.makedirs(lib, exist_ok=True)
     return unique_library_path(lib, library_basename(title, artist), ext)
 
@@ -657,7 +678,6 @@ def find_lyric_file(guid: str) -> str | None:
         sibling = os.path.splitext(audio)[0] + ".lrc"
         if os.path.exists(sibling) and os.path.getsize(sibling) > 0:
             return sibling
-    file_id = online_file_id(guid)
     safe = cache_safe_guid(guid)
     for d in iter_media_dirs():
         if not os.path.isdir(d):
@@ -665,10 +685,6 @@ def find_lyric_file(guid: str) -> str | None:
         exact = os.path.join(d, f"{safe}.lrc")
         if os.path.exists(exact) and os.path.getsize(exact) > 0:
             return exact
-        pattern = os.path.join(d, f"* - {glob.escape(file_id)}.lrc")
-        for path in glob.glob(pattern):
-            if os.path.getsize(path) > 0:
-                return path
     return None
 
 
@@ -751,6 +767,8 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
     if cached:
         return cached
 
+    if not _source_enabled(guid):
+        return ""
     src = source_from_online_guid(guid)
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)
@@ -1012,12 +1030,13 @@ async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -
     return payload
 
 
-async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: int) -> dict | None:
+async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: str | None = None) -> dict | None:
     if not keyword:
         return None
     params: dict[str, Any] = {"keyword": keyword, "limit": limit}
-    if CONF["online_sources"]:
-        params["sources"] = CONF["online_sources"]
+    selected_sources = CONF["online_sources"] if sources is None else sources
+    if selected_sources:
+        params["sources"] = selected_sources
     timeout = max(float(CONF.get("search_timeout") or 25), 8.0)
     try:
         r = await client.get("/search", params=params, timeout=timeout)
@@ -1076,6 +1095,7 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
                 "id": f"netease:{sid}",
                 "source": "netease",
                 "title": title,
+                "version": str(it.get("version") or ""),
                 "artist": artist,
                 "album": album,
                 "duration_s": duration_s,
@@ -1121,6 +1141,13 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
         return None
 
 
+class _SearchItems(list):
+    """List-compatible normalized results with source degradation metadata."""
+    def __init__(self, items, partial=False):
+        super().__init__(items)
+        self.partial = partial
+
+
 async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
     """洛雪音乐源搜索：返回统一 item（id = "lx:<source>:<identifier>"）。"""
     if not keyword:
@@ -1162,6 +1189,7 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -
                 "id": tid,
                 "source": "lx",
                 "lx_source": str(it.get("lx_source") or ""),
+                "version": str(it.get("version") or ""),
                 "title": str(it.get("title") or it.get("name") or ""),
                 "artist": str(it.get("artist") or ""),
                 "album": str(it.get("album") or ""),
@@ -1172,7 +1200,7 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -
                 "lyric": "",
                 "verified": it.get("verified") is True,
             })
-        return [it for it in items if is_playable_online_track(it)]
+        return _SearchItems([it for it in items if is_playable_online_track(it)], partial=bool(data.get("errors")))
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
         return None
@@ -1256,6 +1284,7 @@ def merge_online_tracks(
     online_data: list[dict] | dict | None,
     page: int = 1,
     size: int = 50,
+    selected: bool = False,
 ) -> dict:
     target_list = ensure_search_list(upstream_json)
     if not online_data:
@@ -1278,8 +1307,14 @@ def merge_online_tracks(
         if t and a:
             existing_keys.add((t, a))
 
+    online_limit = CONF["online_limit"]
+    if not selected:
+        start = 0 if page == 1 else online_limit + (page - 2) * size
+        raw_page = raw_items[start:start + (online_limit if page == 1 else size)]
+    else:
+        raw_page = raw_items
     filtered_online = []
-    for online_item in raw_items:
+    for online_item in raw_page:
         if not is_playable_online_track(online_item, require_id=True):
             continue
         ot = str(online_item.get("title") or online_item.get("name") or "").strip().lower()
@@ -1288,11 +1323,7 @@ def merge_online_tracks(
             continue
         filtered_online.append(online_item)
 
-    online_limit = CONF["online_limit"]
-    if page == 1:
-        page_online = filtered_online[:online_limit]
-    else:
-        page_online = filtered_online[online_limit + (page - 2) * size : online_limit + (page - 1) * size]
+    page_online = filtered_online
 
     for it in page_online:
         target_list.append(build_online_track(it))
@@ -1306,7 +1337,7 @@ def merge_online_tracks(
         orig_total = parent.get("total")
         if not isinstance(orig_total, int):
             orig_total = len(target_list) - len(page_online)
-        parent["total"] = orig_total + len(filtered_online)
+        parent["total"] = orig_total + sum(1 for item in raw_items if is_playable_online_track(item, require_id=True) and (title_from_track(item), artist_from_track(item)) not in existing_keys)
 
     return upstream_json
 
@@ -1494,6 +1525,11 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
+        tasks = [entry["task"] for entry in _SEARCH_CACHE.values() if entry.get("task") and not entry["task"].done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if created_upstream and getattr(fastapi_app.state, "upstream_client", None):
             await fastapi_app.state.upstream_client.aclose()
             fastapi_app.state.upstream_client = None
@@ -1514,67 +1550,48 @@ async def lifespan(fastapi_app: FastAPI):
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
 
 
+@app.get("/_ext/livez")
+async def ext_livez():
+    return {"ok": True, "service": "fnmusic-ext", "pid": os.getpid()}
+
+
 @app.get("/_ext/healthz")
 async def ext_healthz(request: Request):
-    upstream_client = get_upstream_client(request.app)
-    musicdl_client = get_musicdl_client(request.app)
-    musicbox_client = get_musicbox_client(request.app)
-    lx_client = get_lx_client(request.app)
-
-    upstream_status = "fail"
-    musicdl_status = "fail"
-    musicbox_status = "fail"
-    lx_status = "fail"
-
-    try:
-        r = await upstream_client.get("/music/api/v1/search/track?keyword=healthz_probe", timeout=2.0)
-        if r.status_code < 500:
-            upstream_status = "ok"
-    except Exception as e:
-        logger.debug("Upstream health check failed: %s", e)
-
-    if not CONF.get("musicdl_enabled", True):
-        musicdl_status = "disabled"
-    else:
+    async def probe(name: str, client: httpx.AsyncClient, path: str) -> dict:
         try:
-            r = await musicdl_client.get("/healthz", timeout=2.0)
-            if r.status_code == 200:
-                musicdl_status = "ok"
-        except Exception as e:
-            logger.debug("Musicdl health check failed: %s", e)
+            response = await asyncio.wait_for(client.get(path, timeout=2.0), timeout=2.4)
+            healthy = response.status_code < 500 if name == "upstream" else response.status_code == 200
+            detail: dict = {"status": "ok" if healthy else "fail", "http_status": response.status_code}
+            if name != "upstream" and healthy:
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        detail["dependency"] = payload
+                        if payload.get("ok") is False:
+                            detail["status"] = "fail"
+                    else:
+                        detail["status"] = "fail"
+                except ValueError:
+                    detail["status"] = "fail"
+                    detail["error"] = "invalid health JSON"
+            return detail
+        except Exception as exc:
+            return {"status": "fail", "error": type(exc).__name__}
 
-    if not CONF["netease_enabled"]:
-        musicbox_status = "disabled"
-    else:
-        try:
-            r = await musicbox_client.get("/healthz", timeout=2.0)
-            if r.status_code == 200:
-                musicbox_status = "ok"
-        except Exception as e:
-            logger.debug("Musicbox health check failed: %s", e)
-
-    if not CONF.get("lx_enabled", True):
-        lx_status = "disabled"
-    else:
-        try:
-            r = await lx_client.get("/healthz", timeout=2.0)
-            if r.status_code == 200:
-                lx_status = "ok"
-        except Exception as e:
-            logger.debug("Lxmusic health check failed: %s", e)
-
-    llm_status = "enabled" if dailyrec.llm_enabled() else "disabled"
-    source_ok = musicdl_status == "ok" or musicbox_status == "ok" or lx_status == "ok"
-
-    return {
-        "ok": upstream_status == "ok" and source_ok,
-        "version": get_version(),
-        "upstream": upstream_status,
-        "musicdl": musicdl_status,
-        "musicbox": musicbox_status,
-        "lxmusic": lx_status,
-        "llm": llm_status,
-    }
+    checks = [("upstream", True, get_upstream_client, "/music/api/v1/search/track?keyword=healthz_probe"),
+              ("musicdl", CONF.get("musicdl_enabled", True), get_musicdl_client, "/healthz"),
+              ("musicbox", CONF.get("netease_enabled", True), get_musicbox_client, "/healthz"),
+              ("lxmusic", CONF.get("lx_enabled", True), get_lx_client, "/healthz")]
+    enabled = [(name, getter, path) for name, on, getter, path in checks if on]
+    results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
+    details = {name: {"status": "disabled"} for name, on, _, _ in checks if not on}
+    details.update({name: result for (name, _, _), result in zip(enabled, results)})
+    statuses = {name: value["status"] for name, value in details.items()}
+    failed = [name for name, status in statuses.items() if status == "fail"]
+    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "lxmusic"))
+    return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
+            **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
+            "degraded": bool(failed), "failures": failed, "details": details}
 
 
 @app.get("/music/api/v1/search/track")
@@ -1635,154 +1652,98 @@ async def search_track(request: Request):
     if not keyword:
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
-    now = time.time()
-    cached_entry = _SEARCH_CACHE.get(keyword)
-    is_valid_cache = cached_entry is not None and (now - cached_entry.get("ts", 0) < CONF["search_cache_ttl"])
-
-    if is_valid_cache and cached_entry is not None:
-        task = cached_entry.get("task")
-        if task and not task.done() and page >= 2:
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=CONF["late_page_wait_s"])
-            except Exception:
-                pass
-        online_all = cached_entry.get("items", [])
-    else:
-        entry: dict[str, Any] = {"items": [], "ts": time.time(), "task": None}
-        mb_task: asyncio.Task | None = None
-        mdl_task: asyncio.Task | None = None
-        lx_task: asyncio.Task | None = None
-        if CONF["netease_enabled"]:
-            mb_task = asyncio.create_task(
-                fetch_musicbox_search(musicbox_client, keyword, CONF["netease_search_limit"])
-            )
-        if CONF.get("musicdl_enabled", True):
-            mdl_task = asyncio.create_task(
-                fetch_musicdl_search(musicdl_client, keyword, CONF["online_limit"])
-            )
-        lx_client = get_lx_client(request.app)
-        if CONF.get("lx_enabled", True):
-            lx_task = asyncio.create_task(
-                fetch_lx_search(lx_client, keyword, CONF["lx_search_limit"])
-            )
-
-        async def _bg_aggregator(
-            e: dict,
-            t_mb: asyncio.Task | None,
-            t_mdl: asyncio.Task | None,
-            t_lx: asyncio.Task | None = None,
-        ):
-            mb_res = None
-            mdl_res = None
-            lx_res = None
-            if t_mb:
-                try:
-                    mb_res = await t_mb
-                except Exception as exc:
-                    logger.warning("musicbox search bg failed: %s", exc)
-            if t_mdl:
-                try:
-                    mdl_res = await t_mdl
-                except Exception as exc:
-                    logger.warning("musicdl search bg failed: %s", exc)
-            if t_lx:
-                try:
-                    lx_res = await t_lx
-                except Exception as exc:
-                    logger.warning("lxmusic search bg failed: %s", exc)
-            mb_list = mb_res if isinstance(mb_res, list) else []
-            mdl_list = (
-                mdl_res.get("items", [])
-                if isinstance(mdl_res, dict) and isinstance(mdl_res.get("items"), list)
-                else []
-            )
-            lx_list = lx_res if isinstance(lx_res, list) else []
-            e["items"] = deduplicate_online_items(mb_list + mdl_list + lx_list)
-
-        agg_task = asyncio.create_task(_bg_aggregator(entry, mb_task, mdl_task, lx_task))
-        entry["task"] = agg_task
-        _set_search_cache(keyword, entry)
-
-        def _collect_source_items(*results: Any) -> list[dict]:
-            merged_items: list[dict] = []
-            for res in results:
-                if isinstance(res, Exception) or res is None:
-                    continue
-                if isinstance(res, dict) and isinstance(res.get("items"), list):
-                    merged_items.extend(res.get("items") or [])
-                elif isinstance(res, list):
-                    merged_items.extend(x for x in res if isinstance(x, dict))
-            return deduplicate_online_items(merged_items)
-
+    key = _search_scope(request) + ":" + keyword
+    _clean_search_cache()
+    entry = _SEARCH_CACHE.get(key)
+    if entry is None:
+        entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0, "keyword": keyword,
+                 "scope": _search_scope(request), "credentials": _credential_scope(request), "config": _source_config(), "task": None}
+        _set_search_cache(key, entry)
+    entry["accessed"] = time.time()
+    task = entry.get("task")
+    if (not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry):
+        task = asyncio.create_task(_aggregate_search(request, keyword, entry))
+        entry["task"] = task
+    if task and not task.done():
         if page == 1:
-            # 阶段一：等待预算（默认3.0s），若多个源全部或部分在此时间内完成，统一收集合并
-            wait_budget = float(CONF.get("netease_wait_s", 3.0))
-            pending = [t for t in (mb_task, mdl_task, lx_task) if t]
-            if pending:
-                try:
-                    done, _pending_left = await asyncio.wait(
-                        pending,
-                        timeout=wait_budget,
-                        return_when=asyncio.ALL_COMPLETED,
-                    )
-                except Exception:
-                    done = {t for t in pending if t.done()}
-                else:
-                    done = {t for t in pending if t.done()}
-
-                if done:
-                    # 3s 内已有音乐源返回：保留原有合并逻辑，并给极短缓冲尽量吸纳刚完成的副源
-                    if not agg_task.done():
-                        results: list[Any] = []
-                        for t in (mb_task, mdl_task, lx_task):
-                            if t and t in done:
-                                try:
-                                    results.append(t.result())
-                                except Exception as exc:
-                                    logger.warning("online search source failed (isolated): %s", exc)
-                        entry["items"] = _collect_source_items(*results)
-                    if not agg_task.done() and (mdl_task or lx_task):
-                        try:
-                            await asyncio.wait_for(asyncio.shield(agg_task), timeout=1.0)
-                        except Exception:
-                            pass
-                else:
-                    # 阶段二：若 3s 内没有任何源返回结果，进入超时外等待（默认 5.0s）
-                    # 在该时间内一旦任何一个在线源返回，马上采用该率先返回的结果
-                    rem_pending = [t for t in pending if not t.done()]
-                    late_wait_s = float(CONF.get("late_page_wait_s", 5.0))
-                    if rem_pending and late_wait_s > 0:
-                        try:
-                            late_done, _ = await asyncio.wait(
-                                rem_pending,
-                                timeout=late_wait_s,
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                        except Exception:
-                            late_done = {t for t in rem_pending if t.done()}
-                        else:
-                            late_done = {t for t in rem_pending if t.done()}
-
-                        if late_done:
-                            first_results: list[Any] = []
-                            # 优先按已完成任务收集结果
-                            for t in (mb_task, mdl_task, lx_task):
-                                if t and t in late_done:
-                                    try:
-                                        first_results.append(t.result())
-                                    except Exception as exc:
-                                        logger.warning("first completed source failed: %s", exc)
-                            entry["items"] = _collect_source_items(*first_results)
+            await asyncio.wait({task}, timeout=float(CONF["netease_wait_s"]))
+            # Empty/error completions do not exhaust the remaining wait budget.
+            if not entry["items"]:
+                deadline = asyncio.get_running_loop().time() + float(CONF["late_page_wait_s"])
+                while not entry["items"] and not task.done() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.wait({task}, timeout=min(0.02, max(0, deadline - asyncio.get_running_loop().time())))
         else:
-            try:
-                await asyncio.wait_for(asyncio.shield(agg_task), timeout=CONF["late_page_wait_s"])
-            except Exception:
-                pass
-
-        online_all = entry.get("items", [])
-
-    merged = merge_online_tracks(upstream_json, online_all, page=page, size=size)
+            await asyncio.wait({task}, timeout=float(CONF["late_page_wait_s"]))
+    local_list = ensure_search_list(upstream_json)
+    local_keys = {(title_from_track(x), artist_from_track(x)) for x in local_list}
+    total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
+    original_total = upstream_json.get("data", {}).get("total", len(local_list))
+    selected = _session_page(entry, page, size)
+    merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
+    if isinstance(original_total, int):
+        merged["data"]["total"] = original_total + total_online
     return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
+
+
+async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
+    sources = []
+    if CONF.get("netease_enabled", True):
+        sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
+    if CONF.get("musicdl_enabled", True):
+        sources.append(fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
+    if CONF.get("lx_enabled", True):
+        sources.append(fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
+    tasks = [asyncio.create_task(coro) for coro in sources]
+    pending = set(tasks)
+    partial = False
+    results: dict[asyncio.Task, list] = {}
+    try:
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(CONF["search_timeout"]))
+        while pending:
+            done, pending = await asyncio.wait(pending, timeout=max(0, deadline - asyncio.get_running_loop().time()), return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                partial = True
+                break
+            for task in tasks:
+                if task not in done:
+                    continue
+                try:
+                    data = task.result()
+                except Exception:
+                    data = None
+                partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
+                items = data.get("items", []) if isinstance(data, dict) else (data or [])
+                results[task] = items
+                if not entry["pages"]:
+                    ordered = [item for source_task in tasks for item in results.get(source_task, [])]
+                else:
+                    ordered = entry["items"] + items
+                entry["items"] = deduplicate_online_items(ordered)[:2000]
+        entry["partial"] = partial
+        entry["ts"] = time.time()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _session_page(entry: dict, page: int, size: int) -> list[dict]:
+    pages = entry["pages"]
+    count = int(CONF["online_limit"]) if page == 1 else size
+    if page not in pages:
+        if len(pages) >= 2000:
+            return []
+        pages[page] = []
+    # Only the trailing page can grow; no published prefix ever moves. This
+    # also lets a repeated empty first page recover after its negative TTL.
+    if page == max(pages):
+        start = entry["cursor"]
+        allocated = entry["items"][start:start + max(0, count - len(pages[page]))]
+        pages[page].extend(online_guid_from_item(item) for item in allocated)
+        entry["cursor"] += len(allocated)
+    by_guid = {online_guid_from_item(item): item for item in entry["items"]}
+    return [by_guid[guid] for guid in pages[page] if guid in by_guid and _source_enabled(guid)]
 
 
 @app.get("/music/api/v1/search/suggest")
@@ -1801,7 +1762,7 @@ async def search_suggest(request: Request):
     headers = copy_incoming_headers(request)
 
     musicdl_task: asyncio.Task | None = None
-    if keyword:
+    if keyword and CONF.get("musicdl_enabled", True):
         musicdl_task = asyncio.create_task(fetch_musicdl_search(musicdl_client, keyword, 5))
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
@@ -1861,111 +1822,195 @@ def stream_tee_response(
     client_to_close: httpx.AsyncClient | None = None,
     resolved_ext: str | None = None,
     pre_info: dict | None = None,
+    chunks: Any = None,
+    first_chunk: bytes = b"",
 ) -> Response:
-    out_headers = {"Accept-Ranges": "bytes"}
-    for k in ("content-type", "content-length", "content-range"):
-        v = resp.headers.get(k)
-        if v:
-            out_headers[k] = v
-
+    headers = {"Accept-Ranges": "bytes"}
+    for key in ("content-type", "content-length", "content-range"):
+        if resp.headers.get(key):
+            headers[key] = resp.headers[key]
     if resolved_ext:
-        out_headers["content-type"] = media_type_for_ext(resolved_ext)
+        headers["content-type"] = media_type_for_ext(resolved_ext)
+    length = resp.headers.get("content-length", "")
+    expected = int(length) if length.isdigit() else None
+    full_resource = resp.status_code == 200
+    if resp.status_code == 206:
+        # Content-Length proves only this segment, not the entire recording.
+        match = re.fullmatch(r"bytes\s+0-(\d+)/(\d+)", resp.headers.get("content-range", "").strip(), re.I)
+        full_resource = bool(match and int(match[1]) + 1 == int(match[2]) and int(match[2]) > 0)
+        if full_resource:
+            total = int(match[2])
+            full_resource = expected is None or expected == total
+            expected = total
+    ext = resolved_ext or ext_from_content_type(resp.headers.get("content-type", ""))
 
-    status_code = resp.status_code
-    content_length_str = resp.headers.get("content-length")
-    content_length = (
-        int(content_length_str) if content_length_str and content_length_str.isdigit() else None
-    )
-
-    ext = (resolved_ext or "").strip().lower() or ext_from_content_type(resp.headers.get("content-type") or "")
-    store_dir = detect_library_dir()
-
-    if should_cache(range_header):
-        os.makedirs(store_dir, exist_ok=True)
-        part_path = os.path.join(store_dir, f"{cache_safe_guid(guid)}.{uuid4().hex[:8]}.part")
-        info_task: asyncio.Task | None = None
-        if pre_info is None and coro_factory is not None:
-            info_task = asyncio.create_task(coro_factory())
-
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-
-        async def _downloader():
-            written = 0
-            part_file = None
-            try:
-                part_file = open(part_path, "wb")
-                async for chunk in resp.aiter_bytes():
-                    if chunk:
-                        part_file.write(chunk)
-                        written += len(chunk)
-                        await queue.put(chunk)
-            except Exception as e:
-                logger.warning("tee download failed for %s: %s", guid, e)
-            finally:
-                if part_file:
-                    try:
-                        part_file.close()
-                    except Exception:
-                        pass
+    async def body() -> AsyncGenerator[bytes, None]:
+        # Pull-through provides backpressure: no unbounded producer queue and no
+        # downloader outliving its consumer. Only a clean EOF may finalize.
+        part = None
+        fp = None
+        written = 0
+        eof = False
+        info_task = None
+        try:
+            if should_cache(range_header) and full_resource:
+                directory = detect_library_dir()
+                os.makedirs(directory, exist_ok=True)
+                part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
+                fp = open(part, "wb")
+                if pre_info is None and coro_factory:
+                    info_task = asyncio.create_task(coro_factory())
+            iterator = chunks if chunks is not None else resp.aiter_bytes()
+            if first_chunk:
+                if fp:
+                    fp.write(first_chunk)
+                written += len(first_chunk)
+                yield first_chunk
+            async for chunk in iterator:
+                if chunk:
+                    if fp:
+                        fp.write(chunk)
+                    written += len(chunk)
+                    yield chunk
+            eof = True
+            if fp:
+                fp.close()
+                fp = None
+            info = pre_info
+            if info is None and info_task:
+                try:
+                    info = await asyncio.wait_for(info_task, timeout=8.0)
+                except Exception:
+                    info = None
+            if part and eof and written >= 1024 and (expected is None or written == expected):
+                title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
+                dest = library_media_path(guid, title, ext, artist=artist)
+                os.replace(part, dest)
+                remember_media_path(guid, dest)
+                adopt_library_perms(dest)
+                write_audio_tags(dest, title, artist, album)
+                lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
+                if lyric.strip():
+                    write_lyric_cache(guid, lyric, title, artist)
+        finally:
+            if fp:
+                fp.close()
+            if part and os.path.exists(part):
+                os.remove(part)
+            with anyio.CancelScope(shield=True):
+                if info_task and not info_task.done():
+                    info_task.cancel()
+                    await asyncio.gather(info_task, return_exceptions=True)
                 await resp.aclose()
                 if client_to_close:
                     await client_to_close.aclose()
-                info: dict | None = pre_info
-                if info is None and info_task:
-                    try:
-                        info = await asyncio.wait_for(asyncio.shield(info_task), timeout=8.0)
-                    except Exception as e:
-                        logger.warning("info/lyric wait failed for %s: %s", guid, e)
-                title = str((info or {}).get("title") or "")
-                artist = str((info or {}).get("artist") or "")
-                album = str((info or {}).get("album") or "")
-                lyric_text = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
-                complete = written >= 1024 and (content_length is None or written == content_length)
-                if complete:
-                    dest = library_media_path(guid, title, ext, artist=artist)
-                    try:
-                        os.replace(part_path, dest)
-                        adopt_library_perms(dest)
-                        remember_media_path(guid, dest)
-                        write_audio_tags(dest, title=title, artist=artist, album=album)
-                        if lyric_text.strip():
-                            write_lyric_cache(guid, lyric_text, title=title, artist=artist)
-                    except Exception as e:
-                        logger.warning("Failed to rename cache file: %s", e)
-                        if os.path.exists(part_path):
-                            try:
-                                os.remove(part_path)
-                            except Exception:
-                                pass
-                elif os.path.exists(part_path):
-                    try:
-                        os.remove(part_path)
-                    except Exception:
-                        pass
-                await queue.put(None)
 
-        dl_task = asyncio.create_task(_downloader())
+    return StreamingResponse(body(), status_code=resp.status_code, headers=headers)
 
-        async def stream_tee() -> AsyncGenerator[bytes, None]:
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                yield chunk
 
-        return StreamingResponse(stream_tee(), status_code=status_code, headers=out_headers)
+def _credential_scope(request: Request) -> str:
+    return hashlib.sha256(json.dumps([request.headers.get(k, "") for k in
+        ("cookie", "authorization", "x-trim-music-temp-token")]).encode()).hexdigest()
 
-    async def stream_no_cache() -> AsyncGenerator[bytes, None]:
-        try:
-            async for chunk in resp.aiter_bytes():
-                if chunk:
-                    yield chunk
-        finally:
+
+def _retained_track(request: Request, guid: str) -> tuple[dict | None, dict | None]:
+    _clean_search_cache()
+    for entry in reversed(list(_SEARCH_CACHE.values())):
+        if entry.get("credentials") != _credential_scope(request) or entry.get("config", _source_config()) != _source_config():
+            continue
+        for item in entry.get("items", []):
+            if online_guid_from_item(item) == guid:
+                return item, entry
+            for alternative in item.get("_alternatives", []):
+                if online_guid_from_item(alternative) == guid:
+                    return alternative, entry
+    return None, None
+
+
+async def _recover_source(request: Request, guid: str, entry: dict | None) -> bool:
+    """One bounded source re-search after a backend loses its in-memory IDs."""
+    if not entry or not _source_enabled(guid):
+        return False
+    source = source_from_online_guid(guid)
+    recovery_key = "recovered:" + source
+    if time.monotonic() - entry.get(recovery_key, -1000) < 30:
+        return False
+    entry[recovery_key] = time.monotonic()
+    keyword = entry.get("keyword", "")
+    if source == "netease":
+        coro = fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
+    elif source == "lx":
+        coro = fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"])
+    else:
+        selected = [name.strip() for name in str(CONF.get("online_sources") or "").split(",")
+                    if name.strip().lower().removesuffix("musicclient") == source.lower()]
+        coro = fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"],
+                                   ",".join(selected) or source)
+    try:
+        result = await asyncio.wait_for(coro, timeout=3.0)
+        items = result.get("items", []) if isinstance(result, dict) else (result or [])
+        return any(online_guid_from_item(item) == guid for item in items)
+    except Exception:
+        return False
+
+
+async def _open_online_stream(request: Request, guid: str, range_header: str | None):
+    """Resolve and read first bytes before committing HTTP headers to the client."""
+    source = source_from_online_guid(guid)
+    info, _ = _retained_track(request, guid)
+    headers = {"Accept-Encoding": "identity"}
+    if range_header:
+        headers["Range"] = range_header
+    owned = None
+    resp = None
+    ext = None
+    try:
+        if source in ("netease", "lx"):
+            if source == "netease":
+                url = await resolve_netease_url(get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+                if not url:
+                    return None
+            else:
+                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+                if not resolved:
+                    return None
+                url = resolved["url"]
+                ext = resolved.get("ext")
+                for key, value in (resolved.get("headers") or {}).items():
+                    if key.lower() in ("referer", "user-agent"):
+                        headers[key] = str(value)
+            if info is None:
+                try:
+                    info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
+                except Exception:
+                    pass
+            ext = ext or (info or {}).get("ext")
+            owned = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+            client = owned
+            req = client.build_request("GET", url, headers=headers)
+        else:
+            client = get_musicdl_client(request.app)
+            req = client.build_request("GET", "/stream", params={"id": song_id_from_online_guid(guid), "proxy": "true"}, headers=headers)
+        resp = await client.send(req, stream=True)
+        content_type = resp.headers.get("content-type", "").lower()
+        if (resp.status_code not in (200, 206)
+                or any(x in content_type for x in ("text/", "json"))
+                or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
+            # Reject servers ignoring identity: decoded bytes cannot use encoded
+            # Content-Length/Range offsets, and must not enter the audio cache.
+            return None
+        chunks = resp.aiter_bytes()
+        first = await anext(chunks, b"")
+        if not first:
+            return None
+        result = (resp, owned, ext, info, chunks, first)
+        resp = owned = None  # transfer ownership to response iterator
+        return result
+    finally:
+        if resp:
             await resp.aclose()
-            if client_to_close:
-                await client_to_close.aclose()
-
-    return StreamingResponse(stream_no_cache(), status_code=status_code, headers=out_headers)
+        if owned:
+            await owned.aclose()
 
 
 @app.get("/music/api/v1/track/stream")
@@ -1974,162 +2019,51 @@ async def stream_track(request: Request):
     guid = extract_guid(request)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
-
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
     if cached:
-        cached = promote_cache_hit(guid, cached)
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
-
-    src = source_from_online_guid(guid)
-    if src == "netease":
-        musicbox_client = get_musicbox_client(request.app)
-        raw_song_id = song_id_from_online_guid(guid)
-        song_id = raw_song_id.split(":")[-1]
-
-        play_url_res, info_res = await asyncio.gather(
-            resolve_netease_url(musicbox_client, song_id),
-            _online_info(request, guid),
-            return_exceptions=True,
-        )
-        play_url = None if isinstance(play_url_res, Exception) else play_url_res
-        info = None if isinstance(info_res, Exception) else info_res
-
-        if not play_url:
-            return JSONResponse(
-                content={"code": 404, "msg": "online source unavailable", "data": None},
-                status_code=404,
-            )
-
-        resolved_ext = str(info.get("ext")) if (isinstance(info, dict) and info.get("ext")) else None
-
-        req_headers = {}
-        if range_header:
-            req_headers["Range"] = range_header
-
-        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        try:
-            stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
-            resp = await stream_client.send(stream_req, stream=True)
-            if resp.status_code >= 400:
-                await resp.aclose()
-                await stream_client.aclose()
-                return JSONResponse(
-                    content={"code": 404, "msg": "online source unavailable", "data": None},
-                    status_code=404,
-                )
-        except Exception as e:
-            logger.warning("Failed to stream direct url %s for %s: %s", play_url, guid, e)
-            await stream_client.aclose()
-            return JSONResponse(
-                content={"code": 404, "msg": "online source unavailable", "data": None},
-                status_code=404,
-            )
-
-        return stream_tee_response(
-            resp,
-            guid=guid,
-            range_header=range_header,
-            coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
-            client_to_close=stream_client,
-            resolved_ext=resolved_ext,
-            pre_info=info if isinstance(info, dict) else None,
-        )
-
-    if src == "lx":
-        lx_client = get_lx_client(request.app)
-        song_id = song_id_from_online_guid(guid)  # 形如 "lx:kg:<hash>"
-
-        url_res, info_res = await asyncio.gather(
-            resolve_lx_url(lx_client, song_id),
-            _online_info(request, guid),
-            return_exceptions=True,
-        )
-        url_info = None if isinstance(url_res, Exception) else url_res
-        info = None if isinstance(info_res, Exception) else info_res
-
-        play_url = str((url_info or {}).get("url") or "") if url_info else ""
-        if not play_url:
-            return JSONResponse(
-                content={"code": 404, "msg": "online source unavailable", "data": None},
-                status_code=404,
-            )
-
-        resolved_ext = (
-            str(url_info.get("ext"))
-            if url_info.get("ext")
-            else (str(info.get("ext")) if (isinstance(info, dict) and info.get("ext")) else None)
-        )
-
-        req_headers = {}
-        url_req_headers = {str(k).lower(): str(v) for k, v in (url_info.get("headers") or {}).items()}
-        for hdr_key in ("user-agent", "referer"):
-            hdr_val = url_req_headers.get(hdr_key, "")
-            if hdr_val:
-                req_headers[hdr_key] = hdr_val
-        if range_header:
-            req_headers["Range"] = range_header
-
-        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        try:
-            stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
-            resp = await stream_client.send(stream_req, stream=True)
-            content_type = (resp.headers.get("content-type") or "").lower()
-            if resp.status_code >= 400 or "text/html" in content_type:
-                await resp.aclose()
-                await stream_client.aclose()
-                return JSONResponse(
-                    content={"code": 404, "msg": "online source unavailable", "data": None},
-                    status_code=404,
-                )
-        except Exception as e:
-            logger.warning("Failed to stream lx url %s for %s: %s", play_url, guid, e)
-            await stream_client.aclose()
-            return JSONResponse(
-                content={"code": 404, "msg": "online source unavailable", "data": None},
-                status_code=404,
-            )
-
-        return stream_tee_response(
-            resp,
-            guid=guid,
-            range_header=range_header,
-            coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
-            client_to_close=stream_client,
-            resolved_ext=resolved_ext,
-            pre_info=info if isinstance(info, dict) else None,
-        )
-
-    musicdl_client = get_musicdl_client(request.app)
-    song_id = song_id_from_online_guid(guid)
-
-    req_headers = {}
-    if range_header:
-        req_headers["Range"] = range_header
-
-    req = musicdl_client.build_request(
-        "GET",
-        "/stream",
-        params={"id": song_id, "proxy": "true"},
-        headers=req_headers,
-    )
-    resp = await musicdl_client.send(req, stream=True)
-
-    if resp.status_code in (404, 502) or resp.status_code >= 400:
-        await resp.aclose()
-        return JSONResponse(
-            content={"code": 404, "msg": "online source unavailable", "data": None},
-            status_code=404,
-        )
-
-    return stream_tee_response(
-        resp,
-        guid=guid,
-        range_header=range_header,
-        coro_factory=lambda: cache_lyrics_from_musicdl(musicdl_client, guid),
-        client_to_close=None,
-    )
+    item, entry = _retained_track(request, guid)
+    candidates = [guid]
+    # Byte offsets are encoding-specific: do not cross sources on seek/probe.
+    if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
+        candidates += [online_guid_from_item(x) for x in item.get("_alternatives", []) if _same_recording(item, x)]
+    deadline = asyncio.get_running_loop().time() + 12.0
+    for candidate in list(dict.fromkeys(candidates))[:3]:
+        if not _source_enabled(candidate):
+            continue
+        for attempt in range(2):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(4.0, remaining))
+            except Exception as exc:
+                logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
+                opened = None
+            if opened:
+                resp, owned, ext, info, chunks, first = opened
+                if candidate != guid:
+                    # Publish the selected source identity before any audio.
+                    # The client owns B's URL for later Range requests even if
+                    # this proxy's search session expires; never alias B as A.
+                    with anyio.CancelScope(shield=True):
+                        await resp.aclose()
+                        if owned:
+                            await owned.aclose()
+                    target = request.url.include_query_params(guid=candidate, _ext_rendition="1")
+                    return RedirectResponse(str(target), status_code=307, headers={"Cache-Control": "no-store"})
+                # Cache the selected source's bytes under its own GUID, never
+                # splice a failed stream or alias different encodings for seeks.
+                return stream_tee_response(resp, candidate, range_header,
+                    coro_factory=lambda: _online_info(request, candidate), client_to_close=owned,
+                    resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first)
+            if attempt or deadline - asyncio.get_running_loop().time() <= 3:
+                break
+            if not await _recover_source(request, candidate, entry):
+                break
+    return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
 @app.get("/music/api/v1/track/hls/{guid}/preset.m3u8")
@@ -2187,6 +2121,23 @@ async def track_transcode(request: Request):
 
 
 async def _online_info(request: Request, guid: str) -> dict | None:
+    retained, entry = _retained_track(request, guid)
+    if not _source_enabled(guid):
+        return retained
+    try:
+        data = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=4.0)
+        if data:
+            return data
+        if await _recover_source(request, guid, entry):
+            data = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=3.0)
+            if data:
+                return data
+    except Exception:
+        pass
+    return retained
+
+
+async def _fetch_online_info(request: Request, guid: str) -> dict | None:
     src = source_from_online_guid(guid)
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)

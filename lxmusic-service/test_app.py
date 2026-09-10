@@ -83,7 +83,7 @@ def test_healthz():
         rj = resp.json()
         assert rj["ok"] is True
         assert rj["service"] == "fnmusic-lxmusic"
-        assert set(rj["sources"]) == {"kg", "wy", "mg", "tx", "kw"}
+        assert set(rj["sources"]) == {"kg", "wy", "mg", "kw"}
         assert rj["third_party"] is True
         assert isinstance(rj["chains"], dict)
 
@@ -225,6 +225,8 @@ def test_track_url_kg_playinfo_resolution():
                 headers={"Content-Type": "text/html"},
                 text='{"errcode":0,"url":"https://sharefs.kugou.com/mp3_track.mp3","fileSize":4085749,"bitRate":128,"extName":"mp3"}',
             )
+        if "sharefs.kugou.com" in str(request.url):
+            return httpx.Response(206, content=b"ID3")
         return httpx.Response(404)
 
     lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -263,6 +265,8 @@ def test_track_url_kg_trackercdn_fallback():
                     "bitRate": 998,
                 },
             )
+        if "cdn.kugou.com" in str(request.url):
+            return httpx.Response(206, content=b"fLaC")
         return httpx.Response(404)
 
     lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -331,10 +335,9 @@ def test_track_url_no_url_404():
 def test_eapi_params_shape():
     params = _eapi_params("/api/song/enhance/player/url", {"header": {"os": "pc"}, "ids": [1], "br": 999000})
     assert isinstance(params, str) and len(params) > 32
-    import base64
     from Crypto.Cipher import AES
 
-    raw = base64.b64decode(params)
+    raw = bytes.fromhex(params)
     plain = AES.new(lxapp._EAPI_KEY, AES.MODE_ECB).decrypt(raw)
     # PKCS7 去填充
     pad = plain[-1]
@@ -374,7 +377,7 @@ def _kw_chain_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             206,
             headers={"Content-Type": "audio/x-flac", "Content-Range": "bytes 0-1/38210000"},
-            content=b"\x00\x01",
+            content=b"fLaC",
         )
     return httpx.Response(404)
 
@@ -471,7 +474,7 @@ def test_search_tx_empty_without_alive_chain():
         assert resp.status_code == 200
         rj = resp.json()
         assert rj["items"] == []
-        assert rj["errors"] == {}
+        assert rj["errors"] == {"tx": "no_resolver_registered"}
 
         # track/url 同样 404（无链路）
         resp2 = client.get("/api/v1/track/url", params={"id": "lx:tx:0039MnYb0qxYhV"})
@@ -514,6 +517,7 @@ def test_search_vip_verified_when_resolvable():
             return httpx.Response(
                 206,
                 headers={"Content-Type": "audio/mpeg", "Content-Range": "bytes 0-1/4300000"},
+                content=b"ID3",
             )
         return httpx.Response(404)
 
@@ -528,8 +532,8 @@ def test_search_vip_verified_when_resolvable():
         assert items[0]["pay_type"] == 3  # 元数据保留（诚实标记），可播性由探活实证
 
 
-def test_search_trial_fragment_rejected():
-    """探活通过但体积远小于时长应有体积（试听碎片）：剔除。"""
+def test_search_empty_media_rejected_even_with_audio_mime():
+    """A MIME label and file size cannot make an empty body valid media."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -606,15 +610,16 @@ def test_fresh_probe_tier_and_expiry():
     """探活缓存：低音质缓存不能满足高音质请求；过期不复用。"""
     import time as _time
 
-    base = {"url": "https://cdn.test/a.flac", "ext": "flac", "headers": {}}
+    base = {"url": "https://cdn.test/a.flac", "ext": "flac", "headers": {},
+            "probed": True, "validation_status": "media_verified"}
     # standard 缓存 → lossless 请求拒绝（需重新解析高音质）
-    item = {"_probe": dict(base, ts=_time.time(), tier="standard")}
+    item = {"_probe": dict(base, ts=_time.time(), actual_tier="standard")}
     assert lxapp._fresh_probe(item, "lossless") is None
     # standard 缓存 → standard 请求复用
     got = lxapp._fresh_probe(item, "standard")
     assert got and got["url"].endswith(".flac") and "ts" not in got and "tier" not in got
     # lossless 缓存 → standard 请求也可复用（音质只高不低）
-    item = {"_probe": dict(base, ts=_time.time(), tier="lossless")}
+    item = {"_probe": dict(base, ts=_time.time(), actual_tier="lossless")}
     assert lxapp._fresh_probe(item, "standard") is not None
     # 过期缓存拒绝
     item = {"_probe": dict(base, ts=_time.time() - lxapp.CONF["probe_fresh_s"] - 1, tier="lossless")}
@@ -649,6 +654,7 @@ def test_probe_url_rejects_html(monkeypatch):
             return httpx.Response(
                 206,
                 headers={"Content-Type": "application/octet-stream", "Content-Range": "bytes 0-1/1000"},
+                content=b"ID3",
             )
         if "redir.test" in url:
             return httpx.Response(302, headers={"Location": "https://audio.test/x.mp3"})
@@ -758,7 +764,7 @@ def test_track_url_mg_falls_back_to_suyin():
             )
         if "suyin.test" in url:
             return httpx.Response(
-                206, headers={"Content-Type": "audio/mpeg", "Content-Range": "bytes 0-1/9000000"}
+                206, headers={"Content-Type": "audio/mpeg", "Content-Range": "bytes 0-1/9000000"}, content=b"ID3"
             )
         return httpx.Response(404)
 

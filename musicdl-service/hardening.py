@@ -4,10 +4,94 @@
 """
 import asyncio
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import threading
 import time
 from typing import Any, Callable, List, Optional
+
+
+class SourceBusy(RuntimeError):
+    """A source already has work running; callers must not enqueue more."""
+
+
+class SearchProgress:
+    """Bounded per-request handoff, never a cache; close rejects late results."""
+
+    def __init__(self, limit, deadline):
+        self.limit = limit
+        self.deadline = deadline
+        self._entries = []
+        self.partial = False
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def stopped(self):
+        with self._lock:
+            return self._closed or time.monotonic() >= self.deadline
+
+    def append(self, entry):
+        with self._lock:
+            if not self._closed and time.monotonic() < self.deadline and len(self._entries) < self.limit:
+                self._entries.append(entry)
+
+    def finish(self):
+        with self._lock:
+            self._closed = True
+            return list(self._entries)
+
+
+class SourceBulkhead:
+    """One persistent worker per known source, with no waiting job queue.
+
+    Admission belongs to the concurrent future, not its asyncio waiter. Timing
+    out/cancelling a request cannot free the source until the worker exits.
+    Unknown names cannot create pools, and shutdown never replaces live pools.
+    """
+
+    def __init__(self, sources) -> None:
+        self._executors = {
+            source: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"src-{source}")
+            for source in set(sources)
+        }
+        self._busy = set()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def submit(self, source, fn, *args):
+        with self._lock:
+            if self._closed:
+                raise SourceBusy("source workers shutting down")
+            if source not in self._executors:
+                raise ValueError(f"unknown source {source!r}")
+            if source in self._busy:
+                raise SourceBusy("source busy (previous search still running); retry later")
+            self._busy.add(source)
+            try:
+                future = self._executors[source].submit(fn, *args)
+            except BaseException:
+                self._busy.remove(source)
+                raise
+        # Register outside the lock: completed futures invoke callbacks inline.
+        def release(_):
+            with self._lock:
+                self._busy.discard(source)
+        future.add_done_callback(release)
+        return future
+
+    async def run(self, source, fn, *args, timeout):
+        future = asyncio.wrap_future(self.submit(source, fn, *args))
+        # Never cancel the executor future, even before its worker starts:
+        # cancelled queue entries would otherwise release admission too early.
+        # Retrieve late failures even when their original waiter has gone away.
+        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+
+    def shutdown(self, wait=True):
+        with self._lock:
+            self._closed = True
+        for executor in self._executors.values():
+            executor.shutdown(wait=wait, cancel_futures=True)
 
 
 class SearchCache:

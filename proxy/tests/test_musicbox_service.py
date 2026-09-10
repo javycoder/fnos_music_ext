@@ -300,13 +300,15 @@ def test_song_url_passes_quality_to_cli(monkeypatch):
 
     def mock_run(args, timeout=30.0):
         captured["args"] = args
-        return 0, '{"url": "http://m.test/a.flac"}', ""
+        return 0, '{"ok": true, "data": {"code": 200, "url": "http://m.test/a.flac"}}', ""
 
     monkeypatch.setattr(runner, "run_musicbox", mock_run)
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/123/url", params={"quality": "lossless"})
     assert resp.status_code == 200
-    assert resp.json()["url"].endswith(".flac")
+    assert resp.json()["ok"] is True
+    assert resp.json()["data"]["code"] == 200
+    assert resp.json()["data"]["url"].endswith(".flac")
     assert captured["args"] == ["song", "url", "123", "--quality", "lossless", "--json"]
 
 
@@ -332,13 +334,24 @@ def test_song_info_artist_album_playlist_cli_args(monkeypatch):
 
 
 def test_song_lyric_ok_and_upstream_error(monkeypatch):
-    monkeypatch.setattr(musicbox_app, "song_lyric_pair", lambda sid: {"lrc": "[00:01]晴天", "tlyric": ""})
+    import netease_ext
+
+    class FakeApi:
+        def song_lyric(self, sid):
+            assert sid == 123
+            return ["[00:01]晴天"]
+
+        def song_tlyric(self, sid):
+            return []
+
+    monkeypatch.setattr(netease_ext, "_get_api", lambda: FakeApi())
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/123/lyric")
     assert resp.status_code == 200
     rj = resp.json()
     assert rj["ok"] is True
-    assert rj["data"]["lrc"].startswith("[00:01]")
+    assert rj["data"]["lyric"] == "[00:01]晴天"
+    assert rj["data"]["tlyric"] == ""
 
     def _boom(sid):
         raise RuntimeError("lyric upstream down")

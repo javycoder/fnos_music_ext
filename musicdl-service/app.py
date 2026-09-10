@@ -4,7 +4,6 @@
 两个消费方（fnmusic-ext 代理、music-box）都以该 ID 串通信。
 """
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -29,7 +28,7 @@ except ImportError:
     logger.warning("curl_cffi not installed, falling back to standard httpx client")
 
 from musicdl import musicdl  # noqa: E402
-from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight
+from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy, SearchProgress
 
 CONF = {
     "sources": [
@@ -48,7 +47,8 @@ CONF = {
     "search_cache_max": int(os.environ.get("MUSICDL_SEARCH_CACHE_MAX", "200")),
     "breaker_threshold": int(os.environ.get("MUSICDL_BREAKER_THRESHOLD", "4")),
     "breaker_cooldown": int(os.environ.get("MUSICDL_BREAKER_COOLDOWN", "120")),
-    "search_workers": int(os.environ.get("MUSICDL_SEARCH_WORKERS", "6")),
+    # Network inactivity timeout is separate from the async response deadline.
+    "request_timeout": max(0.1, float(os.environ.get("MUSICDL_REQUEST_TIMEOUT", "5"))),
     "neg_cache_ttl": int(os.environ.get("MUSICDL_NEG_TTL", "30")),
     # 自适应熔断/降级
     "slow_degrade_s": float(os.environ.get("MUSICDL_SLOW_DEGRADE_S", "8")),
@@ -72,10 +72,6 @@ ADAPTIVE = AdaptiveTimeout(
     slow_latency=CONF["slow_degrade_s"],
 )
 SINGLE_FLIGHT = SingleFlight()
-SOURCE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=CONF["search_workers"],
-    thread_name_prefix="srcsearch",
-)
 
 # id -> {"item": {...}, "keyword": str, "download_headers": dict, "lyric": str, "ts": float}
 _SONG_CACHE: dict = {}
@@ -85,6 +81,29 @@ _STATS = {"searches": 0, "errors": 0}
 
 def _source_short(client_name: str) -> str:
     return (client_name or "").replace("MusicClient", "").lower()
+
+
+def _source_mapping() -> dict:
+    """Resolve names without guessing capitalization (HTQYY/FiveSing/MyFreeMP3)."""
+    names = set(CONF["sources"])
+    try:
+        from musicdl.modules.sources import MusicClientBuilder
+        names.update(MusicClientBuilder.REGISTERED_MODULES)
+    except ImportError:
+        names.update(getattr(musicdl, "SUPPORTED_MUSIC_SOURCES", []) or [])
+    return {alias: name for name in sorted(names)
+            for alias in (name.casefold(), _source_short(name).casefold())}
+
+
+SOURCE_NAMES = _source_mapping()
+SOURCE_WORKERS = SourceBulkhead(SOURCE_NAMES.values())
+
+
+def _source_client(name: str) -> str:
+    client = SOURCE_NAMES.get(name.strip().casefold())
+    if client is None:
+        raise HTTPException(400, f"unknown music source {name!r}; see /sources")
+    return client
 
 
 def _cache_put(item: dict, keyword: str, download_headers: dict, lyric: str):
@@ -115,8 +134,11 @@ def _search_one_source(source: str, keyword: str, limit: int) -> list:
             source: {
                 "search_size_per_source": max(limit, 5),
                 "work_dir": CONF["work_dir"],
+                "max_retries": 1,
             },
         },
+        clients_threadings={source: 1},
+        requests_overrides={source: {"timeout": CONF["request_timeout"]}},
     )
     result = client.search(keyword=keyword)
     return list(result.values())[0] if result else []
@@ -224,47 +246,72 @@ def _probe_playable_sync(url: str, headers: dict) -> bool:
 _head_probe_sync = _probe_playable_sync
 
 
+def _search_playable(source: str, keyword: str, fetch_size: int, limit: int,
+                     song_id: str | None = None, deadline: float | None = None,
+                     progress: SearchProgress | None = None) -> list:
+    """Keep search and bounded probes inside the same source admission slot.
+
+    Return metadata only; a timed-out worker must not update shared caches.
+    """
+    songs = _search_one_source(source, keyword, fetch_size)
+    entries = []
+    probe_estimate = 0.0
+    for song in songs[:fetch_size]:
+        # Leave room for the slowest observed probe and event-loop handoff.
+        # An unexpectedly slower probe is covered by the progress snapshot.
+        if ((deadline is not None and time.monotonic() + probe_estimate >= deadline)
+                or (progress is not None and progress.stopped())):
+            if progress is not None:
+                progress.partial = True
+            break
+        if not song:
+            continue
+        item = _normalize(song, keyword)
+        if song_id is not None and item["id"] != song_id:
+            continue
+        if not _is_candidate_playable(song, item):
+            continue
+        headers = getattr(song, "default_download_headers", {}) or {}
+        probe_started = time.monotonic()
+        valid = _probe_playable_sync(item["download_url"], headers)
+        probe_estimate = max(probe_estimate, (time.monotonic() - probe_started) * 1.1)
+        if not valid:
+            continue
+        entry = (item, headers, str(getattr(song, "lyric", "") or ""))
+        entries.append(entry)
+        if progress is not None:
+            progress.append(entry)
+        if len(entries) >= limit:
+            break
+    return entries
+
+
 async def _refresh_by_keyword(song_id: str) -> dict | None:
     """URL 过期或下载失败后按缓存的关键词重搜一次，找回同 ID 的曲目。"""
     entry = _cache_get(song_id)
     if not entry or not entry.get("keyword"):
         return None
-    src_short = entry["item"].get("source", "")
-    src_client = src_short.capitalize() + "MusicClient"
     try:
+        src_client = _source_client(entry["item"].get("source", ""))
         limit = max(CONF["limit_per_source"], 10)
-        loop = asyncio.get_running_loop()
-        songs = await asyncio.wait_for(
-            loop.run_in_executor(
-                SOURCE_EXECUTOR, _search_one_source, src_client, entry["keyword"], limit
-            ),
-            timeout=ADAPTIVE.timeout_for(src_client),
+        timeout = ADAPTIVE.timeout_for(src_client)
+        entries = await SOURCE_WORKERS.run(
+            src_client, _search_playable, src_client, entry["keyword"], limit, 1, song_id,
+            time.monotonic() + timeout, timeout=timeout,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("Refresh failed for %s: %s", song_id, exc)
         return None
-    for song in songs:
-        item = _normalize(song, entry["keyword"])
-        if item["id"] == song_id:
-            if not _is_candidate_playable(song, item):
-                continue
-            headers = getattr(song, "default_download_headers", {}) or {}
-            valid = await asyncio.to_thread(_probe_playable_sync, item["download_url"], headers)
-            if not valid:
-                continue
-            _cache_put(
-                item,
-                entry["keyword"],
-                headers,
-                str(getattr(song, "lyric", "") or ""),
-            )
-            return _cache_get(song_id)
+    for item, headers, lyric in entries:
+        _cache_put(item, entry["keyword"], headers, lyric)
+        return _cache_get(song_id)
     return None
 
 
 async def _resolve_entry(song_id: str, auto_refresh: bool = True):
     entry = _cache_get(song_id)
     if entry is None:
-        raise HTTPException(404, f"unknown song id {song_id!r}, search it first")
+        raise HTTPException(404, f"unknown song id {song_id!r}: cache expired or service restarted; re-search keyword and source once, then retry")
     fresh = entry["item"].get("download_url") and (time.time() - entry["ts"]) < CONF["url_ttl"]
     if fresh:
         return entry
@@ -276,8 +323,10 @@ async def _resolve_entry(song_id: str, auto_refresh: bool = True):
             entry["ts"] = time.time()
             return entry
     if auto_refresh:
-        entry = await _refresh_by_keyword(song_id) or entry
-    return entry
+        refreshed = await _refresh_by_keyword(song_id)
+        if refreshed:
+            return refreshed
+    raise HTTPException(502, f"playable URL expired for {song_id!r}; bounded refresh failed, re-search keyword and source")
 
 
 def _fetch_upstream_stream_sync(url: str, headers: dict):
@@ -293,8 +342,9 @@ def _fetch_upstream_stream_sync(url: str, headers: dict):
 
 class _HttpxStreamWrapper:
     """包装 httpx 响应以对齐 curl_cffi 响应接口。"""
-    def __init__(self, resp):
+    def __init__(self, resp, client):
         self._resp = resp
+        self._client = client
         self.status_code = resp.status_code
         self.headers = resp.headers
 
@@ -302,20 +352,34 @@ class _HttpxStreamWrapper:
         return self._resp.iter_bytes(chunk_size)
 
     def close(self):
-        self._resp.close()
+        try:
+            self._resp.close()
+        finally:
+            self._client.close()
 
 
 async def _fetch_upstream_stream(url: str, src_headers: dict):
     """请求源站流。优先走 curl_cffi 工作线程，fallback 走 httpx。"""
+    src_headers = {k: v for k, v in src_headers.items() if k.lower() != "accept-encoding"}
+    src_headers["Accept-Encoding"] = "identity"
     if HAS_CURL_CFFI:
-        return await asyncio.to_thread(_fetch_upstream_stream_sync, url, src_headers)
+        resp = await asyncio.to_thread(_fetch_upstream_stream_sync, url, src_headers)
     else:
         def _fetch_httpx_sync():
             client = httpx.Client(follow_redirects=True, timeout=30)
-            req = client.build_request("GET", url, headers=src_headers)
-            resp = client.send(req, stream=True)
-            return _HttpxStreamWrapper(resp)
-        return await asyncio.to_thread(_fetch_httpx_sync)
+            try:
+                req = client.build_request("GET", url, headers=src_headers)
+                response = client.send(req, stream=True)
+                return _HttpxStreamWrapper(response, client)
+            except BaseException:
+                client.close()
+                raise
+        resp = await asyncio.to_thread(_fetch_httpx_sync)
+    encoding = resp.headers.get("Content-Encoding") or resp.headers.get("content-encoding") or "identity"
+    if encoding.strip().lower() != "identity":
+        resp.close()
+        raise HTTPException(502, "source ignored identity encoding; refusing decoded bytes with encoded length/range")
+    return resp
 
 
 @asynccontextmanager
@@ -332,6 +396,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await app.state.http.aclose()
+        SOURCE_WORKERS.shutdown(wait=False)
 
 
 app = FastAPI(title="musicdl-service", lifespan=lifespan)
@@ -383,12 +448,10 @@ async def search(
 
     raw_src_list = CONF["sources"]
     if sources:
-        raw_src_list = [
-            s if s.endswith("MusicClient") else s.capitalize() + "MusicClient"
-            for s in sources.split(",")
-            if s.strip()
-        ]
+        raw_src_list = [_source_client(s) for s in sources.split(",") if s.strip()]
+    raw_src_list = list(dict.fromkeys(raw_src_list))
     sources_key = ",".join(sorted(raw_src_list))
+    cache_key = f"{sources_key}|limit={limit}"
     _STATS["searches"] += 1
 
     async def _do_search() -> dict:
@@ -396,8 +459,9 @@ async def search(
         active_src_list = [s for s in raw_src_list if not SOURCE_BREAKER.is_open(s)]
 
         # 2. 查缓存（命中直接返回）
-        cached = SEARCH_CACHE.get(keyword, sources_key)
-        if cached is not None:
+        cached = SEARCH_CACHE.get(keyword, cache_key)
+        # Search results alone cannot serve playback after song-cache eviction.
+        if cached is not None and all(_cache_get(item["id"]) for item in cached):
             return {
                 "ok": True,
                 "cached": True,
@@ -416,60 +480,55 @@ async def search(
                 "errors": {s: "circuit breaker open" for s in raw_src_list},
             }
 
+        progress_by_source = {}
+
+        def collect(source):
+            progress = progress_by_source.get(source)
+            items = []
+            for item, headers, lyric in progress.finish() if progress else []:
+                _cache_put(item, keyword, headers, lyric)
+                items.append(item)
+            return items
+
         async def one(source: str):
-            loop = asyncio.get_running_loop()
             timeout = ADAPTIVE.timeout_for(source)
             started = time.monotonic()
+            progress = SearchProgress(limit, started + timeout)
+            progress_by_source[source] = progress
             fetch_size = max(limit * 2, 10)
             try:
-                songs = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        SOURCE_EXECUTOR, _search_one_source, source, keyword, fetch_size
-                    ),
+                await SOURCE_WORKERS.run(
+                    source, _search_playable, source, keyword, fetch_size, limit,
+                    None, started + timeout - min(0.1, timeout * 0.1), progress,
                     timeout=timeout,
                 )
                 latency = time.monotonic() - started
+                items = collect(source)
+                if progress.partial:
+                    ADAPTIVE.record_failure(source)
+                    return source, items, "partial results (probe deadline reached)"
                 ADAPTIVE.record_success(source, latency)
-
-                async def _probe_one(s) -> dict | None:
-                    it = _normalize(s, keyword)
-                    if not _is_candidate_playable(s, it):
-                        return None
-                    hdrs = getattr(s, "default_download_headers", {}) or {}
-                    ok = await asyncio.to_thread(_probe_playable_sync, it["download_url"], hdrs)
-                    if not ok:
-                        return None
-                    return it
-
-                candidates = [s for s in songs if s]
-                probed = await asyncio.gather(
-                    *[_probe_one(s) for s in candidates[:fetch_size]],
-                    return_exceptions=True,
-                )
-                items = []
-                for s, res in zip(candidates[:fetch_size], probed):
-                    if isinstance(res, dict) and res.get("id"):
-                        _cache_put(
-                            res,
-                            keyword,
-                            getattr(s, "default_download_headers", {}) or {},
-                            str(getattr(s, "lyric", "") or ""),
-                        )
-                        items.append(res)
-                        if len(items) >= limit:
-                            break
                 if items:
-                    # 慢响应（超过 slow_degrade_s）计入降级失败，持续慢源会被熔断
                     SOURCE_BREAKER.record_success(source, latency)
                 return source, items, None
+            except SourceBusy as exc:
+                # Admission rejection is not another upstream failure.
+                return source, collect(source), str(exc)
             except asyncio.TimeoutError:
                 SOURCE_BREAKER.record_failure(source)
                 ADAPTIVE.record_failure(source)
-                return source, [], f"timeout after {timeout:.1f}s"
+                items = collect(source)
+                suffix = " (partial results)" if items else ""
+                return source, items, f"timeout after {timeout:.1f}s{suffix}"
+            except asyncio.CancelledError:
+                # The aggregate owner collects this closed snapshot on its
+                # global/grace deadline, never the still-running worker.
+                progress.finish()
+                raise
             except Exception as e:  # 单源失败不影响其他源
                 _STATS["errors"] += 1
                 SOURCE_BREAKER.record_failure(source)
-                return source, [], f"{type(e).__name__}: {e}"
+                return source, collect(source), f"{type(e).__name__}: {e}"
 
         results: list = []
         pending = {asyncio.create_task(one(s), name=s): s for s in active_src_list}
@@ -506,7 +565,8 @@ async def search(
             await asyncio.gather(*pending, return_exceptions=True)
             skip_reason = "skipped (fast return)" if skipped_fast_return else f"timeout after {overall}s"
             for task, src in pending.items():
-                results.append((src, [], skip_reason))
+                items = collect(src)
+                results.append((src, items, skip_reason + (" (partial results)" if items else "")))
                 # 被放弃的慢源：收紧自适应超时；若是全局超时放弃，同时计入熔断失败
                 ADAPTIVE.record_failure(src)
                 if not skipped_fast_return:
@@ -520,16 +580,17 @@ async def search(
                     seen_ids.add(item["id"])
                     all_items.append(item)
 
-        if all_items:
-            SEARCH_CACHE.put(keyword, sources_key, all_items)
-        else:
-            SEARCH_CACHE.put(keyword, sources_key, [], ttl=CONF["neg_cache_ttl"])
-
         errors = {src: err for src, _, err in results if err}
-        # 被熔断跳过的源也在 errors 中体现
         for s in raw_src_list:
             if s not in active_src_list:
                 errors.setdefault(s, "circuit breaker open")
+        # Partial/error results must remain retryable, not become a long-lived
+        # apparently complete cache hit with errors silently removed.
+        if not errors:
+            if all_items:
+                SEARCH_CACHE.put(keyword, cache_key, all_items)
+            else:
+                SEARCH_CACHE.put(keyword, cache_key, [], ttl=CONF["neg_cache_ttl"])
 
         return {
             "ok": True,
@@ -539,14 +600,14 @@ async def search(
             "errors": errors,
         }
 
-    return await SINGLE_FLIGHT.run(f"{keyword}|{sources_key}", _do_search)
+    return await SINGLE_FLIGHT.run((keyword, cache_key), _do_search)
 
 
 @app.get("/info")
 async def info(id: str = Query(..., min_length=1)):
     entry = _cache_get(id)
     if entry is None:
-        raise HTTPException(404, f"song id {id!r} not found in cache")
+        raise HTTPException(404, f"song id {id!r} not found in cache: cache expired or service restarted; re-search keyword and source once, then retry")
     item = entry["item"]
     return {
         "ok": True,
@@ -582,6 +643,8 @@ async def stream(
 
     try:
         resp = await _fetch_upstream_stream(url, src_headers)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning("Stream request failed for %s (%s), attempting refresh: %s", id, url, e)
         refreshed_entry = await _refresh_by_keyword(id)

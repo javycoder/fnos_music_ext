@@ -812,8 +812,9 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
 
         # 等待 TTL 过期
         time.sleep(2.1)
-        assert time.time() - _SEARCH_CACHE["周杰伦"]["ts"] >= 2.0
-        # 再次搜索会重新生成缓存
+        entry = next(e for e in _SEARCH_CACHE.values() if e.get("keyword") == "周杰伦")
+        assert time.time() - entry["ts"] >= 2.0
+        # Revalidate this credential/config session without replacing its shown prefix.
         resp3 = client.get("/music/api/v1/search/track?q=周杰伦&page=1&size=50")
         assert resp3.status_code == 200
         assert resp3.json()["data"]["total"] == 16

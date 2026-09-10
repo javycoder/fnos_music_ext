@@ -305,7 +305,7 @@ def test_cli_merge_upgrade_keeps_comments_across_versions(tmp_path):
     """模拟两次版本升级：注释跨版本存续，版本号/新增键正常更新。"""
     existing = tmp_path / ".env"
     existing.write_text(
-        "# 我的key说明（勿删）\nFNMUSIC_LLM_API_KEY='sk-old'\n",
+        "# 我的key说明（勿删）\nFNMUSIC_LLM_API_KEY='sk-old'\nFNMUSIC_VERSION='1.0.0'\n",
         encoding="utf-8",
     )
     # 第一次升级：v1 模板
@@ -319,10 +319,13 @@ def test_cli_merge_upgrade_keeps_comments_across_versions(tmp_path):
     )
     assert rc == 0
 
+    assert dict(env_merge.parse_env_file(existing)[0])["FNMUSIC_VERSION"] == "1.1.0"
+
     # 第二次升级：v2 模板（新版本号 + 新增键）
     desired_v2 = tmp_path / "desired_v2.env"
+    upgraded = [(key, "1.2.0" if key == "FNMUSIC_VERSION" else value) for key, value in DESIRED]
     env_merge.write_env_atomic(
-        desired_v2, env_merge.render_env(DESIRED + [("FNMUSIC_NEW_KEY", "x")])
+        desired_v2, env_merge.render_env(upgraded + [("FNMUSIC_NEW_KEY", "x")])
     )
     rc = env_merge.main(
         [
@@ -340,3 +343,4 @@ def test_cli_merge_upgrade_keeps_comments_across_versions(tmp_path):
     assert "# 我的key说明（勿删）" in text
     assert m["FNMUSIC_LLM_API_KEY"] == "sk-old"
     assert m["FNMUSIC_NEW_KEY"] == "x"
+    assert m["FNMUSIC_VERSION"] == "1.2.0"
