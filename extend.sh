@@ -163,8 +163,13 @@ run_docker() {
 # ------------------------------------------------------------------------------
 rollback() {
     trap - ERR INT TERM
-    log_err "部署失败/中断：记录停机前身份并尝试验证回滚（不打印响应正文或环境变量）。"
-    takeover remember || log_warn "无法记录身份；后续恢复将保守拒绝未知 socket。"
+    log_err "部署失败/中断：校验可恢复性并尝试验证回滚（不打印响应正文或环境变量）。"
+    if ! plan_json="$(takeover restore-plan 2>/dev/null)"; then
+        log_err "无法在停止前确认可恢复身份，保留代理运行状态并中止。请检查归属冲突后重试。"
+        exit 1
+    fi
+    log_info "回滚预检通过 (${plan_json})。"
+    takeover remember || log_warn "无法刷新身份记录；将使用既有归属记录恢复。"
     sudo systemctl stop fnmusic-ext.service || log_warn "停止服务失败。"
     if takeover restore; then
         log_info "官方 socket 回滚已验证。"

@@ -221,6 +221,70 @@ def test_readiness_persistent_identity_change_fails_closed(state, monkeypatch):
     assert not state.file.exists()
 
 
+def test_legacy_restore_recovery_full_flow(state, servers, tmp_path, monkeypatch):
+    """Old proxy without livez: plan correlates it with the unit, then restores."""
+    legacy_server = servers(state.target, 'unknown')
+    servers(state.upstream, official=True)
+    legacy = takeover.snapshot(state.target)
+    assert legacy['kind'] == 'unknown'
+    assert takeover.snapshot(state.upstream)['kind'] == 'official'
+    # Fake systemctl: the unit's MainPID is the legacy listener's kernel peer.
+    main = legacy['process']['pid']
+
+    def fake_systemctl(command, capture_output, text, timeout, check):
+        return subprocess.CompletedProcess(command, 0, stdout=f'{main}\n', stderr='')
+
+    monkeypatch.setattr(takeover.subprocess, 'run', fake_systemctl)
+    assert state.restore_plan() == 'proxy-recovery'
+    with state.lock():
+        recorded = state.load()
+    assert recorded['proxy'] == dict(legacy, kind='proxy')
+    # The plan may be repeated; identity and records stay consistent.
+    assert state.restore_plan() == 'proxy-recovery'
+    # Simulate `systemctl disable --now`: stop the listener, socket file remains.
+    legacy_server.terminate(); legacy_server.wait(timeout=3)
+    assert takeover.snapshot(state.target)['kind'] == 'stale'
+    state.restore()
+    assert takeover.snapshot(state.target) == takeover.snapshot(state.upstream) or not state.upstream.exists()
+    assert not (state.load().get('proxy') or state.load().get('official'))
+
+
+def test_legacy_restore_refuses_unverifiable_without_stop(state, servers, monkeypatch):
+    servers(state.target, 'unknown')
+    servers(state.upstream, official=True)
+    before = (takeover.snapshot(state.target), takeover.snapshot(state.upstream))
+
+    def refuse(*args, **kwargs):
+        raise subprocess.SubprocessError('systemctl unavailable')
+
+    monkeypatch.setattr(takeover.subprocess, 'run', refuse)
+    with pytest.raises(takeover.Unsafe):
+        state.restore_plan()
+    # Nothing stopped or changed; restore stays equally refused.
+    assert (takeover.snapshot(state.target), takeover.snapshot(state.upstream)) == before
+    with pytest.raises(takeover.Unsafe):
+        state.restore_plan()
+    assert not state.file.exists()
+
+
+def test_foreign_legacy_listener_never_attributed(state, servers, monkeypatch):
+    servers(state.target, 'unknown')
+    servers(state.upstream, official=True)
+    foreign_dir = state.directory.parent / (state.directory.name + '.x')
+    foreign_dir.mkdir(mode=0o700, exist_ok=True)
+    foreign = servers(foreign_dir / 'other.sock')
+
+    def fake_systemctl(command, capture_output, text, timeout, check):
+        # Unit points at an unrelated process, not the socket's peer.
+        return subprocess.CompletedProcess(command, 0, stdout=f'{foreign.pid}\n', stderr='')
+
+    monkeypatch.setattr(takeover.subprocess, 'run', fake_systemctl)
+    with pytest.raises(takeover.Unsafe, match='not the unit MainPID'):
+        state.restore_plan()
+    assert takeover.snapshot(state.target)['kind'] == 'unknown'
+    assert not state.file.exists()
+
+
 def function(text, name):
     start = text.index(name+'() {')
     return text[start:text.index('\n}', start)+2]+'\n'

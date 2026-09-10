@@ -72,8 +72,14 @@ if ! sudo -n true 2>/dev/null; then
     fi
 fi
 
-# Persist live identity BEFORE stop; supervisor and ExecStopPost use the same state.
-log_info "记录 socket 身份并停止代理..."
+# Verify recoverability BEFORE any stop: unsupported legacy layout must fail
+# while the proxy is still running, never after disabling it.
+if ! plan_json="$(takeover restore-plan)"; then
+    log_err "当前 socket 状态不支持已验证的恢复，未停止任何服务。"
+    log_err "请检查是否有其他副本占用、旧版代理无身份接口，或官方应用需要重启后重试。"
+    exit 1
+fi
+log_info "恢复预检通过 (${plan_json})，记录 socket 身份并停止代理..."
 takeover remember
 if [ -f /etc/systemd/system/fnmusic-ext.service ]; then
     sudo systemctl disable --now fnmusic-ext.service

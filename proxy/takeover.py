@@ -120,6 +120,69 @@ def snapshot(path, timeout=0.9):
     return {"kind": kind, "inode": ino, "process": peer}
 
 
+def remember_service(target, upstream, directory, unit='fnmusic-ext.service'):
+    """Legacy migration: record a live proxy that predates /_ext/livez.
+
+    The socket's kernel peer must be the deployed unit's MainPID (or a verified
+    member of its cgroup). Kernel identity decides; systemd only correlates the
+    listener with this deployment. Returns the recorded snapshot.
+    """
+    snap = snapshot(target)
+    if snap['kind'] == 'proxy':
+        return snap
+    if snap['kind'] != 'unknown':
+        raise Unsafe('live proxy identity unverifiable')
+    peer = snap.get('process')
+    if not peer:
+        raise Unsafe('legacy proxy has no kernel peer identity')
+    try:
+        main_pid = int(subprocess.run(['systemctl', 'show', unit, '-p', 'MainPID', '--value'],
+                                      capture_output=True, text=True, timeout=10,
+                                      check=True).stdout.strip() or 0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise Unsafe('legacy proxy cannot be correlated with the deployed unit')
+    if peer['pid'] != main_pid:
+        try:
+            cgroup = Path(f'/sys/fs/cgroup/system.slice/{unit}/cgroup.procs').read_text().split()
+        except OSError:
+            raise Unsafe('legacy proxy is not the unit MainPID')
+        if str(peer['pid']) not in cgroup:
+            raise Unsafe('legacy proxy is outside the deployed unit')
+    current = process(peer['pid'])
+    if current is None or current['start'] != peer['start'] or current['exe'] != peer['exe']:
+        raise Unsafe('legacy proxy exited during ownership verification')
+    if inode(target) != snap['inode']:
+        raise Unsafe('legacy proxy socket replaced during verification')
+    with State(target, upstream, directory).lock():
+        data = State(target, upstream, directory).load()
+        recorded = data.get('proxy')
+        # Compare identity (inode/process), not the recorded role label: a
+        # legacy listener is probed as 'unknown' but recorded as proxy.
+        if recorded and {k: v for k, v in recorded.items() if k != 'kind'} != {k: v for k, v in snap.items() if k != 'kind'}:
+            raise Unsafe('recorded proxy ownership differs from legacy listener')
+        # Verify the attribution once more against the current live peer before
+        # writing the proxy role; the record must satisfy restore's checks.
+        verified = snapshot(target)
+        if verified['kind'] != 'unknown' or verified != snap:
+            raise Unsafe('legacy proxy identity changed during recording')
+        attributed = dict(verified, kind='proxy')
+        data['proxy'] = attributed
+        upstream_snap = snapshot(upstream)
+        if upstream_snap['kind'] == 'official':
+            prior = data.get('official')
+            if prior and prior != upstream_snap:
+                raise Unsafe('official upstream ownership changed')
+            data['official'] = upstream_snap
+        State(target, upstream, directory).save(data)
+    return attributed
+
+
+def remember_official(path):
+    """Record a positively identified official listener, else None."""
+    snap = snapshot(path)
+    return snap if snap['kind'] == 'official' else None
+
+
 class State:
     def __init__(self, target, upstream, directory):
         self.target, self.upstream = Path(target), Path(upstream)
@@ -190,6 +253,35 @@ class State:
         if inode(path) != record['inode']:
             raise Unsafe('socket changed before unlink')
         os.unlink(path)
+
+    def restore_plan(self, unit='fnmusic-ext.service'):
+        """Pre-flight: may this stop be followed by verified recovery?
+
+        Called by restore.sh BEFORE disabling the service. Returns the positive
+        future role of the target; raises Unsafe while recovery is unsupported
+        or ambiguous, so the stop never produces an unrecoverable layout.
+        """
+        t, u = snapshot(self.target), snapshot(self.upstream)
+        if t['kind'] == 'official':
+            if u['kind'] != 'absent' and u['kind'] != 'unknown':
+                raise Unsafe('official target plus occupied upstream; refuse stop')
+            return 'official-direct'
+        if u['kind'] == 'absent':
+            raise Unsafe('no positively identified official upstream; refuse stop')
+        if u['kind'] not in ('official', 'unknown'):
+            raise Unsafe('upstream is not official; refuse stop')
+        current = snapshot(self.target)
+        if current['kind'] != 'proxy':
+            recorded = remember_service(self.target, self.upstream, self.directory, unit=unit)
+            live = snapshot(self.target)
+            # The legacy peer stays 'unknown' to live probes; the verified
+            # record grants it the proxy role, matching the exact live identity.
+            if recorded['kind'] != 'proxy' or live not in (recorded, current):
+                raise Unsafe('legacy proxy identity unverifiable; refuse stop')
+        if u['kind'] == 'unknown':
+            if remember_official(self.upstream) is None:
+                raise Unsafe('upstream identity unverifiable; refuse stop')
+        return 'proxy-recovery'
 
     def restore(self):
         with self.lock():
@@ -466,7 +558,7 @@ def prepare_install_lock():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['run', 'preflight', 'remember', 'restore', 'ready', 'status', 'render-unit', 'prepare-install-lock'])
+    parser.add_argument('command', choices=['run', 'preflight', 'remember', 'restore-plan', 'restore', 'ready', 'status', 'render-unit', 'prepare-install-lock'])
     parser.add_argument('--base', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--target', default='/var/run/trim_music.socket')
     parser.add_argument('--upstream', default='/var/run/trim_music_upstream.socket')
@@ -488,6 +580,9 @@ def main():
             wait_ready(state, args.timeout)
         elif args.command == 'status':
             print(json.dumps({'target': snapshot(state.target), 'upstream': snapshot(state.upstream)}))
+        elif args.command == 'restore-plan':
+            plan = state.restore_plan()
+            print(json.dumps({'plan': plan}))
         elif args.command == 'run':
             with state.lock():
                 pass
