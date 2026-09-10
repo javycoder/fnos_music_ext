@@ -67,11 +67,14 @@ application's known storage paths, not arbitrary future import side effects.
 Unknown live sockets, symlinks/non-sockets, two official listeners, changed
 recorded ownership, and unrecorded dead sockets are preserved and cause failure.
 A legacy layout with an absent target and a positively identified official
-upstream can be restored. A legacy live proxy with the new identity endpoint can
-be recorded before shutdown. Older proxies without that endpoint cannot be
-identified from forwarded business responses and may require restoration from
-the original checkout or an administrator-controlled official application restart.
-A reboot loses `/run` records; dead unrecorded sockets are never guessed away.
+upstream can be restored. Older proxies without the `/_ext/livez` endpoint are
+correlated with the deployed unit BEFORE any stop: `restore-plan` matches the
+socket's kernel peer against the unit's MainPID (or cgroup membership),
+double-checks process start/executable and inode, and records the verified
+listener with the proxy role. If that attribution fails, restore.sh refuses
+before stopping anything, so a stop can no longer create an unrecoverable
+layout. A reboot loses `/run` records; dead unrecorded sockets are never
+guessed away.
 SIGKILL of the supervisor relies on systemd killing the remaining child and
 `ExecStopPost`; invoking the supervisor outside systemd does not provide that
 external crash handler. Cooperative locks cannot fully serialize an unrelated
