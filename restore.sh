@@ -8,6 +8,9 @@ set -euo pipefail
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared outer lock is never acquired by systemd service helpers.
+source "${BASE_DIR}/proxy/install_common.sh"
+installation_lock "$@"
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 FULL_RESTORE=0
@@ -51,67 +54,7 @@ run_docker() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 获取 fnOS 网关 http/https 端口 (读取失败时默认 5666/5667)
-# 输出: "<http_port> <https_port>"
-# ------------------------------------------------------------------------------
-get_fnos_gateway_ports() {
-    cat /usr/trim/etc/network_gateway_setting.conf 2>/dev/null | python3 -c '
-import sys, json, re
-text = sys.stdin.read()
-http_port, https_port = "5666", "5667"
-def scan(obj):
-    global http_port, https_port
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            kl = str(k).lower()
-            if isinstance(v, (int, str)) and str(v).isdigit():
-                if "https" in kl and "port" in kl:
-                    https_port = str(v)
-                elif "http" in kl and "port" in kl:
-                    http_port = str(v)
-            else:
-                scan(v)
-    elif isinstance(obj, list):
-        for it in obj:
-            scan(it)
-if text.strip():
-    try:
-        scan(json.loads(text))
-    except Exception:
-        pass
-    if http_port == "5666":
-        m = re.search(r"\"?http_port\"?\s*[:=]\s*(\d+)", text)
-        if m:
-            http_port = m.group(1)
-    if https_port == "5667":
-        m = re.search(r"\"?https_port\"?\s*[:=]\s*(\d+)", text)
-        if m:
-            https_port = m.group(1)
-print(http_port, https_port)
-' 2>/dev/null || echo "5666 5667"
-}
-
-probe_socket_identity() {
-    # 在停代理之前探测：1=proxy 2=trim-music 0=unknown/absent
-    local sock="$1"
-    if [ ! -S "${sock}" ]; then
-        echo "absent"
-        return 0
-    fi
-    local health_resp probe_resp
-    health_resp="$(curl -s --max-time 2 --unix-socket "${sock}" http://localhost/_ext/healthz 2>/dev/null || true)"
-    if echo "${health_resp}" | grep -q '"upstream"'; then
-        echo "proxy"
-        return 0
-    fi
-    probe_resp="$(curl -s --max-time 2 --unix-socket "${sock}" "http://localhost/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
-    if echo "${probe_resp}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
-        echo "trim-music"
-        return 0
-    fi
-    echo "unknown"
-}
+check_proxy_unit_owner || exit 1
 
 log_info "==> 开始还原 fnmusic 原生直连模式..."
 
@@ -129,98 +72,24 @@ if ! sudo -n true 2>/dev/null; then
     fi
 fi
 
-# 2. 停代理前完成身份探测（避免停服务后探针误判）
-log_info "探测 Unix Socket 身份（停代理前）..."
-TARGET_IDENTITY="$(probe_socket_identity "${TARGET_SOCK}")"
-UPSTREAM_EXISTS=0
-[ -S "${UPSTREAM_SOCK}" ] && UPSTREAM_EXISTS=1
-log_info "原路径身份: ${TARGET_IDENTITY}；upstream 存在: ${UPSTREAM_EXISTS}"
-
-# 3. 停用并禁用代理服务
-log_info "停用并禁用 fnmusic-ext systemd 服务..."
-sudo systemctl disable --now fnmusic-ext.service 2>/dev/null || true
-
-# 4. Socket 复位逻辑（绝不误删官方活 socket）
-log_info "复位 Unix Socket 状态..."
-case "${TARGET_IDENTITY}" in
-    proxy)
-        log_info "原路径 (${TARGET_SOCK}) 为代理 socket，正在移除并恢复 upstream..."
-        sudo rm -f "${TARGET_SOCK}"
-        if [ -S "${UPSTREAM_SOCK}" ]; then
-            sudo mv "${UPSTREAM_SOCK}" "${TARGET_SOCK}"
-            sudo chmod 666 "${TARGET_SOCK}"
-            log_info "已将 upstream 恢复至原路径 (${TARGET_SOCK})。"
-        else
-            log_warn "未发现 upstream socket。若飞牛音乐无响应，请在应用中心重启飞牛音乐以重建官方 socket。"
-        fi
-        ;;
-    trim-music)
-        log_info "原路径 (${TARGET_SOCK}) 已由 trim-music 直连监听，保留原 socket，仅清理 upstream 残留..."
-        if [ -e "${UPSTREAM_SOCK}" ] || [ -S "${UPSTREAM_SOCK}" ]; then
-            sudo rm -f "${UPSTREAM_SOCK}"
-        fi
-        sudo chmod 666 "${TARGET_SOCK}" 2>/dev/null || true
-        ;;
-    absent)
-        if [ -S "${UPSTREAM_SOCK}" ]; then
-            log_info "原路径不存在，将 upstream 移回原路径..."
-            sudo mv "${UPSTREAM_SOCK}" "${TARGET_SOCK}"
-            sudo chmod 666 "${TARGET_SOCK}"
-        else
-            log_warn "原路径与 upstream 均不存在。请在应用中心重启飞牛音乐以重建官方 socket。"
-        fi
-        ;;
-    unknown|*)
-        # 保守策略：不确定时绝不删除 TARGET_SOCK，以免误伤官方活 socket
-        if [ -S "${UPSTREAM_SOCK}" ] && [ ! -S "${TARGET_SOCK}" ]; then
-            log_info "原路径无有效 socket，将 upstream 移回..."
-            sudo mv "${UPSTREAM_SOCK}" "${TARGET_SOCK}"
-            sudo chmod 666 "${TARGET_SOCK}"
-        elif [ -S "${UPSTREAM_SOCK}" ] && [ -S "${TARGET_SOCK}" ]; then
-            log_warn "原路径 socket 身份不明且 upstream 仍存在：保留原路径，不删除。"
-            log_warn "若确认扩展残留，可重启飞牛音乐后再执行本脚本。"
-        else
-            log_warn "原路径 socket 身份不明（可能为官方服务暂未就绪）。保留现有文件，不做删除。"
-            log_warn "若飞牛音乐无法连接，请在应用中心重启飞牛音乐。"
-        fi
-        ;;
-esac
-
-# 5. 验证直连恢复 (优先 Unix socket 探活，失败再走网关 https 端口 / 443)
-log_info "验证直连链路..."
-GW_HTTP_PORT=""
-GW_HTTPS_PORT=""
-read -r GW_HTTP_PORT GW_HTTPS_PORT <<< "$(get_fnos_gateway_ports)"
-log_info "fnOS 网关端口: http=${GW_HTTP_PORT} https=${GW_HTTPS_PORT}"
-
-verify_resp="$(curl -s --max-time 5 --unix-socket "${TARGET_SOCK}" "http://localhost/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
-if [ -z "${verify_resp}" ]; then
-    log_warn "socket 探测异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT})..."
-    verify_resp="$(curl -sk --max-time 5 "https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
+# Persist live identity BEFORE stop; supervisor and ExecStopPost use the same state.
+log_info "记录 socket 身份并停止代理..."
+takeover remember
+if [ -f /etc/systemd/system/fnmusic-ext.service ]; then
+    sudo systemctl disable --now fnmusic-ext.service
 fi
-if [ -z "${verify_resp}" ]; then
-    verify_resp="$(curl -skL --max-time 5 "https://127.0.0.1/music/api/v1/search/track?keyword=test" 2>/dev/null || true)"
-fi
-
-if echo "${verify_resp}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
-    log_info "直连验证成功: 官方 trim-music 正常响应 (INVALID TOKEN)。"
-else
-    log_warn "直连验证未收到预期响应: ${verify_resp:-无响应}"
+if ! takeover restore; then
+    log_err "未能验证官方直连恢复；保留未知 socket，不宣称成功。请排查冲突后重试。"
+    exit 1
 fi
 
 # 6. full 模式额外清理音源
 if [ "${FULL_RESTORE}" -eq 1 ]; then
     log_info "(--full 模式) 停止并移除音源容器与宿主机 unit..."
-    rm_out=""
-    if ! rm_out="$(run_docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic 2>&1)"; then
-        log_warn "音源容器移除出现错误（可能部分未删除）: ${rm_out}"
-    fi
-    if [ -f "${BASE_DIR}/docker-compose.yml" ]; then
-        (cd "${BASE_DIR}" && run_docker compose -f docker-compose.yml down --remove-orphans 2>/dev/null) || true
-    fi
     for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-        sudo systemctl disable --now "${unit}.service" 2>/dev/null || true
-        if [ -f "/etc/systemd/system/${unit}.service" ]; then
+        remove_owned_container "${unit}"
+        if owned_source_unit "${unit}"; then
+            stop_owned_source_unit "${unit}"
             sudo rm -f "/etc/systemd/system/${unit}.service"
         fi
     done

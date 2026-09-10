@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # ==============================================================================
 # fnmusic-ext 一键扩展脚本 (Unix Socket 接管架构)
@@ -8,6 +8,9 @@ set -euo pipefail
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared outer lock is never acquired by systemd service helpers.
+source "${BASE_DIR}/proxy/install_common.sh"
+installation_lock "$@"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 TARGET_SOCK="/var/run/trim_music.socket"
@@ -101,6 +104,8 @@ print(http_port, https_port)
 ' 2>/dev/null || echo "5666 5667"
 }
 
+check_proxy_unit_owner || exit 1
+
 if [ ! -f "${BASE_DIR}/.env" ]; then
     if [ -t 0 ]; then
         log_warn "检测到尚未完成初次安装配置（未找到 .env 配置文件）。"
@@ -108,7 +113,7 @@ if [ ! -f "${BASE_DIR}/.env" ]; then
         case "${prompt_ans:-y}" in
             y|Y|yes|YES|"")
                 log_info "正在启动安装向导 (./install.sh)..."
-                exec "${BASE_DIR}/install.sh"
+                exec /bin/bash "${BASE_DIR}/install.sh"
                 ;;
             *)
                 log_err "请先执行 ./install.sh 完成音源与配置安装。"
@@ -125,6 +130,8 @@ set -a
 # shellcheck disable=SC1091
 source "${BASE_DIR}/.env"
 set +a
+# Release diagnostics must not be replaced by stale dotenv version metadata.
+read -r FNMUSIC_VERSION < "${BASE_DIR}/VERSION"
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
@@ -150,46 +157,20 @@ run_docker() {
     fi
 }
 
-# 容器名全局固定（fnmusic-*）；若被其他副本/并发任务的容器占用，移除后由当前目录接管
-reclaim_container() {
-    local name="$1" owner=""
-    if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
-        return 0
-    fi
-    owner="$(run_docker container inspect "${name}" \
-        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
-    log_info "检测到同名容器 ${name}（来自 ${owner:-未知目录}），移除后由当前目录接管..."
-    if ! run_docker rm -f "${name}"; then
-        log_err "无法移除同名容器 ${name}，请手动执行: docker rm -f ${name}"
-        return 1
-    fi
-}
 
 # ------------------------------------------------------------------------------
 # 回滚函数 (restore 逻辑)
 # ------------------------------------------------------------------------------
 rollback() {
-    log_err "执行遇到错误或验收失败，正在执行自动回滚..."
-    sudo systemctl disable --now fnmusic-ext.service 2>/dev/null || true
-
-    # 探测 socket 状态
-    local health_resp
-    health_resp="$(curl -s --max-time 2 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
-    if echo "${health_resp}" | grep -q '"upstream"'; then
-        # 当前原路径仍是代理 socket 残留，清理并恢复 upstream
-        log_info "正在清理代理 socket 并恢复官方 trim-music socket..."
-        sudo rm -f "${TARGET_SOCK}"
-        if [ -S "${UPSTREAM_SOCK}" ]; then
-            sudo mv "${UPSTREAM_SOCK}" "${TARGET_SOCK}"
-            sudo chmod 666 "${TARGET_SOCK}"
-        fi
-    elif [ -S "${UPSTREAM_SOCK}" ] && [ ! -S "${TARGET_SOCK}" ]; then
-        log_info "正在将 upstream socket 恢复为原路径..."
-        sudo mv "${UPSTREAM_SOCK}" "${TARGET_SOCK}"
-        sudo chmod 666 "${TARGET_SOCK}"
+    trap - ERR INT TERM
+    log_err "部署失败/中断：记录停机前身份并尝试验证回滚（不打印响应正文或环境变量）。"
+    takeover remember || log_warn "无法记录身份；后续恢复将保守拒绝未知 socket。"
+    sudo systemctl stop fnmusic-ext.service || log_warn "停止服务失败。"
+    if takeover restore; then
+        log_info "官方 socket 回滚已验证。"
+    else
+        log_err "回滚未能验证：保留未知 socket。请检查身份/冲突后重启飞牛音乐。"
     fi
-
-    log_err "回滚完成。扩展未能成功启用。"
     exit 1
 }
 
@@ -228,7 +209,7 @@ verify_acceptance() {
     rm -f "${resp_file}"
 
     if ! echo "${resp_content}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
-        log_err "验收 6a 失败：未收到预期的 INVALID TOKEN 响应。实际响应: ${resp_content}"
+        log_err "验收 6a 失败：未收到预期的 INVALID TOKEN 响应。响应正文已隐藏"
         return 1
     fi
 
@@ -358,7 +339,7 @@ except Exception:
             local lx_diag
             lx_diag="$(curl -s --max-time 5 "${LX_URL}/api/v1/track/url?id=${first_failed_lx_id}&quality=standard" 2>/dev/null || echo "")"
             if [ -n "${lx_diag}" ]; then
-                log_warn "洛雪音源直链诊断 (${first_failed_lx_id}): ${lx_diag}"
+                log_warn "洛雪音源直链诊断返回数据（正文已隐藏）。"
             fi
         fi
     fi
@@ -434,20 +415,17 @@ ensure_source() {
             fi
         fi
         reclaim_container "fnmusic-${name}" || return 1
-        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || true
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || return 1
     else
         if systemctl list-unit-files "${unit}" >/dev/null 2>&1; then
-            sudo systemctl start "${unit}" 2>/dev/null || true
+            owned_source_unit "${unit%.service}" || { log_err "音源 unit 不属于当前目录；保留。"; return 1; }
+            sudo systemctl start "${unit}" || return 1
         fi
     fi
-    local i
-    for i in $(seq 1 60); do
-        if curl -sf --max-time 3 "${url}/healthz" >/dev/null 2>&1; then
-            log_info "${name} 已就绪。"
-            return 0
-        fi
-        sleep 2
-    done
+    if wait_http "${url}/healthz" 60 2; then
+        log_info "${name} 已就绪。"
+        return 0
+    fi
     log_err "等待 ${name} healthz 超时 (${url}/healthz)。"
     return 1
 }
@@ -480,18 +458,18 @@ if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
 fi
 
 # 1.6 编译与语法检查
-python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
+takeover preflight --base "${BASE_DIR}"
 bash -n "${BASE_DIR}/proxy/run_proxy.sh"
 
 # ------------------------------------------------------------------------------
 # 2. 幂等性检查
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 2/5: 幂等性检查..."
-HEALTH_CHECK="$(curl -s --max-time 3 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
+
 
 if [ "${FORCE_RELOAD}" -eq 1 ]; then
     log_info "已指定 --force：跳过幂等提前退出，将重写 unit 并重启代理以加载最新 .env。"
-elif echo "${HEALTH_CHECK}" | grep -q '"upstream":[[:space:]]*"ok"'; then
+elif takeover ready --timeout 5; then
     log_info "检测到代理服务已在运行且上游健康 (处于扩展接管态)。"
     log_info "直接运行验收测试确认状态..."
     if verify_acceptance; then
@@ -509,26 +487,10 @@ fi
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 3/5: 安装 systemd 服务并启动接管..."
 UNIT_TMP="$(mktemp)"
-cat > "${UNIT_TMP}" <<EOF
-[Unit]
-Description=fnmusic-ext Proxy Service (Socket Takeover)
-After=network.target docker.service
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}
-ExecStart=${BASE_DIR}/proxy/run_proxy.sh
-ExecStartPost=/bin/sh -c 'for i in \$(seq 1 65); do [ -S /var/run/trim_music.socket ] && chmod 666 /var/run/trim_music.socket && exit 0; sleep 1; done; exit 1'
-Restart=always
-RestartSec=5
-Environment=PYTHONUNBUFFERED=1
-Environment=FNMUSIC_HOME=${BASE_DIR}
-EnvironmentFile=-${BASE_DIR}/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
+takeover render-unit --base "${BASE_DIR}" > "${UNIT_TMP}"
+# Arm rollback before any service mutation, including failed systemctl commands.
+trap rollback ERR INT TERM
+takeover remember
 sudo cp "${UNIT_TMP}" /etc/systemd/system/fnmusic-ext.service
 rm -f "${UNIT_TMP}"
 sudo systemctl daemon-reload
@@ -545,18 +507,9 @@ fi
 # 4. 等待接管完成与健康检查
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 4/5: 等待代理服务接管完成并就绪..."
-READY=0
-for i in $(seq 1 30); do
-    STATUS_JSON="$(curl -s --max-time 2 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
-    if echo "${STATUS_JSON}" | grep -q '"ok":[[:space:]]*true' && echo "${STATUS_JSON}" | grep -q '"upstream":[[:space:]]*"ok"'; then
-        READY=1
-        break
-    fi
-    sleep 1
-done
-
-if [ "${READY}" -ne 1 ]; then
-    log_err "等待接管超时 (30s) 或 healthz 未通过。当前探测响应: ${STATUS_JSON:-无响应}"
+# True monotonic deadline; each health request allows 4s (> 2.5s readiness budget).
+if ! takeover ready --timeout 30; then
+    log_err "等待代理身份与健康就绪超时（30s）。"
     rollback
 fi
 
@@ -571,6 +524,7 @@ if ! verify_acceptance; then
 fi
 
 log_info "============================================================"
+trap - ERR INT TERM
 log_info "fnmusic-ext v${FNMUSIC_VERSION} 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
 log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"

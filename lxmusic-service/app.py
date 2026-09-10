@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -38,7 +39,7 @@ except ImportError:
 SERVICE_VERSION = "1.1.0"
 
 CONF = {
-    "sources": [s.strip() for s in os.environ.get("LX_SOURCES", "kg,wy,mg,tx,kw").split(",") if s.strip()],
+    "sources": [s.strip() for s in os.environ.get("LX_SOURCES", "kg,wy,mg,kw").split(",") if s.strip()],
     "search_timeout": float(os.environ.get("LX_SEARCH_TIMEOUT", "12")),
     "limit_per_source": int(os.environ.get("LX_LIMIT_PER_SOURCE", "20")),
     "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "10")),
@@ -78,10 +79,33 @@ MG_HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36"
 TX_HEADERS = {"User-Agent": UA_PC, "Referer": "https://y.qq.com/"}
 KW_HEADERS = {"User-Agent": UA_PC}
 
-_EAPI_KEY = b"#14ljk_!\\]&0U<'("
+_EAPI_KEY = b"e82ckenh8dichen8"
 
 # id -> {"item": {...}, "ts": float}
 _SONG_CACHE: dict[str, dict] = {}
+_RESOLUTION_FAILURES: ContextVar[list | None] = ContextVar("lx_resolution_failures", default=None)
+
+
+def _record_failure(exc: Exception) -> None:
+    failures = _RESOLUTION_FAILURES.get()
+    if failures is not None:
+        failures.append(str(exc) or type(exc).__name__)
+
+
+def _check_resolver_status(response: httpx.Response) -> None:
+    if response.status_code >= 500 or response.status_code in (408, 429):
+        raise ChainTransportError(f"resolver HTTP {response.status_code}")
+
+
+_SEARCH_PARTIAL: ContextVar[list | None] = ContextVar("lx_search_partial", default=None)
+
+
+def _publish(item: dict) -> None:
+    partial = _SEARCH_PARTIAL.get()
+    if partial is not None:
+        partial.append(item)
+
+
 _STATS = {"searches": 0, "url_resolutions": 0, "errors": 0}
 
 
@@ -189,7 +213,7 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     items = []
     vip_candidates = []
     for it in raw:
-        if not isinstance(it, dict):
+        if not isinstance(it, dict) or _explicit_trial(it):
             continue
         fhash = str(it.get("hash") or "")
         if not fhash:
@@ -232,8 +256,10 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         if is_vip:
             vip_candidates.append(item)
         else:
+            item.update(verified=False, validation_status="unverified", completeness="unknown")
             _cache_put(item)
             items.append(item)
+            _publish(item)
     # VIP 候选批量探活，通过（verified）才补进结果
     if vip_candidates and len(items) < limit:
         want = min(len(vip_candidates), limit - len(items) + limit // 2)
@@ -256,17 +282,23 @@ async def kg_resolve_url(
             headers={"User-Agent": UA_MOBILE},
             timeout=8.0,
         )
+        _check_resolver_status(r)
         data = _lenient_json(r, f"kg playInfo {fhash}")
         if isinstance(data, dict) and data.get("errcode") == 0 and data.get("url"):
             ext = str(data.get("extName") or "mp3").lower().lstrip(".") or "mp3"
-            return {
+            candidate = {
+                "trial": _explicit_trial(data),
                 "url": str(data["url"]),
                 "ext": ext,
                 "file_size": int(data.get("fileSize") or 0) or 0,
-                "br": int(data.get("bitRate") or 128) * 1000 if int(data.get("bitRate") or 0) < 1000 else int(data.get("bitRate") or 128000),
+                "br": int(data.get("bitRate") or 0) * 1000 if int(data.get("bitRate") or 0) < 1000 else int(data.get("bitRate") or 0),
                 "headers": dict(KG_HEADERS),
             }
+            result = await _verify_result(client, candidate, report_transport=True)
+            if result:
+                return result
     except Exception as e:  # noqa: BLE001
+        _record_failure(e)
         logger.warning("kg playInfo %s failed: %s", fhash, e)
 
     # 2. 备用接口：老版 trackercdn（部分地区/IP 或自建反代可能可用）
@@ -279,18 +311,28 @@ async def kg_resolve_url(
                 headers={"User-Agent": UA_MOBILE},
                 timeout=6.0,
             )
+            _check_resolver_status(r)
             data = _lenient_json(r, f"kg trackercdn {fhash}")
         except Exception as e:  # noqa: BLE001
+            _record_failure(e)
             last_err = e
             continue
         if isinstance(data, dict) and data.get("code") == 0 and data.get("url"):
-            return {
+            candidate = {
+                "trial": _explicit_trial(data),
                 "url": str(data["url"]),
                 "ext": str(data.get("ext") or "mp3").lower().lstrip(".") or "mp3",
                 "file_size": int(data.get("file_size") or 0) or 0,
-                "br": int((data.get("bitRate") or data.get("bitrate") or 0) or 0),
+                "br": _bitrate_bps(data.get("bitRate") or data.get("bitrate")),
                 "headers": dict(KG_HEADERS),
             }
+            try:
+                result = await _verify_result(client, candidate, report_transport=True)
+            except (httpx.HTTPError, ChainTransportError, TimeoutError) as exc:
+                _record_failure(exc)
+                continue
+            if result:
+                return result
     if last_err:
         logger.warning("kg trackercdn %s last error: %s", fhash, last_err)
     return None
@@ -341,14 +383,18 @@ def _eapi_params(eapi_path: str, payload: dict) -> str:
     """网易 eapi 参数加密（AES-ECB + MD5 摘要，与 LX Music 源一致）。"""
     import json as _json
 
-    text = _json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    message = f"nobody{eapi_path}use{text}md5Encrypt"
+    from urllib.parse import urlparse
+
+    eapi_path = urlparse(eapi_path).path.replace("/eapi/", "/api/")
+    # Match the independent musicdl EapiCryptoUtils wire serialization.
+    text = _json.dumps(payload)
+    message = f"nobody{eapi_path}use{text}md5forencrypt"
     digest = hashlib.md5(message.encode("utf-8")).hexdigest()
     data = f"{eapi_path}-36cd479b6b5-{text}-36cd479b6b5-{digest}".encode("utf-8")
     pad = 16 - len(data) % 16
     data += bytes([pad]) * pad
     cipher = AES.new(_EAPI_KEY, AES.MODE_ECB)
-    return base64.b64encode(cipher.encrypt(data)).decode()
+    return cipher.encrypt(data).hex()
 
 
 _WY_EAPI_HEADER = {
@@ -382,7 +428,7 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     items = []
     vip_candidates = []
     for it in songs:
-        if not isinstance(it, dict):
+        if not isinstance(it, dict) or _explicit_trial(it):
             continue
         sid = str(it.get("id") or "")
         if not sid:
@@ -434,8 +480,10 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         if is_vip:
             vip_candidates.append(item)
         else:
+            item.update(verified=False, validation_status="unverified", completeness="unknown")
             _cache_put(item)
             items.append(item)
+            _publish(item)
     # VIP 候选批量探活，通过（verified）才补进结果
     if vip_candidates and len(items) < limit:
         want = min(len(vip_candidates), limit - len(items) + limit // 2)
@@ -447,7 +495,7 @@ async def wy_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) 
     # 1. 优先尝试官方 eapi 高音质解析（需 pycryptodome）
     if HAS_CRYPTO:
         br_map = {"lossless": 999000, "high": 320000, "standard": 128000}
-        brs = [br_map[t] for t in _quality_tiers(tier) if t in br_map]
+        brs = [br_map[_quality_tiers(tier)[0]]]
         eapi_path = "/api/song/enhance/player/url"
         for br in brs:
             try:
@@ -461,43 +509,35 @@ async def wy_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) 
                     },
                     timeout=8.0,
                 )
+                _check_resolver_status(r)
+                if r.status_code in (401, 403, 404, 410):
+                    continue
                 data = (r.json() or {}).get("data") or []
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                _record_failure(exc)
                 continue
             for entry in data:
                 if isinstance(entry, dict) and entry.get("url"):
-                    return {
+                    candidate = {
                         "url": str(entry["url"]),
-                        "ext": "mp3",
+                        "trial": _explicit_trial(entry),
+                        "ext": str(entry.get("type") or "mp3").lower(),
                         "file_size": int(entry.get("size") or 0) or 0,
-                        "br": int(entry.get("br") or 0) or br,
+                        "br": int(entry.get("br") or 0),
                         "headers": dict(WY_HEADERS),
                     }
+                    try:
+                        result = await _verify_result(client, candidate, report_transport=True)
+                    except (httpx.HTTPError, ChainTransportError, TimeoutError) as exc:
+                        _record_failure(exc)
+                        continue
+                    if result:
+                        return result
 
-    # 2. 备用兜底：网易 outer/url 免登录直链（重定向至真实音频 CDN，先做 Range 探测排除 404 HTML）
-    try:
-        outer_url = f"https://music.163.com/song/media/outer/url?id={identifier}"
-        probe_headers = dict(WY_HEADERS)
-        probe_headers["Range"] = "bytes=0-1"
-        r_probe = await client.get(
-            outer_url,
-            headers=probe_headers,
-            timeout=8.0,
-        )
-        ct = (r_probe.headers.get("content-type") or "").lower()
-        if r_probe.status_code in (200, 206) and "audio" in ct:
-            final_url = str(r_probe.url)
-            cl = int(r_probe.headers.get("content-length") or 0)
-            return {
-                "url": final_url,
-                "ext": "mp3",
-                "file_size": cl,
-                "br": 128000,
-                "headers": dict(WY_HEADERS),
-            }
-    except Exception as e:  # noqa: BLE001
-        logger.warning("wy outer/url fallback %s failed: %s", identifier, e)
-
+    # Standard-only outer URL; the shared pipeline owns the single probe.
+    if tier == "standard":
+        return {"url": f"https://music.163.com/song/media/outer/url?id={identifier}",
+                "ext": "mp3", "br": 128000, "headers": dict(WY_HEADERS)}
     return None
 
 
@@ -524,14 +564,14 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     data = r.json() or {}
     raw = data.get("songs") or (data.get("songResultData") or {}).get("result") or []
 
-    async def _probe_one(it: dict) -> dict | None:
+    def _map_one(it: dict) -> dict | None:
         if not isinstance(it, dict):
             return None
         cid = str(it.get("copyrightId") or it.get("id") or "")
         if not cid:
             return None
         title = str(it.get("songName") or "")
-        if any(marker in title for marker in _TRIAL_TITLE_MARKERS):
+        if _explicit_trial(it) or any(marker in title for marker in _TRIAL_TITLE_MARKERS):
             return None
         singers = it.get("singers") or []
         artist = " / ".join(str(s.get("name") or "") for s in singers if isinstance(s, dict))
@@ -555,35 +595,21 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "lrc_url": str(it.get("lrcUrl") or ""),
             "copyright_id": cid,
         }
-        # 可播性验证：官方解析失败回退溯音咪咕链路，再 Range 探活（含试听碎片防护）
-        res = await resolve_and_probe(client, "mg", item)
-        if not res:
-            return None
-        item["verified"] = True
-        item["_probe"] = dict(res, ts=time.time(), tier="standard")
-        item["file_size"] = res.get("file_size") or 0
-        _cache_put(item)
         return item
 
-    candidates = [it for it in raw if isinstance(it, dict)]
-    probed = await asyncio.gather(*[_probe_one(it) for it in candidates[:fetch_size]], return_exceptions=True)
-    items = []
-    for res in probed:
-        if isinstance(res, dict):
-            items.append(res)
-            if len(items) >= limit:
-                break
-    return items
+    candidates = [item for it in raw[:fetch_size] if (item := _map_one(it))]
+    return await _probe_candidates(client, "mg", candidates, limit)
 
 
 async def mg_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) -> dict | None:
     try:
         r = await client.get(
             "https://music.migu.cn/v3/api/music/audio/player_get_song_info",
-            params={"copyrightId": identifier, "resourceType": "E", "resourceLevel": tier},
+            params={"copyrightId": identifier, "resourceType": "E", "resourceLevel": {"lossless": "ZQ", "high": "PQ", "standard": "E"}.get(tier, tier)},
             headers={"User-Agent": UA_PC, "Referer": "https://music.migu.cn/"},
             timeout=8.0,
         )
+        _check_resolver_status(r)
         json_obj = _lenient_json(r, f"mg player_get_song_info {identifier}")
         if not isinstance(json_obj, dict):
             return None
@@ -594,12 +620,14 @@ async def mg_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) 
         ext = str(data.get("format_type") or "mp3").lower().lstrip(".") or "mp3"
         return {
             "url": url,
+            "trial": _explicit_trial(data),
             "ext": "flac" if ext in ("flac", "zq", "sq") else "mp3",
             "file_size": int(data.get("fileSize") or data.get("overdue_size") or 0) or 0,
-            "br": int(data.get("bitRate") or 0) or 0,
+            "br": _bitrate_bps(data.get("bitRate")),
             "headers": dict(MG_HEADERS),
         }
     except Exception as e:  # noqa: BLE001
+        _record_failure(e)
         logger.warning("mg resolve %s failed: %s", identifier, e)
         return None
 
@@ -626,8 +654,8 @@ async def mg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
 #   [死] Huibq/聆川 qdy 脚本内即为占位符（"your_key_here"）
 # 已死链路不注册；后续复活时在此追加即可，调度/探活/熔断逻辑无需改动。
 #
-# 使用第三方链路解析的曲目一律经 Range 探活验证后才对外返回（"搜得到必能播"），
-# 对应条目带 verified=true 标记，代理侧据此跳过收费元数据拦截。
+# 第三方直链经有界媒体签名探测；verified 仅表示媒体前缀有效，
+# 不保证完整歌曲、授权状态或未来可用性；completeness 始终保守标记 unknown。
 
 
 def _content_total_size(r: httpx.Response) -> int:
@@ -636,30 +664,97 @@ def _content_total_size(r: httpx.Response) -> int:
         tail = cr.rsplit("/", 1)[-1].strip()
         if tail.isdigit():
             return int(tail)
+    # A partial response's Content-Length is NOT the whole file size.
     cl = r.headers.get("content-length") or ""
-    return int(cl) if cl.isdigit() else 0
+    return int(cl) if r.status_code == 200 and cl.isdigit() else 0
+
+
+_PROBE_BYTES = 4096
+
+
+class ChainTransportError(Exception):
+    """Infrastructure failure, unlike a healthy resolver's song miss."""
+
+
+def _media_signature(body: bytes) -> str:
+    """Positive signatures only; MIME and byte counts do not prove a full song."""
+    if body.startswith(b"fLaC"):
+        return "flac"
+    if body.startswith(b"ID3"):
+        return "mp3"
+    if body.startswith(b"OggS"):
+        return "ogg"
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WAVE":
+        return "wav"
+    if len(body) >= 12 and body[4:8] == b"ftyp":
+        return "m4a"
+    if len(body) >= 4 and body[0] == 0xff:
+        if body[1] & 0xf6 == 0xf0:  # ADTS AAC
+            return "aac"
+        if (body[1] & 0xe0 == 0xe0 and body[1] & 6
+                and body[2] & 0xf0 not in (0, 0xf0) and body[2] & 12 != 12):
+            return "mp3"
+    return ""
 
 
 async def probe_url(
-    client: httpx.AsyncClient, url: str, headers: "dict | None" = None
+    client: httpx.AsyncClient, url: str, headers: "dict | None" = None,
+    *, report_transport: bool = False,
 ) -> "tuple[bool, str, str, int]":
-    """直链探活：Range: bytes=0-1 请求，要求 200/206 且非 HTML。
+    """Bounded streaming prefix inspection, even when a CDN ignores Range.
 
-    返回 (ok, final_url, content_type, total_size)。部分 CDN（如酷我）的
-    Content-Type 是 application/octet-stream，因此只排除 text/html。
+    The tuple remains API-compatible. Success means media prefix verified, not
+    complete-song verification. Streams close on success, failure and cancellation.
     """
-    h = {"User-Agent": UA_PC, "Range": "bytes=0-1"}
-    if headers:
-        for k, v in headers.items():
-            if k.lower() in ("user-agent", "referer"):
-                h[k] = v
+    h = {k: v for k, v in (headers or {}).items()
+         if k.lower() not in ("range", "accept-encoding")}
+    h.setdefault("User-Agent", UA_PC)
+    h.update({"Range": f"bytes=0-{_PROBE_BYTES - 1}", "Accept-Encoding": "identity"})
     try:
-        r = await client.get(url, headers=h, timeout=CONF["probe_timeout"])
-    except Exception:  # noqa: BLE001
+        async with asyncio.timeout(CONF["probe_timeout"]):
+            for _ in range(6):  # at most five redirects, one shared deadline
+                async with client.stream("GET", url, headers=h, follow_redirects=False,
+                                         timeout=CONF["probe_timeout"]) as r:
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        location = r.headers.get("location")
+                        if not location:
+                            return False, str(r.url), "", 0
+                        target = r.url.join(location)
+                        if target.scheme not in ("http", "https"):
+                            return False, str(r.url), "", 0
+                        if target.host != r.url.host:
+                            h = {k: v for k, v in h.items()
+                                 if k.lower() not in ("authorization", "cookie", "host")}
+                        url = str(target)
+                        # Leaving this context closes the intermediate response
+                        # WITHOUT HTTPX's automatic redirect body draining.
+                        continue
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if r.status_code >= 500 or r.status_code in (408, 429):
+                        raise ChainTransportError(f"media HTTP {r.status_code}")
+                    if r.status_code not in (200, 206):
+                        return False, str(r.url), ct, 0
+                    if (ct.startswith("text/") or "json" in ct or "xml" in ct
+                            or r.headers.get("content-encoding", "identity") != "identity"):
+                        return False, str(r.url), ct, 0
+                    prefix = bytearray()
+                    # aiter_raw avoids decompression/buffering the full response. Slice
+                    # each transport chunk and stop as soon as a signature is known.
+                    if r.is_stream_consumed:  # in-memory transports (e.g. MockTransport)
+                        prefix.extend(r.content[:_PROBE_BYTES])
+                    else:
+                        async for chunk in r.aiter_raw():
+                            prefix.extend(chunk[:_PROBE_BYTES - len(prefix)])
+                            ext = _media_signature(prefix)
+                            if ext or len(prefix) >= _PROBE_BYTES:
+                                break
+                    ext = _media_signature(prefix)
+                    return bool(ext), str(r.url), (f"audio/{ext}" if ext else ct), _content_total_size(r) if ext else 0
+            raise ChainTransportError("media redirect limit exceeded")
+    except (httpx.HTTPError, TimeoutError, ChainTransportError) as exc:
+        if report_transport:
+            raise ChainTransportError(str(exc)) from exc
         return False, url, "", 0
-    ct = (r.headers.get("content-type") or "").lower()
-    ok = r.status_code in (200, 206) and "text/html" not in ct
-    return ok, str(r.url), ct, _content_total_size(r) if ok else 0
 
 
 # 链路熔断器：连续失败达阈值后暂停该链路一段时间，避免每次搜索白等超时
@@ -670,17 +765,27 @@ _CHAIN_HEALTH: dict[str, dict] = {}
 
 def _chain_available(name: str) -> bool:
     h = _CHAIN_HEALTH.get(name)
-    return not (h and h.get("open_until", 0) > time.time())
+    return not (h and (h.get("open_until", 0) > time.time() or h.get("half_open")))
+
+
+def _chain_acquire(name: str) -> bool:
+    if not _chain_available(name):
+        return False
+    h = _CHAIN_HEALTH.get(name)
+    if h and h.get("open_until"):
+        h["half_open"] = True  # synchronous claim: only one recovery request
+    return True
 
 
 def _chain_report(name: str, ok: bool) -> None:
     h = _CHAIN_HEALTH.setdefault(name, {"fails": 0, "open_until": 0.0, "breaks": 0})
+    was_half_open = h.pop("half_open", False)
     if ok:
         h["fails"] = 0
         h["open_until"] = 0.0
         return
     h["fails"] = int(h.get("fails") or 0) + 1
-    if h["fails"] >= _CHAIN_FAIL_THRESHOLD:
+    if was_half_open or h["fails"] >= _CHAIN_FAIL_THRESHOLD:
         h["open_until"] = time.time() + _CHAIN_OPEN_SECONDS
         h["fails"] = 0
         h["breaks"] = int(h.get("breaks") or 0) + 1
@@ -697,7 +802,7 @@ def _fuzzy_contains(a: str, b: str) -> bool:
         return s.lower()
 
     na, nb = norm(a), norm(b)
-    return (not na or not nb) or na in nb or nb in na
+    return bool(na and nb) and (na in nb or nb in na)
 
 
 _TIER_TO_NETESE_LEVEL = {"lossless": "lossless", "high": "exhigh", "standard": "standard"}
@@ -709,17 +814,8 @@ async def _chain_changqing_kw(client: httpx.AsyncClient, ctx: dict) -> "dict | N
 
     level = _TIER_TO_NETESE_LEVEL.get(ctx["tier"], "standard")
     url = f"https://musicapi.haitangw.net/music/kw.php?type=mp3&id={quote(str(ctx['identifier']))}&level={level}"
-    ok, final, ct, size = await probe_url(client, url)
-    if not ok:
-        return None
-    lower = (final.split("?")[0] + " " + ct).lower()
-    return {
-        "url": final,
-        "ext": "flac" if "flac" in lower else "mp3",
-        "file_size": size,
-        "br": 740000 if "flac" in lower else 128000,
-        "headers": dict(KW_HEADERS),
-    }
+    # Resolution only. The dispatcher owns the single media verification.
+    return {"url": url, "headers": dict(KW_HEADERS)}
 
 
 async def _chain_suyin_migu(client: httpx.AsyncClient, ctx: dict) -> "dict | None":
@@ -734,9 +830,16 @@ async def _chain_suyin_migu(client: httpx.AsyncClient, ctx: dict) -> "dict | Non
             headers={"User-Agent": UA_MOBILE},
             timeout=CONF["resolver_timeout"],
         )
+        if r.status_code >= 500 or r.status_code in (408, 429):
+            raise ChainTransportError(f"resolver HTTP {r.status_code}")
+        if r.status_code in (404, 410):
+            return None
+        r.raise_for_status()
         data = _lenient_json(r, "suyin mg")
-    except Exception:  # noqa: BLE001
-        return None
+        if not isinstance(data, dict):
+            raise ChainTransportError("invalid resolver response")
+    except httpx.HTTPError as exc:
+        raise ChainTransportError(str(exc)) from exc
     if not isinstance(data, dict) or int(data.get("code") or 0) != 200:
         return None
     if ctx.get("title") and not _fuzzy_contains(str(data.get("title") or ""), str(ctx["title"])):
@@ -746,15 +849,13 @@ async def _chain_suyin_migu(client: httpx.AsyncClient, ctx: dict) -> "dict | Non
     url = str(data.get("music_url") or "")
     if not url.startswith(("http://", "https://")):
         return None
-    ok, final, ct, size = await probe_url(client, url)
-    if not ok:
-        return None
     return {
-        "url": final,
+        "url": url,
         "ext": "mp3",
-        "file_size": size or int(data.get("size") or 0),
-        "br": 320000,
+        "file_size": int(data.get("size") or 0),
+        "br": int(data.get("br") or 0),
         "headers": dict(MG_HEADERS),
+        "trial": _explicit_trial(data),
     }
 
 
@@ -790,32 +891,65 @@ async def resolve_third_party(
             continue
         if link.get("needs_keyword") and not (title or artist):
             continue
-        if not _chain_available(link["name"]):
+        if not _chain_acquire(link["name"]):
+            _record_failure(ChainTransportError("resolver circuit open"))
             continue
+        recovering = bool(_CHAIN_HEALTH.get(link["name"], {}).get("half_open"))
         ctx = {"identifier": identifier, "tier": tier, "title": title, "artist": artist}
         try:
             result = await asyncio.wait_for(
                 link["fn"](client, ctx), timeout=CONF["resolver_timeout"] + CONF["probe_timeout"]
             )
-        except Exception:  # noqa: BLE001
-            result = None
-        if result and result.get("url"):
+            if result and result.get("url"):
+                result = await _verify_result(client, result, report_transport=True)
+        except asyncio.CancelledError:
+            # Deadline/client cancellation says nothing about provider health.
+            _CHAIN_HEALTH.get(link["name"], {}).pop("half_open", None)
+            raise
+        except Exception as exc:  # transport, timeout, or broken resolver protocol
+            _record_failure(exc)
+            _chain_report(link["name"], False)
+            continue
+        # A missing song, mismatch, or rejected media is not a provider outage.
+        # A late pre-open request must not close a circuit opened by siblings.
+        if recovering or not _CHAIN_HEALTH.get(link["name"], {}).get("open_until"):
             _chain_report(link["name"], True)
+        if result:
+            result["resolver"] = link["name"]
+            result["third_party"] = True
             return result
-        _chain_report(link["name"], False)
     return None
 
 
 def chain_health_snapshot() -> dict:
     now = time.time()
-    return {
-        name: {
-            "fails": h.get("fails", 0),
-            "open": bool(h.get("open_until", 0) > now),
-            "breaks": h.get("breaks", 0),
-        }
-        for name, h in _CHAIN_HEALTH.items()
-    }
+    snapshot = {}
+    for link in THIRD_PARTY_CHAIN:
+        name = link["name"]
+        h = _CHAIN_HEALTH.get(name, {})
+        state = ("disabled" if not CONF["third_party"] else
+                 "half_open" if h.get("half_open") else
+                 "open" if h.get("open_until", 0) > now else
+                 "recovery_ready" if h.get("open_until") else "closed")
+        snapshot[name] = {"fails": h.get("fails", 0), "open": state == "open",
+                          "breaks": h.get("breaks", 0), "state": state,
+                          "enabled": CONF["third_party"]}
+    return snapshot
+
+
+def source_capabilities() -> dict:
+    result = {}
+    for src in _SEARCHERS:
+        official = src in ("kg", "wy", "mg")
+        links = [link for link in THIRD_PARTY_CHAIN if src in link["platforms"]]
+        available = CONF["third_party"] and any(_chain_available(link["name"]) for link in links)
+        reason = ("" if official or available else "third_party_disabled" if not CONF["third_party"]
+                  else "no_resolver_registered" if not links else "resolver_circuit_open")
+        result[src] = {"search_available": True, "playback_available": bool(official or available),
+                       "official_resolver": official, "third_party_enabled": CONF["third_party"],
+                       "chains": [link["name"] for link in links], "reason": reason,
+                       "validation_status": "unverified", "completeness": "unknown"}
+    return result
 
 
 # ------------------------------------------------------------ 可播性验证 ---
@@ -826,67 +960,147 @@ _TRIAL_TITLE_MARKERS = ("(试听)", "（试听）", "试听片段", "片段试�
 _TIER_RANK = {"standard": 0, "high": 1, "lossless": 2}
 
 
+def _explicit_trial(data: dict) -> bool:
+    """Only explicit clip metadata; fee/VIP and size are not trial proof."""
+    for key in ("trial", "is_trial", "isTrial", "is_free_part", "isFreePart"):
+        if str(data.get(key, "")).lower() in ("1", "true", "yes"):
+            return True
+    return bool(data.get("freeTrialInfo") or data.get("trialInfo")
+                or data.get("trial_url") or data.get("trialUrl"))
+
+
+def _bitrate_bps(value: Any) -> int:
+    br = int(value or 0)
+    return br * 1000 if 0 < br < 1000 else br
+
+
+def _actual_tier(result: dict) -> str:
+    if result.get("ext") in ("flac", "wav", "ape"):
+        return "lossless"
+    br = int(result.get("br") or 0)
+    if br >= 256000:
+        return "high"
+    return "standard" if br > 0 else "unknown"
+
+
+async def _verify_result(client: httpx.AsyncClient, result: dict | None,
+                         *, report_transport: bool = False) -> dict | None:
+    if not result or not result.get("url") or _explicit_trial(result):
+        return None
+    result = dict(result)
+    if not result.get("probed"):
+        ok, final, ct, size = await probe_url(client, result["url"], result.get("headers"),
+                                            report_transport=report_transport)
+        if not ok:
+            return None
+        result.update(url=final, file_size=size or result.get("file_size") or 0,
+                      ext=ct.split("/")[-1], probed=True)
+    result.update(validation_status="media_verified", completeness="unknown")
+    result["actual_tier"] = _actual_tier(result)
+    return result
+
+
 def _fresh_probe(item: "dict | None", want_tier: str = "standard") -> "dict | None":
-    """探活缓存未过期且音质不低于请求档位时直接复用（CDN 直链有时效，过期需重新解析）。"""
-    if not isinstance(item, dict):
+    """Reuse actual quality or a completed downgrade for this requested tier."""
+    if not isinstance(item, dict) or _explicit_trial(item):
         return None
     p = item.get("_probe")
-    if not (isinstance(p, dict) and p.get("url")):
+    if not (isinstance(p, dict) and p.get("url") and p.get("probed")
+            and p.get("validation_status") == "media_verified"):
+        return None
+    if _explicit_trial(p) or (p.get("third_party") and not CONF["third_party"]):
         return None
     if time.time() - p.get("ts", 0) >= CONF["probe_fresh_s"]:
         return None
-    if _TIER_RANK.get(str(p.get("tier") or "standard"), 0) < _TIER_RANK.get(want_tier, 0):
+    want_tier = _quality_tiers(want_tier)[0]
+    rank = _TIER_RANK.get(p.get("actual_tier"), -1)
+    if rank < _TIER_RANK[want_tier] and want_tier not in p.get("attempted_tiers", []):
         return None
     return {k: v for k, v in p.items() if k not in ("ts", "tier")}
 
 
-async def resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict, tier: str = "standard") -> "dict | None":
-    """搜索期可播性验证：官方解析 → 第三方链路 → Range 探活 + 试听碎片防护。
+async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
+                             tier: str = "standard", retained: dict | None = None) -> "dict | None":
+    """Shared search/URL pipeline: official -> verify -> fallback -> downgrade."""
+    if _explicit_trial(item) or any(m in str(item.get("title") or "") for m in _TRIAL_TITLE_MARKERS):
+        return None
+    tiers = _quality_tiers(tier)
+    cached = _fresh_probe(item, tiers[0])
+    if cached:
+        return cached
+    item.pop("_probe", None)
+    item.update(verified=False, validation_status="unverified", completeness="unknown")
+    identifier = parse_track_id(str(item.get("id") or ""))[1]
+    title, artist = str(item.get("title") or ""), str(item.get("artist") or "")
+    attempted = []
+    best = None
+    failures = _RESOLUTION_FAILURES.get()
+    for t in tiers:
+        # Once a better known tier is retained, lower tiers cannot improve it.
+        if best and _TIER_RANK.get(best["actual_tier"], -1) >= _TIER_RANK[t]:
+            break
+        before = len(failures or [])
+        try:
+            if src == "kg":
+                raw = await kg_resolve_url(client, item, identifier, t)
+            elif src == "wy":
+                raw = await wy_resolve_url(client, identifier, t)
+            elif src == "mg":
+                raw = await mg_resolve_url(client, identifier, t)
+            else:
+                raw = None
+            result = await _verify_result(client, raw, report_transport=True)
+        except Exception as exc:
+            _record_failure(exc)
+            result = None
+        if result:
+            result["resolver"] = "official"
+            if not best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(best["actual_tier"], -1):
+                best = result
+                if retained is not None:
+                    retained.update(best=best, attempted=attempted)
+        if not best or (t != "standard" and _TIER_RANK.get(best["actual_tier"], -1) < _TIER_RANK[t]):
+            result = await resolve_third_party(client, src, identifier, t, title, artist)
+            if result and (not best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(best["actual_tier"], -1)):
+                best = result
+                if retained is not None:
+                    retained.update(best=best, attempted=attempted)
+        # Infrastructure-interrupted tiers must not be cached as exhausted.
+        if len(failures or []) == before:
+            attempted.append(t)
+    if best:
+        best["attempted_tiers"] = attempted
+        item["_probe"] = dict(best, ts=time.time(), tier=best["actual_tier"])
+        item.update(verified=True, validation_status="media_verified", completeness="unknown")
+        _cache_put(item)
+    return best
 
-    返回直链信息（已探活）或 None（不可播）。
-    """
-    identifier = str(item.get("id") or "").split(":", 2)[-1]
-    title = str(item.get("title") or "")
-    artist = str(item.get("artist") or "")
-    result = None
+
+async def resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
+                            tier: str = "standard", *, budget: float | None = None) -> dict | None:
+    failures: list[str] = []
+    retained: dict = {}
+    token = _RESOLUTION_FAILURES.set(failures)
     try:
-        if src == "kg":
-            for t in _quality_tiers(tier):
-                result = await kg_resolve_url(client, item, identifier, t)
-                if result:
-                    break
-        elif src == "wy":
-            result = await wy_resolve_url(client, identifier, tier)
-        elif src == "mg":
-            result = await mg_resolve_url(client, identifier, "E")
-        elif src == "tx":
-            result = await resolve_third_party(client, "tx", identifier, tier, title, artist)
-        elif src == "kw":
-            cached_probe = _fresh_probe(item)
-            if cached_probe:
-                return cached_probe
-            result = await resolve_third_party(client, "kw", identifier, tier, title, artist)
-        else:
-            return None
-    except Exception:  # noqa: BLE001
-        result = None
-    if not result or not result.get("url"):
-        return None
-
-    if not result.get("probed"):
-        ok, final, ct, size = await probe_url(client, result["url"], result.get("headers"))
-        if not ok:
-            return None
-        result["url"] = final
-        result["file_size"] = size or result.get("file_size") or 0
-        result["probed"] = True
-
-    # 试听碎片防护：实际文件明显小于该时长应有的最小体积（128kbps ≈ 16KB/s）时判为片段
-    duration_s = float(item.get("duration_s") or 0)
-    size = int(result.get("file_size") or 0)
-    if duration_s > 60 and 0 < size < duration_s * 16000 * 0.5:
-        return None
-    return result
+        deadline = asyncio.timeout(budget)
+        try:
+            async with deadline:
+                result = await _resolve_and_probe(client, src, item, tier, retained)
+        except TimeoutError:
+            # Only our resolution budget may return retained media. External
+            # caller cancellation remains CancelledError and propagates after
+            # the awaited resolver/upgrade has completed cancellation cleanup.
+            if not deadline.expired() or not retained.get("best"):
+                raise
+            result = dict(retained["best"], attempted_tiers=list(retained["attempted"]))
+            item["_probe"] = dict(result, ts=time.time(), tier=result["actual_tier"])
+            item.update(verified=True, validation_status="media_verified", completeness="unknown")
+            _cache_put(item)
+        if result is None and failures:
+            raise ChainTransportError("resolution infrastructure exhausted: " + failures[-1])
+        return result
+    finally:
+        _RESOLUTION_FAILURES.reset(token)
 
 
 def _chunks(seq: list, n: int) -> list:
@@ -897,22 +1111,37 @@ async def _probe_candidates(
     client: httpx.AsyncClient, src: str, candidates: list[dict], limit: int
 ) -> list[dict]:
     """批量并发探活候选曲目，返回通过的条目（附带 verified/_probe 标记）。"""
+    if limit <= 0:
+        return []
     passed: list[dict] = []
+    async def one(it):
+        res = await resolve_and_probe(client, src, it)
+        if res:
+            it.update(verified=True, validation_status="media_verified", completeness="unknown",
+                      ext=res.get("ext") or it.get("ext") or "mp3",
+                      file_size=res.get("file_size") or 0)
+            _cache_put(it)
+            _publish(it)
+            return it
+        return None
+
     for batch in _chunks(candidates, 6):
-        results = await asyncio.gather(
-            *(resolve_and_probe(client, src, it) for it in batch), return_exceptions=True
-        )
-        for it, res in zip(batch, results):
-            if isinstance(res, dict):
-                it["verified"] = True
-                it["_probe"] = dict(res, ts=time.time(), tier="standard")
-                it["ext"] = res.get("ext") or it.get("ext") or "mp3"
-                if res.get("file_size"):
-                    it["file_size"] = res["file_size"]
-                _cache_put(it)
-                passed.append(it)
-                if len(passed) >= limit:
-                    return passed
+        tasks = [asyncio.create_task(one(it)) for it in batch]
+        try:
+            for done in asyncio.as_completed(tasks):
+                try:
+                    it = await done
+                except Exception:
+                    continue
+                if it:
+                    passed.append(it)
+                    if len(passed) >= limit:
+                        return passed
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     return passed
 
 
@@ -943,7 +1172,7 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     songs = ((((data.get("req_1") or {}).get("data") or {}).get("body") or {}).get("song") or {}).get("list") or []
     candidates = []
     for it in songs:
-        if not isinstance(it, dict):
+        if not isinstance(it, dict) or _explicit_trial(it):
             continue
         mid = str(it.get("mid") or it.get("songmid") or "")
         title = str(it.get("title") or "")
@@ -981,11 +1210,8 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
 async def tx_resolve_url(
     client: httpx.AsyncClient, item: "dict | None", identifier: str, tier: str
 ) -> "dict | None":
-    cached = _fresh_probe(item, tier)
-    if cached:
-        return cached
-    return await resolve_third_party(
-        client, "tx", identifier, tier, str((item or {}).get("title") or ""), str((item or {}).get("artist") or "")
+    return await resolve_and_probe(
+        client, "tx", item or {"id": f"lx:tx:{identifier}"}, tier
     )
 
 
@@ -1081,7 +1307,7 @@ async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     raw = _lenient_pydict(r, "kw r.s") or {}
     candidates = []
     for it in raw.get("abslist") or []:
-        if not isinstance(it, dict):
+        if not isinstance(it, dict) or _explicit_trial(it):
             continue
         rid = str(it.get("MUSICRID") or "").replace("MUSIC_", "").strip()
         if not rid.isdigit():
@@ -1118,11 +1344,8 @@ async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
 async def kw_resolve_url(
     client: httpx.AsyncClient, item: "dict | None", identifier: str, tier: str
 ) -> "dict | None":
-    cached = _fresh_probe(item, tier)
-    if cached:
-        return cached
-    return await resolve_third_party(
-        client, "kw", identifier, tier, str((item or {}).get("title") or ""), str((item or {}).get("artist") or "")
+    return await resolve_and_probe(
+        client, "kw", item or {"id": f"lx:kw:{identifier}"}, tier
     )
 
 
@@ -1173,6 +1396,7 @@ async def healthz():
         "eapi": HAS_CRYPTO,
         "third_party": CONF["third_party"],
         "chains": chain_health_snapshot(),
+        "capabilities": source_capabilities(),
     }
 
 
@@ -1199,23 +1423,55 @@ async def search(
 
     client = get_http(app)
     tasks = {}
-    for src in wanted:
-        fn = _SEARCHERS.get(src)
-        if fn is None:
-            continue
-        tasks[src] = asyncio.create_task(fn(client, kw, limit))
-
-    items: list[dict] = []
+    partials = {}
     errors: dict[str, str] = {}
-    for src, task in tasks.items():
-        try:
-            items.extend(await asyncio.wait_for(task, timeout=max(CONF["search_timeout"], 8.0) * 2))
-        except Exception as e:  # noqa: BLE001
-            _STATS["errors"] += 1
-            errors[src] = str(e)
-            logger.warning("lx search %s failed: %s", src, e)
+    capabilities = source_capabilities()
 
-    return {"ok": True, "items": items, "errors": errors, "stats": dict(_STATS)}
+    async def run_source(src):
+        token = _SEARCH_PARTIAL.set(partials[src])
+        try:
+            return await _SEARCHERS[src](client, kw, limit)
+        finally:
+            _SEARCH_PARTIAL.reset(token)
+
+    for src in dict.fromkeys(wanted):
+        if src not in _SEARCHERS:
+            continue
+        if not capabilities[src]["playback_available"]:
+            errors[src] = capabilities[src]["reason"]
+            continue
+        partials[src] = []
+        tasks[src] = asyncio.create_task(run_source(src))
+    items: list[dict] = []
+    try:
+        if tasks:
+            # One shared budget, below the proxy's default 15s timeout. Never
+            # multiply the timeout by source count or wait in insertion order.
+            await asyncio.wait(tasks.values(), timeout=max(0.001, min(CONF["search_timeout"], 13.0)))
+    finally:
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+    for src, task in tasks.items():
+        if task.cancelled():
+            errors[src] = "search deadline exceeded"
+            results = partials[src]
+        elif task.exception() is not None:
+            errors[src] = str(task.exception()) or type(task.exception()).__name__
+            results = partials[src]
+        else:
+            results = task.result()
+        seen = set()
+        for item in results:
+            if item.get("id") not in seen:
+                items.append(item)
+                seen.add(item.get("id"))
+                if len(seen) >= limit:
+                    break
+    _STATS["errors"] += len(errors)
+    return {"ok": True, "items": items, "errors": errors, "stats": dict(_STATS),
+            "capabilities": capabilities}
 
 
 @app.get("/api/v1/track/url")
@@ -1229,48 +1485,20 @@ async def track_url(
     if not src or not identifier:
         return _err(f"invalid track id: {track_id}", 400)
     _STATS["url_resolutions"] += 1
-    cached = _cache_get(track_id)
+    canonical_id = f"lx:{src}:{identifier}"
+    cached = _cache_get(canonical_id) or {"id": canonical_id, "lx_source": src}
     client = get_http(app)
     try:
-        if src == "kg":
-            result = _fresh_probe(cached, _quality_tiers(quality)[0])
-            if not result:
-                for tier in _quality_tiers(quality):
-                    result = await kg_resolve_url(client, cached, identifier, tier)
-                    if result:
-                        break
-                if not result:
-                    result = await resolve_third_party(
-                        client, "kg", identifier, _quality_tiers(quality)[0],
-                        str((cached or {}).get("title") or ""), str((cached or {}).get("artist") or ""),
-                    )
-        elif src == "wy":
-            result = await wy_resolve_url(client, identifier, quality)
-            if not result:
-                result = _fresh_probe(cached, _quality_tiers(quality)[0]) or await resolve_third_party(
-                    client, "wy", identifier, _quality_tiers(quality)[0],
-                    str((cached or {}).get("title") or ""), str((cached or {}).get("artist") or ""),
-                )
-        elif src == "mg":
-            result = await mg_resolve_url(client, identifier, "E")
-            if not result:
-                result = _fresh_probe(cached, _quality_tiers(quality)[0]) or await resolve_third_party(
-                    client, "mg", identifier, _quality_tiers(quality)[0],
-                    str((cached or {}).get("title") or ""), str((cached or {}).get("artist") or ""),
-                )
-        elif src == "tx":
-            result = await tx_resolve_url(client, cached, identifier, _quality_tiers(quality)[0])
-        elif src == "kw":
-            result = await kw_resolve_url(client, cached, identifier, _quality_tiers(quality)[0])
-        else:
-            return _err(f"unsupported source: {src}", 400)
+        result = await resolve_and_probe(
+            client, src, cached, quality, budget=CONF["url_timeout"]
+        )
     except Exception as e:  # noqa: BLE001
         _STATS["errors"] += 1
         logger.warning("lx url resolve %s failed: %s", track_id, e)
         return _err(f"resolve failed: {e}", 502)
 
     if not result:
-        return _err("no playable url", 404)
+        return _err(source_capabilities()[src]["reason"] or "no playable url", 404)
     return {"ok": True, "data": {"id": track_id, "quality": quality, **{k: v for k, v in result.items() if k != "probed"}}}
 
 
@@ -1280,7 +1508,7 @@ async def track_info(id: str = Query("", alias="id"), guid: str = Query("", alia
     src, identifier = parse_track_id(track_id)
     if not src:
         return _err(f"invalid track id: {track_id}", 400)
-    cached = _cache_get(track_id)
+    cached = _cache_get(f"lx:{src}:{identifier}")
     if cached:
         return {"ok": True, "data": cached}
     return {"ok": True, "data": {"id": track_id, "source": "lx", "lx_source": src, "title": "", "artist": "", "album": "", "duration_s": 0, "ext": "mp3", "file_size": 0, "cover_url": "", "lyric": ""}}
@@ -1292,7 +1520,7 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
     src, identifier = parse_track_id(track_id)
     if not src:
         return _err(f"invalid track id: {track_id}", 400)
-    cached = _cache_get(track_id) or {}
+    cached = _cache_get(f"lx:{src}:{identifier}") or {}
     client = get_http(app)
     text = ""
     try:

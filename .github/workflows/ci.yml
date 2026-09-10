@@ -23,15 +23,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Install audio test tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install test dependencies
         run: >
           python -m pip install -r proxy/requirements.txt
           pytest mutagen qrcode pillow pycryptodome
 
       - name: Shell script syntax check
-        run: >
-          bash -n install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh
-          proxy/run_proxy.sh musicdl-service/smoke_test.sh
+        run: |
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(git ls-files -z '*.sh')
 
       - name: Python compile check
         run: >
@@ -47,9 +51,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 阶段一：仅报告不阻断（continue-on-error），存量问题另行评估修复
-      - name: shellcheck (report only)
-        continue-on-error: true
-        run: >
-          shellcheck -S error install.sh extend.sh restore.sh netease_login.sh ensure_base_image.sh
-          proxy/run_proxy.sh musicdl-service/smoke_test.sh
+      - name: Shellcheck errors
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+
+  production:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [musicdl, musicbox, lxmusic]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install real production dependencies
+        run: python -m pip install -r '${{ matrix.service }}-service/requirements.txt'
+      - name: Offline dependency and CLI contract
+        run: python tests/integration/production_contract.py '${{ matrix.service }}' --app-dir '${{ matrix.service }}-service'
+
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [musicdl, musicbox, lxmusic]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: |
+          docker build --build-arg BASE_IMAGE=python:3.13-slim \
+            --build-arg PIP_INDEX_URL=https://pypi.org/simple \
+            --build-arg APT_MIRROR= \
+            -t fnmusic-ci:${{ matrix.service }} '${{ matrix.service }}-service'
+      - name: Verify non-root dependency and CLI contract
+        run: |
+          docker run --rm --network none \
+            -v "$PWD/tests/integration/production_contract.py:/tmp/production_contract.py:ro" \
+            fnmusic-ci:${{ matrix.service }} python /tmp/production_contract.py \
+            '${{ matrix.service }}' --app-dir /app --require-non-root
+      - name: Verify isolated HTTP startup
+        run: |
+          name="fnmusic-ci-${{ matrix.service }}"
+          trap 'docker logs "$name"; docker rm -f "$name"' EXIT
+          docker run -d --name "$name" --network none fnmusic-ci:${{ matrix.service }}
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker exec "$name" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=2)'; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1

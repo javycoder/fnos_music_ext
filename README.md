@@ -14,7 +14,7 @@
 - **多音源自由组合**：
   - [musicbox](https://github.com/darknessomi/musicbox)（网易云高品质解析，支持扫码登录 VIP/收藏）；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等平台聚合）；
-  - **lxmusic**（洛雪风格免登录解析：酷狗 kg / 网易 wy / 咪咕 mg / QQ tx / 酷我 kw 直链；VIP 曲目经第三方链路解析并 Range 探活验证后才返回——"搜得到必能播"）。
+  - **lxmusic**（洛雪风格解析：默认启用酷狗 kg / 网易 wy / 咪咕 mg / 酷我 kw。QQ tx 保留搜索/歌词适配，但当前没有可用播放解析链路，默认不启用）。解析结果会进行有限媒体探活；这不能保证完整歌曲、账户权限或直链后续始终可用，请仅访问您有权收听的内容。
 
 ---
 
@@ -88,8 +88,8 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   ./restore.sh --full
   ```
 - **多副本部署提示**：容器名（`fnmusic-musicdl/musicbox/lxmusic`）与端口（8768/8770/8772）全局固定。
-  从第二个副本（如测试目录）运行 `install.sh`/`extend.sh` 时，会自动移除并接管其他副本创建的同名容器；
-  请避免多个副本同时执行安装/还原等运维操作。
+  安装/恢复会检查部署归属并串行化操作；遇到其他目录的服务或容器会拒绝接管，不再自动删除。
+  请在现有部署目录维护服务。身份不明或官方 socket 已改变时，恢复会保留现场并报告未完成，禁止手工猜测后删除 socket。
 
 ---
 
@@ -106,18 +106,20 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_MUSICDL_URL` | `http://127.0.0.1:8768` | 聚合音源服务地址 |
 | `FNMUSIC_LX_ENABLED` | `true` | 是否启用洛雪免登录音源 (`lxmusic`) |
 | `FNMUSIC_LX_URL` | `http://127.0.0.1:8772` | 洛雪音源服务地址 |
-| `LX_SOURCES` | `kg,wy,mg,tx,kw` | lxmusic 启用的子源列表（容器/systemd 环境变量） |
+| `LX_SOURCES` | `kg,wy,mg,kw` | lxmusic 子源列表；根 `.env` 可覆盖容器/Host 配置，重装后生效 |
 | `LX_THIRD_PARTY` | `1` | lxmusic 第三方解析链路总开关（关闭后退化为官方免登录直连，kw/tx 无结果） |
 | `LX_RESOLVER_TIMEOUT` | `4.0` | 第三方链路单次解析超时（秒） |
 | `FNMUSIC_ONLINE_SOURCES` | `MiguMusicClient,KuwoMusicClient` | musicdl 启用的子平台列表 |
 | `FNMUSIC_SEARCH_TIMEOUT` | `3.0` | 多音源并发搜索常规等待预算（秒） |
-| `FNMUSIC_SEARCH_CACHE_TTL`| `604800` | 搜索结果缓存有效期（默认 7 天） |
+| `FNMUSIC_SEARCH_CACHE_TTL`| `604800` | 搜索缓存上限；成功结果最长 5 分钟后刷新，空/部分失败结果使用更短时效 |
 | `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（兼容 OpenAI 规范） |
 | `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key |
 | `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 每日推荐生成模型 |
 | `FNMUSIC_VERSION` | `1.3.0` | 当前安装的版本号 |
 
 ---
+
+本次 CI、安装故障及多源链路的审查结论见 [可靠性审查报告](docs/RELIABILITY_REVIEW.md)，接管与恢复的安全边界见 [安装恢复说明](docs/installation-reliability.md)。
 
 ## 实现原理
 

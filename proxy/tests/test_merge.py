@@ -74,7 +74,9 @@ def test_find_cache_file_legacy_id_name_and_ref(tmp_path):
     legacy = os.path.join(CONF["library_dir"], "晴天 - 600902000006889366.mp3")
     with open(legacy, "wb") as f:
         f.write(b"x" * 2048)
-    assert find_cache_file(guid) == legacy
+    # Bare IDs collide across sources: only an explicit namespaced ref is safe.
+    assert find_cache_file(guid) is None
+    assert find_cache_file("online:kuwo:600902000006889366") is None
 
     renamed = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
     os.rename(legacy, renamed)
@@ -1196,13 +1198,13 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
         # 2. 网易云
         assert items[1]["guid"] == "online:netease:mb_unique"
         assert items[1]["artist"] == "网易翻唱歌手"
-        # 3. Musicdl (去掉了与网易重复的网易翻唱歌手)
-        assert items[2]["guid"] == "online:kuwo:mdl_unique"
-        assert items[2]["artist"] == "Musicdl翻唱歌手"
-        # 4. 洛雪
-        assert items[3]["guid"] == "online:lx:kg:lx_unique"
-        assert items[3]["artist"] == "洛雪翻唱歌手"
-        assert len(items) == 4
+        # Unknown musicbox duration cannot prove this is the same recording.
+        assert items[2]["guid"] == "online:kuwo:mdl_same"
+        assert items[3]["guid"] == "online:kuwo:mdl_unique"
+        assert items[3]["artist"] == "Musicdl翻唱歌手"
+        assert items[4]["guid"] == "online:lx:kg:lx_unique"
+        assert items[4]["artist"] == "洛雪翻唱歌手"
+        assert len(items) == 5
 
 
 
