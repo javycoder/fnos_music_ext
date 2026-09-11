@@ -4,7 +4,12 @@ set -euo pipefail
 # ==============================================================================
 # fnmusic-ext 一键还原脚本 (Unix Socket 接管架构)
 # 功能：停用代理服务并复位 trim-music 原生 Unix Socket
-# 参数：--full 额外停止并删除音源容器/宿主机 unit（musicdl、musicbox、lxmusic）
+# 语义：
+#   默认     还原官方直连 + 移除代理 unit + 停止并删除音源容器/宿主机 unit；
+#            .env 与全部数据（网易云登录、缓存、在线收藏、播放历史、推荐缓存）保留，
+#            重装后无需重新填写大模型 Key 等任何配置。
+#   --full   在默认动作之外执行工厂级清理：删除 .env（含历史备份）与上述全部数据
+#            目录及虚拟环境；仅保留代码与 git 仓库本身。
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +27,9 @@ for arg in "$@"; do
             ;;
         -h|--help)
             echo "用法: $0 [--full]"
-            echo "  --full: 还原 socket 与代理服务的同时，停止并删除 musicdl/musicbox/lxmusic 容器与宿主机 unit"
+            echo "  默认:   还原官方直连，删除代理 unit 与音源容器/宿主机 unit；保留 .env 与全部数据"
+            echo "  --full: 额外删除 .env（含备份）、网易云登录、缓存、在线收藏、播放历史、"
+            echo "          推荐缓存与虚拟环境（保留代码），用于彻底重置"
             exit 0
             ;;
         *)
@@ -52,6 +59,25 @@ run_docker() {
     else
         return 1
     fi
+}
+
+# 工厂级清理：删除配置与数据（代码与 git 保留）。仅允许清理 BASE_DIR 内的已知路径。
+purge_local_state() {
+    local removed="" target
+    for target in "${BASE_DIR}"/.env "${BASE_DIR}"/.env.bak.* \
+                  "${BASE_DIR}/musicbox-data" "${BASE_DIR}/cache" \
+                  "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" \
+                  "${BASE_DIR}/recommend_cache" "${BASE_DIR}"/.venv-*; do
+        # 通配符未匹配时会原样出现，且仅允许清理本目录内的路径
+        if [ -e "${target}" ] && [[ "${target}" == "${BASE_DIR}"/* ]]; then
+            rm -rf -- "${target}"
+            removed="${removed} ${target#"${BASE_DIR}/"}"
+        fi
+    done
+    if [ -n "${removed}" ]; then
+        log_info "已删除:${removed}"
+    fi
+    log_info "已保留：代码、git 仓库与 Docker 镜像（重装时可直接复用缓存）。"
 }
 
 check_proxy_unit_owner || exit 1
@@ -89,39 +115,44 @@ if ! takeover restore; then
     exit 1
 fi
 
-# 6. full 模式额外清理音源
-if [ "${FULL_RESTORE}" -eq 1 ]; then
-    log_info "(--full 模式) 停止并移除音源容器与宿主机 unit..."
-    for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-        remove_owned_container "${unit}"
-        if owned_source_unit "${unit}"; then
-            stop_owned_source_unit "${unit}"
-            sudo rm -f "/etc/systemd/system/${unit}.service"
-        fi
-    done
-    # 如实校验清理结果：容器可能被其他副本/并发任务重建，绝不静默假成功
-    leftover=""
-    for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-        if run_docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${unit}"; then
-            leftover="${leftover} ${unit}"
-        fi
-    done
-    if [ -n "${leftover}" ]; then
-        log_warn "以下容器仍存在（可能刚被其他副本或并发任务重建）:${leftover}"
-        log_warn "如需彻底清理，请手动执行: docker rm -f${leftover}"
-    else
-        log_info "musicdl / musicbox / lxmusic 容器与宿主机 unit 已清理完毕。"
-    fi
-else
-    log_info "默认保留音源容器/unit 与 cache/ 目录。"
-fi
-
-# 7. 移除代理 systemd unit
+# 2. 移除代理 systemd unit
 if [ -f "/etc/systemd/system/fnmusic-ext.service" ]; then
     log_info "移除 /etc/systemd/system/fnmusic-ext.service..."
-    sudo rm -f "/etc/systemd/system/fnmusic-ext.service"
+    sudo rm -f /etc/systemd/system/fnmusic-ext.service
 fi
 sudo systemctl daemon-reload 2>/dev/null || true
+
+# 3. 停止并移除音源容器与宿主机 unit（默认动作；配置与数据一律保留）
+log_info "停止并移除音源容器与宿主机 unit..."
+for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+    remove_owned_container "${unit}"
+    if owned_source_unit "${unit}"; then
+        stop_owned_source_unit "${unit}"
+        sudo rm -f "/etc/systemd/system/${unit}.service"
+    fi
+done
+# 如实校验清理结果：容器可能被其他副本/并发任务重建，绝不静默假成功
+leftover=""
+for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+    if run_docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${unit}"; then
+        leftover="${leftover} ${unit}"
+    fi
+done
+if [ -n "${leftover}" ]; then
+    log_warn "以下容器仍存在（可能刚被其他副本或并发任务重建）:${leftover}"
+    log_warn "如需彻底清理，请手动执行: docker rm -f${leftover}"
+else
+    log_info "musicdl / musicbox / lxmusic 容器与宿主机 unit 已清理完毕。"
+fi
+
+# 4. --full：工厂级清理配置与数据（代码与 git 保留）
+if [ "${FULL_RESTORE}" -eq 1 ]; then
+    log_info "(--full 模式) 删除配置与数据（.env、网易云登录、缓存、收藏、历史、推荐缓存、虚拟环境）..."
+    purge_local_state
+else
+    log_info "已保留 .env 与全部数据（网易云登录/缓存/在线收藏/播放历史/推荐缓存）。"
+    log_info "如需彻底重置（删除全部配置与数据），请执行: $0 --full"
+fi
 
 log_info "============================================================"
 log_info "fnmusic 已成功还原为原生直连模式！"

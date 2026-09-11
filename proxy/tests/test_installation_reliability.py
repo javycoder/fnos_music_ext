@@ -414,6 +414,53 @@ def test_unit_uses_canonical_template_and_explicit_interpreters(tmp_path):
     assert '[ -S ' not in output and 'Restart=no' in output
 
 
+def test_install_decline_recommend_never_wipes_llm_config():
+    """安装向导答 N 不清空已保存的大模型配置：只有显式 --disable-recommend 才写入空值。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    # 默认初始化 + 仅显式关闭时置位
+    assert 'LLM_CLEAR=0' in text
+    assert '--disable-recommend) ENABLE_RECOMMEND="no"; LLM_CLEAR=1' in text
+    # 空值清除只允许出现在 LLM_CLEAR 分支（env 输出与 explicit 列表各一处）
+    assert text.count("FNMUSIC_LLM_API_KEY=''") == 1
+    assert text.count('elif [ "${LLM_CLEAR}" -eq 1 ]') == 2
+    # 关闭推荐时不再无条件加入 explicit（旧版会把密钥覆盖为空）
+    assert 'ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL,FNMUSIC_LLM_API_KEY,FNMUSIC_LLM_MODEL"\nfi' in text
+    assert text.count('ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL,FNMUSIC_LLM_API_KEY,FNMUSIC_LLM_MODEL"') == 1
+
+
+def test_restore_default_removes_sources_and_full_purges_state(tmp_path):
+    """restore.sh 语义：默认删除音源容器但保留配置数据；--full 才工厂级清理。"""
+    text = (BASE/'restore.sh').read_text(encoding='utf-8')
+    # 容器清理位于默认路径（FULL_RESTORE 判定之前）
+    assert text.index('remove_owned_container "${unit}"') < text.index('if [ "${FULL_RESTORE}" -eq 1 ]')
+    # 数据清理只在 --full 分支内调用
+    assert 'purge_local_state\n' in text.split('if [ "${FULL_RESTORE}" -eq 1 ]')[1].split('fi')[0]
+
+    # 行为验证：提取 purge_local_state 在临时目录执行，只删已知路径，代码保留
+    base = tmp_path/'deploy'
+    for name in ('.env', '.env.bak.20260101000000', 'musicbox-data/x', 'cache/a.ref',
+                 'online_favorites/u.json', 'play_history/u.json', 'recommend_cache/u/d.json',
+                 '.venv-proxy/bin/python'):
+        p = base/name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('x', encoding='utf-8')
+    for name in ('install.sh', 'restore.sh', 'proxy/app.py', 'musicdl_outputs/out.bin'):
+        p = base/name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('code', encoding='utf-8')
+
+    script = 'set -euo pipefail\nlog_info() { :; }\n'
+    script += function(text, 'purge_local_state')
+    script += f'BASE_DIR="{base}"\npurge_local_state\n'
+    subprocess.run(['bash', '-c', script], check=True)
+
+    for name in ('.env', '.env.bak.20260101000000', 'musicbox-data', 'cache',
+                 'online_favorites', 'play_history', 'recommend_cache', '.venv-proxy'):
+        assert not (base/name).exists(), f'--full 应删除 {name}'
+    for name in ('install.sh', 'restore.sh', 'proxy/app.py', 'musicdl_outputs/out.bin'):
+        assert (base/name).exists(), f'--full 必须保留代码文件 {name}'
+
+
 def test_preflight_invalid_config_never_touches_sockets_or_production(tmp_path):
     base = tmp_path/'checkout'; base.mkdir()
     (base/'proxy').symlink_to(BASE/'proxy', target_is_directory=True)

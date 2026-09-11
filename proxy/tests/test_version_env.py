@@ -123,6 +123,31 @@ def test_merge_explicit_override_only_when_user_provides():
     assert m["FNMUSIC_LLM_BASE_URL"] == "https://user.example.com/v1"
 
 
+def test_merge_decline_recommend_keeps_existing_llm_config():
+    """向导答 N（不开启推荐）：desired 完全不含 LLM 键，已保存的密钥原样保留。"""
+    desired = [(k, v) for k, v in DESIRED if not k.startswith("FNMUSIC_LLM_")]
+    merged, summary = env_merge.merge_env(EXISTING, desired, explicit={"FNMUSIC_VERSION"})
+    m = dict(merged)
+    assert m["FNMUSIC_LLM_API_KEY"] == "sk-user-secret"
+    assert m["FNMUSIC_LLM_BASE_URL"] == "https://user.example.com/v1"
+    assert m["FNMUSIC_LLM_MODEL"] == "deepseek-chat"
+    # desired 未提及的键不在 updated 里（即绝无被覆盖清除的可能）
+    assert "FNMUSIC_LLM_API_KEY" not in summary["updated"]
+
+
+def test_merge_explicit_disable_clears_llm_config():
+    """显式 --disable-recommend：空值 + 全部加入 explicit 才清除。"""
+    merged, _ = env_merge.merge_env(
+        EXISTING, DESIRED,
+        explicit={"FNMUSIC_VERSION", "FNMUSIC_LLM_BASE_URL",
+                  "FNMUSIC_LLM_API_KEY", "FNMUSIC_LLM_MODEL"},
+    )
+    m = dict(merged)
+    assert m["FNMUSIC_LLM_API_KEY"] == ""
+    assert m["FNMUSIC_LLM_BASE_URL"] == ""
+    assert m["FNMUSIC_LLM_MODEL"] == ""
+
+
 def test_merge_same_version_reinstall_keeps_everything():
     existing = EXISTING + [("FNMUSIC_VERSION", "1.1.0")]
     merged, summary = env_merge.merge_env(existing, DESIRED, explicit={"FNMUSIC_VERSION"})

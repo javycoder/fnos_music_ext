@@ -301,10 +301,13 @@ def filter_headers(headers: Any, exclude_keys: set | None = None) -> dict:
 
 
 def copy_incoming_headers(request: Request) -> dict:
-    """透传鉴权 Cookie / Token。Starlette 头名为小写，需显式回填以免丢失 music-token。"""
+    """透传鉴权 Cookie / Token。Starlette 头名为小写，需显式回填以免丢失 music-token。
+
+    authx 为新版官方前端登录后的逐请求签名头（含时间戳与随机数），
+    原样转发给上游即可通过校验；切勿缓存或复用其值。"""
     headers = filter_headers(request.headers, exclude_keys={"host", "content-length"})
     headers["accept-encoding"] = "identity"
-    for key in ("cookie", "authorization", "x-trim-music-temp-token"):
+    for key in ("cookie", "authorization", "x-trim-music-temp-token", "authx"):
         val = request.headers.get(key)
         if val:
             headers[key] = val
