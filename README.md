@@ -21,7 +21,9 @@
 ## 快速开始
 
 ### 前置准备
-1. 已在 fnOS「应用中心」安装并启动官方 **【飞牛音乐】** 应用；
+1. 已在 fnOS「应用中心」安装并启动官方 **【飞牛音乐】** 应用
+   （v1.4.0 已适配 2026-09-11 升级后的新版官方应用，含 authx 签名头透传；
+   旧版官方应用同样兼容）；
 2. 宿主机已安装基础依赖（Python 3 及 venv）：
    ```bash
    sudo apt-get update && sudo apt-get install -y python3 python3-venv git
@@ -115,7 +117,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（兼容 OpenAI 规范） |
 | `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key |
 | `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 每日推荐生成模型 |
-| `FNMUSIC_VERSION` | `1.3.1` | 当前安装的版本号 |
+| `FNMUSIC_VERSION` | `1.4.0` | 当前安装的版本号 |
 
 ---
 
