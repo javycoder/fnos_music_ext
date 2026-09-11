@@ -600,7 +600,7 @@ install_unit() {
         log_warn "或稍后用 sudo cp 该文件到 ${dest}"
         return 1
     fi
-    if [ -f "${dest}" ] && ! grep -Fq "WorkingDirectory=${BASE_DIR}/" "${dest}"; then
+    if [ -f "${dest}" ] && ! same_dir "$(unit_working_dir "${dest}")" "${BASE_DIR}"; then
         log_err "目标 unit 不属于当前目录；拒绝覆盖。"
         return 1
     fi

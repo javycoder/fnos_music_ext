@@ -115,7 +115,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（兼容 OpenAI 规范） |
 | `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key |
 | `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 每日推荐生成模型 |
-| `FNMUSIC_VERSION` | `1.3.0` | 当前安装的版本号 |
+| `FNMUSIC_VERSION` | `1.3.1` | 当前安装的版本号 |
 
 ---
 

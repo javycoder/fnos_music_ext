@@ -237,50 +237,81 @@ class State:
                 snap = snapshot(path)
                 if snap['kind'] == key:
                     if data.get(key) and data[key] != snap:
-                        raise Unsafe('recorded socket ownership changed; migration refused')
+                        # Both roles are kernel-verified live listeners, so the
+                        # record is a cache: adopt the new identity (an official
+                        # restart must never deadlock install or restore).
+                        print('[takeover] note: ' + key + ' identity changed; adopting verified listener',
+                              file=sys.stderr, flush=True)
                     data[key] = snap
             self.save(data)
 
-    def remove_owned(self, path, record):
+    def remove_vacant(self, path, record=None):
+        """Reclaim a socket file that is provably unreachable.
+
+        A stream connect() that returns ECONNREFUSED proves no listener accepts
+        on that path, so the file is a leftover artifact and unlinking it cannot
+        disconnect any client. Requiring a matching ownership record here turned
+        every aborted takeover into a permanent deadlock (a stale file blocked
+        both re-installation and restoration), so a *verified vacant* socket is
+        reclaimed even when unrecorded. A live or indeterminate socket, an
+        unverifiable file type, and any inode change during the check are still
+        preserved untouched.
+        """
         current = snapshot(path)
         if current['kind'] == 'absent':
             return
-        if not record or current.get('inode') != record.get('inode'):
-            raise Unsafe('unrecorded/replaced socket; preserved')
-        # Live sockets, including a known proxy, must first be stopped by their owner.
         if current['kind'] != 'stale':
+            # Live sockets, including a known proxy, stay owned by their process.
             raise Unsafe('socket still live or indeterminate; preserved')
-        if inode(path) != record['inode']:
+        if record and record.get('inode') != current.get('inode'):
+            # The recorded owner is elsewhere (crashed, killed or replaced); the
+            # vacant path is unrelated garbage, still provably unreachable.
+            print('[takeover] note: recorded owner inode differs; reclaiming vacant socket',
+                  file=sys.stderr, flush=True)
+        # Vacancy must be observed twice, on the same inode, immediately before unlink.
+        if inode(path) != current['inode'] or snapshot(path)['kind'] != 'stale':
             raise Unsafe('socket changed before unlink')
         os.unlink(path)
+        print('[takeover] reclaimed vacant socket file: ' + str(path), file=sys.stderr, flush=True)
+
+    def remove_vacant_any(self, data):
+        """Reclaim vacant files on both known paths; live sockets are never touched."""
+        for path, role in ((self.upstream, 'official'), (self.target, 'proxy')):
+            if snapshot(path)['kind'] == 'stale':
+                self.remove_vacant(path, data.get(role))
 
     def restore_plan(self, unit='fnmusic-ext.service'):
         """Pre-flight: may this stop be followed by verified recovery?
 
         Called by restore.sh BEFORE disabling the service. Returns the positive
         future role of the target; raises Unsafe while recovery is unsupported
-        or ambiguous, so the stop never produces an unrecoverable layout.
+        or ambiguous, so the stop never produces an unrecoverable layout. A
+        vacant (unreachable) target or upstream file is never a blocker: it is
+        reclaimable, so an aborted takeover stays restorable.
         """
         t, u = snapshot(self.target), snapshot(self.upstream)
         if t['kind'] == 'official':
-            if u['kind'] != 'absent' and u['kind'] != 'unknown':
+            if u['kind'] not in ('absent', 'stale'):
                 raise Unsafe('official target plus occupied upstream; refuse stop')
             return 'official-direct'
         if u['kind'] == 'absent':
             raise Unsafe('no positively identified official upstream; refuse stop')
         if u['kind'] not in ('official', 'unknown'):
             raise Unsafe('upstream is not official; refuse stop')
-        current = snapshot(self.target)
-        if current['kind'] != 'proxy':
-            recorded = remember_service(self.target, self.upstream, self.directory, unit=unit)
-            live = snapshot(self.target)
-            # The legacy peer stays 'unknown' to live probes; the verified
-            # record grants it the proxy role, matching the exact live identity.
-            if recorded['kind'] != 'proxy' or live not in (recorded, current):
-                raise Unsafe('legacy proxy identity unverifiable; refuse stop')
         if u['kind'] == 'unknown':
             if remember_official(self.upstream) is None:
                 raise Unsafe('upstream identity unverifiable; refuse stop')
+        if t['kind'] == 'stale':
+            return 'vacant-target-repair'
+        if t['kind'] == 'proxy':
+            return 'proxy-recovery'
+        current = t
+        recorded = remember_service(self.target, self.upstream, self.directory, unit=unit)
+        live = snapshot(self.target)
+        # The legacy peer stays 'unknown' to live probes; the verified
+        # record grants it the proxy role, matching the exact live identity.
+        if recorded['kind'] != 'proxy' or live not in (recorded, current):
+            raise Unsafe('legacy proxy identity unverifiable; refuse stop')
         return 'proxy-recovery'
 
     def restore(self):
@@ -288,16 +319,34 @@ class State:
             data = self.load()
             t, u = snapshot(self.target), snapshot(self.upstream)
             if t['kind'] == 'official':
-                if u['kind'] != 'absent':
+                if u['kind'] == 'stale':
+                    self.remove_vacant(self.upstream, data.get('official'))
+                elif u['kind'] != 'absent':
                     raise Unsafe('official target plus occupied upstream; both preserved')
                 self.save({})
+                print('[takeover] official socket already in place', flush=True)
                 return
+            if u['kind'] == 'stale':
+                # Vacant upstream is unreachable garbage: clear it, then report
+                # honestly that nothing is listening for clients.
+                self.remove_vacant(self.upstream, data.get('official'))
+                u = snapshot(self.upstream)
+                if u['kind'] == 'absent':
+                    # Leave both canonical paths clean: a restarting official app
+                    # must be able to bind them again without stale leftovers.
+                    if snapshot(self.target)['kind'] == 'stale':
+                        self.remove_vacant(self.target, data.get('proxy'))
+                    self.save({})
+                    raise Unsafe('no official listener present; restart the official music app')
             if u['kind'] != 'official':
                 raise Unsafe('no positively identified official upstream; preserved')
             recorded = data.get('official')
             if recorded and (recorded.get('inode') != u['inode'] or recorded.get('process') != u['process']):
-                raise Unsafe('official upstream ownership changed; preserved')
-            self.remove_owned(self.target, data.get('proxy'))
+                # The official app restarted while taken over: the live kernel
+                # identity wins, and the move below re-verifies the end state.
+                print('[takeover] note: official identity changed; adopting verified listener',
+                      file=sys.stderr, flush=True)
+            self.remove_vacant(self.target, data.get('proxy'))
             if inode(self.upstream) != u['inode'] or inode(self.target) is not None:
                 raise Unsafe('socket changed before restore')
             move_no_replace(self.upstream, self.target)
@@ -309,6 +358,8 @@ class State:
     def publish(self, staged, proxy):
         with self.lock():
             data = self.load()
+            # Vacant leftovers never block publication, whichever path holds them.
+            self.remove_vacant_any(data)
             t, u = snapshot(self.target), snapshot(self.upstream)
             if t['kind'] == 'official' and u['kind'] == 'absent':
                 data['official'] = t
@@ -320,8 +371,10 @@ class State:
             elif u['kind'] == 'official' and t['kind'] in ('absent', 'stale'):
                 prior = data.get('official')
                 if prior and prior != u:
-                    raise Unsafe('upstream differs from ownership record')
-                self.remove_owned(self.target, data.get('proxy'))
+                    # The official app restarted between installs; the live
+                    # kernel identity is authoritative, not the cached record.
+                    print('[takeover] note: upstream identity changed; adopting verified listener',
+                          file=sys.stderr, flush=True)
                 data.update(official=u, proxy=proxy)
                 self.save(data)
             else:
@@ -496,6 +549,7 @@ def supervise(state, base):
     # Private staging prevents uvicorn from unlinking an existing target on startup.
     with tempfile.TemporaryDirectory(prefix='proxy-', dir=state.directory) as temp:
         staged = Path(temp) / 'listen.sock'
+        failure = None
         try:
             child = subprocess.Popen([str(base / '.venv-proxy/bin/python'), '-m', 'uvicorn',
                                       'app:app', '--app-dir', str(base / 'proxy'), '--uds', str(staged),
@@ -516,13 +570,18 @@ def supervise(state, base):
                 raise Unsafe('child failed liveness before takeover')
             changed = True  # publish may fail after moving official
             state.publish(staged, proxy)
-            wait_ready(state, 30)
+            # Readiness is the acceptance gate; keep this window below the unit's
+            # 65s ExecStartPost deadline so a failure reports the real dependency
+            # state instead of racing systemd's own timeout.
+            wait_ready(state, 55)
             print('[takeover] proxy identity and readiness verified', flush=True)
             code = child.wait()
-            raise Unsafe(f'proxy exited (status {code})')
-        except InterruptedError:
+            failure = Unsafe(f'proxy exited (status {code})')
+        except InterruptedError as exc:
             if not stopping:
-                raise
+                failure = exc
+        except BaseException as exc:
+            failure = exc
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -535,8 +594,17 @@ def supervise(state, base):
                     child.wait(timeout=3)
             if log_thread:
                 log_thread.join(timeout=1)
-            if changed:
+        if changed:
+            # Rollback failure must never hide why the service failed: report both.
+            try:
                 state.restore()
+            except BaseException as rollback:
+                if failure is not None:
+                    raise Unsafe(str(failure) + '; rollback failed: ' + str(rollback)) from rollback
+                raise
+            print('[takeover] rolled back to the official socket', flush=True)
+        if failure is not None:
+            raise failure
 
 
 def prepare_install_lock():
