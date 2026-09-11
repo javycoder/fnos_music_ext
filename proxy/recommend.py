@@ -1,7 +1,12 @@
-"""每日推荐：基于最近收听记录生成可播放在线歌单。
+"""每日推荐：采信音源原生推荐生成可播放在线歌单。
 
-已登录用户始终注入「每日推荐」歌单。配置了 FNMUSIC_LLM_BASE_URL + FNMUSIC_LLM_API_KEY
-时走大模型；否则按最近播放歌手降级检索。密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
+优先级单链（取第一个能凑满 PLAYLIST_SIZE 首的来源，不足则逐级补齐）：
+  1. netease-daily  网易真·每日推荐（musicbox，已登录为个性化）
+  2. netease-charts 网易榜单（musicbox toplist，免登录）
+  3. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
+  4. llm            大模型候选 + 搜索匹配（仅当网易音源未启用且配置了 FNMUSIC_LLM_*）
+  5. fallback       种子歌手 + 热门池关键词检索（最终保险）
+密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
 """
 from __future__ import annotations
 
@@ -28,6 +33,10 @@ PLAYLIST_SIZE = 20
 RECOMMEND_COUNT = PLAYLIST_SIZE  # 兼容旧引用
 LLM_TIMEOUT_S = 20.0
 BUILD_BUDGET_S = 25.0
+# 音源原生推荐抓取量（过滤已收藏/最近播放与不可播曲目后仍有余量）
+NETEASE_DAILY_LIMIT = 40
+NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜
+CHART_FETCH_COUNT = 40
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HIRA_KATA = re.compile(r"[\u3040-\u30ff]")
@@ -526,6 +535,134 @@ async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
         return []
 
 
+# ------------------------------------------------------- 音源原生推荐（平台 ID 直连） ---
+
+def _musicbox_recommend_item(it: dict) -> dict:
+    """musicbox 推荐/榜单详情行（batch_song_details 已过滤可播）-> 统一候选条目。"""
+    sid = str(it.get("song_id") or it.get("id") or "")
+    if not sid:
+        return {}
+    dur_ms = int(it.get("duration_ms") or 0)
+    return {
+        "id": f"netease:{sid}",
+        "source": "netease",
+        "title": str(it.get("name") or it.get("song_name") or ""),
+        "artist": str(it.get("artist") or ""),
+        "album": str(it.get("album_name") or it.get("album") or ""),
+        "duration_s": dur_ms / 1000.0,
+        "ext": "flac" if (it.get("has_sq") or it.get("has_hr")) else "mp3",
+        "cover_url": str(it.get("album_pic_url") or ""),
+    }
+
+
+def _lx_recommend_item(it: dict) -> dict:
+    """lxmusic 榜单条目 -> 统一候选条目（与 _search_keyword 的 lx 归一化一致）。"""
+    tid = str(it.get("id") or "")
+    if not tid:
+        return {}
+    return {
+        "id": tid if tid.startswith("lx:") else f"lx:{tid}",
+        "source": "lx",
+        "title": str(it.get("title") or it.get("name") or ""),
+        "artist": str(it.get("artist") or ""),
+        "album": str(it.get("album") or ""),
+        "duration_s": float(it.get("duration_s") or 0) or 0,
+        "ext": str(it.get("ext") or "mp3") or "mp3",
+        "cover_url": str(it.get("cover_url") or ""),
+    }
+
+
+def resolve_source_candidates(
+    items: list[dict],
+    build_track,
+    limit: int = PLAYLIST_SIZE,
+    exclude_guids: set[str] | None = None,
+    exclude_ta: set[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """音源原生推荐条目（已含平台 ID，无需搜索匹配）直转 Track，跳过排除项凑满 limit 首。"""
+    skip_ids = set(exclude_guids or ())
+    skip_ta = set(exclude_ta or ())
+    out: list[dict] = []
+    for pick in items:
+        if len(out) >= limit:
+            break
+        if not isinstance(pick, dict):
+            continue
+        pid = str(pick.get("id") or "")
+        guid = f"online:{pid}" if pid and not pid.startswith("online:") else pid
+        ptitle = str(pick.get("title") or pick.get("name") or "")
+        partist = str(pick.get("artist") or "")
+        if (guid and guid in skip_ids) or (pid and pid in skip_ids):
+            continue
+        key = identity_key(ptitle, partist)
+        if key != ("", "") and key in skip_ta:
+            continue
+        track = build_track(pick)
+        tg = str(track.get("guid") or guid)
+        tt, ta = str(track.get("title") or ptitle), str(track.get("artist") or partist)
+        if tg and tg in skip_ids:
+            continue
+        tkey = identity_key(tt, ta)
+        if tkey != ("", "") and tkey in skip_ta:
+            continue
+        track["recommendDimension"] = str(pick.get("dimension") or "")
+        track["recommendReason"] = str(pick.get("reason") or "")
+        out.append(track)
+    return out
+
+
+async def fetch_musicbox_recommend(
+    client: httpx.AsyncClient, path: str, params: dict
+) -> list[dict]:
+    """调 musicbox 推荐端点，返回标准化候选；服务不可用/未登录/失败一律返回 []（跳级）。"""
+    try:
+        r = await client.get(path, params=params, timeout=15.0)
+        if r.status_code != 200:
+            logger.debug("musicbox %s http %s", path, r.status_code)
+            return []
+        data = r.json()
+    except Exception as e:
+        logger.debug("musicbox %s failed: %s", path, e)
+        return []
+    if not (isinstance(data, dict) and data.get("ok") is True):
+        # 未登录/CLI 错误等结构化错误 -> 直接跳级
+        logger.debug("musicbox %s not ok: %.120s", path, data)
+        return []
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    for it in rows:
+        if isinstance(it, dict):
+            item = _musicbox_recommend_item(it)
+            if item:
+                out.append(item)
+    return out
+
+
+async def fetch_lx_charts(client: httpx.AsyncClient, limit: int) -> list[dict]:
+    """调 lxmusic 免登录榜单端点，返回标准化候选。"""
+    try:
+        r = await client.get("/api/v1/recommend", params={"limit": limit}, timeout=20.0)
+        if r.status_code != 200:
+            logger.debug("lx charts http %s", r.status_code)
+            return []
+        data = r.json()
+    except Exception as e:
+        logger.debug("lx charts failed: %s", e)
+        return []
+    rows = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    for it in rows:
+        if isinstance(it, dict):
+            item = _lx_recommend_item(it)
+            if item:
+                out.append(item)
+    return out
+
+
 def _match_score(item: dict, title: str, artist: str) -> int:
     it = str(item.get("title") or item.get("name") or "").strip().lower()
     ia = str(item.get("artist") or "").strip().lower()
@@ -925,6 +1062,23 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
             logger.warning("failed to purge %s: %s", path, e)
 
 
+# 每用户最近一次每日推荐构建结果（仅供 /_ext/healthz 观测，非持久化）
+_LAST_DAILY_INFO: dict[str, dict] = {}
+
+
+def _remember_daily_result(user_guid: str, payload: dict) -> None:
+    _LAST_DAILY_INFO[user_guid] = {
+        "day": payload.get("day"),
+        "status": payload.get("status"),
+        "tiers": list(payload.get("tiers") or []),
+        "trackCount": len(payload.get("tracks") or []),
+    }
+
+
+def last_recommend_summary() -> dict:
+    return {user: dict(info) for user, info in _LAST_DAILY_INFO.items()}
+
+
 def build_playlist_record(
     guid: str,
     name: str,
@@ -981,6 +1135,7 @@ async def get_or_build_daily(
     cached = load_daily_cache(user_guid, day)
     existing = list(cached.get("tracks") or []) if cached else []
     if len(existing) >= PLAYLIST_SIZE:
+        _remember_daily_result(user_guid, cached)
         return cached
 
     local_seeds = read_local_recent_tracks(music_db_path(), user_guid, SEED_LIMIT)
@@ -1016,8 +1171,38 @@ async def get_or_build_daily(
             identity_key(str(t.get("title") or ""), str(t.get("artist") or "")) for t in existing
         }
 
+    async def from_netease_daily() -> list[dict]:
+        if not (netease_enabled and musicbox_client):
+            return []
+        items = await fetch_musicbox_recommend(
+            musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
+        )
+        if not items:
+            return []
+        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+
+    async def from_netease_charts() -> list[dict]:
+        if not (netease_enabled and musicbox_client):
+            return []
+        items = await fetch_musicbox_recommend(
+            musicbox_client, "/api/v1/toplist",
+            {"index": NETEASE_TOPLIST_INDEX, "limit": CHART_FETCH_COUNT},
+        )
+        if not items:
+            return []
+        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+
+    async def from_lx_charts() -> list[dict]:
+        if not (lx_enabled and lx_client):
+            return []
+        items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT)
+        if not items:
+            return []
+        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+
     async def from_llm() -> list[dict]:
-        if llm_http is None or not llm_enabled():
+        # 仅当网易音源未启用时才走大模型（采信音源原生推荐优先）
+        if llm_http is None or not llm_enabled() or netease_enabled:
             return []
         recs = await call_llm(
             llm_http, build_llm_prompt(play_seeds, fav_seeds[:40], LLM_CANDIDATE_COUNT)
@@ -1040,22 +1225,34 @@ async def get_or_build_daily(
 
     tracks = list(existing)
     t0 = time.monotonic()
-    remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
-    # 启用 LLM 时优先走大模型；失败/超时/不足 20 首再用 fallback 补齐
-    if llm_http is not None and llm_enabled() and remaining > 0 and len(tracks) < PLAYLIST_SIZE:
-        try:
-            chunk = await asyncio.wait_for(from_llm(), timeout=max(remaining, 0.1))
-            tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.debug("daily recommend llm branch failed: %s", e)
+    contributing: list[str] = []
 
-    remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
-    if len(tracks) < PLAYLIST_SIZE and remaining > 0:
+    async def run_tier(name: str, tier_factory) -> None:
+        nonlocal tracks
+        if len(tracks) >= PLAYLIST_SIZE:
+            return
+        remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
+        if remaining <= 0:
+            return
         try:
-            chunk = await asyncio.wait_for(from_fallback(), timeout=max(remaining, 0.1))
-            tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
+            chunk = await asyncio.wait_for(tier_factory(), timeout=remaining)
         except (asyncio.TimeoutError, Exception) as e:
-            logger.debug("daily recommend fallback branch failed: %s", e)
+            logger.debug("daily recommend tier %s failed: %s", name, e)
+            return
+        if chunk:
+            before = len(tracks)
+            tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
+            if len(tracks) > before:
+                contributing.append(name)
+
+    # 优先级单链：网易真每日推荐 -> 网易榜单（未登录）-> lx 免登录榜单
+    # -> LLM（仅网易未启用）-> 种子关键词兜底；每级不足 20 首由下一级补齐
+    await run_tier("netease-daily", from_netease_daily)
+    await run_tier("netease-charts", from_netease_charts)
+    await run_tier("lx-charts", from_lx_charts)
+    if not netease_enabled:
+        await run_tier("llm", from_llm)
+    await run_tier("fallback", from_fallback)
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
     cover_id = tracks[0].get("coverId") or tracks[0].get("guid") if tracks else guid
@@ -1071,11 +1268,16 @@ async def get_or_build_daily(
         "status": "ready" if len(tracks) >= PLAYLIST_SIZE else "partial",
         "playlist": playlist,
         "tracks": tracks,
+        "tiers": contributing,
         "seedCount": len(play_seeds),
         "favoriteCount": len(fav_seeds),
         "builtAt": int(time.time()),
     }
     if tracks:
         save_daily_cache(user_guid, day, payload)
-        logger.info("daily recommend %s tracks=%s status=%s", guid, len(tracks), payload["status"])
+        logger.info(
+            "daily recommend %s tracks=%s status=%s tiers=%s",
+            guid, len(tracks), payload["status"], ",".join(contributing) or "-",
+        )
+    _remember_daily_result(user_guid, payload)
     return payload

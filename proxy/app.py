@@ -1594,6 +1594,13 @@ async def ext_healthz(request: Request):
     source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "lxmusic"))
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
+            "recommend": {
+                "mode": "source-native",
+                "netease": bool(CONF.get("netease_enabled", True)),
+                "lx": bool(CONF.get("lx_enabled", True)),
+                "llm_fallback": dailyrec.llm_enabled() and not CONF.get("netease_enabled", True),
+                "recent": dailyrec.last_recommend_summary(),
+            },
             "degraded": bool(failed), "failures": failed, "details": details}
 
 

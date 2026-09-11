@@ -7,7 +7,8 @@ set -euo pipefail
 #     musicbox https://github.com/darknessomi/musicbox   (:8770 网易云)
 #     musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合)
 #     lxmusic  洛雪音乐源（LX Music 免登录解析）          (:8772)
-# - 可选开启每日推荐（OpenAI 兼容接口；不填则关闭）
+# - 每日推荐默认采信音源原生推荐（网易每日推荐/榜单 + lxmusic 免登录榜单）；
+#   大模型（OpenAI 兼容）仅当网易音源未启用时作为兜底，可选配置
 # - 不修改飞牛 nginx / 官方二进制 / 官方数据库写入
 # 用法:
 #   ./install.sh                         # 交互
@@ -62,8 +63,9 @@ usage() {
                          3 = lxmusic  洛雪音乐源 [8772]
                          非交互缺省: musicdl
   --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
-  --enable-recommend     开启每日推荐（需同时给 base-url 与 api-key）
-  --disable-recommend    明确关闭每日推荐，并清除 .env 中已保存的 LLM 配置
+  --enable-recommend     开启大模型兜底推荐（需同时给 base-url 与 api-key；
+                        仅当网易音源未启用时生效，平时每日推荐走音源原生推荐）
+  --disable-recommend    明确关闭大模型兜底，并清除 .env 中已保存的 LLM 配置
   --llm-base-url URL     OpenAI 兼容 Base URL，例如 https://api.openai.com/v1
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
@@ -416,10 +418,10 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         SOURCES_RAW="$(prompt "输入 1 / 2 / 3 / 1,2 / 1,3 / 1,2,3" "1,2,3")"
     fi
     if [ -z "${ENABLE_RECOMMEND}" ]; then
-        echo "大模型每日推荐歌单（可选选填）:"
-        echo "  支持接入兼容 OpenAI 协议的大模型（如 DeepSeek/GPT/Qwen 等），"
-        echo "  根据播放偏好每天自动生成 20 首推荐新歌。"
-        rec_choice="$(prompt "是否开启每日推荐（需 OpenAI 兼容 API Key）? [y/N]" "N")"
+        echo "大模型兜底推荐（可选选填）:"
+        echo "  每日推荐默认采信音源原生推荐（网易每日推荐/榜单 + 洛雪免登录榜单），"
+        echo "  大模型（OpenAI 兼容，如 DeepSeek/GPT/Qwen）仅在网易音源未启用时作为兜底。"
+        rec_choice="$(prompt "是否配置大模型兜底（需 OpenAI 兼容 API Key）? [y/N]" "N")"
         case "${rec_choice}" in
             y|Y|yes|YES) ENABLE_RECOMMEND="yes" ;;
             *) ENABLE_RECOMMEND="no" ;;

@@ -1354,6 +1354,203 @@ async def kw_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
     return ""
 
 
+# ------------------------------------------------------------ 免登录榜单推荐 ---
+
+# 实测存活的免登录榜单（2026-09）：kg 移动端 TOP500 / kw kbang 飙升榜 / wy 新歌速递
+_KG_RANK_ID = 8888  # m.kugou.com/rank/info 必须带 page 参数，否则 songs.list 为空
+_KW_BANG_ID = 93    # kbangserver.kuwo.cn 免签老接口
+
+
+async def kg_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
+    """酷狗移动端 TOP500 榜单（免登录）。免费曲直接收录，付费曲探活通过才返回。"""
+    try:
+        r = await client.get(
+            "http://m.kugou.com/rank/info/",
+            params={"rankid": _KG_RANK_ID, "page": 1, "json": "true"},
+            headers={"User-Agent": UA_MOBILE},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        rows = ((r.json() or {}).get("songs") or {}).get("list") or []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("kg chart rank %s failed: %s", _KG_RANK_ID, e)
+        return []
+    items: list[dict] = []
+    vip_candidates: list[dict] = []
+    for it in rows:
+        if not isinstance(it, dict) or _explicit_trial(it):
+            continue
+        fhash = str(it.get("hash") or "")
+        if not fhash:
+            continue
+        # 榜单曲目几乎全部带 pay_type/fail_process VIP 标记，但实测匿名 playInfo
+        # 仍能解析出完整时长直链（2026-09 验证 3.6MB/225s），故不按标记硬过滤，
+        # 一律以探活结果为准（与搜索侧"可播性验证取代收费过滤"同一原则）
+        if int(it.get("is_free_part") or 0) != 0:
+            continue
+        singer = " / ".join(
+            str(a.get("author_name") or "")
+            for a in (it.get("authors") or [])
+            if isinstance(a, dict) and a.get("author_name")
+        )
+        title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "")
+        if not title or any(marker in title for marker in _TRIAL_TITLE_MARKERS):
+            continue
+        pay_type = int(it.get("pay_type") or 0)
+        is_vip = pay_type != 0 or int(it.get("pkg_price") or 0) != 0 or int(it.get("price") or 0) != 0
+        sq = str(it.get("sqhash") or "")
+        item = {
+            "id": f"lx:kg:{fhash}",
+            "lx_source": "kg",
+            "title": title,
+            "artist": singer,
+            "album": "",  # rank 接口不返回专辑名
+            "duration_s": int(it.get("duration") or 0),  # rank 接口 duration 单位为秒
+            "ext": "flac" if sq else "mp3",
+            "cover_url": str(it.get("album_sizable_cover") or "").replace("{size}", "480"),
+            "file_size": int(it.get("sqfilesize") or it.get("320filesize") or 0) or 0,
+            "lyric": "",
+            "hash": fhash,
+            "hash_hq": str(it.get("320hash") or ""),
+            "hash_sq": sq,
+            "mixsongid": str(it.get("album_audio_id") or ""),
+            "pay_type": pay_type,
+        }
+        if is_vip:
+            vip_candidates.append(item)
+        else:
+            item.update(verified=False, validation_status="unverified", completeness="unknown")
+            _cache_put(item)
+            items.append(item)
+            _publish(item)
+    if vip_candidates and len(items) < limit:
+        items.extend(await _probe_candidates(client, "kg", vip_candidates, limit - len(items)))
+    return items[:limit]
+
+
+async def kw_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
+    """酷我 kbang 免签飙升榜（老接口字段较旧）。酷我直链依赖第三方链路，全部探活。"""
+    import html as _html
+
+    try:
+        r = await client.get(
+            "http://kbangserver.kuwo.cn/ksong.s",
+            params={
+                "from": "pc",
+                "fmt": "json",
+                "pn": 0,
+                "rn": max(limit * 2, 40),
+                "id": _KW_BANG_ID,
+                "nc": 1,
+            },
+            headers={"User-Agent": UA_PC},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        rows = (r.json() or {}).get("musiclist") or []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("kw bang %s failed: %s", _KW_BANG_ID, e)
+        return []
+    candidates: list[dict] = []
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        rid = str(it.get("id") or "")
+        if not rid.isdigit():
+            continue
+        payinfo = it.get("payInfo") or {}
+        # cannotOnlinePlay=1 无在线版权；listen_fragment=1 仅有试听片段，均真不可播
+        if str(payinfo.get("cannotOnlinePlay") or "0") == "1":
+            continue
+        if str(payinfo.get("listen_fragment") or "0") == "1":
+            continue
+        title = _html.unescape(str(it.get("name") or "")).replace("\xa0", " ").strip()
+        if not title or any(marker in title for marker in _TRIAL_TITLE_MARKERS):
+            continue
+        formats = str(it.get("formats") or "")
+        fee_type = payinfo.get("feeType") or {}
+        candidates.append(
+            {
+                "id": f"lx:kw:{rid}",
+                "lx_source": "kw",
+                "title": title,
+                "artist": _html.unescape(str(it.get("artist") or "")).replace("\xa0", " ").strip(),
+                "album": _html.unescape(str(it.get("album") or "")).replace("\xa0", " ").strip(),
+                "duration_s": int(float(it.get("song_duration") or 0)),
+                "ext": "flac" if "ALFLAC" in formats else "mp3",
+                "cover_url": "",
+                "file_size": 0,
+                "lyric": "",
+                "rid": rid,
+                "pay_type": 1 if str(fee_type.get("song") or "0") != "0" else 0,
+            }
+        )
+    return await _probe_candidates(client, "kw", candidates, limit)
+
+
+async def wy_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
+    """网易新歌速递（免登录）。fee∉(0,8) 的付费曲转探活验证。"""
+    try:
+        r = await client.get(
+            "https://music.163.com/api/personalized/newsong",
+            params={"limit": max(limit * 2, 30)},
+            headers={
+                "User-Agent": UA_PC,
+                "Referer": "https://music.163.com/",
+                "Cookie": "os=pc; appver=9.1.15",
+            },
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        rows = (r.json() or {}).get("result") or []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("wy newsong failed: %s", e)
+        return []
+    items: list[dict] = []
+    vip_candidates: list[dict] = []
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        song = it.get("song") if isinstance(it.get("song"), dict) else {}
+        sid = str(song.get("id") or it.get("id") or "")
+        if not sid:
+            continue
+        name = str(song.get("name") or it.get("name") or "")
+        if not name or any(marker in name for marker in _TRIAL_TITLE_MARKERS):
+            continue
+        artists = song.get("artists") or []
+        artist = " / ".join(str(a.get("name") or "") for a in artists if isinstance(a, dict))
+        album = song.get("album") or {}
+        fee = int(song.get("fee") or 0)
+        item = {
+            "id": f"lx:wy:{sid}",
+            "lx_source": "wy",
+            "title": name,
+            "artist": artist,
+            "album": str(album.get("name") or "") if isinstance(album, dict) else "",
+            "duration_s": int(song.get("duration") or 0) / 1000.0,
+            "ext": "mp3",
+            "cover_url": str(album.get("picUrl") or "") if isinstance(album, dict) else "",
+            "file_size": 0,
+            "lyric": "",
+            "song_id": sid,
+            "fee": fee,
+        }
+        if fee not in (0, 8):
+            vip_candidates.append(item)
+        else:
+            item.update(verified=False, validation_status="unverified", completeness="unknown")
+            _cache_put(item)
+            items.append(item)
+            _publish(item)
+    if vip_candidates and len(items) < limit:
+        items.extend(await _probe_candidates(client, "wy", vip_candidates, limit - len(items)))
+    return items[:limit]
+
+
+_CHARTERS: dict[str, Any] = {"kg": kg_chart_songs, "kw": kw_chart_songs, "wy": wy_chart_songs}
+
+
 # --------------------------------------------------------------------- app ---
 
 _SEARCHERS = {"kg": kg_search, "wy": wy_search, "mg": mg_search, "tx": tx_search, "kw": kw_search}
@@ -1397,6 +1594,7 @@ async def healthz():
         "third_party": CONF["third_party"],
         "chains": chain_health_snapshot(),
         "capabilities": source_capabilities(),
+        "charts": sorted(_CHARTERS),
     }
 
 
@@ -1472,6 +1670,38 @@ async def search(
     _STATS["errors"] += len(errors)
     return {"ok": True, "items": items, "errors": errors, "stats": dict(_STATS),
             "capabilities": capabilities}
+
+
+@app.get("/api/v1/recommend")
+async def recommend_charts(
+    limit: int = Query(0),
+    sources: str = Query(""),
+):
+    """免登录榜单推荐：kg TOP500 / kw 飙升榜 / wy 新歌速递，按源顺序聚合凑满 limit。"""
+    if limit <= 0:
+        limit = CONF["limit_per_source"]
+    wanted_raw = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    wanted = [normalize_source(s) for s in wanted_raw]
+    wanted = [s for s in wanted if s in _CHARTERS] or [s for s in CONF["sources"] if s in _CHARTERS]
+
+    client = get_http(app)
+    capabilities = source_capabilities()
+    items: list[dict] = []
+    errors: dict[str, str] = {}
+    for src in dict.fromkeys(wanted):
+        if not capabilities.get(src, {}).get("playback_available"):
+            errors[src] = capabilities.get(src, {}).get("reason") or "playback unavailable"
+            continue
+        try:
+            chunk = await _CHARTERS[src](client, limit)
+        except Exception as e:  # noqa: BLE001
+            errors[src] = str(e) or type(e).__name__
+            continue
+        items.extend(chunk)
+        if len(items) >= limit:
+            break
+    _STATS["errors"] += len(errors)
+    return {"ok": True, "items": items[:limit], "errors": errors, "charts": sorted(_CHARTERS)}
 
 
 @app.get("/api/v1/track/url")

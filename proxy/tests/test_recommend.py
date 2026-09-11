@@ -16,6 +16,7 @@ from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value
 def setup_recommend_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
     _DAILY_TASKS.clear()
+    dailyrec._LAST_DAILY_INFO.clear()
     rec_dir = str(tmp_path / "recommend_cache")
     hist_dir = str(tmp_path / "play_history")
     fav_dir = str(tmp_path / "online_favorites")
@@ -29,6 +30,11 @@ def setup_recommend_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
+    # lxmusic 客户端默认 mock（404），防止每日推荐链路在测试中触达真实 127.0.0.1:8772
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
+        base_url="http://127.0.0.1:8772",
+    )
 
 
 def _auth_user(guid="user-rec-1"):
@@ -187,6 +193,8 @@ def test_playlist_list_drops_yesterday_daily(tmp_path, monkeypatch):
 
 
 def test_playlist_list_injects_daily_when_enabled(monkeypatch, tmp_path):
+    # 大模型链路仅当网易音源未启用时生效（新策略），此处关闭网易以覆盖 LLM 注入端到端流程
+    monkeypatch.setitem(CONF, "netease_enabled", False)
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
@@ -458,11 +466,16 @@ def test_healthz_includes_llm_flag():
         resp = client.get("/_ext/healthz")
         assert "llm" in resp.json()
         assert resp.json()["llm"] in ("disabled", "enabled")
+        rec = resp.json()["recommend"]
+        assert rec["mode"] == "source-native"
+        assert rec["netease"] is True
+        assert isinstance(rec["recent"], dict)
 
 
 @pytest.mark.anyio
-async def test_get_or_build_daily_prefers_llm_over_fallback(monkeypatch):
-    """启用 LLM 时应先走大模型，不能被 fallback 竞速取消。"""
+async def test_get_or_build_daily_uses_llm_when_netease_disabled(monkeypatch):
+    """网易音源未启用且配置了 LLM 时走大模型，不能被 fallback 竞速取消。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", "/nonexistent.db")
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
     monkeypatch.setenv("FNMUSIC_LLM_MODEL", "gpt-test")
@@ -499,6 +512,143 @@ async def test_get_or_build_daily_prefers_llm_over_fallback(monkeypatch):
         )
     assert llm_calls["n"] >= 1
     assert len(payload["tracks"]) >= 1
+    assert "llm" in payload["tiers"]
     # 至少部分曲目应来自 LLM 候选标题
     titles = " ".join(str(t.get("title") or "") for t in payload["tracks"])
     assert "LLM歌" in titles
+
+
+def _mb_detail_rows(n: int, prefix: str, sid_base: int = 90000) -> list[dict]:
+    return [
+        {
+            "song_id": sid_base + i,
+            "name": f"{prefix}{i}",
+            "artist": f"网易歌手{i % 5}",
+            "album_name": f"专辑{i}",
+            "album_pic_url": f"http://img/{sid_base + i}.jpg",
+            "duration_ms": 210000,
+            "has_sq": i % 4 == 0,
+            "has_hr": False,
+        }
+        for i in range(n)
+    ]
+
+
+@pytest.mark.anyio
+async def test_daily_prefers_netease_daily_and_skips_llm(tmp_path, monkeypatch):
+    """网易启用时：真·每日推荐直接命中（平台 ID 直连），LLM 完全不调用。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+    llm_calls = {"n": 0}
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_calls["n"] += 1
+        return httpx.Response(500)
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/recommend/songs":
+            assert request.url.params.get("limit") == str(dailyrec.NETEASE_DAILY_LIMIT)
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "网易日推"), "logged_in": True})
+        return httpx.Response(404, json={"ok": False})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler), base_url="http://127.0.0.1:9") as llm_client, \
+            httpx.AsyncClient(transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770") as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-netease-daily",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=llm_client,
+            build_track=build_online_track,
+            netease_enabled=True,
+            favorite_items=[{"guid": "online:netease:90000", "track": {"title": "网易日推0", "artist": "网易歌手0"}}],
+        )
+    assert payload["tiers"] == ["netease-daily"]
+    assert payload["status"] == "ready"
+    assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
+    assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
+    titles = [str(t.get("title")) for t in payload["tracks"]]
+    assert "网易日推0" not in titles  # 已收藏跳过
+    assert "网易日推1" in titles
+    assert llm_calls["n"] == 0  # 网易启用时绝不调 LLM
+    summary = dailyrec.last_recommend_summary().get("u-netease-daily")
+    assert summary and summary["tiers"] == ["netease-daily"]
+
+
+@pytest.mark.anyio
+async def test_daily_falls_back_to_netease_charts_when_not_logged_in(tmp_path, monkeypatch):
+    """网易推荐返回 not_logged_in 时自动降级榜单，同一音源内补齐。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/recommend/songs":
+            return httpx.Response(
+                200,
+                json={"ok": False, "error": {"type": "not_logged_in", "message": "未登录或登录已过期"}},
+            )
+        if request.url.path == "/api/v1/toplist":
+            assert request.url.params.get("index") == str(dailyrec.NETEASE_TOPLIST_INDEX)
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "热歌榜", sid_base=70000), "index": 3})
+        return httpx.Response(404, json={"ok": False})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770") as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-netease-charts",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=None,
+            build_track=build_online_track,
+            netease_enabled=True,
+        )
+    assert payload["tiers"] == ["netease-charts"]
+    assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
+    assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
+
+
+@pytest.mark.anyio
+async def test_daily_uses_lx_charts_when_musicbox_unavailable(tmp_path, monkeypatch):
+    """musicbox 全挂时降级 lxmusic 免登录榜单。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+
+    def lx_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/recommend":
+            items = [
+                {
+                    "id": f"lx:kg:HASH{i}",
+                    "lx_source": "kg",
+                    "title": f"榜单歌{i}",
+                    "artist": f"酷狗歌手{i}",
+                    "album": "",
+                    "duration_s": 200,
+                    "ext": "mp3",
+                    "cover_url": "",
+                }
+                for i in range(25)
+            ]
+            return httpx.Response(200, json={"ok": True, "items": items, "errors": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770") as mb, \
+            httpx.AsyncClient(transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772") as lx:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-lx-charts",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=None,
+            build_track=build_online_track,
+            netease_enabled=True,
+            lx_client=lx,
+            lx_enabled=True,
+        )
+    assert payload["tiers"] == ["lx-charts"]
+    assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
+    assert all(str(t["guid"]).startswith("online:lx:kg:") for t in payload["tracks"])
