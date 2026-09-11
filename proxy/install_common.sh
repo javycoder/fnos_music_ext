@@ -12,11 +12,26 @@ installation_lock() {
     fi
 }
 
+same_dir() {
+    # One checkout is reachable as /home/admin/... and /vol2/home/admin/... on
+    # fnOS: compare canonical paths so a symlinked spelling of the SAME directory
+    # is never mistaken for a foreign deployment (which would block install/restore).
+    local left right
+    left="$(readlink -f -- "${1:-}" 2>/dev/null || true)"
+    right="$(readlink -f -- "${2:-}" 2>/dev/null || true)"
+    [ -n "${left}" ] && [ "${left}" = "${right}" ]
+}
+
+unit_working_dir() {
+    # WorkingDirectory as recorded in a unit file (no systemd interaction needed).
+    sed -n 's/^[[:space:]]*WorkingDirectory=//p' "$1" 2>/dev/null | head -n1
+}
+
 check_proxy_unit_owner() {
     local file="/etc/systemd/system/fnmusic-ext.service" wd
     if [ -f "${file}" ]; then
         wd="$(systemctl show fnmusic-ext.service -p WorkingDirectory --value)" || return 1
-        if [ "${wd}" != "${BASE_DIR}" ]; then
+        if ! same_dir "${wd}" "${BASE_DIR}"; then
             log_err "代理 unit 属于其他目录；拒绝停止或覆盖。请先从原目录还原。"
             return 1
         fi
@@ -45,7 +60,7 @@ reclaim_container() {
     fi
     owner="$(run_docker container inspect "${name}" \
         --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
-    if [ "${owner}" != "${BASE_DIR}" ]; then
+    if ! same_dir "${owner}" "${BASE_DIR}"; then
         log_err "容器 ${name} 不属于当前目录；保留并拒绝接管。请先解决名称/端口冲突。"
         return 1
     fi
@@ -63,7 +78,7 @@ remove_owned_container() {
 owned_source_unit() {
     local unit="$1" file="/etc/systemd/system/${1}.service"
     [ -f "${file}" ] || return 1
-    grep -Fqx "WorkingDirectory=${BASE_DIR}/${unit#fnmusic-}-service" "${file}"
+    same_dir "$(unit_working_dir "${file}")" "${BASE_DIR}/${unit#fnmusic-}-service"
 }
 
 stop_owned_source_unit() {

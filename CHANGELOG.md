@@ -3,6 +3,36 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.3.1] - 2026-09-10
+
+### 修复
+
+- **修复接管中断后"装不上也还原不了"的死锁（严重）**：`takeover.py` 原先要求 socket 文件
+  必须在归属记录（`ownership.json`）中登记过才允许删除，且只允许删除 `stale` 状态的文件。
+  一旦上一次接管失败留下未登记的僵尸 socket 文件（官方 socket 已停放在
+  `trim_music_upstream.socket`，而 `trim_music.socket` 是一个无人监听的残留文件），
+  `publish` 与 `restore` 会同时以 `unrecorded/replaced socket; preserved` 失败并永久互锁。
+  现改为：对**可证明不可达**的 socket 文件（`connect()` 返回 `ECONNREFUSED`、同一 inode
+  连续两次观测一致）一律回收，并打印审计行；仍然拒绝删除任何存活（含代理自身）或身份不明
+  的 socket 文件。安装与还原在任何历史失败残留之后都可继续。
+- **修复 supervisor 回滚异常掩盖真实失败原因**：`supervise()` 的 `finally` 中执行回滚，
+  回滚自身的异常会覆盖原始异常，导致日志只显示 `unrecorded/replaced socket; preserved`，
+  真正的失败原因（例如拓扑冲突）被吞掉。现改为分别捕获并串行上报
+  `<原始原因>; rollback failed: <回滚原因>`，且正常停止（SIGTERM）时不再被误判为失败。
+- **修复归属记录不一致导致的死锁**：官方应用重启（PID/inode 变化）或代理崩溃后，
+  `remember`/`publish`/`restore` 原先会以"归属变更"直接失败。因两类角色均由内核身份
+  （`SO_PEERCRED` + `/proc/<pid>/exe`、`/_ext/livez` + peer PID）实证，记录仅作缓存，
+  现改为带 `[takeover] note:` 审计行地采纳新的存活身份，并在移动后校验终态。
+- **`restore-plan` 覆盖全部可恢复拓扑**：新增 `vacant-target-repair`（僵尸 target + 官方
+  upstream）与 `official-direct`（含 upstream 僵尸文件清理）两类计划；`restore()` 会清理
+  僵尸 upstream，并在确实不存在任何官方监听者时明确报错
+  `no official listener present; restart the official music app`，不再留下自相矛盾的布局。
+- **就绪窗口对齐**：supervisor 内部就绪判定由 30s 放宽到 55s，保持在 unit
+  `ExecStartPost` 的 65s 之内，慢启动不再被内部判定抢先回滚。
+- 回归测试同步更新：新增僵尸 target/upstream 回收、官方重启采纳、双活冲突下的
+  错误串行上报等用例；文档 `docs/installation-reliability.md` 补充"vacant socket 必回收"
+  契约说明。
+
 ## [1.3.0] - 2026-09-09
 
 ### 新增

@@ -117,17 +117,19 @@ def test_two_official_sockets_are_preserved(state, servers, tmp_path):
     assert before == [takeover.inode(p) for p in (state.target, state.upstream)]
 
 
-def test_replaced_stale_inode_not_deleted(state, servers):
+def test_replaced_stale_inode_is_reclaimed_and_restored(state, servers):
     servers(state.upstream, official=True)
     proxy = servers(state.target)
     state.remember()
     proxy.terminate(); proxy.wait(timeout=3)
     old = state.target.with_suffix('.old')
-    state.target.rename(old)  # hold old inode allocated
+    state.target.rename(old)  # hold the recorded inode allocated elsewhere
     s = socket.socket(socket.AF_UNIX); s.bind(str(state.target)); s.close()
-    with pytest.raises(takeover.Unsafe):
-        state.restore()
-    assert state.target.exists() and state.upstream.exists()
+    # The replacement is provably vacant: recovery must not deadlock on it.
+    state.restore()
+    assert takeover.snapshot(state.target)['kind'] == 'official'
+    assert not state.upstream.exists()
+    assert old.exists()
 
 
 def test_legacy_absent_target_official_upstream_recovers(state, servers):
@@ -137,12 +139,57 @@ def test_legacy_absent_target_official_upstream_recovers(state, servers):
     assert takeover.snapshot(state.target) == identity
 
 
-def test_legacy_dead_unrecorded_proxy_preserved(state, servers):
+def test_legacy_dead_unrecorded_target_is_repaired(state, servers):
     servers(state.upstream, official=True)
+    identity = takeover.snapshot(state.upstream)
     s = socket.socket(socket.AF_UNIX); s.bind(str(state.target)); s.close()
-    with pytest.raises(takeover.Unsafe):
+    assert takeover.snapshot(state.target)['kind'] == 'stale'
+    assert state.restore_plan() == 'vacant-target-repair'
+    state.restore()
+    assert takeover.snapshot(state.target) == identity
+    assert not state.upstream.exists()
+
+
+def test_publish_reclaims_dead_target_leftover(state, servers, tmp_path):
+    """An aborted takeover's leftover must never block the next installation."""
+    servers(state.upstream, official=True)
+    official = takeover.snapshot(state.upstream)
+    s = socket.socket(socket.AF_UNIX); s.bind(str(state.target)); s.close()
+    staged = tmp_path/'staged.sock'
+    servers(staged)
+    proxy = takeover.snapshot(staged)
+    state.publish(staged, proxy)
+    assert takeover.snapshot(state.target) == proxy
+    assert takeover.snapshot(state.upstream) == official
+
+
+def test_publish_reclaims_dead_upstream_leftover(state, servers, tmp_path):
+    servers(state.target, official=True)
+    original = takeover.snapshot(state.target)
+    s = socket.socket(socket.AF_UNIX); s.bind(str(state.upstream)); s.close()
+    staged = tmp_path/'staged.sock'
+    servers(staged)
+    state.publish(staged, takeover.snapshot(staged))
+    assert takeover.snapshot(state.upstream) == original
+
+
+def test_restore_clears_dead_upstream_leftover(state, servers):
+    servers(state.target, official=True)
+    original = takeover.snapshot(state.target)
+    s = socket.socket(socket.AF_UNIX); s.bind(str(state.upstream)); s.close()
+    state.restore()
+    assert takeover.snapshot(state.target) == original
+    assert not state.upstream.exists()
+
+
+def test_restore_reports_absent_official_and_leaves_no_record(state):
+    for path in (state.target, state.upstream):
+        s = socket.socket(socket.AF_UNIX); s.bind(str(path)); s.close()
+    with state.lock(): state.save({'proxy': {'inode': [0, 0]}})
+    with pytest.raises(takeover.Unsafe, match='no official listener present'):
         state.restore()
-    assert state.target.exists()
+    assert not state.target.exists() and not state.upstream.exists()
+    assert not (state.load().get('proxy') or state.load().get('official'))
 
 
 def test_symlink_is_not_socket(state, servers, tmp_path):
@@ -279,7 +326,11 @@ def test_foreign_legacy_listener_never_attributed(state, servers, monkeypatch):
         return subprocess.CompletedProcess(command, 0, stdout=f'{foreign.pid}\n', stderr='')
 
     monkeypatch.setattr(takeover.subprocess, 'run', fake_systemctl)
-    with pytest.raises(takeover.Unsafe, match='not the unit MainPID'):
+    # Which refusal fires depends on whether a live fnmusic-ext.service cgroup
+    # exists on the host: a missing cgroup -> "not the unit MainPID", an existing
+    # one whose procs exclude the peer -> "outside the deployed unit". Both mean
+    # the foreign listener is never attributed to this deployment.
+    with pytest.raises(takeover.Unsafe, match='not the unit MainPID|outside the deployed unit'):
         state.restore_plan()
     assert takeover.snapshot(state.target)['kind'] == 'unknown'
     assert not state.file.exists()
@@ -423,16 +474,53 @@ def health(): return {'ok':True, 'upstream':'ok'}
             supervisor.communicate(timeout=12)
 
 
-def test_official_process_restart_record_mismatch_preserved(state, servers, tmp_path):
+def test_official_restart_record_mismatch_is_adopted(state, servers, tmp_path):
+    """A restarted official app must not deadlock install or restore."""
     official = servers(state.upstream, official=True)
     state.remember()
     official.terminate(); official.wait(timeout=3)
     state.upstream.rename(tmp_path/'old.sock')
     servers(state.upstream, official=True)
-    before = takeover.snapshot(state.upstream)
-    with pytest.raises(takeover.Unsafe): state.remember()
-    with pytest.raises(takeover.Unsafe): state.restore()
-    assert takeover.snapshot(state.upstream) == before
+    restarted = takeover.snapshot(state.upstream)
+    assert restarted['kind'] == 'official'
+    state.remember()  # adopts the kernel-verified live identity
+    assert state.load()['official'] == restarted
+    state.restore()
+    assert takeover.snapshot(state.target) == restarted
+    assert not state.upstream.exists()
+
+
+def _fake_checkout(tmp_path):
+    """Minimal base directory the real supervisor can preflight and run."""
+    base = tmp_path/'checkout'; (base/'proxy').mkdir(parents=True)
+    (base/'.venv-proxy/bin').mkdir(parents=True)
+    (base/'.venv-proxy/bin/python').symlink_to(sys.executable)
+    (base/'proxy/recommend.py').write_text('')
+    (base/'proxy/app.py').write_text("""import os
+from fastapi import FastAPI
+app = FastAPI()
+@app.get('/_ext/livez')
+def livez(): return {'service':'fnmusic-ext', 'pid':os.getpid()}
+@app.get('/_ext/healthz')
+def health(): return {'ok':True, 'upstream':'ok'}
+""")
+    return base
+
+
+def test_supervisor_reports_primary_failure_and_rollback_failure(state, servers, tmp_path):
+    """A rollback must never hide why the takeover failed."""
+    servers(state.target, official=True)
+    servers(state.upstream, official=True)
+    base = _fake_checkout(tmp_path)
+    command = [sys.executable, str(BASE/'proxy/takeover.py'), 'run', '--base', str(base),
+               '--target', str(state.target), '--upstream', str(state.upstream), '--state-dir', str(state.directory)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert 'ambiguous/live socket topology; nothing removed' in result.stderr
+    assert 'rollback failed: official target plus occupied upstream' in result.stderr
+    # Both live listeners stay untouched when rollback also fails.
+    assert takeover.snapshot(state.target)['kind'] == 'official'
+    assert takeover.snapshot(state.upstream)['kind'] == 'official'
 
 
 def test_record_symlink_and_permissions_rejected(state, tmp_path):
@@ -509,6 +597,47 @@ printf '%s|%s|%s|%s' "$(id -u)" "$HOME" "$PIP_INDEX" "$FNMUSIC_CUSTOM_TEST"
     env.pop('FNMUSIC_INSTALL_LOCK_HELD', None)
     out = subprocess.check_output(['bash', str(script)], env=env, text=True)
     assert out == f'{os.getuid()}|{tmp_path}|custom-index|retained'
+
+
+def test_checkout_ownership_accepts_symlinked_spelling(tmp_path):
+    """The same checkout must never look foreign when reached via a symlink."""
+    checkout = tmp_path/'vol2'/'checkout'
+    (checkout/'musicdl-service').mkdir(parents=True)
+    link = tmp_path/'home'/'checkout'
+    link.parent.mkdir()
+    link.symlink_to(checkout)
+    other = tmp_path/'other'; other.mkdir()
+    unit = tmp_path/'fnmusic-ext.service'
+    unit.write_text(f'[Service]\nWorkingDirectory={checkout}\n')
+    source = tmp_path/'fnmusic-musicdl.service'
+    source.write_text(f'[Service]\nWorkingDirectory={checkout}/musicdl-service\n')
+    helper = tmp_path/'common.sh'
+    helper.write_text(
+        (BASE/'proxy/install_common.sh').read_text()
+        .replace('/etc/systemd/system/fnmusic-ext.service', str(unit))
+        .replace('systemctl show fnmusic-ext.service -p WorkingDirectory --value', f"printf '%s\\n' '{checkout}'")
+        .replace('/etc/systemd/system/${1}.service', str(source))
+    )
+    script = tmp_path/'check.sh'
+    script.write_text(f"""#!/bin/bash
+set -euo pipefail
+BASE_DIR='{link}'
+STUB_OWNER='{checkout}'
+log_err() {{ printf 'refused: %s\\n' "$*"; }}
+run_docker() {{ printf '%s\\n' "$STUB_OWNER"; }}
+source '{helper}'
+if check_proxy_unit_owner && owned_source_unit musicdl && reclaim_container fnmusic-musicdl; then
+    printf 'accepted\\n'
+else
+    printf 'refused\\n'
+fi
+STUB_OWNER='{other}'
+if reclaim_container fnmusic-musicdl; then printf 'foreign-accepted\\n'; else printf 'foreign-refused\\n'; fi
+""")
+    result = subprocess.run(['bash', str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert 'accepted' in result.stdout
+    assert 'foreign-refused' in result.stdout
 
 
 def test_socket_mutation_lock_serializes_processes(state):

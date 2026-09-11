@@ -64,23 +64,42 @@ application's known storage paths, not arbitrary future import side effects.
 
 ## Conservative recovery limits
 
-Unknown live sockets, symlinks/non-sockets, two official listeners, changed
-recorded ownership, and unrecorded dead sockets are preserved and cause failure.
-A legacy layout with an absent target and a positively identified official
-upstream can be restored. Older proxies without the `/_ext/livez` endpoint are
-correlated with the deployed unit BEFORE any stop: `restore-plan` matches the
-socket's kernel peer against the unit's MainPID (or cgroup membership),
-double-checks process start/executable and inode, and records the verified
-listener with the proxy role. If that attribution fails, restore.sh refuses
-before stopping anything, so a stop can no longer create an unrecoverable
-layout. A reboot loses `/run` records; dead unrecorded sockets are never
-guessed away.
-SIGKILL of the supervisor relies on systemd killing the remaining child and
-`ExecStopPost`; invoking the supervisor outside systemd does not provide that
-external crash handler. Cooperative locks cannot fully serialize an unrelated
-root process mutating the same paths. No-replace moves and repeated identity
-checks reduce races; do not concurrently restart the official application during
-installation or recovery.
+Unknown live sockets, symlinks/non-sockets and two official listeners are
+preserved and cause failure. What is never preserved is a **vacant** socket file:
+a stream `connect()` answered with `ECONNREFUSED`, observed twice on the same
+inode. Such a path accepts no listener, so it is an artifact of an aborted
+takeover and unlinking it cannot disconnect any client. Reclaiming it (with a
+`[takeover] note:` audit line) is what keeps installation and `restore.sh`
+available after any earlier failed run — refusing it made a leftover file block
+both directions permanently. Unrecorded but live sockets, sockets whose inode
+changes during the check, and non-socket files are still refused.
+
+A recorded ownership mismatch is no longer fatal either. Both recorded roles are
+kernel-verified live listeners, so the record is a cache: a restarted official
+app or a crashed proxy is adopted with a note, then the move is verified against
+the live identity. `restore()` also clears a vacant upstream, and reports
+`no official listener present; restart the official music app` when nothing is
+listening anywhere instead of leaving a contradictory layout.
+
+A legacy layout with an absent (or vacant) target and a positively identified
+official upstream can always be restored. Older proxies without the
+`/_ext/livez` endpoint are correlated with the deployed unit BEFORE any stop:
+`restore-plan` matches the socket's kernel peer against the unit's MainPID (or
+cgroup membership), double-checks process start/executable and inode, and records
+the verified listener with the proxy role. If that attribution fails, restore.sh
+refuses before stopping anything. `restore-plan` returns `official-direct`,
+`vacant-target-repair` or `proxy-recovery`, so a stop always has a verified exit.
+A reboot loses `/run` records; the loss is survivable because recovery no longer
+depends on the record.
+
+Rollback failures never hide the primary failure: the supervisor reports
+`<primary cause>; rollback failed: <reason>` so an operator sees both. SIGKILL of
+the supervisor relies on systemd killing the remaining child and `ExecStopPost`;
+invoking the supervisor outside systemd does not provide that external crash
+handler. Cooperative locks cannot fully serialize an unrelated root process
+mutating the same paths. No-replace moves and repeated identity checks reduce
+races; do not concurrently restart the official application during installation
+or recovery.
 
 On an ambiguous state, stop and investigate; do not manually remove socket paths
 based solely on a successful business request. Failed verification does not print
