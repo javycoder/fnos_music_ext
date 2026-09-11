@@ -28,6 +28,9 @@ MODE=""
 SOURCES_RAW=""
 NON_INTERACTIVE=0
 ENABLE_RECOMMEND=""
+# 仅显式 --disable-recommend 才清除 .env 中已保存的大模型配置；
+# 向导答 N / 未开启推荐一律保留既有密钥，避免重装后被迫重新填入。
+LLM_CLEAR=0
 LLM_BASE_URL=""
 LLM_API_KEY=""
 LLM_MODEL=""
@@ -60,7 +63,7 @@ usage() {
                          非交互缺省: musicdl
   --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
   --enable-recommend     开启每日推荐（需同时给 base-url 与 api-key）
-  --disable-recommend    明确关闭每日推荐
+  --disable-recommend    明确关闭每日推荐，并清除 .env 中已保存的 LLM 配置
   --llm-base-url URL     OpenAI 兼容 Base URL，例如 https://api.openai.com/v1
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
@@ -117,7 +120,7 @@ while [ $# -gt 0 ]; do
         --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
-        --disable-recommend) ENABLE_RECOMMEND="no"; shift ;;
+        --disable-recommend) ENABLE_RECOMMEND="no"; LLM_CLEAR=1; shift ;;
         --llm-base-url)
             [ $# -ge 2 ] || { log_err "--llm-base-url 需要 URL 参数"; exit 1; }
             LLM_BASE_URL="${2}"; shift 2 ;;
@@ -429,7 +432,7 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             echo
         fi
         if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
-            log_warn "未同时提供 Base URL 与 API Key，每日推荐将关闭。"
+            log_warn "未同时提供 Base URL 与 API Key，本次不开启推荐（.env 中已保存的 LLM 配置保持不变）。"
             ENABLE_RECOMMEND="no"
             LLM_BASE_URL=""
             LLM_API_KEY=""
@@ -528,11 +531,13 @@ ENV_DESIRED="$(mktemp)"
         echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
         echo "FNMUSIC_LLM_API_KEY='$(dotenv_escape "${LLM_API_KEY}")'"
         echo "FNMUSIC_LLM_MODEL='$(dotenv_escape "${LLM_MODEL}")'"
-    else
+    elif [ "${LLM_CLEAR}" -eq 1 ]; then
+        # 仅显式 --disable-recommend 才清除已保存的 LLM 配置
         echo "FNMUSIC_LLM_BASE_URL=''"
         echo "FNMUSIC_LLM_API_KEY=''"
         echo "FNMUSIC_LLM_MODEL=''"
     fi
+    # 其余情况不输出 LLM 键：env_merge 将原样保留 .env 中已保存的密钥
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
@@ -543,10 +548,11 @@ if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     [ -n "${LLM_BASE_URL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL"
     [ -n "${LLM_API_KEY}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_API_KEY"
     [ -n "${LLM_MODEL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_MODEL"
-else
-    # 关闭推荐时必须显式覆盖，否则 env_merge 会保留旧 Key
+elif [ "${LLM_CLEAR}" -eq 1 ]; then
+    # 显式关闭推荐：以空值覆盖，清除已保存的 LLM 配置
     ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL,FNMUSIC_LLM_API_KEY,FNMUSIC_LLM_MODEL"
 fi
+# 未开启也未显式关闭：不加入 ENV_EXPLICIT，env_merge 保留旧 Key
 
 if [ -f "${ENV_PATH}" ]; then
     PREV_VERSION="$(grep -E "^\s*(export\s+)?FNMUSIC_VERSION=" "${ENV_PATH}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"

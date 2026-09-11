@@ -87,8 +87,8 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | **权限与安全性** | 容器内无特权用户运行，隔离网络端口 | 独立 systemd 进程，仅监听本地回环网络 |
 | **数据落盘路径** | 项目根目录 `cache/`、`online_favorites/`、`musicbox-data/` | 项目根目录 `cache/`、`online_favorites/`、`musicbox-data/` |
 | **常规日常管理** | `docker logs -f fnmusic-musicdl`<br>`docker compose ps` | `journalctl -u fnmusic-musicdl -f`<br>`systemctl status fnmusic-musicbox` |
-| **一键恢复直连** | 执行 `./restore.sh`（秒级切回原生直连，保留音源与数据） | 执行 `./restore.sh`（秒级切回原生直连，保留音源与数据） |
-| **一键彻底卸载** | 执行 `./restore.sh --full`（自动停止并删除 Docker 容器） | 执行 `./restore.sh --full`（自动停止并注销 systemd 音源服务） |
+| **一键恢复直连** | 执行 `./restore.sh`（秒级切回原生直连；停止并删除音源容器，保留 .env 与数据） | 执行 `./restore.sh`（秒级切回原生直连；注销音源服务，保留 .env 与数据） |
+| **一键彻底卸载** | 执行 `./restore.sh --full`（额外删除 .env、网易云登录、缓存、收藏、历史与虚拟环境） | 执行 `./restore.sh --full`（同左） |
 
 ---
 
@@ -101,13 +101,16 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
    ./restore.sh
    ```
    * 会立即复位 `/var/run/trim_music.socket`，停用代理服务，秒级恢复官方原生直连；
-   * 音源服务与本地缓存数据完好保留，日后执行 `./extend.sh` 可秒级重新启用。
+   * 同时停止并删除音源容器/宿主机 unit（重新启用时 `install.sh` 或 `extend.sh` 会自动拉起）；
+   * `.env` 配置（含大模型 Key）与全部数据（网易云登录、缓存、在线收藏、播放历史）完好保留，
+     重装后无需重新填写任何配置。
 2. **彻底清理卸载**：
    ```bash
    ./restore.sh --full
    ```
-   * **在 Docker 模式下**：自动停止并删除 `fnmusic-musicdl` 与 `fnmusic-musicbox` 容器；
-   * **在 Host 模式下**：自动停止并禁用 `fnmusic-musicdl.service` 与 `fnmusic-musicbox.service`，移除 `/etc/systemd/system/fnmusic-ext.service`；
+   * 在默认还原动作之外，删除 `.env`（含历史备份）、`musicbox-data/`（网易云登录）、
+     `cache/`、`online_favorites/`、`play_history/`、`recommend_cache/` 与 `.venv-*` 虚拟环境；
+   * 仅保留代码与 git 仓库，用于彻底重置；Docker 镜像保留以便重装加速。
    * 真正做到系统级服务干净利索、彻底无残留。
 
 ---
@@ -154,10 +157,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 # 1. 启用扩展接管（包含全链路健康与流式验收，失败自动秒级回滚）
 ./extend.sh
 
-# 2. 还原官方原生直连（保留音源组件与本地缓存）
+# 2. 还原官方原生直连（停止并删除音源容器；保留 .env 与全部数据，重装免重配）
 ./restore.sh
 
-# 3. 深度彻底还原（同时停止并删除音源 Docker 容器或宿主机 systemd 音源服务）
+# 3. 深度彻底还原（额外删除 .env、网易云登录、缓存、收藏、历史，仅保留代码）
 ./restore.sh --full
 ```
 
