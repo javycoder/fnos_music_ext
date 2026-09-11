@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from netease_ext import batch_song_details, filter_playable_song_ids, song_lyric_pair
+from netease_ext import batch_song_details, check_is_logged_in, filter_playable_song_ids, song_lyric_pair
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
@@ -163,6 +163,63 @@ def album(album_id: int = Path(..., ge=1)):
 @app.get("/api/v1/playlist/{playlist_id}")
 def playlist(playlist_id: int = Path(..., ge=1)):
     return exec_musicbox(["playlist", "show", str(playlist_id), "--json"])
+
+
+def _cli_error_or_raise(exc: UpstreamException) -> Any:
+    """CLI 非零退出时，若 stderr 带结构化 JSON 错误（如 not_logged_in）原样透传。"""
+    try:
+        parsed = json.loads(exc.stderr or "")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(parsed, dict) and parsed.get("ok") is False:
+        return parsed
+    return None
+
+
+def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
+    """CLI 推荐输出 -> 批量详情 + 可播过滤（未登录剔除 VIP/试听片段）。"""
+    ids: list[int] = []
+    if isinstance(rows, list):
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            try:
+                sid = int(it.get("song_id") or it.get("id") or 0)
+            except (ValueError, TypeError):
+                sid = 0
+            if sid > 0:
+                ids.append(sid)
+    return batch_song_details(ids[:100])[:limit]
+
+
+@app.get("/api/v1/recommend/songs")
+def recommend_songs(limit: int = Query(30, ge=10, le=60)):
+    """网易每日推荐（已登录为个性化推荐；匿名设备返回平台通用推荐）。"""
+    try:
+        data = exec_musicbox(["recommend", "songs", "--limit", str(limit), "--json"])
+    except UpstreamException as exc:
+        parsed = _cli_error_or_raise(exc)
+        if parsed is not None:
+            return parsed
+        raise
+    rows = _playable_recommendation_rows(_extract_payload(data), limit)
+    return {"ok": True, "data": rows, "logged_in": check_is_logged_in()}
+
+
+@app.get("/api/v1/toplist")
+def toplist(index: int = Query(-1), limit: int = Query(60, ge=1, le=100)):
+    """网易榜单：不带 index 返回榜单列表；带 index 返回该榜单可播曲目。"""
+    if index < 0:
+        return exec_musicbox(["toplist", "--json"])
+    try:
+        data = exec_musicbox(["toplist", "--index", str(index), "--json"])
+    except UpstreamException as exc:
+        parsed = _cli_error_or_raise(exc)
+        if parsed is not None:
+            return parsed
+        raise
+    rows = _playable_recommendation_rows(_extract_payload(data), limit)
+    return {"ok": True, "data": rows, "index": index}
 
 
 @app.get("/api/v1/auth/status")

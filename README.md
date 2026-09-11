@@ -10,7 +10,7 @@
 - **智能边播边存（无感离线）**：在线听歌时后台自动缓存音频文件，再次播放直接走本地，省外网流量且秒开；
 - **全平台原生无感适配**：飞牛网页端、官方手机 App、车载端开箱即用，无需安装任何客户端第三方插件；
 - **多用户隔离收藏**：家庭多成员在 App 里点「红心」收藏在线歌曲，彼此数据独立隔离，与本地曲库完美融合；
-- **AI 每日专属推荐（可选）**：接入大模型，结合听歌习惯每日清晨自动生成专属「每日推荐」歌单；
+- **音源原生每日推荐**：默认采信音源原生推荐（网易每日推荐/榜单 + 洛雪免登录榜单，平台 ID 直连并复用可播性验证）；网易未启用时可选接入大模型兜底；
 - **多音源自由组合**：
   - [musicbox](https://github.com/darknessomi/musicbox)（网易云高品质解析，支持扫码登录 VIP/收藏）；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等平台聚合）；
@@ -56,7 +56,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   - `1 = musicbox`：网易云音源 [端口 8770]
   - `2 = musicdl`：酷我/咪咕等聚合音源 [端口 8768]
   - `3 = lxmusic`：洛雪免登录解析音源 [端口 8772]
-- **大模型每日推荐（选填）**：可选接入 OpenAI 兼容协议接口，每天自动生成专属推荐歌单。
+- **每日推荐**：默认使用音源原生推荐（网易云每日推荐/榜单 + 洛雪免登录榜单），无需额外配置；未启用网易音源时可选配置大模型作为兜底。
 
 > 💡 **进阶：非交互静默安装示例**（一行命令全自动完成并启用）：
 > ```bash
@@ -114,10 +114,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_ONLINE_SOURCES` | `MiguMusicClient,KuwoMusicClient` | musicdl 启用的子平台列表 |
 | `FNMUSIC_SEARCH_TIMEOUT` | `3.0` | 多音源并发搜索常规等待预算（秒） |
 | `FNMUSIC_SEARCH_CACHE_TTL`| `604800` | 搜索缓存上限；成功结果最长 5 分钟后刷新，空/部分失败结果使用更短时效 |
-| `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（兼容 OpenAI 规范） |
-| `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key |
-| `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 每日推荐生成模型 |
-| `FNMUSIC_VERSION` | `1.4.0` | 当前安装的版本号 |
+| `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（仅网易音源未启用时作为每日推荐兜底） |
+| `FNMUSIC_LLM_API_KEY` | *(空)* | 大模型 API Key（仅网易音源未启用时使用） |
+| `FNMUSIC_LLM_MODEL` | `gpt-4o-mini` | 兜底推荐生成模型 |
+| `FNMUSIC_VERSION` | `1.5.0` | 当前安装的版本号 |
 
 ---
 
@@ -145,7 +145,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 │  ├─ 本地接口透传 ──► 官方后端 (trim_music_upstream.sock)│
 │  ├─ 在线搜索聚合 ──► 并发调度 musicbox / musicdl / lx   │
 │  ├─ 边播边落盘   ──► 流式 Tee 写入本地 cache/ 目录      │
-│  └─ 每日推荐歌单 ──► 注入 LLM 生成的虚拟歌单           │
+│  └─ 每日推荐歌单 ──► 注入音源原生推荐/榜单（或 LLM 兜底） │
 └────────────────────────────────────────────────────────┘
 ```
 

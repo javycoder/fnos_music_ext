@@ -848,3 +848,151 @@ def test_track_lyric_kw_returns_empty():
         resp = client.get("/api/v1/track/lyric", params={"id": "lx:kw:228908"})
         assert resp.status_code == 200
         assert resp.json()["data"]["lyric"] == ""
+
+
+# ------------------------------------------------------------ 免登录榜单推荐 ---
+
+def test_kg_chart_songs_filters_and_requires_page_param():
+    """kg 榜单：必须带 page 参数；试听/免费片段标记剔除；免费曲直接收录（秒制时长）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "m.kugou.com/rank/info/" in str(request.url):
+            assert request.url.params.get("page") == "1", "rank/info 不带 page 时 songs.list 为空"
+            assert request.url.params.get("rankid") == "8888"
+            return httpx.Response(
+                200,
+                json={
+                    "songs": {
+                        "list": [
+                            {
+                                "hash": "KGFREE1",
+                                "sqhash": "KGSQ1",
+                                "320hash": "KGHQ1",
+                                "songname": "榜单歌A",
+                                "authors": [{"author_name": "歌手A", "author_id": 1}],
+                                "duration": 210,  # rank 接口 duration 单位为秒
+                                "pay_type": 0,
+                                "price": 0,
+                                "pkg_price": 0,
+                                "album_sizable_cover": "http://imge.kugou.com/stdmusic/{size}/a.jpg",
+                                "sqfilesize": 25000000,
+                            },
+                            {
+                                "hash": "KGTRIALTITLE",
+                                "songname": "榜单歌B(试听)",
+                                "authors": [{"author_name": "歌手B", "author_id": 2}],
+                                "duration": 200,
+                                "pay_type": 0,
+                            },
+                            {
+                                "hash": "KGFREEPART",
+                                "songname": "榜单歌C",
+                                "authors": [{"author_name": "歌手C", "author_id": 3}],
+                                "duration": 200,
+                                "pay_type": 0,
+                                "is_free_part": 1,
+                            },
+                        ]
+                    }
+                },
+            )
+        return httpx.Response(500)
+
+    lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with TestClient(lxapp.app) as client:
+        resp = client.get("/api/v1/recommend", params={"limit": 5, "sources": "kg"})
+    assert resp.status_code == 200
+    rj = resp.json()
+    assert rj["ok"] is True
+    assert rj["errors"] == {}
+    assert [it["id"] for it in rj["items"]] == ["lx:kg:KGFREE1"]
+    item = rj["items"][0]
+    assert item["title"] == "榜单歌A"
+    assert item["artist"] == "歌手A"
+    assert item["duration_s"] == 210
+    assert item["ext"] == "flac"  # 有 sqhash
+    assert "{size}" not in item["cover_url"]
+
+
+def test_wy_chart_songs_routes_vip_to_probe():
+    """wy 新歌速递：fee∈(0,8) 免费直收；付费曲转探活（探活失败即剔除）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "personalized/newsong" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "result": [
+                        {
+                            "id": 1,
+                            "song": {
+                                "id": "3425638996",
+                                "name": "新歌免费",
+                                "artists": [{"name": "歌手D", "id": 9}],
+                                "album": {"name": "专辑D", "picUrl": "http://img/d.jpg"},
+                                "duration": 211686,
+                                "fee": 0,
+                            },
+                        },
+                        {
+                            "id": 2,
+                            "song": {
+                                "id": "3425638997",
+                                "name": "新歌VIP",
+                                "artists": [{"name": "歌手E", "id": 10}],
+                                "album": {"name": "专辑E", "picUrl": ""},
+                                "duration": 200000,
+                                "fee": 1,
+                            },
+                        },
+                    ]
+                },
+            )
+        return httpx.Response(500)  # 探活链路全部失败
+
+    lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with TestClient(lxapp.app) as client:
+        resp = client.get("/api/v1/recommend", params={"limit": 5, "sources": "wy"})
+    assert resp.status_code == 200
+    rj = resp.json()
+    assert rj["ok"] is True
+    assert [it["id"] for it in rj["items"]] == ["lx:wy:3425638996"]
+    item = rj["items"][0]
+    assert item["title"] == "新歌免费"
+    assert item["duration_s"] == 211.686
+
+
+def test_recommend_aggregates_in_source_order_with_early_stop():
+    """聚合按源顺序凑满即停：kg 已满足 limit 时不再请求 wy。"""
+    calls = {"kg": 0, "wy": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "m.kugou.com/rank/info/" in url:
+            calls["kg"] += 1
+            rows = [
+                {
+                    "hash": f"KGN{i}",
+                    "songname": f"聚合歌{i}",
+                    "authors": [{"author_name": f"聚合歌手{i}", "author_id": i}],
+                    "duration": 200,
+                    "pay_type": 0,
+                }
+                for i in range(3)
+            ]
+            return httpx.Response(200, json={"songs": {"list": rows}})
+        if "personalized/newsong" in url:
+            calls["wy"] += 1
+            return httpx.Response(200, json={"result": []})
+        return httpx.Response(500)
+
+    lxapp.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with TestClient(lxapp.app) as client:
+        resp = client.get("/api/v1/recommend", params={"limit": 3, "sources": "kg,wy"})
+    assert resp.status_code == 200
+    rj = resp.json()
+    assert len(rj["items"]) == 3
+    assert calls == {"kg": 1, "wy": 0}  # kg 凑满后未再触达 wy

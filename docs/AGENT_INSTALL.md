@@ -48,14 +48,14 @@
     ./install.sh --non-interactive --mode docker --sources lxmusic --extend
   - Host 模式（宿主机独立 venv）：
     ./install.sh --non-interactive --mode host --sources musicdl,musicbox,lxmusic --extend
-  - 若用户提供了 OpenAI 兼容的 Base URL 与 API Key，则追加大模型参数（密钥仅写入 .env，禁止 echo 到日志）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic \
+  - 每日推荐默认采信音源原生推荐（无需额外参数）；若用户未启用网易音源并希望配置大模型兜底，可追加（密钥仅写入 .env，禁止 echo 到日志）：
+    ./install.sh --non-interactive --mode docker --sources musicdl,lxmusic \
       --enable-recommend \
       --llm-base-url '<用户提供的 URL>' \
       --llm-api-key '<用户提供的 KEY>' \
       --llm-model '<模型名称或 gpt-4o-mini>' \
       --extend
-    （注：若用户未提供密钥，切勿开启每日推荐）。
+    （注：平时每日推荐自动采信网易/洛雪原生推荐，仅网易音源未启用时大模型兜底生效）。
   - 若安装时未加 --extend，则需在安装完成后显式执行 ./extend.sh。
 
 步骤 4：端到端健康检查与验收

@@ -422,3 +422,113 @@ def test_upstream_timeout_maps_to_504(monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/status")
     assert resp.status_code == 504
+
+
+# ------------------------------------------------------------- 推荐路由 ---
+
+def _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False):
+    """替换 netease_ext 的 NEMbox API 实例：详情 + 可播性 URL + 登录态。"""
+    import netease_ext
+
+    class MockApi:
+        def songs_detail(self, ids):
+            return detail_rows
+
+        def songs_url(self, ids):
+            return url_rows
+
+        def get_account_info(self):
+            return ({"account": {"id": 1}, "profile": {"nickname": "u"}} if logged_in
+                    else {"account": None, "profile": None})
+
+    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+
+
+def test_recommend_songs_hydrates_and_filters_playable(monkeypatch):
+    import json as _json
+
+    cli_rows = [
+        {"song_id": 301, "song_name": "日推免费", "artist": "S1", "duration": 210},
+        {"song_id": 302, "song_name": "日推VIP", "artist": "S1", "duration": 210},
+        {"song_id": "bad", "song_name": "畸形id", "artist": "S1", "duration": 210},
+    ]
+
+    def mock_run(args, timeout=30.0):
+        assert args == ["recommend", "songs", "--limit", "30", "--json"]
+        return 0, _json.dumps({"ok": True, "data": cli_rows}), ""
+
+    detail_rows = [
+        {"id": 301, "name": "日推免费", "ar": [{"name": "S1"}], "al": {"name": "专辑", "picUrl": "http://img/1.jpg"}, "dt": 210000},
+        {"id": 302, "name": "日推VIP", "ar": [{"name": "S1"}], "al": {"name": "专辑", "picUrl": "http://img/2.jpg"}, "dt": 210000},
+    ]
+    url_rows = [
+        {"id": 301, "url": "http://audio.126.net/301.mp3", "code": 200, "fee": 0, "freeTrialInfo": None},
+        {"id": 302, "url": None, "code": 404, "fee": 1, "freeTrialInfo": None},
+    ]
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False)
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/songs")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["logged_in"] is False
+    # VIP 无 URL 曲目被可播过滤剔除；畸形 id 不进入批量详情
+    assert [row["song_id"] for row in data["data"]] == [301]
+    assert data["data"][0]["name"] == "日推免费"
+    assert data["data"][0]["duration_ms"] == 210000
+
+
+def test_recommend_songs_not_logged_in_passthrough(monkeypatch):
+    """CLI 退出码 3 + stderr JSON（not_logged_in）原样透传，供代理降级判断。"""
+    import json as _json
+
+    def mock_run(args, timeout=30.0):
+        return 3, "", _json.dumps(
+            {"ok": False, "error": {"type": "not_logged_in", "message": "未登录或登录已过期", "hint": "musicbox auth login"}}
+        )
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/recommend/songs")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["error"]["type"] == "not_logged_in"
+
+
+def test_toplist_without_index_returns_chart_list(monkeypatch):
+    import json as _json
+
+    def mock_run(args, timeout=30.0):
+        assert args == ["toplist", "--json"]
+        return 0, _json.dumps({"ok": True, "data": [{"index": 0, "name": "飙升榜", "id": 19723756}]}), ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/toplist")
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["name"] == "飙升榜"
+
+
+def test_toplist_with_index_hydrates_playable_songs(monkeypatch):
+    import json as _json
+
+    def mock_run(args, timeout=30.0):
+        assert args == ["toplist", "--index", "3", "--json"]
+        rows = [{"song_id": 501, "song_name": "热歌", "artist": "S", "duration": 200}]
+        return 0, _json.dumps({"ok": True, "data": rows}), ""
+
+    detail_rows = [{"id": 501, "name": "热歌", "ar": [{"name": "S"}], "al": {"name": "A", "picUrl": ""}, "dt": 200000}]
+    url_rows = [{"id": 501, "url": "http://audio.126.net/501.mp3", "code": 200, "fee": 0, "freeTrialInfo": None}]
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False)
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/toplist", params={"index": 3, "limit": 60})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["index"] == 3
+    assert [row["song_id"] for row in data["data"]] == [501]
