@@ -22,8 +22,8 @@
 
 ### 前置准备
 1. 已在 fnOS「应用中心」安装并启动官方 **【飞牛音乐】** 应用
-   （v1.4.0 已适配 2026-09-11 升级后的新版官方应用，含 authx 签名头透传；
-   旧版官方应用同样兼容）；
+   （v1.4.0 起已适配 2026-09-11 升级后的新版官方应用，旧版同样兼容；
+   官方应用升级后若扩展未生效，重新执行 `./extend.sh` 即可恢复）；
 2. 宿主机已安装基础依赖（Python 3 及 venv）：
    ```bash
    sudo apt-get update && sudo apt-get install -y python3 python3-venv git
