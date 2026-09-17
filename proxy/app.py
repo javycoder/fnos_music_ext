@@ -31,9 +31,11 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
+    from .cache_gc import purge_rolling
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    from cache_gc import purge_rolling  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -62,6 +64,11 @@ CONF = {
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
+    # 边听边存：默认开；保存路径空=自动探测飞牛共享曲库，不可用自动回退；
+    # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
+    "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
+    "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
@@ -608,10 +615,36 @@ def detect_library_dir() -> str:
     return CONF["cache_dir"]
 
 
+_TEE_SAVE_DIR_WARNED = False
+
+
+def tee_save_dir() -> str:
+    """边听边存落盘目录：配置路径可用则用，否则回退自动探测的曲库目录。"""
+    explicit = str(CONF.get("tee_save_dir") or "").strip()
+    if not explicit:
+        return detect_library_dir()
+    usable = False
+    try:
+        os.makedirs(explicit, exist_ok=True)
+        usable = os.path.isdir(explicit) and os.access(explicit, os.W_OK)
+    except Exception:
+        usable = False
+    if usable:
+        return explicit
+    global _TEE_SAVE_DIR_WARNED
+    if not _TEE_SAVE_DIR_WARNED:
+        _TEE_SAVE_DIR_WARNED = True
+        logger.warning(
+            "FNMUSIC_TEE_SAVE_DIR=%s 不可用（无法创建或不可写），边听边存回退到 %s",
+            explicit, detect_library_dir(),
+        )
+    return detect_library_dir()
+
+
 def iter_media_dirs() -> list[str]:
     dirs: list[str] = []
-    lib = detect_library_dir()
-    for d in (lib, CONF["cache_dir"]):
+    explicit = str(CONF.get("tee_save_dir") or "").strip()
+    for d in (([explicit] if explicit else []) + [detect_library_dir(), CONF["cache_dir"]]):
         if d and d not in dirs:
             dirs.append(d)
     return dirs
@@ -658,14 +691,23 @@ def promote_cache_hit(guid: str, audio_path: str) -> str:
     return audio_path
 
 
-def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str:
+def _is_rolling_cache_stem(path: str, guid: str) -> bool:
+    """是否为 cache 目录下该 guid 的滚动缓存产物（cache_safe_guid 命名）。"""
+    rolling = os.path.join(CONF["cache_dir"], cache_safe_guid(guid))
+    try:
+        return os.path.abspath(os.path.splitext(path)[0]) == os.path.abspath(rolling)
+    except Exception:
+        return False
+
+
+def library_media_path(guid: str, title: str, ext: str, artist: str = "", directory: str | None = None) -> str:
+    lib = directory or detect_library_dir()
     recalled = recalled_media_path(guid)
-    if recalled:
+    if recalled and not _is_rolling_cache_stem(recalled, guid):
         return recalled
     stem = recalled_media_stem(guid)
-    if stem:
+    if stem and not _is_rolling_cache_stem(stem, guid):
         return f"{stem}.{ext}"
-    lib = detect_library_dir()
     os.makedirs(lib, exist_ok=True)
     return unique_library_path(lib, library_basename(title, artist), ext)
 
@@ -1863,8 +1905,9 @@ def stream_tee_response(
         eof = False
         info_task = None
         try:
+            tee_enabled = bool(CONF.get("tee_save_enabled"))
             if should_cache(range_header) and full_resource:
-                directory = detect_library_dir()
+                directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
                 os.makedirs(directory, exist_ok=True)
                 part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
                 fp = open(part, "wb")
@@ -1894,14 +1937,24 @@ def stream_tee_response(
                     info = None
             if part and eof and written >= 1024 and (expected is None or written == expected):
                 title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
-                dest = library_media_path(guid, title, ext, artist=artist)
-                os.replace(part, dest)
-                remember_media_path(guid, dest)
-                adopt_library_perms(dest)
-                write_audio_tags(dest, title, artist, album)
+                if tee_enabled:
+                    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+                    os.replace(part, dest)
+                    remember_media_path(guid, dest)
+                    adopt_library_perms(dest)
+                    write_audio_tags(dest, title, artist, album)
+                else:
+                    # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
+                    dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
+                    os.replace(part, dest)
                 lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
                 if lyric.strip():
                     write_lyric_cache(guid, lyric, title, artist)
+                if not tee_enabled:
+                    try:
+                        purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
+                    except Exception as e:
+                        logger.warning("Rolling cache purge failed: %s", e)
         finally:
             if fp:
                 fp.close()

@@ -112,6 +112,9 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `LX_THIRD_PARTY` | `1` | lxmusic 第三方解析链路总开关（关闭后退化为官方免登录直连，kw/tx 无结果） |
 | `LX_RESOLVER_TIMEOUT` | `4.0` | 第三方链路单次解析超时（秒） |
 | `FNMUSIC_ONLINE_SOURCES` | `MiguMusicClient,KuwoMusicClient` | musicdl 启用的子平台列表 |
+| `FNMUSIC_TEE_SAVE_ENABLED` | `true` | 边听边存开关：完整试听在线歌后自动保存到本地曲库 |
+| `FNMUSIC_TEE_SAVE_DIR` | *(空)* | 边听边存保存路径；留空=自动探测飞牛共享曲库，配置后以配置为准，不可用自动回退 |
+| `FNMUSIC_TEE_CACHE_MAX` | `2` | 关闭边听边存时滚动保留的最新试听缓存条数（仅在关闭时生效；restore 会清理） |
 | `FNMUSIC_SEARCH_TIMEOUT` | `3.0` | 多音源并发搜索常规等待预算（秒） |
 | `FNMUSIC_SEARCH_CACHE_TTL`| `604800` | 搜索缓存上限；成功结果最长 5 分钟后刷新，空/部分失败结果使用更短时效 |
 | `FNMUSIC_LLM_BASE_URL` | *(空)* | 大模型 Base URL（仅网易音源未启用时作为每日推荐兜底） |
@@ -120,8 +123,6 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_VERSION` | `1.5.0` | 当前安装的版本号 |
 
 ---
-
-本次 CI、安装故障及多源链路的审查结论见 [可靠性审查报告](docs/RELIABILITY_REVIEW.md)，接管与恢复的安全边界见 [安装恢复说明](docs/installation-reliability.md)。
 
 ## 实现原理
 
@@ -154,6 +155,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   透传请求给官方服务获取本地歌曲，同时并发调度已启用的在线音源服务；按 `(title, artist)` 去重合并后渐进式返回。
 - **流媒体播放与边播边存 (`/music/api/v1/track/stream`)**：
   拦截带有在线标识（`online:...`）的 GUID，解析真实流直链后返回 `206 Partial Content` 流式切片，并在后台通过独立的 Tee Task 异步将音频写入本地缓存。下次播放直接命中本地文件，秒开且省外网流量。
+  边听边存由 `FNMUSIC_TEE_SAVE_ENABLED` 控制（默认开）：开启时完整试听的歌曲以
+  `歌手 - 歌名` 保存到 `FNMUSIC_TEE_SAVE_DIR`（留空自动探测飞牛共享曲库，配置不可用自动回退）；
+  关闭时仅滚动缓存最新 `FNMUSIC_TEE_CACHE_MAX` 首（默认 2）到 cache 目录供秒开重播，
+  不进曲库，`restore.sh` 还原时一并清理。
 - **多用户隔离在线收藏 (`/music/api/v1/favorite/track`)**：
   用户点击红心时，拦截请求按当前登录用户的 GUID 独立记录在本地 `online_favorites/`，获取收藏列表时与官方本地收藏自动合并展示。
 - **容灾与自动降级**：

@@ -513,6 +513,7 @@ def preflight(base, env):
         isolated = env.copy()
         for key in ('HOME', 'FNMUSIC_HOME', 'FNMUSIC_CACHE_DIR', 'FNMUSIC_FAV_DIR',
                     'FNMUSIC_PLAY_HISTORY_DIR', 'FNMUSIC_RECOMMEND_DIR', 'FNMUSIC_LIBRARY_DIR',
+                    'FNMUSIC_TEE_SAVE_DIR',
                     'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME'):
             isolated[key] = temp
         isolated['FNMUSIC_MUSIC_DB'] = temp + '/nonexistent.db'
