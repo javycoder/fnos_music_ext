@@ -106,15 +106,18 @@ def test_takeover_stale_proxy_restore_and_repeat(state, servers, tmp_path):
     assert official.poll() is None
 
 
-def test_two_official_sockets_are_preserved(state, servers, tmp_path):
-    servers(state.target, official=True)
-    servers(state.upstream, official=True)
+def test_publish_reclaims_live_upstream_orphan(state, servers, tmp_path):
+    """An orphaned pre-restart official listener must not block installation."""
+    official = servers(state.target, official=True)
+    original = takeover.snapshot(state.target)
+    orphan = servers(state.upstream, official=True)
     staged = tmp_path/'staged.sock'
     servers(staged)
-    before = [takeover.inode(p) for p in (state.target, state.upstream)]
-    with pytest.raises(takeover.Unsafe):
-        state.publish(staged, takeover.snapshot(staged))
-    assert before == [takeover.inode(p) for p in (state.target, state.upstream)]
+    state.publish(staged, takeover.snapshot(staged))
+    assert takeover.snapshot(state.target)['kind'] == 'proxy'
+    assert takeover.snapshot(state.upstream) == original
+    # Only the orphan's pathname is dropped; both official processes stay alive.
+    assert official.poll() is None and orphan.poll() is None
 
 
 def test_replaced_stale_inode_is_reclaimed_and_restored(state, servers):
@@ -148,6 +151,38 @@ def test_legacy_dead_unrecorded_target_is_repaired(state, servers):
     state.restore()
     assert takeover.snapshot(state.target) == identity
     assert not state.upstream.exists()
+
+
+def test_restore_plan_allows_official_target_with_live_orphan(state, servers, tmp_path):
+    servers(state.target, official=True)
+    servers(state.upstream, official=True)
+    assert state.restore_plan() == 'official-reclaim'
+    # Any live upstream occupant is reclaimed, not just a verified official orphan.
+    alt = takeover.State(tmp_path/'t2.sock', tmp_path/'u2.sock', tmp_path/'s2')
+    servers(alt.target, official=True)
+    servers(alt.upstream, 'unknown')
+    assert alt.restore_plan() == 'official-reclaim'
+
+
+def test_restore_reclaims_live_upstream_orphan(state, servers, capsys):
+    official = servers(state.target, official=True)
+    before = takeover.snapshot(state.target)
+    orphan = servers(state.upstream, official=True)
+    state.restore()
+    assert takeover.snapshot(state.target) == before
+    assert not state.upstream.exists()
+    # Only the pathname is dropped; the orphan keeps its inode and the
+    # official listener keeps serving clients on target.
+    assert official.poll() is None and orphan.poll() is None
+    assert state.load() == {'target': str(state.target), 'upstream': str(state.upstream)}
+    assert 'official socket already in place' in capsys.readouterr().out
+
+
+def test_restore_plan_still_refuses_unverified_target(state, servers):
+    servers(state.target, 'unknown')
+    servers(state.upstream, 'unknown')
+    with pytest.raises(takeover.Unsafe, match='upstream identity unverifiable'):
+        state.restore_plan()
 
 
 def test_publish_reclaims_dead_target_leftover(state, servers, tmp_path):
@@ -556,7 +591,7 @@ def health(): return {'ok':True, 'upstream':'ok'}
 
 def test_supervisor_reports_primary_failure_and_rollback_failure(state, servers, tmp_path):
     """A rollback must never hide why the takeover failed."""
-    servers(state.target, official=True)
+    servers(state.target, 'unknown')
     servers(state.upstream, official=True)
     base = _fake_checkout(tmp_path)
     command = [sys.executable, str(BASE/'proxy/takeover.py'), 'run', '--base', str(base),
@@ -564,9 +599,9 @@ def test_supervisor_reports_primary_failure_and_rollback_failure(state, servers,
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     assert result.returncode == 1
     assert 'ambiguous/live socket topology; nothing removed' in result.stderr
-    assert 'rollback failed: official target plus occupied upstream' in result.stderr
+    assert 'rollback failed: socket still live or indeterminate; preserved' in result.stderr
     # Both live listeners stay untouched when rollback also fails.
-    assert takeover.snapshot(state.target)['kind'] == 'official'
+    assert takeover.snapshot(state.target)['kind'] == 'unknown'
     assert takeover.snapshot(state.upstream)['kind'] == 'official'
 
 
