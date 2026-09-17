@@ -6,8 +6,9 @@ set -euo pipefail
 # 功能：停用代理服务并复位 trim-music 原生 Unix Socket
 # 语义：
 #   默认     还原官方直连 + 移除代理 unit + 停止并删除音源容器/宿主机 unit；
-#            .env 与全部数据（网易云登录、缓存、在线收藏、播放历史、推荐缓存）保留，
-#            重装后无需重新填写大模型 Key 等任何配置。
+#            .env 与全部用户数据（网易云登录、在线收藏、播放历史、推荐缓存）保留，
+#            重装后无需重新填写大模型 Key 等任何配置；
+#            在线试听滚动缓存（cache 目录中 online_* 音频/歌词）会被清理。
 #   --full   在默认动作之外执行工厂级清理：删除 .env（含历史备份）与上述全部数据
 #            目录及虚拟环境；仅保留代码与 git 仓库本身。
 # ==============================================================================
@@ -28,6 +29,7 @@ for arg in "$@"; do
         -h|--help)
             echo "用法: $0 [--full]"
             echo "  默认:   还原官方直连，删除代理 unit 与音源容器/宿主机 unit；保留 .env 与全部数据"
+            echo "         （仅清理在线试听滚动缓存 cache/online_*，不影响已存入曲库的歌曲）"
             echo "  --full: 额外删除 .env（含备份）、网易云登录、缓存、在线收藏、播放历史、"
             echo "          推荐缓存与虚拟环境（保留代码），用于彻底重置"
             exit 0
@@ -150,7 +152,15 @@ if [ "${FULL_RESTORE}" -eq 1 ]; then
     log_info "(--full 模式) 删除配置与数据（.env、网易云登录、缓存、收藏、历史、推荐缓存、虚拟环境）..."
     purge_local_state
 else
-    log_info "已保留 .env 与全部数据（网易云登录/缓存/在线收藏/播放历史/推荐缓存）。"
+    # 在线试听滚动缓存不属于用户数据，默认还原即清理；
+    # 指向曲库文件的 .ref 由 cache_gc 保留，重装后重播已入库歌曲仍可本地命中。
+    if GC_OUT="$(python3 "${BASE_DIR}/proxy/cache_gc.py" --base "${BASE_DIR}" 2>&1)"; then
+        log_info "${GC_OUT%%$'\n'*}"
+    else
+        log_warn "滚动缓存清理失败（不影响还原结果），可稍后手动执行:"
+        log_warn "  python3 ${BASE_DIR}/proxy/cache_gc.py --base ${BASE_DIR}"
+    fi
+    log_info "已保留 .env 与全部数据（网易云登录/在线收藏/播放历史/推荐缓存）。"
     log_info "如需彻底重置（删除全部配置与数据），请执行: $0 --full"
 fi
 
