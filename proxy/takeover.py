@@ -280,6 +280,35 @@ class State:
             if snapshot(path)['kind'] == 'stale':
                 self.remove_vacant(path, data.get(role))
 
+    def remove_live_upstream(self, target_snapshot, data):
+        """Reclaim a live upstream listener while the official app owns target.
+
+        The upstream path exists only because a takeover renamed the official
+        socket onto it; no client ever connects there. With target
+        kernel-verified as the official listener, a live upstream occupant is
+        an orphan from an aborted cycle (typically an official restart that
+        left the pre-restart process bound there); restarting the official app
+        never clears it, and preserving it deadlocks restore and install
+        forever. Unlinking is a deliberate exception to fail-closed
+        preservation: it drops only the pathname (the orphan keeps its inode,
+        and the printed pid lets an administrator retire the process).
+        """
+        current = snapshot(self.upstream)
+        if current['kind'] in ('absent', 'stale'):
+            return current
+        # The kernel-verified official listener must still be exactly the one
+        # that justified the reclaim at the moment of unlink.
+        if snapshot(self.target) != target_snapshot or inode(self.target) != target_snapshot['inode']:
+            raise Unsafe('official target changed before upstream reclaim')
+        if inode(self.upstream) != current['inode']:
+            raise Unsafe('upstream changed before reclaim')
+        peer = current.get('process')
+        pid = peer['pid'] if peer else '?'
+        os.unlink(self.upstream)
+        print('[takeover] note: reclaimed live upstream orphan (pid ' + str(pid) +
+              '); target is verified official', file=sys.stderr, flush=True)
+        return snapshot(self.upstream)
+
     def restore_plan(self, unit='fnmusic-ext.service'):
         """Pre-flight: may this stop be followed by verified recovery?
 
@@ -291,9 +320,12 @@ class State:
         """
         t, u = snapshot(self.target), snapshot(self.upstream)
         if t['kind'] == 'official':
-            if u['kind'] not in ('absent', 'stale'):
-                raise Unsafe('official target plus occupied upstream; refuse stop')
-            return 'official-direct'
+            if u['kind'] in ('absent', 'stale'):
+                return 'official-direct'
+            # The official app already serves clients on target; any live
+            # upstream listener is an unreachable orphan and gets reclaimed
+            # during restore instead of blocking it forever.
+            return 'official-reclaim'
         if u['kind'] == 'absent':
             raise Unsafe('no positively identified official upstream; refuse stop')
         if u['kind'] not in ('official', 'unknown'):
@@ -322,7 +354,7 @@ class State:
                 if u['kind'] == 'stale':
                     self.remove_vacant(self.upstream, data.get('official'))
                 elif u['kind'] != 'absent':
-                    raise Unsafe('official target plus occupied upstream; both preserved')
+                    self.remove_live_upstream(t, data)
                 self.save({})
                 print('[takeover] official socket already in place', flush=True)
                 return
@@ -361,6 +393,10 @@ class State:
             # Vacant leftovers never block publication, whichever path holds them.
             self.remove_vacant_any(data)
             t, u = snapshot(self.target), snapshot(self.upstream)
+            if t['kind'] == 'official' and u['kind'] not in ('absent', 'stale'):
+                # Orphaned pre-restart official listener: without this reclaim
+                # a live upstream file blocks re-installation forever.
+                u = self.remove_live_upstream(t, data)
             if t['kind'] == 'official' and u['kind'] == 'absent':
                 data['official'] = t
                 data['proxy'] = proxy
