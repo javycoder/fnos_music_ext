@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote
 from uuid import uuid4
@@ -1595,6 +1596,25 @@ async def lifespan(fastapi_app: FastAPI):
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def log_client_requests(request: Request, call_next):
+    """记录 /music/ 请求的方法/路径/状态/UA，供 App 端兼容问题远程定位。
+
+    不记 query（guid 无必要），UA 折叠空白并截断，配合 takeover 日志白名单的固定格式。
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/music/"):
+        ua = re.sub(r"\s+", " ", request.headers.get("user-agent") or "-")[:100]
+        logger.info(
+            "client request %s %s status=%s ua=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            ua,
+        )
+    return response
+
+
 @app.get("/_ext/livez")
 async def ext_livez():
     return {"ok": True, "service": "fnmusic-ext", "pid": os.getpid()}
@@ -2076,14 +2096,42 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             await owned.aclose()
 
 
-@app.get("/music/api/v1/track/stream")
-@app.get("/music/api/v1/track/stream/{subpath:path}")
-async def stream_track(request: Request):
-    guid = extract_guid(request)
+async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
+    """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源轻量试开一次即关。"""
+    if cached:
+        ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
+        full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
+        return Response(status_code=full.status_code, headers=dict(full.headers))
+    opened = None
+    try:
+        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=4.0)
+    except Exception:
+        opened = None
+    if not opened:
+        return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
+    resp, owned, _ext, _info, _chunks, _first = opened
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+    for key in ("content-type", "content-length", "content-range"):
+        val = resp.headers.get(key)
+        if val:
+            headers[key] = val
+    with anyio.CancelScope(shield=True):
+        await resp.aclose()
+        if owned:
+            await owned.aclose()
+    return Response(status_code=206 if "content-range" in headers else 200, headers=headers)
+
+
+@app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
+async def stream_track(request: Request, subpath: str = ""):
+    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
+    if request.method == "HEAD":
+        return await _stream_head_response(request, guid, cached, range_header)
     if cached:
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
@@ -2129,8 +2177,8 @@ async def stream_track(request: Request):
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
-@app.get("/music/api/v1/track/hls/{guid}/preset.m3u8")
-@app.get("/music/api/v1/track/hls/{guid}/{filename}")
+@app.api_route("/music/api/v1/track/hls/{guid}/preset.m3u8", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/track/hls/{guid}/{filename}", methods=["GET", "HEAD"])
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -2448,7 +2496,49 @@ def save_online_favorites(user_guid: str, items: list[dict]) -> bool:
         return False
 
 
-def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: int | None = None) -> dict:
+def official_track_template(official_list: list) -> dict | None:
+    """取一条真实官方 track 作结构模板：App 端反序列化严格，在线条目字段集需与官方对齐。"""
+    for item in official_list:
+        if isinstance(item, dict):
+            g = str(item.get("guid") or "")
+            if g and not is_online_guid(g):
+                return deepcopy(item)
+    return None
+
+
+def _snapshot_to_info(track: dict) -> dict:
+    """把落盘的 track 对象（最终形状）还原成 build_online_track 的 info 输入形状。
+
+    收藏/历史快照是最终 track 对象（artists 数组、duration 毫秒、audioSpec），
+    重建时需映射回 artist/duration_s/ext；info 形状的历史快照字段已对齐则原样保留。
+    """
+    info = dict(track)
+    artists = track.get("artists")
+    if not info.get("artist") and isinstance(artists, list) and artists and isinstance(artists[0], dict):
+        info["artist"] = artists[0].get("name") or ""
+    album = track.get("album")
+    if isinstance(album, dict):
+        info["album"] = album.get("name") or ""
+    if not info.get("duration_s") and track.get("duration"):
+        try:
+            info["duration_s"] = float(track["duration"]) / 1000.0
+        except (TypeError, ValueError):
+            pass
+    spec = track.get("audioSpec")
+    if isinstance(spec, dict):
+        info.setdefault("ext", spec.get("format") or "mp3")
+        info.setdefault("file_size", spec.get("size") or 0)
+        if not info.get("cover_url"):
+            info["cover_url"] = track.get("coverUrl") or track.get("cover_url") or ""
+    return info
+
+
+def build_favorite_track_obj(
+    guid: str,
+    info: dict | None = None,
+    created_at: int | None = None,
+    template: dict | None = None,
+) -> dict:
     raw_info = dict(info or {})
     raw_info.setdefault("id", song_id_from_online_guid(guid))
     raw_info.setdefault("source", source_from_online_guid(guid))
@@ -2457,7 +2547,8 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
     now = int(time.time())
     ts = created_at or now
 
-    artist_name = vo.get("artist") or ""
+    # App 端解析严格：artists 永不为空、album.name 永不为空，避免整列表被丢弃。
+    artist_name = vo.get("artist") or "未知艺术家"
     artists_list = [
         {
             "guid": f"{guid}:artist",
@@ -2466,9 +2557,13 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
             "createdAt": ts,
             "updatedAt": ts,
         }
-    ] if artist_name else []
+    ]
 
-    album_name = vo.get("albumName") or (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
+    album_name = (
+        vo.get("albumName")
+        or (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "")
+        or "未知专辑"
+    )
     album_obj = {
         "guid": f"{guid}:album",
         "name": album_name,
@@ -2482,7 +2577,7 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
 
     audio_spec = vo.get("audioSpec") or {}
 
-    return {
+    obj = {
         "guid": guid,
         "title": vo.get("title") or "",
         "duration": vo.get("duration") or 0,
@@ -2501,6 +2596,14 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
         "createdAt": ts,
         "updatedAt": ts,
     }
+
+    if isinstance(template, dict) and template:
+        # 以官方真实条目为结构底版，再用在线字段全覆盖：本侧未构造的官方字段
+        # 保留官方结构，避免 App 因缺字段整列表解析失败。
+        merged = deepcopy(template)
+        merged.update(obj)
+        return merged
+    return obj
 
 
 async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> tuple[bool, str, Response | None]:
@@ -2675,10 +2778,13 @@ async def favorite_track_list(request: Request):
     if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
-    # 探测当前用户身份
+    # 探测当前用户身份。官方列表已取回成功（同一组请求头），此时探测被拒
+    # （如 App 一次性票据已被首次请求消耗）不能回传鉴权错误导致整列表空白，
+    # 降级为仅返回官方列表。
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
-    if not is_authed and auth_resp is not None:
-        return auth_resp
+    if not is_authed:
+        logger.warning("favorite list degraded to official-only: auth probe rejected after official list ok")
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     # 成功获取官方列表，合并本地在线收藏
     data = upstream_json.get("data")
@@ -2707,19 +2813,21 @@ async def favorite_track_list(request: Request):
             logger.warning("Error reading online favorites for list for user %s: %s", user_guid, e)
             fav_items = []
 
+    # 官方真实条目作为结构模板：App 端解析严格，在线条目字段集需与官方对齐；
+    # 旧数据存的快照也统一重建，避免历史遗留形状继续下发。
+    template = official_track_template(official_list)
+
     # 按 createdAt 倒序
     fav_items_sorted = sorted(fav_items, key=lambda x: x.get("createdAt", 0), reverse=True)
     online_tracks = []
     for it in fav_items_sorted:
-        t = it.get("track")
-        if isinstance(t, dict):
-            # 确保关键属性为最新或格式完整
-            t["isFavorite"] = True
-            online_tracks.append(t)
-        else:
-            g = it.get("guid") or ""
-            if g:
-                online_tracks.append(build_favorite_track_obj(g, created_at=it.get("createdAt")))
+        g = str(it.get("guid") or "")
+        if not g:
+            continue
+        snapshot = it.get("track") if isinstance(it.get("track"), dict) else None
+        obj = build_favorite_track_obj(g, _snapshot_to_info(snapshot) if snapshot else None, created_at=it.get("createdAt"), template=template)
+        obj["isFavorite"] = True
+        online_tracks.append(obj)
 
     data["list"] = official_list + online_tracks
     data["total"] = official_total + len(online_tracks)
@@ -2969,7 +3077,7 @@ async def event_report(request: Request):
     except Exception:
         body = {}
     events = body.get("events") if isinstance(body, dict) else None
-    online_plays: list[str] = []
+    online_plays: list[tuple[str, dict]] = []
     other_events: list = []
     if isinstance(events, list):
         for ev in events:
@@ -2979,7 +3087,7 @@ async def event_report(request: Request):
             payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
             guid = str(payload.get("trackGUID") or payload.get("guid") or "")
             if et in ("track_play", "TrackPlay") and is_online_guid(guid):
-                online_plays.append(guid)
+                online_plays.append((guid, payload))
             else:
                 other_events.append(ev)
     else:
@@ -2989,22 +3097,44 @@ async def event_report(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if is_authed:
             async with _HISTORY_LOCK:
-                for guid in online_plays:
+                for guid, payload in online_plays:
                     info = stub_online_info(guid)
+                    title = str(info.get("title") or "").strip()
+                    artist = str(info.get("artist") or "").strip()
+                    album = ""
+                    duration_s = None
+                    if payload:
+                        # 客户端上报若带元数据（App/Web 字段名可能不同）优先采信，
+                        # 避免历史条目只有 guid、标题歌手为空。
+                        title = str(payload.get("title") or payload.get("name") or "").strip() or title
+                        artist = str(payload.get("artist") or payload.get("artistName") or "").strip() or artist
+                        album = str(payload.get("album") or payload.get("albumName") or "").strip()
+                        raw_dur = payload.get("duration") or payload.get("durationMs") or payload.get("duration_ms")
+                        try:
+                            dv = float(raw_dur)
+                            duration_s = dv / 1000.0 if dv > 10000 else dv
+                        except (TypeError, ValueError):
+                            duration_s = None
                     cached = find_cache_file(guid)
-                    title = str(info.get("title") or "")
-                    artist = str(info.get("artist") or "")
-                    if cached:
+                    if cached and (not title or not artist):
                         base = os.path.splitext(os.path.basename(cached))[0]
                         if " - " in base:
-                            artist, title = base.split(" - ", 1)
-                        elif not title:
-                            title = base
-                    dailyrec.record_online_play(
-                        user_guid,
-                        guid,
-                        {"guid": guid, "title": title, "artist": artist, "source": source_from_online_guid(guid)},
-                    )
+                            file_artist, file_title = base.split(" - ", 1)
+                            artist = artist or file_artist
+                            title = title or file_title
+                        else:
+                            title = title or base
+                    snapshot = {
+                        "guid": guid,
+                        "title": title,
+                        "artist": artist,
+                        "source": source_from_online_guid(guid),
+                    }
+                    if album:
+                        snapshot["album"] = album
+                    if duration_s:
+                        snapshot["duration_s"] = duration_s
+                    dailyrec.record_online_play(user_guid, guid, snapshot)
         elif auth_resp is not None and not other_events:
             return auth_resp
 
@@ -3039,9 +3169,12 @@ async def play_history_list(request: Request):
     if envelope.get("code") != 0:
         return JSONResponse(content=envelope, headers=headers)
 
+    # 官方历史已取回成功（同一组请求头），此时探测被拒不回传鉴权错误，
+    # 降级为仅返回官方列表（同收藏列表）。
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed:
-        return auth_resp or JSONResponse(content=envelope, headers=headers)
+        logger.warning("play history list degraded to official-only: auth probe rejected after official list ok")
+        return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
     if not isinstance(data, dict):
@@ -3054,13 +3187,14 @@ async def play_history_list(request: Request):
 
     async with _HISTORY_LOCK:
         online_items = dailyrec.load_online_play_history(user_guid)
+    template = official_track_template(official)
     online_tracks = []
     for it in reversed(online_items):
         guid = str(it.get("guid") or "")
         if not guid:
             continue
         track = it.get("track") if isinstance(it.get("track"), dict) else {}
-        obj = build_favorite_track_obj(guid, track, created_at=int(it.get("playedAt") or time.time()))
+        obj = build_favorite_track_obj(guid, _snapshot_to_info(track) if track else None, created_at=int(it.get("playedAt") or time.time()), template=template)
         obj["isFavorite"] = False
         online_tracks.append(obj)
 

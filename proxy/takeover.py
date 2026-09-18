@@ -486,7 +486,9 @@ _SAFE_OUTCOME = re.compile(
     r'(?:musicbox|lxmusic|musicdl)(?: /info| lyric fetch(?: in _online_info)?)? failed|'
     r'lyric sidecar fetch failed|resolve_(?:lx|netease)_url error|'
     r'llm call failed|daily recommend (?:peek|list inject|llm branch|fallback branch) failed|'
-    r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge))',
+    r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge)|'
+    r'(?:favorite|play history) list degraded to official-only|'
+    r'client request (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,180} status=[1-5][0-9]{2} ua=[ -~]{1,100})',
     re.I,
 )
 
