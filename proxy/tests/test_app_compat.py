@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
-from proxy.app import app, CONF, _SEARCH_CACHE
+from proxy.app import app, CONF, _SEARCH_CACHE, fake_official_guid
 from proxy.takeover import safe_child_log
 
 
@@ -146,7 +146,7 @@ def test_favorite_list_online_entry_matches_official_shape():
         rj = resp.json()
         assert rj["data"]["total"] == 2
         online_item = rj["data"]["list"][1]
-        assert online_item["guid"] == "online:migu:600908"
+        assert online_item["guid"] == fake_official_guid("online:migu:600908")
         assert online_item["title"] == "稻香"
         assert online_item["duration"] == 223000
         assert online_item["artists"][0]["name"] == "未知艺术家"
@@ -246,7 +246,7 @@ def test_event_report_captures_payload_metadata():
         listed = client.get("/music/api/v1/play-history/list")
         assert listed.status_code == 200
         rj = listed.json()
-        entry = next(it for it in rj["data"]["list"] if it.get("guid") == "online:kuwo:228908")
+        entry = next(it for it in rj["data"]["list"] if it.get("guid") == fake_official_guid("online:kuwo:228908"))
         assert entry["title"] == "晴天"
         assert entry["artists"][0]["name"] == "周杰伦"
         assert entry["duration"] == 269000
@@ -300,3 +300,167 @@ def test_safe_child_log_allows_request_log_and_degrade():
     assert safe_child_log(degrade_line) is not None
 
     assert safe_child_log("2026-09-18 10:00:00,123 [INFO] fnmusic_proxy: secret token abc123") is None
+
+
+def test_search_response_disguised_no_online_prefix():
+    """搜索结果零 online: 泄漏，假 id 可反解，coverId 带 track_ 前缀。"""
+    from proxy.app import resolve_real_guid
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/search/track":
+            return httpx.Response(200, json={"code": 0, "msg": "", "data": {"list": [], "total": 0}})
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-a"}})
+        return httpx.Response(500)
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            return httpx.Response(200, json={"ok": True, "items": [
+                {"id": "migu:600908", "title": "稻香", "artist": "周杰伦", "duration_s": 223, "download_url": "http://cdn/1.mp3"},
+            ]})
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/search/track", params={"keyword": "稻香", "page": 1, "size": 30})
+        assert resp.status_code == 200
+        import json as _json
+        raw = resp.text
+        assert "online:" not in raw
+        items = resp.json()["data"]["list"]
+        online_items = [it for it in items if resolve_real_guid(str(it.get("guid"))).startswith("online:")]
+        assert online_items, "merged online item missing"
+        it = online_items[0]
+        assert it["coverId"].startswith("track_")
+        assert resolve_real_guid(it["coverId"]).startswith("online:")
+        assert resolve_real_guid(str(it["guid"])) == "online:migu:600908"
+
+
+def test_registry_warm_rebuilds_after_restart(monkeypatch):
+    """注册表清空（模拟重启）后能从收藏/历史存储确定性重建反解映射。"""
+    from proxy.app import _FAKE_GUID_REVERSE, fake_official_guid, ensure_registry_warm, resolve_real_guid
+
+    _write_fav_file("user-warm", [{
+        "guid": "online:netease:111",
+        "createdAt": 1700000000,
+        "track": {"guid": "online:netease:111", "title": "歌", "duration": 1000},
+    }])
+    dailyrec.record_online_play("user-warm", "online:netease:222", {"title": "歌2"})
+
+    fake_fav = fake_official_guid("online:netease:111")
+    fake_hist = fake_official_guid("online:netease:222")
+    _FAKE_GUID_REVERSE.clear()
+    monkeypatch.setattr("proxy.app._REGISTRY_WARMED", False)
+
+    assert resolve_real_guid(fake_fav) == "online:netease:111"
+    assert resolve_real_guid("track_" + fake_hist) == "online:netease:222"
+    # 未知 32-hex 不受影响（视为官方 id 原样返回）
+    assert resolve_real_guid("0123456789abcdef0123456789abcdef") == "0123456789abcdef0123456789abcdef"
+
+
+def test_metadata_reflects_favorite_state():
+    """元数据 isFavorite 反映真实收藏状态（收藏后 App 红心刷新的数据源）。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-a"}})
+        return httpx.Response(500)
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/info":
+            return httpx.Response(200, json={"ok": True, "title": "稻香", "artist": "周杰伦"})
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    _write_fav_file("user-a", [{
+        "guid": "online:migu:600908",
+        "createdAt": 1700000000,
+        "track": {"guid": "online:migu:600908", "title": "稻香", "duration": 223000},
+    }])
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/metadata", params={"guid": "online:migu:600908"})
+        assert resp.status_code == 200
+        assert resp.json()["data"]["isFavorite"] is True
+        assert resp.json()["data"]["track"]["isFavorite"] is True
+        assert "online:" not in resp.text
+
+        resp2 = client.get("/music/api/v1/track/metadata", params={"guid": "online:migu:777"})
+        assert resp2.status_code == 200
+        assert resp2.json()["data"]["isFavorite"] is False
+
+
+def test_history_entry_carries_favorite_state():
+    """播放历史条目的 isFavorite 反映收藏状态。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/play-history/list":
+            return httpx.Response(200, json={"code": 0, "msg": "", "data": {"list": [], "total": 0}})
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-a"}})
+        return httpx.Response(500)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(500)), base_url="http://127.0.0.1:8768"
+    )
+    dailyrec.record_online_play("user-a", "online:migu:600908", {"title": "稻香", "artist": "周杰伦"})
+    dailyrec.record_online_play("user-a", "online:migu:777", {"title": "晴天"})
+    _write_fav_file("user-a", [{
+        "guid": "online:migu:600908",
+        "createdAt": 1700000000,
+        "track": {"guid": "online:migu:600908", "title": "稻香", "duration": 223000},
+    }])
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/play-history/list")
+        assert resp.status_code == 200
+        assert "online:" not in resp.text
+        by_title = {it.get("title"): it for it in resp.json()["data"]["list"]}
+        assert by_title["稻香"]["isFavorite"] is True
+        assert by_title["晴天"]["isFavorite"] is False
+
+
+def test_wait_official_target_boot_race(tmp_path):
+    """开机竞态：双路径无监听时等待官方出现；超时报错；有活监听立即返回。"""
+    import socket as _socket
+    from proxy.takeover import Unsafe, wait_official_target
+
+    class _StubState:
+        def __init__(self, target, upstream):
+            self.target = str(target)
+            self.upstream = str(upstream)
+
+    state = _StubState(tmp_path / "target.sock", tmp_path / "upstream.sock")
+
+    # 双 absent：短预算内应等待并最终 Unsafe
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+        wait_official_target(state, 0.4)
+        raised = False
+    except Unsafe:
+        raised = True
+    assert raised and _time.monotonic() - t0 >= 0.4
+
+    # target 上出现活监听：立即返回
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(tmp_path / "target.sock"))
+    srv.listen(1)
+    try:
+        t0 = _time.monotonic()
+        wait_official_target(state, 5.0)
+        assert _time.monotonic() - t0 < 2.0
+    finally:
+        srv.close()

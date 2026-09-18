@@ -9,7 +9,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
-from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value
+from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value, fake_official_guid
+from proxy.app import resolve_real_guid
 
 
 @pytest.fixture(autouse=True)
@@ -259,7 +260,7 @@ def test_playlist_list_injects_daily_when_enabled(monkeypatch, tmp_path):
         tj = tracks.json()
         assert tj["code"] == 0
         assert tj["data"]["total"] >= 1
-        assert tj["data"]["list"][0]["guid"].startswith("online:")
+        assert resolve_real_guid(tj["data"]["list"][0]["guid"]).startswith("online:")
         assert isinstance(tj["data"]["list"][0]["artists"], list)
 
         batch = client.get(f"/music/api/v1/playlist/batch-detail?guids={first['guid']},localpl")
@@ -301,7 +302,7 @@ def test_play_history_merges_online(tmp_path, monkeypatch):
         resp = client.get("/music/api/v1/play-history/list")
         body = resp.json()
         guids = [x["guid"] for x in body["data"]["list"]]
-        assert "online:migu:99" in guids
+        assert fake_official_guid("online:migu:99") in guids
         assert "local-track-1" in guids
         assert body["data"]["total"] == 2
 

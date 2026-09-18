@@ -569,6 +569,24 @@ def preflight(base, env):
                     raise Unsafe(f'preflight {stage}: exit={result.returncode}, exception={kind} (values suppressed)')
 
 
+def wait_official_target(state, budget):
+    """Boot race: the official app daemon may bind the target socket after us.
+
+    Neither path holding a live listener means 'official app not started yet'
+    (e.g. our unit raced ahead during system boot), not ambiguity: wait a
+    bounded time for the official daemon to appear before publishing, so the
+    takeover survives reboot without manual restart.
+    """
+    deadline = time.monotonic() + budget
+    while True:
+        t, u = snapshot(state.target), snapshot(state.upstream)
+        if not (t['kind'] in ('absent', 'stale') and u['kind'] in ('absent', 'stale')):
+            return
+        if time.monotonic() >= deadline:
+            raise Unsafe('official app socket did not appear within wait budget')
+        time.sleep(0.5)
+
+
 def supervise(state, base):
     env = environment(base)
     env['FNMUSIC_UPSTREAM_SOCK'] = str(state.upstream)
@@ -608,6 +626,7 @@ def supervise(state, base):
             if not proxy:
                 raise Unsafe('child failed liveness before takeover')
             changed = True  # publish may fail after moving official
+            wait_official_target(state, 40.0)
             state.publish(staged, proxy)
             # Readiness is the acceptance gate; keep this window below the unit's
             # 65s ExecStartPost deadline so a failure reports the real dependency

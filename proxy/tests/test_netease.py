@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy.app import (
+    fake_official_guid,
     app,
     CONF,
     _SEARCH_CACHE,
@@ -779,8 +780,8 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         list1 = data1["list"]
         assert len(list1) == 11
         assert list1[0]["guid"] == "local:101"
-        assert list1[1]["guid"] == "online:netease:mb_1"
-        assert list1[10]["guid"] == "online:netease:mb_10"
+        assert list1[1]["guid"] == fake_official_guid("online:netease:mb_1")
+        assert list1[10]["guid"] == fake_official_guid("online:netease:mb_10")
 
         # page=2 请求 (命中缓存，返回剩余 5 条在线：mb_11, mb_12, kw_1, kw_2, kw_3)
         resp2 = client.get("/music/api/v1/search/track?q=周杰伦&page=2&size=50")
@@ -789,11 +790,11 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         assert data2["total"] == 16
         list2 = data2["list"]
         assert len(list2) == 5
-        assert list2[0]["guid"] == "online:netease:mb_11"
-        assert list2[1]["guid"] == "online:netease:mb_12"
-        assert list2[2]["guid"] == "online:kuwo:kw_1"
-        assert list2[3]["guid"] == "online:kuwo:kw_2"
-        assert list2[4]["guid"] == "online:kuwo:kw_3"
+        assert list2[0]["guid"] == fake_official_guid("online:netease:mb_11")
+        assert list2[1]["guid"] == fake_official_guid("online:netease:mb_12")
+        assert list2[2]["guid"] == fake_official_guid("online:kuwo:kw_1")
+        assert list2[3]["guid"] == fake_official_guid("online:kuwo:kw_2")
+        assert list2[4]["guid"] == fake_official_guid("online:kuwo:kw_3")
 
         # 断言 page=2 与 page=1 的在线条目无重叠
         guids1 = {it["guid"] for it in list1[1:]}
@@ -1003,8 +1004,8 @@ def test_search_volume_and_default_limits(monkeypatch):
         assert "50" in captured_limits
         # online_limit = 30，第一页最多 30 条在线
         assert len(data["list"]) == 30
-        assert data["list"][0]["guid"] == "online:netease:mb_1"
-        assert data["list"][29]["guid"] == "online:netease:mb_30"
+        assert data["list"][0]["guid"] == fake_official_guid("online:netease:mb_1")
+        assert data["list"][29]["guid"] == fake_official_guid("online:netease:mb_30")
         # total 为 40
         assert data["total"] == 40
 
@@ -1141,7 +1142,7 @@ def test_search_musicdl_only_skips_musicbox(monkeypatch):
     with TestClient(app) as client:
         items = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()["data"]["list"]
         assert len(items) == 1
-        assert items[0]["guid"] == "online:migu:1"
+        assert items[0]["guid"] == fake_official_guid("online:migu:1")
         assert called["musicbox"] == 0
 
 
@@ -1190,5 +1191,5 @@ def test_search_musicbox_only_skips_musicdl(monkeypatch):
     with TestClient(app) as client:
         items = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()["data"]["list"]
         assert len(items) == 1
-        assert items[0]["guid"] == "online:netease:228908"
+        assert items[0]["guid"] == fake_official_guid("online:netease:228908")
         assert called["musicdl"] == 0

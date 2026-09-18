@@ -9,6 +9,7 @@ import pytest
 from starlette.requests import Request
 
 p = importlib.import_module("proxy.app")
+fake_official_guid = p.fake_official_guid
 
 
 @pytest.fixture
@@ -141,7 +142,7 @@ async def test_empty_or_error_first_completion_still_waits_for_song(monkeypatch,
     p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})), base_url="http://test")
     response = await p.search_track(request("q=Song"))
     import json
-    assert json.loads(response.body)["data"]["list"][0]["guid"] == "online:kuwo:1"
+    assert json.loads(response.body)["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:1")
     for entry in p._SEARCH_CACHE.values():
         await entry["task"]
 
@@ -330,8 +331,8 @@ async def test_late_priority_cannot_replace_published_first_page(monkeypatch):
     first = json.loads((await p.search_track(request("q=Song&page=1"))).body)
     second = json.loads((await p.search_track(request("q=Song&page=2"))).body)
     repeated = json.loads((await p.search_track(request("q=Song&page=1"))).body)
-    assert first["data"]["list"][0]["guid"] == "online:kuwo:1"
-    assert second["data"]["list"][0]["guid"] == "online:netease:2"
+    assert first["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:1")
+    assert second["data"]["list"][0]["guid"] == fake_official_guid("online:netease:2")
     assert repeated["data"]["list"] == first["data"]["list"]
     assert next(iter(p._SEARCH_CACHE.values()))["items"][0]["_alternatives"][0]["id"] == "netease:1"
 

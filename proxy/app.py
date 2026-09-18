@@ -1388,10 +1388,106 @@ def merge_online_tracks(
     return upstream_json
 
 
+_FAKE_GUID_REVERSE: dict[str, str] = {}
+_REGISTRY_WARMED = False
+_ONLINE_ID_RE = re.compile(r"online:[A-Za-z0-9_:\-]+")
+
+
+def fake_official_guid(real_guid: str) -> str:
+    """在线 guid 确定性映射为官方 32-hex 形态。
+
+    官方 App 会按 id 格式过滤条目（非 32-hex 的 online: 前缀 id 整条被丢弃，
+    症状为收藏/播放历史列表空白或条目消失），且要求收藏/播放回读的 guid 与
+    客户端自身持有的一致，因此所有下发的在线 id 必须统一伪装成官方形态。
+    """
+    fake = hashlib.md5(f"fnmusic-ext::{real_guid}".encode()).hexdigest()
+    _FAKE_GUID_REVERSE.setdefault(fake, real_guid)
+    return fake
+
+
+def _register_fakes_from_items(items) -> None:
+    for it in items or []:
+        if isinstance(it, dict):
+            g = str(it.get("guid") or "")
+            if is_online_guid(g):
+                fake_official_guid(g)
+
+
+def ensure_registry_warm() -> None:
+    """从收藏/历史存储重建 fake→real 映射（假 id 是确定性 md5，可完整重建）。
+
+    服务重启后内存注册表为空，而客户端仍持有重启前学到的假 id；此时上报的
+    播放/收藏事件若反解失败会被当作官方事件透传而丢失。收藏与历史存储里
+    出现过的 guid 恰好覆盖客户端会回传的全部假 id。
+    """
+    global _REGISTRY_WARMED
+    if _REGISTRY_WARMED:
+        return
+    _REGISTRY_WARMED = True
+    for directory in (CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites"),
+                      dailyrec.play_history_dir()):
+        try:
+            if not os.path.isdir(directory):
+                continue
+            for name in os.listdir(directory):
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(directory, name), "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    _register_fakes_from_items(data.get("items") if isinstance(data, dict) else data)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+
+def resolve_real_guid(candidate: str) -> str:
+    if not candidate:
+        return candidate
+    if candidate in _FAKE_GUID_REVERSE:
+        return _FAKE_GUID_REVERSE[candidate]
+    if candidate.startswith("track_") and len(candidate) > 6:
+        stripped = candidate[6:]
+        if stripped in _FAKE_GUID_REVERSE:
+            return _FAKE_GUID_REVERSE[stripped]
+    if re.fullmatch(r"[0-9a-f]{32}", candidate or ""):
+        ensure_registry_warm()
+        if candidate in _FAKE_GUID_REVERSE:
+            return _FAKE_GUID_REVERSE[candidate]
+    return candidate
+
+
+def disguise_client_json(obj):
+    """递归把客户端可见数据里的 online: 前缀 id 全部替换为官方 32-hex 形态。
+
+    所有下发出口（搜索/元数据/歌词/收藏/历史/每日推荐曲目）统一伪装；
+    入口（extract_guid/create/delete/event）经 resolve_real_guid 反解回真实 guid。
+    coverId 按官方惯例带 track_ 前缀；字符串内嵌的 guid（如 audioSpec.path）
+    一并替换。纯内存变换，不落盘、不触碰官方库，restore 后自然消失。
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, str) and v.startswith("online:"):
+                if k in ("coverId", "cover_id"):
+                    out[k] = "track_" + fake_official_guid(v)
+                else:
+                    out[k] = fake_official_guid(v)
+            else:
+                out[k] = disguise_client_json(v)
+        return out
+    if isinstance(obj, list):
+        return [disguise_client_json(x) for x in obj]
+    if isinstance(obj, str):
+        return _ONLINE_ID_RE.sub(lambda m: fake_official_guid(m.group(0)), obj)
+    return obj
+
+
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
     if path_guid:
-        return path_guid
-    return (
+        return resolve_real_guid(path_guid)
+    return resolve_real_guid(
         request.query_params.get("guid")
         or request.query_params.get("trackGUID")
         or request.query_params.get("trackGuid")
@@ -1411,14 +1507,14 @@ async def extract_guid_from_body(request: Request) -> str:
     except Exception:
         return ""
     if isinstance(body, dict):
-        return str(
+        return resolve_real_guid(str(
             body.get("guid")
             or body.get("trackGUID")
             or body.get("trackGuid")
             or body.get("id")
             or body.get("trackId")
             or ""
-        )
+        ))
     return ""
 
 
@@ -1754,7 +1850,12 @@ async def search_track(request: Request):
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     if isinstance(original_total, int):
         merged["data"]["total"] = original_total + total_online
-    return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
+    fav_set = await _online_favorite_set(request)
+    if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
+        for it in merged["data"]["list"]:
+            if isinstance(it, dict) and str(it.get("guid") or "") in fav_set:
+                it["isFavorite"] = True
+    return JSONResponse(content=disguise_client_json(merged), status_code=upstream_resp.status_code, headers=resp_headers)
 
 
 async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
@@ -2180,6 +2281,7 @@ async def stream_track(request: Request, subpath: str = ""):
 @app.api_route("/music/api/v1/track/hls/{guid}/preset.m3u8", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/hls/{guid}/{filename}", methods=["GET", "HEAD"])
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
+    guid = resolve_real_guid(guid)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -2373,7 +2475,7 @@ async def lyric_list(request: Request, subpath: str = ""):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     lyric_text = await resolve_online_lyric(request, guid)
-    return JSONResponse(content=build_lyric_list_payload(guid, lyric_text))
+    return JSONResponse(content=disguise_client_json(build_lyric_list_payload(guid, lyric_text)))
 
 
 @app.get("/music/api/v1/track/lyrics")
@@ -2388,7 +2490,7 @@ async def track_lyrics(request: Request, subpath: str = ""):
     if lyric_text:
         res = {"code": 0, "msg": "ok", "data": {"guid": guid, "lyric": lyric_text}}
         set_by_path(res, CONF["lyric_field"], lyric_text)
-        return JSONResponse(content=res)
+        return JSONResponse(content=disguise_client_json(res))
     return empty_ok()
 
 
@@ -2411,7 +2513,13 @@ async def track_metadata(request: Request, subpath: str = ""):
             title=str(data.get("title") or ""),
             artist=str(data.get("artist") or ""),
         )
-    return JSONResponse(content=build_metadata_payload(guid, data))
+    payload = build_metadata_payload(guid, data)
+    if guid in await _online_favorite_set(request):
+        if isinstance(payload.get("data"), dict):
+            payload["data"]["isFavorite"] = True
+            if isinstance(payload["data"].get("track"), dict):
+                payload["data"]["track"]["isFavorite"] = True
+    return JSONResponse(content=disguise_client_json(payload))
 
 
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
@@ -2548,12 +2656,13 @@ def build_favorite_track_obj(
     ts = created_at or now
 
     # App 端解析严格：artists 永不为空、album.name 永不为空，避免整列表被丢弃。
+    # 官方习惯：artist.coverId 为 null（无独立歌手封面），不能填歌曲 guid。
     artist_name = vo.get("artist") or "未知艺术家"
     artists_list = [
         {
             "guid": f"{guid}:artist",
             "name": artist_name,
-            "coverId": guid,
+            "coverId": None,
             "createdAt": ts,
             "updatedAt": ts,
         }
@@ -2564,13 +2673,13 @@ def build_favorite_track_obj(
         or (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "")
         or "未知专辑"
     )
+    # 官方 album 对象没有 artists 键；releaseDate/barcode 缺省为 null 而非 0/""
     album_obj = {
         "guid": f"{guid}:album",
         "name": album_name,
-        "artists": artists_list,
         "coverId": guid,
-        "releaseDate": 0,
-        "barcode": "",
+        "releaseDate": None,
+        "barcode": None,
         "createdAt": ts,
         "updatedAt": ts,
     }
@@ -2589,10 +2698,10 @@ def build_favorite_track_obj(
         "audioSpec": audio_spec,
         "accessStatus": 0,
         "coverId": guid,
-        "year": 0,
-        "discNo": 1,
-        "trackNo": 1,
-        "isrc": "",
+        "year": None,
+        "discNo": None,
+        "trackNo": None,
+        "isrc": None,
         "createdAt": ts,
         "updatedAt": ts,
     }
@@ -2652,6 +2761,19 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
         return True, "shared", None
 
 
+async def _online_favorite_set(request: Request) -> set[str]:
+    """当前用户在线收藏 guid 集合（探测失败回退 shared/空集，绝不抛错）。"""
+    try:
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, _resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed:
+            return set()
+        async with _FAV_LOCK:
+            return {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+    except Exception:
+        return set()
+
+
 @app.post("/music/api/v1/favorite-track/create")
 async def favorite_track_create(request: Request):
     upstream_client = get_upstream_client(request.app)
@@ -2662,7 +2784,7 @@ async def favorite_track_create(request: Request):
 
     guid = ""
     if isinstance(body, dict):
-        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+        guid = resolve_real_guid(str(body.get("trackGUID") or body.get("guid") or "").strip())
 
     if not is_online_guid(guid):
         return await forward_to_upstream(request, upstream_client)
@@ -2725,7 +2847,7 @@ async def favorite_track_delete(request: Request):
 
     guid = ""
     if isinstance(body, dict):
-        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+        guid = resolve_real_guid(str(body.get("trackGUID") or body.get("guid") or "").strip())
 
     if not is_online_guid(guid):
         return await forward_to_upstream(request, upstream_client)
@@ -2827,7 +2949,7 @@ async def favorite_track_list(request: Request):
         snapshot = it.get("track") if isinstance(it.get("track"), dict) else None
         obj = build_favorite_track_obj(g, _snapshot_to_info(snapshot) if snapshot else None, created_at=it.get("createdAt"), template=template)
         obj["isFavorite"] = True
-        online_tracks.append(obj)
+        online_tracks.append(disguise_client_json(obj))
 
     data["list"] = official_list + online_tracks
     data["total"] = official_total + len(online_tracks)
@@ -3060,11 +3182,11 @@ async def playlist_track_list(request: Request):
     start = (page - 1) * size
     page_tracks = tracks[start:start + size] if size != -1 else tracks
     return JSONResponse(
-        content={
+        content=disguise_client_json({
             "code": 0,
             "msg": "ok",
             "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
-        }
+        })
     )
 
 
@@ -3085,7 +3207,7 @@ async def event_report(request: Request):
                 continue
             et = str(ev.get("eventType") or ev.get("type") or "")
             payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-            guid = str(payload.get("trackGUID") or payload.get("guid") or "")
+            guid = resolve_real_guid(str(payload.get("trackGUID") or payload.get("guid") or ""))
             if et in ("track_play", "TrackPlay") and is_online_guid(guid):
                 online_plays.append((guid, payload))
             else:
@@ -3115,6 +3237,18 @@ async def event_report(request: Request):
                             duration_s = dv / 1000.0 if dv > 10000 else dv
                         except (TypeError, ValueError):
                             duration_s = None
+                    if not title or not artist or not album:
+                        # 事件不带元数据时从内存搜索会话补齐（播放时会话必在）
+                        retained, _entry = _retained_track(request, guid)
+                        if retained:
+                            title = title or str(retained.get("title") or "")
+                            artist = artist or str(retained.get("artist") or "")
+                            album = album or str(retained.get("album") or "")
+                            if not duration_s:
+                                try:
+                                    duration_s = float(retained.get("duration_s") or 0) or None
+                                except (TypeError, ValueError):
+                                    duration_s = None
                     cached = find_cache_file(guid)
                     if cached and (not title or not artist):
                         base = os.path.splitext(os.path.basename(cached))[0]
@@ -3187,6 +3321,7 @@ async def play_history_list(request: Request):
 
     async with _HISTORY_LOCK:
         online_items = dailyrec.load_online_play_history(user_guid)
+    fav_set = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
     template = official_track_template(official)
     online_tracks = []
     for it in reversed(online_items):
@@ -3194,9 +3329,22 @@ async def play_history_list(request: Request):
         if not guid:
             continue
         track = it.get("track") if isinstance(it.get("track"), dict) else {}
-        obj = build_favorite_track_obj(guid, _snapshot_to_info(track) if track else None, created_at=int(it.get("playedAt") or time.time()), template=template)
-        obj["isFavorite"] = False
-        online_tracks.append(obj)
+        info = _snapshot_to_info(track) if track else None
+        if not (info or {}).get("title"):
+            # 历史快照可能没带元数据：从内存搜索会话补齐（无网络开销）
+            retained, _entry = _retained_track(request, guid)
+            if retained:
+                info = {
+                    **(info or {}),
+                    "title": retained.get("title") or "",
+                    "artist": retained.get("artist") or "",
+                    "album": retained.get("album") or "",
+                    "duration_s": retained.get("duration_s") or 0,
+                    "ext": retained.get("ext") or "",
+                }
+        obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
+        obj["isFavorite"] = guid in fav_set
+        online_tracks.append(disguise_client_json(obj))
 
     seen = {str(x.get("guid")) for x in official if isinstance(x, dict)}
     merged_online = [t for t in online_tracks if t.get("guid") not in seen]

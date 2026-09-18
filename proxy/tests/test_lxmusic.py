@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy.app import (
+    fake_official_guid,
     app,
     CONF,
     _SEARCH_CACHE,
@@ -13,6 +14,7 @@ from proxy.app import (
     resolve_lx_url,
     get_version,
     is_playable_online_track,
+    resolve_real_guid,
 )
 
 
@@ -337,7 +339,7 @@ def test_search_merge_lx_items():
         # 上游本地曲库条目保留
         assert "local:101" in guid_set
         # lx 条目合并进列表（与上游 (title, artist) 重复的 kg 条目被去重，Live 版保留）
-        assert "online:lx:wy:186016" in guid_set
+        assert fake_official_guid("online:lx:wy:186016") in guid_set
 
 
 # =========================================================================
@@ -444,7 +446,7 @@ def test_lyric_list_from_lxmusic():
         resp2 = client.get("/music/api/v1/track/metadata?guid=online:lx:kg:ABCDEF1234567890")
         assert resp2.status_code == 200
         track = resp2.json()["data"]["track"]
-        assert track["guid"] == "online:lx:kg:ABCDEF1234567890"
+        assert track["guid"] == fake_official_guid("online:lx:kg:ABCDEF1234567890")
         assert track["title"] == "晴天"
         assert track["audioSpec"]["format"] == "flac"
 
@@ -488,5 +490,5 @@ def test_search_without_netease_merges_lx_and_musicdl(monkeypatch):
         assert body.get("code") == 0
         guids = [str(x.get("guid")) for x in (body.get("data") or {}).get("list") or []]
         assert "local-1" in guids
-        assert any(g.startswith("online:lx:") for g in guids)
-        assert any("migu" in g for g in guids)
+        assert any(resolve_real_guid(g).startswith("online:lx:") for g in guids)
+        assert any("migu" in resolve_real_guid(g) for g in guids)
