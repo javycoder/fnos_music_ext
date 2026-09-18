@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from proxy.app import (
+    fake_official_guid,
     app,
     CONF,
     _SEARCH_CACHE,
@@ -18,7 +19,7 @@ from proxy.app import (
 def _assert_playback_metadata_shape(data: dict, guid: str) -> None:
     """飞牛 _h()：data.track.genres.join / album 对象 / artists 列表，缺一即跳过播放。"""
     track = data["track"]
-    assert track["guid"] == guid
+    assert track["guid"] in (guid, fake_official_guid(guid))
     assert isinstance(track["artists"], list)
     assert isinstance(track["genres"], list)
     " / ".join(track["genres"])
@@ -183,7 +184,7 @@ def test_search_track_merge_success():
         assert items[0]["guid"] == "local:101"
         assert items[0]["title"] == "夜曲"
         # 在线条目合并追加且格式正确
-        assert items[1]["guid"] == "online:netease:228908"
+        assert items[1]["guid"] == fake_official_guid("online:netease:228908")
         assert items[1]["title"] == "晴天"
         assert items[1]["artist"] == "周杰伦"
         assert items[1]["albumName"] == "叶惠美" and items[1]["album"]["name"] == "叶惠美"
@@ -242,7 +243,7 @@ def test_search_track_merge_with_q_param():
         assert resp.status_code == 200
         items = resp.json()["data"]["list"]
         assert len(items) == 1
-        assert items[0]["guid"] == "online:netease:1"
+        assert items[0]["guid"] == fake_official_guid("online:netease:1")
 
 
 def test_search_track_preserves_lossless_and_common_formats():
@@ -314,14 +315,14 @@ def test_search_track_preserves_lossless_and_common_formats():
         items = resp.json()["data"]["list"]
         assert resp.json()["data"]["total"] == 3
         by_guid = {it["guid"]: it for it in items}
-        flac = by_guid["online:netease:flac1"]
+        flac = by_guid[fake_official_guid("online:netease:flac1")]
         assert flac["format"] == "flac"
         assert flac["audioSpec"]["format"] == "flac"
         assert flac["audioSpec"]["path"].endswith(".flac")
-        assert flac["coverId"] == "online:netease:flac1"
-        assert by_guid["online:migu:m4a1"]["format"] == "m4a"
-        assert by_guid["online:kuwo:wav1"]["format"] == "wav"
-        assert by_guid["online:kuwo:wav1"]["audioSpec"]["bitDepth"] == 16
+        assert flac["coverId"] == "track_" + fake_official_guid("online:netease:flac1")
+        assert by_guid[fake_official_guid("online:migu:m4a1")]["format"] == "m4a"
+        assert by_guid[fake_official_guid("online:kuwo:wav1")]["format"] == "wav"
+        assert by_guid[fake_official_guid("online:kuwo:wav1")]["audioSpec"]["bitDepth"] == 16
 
 
 def test_search_track_merges_when_upstream_data_null_list_missing():
@@ -364,7 +365,7 @@ def test_search_track_merges_when_upstream_data_null_list_missing():
         resp = client.get("/music/api/v1/search/track?q=不再犹豫")
         items = resp.json()["data"]["list"]
         assert len(items) == 1
-        assert items[0]["guid"] == "online:netease:1"
+        assert items[0]["guid"] == fake_official_guid("online:netease:1")
         assert items[0]["format"] == "flac"
 
 
@@ -537,7 +538,7 @@ def test_search_track_deduplication():
         items = resp.json()["data"]["list"]
         assert len(items) == 2
         assert items[0]["guid"] == "local:101"
-        assert items[1]["guid"] == "online:netease:228909"
+        assert items[1]["guid"] == fake_official_guid("online:netease:228909")
         assert items[1]["title"] == "晴天 (Live)"
 
 
@@ -828,7 +829,7 @@ def test_online_lyrics_and_metadata():
         assert resp.status_code == 200
         rj = resp.json()
         assert rj["code"] == 0
-        assert rj["data"]["guid"] == "online:kuwo:228908"
+        assert rj["data"]["guid"] == fake_official_guid("online:kuwo:228908")
         assert "[00:00.00]晴天" in rj["data"]["lyric"]
 
         # 飞牛播放器实际走 GET /lyric/list?trackGUID=
@@ -836,10 +837,10 @@ def test_online_lyrics_and_metadata():
         assert resp_list.status_code == 200
         lj = resp_list.json()
         assert lj["code"] == 0
-        assert lj["data"]["preferred"] == "online:kuwo:228908:lyric"
+        assert lj["data"]["preferred"] == fake_official_guid("online:kuwo:228908:lyric")
         assert len(lj["data"]["list"]) == 1
         item = lj["data"]["list"][0]
-        assert item["guid"] == "online:kuwo:228908:lyric"
+        assert item["guid"] == fake_official_guid("online:kuwo:228908:lyric")
         assert item["source"] == 2
         assert item["isLRC"] is True
         assert "[00:00.00]晴天" in item["content"]
@@ -1073,7 +1074,7 @@ def test_search_track_late_wait_first_source_completed(monkeypatch):
         assert items[0]["guid"] == "local:101"
         assert items[0]["title"] == "晴天"
         # 率先返回的 musicdl 被并入
-        assert items[1]["guid"] == "online:kuwo:first_win"
+        assert items[1]["guid"] == fake_official_guid("online:kuwo:first_win")
         assert items[1]["title"] == "晴天 (Live)"
         assert items[1]["artist"] == "刘瑞琦"
 
@@ -1196,13 +1197,13 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
         assert items[0]["guid"] == "local:101"
         assert items[0]["artist"] == "周杰伦"
         # 2. 网易云
-        assert items[1]["guid"] == "online:netease:mb_unique"
+        assert items[1]["guid"] == fake_official_guid("online:netease:mb_unique")
         assert items[1]["artist"] == "网易翻唱歌手"
         # Unknown musicbox duration cannot prove this is the same recording.
-        assert items[2]["guid"] == "online:kuwo:mdl_same"
-        assert items[3]["guid"] == "online:kuwo:mdl_unique"
+        assert items[2]["guid"] == fake_official_guid("online:kuwo:mdl_same")
+        assert items[3]["guid"] == fake_official_guid("online:kuwo:mdl_unique")
         assert items[3]["artist"] == "Musicdl翻唱歌手"
-        assert items[4]["guid"] == "online:lx:kg:lx_unique"
+        assert items[4]["guid"] == fake_official_guid("online:lx:kg:lx_unique")
         assert items[4]["artist"] == "洛雪翻唱歌手"
         assert len(items) == 5
 
@@ -1570,7 +1571,7 @@ def test_favorite_track_list_merge():
         assert items[0]["isFavorite"] is True
         
         online_item = items[1]
-        assert online_item["guid"] == "online:migu:600908"
+        assert online_item["guid"] == fake_official_guid("online:migu:600908")
         assert online_item["title"] == "稻香"
         assert online_item["duration"] == 223000
         assert online_item["isFavorite"] is True
@@ -1726,14 +1727,14 @@ def test_user_isolation_create_and_list():
         resp_b_list2 = client.get("/music/api/v1/favorite-track/list")
         assert resp_b_list2.status_code == 200
         assert resp_b_list2.json()["data"]["total"] == 1
-        assert resp_b_list2.json()["data"]["list"][0]["guid"] == "online:kuwo:bbb"
+        assert resp_b_list2.json()["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:bbb")
 
         # A 查看列表，只有 A 的歌曲
         current_user["guid"] = "user-a"
         resp_a_list = client.get("/music/api/v1/favorite-track/list")
         assert resp_a_list.status_code == 200
         assert resp_a_list.json()["data"]["total"] == 1
-        assert resp_a_list.json()["data"]["list"][0]["guid"] == "online:kuwo:aaa"
+        assert resp_a_list.json()["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:aaa")
 
 
 def test_user_isolation_delete():
@@ -1781,7 +1782,7 @@ def test_user_isolation_delete():
         resp_a_list = client.get("/music/api/v1/favorite-track/list")
         assert resp_a_list.status_code == 200
         assert resp_a_list.json()["data"]["total"] == 1
-        assert resp_a_list.json()["data"]["list"][0]["guid"] == "online:kuwo:same_song"
+        assert resp_a_list.json()["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:same_song")
 
 
 def test_user_me_missing_guid_fallback_shared():
@@ -1828,7 +1829,7 @@ def test_user_me_missing_guid_fallback_shared():
         resp_list = client.get("/music/api/v1/favorite-track/list")
         assert resp_list.status_code == 200
         assert resp_list.json()["data"]["total"] == 1
-        assert resp_list.json()["data"]["list"][0]["guid"] == "online:kuwo:fallback_track"
+        assert resp_list.json()["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:fallback_track")
 
 
 def test_user_guid_sanitization():
@@ -1979,7 +1980,7 @@ def test_favorite_track_list_official_items_populate_is_favorite_and_empty_handl
         rj2 = resp2.json()
         assert rj2["data"]["total"] == 1
         assert len(rj2["data"]["list"]) == 1
-        assert rj2["data"]["list"][0]["guid"] == "online:netease:12345"
+        assert rj2["data"]["list"][0]["guid"] == fake_official_guid("online:netease:12345")
         assert rj2["data"]["list"][0]["isFavorite"] is True
 
         # Case 3: 官方列表中包含未带 isFavorite 字段（或 isFavorite 为 False）的条目
@@ -1998,7 +1999,7 @@ def test_favorite_track_list_official_items_populate_is_favorite_and_empty_handl
         assert items[0]["isFavorite"] is True
         assert items[1]["guid"] == "local:202"
         assert items[1]["isFavorite"] is True
-        assert items[2]["guid"] == "online:netease:12345"
+        assert items[2]["guid"] == fake_official_guid("online:netease:12345")
         assert items[2]["isFavorite"] is True
 
 
