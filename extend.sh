@@ -192,29 +192,40 @@ verify_acceptance() {
     # 6a. 401 快速路径响应与时延测试 (< 3s)
     log_info "验收 6a: 验证未登录 401/99999 快速路径透传 (耗时必须 < 3s)..."
     local url_https="https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/search/track?keyword=test"
+    local url_http="http://127.0.0.1:${GW_HTTP_PORT}/music/api/v1/search/track?keyword=test"
     local url_443="https://127.0.0.1/music/api/v1/search/track?keyword=test"
-    local resp_file
+    local resp_file http_code="" time_total="" resp_content="" probe_stats
     resp_file="$(mktemp)"
-    local time_total=""
-    local resp_content=""
 
-    # 优先通过 Unix socket 探测
-    time_total="$(curl -s --max-time 8 --unix-socket "${TARGET_SOCK}" -w "%{time_total}" -o "${resp_file}" "http://localhost/music/api/v1/search/track?keyword=test" 2>/dev/null || echo "")"
-    resp_content="$(cat "${resp_file}" 2>/dev/null || true)"
+    # 探测成功以拿到 HTTP 状态码为准；不同 fnOS 版本的未登录响应正文可能为空或格式不同。
+    probe_401() {
+        : > "${resp_file}"
+        probe_stats="$(curl "$@" -w "%{http_code} %{time_total}" -o "${resp_file}" 2>/dev/null || true)"
+        http_code="${probe_stats%% *}"
+        time_total="${probe_stats##* }"
+        [ -n "${http_code}" ] && [ "${http_code}" != "000" ]
+    }
 
-    if [ -z "${time_total}" ] || [ ! -s "${resp_file}" ]; then
+    # 优先通过 Unix socket 探测，依次回退：网关 https -> 网关 http -> 443
+    if ! probe_401 -s --max-time 8 --unix-socket "${TARGET_SOCK}" "http://localhost/music/api/v1/search/track?keyword=test"; then
         log_warn "socket 探测异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT})..."
-        time_total="$(curl -sk --max-time 8 -w "%{time_total}" -o "${resp_file}" "${url_https}" 2>/dev/null || echo "")"
-        if [ -z "${time_total}" ] || [ ! -s "${resp_file}" ]; then
-            log_warn "网关 https 端口连接异常，尝试 fallback 访问 443 端口 (302 跳转)..."
-            time_total="$(curl -skL --max-time 8 -w "%{time_total}" -o "${resp_file}" "${url_443}" 2>/dev/null || echo "99")"
+        if ! probe_401 -sk --max-time 8 "${url_https}"; then
+            log_warn "网关 https 端口连接异常，尝试 fallback 访问网关 http 端口 (${GW_HTTP_PORT})..."
+            if ! probe_401 -s --max-time 8 "${url_http}"; then
+                log_warn "网关 http 端口连接异常，尝试 fallback 访问 443 端口 (302 跳转)..."
+                probe_401 -skL --max-time 8 "${url_443}" || true
+            fi
         fi
-        resp_content="$(cat "${resp_file}" 2>/dev/null || true)"
     fi
+    resp_content="$(cat "${resp_file}" 2>/dev/null || true)"
     rm -f "${resp_file}"
 
-    if ! echo "${resp_content}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
-        log_err "验收 6a 失败：未收到预期的 INVALID TOKEN 响应。响应正文已隐藏"
+    if echo "${resp_content}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
+        :
+    elif [ "${http_code}" = "401" ]; then
+        log_info "验收 6a：未登录响应为 401（正文非 INVALID TOKEN 格式，按状态码判定）。"
+    else
+        log_err "验收 6a 失败：未收到预期的 INVALID TOKEN/401 响应 (HTTP=${http_code:-000})。响应正文已隐藏"
         return 1
     fi
 
@@ -224,7 +235,7 @@ verify_acceptance() {
         log_err "验收 6a 失败：401 请求耗时过长 (${time_total}s >= 3s)，快速路径可能被阻塞！"
         return 1
     fi
-    log_info "验收 6a 通过：INVALID TOKEN 正确透传，耗时 ${time_total}s (< 3s)。"
+    log_info "验收 6a 通过：未登录拒绝正确透传，耗时 ${time_total}s (< 3s)。"
 
     # 6b. 在线音频取流与全链路测试 (Range: bytes=0-1048575 -> 200/206)
     log_info "验收 6b: 验证在线播放全链路取流 (Range 200/206 及数据流传输)..."
@@ -284,6 +295,7 @@ except Exception:
         local stream_guid="online:${probe_id}"
         local stream_sock="http://localhost/music/api/v1/track/stream?guid=${stream_guid}"
         local stream_https="https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
+        local stream_http="http://127.0.0.1:${GW_HTTP_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
         local stream_443="https://127.0.0.1/music/api/v1/track/stream?guid=${stream_guid}"
         local out_file http_code recv_size=0
         out_file="$(mktemp)"
@@ -294,7 +306,11 @@ except Exception:
             http_code="$(curl -sk -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_https}" 2>/dev/null || echo "000")"
         fi
         if [ "${http_code}" = "000" ]; then
-            log_warn "网关 https 端口取流异常，尝试 fallback 访问 443 端口取流..."
+            log_warn "网关 https 端口取流异常，尝试 fallback 访问网关 http 端口 (${GW_HTTP_PORT}) 取流..."
+            http_code="$(curl -s -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_http}" 2>/dev/null || echo "000")"
+        fi
+        if [ "${http_code}" = "000" ]; then
+            log_warn "网关 http 端口取流异常，尝试 fallback 访问 443 端口取流..."
             http_code="$(curl -skL -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_443}" 2>/dev/null || echo "000")"
         fi
         if [ -f "${out_file}" ]; then
