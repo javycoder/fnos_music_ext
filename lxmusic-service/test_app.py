@@ -37,6 +37,17 @@ def setup_http(monkeypatch):
 
 # ------------------------------------------------------------- id contract --
 
+def test_normalize_sources_startup():
+    """LX_SOURCES 启动归一：别名→规范代码、去重、非法丢弃、全非法回退默认。"""
+    assert lxapp._normalize_sources(["kugou", "kuwo", "kugou"]) == ["kg", "kw"]
+    assert lxapp._normalize_sources(["qq", "tx"]) == ["tx"]
+    assert lxapp._normalize_sources(["bogus", ""]) == ["kg", "wy", "mg", "kw"]
+    assert lxapp._normalize_sources([]) == ["kg", "wy", "mg", "kw"]
+    # 模块加载时 CONF["sources"] 必然是归一结果（别名若不归一会被 _SEARCHERS 静默跳过）
+    assert lxapp.CONF["sources"] == lxapp._normalize_sources(lxapp.CONF["sources"])
+    assert all(src in lxapp._SEARCHERS for src in lxapp.CONF["sources"])
+
+
 def test_parse_track_id():
     assert parse_track_id("lx:kg:ABC123") == ("kg", "ABC123")
     assert parse_track_id("lx:wy:186016") == ("wy", "186016")

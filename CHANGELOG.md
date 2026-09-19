@@ -3,6 +3,39 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.7.0] - 2026-09-19
+
+### 新增
+
+- **音源选择升级为「源+平台」粒度（重要）**：此前 lxmusic / musicdl 只能整源启用，
+  源内平台（酷我、酷狗、咪咕、QQ 等）无法自行选择。现在安装向导与
+  `--sources` 均支持组合写法，例如 `--sources netease,lx-kw,musicdl-kuwo`
+  表示：网易云整源 + lxmusic 仅启用酷我 + musicdl 仅启用酷我（两个音源
+  容器一起安装，搜索仍按多源并发策略聚合、去重与换源兜底）。
+  - 交互向导改为平铺组合菜单：`1` 网易云、`2`-`7` lx 按平台（全部默认/
+    酷狗/网易/咪咕/酷我/QQ）、`8`-`14` musicdl 精选平台（全部默认/酷我/
+    酷狗/咪咕/QQ/千千/B站）、`0` 其他 musicdl 平台（输编号或短名）；
+  - musicdl 内置 57 个平台，全部平台的编号/短名对照表见
+    `musicdl-service/PLATFORMS.md`（与安装脚本内嵌表由测试同步校验）；
+  - 所选平台自动写入 `.env`（`LX_SOURCES` / `FNMUSIC_ONLINE_SOURCES` /
+    `MUSICDL_SOURCES`），容器与宿主机两种部署形态均按所选平台启动，
+    代理的搜索、翻页、播放、每日推荐榜单全链路按平台过滤；
+  - 旧写法完全兼容：`--sources musicbox,musicdl,lxmusic` 或 `1,2,3`
+    仍是"整源 + 默认平台"，不覆盖 `.env` 中已有的平台自定义值。
+- **lxmusic 平台白名单打通代理层**：`lx /api/v1/search` 的 `?sources=`
+  参数此前未被代理使用，现按所选平台透传；`online:lx:<平台>:<id>` 条目
+  在翻页与播放时按白名单过滤；后端丢失内存 ID 的按平台精确重搜；洛雪
+  榜单（酷狗 TOP500/酷我飙升榜/网易新歌速递）按所选平台取交集，交集为
+  空时跳过 lx 榜单。
+- **配置健壮性**：lxmusic 与 musicdl 服务启动时对平台列表做归一化
+  （lx 别名 kugou/kuwo 等归一到 kg/kw；musicdl 短名 kuwo 归一到
+  KuwoMusicClient），手改 `.env` 写别名或短名不再静默失效；未知平台
+  告警并忽略。`docker-compose.yml` 的 `MUSICDL_SOURCES` 改为由根 `.env`
+  覆盖（与 `LX_SOURCES` 同款）。
+- **验收按所选平台探测**：`extend.sh` 链路验收对 lxmusic 只探测所选平台、
+  musicdl 探测携带平台白名单；所选平台不在 musicdl 服务注册表时输出告警
+  （库版本差异，不阻断部署）。
+
 ## [1.6.3] - 2026-09-19
 
 ### 修复

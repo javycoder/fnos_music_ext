@@ -107,6 +107,16 @@ def _fake_search_factory(calls: dict, plan: dict):
     return _fake
 
 
+def test_normalize_startup_sources():
+    """MUSICDL_SOURCES 白名单启动归一：短名→注册全名、未知丢弃（回退默认）。"""
+    registered = {"KuwoMusicClient": 1, "BilibiliMusicClient": 2, "MiguMusicClient": 3}
+    norm = app_module._normalize_startup_sources
+    assert norm(["kuwo", "bilibili", "kuwo"], registered) == ["KuwoMusicClient", "BilibiliMusicClient"]
+    assert norm(["KuwoMusicClient", "migu"], registered) == ["KuwoMusicClient", "MiguMusicClient"]
+    assert norm(["nope"], registered) == ["KuwoMusicClient", "MiguMusicClient"]
+    assert norm([], registered) == ["KuwoMusicClient", "MiguMusicClient"]
+
+
 def test_fast_return_when_enough_results(clean_state, monkeypatch):
     """快源返回足够结果后立即返回，不被慢源拖到全局超时。"""
     calls: dict = {}
