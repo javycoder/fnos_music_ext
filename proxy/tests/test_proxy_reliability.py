@@ -209,6 +209,7 @@ async def test_prebyte_fallback_and_no_splicing(monkeypatch):
     response = await p.stream_track(req)
     assert attempts == ["online:kuwo:1", "online:netease:2"]
     assert response.status_code == 307
+    assert response.headers["location"].startswith("/")  # never absolute
     assert streams[0].closed  # prevalidation connection is not orphaned
     target = httpx.URL(response.headers["location"])
     assert target.params["guid"] == "online:netease:2"
@@ -222,6 +223,47 @@ async def test_prebyte_fallback_and_no_splicing(monkeypatch):
     with pytest.raises(httpx.ReadError):
         await anext(response.body_iterator)
     assert attempts == ["online:kuwo:1", "online:netease:2", "online:netease:2"]
+
+
+@pytest.mark.anyio
+async def test_fallback_redirect_survives_relayed_https_client(monkeypatch):
+    # A wan client (fn Connect relay / port forward) sends Host=<public domain>
+    # with X-Forwarded-Proto: https, but behind the gateway unix socket the
+    # ASGI scheme stays http and the Host header carries no port. The fallback
+    # 307 must stay relative: an absolute Location would downgrade the client
+    # to http://<domain>/... which no listener serves on that path.
+    req = Request({"type": "http", "method": "GET", "path": "/music/api/v1/track/stream",
+                   "query_string": b"guid=online:kuwo:1",
+                   "headers": [(b"authorization", b"a"), (b"host", b"relay.example.com"),
+                               (b"x-forwarded-proto", b"https")],
+                   "app": p.app, "scheme": "http", "server": ("relay.example.com", 443)})
+    items = p.deduplicate_online_items([song("kuwo:1"), song("netease:2")])
+    session(req, items)
+
+    async def opened(req, guid, rang):
+        if guid == "online:kuwo:1":
+            raise httpx.ReadError("before first byte")
+        audio = Audio()
+        resp = httpx.Response(200, stream=audio)
+        chunks = resp.aiter_bytes()
+        return resp, None, "mp3", {}, chunks, await anext(chunks)
+
+    monkeypatch.setattr(p, "_open_online_stream", opened)
+
+    async def no_recovery(*args):
+        return False
+
+    monkeypatch.setattr(p, "_recover_source", no_recovery)
+    response = await p.stream_track(req)
+    assert response.status_code == 307
+    location = response.headers["location"]
+    assert location.startswith("/")
+    assert "relay.example.com" not in location
+    assert not location.startswith(("http://", "https://"))
+    target = httpx.URL(location)
+    assert target.path == "/music/api/v1/track/stream"
+    assert target.params["guid"] == "online:netease:2"
+    assert target.params["_ext_rendition"] == "1"
 
 
 @pytest.mark.anyio

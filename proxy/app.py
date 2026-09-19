@@ -2264,8 +2264,14 @@ async def stream_track(request: Request, subpath: str = ""):
                         await resp.aclose()
                         if owned:
                             await owned.aclose()
+                    # Behind the fnOS gateway over a unix socket the request
+                    # scheme is always http and the Host header carries no
+                    # port, so an absolute URL would strand https/wan clients
+                    # on an unreachable address; only a relative Location is
+                    # safe for every client entry point.
                     target = request.url.include_query_params(guid=candidate, _ext_rendition="1")
-                    return RedirectResponse(str(target), status_code=307, headers={"Cache-Control": "no-store"})
+                    location = target.path + (f"?{target.query}" if target.query else "")
+                    return RedirectResponse(location, status_code=307, headers={"Cache-Control": "no-store"})
                 # Cache the selected source's bytes under its own GUID, never
                 # splice a failed stream or alias different encodings for seeks.
                 return stream_tee_response(resp, candidate, range_header,
