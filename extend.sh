@@ -182,8 +182,35 @@ rollback() {
 # ------------------------------------------------------------------------------
 # 验收测试函数
 # ------------------------------------------------------------------------------
+warn_unregistered_mdl_platforms() {
+    # 所选 musicdl 平台不在服务注册表时告警（musicdl 库版本差异可能不含个别平台），不阻断
+    [ "${ENABLE_MUSICDL}" -eq 1 ] || return 0
+    local raw="${FNMUSIC_ONLINE_SOURCES:-}"
+    [ -n "${raw}" ] || return 0
+    local body unknown
+    body="$(curl -s --max-time 5 "${MUSICDL_URL}/sources" 2>/dev/null || true)"
+    [ -n "${body}" ] || return 0
+    unknown="$(python3 - "${raw}" "${body}" <<'PY' 2>/dev/null || true
+import json, sys
+raw, body = sys.argv[1], sys.argv[2]
+try:
+    registered = {str(x).strip().lower().removesuffix("musicclient")
+                  for x in json.loads(body).get("registered", [])}
+except Exception:
+    sys.exit(0)
+unknown = [s for s in (x.strip() for x in raw.split(",")) if s
+           and s.lower().removesuffix("musicclient") not in registered]
+if unknown:
+    print(",".join(unknown))
+PY
+)" || true
+    [ -n "${unknown}" ] && log_warn "musicdl 平台 [${unknown}] 不在服务注册表中（musicdl 库版本差异），相关平台搜索将返回空。"
+    return 0
+}
+
 verify_acceptance() {
     log_info "==> 执行链路与功能验收..."
+    warn_unregistered_mdl_platforms
 
     local GW_HTTP_PORT GW_HTTPS_PORT
     read -r GW_HTTP_PORT GW_HTTPS_PORT <<< "$(get_fnos_gateway_ports)"
@@ -249,7 +276,10 @@ verify_acceptance() {
         encoded="$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${keyword}" 2>/dev/null || true)"
         [ -z "${encoded}" ] && return 0
         if [ "${source}" = "musicdl" ]; then
-            curl -s --max-time 20 "${MUSICDL_URL}/search?keyword=${encoded}&limit=3" 2>/dev/null | python3 -c "import sys,json
+            # 按用户选择的 musicdl 平台白名单探测（FNMUSIC_ONLINE_SOURCES，空=服务默认白名单）
+            local mdl_sources_q=""
+            [ -n "${FNMUSIC_ONLINE_SOURCES:-}" ] && mdl_sources_q="&sources=${FNMUSIC_ONLINE_SOURCES}"
+            curl -s --max-time 20 "${MUSICDL_URL}/search?keyword=${encoded}&limit=3${mdl_sources_q}" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
     for it in (d.get('items') or [])[:3]:
@@ -258,9 +288,12 @@ try:
 except Exception:
     pass" 2>/dev/null || true
         elif [ "${source}" = "lxmusic" ]; then
-            # 轮询 kg/wy/mg/kw 子源（tx 探活依赖第三方链路，当前默认无存活链路会返回空，仅作补充探测），避免单一子源故障导致候选题库全灭
+            # 只轮询用户选择的 lx 平台（LX_SOURCES；未配置时默认 kg/wy/mg/kw 并补充 tx 探测），
+            # 避免单一子源故障导致候选题库全灭
             local lx_sub
-            for lx_sub in kg wy mg kw tx; do
+            local lx_probe_list="${LX_SOURCES:-kg,wy,mg,kw,tx}"
+            for lx_sub in ${lx_probe_list//,/ }; do
+                [ -z "${lx_sub}" ] && continue
                 curl -s --max-time 20 "${LX_URL}/api/v1/search?keyword=${encoded}&limit=5&sources=${lx_sub}" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)

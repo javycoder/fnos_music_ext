@@ -417,6 +417,85 @@ stop_owned_source_unit() { printf 'unit %s\\n' "$1"; }
     assert json.loads(output) == list(map(bool, flags))
 
 
+def install_platform_block():
+    """提取 install.sh 的平台表 + 解析函数块（菜单表 → 参数解析 while 之前）。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    start = text.index("MDL_PLATFORM_TABLE='")
+    end = text.index('while [ $# -gt 0 ]')
+    return text[start:end]
+
+
+def run_install_bash(body):
+    script = 'set -euo pipefail\nlog_err() { printf "%s\\n" "$*" >&2; }\n' + body
+    return subprocess.run(['bash', '-c', script], text=True, capture_output=True)
+
+
+def test_parse_sources_platform_tokens():
+    block = install_platform_block()
+    body = block + '''
+parse_sources "netease,lx-kw,musicdl-kuwo"
+printf "combo %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
+parse_sources "1,2,3"
+printf "bare %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
+parse_sources "lxmusic-KuGou,mdl-48,mdl-GequhaiMusicClient"
+printf "alias [%s] [%s]\\n" "$LX_PLATFORMS" "$MDL_PLATFORMS"
+parse_sources "lx-kw,lx-kg,lx-kw"
+printf "union [%s]\\n" "$LX_PLATFORMS"
+parse_sources "musicdl-all"
+printf "all [%s] [%s]\\n" "$MDL_PLATFORMS" "$(mdl_short_to_full "$MDL_PLATFORMS")"
+printf "menu [%s]\\n" "$(menu_answer_to_tokens "1,6,9")"
+printf "menu [%s]\\n" "$(menu_answer_to_tokens "1,2,8")"
+printf "menu [%s]\\n" "$(menu_answer_to_tokens "lx-kw,musicdl-kuwo")"
+'''
+    result = run_install_bash(body)
+    assert result.returncode == 0, result.stderr
+    rows = result.stdout.splitlines()
+    # 显式平台 token：源开关 + 平台列表 + 显式标记
+    assert rows[0] == 'combo 1 1 1 [kw] [kuwo] 1 1'
+    # 裸 token（旧写法）= 整源默认平台，不动平台键
+    assert rows[1] == 'bare 1 1 1 [] [] 0 0'
+    # lx 别名 / musicdl 编号与全名输入归一
+    assert rows[2] == 'alias [kg] [gequhai]'
+    # 同源多平台并集去重
+    assert rows[3] == 'union [kw,kg]'
+    # musicdl-all = 显式默认平台，短名 → 全名映射
+    assert rows[4] == 'all [kuwo,migu] [KuwoMusicClient,MiguMusicClient]'
+    # 菜单编号 → token（1 网易云 / 6 lx-酷我 / 9 mdl-酷我；默认 1,2,8）
+    assert rows[5] == 'menu [musicbox,lx-kw,musicdl-kuwo]'
+    assert rows[6] == 'menu [musicbox,lx-all,musicdl-all]'
+    assert rows[7] == 'menu [lx-kw,musicdl-kuwo]'
+
+
+def test_parse_sources_rejects_unknown_platforms():
+    block = install_platform_block()
+    result = run_install_bash(block + 'parse_sources "lx-foo"')
+    assert result.returncode != 0 and '未知 lx 平台' in result.stderr
+    result = run_install_bash(block + 'parse_sources "musicdl-nope"')
+    assert result.returncode != 0 and '未知 musicdl 平台' in result.stderr
+    result = run_install_bash(block + 'parse_sources "bogus"')
+    assert result.returncode != 0 and '未知音源' in result.stderr
+    result = run_install_bash(block + 'menu_answer_to_tokens "15"')
+    assert result.returncode != 0 and '未知菜单编号' in result.stderr
+
+
+def test_env_write_platform_keys_explicit_only():
+    """平台键仅显式选择时写入并覆盖；裸 token 沿用 .env 既有值。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    assert 'ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCES"' in text
+    assert 'ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_ONLINE_SOURCES,MUSICDL_SOURCES"' in text
+    # 显式分支：短名白名单（代理请求级）+ 全名白名单（容器级）
+    assert 'echo "FNMUSIC_ONLINE_SOURCES=\'$(dotenv_escape "${MDL_PLATFORMS}")\'"' in text
+    assert 'echo "MUSICDL_SOURCES=\'$(dotenv_escape "$(mdl_short_to_full "${MDL_PLATFORMS}")")\'"' in text
+    assert 'echo "LX_SOURCES=\'$(dotenv_escape "${LX_PLATFORMS}")\'"' in text
+    # 非显式分支维持旧默认值（env_merge 沿用既有值）
+    assert "echo \"FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'\"" in text
+    # host unit 与 compose 均按所选平台注入
+    assert 'Environment=MUSICDL_SOURCES=${MUSICDL_UNIT_SOURCES}' in text
+    assert 'Environment=LX_SOURCES=${LX_UNIT_SOURCES}' in text
+    assert 'MUSICDL_SOURCES=${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}' in \
+        (BASE/'docker-compose.yml').read_text(encoding='utf-8')
+
+
 def test_host_install_unit_restarts_and_propagates_failure(tmp_path):
     install = (BASE/'install.sh').read_text()
     script = 'set -euo pipefail\n'+function(install, 'install_unit')

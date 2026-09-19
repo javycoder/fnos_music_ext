@@ -95,6 +95,32 @@ def _source_mapping() -> dict:
             for alias in (name.casefold(), _source_short(name).casefold())}
 
 
+def _normalize_startup_sources(raw: list, registered: set | None = None) -> list:
+    """MUSICDL_SOURCES 白名单启动归一：短名/别名 → 注册全名，未知项告警丢弃。
+
+    库层 musicdl.MusicClient 只认全名；短名必须在服务入口解析。
+    只对照注册表解析（不把白名单自身当别名），打错的平台名才会被丢弃。"""
+    if registered is None:
+        try:
+            from musicdl.modules.sources import MusicClientBuilder
+            registered = set(MusicClientBuilder.REGISTERED_MODULES)
+        except ImportError:
+            registered = set(getattr(musicdl, "SUPPORTED_MUSIC_SOURCES", []) or [])
+    alias = {a: n for n in sorted(registered)
+             for a in (n.casefold(), _source_short(n).casefold())}
+    out: list = []
+    for name in raw:
+        resolved = alias.get(name.strip().casefold())
+        if resolved is None:
+            logger.warning("MUSICDL_SOURCES 忽略未知平台 %r（可用平台见 /sources）", name)
+            continue
+        if resolved not in out:
+            out.append(resolved)
+    return out or ["KuwoMusicClient", "MiguMusicClient"]
+
+
+CONF["sources"] = _normalize_startup_sources(CONF["sources"])
+
 SOURCE_NAMES = _source_mapping()
 SOURCE_WORKERS = SourceBulkhead(SOURCE_NAMES.values())
 

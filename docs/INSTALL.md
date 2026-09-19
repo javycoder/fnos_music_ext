@@ -125,23 +125,28 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 向导将自动执行环境安全预检，并提供直观的交互选择：
 1. **安装模式**：输入 `1`（Docker 模式）或 `2`（Host 模式）；
-2. **音源选择**：可多选，至少选一个：
-   * `1`：`musicdl`（酷我/咪咕等，覆盖绝大多数华语热门流行曲目）；
-   * `2`：`musicbox`（网易云高品质解析，支持 FLAC/歌词/封面）；
-   * `1,2`：双音源并行聚合（强烈推荐，网易云高品质优先，未命中自动回退检索）；
+2. **音源选择**（平铺组合菜单，可多选编号，至少选一个）：
+   * `1`：网易云 `musicbox`；
+   * `2`-`7`：lxmusic 按平台（全部默认/酷狗/网易/咪咕/酷我/QQ）；
+   * `8`-`14`：musicdl 按平台（全部默认/酷我/酷狗/咪咕/QQ/千千/B站）；
+   * `0`：其他 musicdl 平台（输编号或短名，全部 57 个平台见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
+   * 示例：`1,6,9` = 网易云 + lx-酷我 + mdl-酷我，对应容器一起安装、搜索多源并发聚合；`1,2,3` 整源默认全开；
 3. **每日推荐（可选）**：支持填入兼容 OpenAI 规范的 API Key，自动为登录用户定制每日歌单；若不使用直接回车跳过；
 4. **一键启用**：向导完成后直接确认即可调用 `./extend.sh` 自动接管上线。
 
 ### 非交互静默部署示例（进阶运维 / 自动化脚本）
 
 ```bash
-# 示例 1：推荐配置 —— Docker 模式 + 双音源 + 自动启用
+# 示例 1：推荐配置 —— Docker 模式 + 三音源 + 自动启用
 ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic --extend
 
 # 示例 2：纯净轻量 —— Host 宿主机模式 + 仅 musicdl 音源
 ./install.sh --non-interactive --mode host --sources musicdl --extend
 
-# 示例 3：启用大模型每日推荐（密钥保存在项目本地 .env 中，权限为 600）
+# 示例 3：平台粒度 —— 网易云 + lx 只启用酷我 + musicdl 只启用酷我和咪咕
+./install.sh --non-interactive --mode docker --sources netease,lx-kw,musicdl-kuwo,musicdl-migu --extend
+
+# 示例 4：启用大模型每日推荐（密钥保存在项目本地 .env 中，权限为 600）
 ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic --enable-recommend \
   --llm-base-url 'https://api.openai.com/v1' \
   --llm-api-key 'sk-xxxxxx' \
