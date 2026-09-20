@@ -62,7 +62,11 @@ def test_install_and_md_tables_in_sync():
 
 def test_table_invariants():
     rows = _install_table()
-    assert [no for no, *_rest in rows] == list(range(1, len(rows) + 1)), '编号须从 1 起连续递增'
+    ids = [no for no, *_rest in rows]
+    # 编号从 1 起、严格递增、唯一；上游下线平台留空缺号（如 53=zhuolin 已退役）
+    assert ids[0] == 1, '首行编号须为 1（musicbox）'
+    assert ids == sorted(ids), '编号须递增'
+    assert len(set(ids)) == len(ids), '编号不得重复'
     providers = {p for _n, p, *_rest in rows}
     assert providers == {'musicbox', 'musicdl', 'lx'}
     pairs = [(p, s) for _n, p, s, *_rest in rows]
@@ -77,8 +81,11 @@ def test_table_invariants():
         assert full.replace('MusicClient', '').lower() == short, f'{full} 的短名应为 {short}'
     for _no, _p, short, full, _label, _star in lx:
         assert short == full
-    assert [n for n, *_r in mdl] == list(range(2, 59))
+    # lx 固定占 59–63；musicdl 原始区段 2–58（允许退役空缺），新平台从 64 起表末追加
     assert [n for n, *_r in lx] == list(range(59, 64))
+    mdl_ids = [n for n, *_r in mdl]
+    assert all(2 <= n <= 58 or n >= 64 for n in mdl_ids), 'musicdl 编号须落在 2–58 或 ≥64 追加区段'
+    assert 53 not in mdl_ids, '编号 53 已随上游下线退役，不得复用'
 
 
 def test_menu_curated_matches_md_star_rows():

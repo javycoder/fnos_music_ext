@@ -143,13 +143,14 @@ read -r FNMUSIC_VERSION < "${BASE_DIR}/VERSION"
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
-DEPLOY_MODE="${FNMUSIC_DEPLOY_MODE:-}"
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 ENABLE_LX=0
+ENABLE_WEBUI=0
 is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
 is_enabled "${FNMUSIC_NETEASE_ENABLED:-true}" && ENABLE_MUSICBOX=1
 is_enabled "${FNMUSIC_LX_ENABLED:-false}" && ENABLE_LX=1
+is_enabled "${FNMUSIC_WEBUI_ENABLED:-false}" && ENABLE_WEBUI=1
 if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
     log_err "至少需要启用一个音源（FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED）。"
     exit 1
@@ -448,85 +449,123 @@ if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
     exit 1
 fi
 
-# 1.4 检查 / 自动拉起已启用的音源（按 DEPLOY_MODE 只走 docker 或 host，避免双轨冲突）
-ensure_source() {
-    local name="$1" url="$2" compose_svc="$3" unit="$4"
-    if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
-        # A healthy endpoint alone must not silently borrow another checkout's
-        # container/unit: verify ownership before reusing the ready service.
-        local mode="${DEPLOY_MODE}"
-        if [ -z "${mode}" ]; then
-            # Same fallback as the pull-up branch below when .env is silent.
-            if [ -f "/etc/systemd/system/${unit}.service" ]; then
-                mode="host"
-            else
-                mode="docker"
-            fi
-        fi
-        if [ "${mode}" = "docker" ]; then
-            reclaim_container "fnmusic-${name}" || return 1
-        else
-            owned_source_unit "${unit%.service}" \
-                || { log_err "音源 unit ${unit} 不属于当前目录；保留并拒绝接管。"; return 1; }
-        fi
-        log_info "${name} 已就绪 (${url}/healthz)。"
-        return 0
-    fi
-    log_warn "${name} 未就绪，正在拉起..."
-    local mode="${DEPLOY_MODE}"
-    if [ -z "${mode}" ]; then
-        if systemctl list-unit-files "${unit}" 2>/dev/null | grep -q "${unit}"; then
-            mode="host"
-        elif command -v docker >/dev/null 2>&1; then
-            mode="docker"
-        else
-            mode="host"
-        fi
-    fi
-    if [ "${mode}" = "docker" ]; then
-        # 基础镜像源保障（国内镜像优先/官方兜底，见 ensure_base_image.sh），整次运行只执行一次
-        if [ "${BASE_IMAGE_ENSURED:-0}" -ne 1 ]; then
-            if bash "${BASE_DIR}/ensure_base_image.sh"; then
-                BASE_IMAGE_ENSURED=1
-            else
-                log_err "基础镜像源探测失败，无法构建容器。"
-                return 1
-            fi
-        fi
-        reclaim_container "fnmusic-${name}" || return 1
-        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || return 1
+# 1.4 检查 / 自动拉起单容器 fnmusic-sources（v2.0.0 仅 Docker 部署，entrypoint 按需加载）
+CONTAINER_NAME="fnmusic-sources"
+if ! command -v docker >/dev/null 2>&1 || ! run_docker info >/dev/null 2>&1; then
+    log_err "【缺少组件】v2.0.0 仅支持 Docker 部署，但当前 Docker 不可用。"
+    log_err "请先在 fnOS 应用中心安装 Docker 后重试。"
+    exit 1
+fi
+
+# v1.x 直接 git pull 后运行本脚本的兜底：迁移旧数据目录 musicbox-data -> sources-data
+if [ -d "${BASE_DIR}/musicbox-data" ] && [ ! -d "${BASE_DIR}/sources-data" ]; then
+    log_info "迁移数据目录: musicbox-data -> sources-data（网易登录态/缓存原样保留）"
+    mv "${BASE_DIR}/musicbox-data" "${BASE_DIR}/sources-data"
+fi
+mkdir -p "${BASE_DIR}/sources-data/cache/netease-musicbox" \
+    "${BASE_DIR}/sources-data/config/netease-musicbox" \
+    "${BASE_DIR}/sources-data/netease-musicbox" \
+    "${BASE_DIR}/sources-data/lxmusic"
+chmod -R 0755 "${BASE_DIR}/sources-data" 2>/dev/null || true
+
+# 旧 v1.x 部署形态清理：宿主机三 unit + 三容器（释放端口 8768/8770/8772 给单容器）
+for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+    stop_owned_source_unit "${unit}" || exit 1
+    remove_owned_container "${unit}" || exit 1
+done
+
+source_healthy() {
+    curl -sf --max-time 5 "${1}/healthz" >/dev/null 2>&1
+}
+
+# 任一应启程序未就绪即视为需要拉起/重启容器（.env 改开关后 extend 会重启容器重选进程集）
+need_start=0
+if [ "${ENABLE_MUSICDL}" -eq 1 ] && ! source_healthy "${MUSICDL_URL}"; then need_start=1; fi
+if [ "${ENABLE_MUSICBOX}" -eq 1 ] && ! source_healthy "${MUSICBOX_URL}"; then need_start=1; fi
+if [ "${ENABLE_LX}" -eq 1 ] && ! source_healthy "${LX_URL}"; then need_start=1; fi
+if [ "${ENABLE_WEBUI}" -eq 1 ] && ! source_healthy "http://127.0.0.1:8774"; then need_start=1; fi
+
+if [ "${need_start}" -eq 0 ]; then
+    # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
+    if run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        reclaim_container "${CONTAINER_NAME}" || exit 1
+        log_info "音源容器 ${CONTAINER_NAME} 已就绪（按需加载：仅所选音源进程驻留内存）。"
     else
-        if systemctl list-unit-files "${unit}" >/dev/null 2>&1; then
-            owned_source_unit "${unit%.service}" || { log_err "音源 unit 不属于当前目录；保留。"; return 1; }
-            sudo systemctl start "${unit}" || return 1
+        log_warn "音源 healthz 已就绪，但未发现 ${CONTAINER_NAME} 容器（疑似 v1.x 宿主机服务残留）。"
+        log_warn "建议重新运行 ./install.sh 完成 v2.0.0 单容器迁移。"
+    fi
+else
+    log_info "音源服务未全部就绪，拉起单容器 ${CONTAINER_NAME}..."
+    # 基础镜像源保障（国内镜像优先/官方兜底，见 ensure_base_image.sh），整次运行只执行一次
+    if [ "${BASE_IMAGE_ENSURED:-0}" -ne 1 ]; then
+        if bash "${BASE_DIR}/ensure_base_image.sh"; then
+            BASE_IMAGE_ENSURED=1
+        else
+            log_err "基础镜像源探测失败，无法构建容器。"
+            exit 1
         fi
     fi
-    if wait_http "${url}/healthz" 60 2; then
-        log_info "${name} 已就绪。"
+    reclaim_container "${CONTAINER_NAME}" || exit 1
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+        log_err "构建/启动 ${CONTAINER_NAME} 失败。"
+        exit 1
+    fi
+    # compose 对配置未变的运行中容器不会重启：手动 restart 让 entrypoint 按最新 .env 重选进程集
+    run_docker restart "${CONTAINER_NAME}" || exit 1
+fi
+
+wait_source() {
+    local name="$1" url="$2" tries="${3:-60}"
+    if wait_http "${url}/healthz" "${tries}" 2; then
+        log_info "${name} 已就绪 ${url}/healthz"
         return 0
     fi
-    log_err "等待 ${name} healthz 超时 (${url}/healthz)。"
+    log_err "等待 ${name} healthz 超时 (${url}/healthz)"
     return 1
 }
 
-if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
-    if ! ensure_source "musicdl" "${MUSICDL_URL}" "musicdl" "fnmusic-musicdl.service"; then
-        exit 1
-    fi
-fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
-    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
-        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
-        "${BASE_DIR}/musicbox-data/netease-musicbox"
-    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
-    if ! ensure_source "musicbox" "${MUSICBOX_URL}" "musicbox" "fnmusic-musicbox.service"; then
-        exit 1
-    fi
+    wait_source "musicbox" "${MUSICBOX_URL}" || exit 1
+fi
+if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
+    wait_source "musicdl" "${MUSICDL_URL}" 90 || exit 1
 fi
 if [ "${ENABLE_LX}" -eq 1 ]; then
-    if ! ensure_source "lxmusic" "${LX_URL}" "lxmusic" "fnmusic-lxmusic.service"; then
-        exit 1
-    fi
+    wait_source "lxmusic" "${LX_URL}" || exit 1
+fi
+if [ "${ENABLE_WEBUI}" -eq 1 ]; then
+    wait_source "WebUI" "http://127.0.0.1:8774" || exit 1
+fi
+
+# 洛雪用户源状态：healthz 的 user_source.initialized（未配置/初始化失败仅告警，可稍后在 WebUI 配置）
+if [ "${ENABLE_LX}" -eq 1 ]; then
+    lx_state="$(curl -sf --max-time 5 "${LX_URL}/healthz" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    us = (json.load(sys.stdin) or {}).get("user_source") or {}
+except Exception:
+    print("unknown|"); raise SystemExit
+if us.get("initialized"):
+    s = us.get("source") or {}
+    print("ok|%s|%s" % (s.get("name") or "", s.get("version") or ""))
+elif us.get("configured"):
+    print("broken|%s" % (us.get("last_error") or "初始化失败"))
+else:
+    print("unconfigured|")
+' 2>/dev/null || true)"
+    case "${lx_state%%|*}" in
+        ok)
+            log_info "洛雪用户自定义源已加载: $(printf '%s' "${lx_state#*|}" | tr '|' ' ')"
+            ;;
+        broken)
+            log_warn "洛雪用户源初始化失败: ${lx_state#*|}"
+            log_warn "请在 WebUI 或 ./install.sh --sources lxmusic --lx-source-url <URL> 重新配置。"
+            ;;
+        *)
+            log_warn "尚未配置洛雪用户自定义源（播放解析不可用，搜索/榜单不受影响）。"
+            log_warn "可在 WebUI (http://<NAS_IP>:8774) 配置，或重跑 install.sh 时提供 --lx-source-url。"
+            ;;
+    esac
 fi
 
 # 1.5 检查 Python 虚拟环境与依赖
@@ -629,5 +668,8 @@ fi
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"
+if [ "${ENABLE_WEBUI}" -eq 1 ]; then
+    log_info "   • 管理 WebUI: http://<NAS_IP>:8774（无鉴权，仅限可信内网；音源三选一/音质/推荐/LLM 运行期可调）"
+fi
 log_info "   • 一键还原: ./restore.sh (一键无损切回官方原生直连)"
 log_info "============================================================"
