@@ -316,11 +316,20 @@ def get_http(request: Request) -> httpx.AsyncClient:
     return client
 
 
+def _resp_json(resp: httpx.Response) -> dict:
+    """防御性解析同容器服务的响应体：上游裸 500 等非 JSON 文本时返回带 error 的
+    字典而不是抛 JSONDecodeError（否则自身也会 500，用户只能看到 "HTTP 500"）。"""
+    try:
+        return resp.json() if resp.content else {}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": f"上游返回非 JSON 响应（HTTP {resp.status_code}）"}
+
+
 async def _fetch_json(request: Request, url: str, *, timeout: float = 4.0) -> "tuple[bool, dict]":
     client = get_http(request)
     try:
         resp = await client.get(url, timeout=timeout)
-        data = resp.json() if resp.content else {}
+        data = _resp_json(resp)
         return resp.status_code < 400 and data.get("ok", True), data
     except Exception as exc:  # noqa: BLE001
         return False, {"error": str(exc)}
@@ -434,7 +443,7 @@ async def api_config_put(body: ConfigBody, request: Request):
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
                                      json={"url": new_url}, timeout=130.0)
-            report = resp.json() if resp.content else {}
+            report = _resp_json(resp)
         except Exception as exc:  # noqa: BLE001
             report = {"ok": False, "data": {"message": str(exc)}}
         if not report.get("ok"):
@@ -464,8 +473,9 @@ async def api_config_put(body: ConfigBody, request: Request):
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
                                      json={"url": after["LX_SOURCE_URL"]}, timeout=130.0)
-            ok = resp.status_code == 200 and resp.json().get("ok", False)
-            err = "" if ok else (resp.json().get("error") if resp.content else f"HTTP {resp.status_code}")
+            payload = _resp_json(resp)
+            ok = resp.status_code == 200 and payload.get("ok", False)
+            err = "" if ok else (payload.get("error") or f"HTTP {resp.status_code}")
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
         actions.append({"kind": "lx_activate", "ok": ok, "error": err or ""})
@@ -493,7 +503,7 @@ async def api_lx_verify(body: ConfigBody, request: Request):
     try:
         resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
                                  json={"url": url}, timeout=130.0)
-        return JSONResponse(content=resp.json() if resp.content else {"ok": False},
+        return JSONResponse(content=_resp_json(resp) or {"ok": False},
                             status_code=resp.status_code)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc

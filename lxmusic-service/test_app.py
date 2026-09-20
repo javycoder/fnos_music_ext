@@ -466,6 +466,38 @@ def test_source_verify_endpoint(isolated, monkeypatch):
         assert r2.status_code == 400
 
 
+def test_source_verify_endpoint_never_500s_on_verify_exception(isolated, monkeypatch):
+    """校验链路任何异常（SourceError 或未预期错误）都必须返回结构化 JSON，
+    裸 500 纯文本会让 WebUI 反代解析崩溃，用户只看到 "HTTP 500"。"""
+    from source_runtime import SourceError
+
+    async def boom(url):
+        raise SourceError("resolve", "console.group is not a function")
+
+    async def crash(url):
+        raise RuntimeError("unexpected")
+
+    stub = types.ModuleType("verify_source")
+    stub.verify_url = boom
+    monkeypatch.setitem(sys.modules, "verify_source", stub)
+
+    with TestClient(lxapp.app) as client:
+        r = client.post("/api/v1/source/verify", json={"url": "https://s/1.js"})
+        assert r.status_code == 200
+        rj = r.json()
+        assert rj["ok"] is False
+        assert rj["data"]["category"] == "resolve"
+        assert "console.group" in rj["data"]["message"]
+
+        stub.verify_url = crash
+        r2 = client.post("/api/v1/source/verify", json={"url": "https://s/1.js"})
+        assert r2.status_code == 200
+        rj2 = r2.json()
+        assert rj2["ok"] is False
+        assert rj2["data"]["category"] == "internal"
+        assert "unexpected" in rj2["data"]["message"]
+
+
 # ------------------------------------------------------------------ 歌词 ---
 
 def test_track_lyric_tx_base64_decode():

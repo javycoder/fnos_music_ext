@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -621,6 +622,33 @@ def test_manager_state_dir_fallback_when_unwritable(tmp_path):
     mgr = sr.SourceManager(state_dir=str(blocker / "sub"))
     assert mgr.state_dir != blocker / "sub"
     assert mgr.state_dir.exists()
+
+
+# ----------------------------------------------------- 沙箱 console 完整性 ---
+
+# 洛雪桌面端给脚本的是完整 console；野生源脚本普遍调用 group/table/count/time 等，
+# 桥里缺任何一个方法都会让脚本抛 "console.xxx is not a function" 直接打断解析
+# （真实事故：全豆要/ikun 源调用 console.group 导致 musicUrl 全挂）。宿主无 node，
+# 用静态结构断言锁住方法集。
+REQUIRED_CONSOLE_METHODS = (
+    "log", "info", "warn", "error", "debug",
+    "group", "groupCollapsed", "groupEnd",
+    "table", "dir", "dirxml", "trace",
+    "count", "countReset", "assert",
+    "time", "timeLog", "timeEnd",
+    "clear", "profile", "profileEnd", "timeStamp", "context",
+)
+
+
+def test_bridge_console_exposes_full_standard_api():
+    bridge = Path(sr.__file__).with_name("js") / "bridge.js"
+    text = bridge.read_text(encoding="utf-8")
+    start = text.index("const sandboxConsole = {")
+    end = text.index("};", start)
+    block = text[start:end]
+    defined = set(re.findall(r"^\s{2}(\w+):", block, re.M))
+    missing = [m for m in REQUIRED_CONSOLE_METHODS if m not in defined]
+    assert not missing, f"bridge.js sandboxConsole 缺少方法: {missing}"
 
 
 # ------------------------------------------------------------------ Node 集成 ---
