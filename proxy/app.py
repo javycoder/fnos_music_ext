@@ -32,11 +32,11 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
-    from .cache_gc import purge_rolling
+    from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
-    from cache_gc import purge_rolling  # type: ignore
+    from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -97,6 +97,9 @@ CONF = {
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
+    # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
+    # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
+    "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     # lx 平台白名单（同 .env 的 LX_SOURCES；install.sh --sources lx-<平台> 写入）；
@@ -524,6 +527,15 @@ def is_range_from_zero_or_none(range_header: str | None) -> bool:
     return should_cache(range_header)
 
 
+def log_stream_probe(method: str, guid: str, range_header: str | None, cached: bool) -> None:
+    """在线取流探针：一行记录 Range 形态与落盘资格，供真机确认播放器取流行为。"""
+    if CONF.get("stream_probe"):
+        logger.info(
+            "stream probe: %s %s range=%r cached=%s tee_eligible=%s",
+            method, guid, range_header, cached, should_cache(range_header),
+        )
+
+
 def cache_safe_guid(guid: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", guid)
 
@@ -772,17 +784,17 @@ def find_lyric_file(guid: str) -> str | None:
 
 
 def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
+    """歌词三档归属（音频到哪，歌词到哪）：已有歌词复用原位；有音频落在音频旁；
+    无音频只落 cache（guid 命名）。绝不把曲库目录当无音频时的兜底——那会制造
+    只有歌词没有音频的孤儿 .lrc（曲库在云盘上时还会产生上传流量）。
+    """
     found = find_lyric_file(guid)
     if found:
         return found
     audio = find_cache_file(guid)
     if audio:
         return os.path.splitext(audio)[0] + ".lrc"
-    d = detect_library_dir()
-    os.makedirs(d, exist_ok=True)
-    if (title or "").strip() or (artist or "").strip():
-        return os.path.join(d, f"{library_basename(title, artist)}.lrc")
-    return os.path.join(d, f"{cache_safe_guid(guid)}.lrc")
+    return os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
 
 
 def read_lyric_cache(guid: str) -> str:
@@ -820,6 +832,28 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
                 os.remove(part_path)
             except Exception:
                 pass
+
+
+def promote_shadow_lyric(guid: str, audio_path: str) -> None:
+    """音频落曲库后，把 cache 里的影子歌词（无音频时代的 guid 命名副本）提升为
+    音频旁 sidecar，词曲贴身；曲库已有 sidecar 时不覆盖。跨文件系统时退化为复制。
+    """
+    dest = os.path.splitext(audio_path)[0] + ".lrc"
+    if os.path.exists(dest):
+        return
+    shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
+    if not os.path.exists(shadow):
+        return
+    try:
+        os.replace(shadow, dest)
+    except OSError:
+        try:
+            shutil.copyfile(shadow, dest)
+            os.remove(shadow)
+        except Exception as e:
+            logger.warning("shadow lyric promote failed for %s: %s", guid, e)
+            return
+    adopt_library_perms(dest)
 
 
 async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str) -> dict | None:
@@ -1663,6 +1697,33 @@ def _conf_log_value(key: str, value: Any) -> Any:
     return value
 
 
+def _background_jobs_enabled() -> bool:
+    """后台任务只在真实服务环境启用（takeover 注入 FNMUSIC_BACKGROUND_JOBS=1）；
+    默认关闭，单元测试与手动导入 app 永不触发，避免误扫真实曲库目录。
+    """
+    return os.environ.get("FNMUSIC_BACKGROUND_JOBS", "").lower() in ("1", "true", "yes")
+
+
+async def _lyric_orphan_sweeper() -> None:
+    """启动即清一次、之后每 30 分钟复扫：清掉本插件写进曲库、音频已消失的孤儿
+    .lrc（安全边界见 cache_gc.sweep_orphan_lyrics，用户自有歌词永不触碰）。
+    """
+    while True:
+        try:
+            dirs: list[str] = []
+            for d in (tee_save_dir(), detect_library_dir()):
+                if d and d not in dirs and d != CONF["cache_dir"]:
+                    dirs.append(d)
+            removed = await asyncio.to_thread(sweep_orphan_lyrics, CONF["cache_dir"], dirs)
+            if removed:
+                logger.info("orphan lyric sweep removed %d file(s): %s", len(removed), removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("orphan lyric sweep failed: %s", e)
+        await asyncio.sleep(1800)
+
+
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
@@ -1671,6 +1732,7 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
     logger.info("==================================")
 
+    sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
     created_upstream = False
     created_musicdl = False
     created_musicbox = False
@@ -1718,6 +1780,9 @@ async def lifespan(fastapi_app: FastAPI):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if sweeper_task:
+            sweeper_task.cancel()
+            await asyncio.gather(sweeper_task, return_exceptions=True)
         if created_upstream and getattr(fastapi_app.state, "upstream_client", None):
             await fastapi_app.state.upstream_client.aclose()
             fastapi_app.state.upstream_client = None
@@ -2110,6 +2175,8 @@ def stream_tee_response(
                     remember_media_path(guid, dest)
                     adopt_library_perms(dest)
                     write_audio_tags(dest, title, artist, album)
+                    # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+                    promote_shadow_lyric(guid, dest)
                 else:
                     # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
                     dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
@@ -2280,6 +2347,7 @@ async def stream_track(request: Request, subpath: str = ""):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
+    log_stream_probe(request.method, guid, range_header, bool(cached))
     if request.method == "HEAD":
         return await _stream_head_response(request, guid, cached, range_header)
     if cached:

@@ -486,7 +486,8 @@ def environment(base):
             if len(words) > 1:
                 raise Unsafe('dotenv value must be quoted')
             env[key] = words[0] if words else ''
-    env.update(FNMUSIC_HOME=str(base), PYTHONUNBUFFERED='1', PYTHONDONTWRITEBYTECODE='1')
+    env.update(FNMUSIC_HOME=str(base), PYTHONUNBUFFERED='1', PYTHONDONTWRITEBYTECODE='1',
+               FNMUSIC_BACKGROUND_JOBS='1')
     return env
 
 
