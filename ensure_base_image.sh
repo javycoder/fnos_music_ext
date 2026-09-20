@@ -7,16 +7,15 @@ set -euo pipefail
 #       加速器异常（401/超时）时 BuildKit 解析 python:3.13-slim 元数据会失败且不会
 #       回退官方源，导致 docker compose up --build 直接失败。
 # 本脚本不修改任何系统配置，仅为本应用解析一个「真实可拉取」的基础镜像引用：
-#   1. 环境变量 BASE_IMAGE 手动指定 → 仅验证该引用（跳过自动探测）
-#   2. .env 已缓存的镜像源引用 FNMUSIC_BASE_IMAGE → 真实拉取验证，可用即沿用
-#   3. 国内镜像优先逐个尝试（环境变量 FNMUSIC_DOCKER_MIRRORS 空格分隔可覆盖）：
-#      daemon 加速器（如 docker.fnnas.com）只拦截 docker.io 短引用，完整镜像源引用
-#      直连对应仓库，绕开故障/限速的加速器，稳定可靠
-#   4. 官方 python:3.13-slim 作为最后兜底（走 daemon 加速器链路，国内网络下常慢/不稳）
+#   1. 环境变量 BASE_IMAGE 手动指定 → 仅验证该引用（跳过自动探测，支持本地短路）
+#   2. 本地探测短路优先：候选引用拉取前先本地探测，已存在则秒级跳过拉取，零网络请求
+#   3. 最多尝试 FNMUSIC_MIRROR_TRIES（默认 2）个镜像源（含 .env 缓存源）：
+#      缓存源优先复用，随后国内镜像源补足至上限；拉取时打印候选进度并保留错误信息
+#   4. 官方 python:3.13-slim 作为最后兜底（不计入镜像源上限）
 # 探测结果经 proxy/env_merge.py 安全增量写入 .env 的 FNMUSIC_BASE_IMAGE（备份+600 权限），
 # docker-compose.yml 的 build.args 自动读取该值；install.sh / extend.sh / 手动重建全部生效。
 # 用法: bash ensure_base_image.sh   （由 install.sh / extend.sh 在 docker 模式构建前调用）
-# 可调环境变量: BASE_IMAGE / FNMUSIC_DOCKER_MIRRORS / PULL_TIMEOUT（单次拉取超时秒数，默认 240）
+# 可调环境变量: BASE_IMAGE / FNMUSIC_DOCKER_MIRRORS / FNMUSIC_MIRROR_TRIES（镜像源尝试上限，默认 2） / PULL_TIMEOUT（单次拉取超时秒数，默认 240）
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +23,7 @@ ENV_PATH="${BASE_DIR}/.env"
 BASE_TAG="python:3.13-slim"
 DEFAULT_MIRRORS="docker.1ms.run docker.m.daocloud.io docker.1panel.live hub.rat.dev"
 PULL_TIMEOUT="${PULL_TIMEOUT:-240}"
+MIRROR_TRIES="${FNMUSIC_MIRROR_TRIES:-2}"
 
 log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
 log_warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
@@ -46,11 +46,18 @@ cached_base_image() {
         | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true
 }
 
+# 检查镜像是否已存在于本地（超时 10 秒，避免 daemon 挂起）
+image_exists_local() {
+    local ref="$1"
+    # shellcheck disable=SC2086
+    timeout 10 ${DOCKER_CMD} image inspect "${ref}" >/dev/null 2>&1
+}
+
 # 用真实 docker pull 验证（与 BuildKit 构建走同一条 daemon 链路，顺带预取镜像层）
 pull_ok() {
     local ref="$1"
     # shellcheck disable=SC2086
-    timeout "${PULL_TIMEOUT}" ${DOCKER_CMD} pull "$ref" >/dev/null 2>&1
+    timeout "${PULL_TIMEOUT}" ${DOCKER_CMD} pull --quiet "${ref}"
 }
 
 # 安全增量写入 FNMUSIC_BASE_IMAGE（沿用 install.sh 的 env_merge 备份惯例）
@@ -90,23 +97,38 @@ if [ -n "${MANUAL}" ]; then
     log_info "已通过 BASE_IMAGE 手动指定基础镜像，跳过自动探测。"
     add_candidate "${MANUAL}"
 else
-    # 缓存的镜像源引用优先复用；缓存的官方短引用（docker.io 域）不提前——
+    # 缓存的镜像源引用优先复用（计入镜像源上限）；缓存的官方短引用（docker.io 域）不提前——
     # daemon 加速器链路不稳时它最慢最不可靠，统一沉底做最后兜底
     case "${CACHED}" in
         ""|"${BASE_TAG}"|"docker.io/"*|"registry.hub.docker.com/"*) ;;
-        *) add_candidate "${CACHED}" ;;
+        *)
+            if [ "${#CANDIDATES[@]}" -lt "${MIRROR_TRIES}" ]; then
+                add_candidate "${CACHED}"
+            fi
+            ;;
     esac
     local_mirrors="${MIRRORS}"
     # shellcheck disable=SC2086
     for m in ${local_mirrors}; do
+        if [ "${#CANDIDATES[@]}" -ge "${MIRROR_TRIES}" ]; then
+            break
+        fi
         add_candidate "${m}/library/${BASE_TAG}"
     done
     add_candidate "${BASE_TAG}"
 fi
 
 CHOSEN=""
+total="${#CANDIDATES[@]}"
+idx=0
 for ref in "${CANDIDATES[@]}"; do
-    log_info "尝试拉取基础镜像: ${ref} ..."
+    idx=$((idx + 1))
+    log_info "[${idx}/${total}] ${ref}（超时 ${PULL_TIMEOUT}s，失败将自动切换下一源）"
+    if image_exists_local "${ref}"; then
+        log_info "基础镜像 ${ref} 本地已存在，跳过拉取。"
+        CHOSEN="${ref}"
+        break
+    fi
     rc=0
     pull_ok "${ref}" || rc=$?
     if [ "${rc}" -eq 0 ]; then
