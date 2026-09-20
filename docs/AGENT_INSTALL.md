@@ -1,28 +1,27 @@
 # Agent 安装提示词
 
 本提示词专为 AI CLI Agent（如 OpenCode、Claude Code、Cursor 等）自动化部署与运维设计。
-人工详细安装步骤、部署模式差异与背景说明见：[人工安装与部署指南](INSTALL.md)。
+人工详细安装步骤、部署形态说明与背景见：[安装与部署指南](INSTALL.md)。
 
 把下面代码块内的整段内容复制给 Agent。要求：只改本仓库与本机配置，禁止改飞牛系统文件，禁止把密钥写入 git。
 
 ```text
 你在一台已安装飞牛 NAS（fnOS）和「飞牛音乐」(trim.music) 的机器上工作。
-仓库是 fnmusic-ext：无侵入 Unix Socket 代理，扩展在线搜索/播放/歌词/封面/边听边存。
+仓库是 fnmusic-ext v2.0.0：无侵入 Unix Socket 代理，扩展在线搜索/播放/歌词/封面/
+边听边存；三个音源 + WebUI 合并为单个 Docker 容器 fnmusic-sources（supervisor 按
+.env 只启动所选音源进程）。
 
 【核心运行原则与硬约束（违反即失败）】
 1. 禁止修改 /usr/trim/nginx 以及任何 nginx 配置；飞牛系统更新或配置重载会回写覆盖。
 2. 禁止 patch trim-music 官方二进制，禁止写入官方 music.db（只读读取 play_history 进行口味分析可以）。
 3. 禁止把 API Key、密码、token 写进源码、测试、README、commit、issue 或 echo 打印到终端日志。所有密钥仅保存在仓库根目录 .env（文件权限 chmod 600）。
-4. 绝对禁止擅自安装 Docker 引擎：fnOS 的 Docker 必须在「应用中心」由系统管理员安装。若环境未安装 Docker，必须选用 Host 宿主机模式，严禁执行 apt-get install docker 等命令。
-5. 核心代理运行原则：无论选择 Docker 模式还是 Host 模式，核心代理服务（fnmusic-ext）都必须由宿主机 systemd（运行在项目根目录 .venv-proxy 独立虚拟环境中）原生管理，负责无侵入接管 /var/run/trim_music.socket。两种模式的区别仅在于「音源服务（musicdl / musicbox / lxmusic）」以何种方式运行与隔离。
-6. 一键扩展 ./extend.sh 与一键还原 ./restore.sh（含彻底清理 ./restore.sh --full）必须始终保持可用；扩展失败必须安全秒级回滚到官方直连。
-7. 单机单部署：代理单元名、音源容器名与安装锁全局唯一，本机以 /var/lib/fnmusic-ext/deployment 登记当前部署目录。从另一份仍存在的仓库副本执行安装/扩展/还原会被拒绝；Agent 不得用克隆目录绕过，应在原部署目录操作，或经用户确认后使用 --adopt 显式迁移部署。原登记目录已删除时不拦截。
-8. 音源组件与端口规划：
-   - musicdl: https://github.com/CharlesPikachu/musicdl（酷我/咪咕聚合，127.0.0.1:8768）。
-   - musicbox: https://github.com/darknessomi/musicbox（网易云；Docker/Host 均可映射 0.0.0.0:8770 便于局域网扫码 http://<NAS-IP>:8770/api/v1/auth/login/qr.png；凭证在 musicbox-data/）。
-   - lxmusic: 洛雪风格免登录解析（酷狗/网易/咪咕），127.0.0.1:8772。
-   - 音源可多选、至少选一个。编号是全局「源+平台」ID（见 musicdl-service/PLATFORMS.md）：1=网易云 musicbox，2=mdl-酷我，62=lx-酷我 等。向导只列精选，其余对照文档输入编号。非整源数字：1,2,3 现为三个具体平台。三整源示例 --sources musicbox,musicdl,lxmusic。非交互默认仅 musicdl。
-   - 安装写入 FNMUSIC_DEPLOY_MODE；重装改源会停用未选项；install --extend 会带 --force 重载代理配置。
+4. 绝对禁止擅自安装 Docker 引擎：fnOS 的 Docker 必须在「应用中心」由系统管理员安装。v2.0.0 仅支持 Docker 部署：若环境未安装 Docker 或 docker daemon 不可用，install.sh 会直接报错退出——此时应报告用户先安装 Docker，严禁执行 apt-get install docker 等命令，严禁尝试任何 host 模式替代。
+5. 部署形态：核心代理由宿主机 systemd（项目根 .venv-proxy 虚拟环境）运行并接管 /var/run/trim_music.socket；音源（musicdl 8768 / musicbox 8770 / lxmusic 8772）与 WebUI（8774）全部在单容器 fnmusic-sources 内按需运行。
+6. 音源三选一互斥：--sources 与 .env 的三个 FNMUSIC_*_ENABLED 开关只能有一个为 true，跨音源组合会被 install.sh 拒绝。换源属于运行期操作（WebUI 或改 .env 后 ./extend.sh），不要通过重装切换。
+7. 洛雪 lxmusic 源：播放解析依赖用户提供的洛雪自定义源脚本 URL（LX_SOURCE_URL）。非交互安装选 lxmusic 时必须携带 --lx-source-url '<URL>'；安装器会在容器内做全链路校验（下载→初始化→搜索→解析→探活）。校验失败分类提示，Agent 应把原始错误转告用户而不是自行编造 URL。
+8. 一键扩展 ./extend.sh 与一键还原 ./restore.sh（含彻底清理 ./restore.sh --full）必须始终保持可用；扩展失败必须安全秒级回滚到官方直连。
+9. 单机单部署：代理单元名、音源容器名与安装锁全局唯一，本机以 /var/lib/fnmusic-ext/deployment 登记当前部署目录。从另一份仍存在的仓库副本执行安装/扩展/还原会被拒绝；Agent 不得用克隆目录绕过，应在原部署目录操作，或经用户确认后使用 --adopt 显式迁移部署。原登记目录已删除时不拦截。
+10. WebUI（端口 8774）无鉴权，仅限可信内网；安装开关为 --webui / --no-webui，非交互默认不装。
 
 【自动化部署执行步骤】
 
@@ -30,59 +29,45 @@
 在仓库根目录执行：
   chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
-步骤 2：环境预检（Preflight Checks）与模式决策
-在执行安装前进行环境检测判断（install.sh 会自动执行安全预检，Agent 应先行确认或理解预检逻辑）：
-  1. Python 环境：检查系统具备 python3 (>=3.11) 以及 python3-venv 模块。若缺失，需先安装：sudo apt-get update && sudo apt-get install -y python3 python3-venv。
-  2. 管理员权限：确认当前执行用户具备 sudo 权限（非交互脚本需免密 sudo）。
-  3. 飞牛音乐运行套接字：确认官方套接字 /var/run/trim_music.socket 存在。若不存在，提示用户必须先在 fnOS「应用中心」安装并启动「飞牛音乐」。
-  4. Docker / Host 模式决策：
-     - 运行 command -v docker 检测 Docker 环境：
-       * 若已安装 Docker：采用 --mode docker（推荐，音源在 compose 轻量无特权容器中运行，隔离最彻底）。
-       * 若未安装 Docker：采用 --mode host（使用项目内独立的 .venv-musicdl / .venv-musicbox / .venv-lxmusic 虚拟环境运行并注册为 systemd 服务，纯净轻量，零全局依赖污染；切勿擅自安装 Docker）。
+步骤 2：环境预检（install.sh 会自动执行，Agent 应先行确认）
+  1. Python 环境：python3 (>=3.11) 与 python3-venv；缺失时安装：sudo apt-get update && sudo apt-get install -y python3 python3-venv。
+  2. 管理员权限：当前用户具备 sudo 权限（非交互需免密 sudo）。
+  3. 飞牛音乐运行套接字 /var/run/trim_music.socket 存在；不存在则提示用户先在「应用中心」安装并启动「飞牛音乐」。
+  4. Docker：command -v docker 且 docker info 可用。任一不满足即停止并报告（见硬约束 4）。
 
 步骤 3：执行安装与一步到位启用（--extend）
-推荐使用 --extend 参数，让 install.sh 在依赖就绪、服务配置完成后自动调用 ./extend.sh 进行 Unix Domain Socket 接管与端到端验收自检，实现安装+接管一步到位：
-  - Docker 模式（推荐，三音源一步到位）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic --extend
-  - Docker 模式（单音源 / 仅洛雪）：
-    ./install.sh --non-interactive --mode docker --sources musicdl --extend
-    ./install.sh --non-interactive --mode docker --sources lxmusic --extend
-  - Host 模式（宿主机独立 venv）：
-    ./install.sh --non-interactive --mode host --sources musicdl,musicbox,lxmusic --extend
-  - 每日推荐默认采信音源原生推荐（无需额外参数）；若用户未启用网易音源并希望配置大模型兜底，可追加（密钥仅写入 .env，禁止 echo 到日志）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,lxmusic \
-      --enable-recommend \
-      --llm-base-url '<用户提供的 URL>' \
-      --llm-api-key '<用户提供的 KEY>' \
-      --llm-model '<模型名称或 gpt-4o-mini>' \
-      --extend
-    （注：平时每日推荐自动采信网易/洛雪原生推荐，仅网易音源未启用时大模型兜底生效）。
+推荐命令（按用户所选音源三选一）：
+  - 网易云 musicbox（含 WebUI）：
+    ./install.sh --non-interactive --sources musicbox --webui --extend
+  - musicdl（默认精选酷我+咪咕；平台粒度用 musicdl-<短名> 或编号）：
+    ./install.sh --non-interactive --sources musicdl --extend
+  - 洛雪 lxmusic（--lx-source-url 必填）：
+    ./install.sh --non-interactive --sources lxmusic --lx-source-url '<URL>' --extend
+  - 大模型推荐兜底（可选；密钥仅写入 .env，禁止 echo）：
+    追加 --enable-recommend --llm-base-url '<URL>' --llm-api-key '<KEY>' --llm-model '<模型>'
   - 若安装时未加 --extend，则需在安装完成后显式执行 ./extend.sh。
 
 步骤 4：端到端健康检查与验收
-部署完成后执行以下验证命令：
   1. 探测代理接管与各组件健康端点：
      curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
-     期望输出 JSON 中 "ok": true 且 "upstream": "ok"；已启用的音源状态为 "ok"，未启用的音源为 "disabled"。
-  2. Shell 语法检查：
-     bash -n extend.sh restore.sh install.sh proxy/run_proxy.sh
-  3. Python 代码语法检查：
-     .venv-proxy/bin/python -m py_compile proxy/app.py proxy/recommend.py
-     （可选运行自动化测试集：.venv-proxy/bin/python -m pytest proxy/tests -q）
+     期望 "ok": true 且 "upstream": "ok"；已启用音源为 "ok"，未启用为 "disabled"。
+  2. 所选音源容器内端点（仅启用项）：
+     curl -s http://127.0.0.1:8768/healthz   # musicdl
+     curl -s http://127.0.0.1:8770/healthz   # musicbox
+     curl -s http://127.0.0.1:8772/healthz   # lxmusic（检查 user_source.initialized）
+  3. Shell 语法检查：bash -n install.sh extend.sh restore.sh proxy/run_proxy.sh
+  4. Python 语法检查：.venv-proxy/bin/python -m py_compile proxy/app.py proxy/recommend.py
+     （可选：.venv-proxy/bin/python -m pytest -q）
 
 步骤 5：还原机制与彻底卸载规范（知悉与必要时使用）
-  - 日常无损还原（秒级恢复官方原生直连）：
-    ./restore.sh
-    复位 Unix Socket，停用 fnmusic-ext 代理服务，秒级恢复官方直连；保留音源容器/服务及本地缓存数据，日后执行 ./extend.sh 可秒级重新上线。
-  - 彻底清理卸载（系统级服务零残留）：
-    ./restore.sh --full
-    在复位 Socket 并停用核心代理的同时，自动停止并删除音源 Docker 容器（fnmusic-musicdl、fnmusic-musicbox）或注销宿主机 systemd 音源服务（fnmusic-musicdl.service、fnmusic-musicbox.service）。
+  - 日常无损还原：./restore.sh —— 复位 Socket、停用代理、停止音源容器，秒级恢复官方直连；.env 与全部数据保留。
+  - 彻底清理：./restore.sh --full —— 额外删除 .env、登录态、缓存、收藏、历史与 .venv-*。
 
 【完成汇报规范】
 任务完成后用简短中文输出总结，内容包含：
-1. 部署模式判断（Docker 模式或 Host 模式，及环境预检依据）；
-2. 启用的音源与端口说明（musicdl: 127.0.0.1:8768，musicbox: 0.0.0.0:8770，lxmusic: 127.0.0.1:8772）；
-3. 每日推荐是否开启（严禁复述敏感密钥）；
+1. 部署形态确认（Docker 单容器 + 宿主机核心代理）与环境预检结论；
+2. 所选音源与端口（musicdl 127.0.0.1:8768 / musicbox 0.0.0.0:8770 / lxmusic 127.0.0.1:8772）及 WebUI 是否安装（8774）；
+3. 洛雪源校验结论（若适用：源名称/版本/推导平台）；每日推荐是否开启（严禁复述敏感密钥）；
 4. healthz 接口探测响应 JSON；
 5. extend 链路接管与验收状态。
 ```

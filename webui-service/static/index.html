@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>fnmusic-ext 管理台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="brand-mark">♪</span>
+        <div>
+          <div class="brand-name">fnmusic-ext</div>
+          <div class="brand-sub" id="brand-version">管理台</div>
+        </div>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-page="overview">概览</button>
+        <button class="nav-item" data-page="source">音乐源</button>
+        <button class="nav-item" data-page="quality">播放与推荐</button>
+        <button class="nav-item" data-page="tee">边听边存</button>
+        <button class="nav-item" data-page="llm">高级 · 大模型</button>
+      </nav>
+      <div class="sidebar-foot" id="sidebar-foot"></div>
+    </aside>
+
+    <main class="main">
+      <!-- 概览 -->
+      <section class="page active" id="page-overview">
+        <h2>概览</h2>
+        <div class="card" id="ov-provider">
+          <div class="card-title">当前音源</div>
+          <div id="ov-provider-body" class="muted">加载中…</div>
+        </div>
+        <div class="card">
+          <div class="card-title">进程状态（按需加载：仅启用音源 + WebUI 常驻）</div>
+          <div id="ov-processes" class="chip-grid"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">服务健康</div>
+          <div id="ov-services" class="stack"></div>
+        </div>
+        <div class="card" id="ov-lx-card" hidden>
+          <div class="card-title">洛雪自定义源</div>
+          <div id="ov-lx" class="stack"></div>
+        </div>
+      </section>
+
+      <!-- 音乐源 -->
+      <section class="page" id="page-source">
+        <h2>音乐源（三选一）</h2>
+        <p class="hint">切换即时生效：旧音源进程停止、新音源进程启动，代理配置热重载。点选未启用的音源会临时拉起其进程供预览（选平台/测试源/扫码立即可用），保存后转正式启用，5 分钟内未保存自动停止。</p>
+        <div class="provider-grid">
+          <label class="provider-card" data-provider="musicbox">
+            <input type="radio" name="provider" value="musicbox">
+            <div class="provider-head">网易云音乐盒子</div>
+            <div class="provider-desc">账号扫码登录，个人曲库/每日推荐原生支持</div>
+          </label>
+          <label class="provider-card" data-provider="musicdl">
+            <input type="radio" name="provider" value="musicdl">
+            <div class="provider-head">musicdl 聚合音源</div>
+            <div class="provider-desc">免登录多平台聚合，自选启用平台</div>
+          </label>
+          <label class="provider-card" data-provider="lxmusic">
+            <input type="radio" name="provider" value="lxmusic">
+            <div class="provider-head">洛雪自定义源</div>
+            <div class="provider-desc">粘贴洛雪自定义源脚本 URL，播放解析全走用户源</div>
+          </label>
+        </div>
+
+        <!-- musicbox：扫码登录 -->
+        <div class="subpanel" id="panel-musicbox" hidden>
+          <div class="card">
+            <div class="card-title">网易扫码登录</div>
+            <p class="hint">手机网易云音乐 App 扫码授权。登录态保存在数据卷，重启不丢失。</p>
+            <div class="qr-area">
+              <img id="qr-img" alt="登录二维码" hidden>
+              <div id="qr-status" class="muted">点击下方按钮生成二维码</div>
+            </div>
+            <div class="btn-row">
+              <button class="btn" id="qr-btn">生成二维码</button>
+              <span id="qr-check" class="muted"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- musicdl：平台多选 -->
+        <div class="subpanel" id="panel-musicdl" hidden>
+          <div class="card">
+            <div class="card-title">启用平台（多选）</div>
+            <div class="btn-row">
+              <input class="input grow" id="platform-search" placeholder="搜索平台…">
+              <button class="btn" id="platform-reload">刷新列表</button>
+            </div>
+            <div id="platform-list" class="chip-grid pad"></div>
+            <p class="hint" id="platform-note"></p>
+          </div>
+        </div>
+
+        <!-- lx：源 URL -->
+        <div class="subpanel" id="panel-lxmusic" hidden>
+          <div class="card">
+            <div class="card-title">洛雪自定义源</div>
+            <p class="hint">粘贴洛雪音乐自定义源脚本地址（以 http/https 开头）。保存前会自动做端到端校验。</p>
+            <div class="btn-row">
+              <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js">
+              <button class="btn" id="lx-test">测试</button>
+            </div>
+            <div id="lx-report" class="report" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 播放与推荐 -->
+      <section class="page" id="page-quality">
+        <h2>播放与推荐</h2>
+        <div class="card">
+          <div class="card-title">音质偏好</div>
+          <div class="radio-list" id="quality-list">
+            <label><input type="radio" name="quality" value="high"><div><b>高音质</b><span>优先最高档，失败逐级向下</span></div></label>
+            <label><input type="radio" name="quality" value="balanced"><div><b>平衡</b><span>取中间档（偶数档取中间偏高），失败先降后升</span></div></label>
+            <label><input type="radio" name="quality" value="smooth"><div><b>流畅</b><span>优先最低档，最快出声</span></div></label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">推荐</div>
+          <label class="switch-row"><span>热门榜单推荐<div class="sub">音源支持时提供热门/飙升榜单</div></span><input type="checkbox" id="recommend-hot"></label>
+          <label class="switch-row"><span>每日推荐<div class="sub">网易每日歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
+        </div>
+      </section>
+
+      <!-- 边听边存 -->
+      <section class="page" id="page-tee">
+        <h2>边听边存</h2>
+        <div class="card">
+          <label class="switch-row"><span>边听边存<div class="sub">完整试听在线歌后自动保存到本地曲库</div></span><input type="checkbox" id="tee-enabled"></label>
+          <label class="field"><span>保存路径</span>
+            <input class="input" id="tee-dir" placeholder="留空自动探测共享曲库目录">
+          </label>
+          <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
+            <input class="input" id="tee-max" type="number" min="1" max="100">
+          </label>
+          <p class="hint">缓存数仅在关闭边听边存时生效；restore 还原时会一并清理这些滚动缓存。</p>
+        </div>
+      </section>
+
+      <!-- LLM -->
+      <section class="page" id="page-llm">
+        <h2>高级 · 大模型</h2>
+        <div class="card">
+          <p class="hint">配置 OpenAI 兼容接口后，非网易音源也可获得每日推荐。留空即禁用。保存后代理热重载生效。</p>
+          <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
+          <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
+          <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 移动端底部导航 -->
+  <nav class="bottom-nav" id="bottom-nav">
+    <button class="nav-item active" data-page="overview">概览</button>
+    <button class="nav-item" data-page="source">音源</button>
+    <button class="nav-item" data-page="quality">播放</button>
+    <button class="nav-item" data-page="tee">缓存</button>
+    <button class="nav-item" data-page="llm">高级</button>
+  </nav>
+
+  <!-- 保存条 -->
+  <div class="save-bar" id="save-bar">
+    <span id="save-note" class="muted"></span>
+    <button class="btn primary" id="save-btn">保存并生效</button>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
