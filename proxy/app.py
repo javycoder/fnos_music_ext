@@ -33,10 +33,12 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 try:
     from . import recommend as dailyrec
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
+    from .env_merge import parse_env_file
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
+    from env_merge import parse_env_file  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -75,9 +77,9 @@ CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
-    "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").lower() in ("true", "1", "yes"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
@@ -114,6 +116,13 @@ CONF = {
     ),
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
+    # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order）；
+    # 推荐双开关 / 封面补全 / .env 热重载默认开，均可被 .env 覆盖
+    "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
+    "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
+    "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
+    "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
+    "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
 }
 
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
@@ -193,6 +202,118 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
     _SEARCH_CACHE[keyword] = entry
 
 
+# === .env 热重载（FNMUSIC_ENV_WATCH=1 默认开） ===
+# WebUI 切源 / 手工编辑 .env 后无需重启 proxy：白名单键同步进 CONF 与
+# os.environ（recommend 的 LLM 配置直接读环境变量），并清空搜索缓存让
+# 新选音源立即生效。路径/端口类配置不在白名单，仍需重启。
+_ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
+    "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
+    "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
+    "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
+    "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
+    "LX_SOURCES": ("lx_sources", "lx_sources"),
+    "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
+    "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
+    "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
+    "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
+    "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
+    "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
+    "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
+    "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
+    "FNMUSIC_LLM_API_KEY": ("", "str"),
+    "FNMUSIC_LLM_MODEL": ("llm_model", "str"),
+}
+_ENV_WATCH_INTERVAL_S = 2.0
+_ENV_WATCH_DEBOUNCE_S = 0.5
+
+
+def _env_watch_path() -> str:
+    return os.environ.get("FNMUSIC_ENV_FILE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", ".env"
+    )
+
+
+def _env_watch_parse(raw: str, kind: str):
+    raw = str(raw or "").strip()
+    if kind == "bool":
+        return raw.lower() in ("true", "1", "yes")
+    if kind == "tee_cache_max":
+        try:
+            return max(1, min(100, int(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "quality_mode":
+        return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
+    if kind == "lx_sources":
+        return _normalize_lx_sources(raw)
+    if kind == "llm_url":
+        return raw.rstrip("/")
+    return raw
+
+
+def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
+    """解析 .env 应用白名单键；返回发生变化的 CONF 键名（空 = 无变化）。
+
+    环境变量同步写原始字符串（recommend 等模块直接读 os.environ）。
+    """
+    path = env_path or _env_watch_path()
+    kv = dict(parse_env_file(path)[0])
+    changed: list[str] = []
+    for env_key, (conf_key, kind) in _ENV_WATCH_KEYS.items():
+        if env_key not in kv:
+            continue
+        os.environ[env_key] = str(kv[env_key])
+        value = _env_watch_parse(kv[env_key], kind)
+        if value is None:
+            continue
+        if conf_key and CONF.get(conf_key) != value:
+            CONF[conf_key] = value
+            changed.append(conf_key)
+    return changed
+
+
+def _reset_search_cache() -> None:
+    tasks = [
+        entry.get("task") for entry in _SEARCH_CACHE.values()
+        if entry.get("task") and not entry["task"].done()
+    ]
+    for task in tasks:
+        task.cancel()
+    _SEARCH_CACHE.clear()
+
+
+def _env_watch_stat(path: "str | None" = None):
+    try:
+        st = os.stat(path or _env_watch_path())
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+async def _env_watch_loop() -> None:
+    last = _env_watch_stat()
+    while True:
+        try:
+            await asyncio.sleep(_ENV_WATCH_INTERVAL_S)
+            cur = _env_watch_stat()
+            if cur is None or cur == last:
+                last = cur
+                continue
+            await asyncio.sleep(_ENV_WATCH_DEBOUNCE_S)
+            settled = _env_watch_stat()
+            if settled != cur:
+                continue  # 仍在写入，下一轮再看
+            last = settled
+            changed = apply_env_hot_reload()
+            if changed:
+                _reset_search_cache()
+                logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("env watch loop error: %s", e)
+
+
 def _source_config() -> dict:
     return {k: v for k, v in CONF.items() if k.endswith(("_enabled", "_url", "_limit", "_quality", "_sources")) or k == "online_sources"}
 
@@ -206,7 +327,7 @@ def _search_scope(request: Request) -> str:
 
 def _source_enabled(guid: str) -> bool:
     source = source_from_online_guid(guid)
-    if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled"), True):
+    if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled")):
         return False
     if source == "lx":
         # lx 平台白名单（online:lx:<platform>:<id>）；未配置 = 跟随 lx 服务全部已启用平台
@@ -1332,15 +1453,41 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, s
         return None
 
 
+# 音质档（从低到高）：网易 = musicbox QUALITY_WHITELIST 全集；
+# lx = 洛雪源脚本三档（128k/320k/flac 对应 standard/high/lossless）
+_NETEASE_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster"]
+_LX_QUALITY_LADDER = ["standard", "high", "lossless"]
+
+
+def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", primary: "str | None" = None) -> list[str]:
+    """按音质模式排档序（ladder 从低到高）。
+
+    high（默认）：锚定 primary（缺省取最高档）向下逐级，失败逐级降档；
+    balanced：取中间档（偶数档取中间偏高），失败先向下再向上；
+    smooth：从低到高，优先最省流量的档。
+    """
+    seq = [q for q in ladder if q]
+    if not seq:
+        return []
+    mode = str(mode or "high").strip().lower()
+    if mode == "smooth":
+        return list(seq)
+    if mode == "balanced":
+        mid = len(seq) // 2
+        return [seq[mid]] + list(reversed(seq[:mid])) + seq[mid + 1:]
+    if primary in seq:
+        idx = seq.index(primary)
+    else:
+        idx = len(seq) - 1
+    return [seq[idx]] + list(reversed(seq[:idx]))
+
+
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
-    qualities = []
     primary = str(CONF.get("lx_quality") or "lossless").strip()
-    if primary:
-        qualities.append(primary)
-    for fallback in ("high", "standard"):
-        if fallback not in qualities:
-            qualities.append(fallback)
+    qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
+    if primary and primary not in qualities:
+        qualities.insert(0, primary)
 
     for q in qualities:
         try:
@@ -1361,12 +1508,10 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
 
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
-    qualities = []
     primary = str(CONF.get("netease_quality") or "lossless").strip()
-    if primary:
-        qualities.append(primary)
-    if "exhigh" not in qualities:
-        qualities.append("exhigh")
+    qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
+    if primary and primary not in qualities:
+        qualities.insert(0, primary)
 
     for q in qualities:
         try:
@@ -1733,6 +1878,9 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("==================================")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
+    env_task = asyncio.create_task(_env_watch_loop()) if (
+        _background_jobs_enabled() and CONF.get("env_watch", True)
+    ) else None
     created_upstream = False
     created_musicdl = False
     created_musicbox = False
@@ -1783,6 +1931,9 @@ async def lifespan(fastapi_app: FastAPI):
         if sweeper_task:
             sweeper_task.cancel()
             await asyncio.gather(sweeper_task, return_exceptions=True)
+        if env_task:
+            env_task.cancel()
+            await asyncio.gather(env_task, return_exceptions=True)
         if created_upstream and getattr(fastapi_app.state, "upstream_client", None):
             await fastapi_app.state.upstream_client.aclose()
             fastapi_app.state.upstream_client = None
@@ -1851,9 +2002,9 @@ async def ext_healthz(request: Request):
             return {"status": "fail", "error": type(exc).__name__}
 
     checks = [("upstream", True, get_upstream_client, "/music/api/v1/search/track?keyword=healthz_probe"),
-              ("musicdl", CONF.get("musicdl_enabled", True), get_musicdl_client, "/healthz"),
-              ("musicbox", CONF.get("netease_enabled", True), get_musicbox_client, "/healthz"),
-              ("lxmusic", CONF.get("lx_enabled", True), get_lx_client, "/healthz")]
+              ("musicdl", CONF.get("musicdl_enabled"), get_musicdl_client, "/healthz"),
+              ("musicbox", CONF.get("netease_enabled"), get_musicbox_client, "/healthz"),
+              ("lxmusic", CONF.get("lx_enabled"), get_lx_client, "/healthz")]
     enabled = [(name, getter, path) for name, on, getter, path in checks if on]
     results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
     details = {name: {"status": "disabled"} for name, on, _, _ in checks if not on}
@@ -1865,9 +2016,9 @@ async def ext_healthz(request: Request):
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
                 "mode": "source-native",
-                "netease": bool(CONF.get("netease_enabled", True)),
-                "lx": bool(CONF.get("lx_enabled", True)),
-                "llm_fallback": dailyrec.llm_enabled() and not CONF.get("netease_enabled", True),
+                "netease": bool(CONF.get("netease_enabled")),
+                "lx": bool(CONF.get("lx_enabled")),
+                "llm_fallback": dailyrec.llm_enabled() and not CONF.get("netease_enabled"),
                 "recent": dailyrec.last_recommend_summary(),
             },
             "degraded": bool(failed), "failures": failed, "details": details}
@@ -1943,6 +2094,8 @@ async def search_track(request: Request):
     if (not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry):
         task = asyncio.create_task(_aggregate_search(request, keyword, entry))
         entry["task"] = task
+    # 首屏等待适用于当前唯一启用源（musicbox/musicdl/lx 同样需要：
+    # 不等待则首屏 total 不含在线条目，客户端不会翻页去取在线结果）
     if task and not task.done():
         if page == 1:
             await asyncio.wait({task}, timeout=float(CONF["netease_wait_s"]))
@@ -1971,11 +2124,11 @@ async def search_track(request: Request):
 
 async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
     sources = []
-    if CONF.get("netease_enabled", True):
+    if CONF.get("netease_enabled"):
         sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
-    if CONF.get("musicdl_enabled", True):
+    if CONF.get("musicdl_enabled"):
         sources.append(fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
-    if CONF.get("lx_enabled", True):
+    if CONF.get("lx_enabled"):
         sources.append(fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
     tasks = [asyncio.create_task(coro) for coro in sources]
     pending = set(tasks)
@@ -2046,7 +2199,7 @@ async def search_suggest(request: Request):
     headers = copy_incoming_headers(request)
 
     musicdl_task: asyncio.Task | None = None
-    if keyword and CONF.get("musicdl_enabled", True):
+    if keyword and CONF.get("musicdl_enabled"):
         musicdl_task = asyncio.create_task(fetch_musicdl_search(musicdl_client, keyword, 5))
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
@@ -2339,6 +2492,43 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
     return Response(status_code=206 if "content-range" in headers else 200, headers=headers)
 
 
+def _candidate_kbps(item: dict) -> float:
+    """同录音候选的估算码率 kbps（file_size*8/duration）；未知返回 0。"""
+    try:
+        dur = float(item.get("duration_s") or 0)
+        size = float(item.get("file_size") or 0)
+        if dur > 0 and size > 0:
+            return size * 8.0 / dur / 1000.0
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def ordered_stream_alternatives(item: dict) -> list[dict]:
+    """musicdl 同录音跨平台候选按音质模式排序。
+
+    high：码率高者优先；balanced：中间码率先向下再向上；smooth：码率低者优先。
+    无码率信息时保持原始顺序。
+    """
+    alts = [
+        x for x in (item.get("_alternatives") or [])
+        if isinstance(x, dict) and _same_recording(item, x)
+    ]
+    mode = str(CONF.get("quality_mode") or "high").strip().lower()
+    known = sorted({round(_candidate_kbps(x), 1) for x in alts if _candidate_kbps(x) > 0})
+    if not known:
+        return list(alts)
+    if mode == "smooth":
+        order = known
+    elif mode == "balanced":
+        mid = len(known) // 2
+        order = [known[mid]] + list(reversed(known[:mid])) + known[mid + 1:]
+    else:
+        order = list(reversed(known))
+    rank = {v: i for i, v in enumerate(order)}
+    return sorted(alts, key=lambda x: rank.get(round(_candidate_kbps(x), 1), len(order)))
+
+
 @app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request, subpath: str = ""):
@@ -2357,7 +2547,7 @@ async def stream_track(request: Request, subpath: str = ""):
     candidates = [guid]
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
-        candidates += [online_guid_from_item(x) for x in item.get("_alternatives", []) if _same_recording(item, x)]
+        candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
     deadline = asyncio.get_running_loop().time() + 12.0
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
@@ -2645,6 +2835,205 @@ async def track_metadata(request: Request, subpath: str = ""):
     return JSONResponse(content=disguise_client_json(payload))
 
 
+# === 封面兜底链：cover_url 302 → 源 CDN 直构（kw rid / qq albummid）→
+# 网易 cloudsearch 补全 → 本地缓存文件内嵌图 → 本地占位图池。
+# 在线曲目封面永不 404（空封面是客户端裂图的主要来源）。 ===
+_COVER_CDN_CACHE: dict[str, tuple[str, float]] = {}
+_COVER_CDN_TTL_S = 7 * 86400.0
+_KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
+_PLACEHOLDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "covers")
+_PLACEHOLDER_COUNT = 6
+_PLACEHOLDER_CACHE: dict[str, bytes] = {}
+# 1x1 灰点：占位图文件意外缺失时的最终兜底，保证响应仍是合法图片
+_TINY_GRAY_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+    b"\xf0\x1f\x00\x05\x05\x02\x00_\xc8\xe7A\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _cover_cache_get(key: str) -> str:
+    hit = _COVER_CDN_CACHE.get(key)
+    if hit and time.time() - hit[1] < _COVER_CDN_TTL_S:
+        return hit[0]
+    _COVER_CDN_CACHE.pop(key, None)
+    return ""
+
+
+def _cover_cache_put(key: str, url: str) -> None:
+    if len(_COVER_CDN_CACHE) > 2000:
+        _COVER_CDN_CACHE.clear()
+    _COVER_CDN_CACHE[key] = (url, time.time())
+
+
+def _kw_rid_from_guid(guid: str) -> str:
+    """酷我 rid：lx 平台 online:lx:kw:<rid>；musicdl online:kuwo:<rid>。"""
+    parts = (guid or "").split(":")
+    if len(parts) >= 4 and parts[1] == "lx" and parts[2] == "kw":
+        return parts[3]
+    if len(parts) == 3 and parts[1] in ("kw", "kuwo"):
+        return parts[2]
+    return ""
+
+
+def _cover_cdn_client() -> httpx.AsyncClient:
+    # 直构 CDN 探测用独立短超时客户端；transport 仅供测试注入 MockTransport
+    kwargs: dict = {"timeout": 5.0, "follow_redirects": True}
+    if _COVER_CDN_TRANSPORT is not None:
+        kwargs["transport"] = _COVER_CDN_TRANSPORT
+    return httpx.AsyncClient(**kwargs)
+
+
+_COVER_CDN_TRANSPORT: "httpx.AsyncBaseTransport | None" = None
+
+
+async def _kw_cover_by_rid(rid: str) -> str:
+    """酷我 artistpicserver 按 rid 取真图（接口返回文本，需解析出图片地址）。"""
+    rid = str(rid or "").strip()
+    if not rid.isdigit():
+        return ""
+    cached = _cover_cache_get(f"kw:{rid}")
+    if cached:
+        return cached
+    url = (
+        "https://artistpicserver.kuwo.cn/pic?corp=kuwo&type=rid_pic"
+        f"&pictype=500&size=500&rid={rid}"
+    )
+    try:
+        async with _cover_cdn_client() as client:
+            r = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.kuwo.cn/"},
+            )
+        if r.status_code != 200:
+            return ""
+        m = re.search(r"https?://[^\s'\"<>]+?\.(?:jpg|jpeg|png|webp)", r.text, re.IGNORECASE)
+        if not m:
+            return ""
+        real = m.group(0)
+    except Exception as e:
+        logger.debug("kw artistpic resolve failed for rid=%s: %s", rid, e)
+        return ""
+    _cover_cache_put(f"kw:{rid}", real)
+    return real
+
+
+def _qq_cover_by_albummid(albummid: "str | None") -> str:
+    mid = re.sub(r"[^0-9A-Za-z]", "", str(albummid or ""))
+    if len(mid) < 8:
+        return ""
+    return f"https://y.gtimg.cn/music/photo_new/T002R800x800M000{mid}.jpg?max_age=2592000"
+
+
+async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> str:
+    """musicdl/lx 空封面 → 网易 cloudsearch 同名曲补全（FNMUSIC_COVER_ENRICH=1）。"""
+    if not CONF.get("cover_enrich", True):
+        return ""
+    title = str((data or {}).get("title") or "").strip()
+    if not title:
+        return ""
+    artist = str((data or {}).get("artist") or "").strip()
+    key = f"wy:{title.casefold()}|{artist.casefold()}"
+    cached = _cover_cache_get(key)
+    if cached:
+        return cached
+    musicbox_client = get_musicbox_client(request.app)
+    keyword = " ".join(x for x in (artist, title) if x)
+    target = ""
+    try:
+        r = await musicbox_client.get(
+            "/api/v1/search",
+            params={"keyword": keyword, "limit": 5, "type": "song"},
+            timeout=8.0,
+        )
+        if r.status_code != 200:
+            return ""
+        payload = r.json()
+        raw = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(raw, list):
+            return ""
+        title_l = title.casefold()
+        artist_l = artist.casefold()
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            it_title = str(it.get("song_name") or it.get("title") or "")
+            if it_title.casefold() != title_l:
+                continue
+            it_artist = str(it.get("artist") or "")
+            if artist_l and artist_l not in it_artist.casefold() and it_artist.casefold() not in artist_l:
+                continue
+            sid = str(it.get("song_id") or it.get("id") or "")
+            if not sid:
+                continue
+            d = await musicbox_client.get("/api/v1/songs/detail", params={"ids": sid}, timeout=8.0)
+            if d.status_code == 200:
+                dj = d.json()
+                dl = dj.get("data") if isinstance(dj, dict) else None
+                first = dl[0] if isinstance(dl, list) and dl and isinstance(dl[0], dict) else {}
+                target = str(first.get("album_pic_url") or "")
+            break
+    except Exception as e:
+        logger.debug("cover enrich via netease failed for %s: %s", guid, e)
+        return ""
+    if target:
+        _cover_cache_put(key, target)
+    return target
+
+
+def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
+    """本地边听边存缓存文件的内嵌专辑图（mutagen 读 ID3/FLAC/MP4 封面）。"""
+    path = find_cache_file(guid)
+    if not path:
+        return None
+    try:
+        from mutagen import File as MutagenFile
+
+        mf = MutagenFile(path)
+        tags = getattr(mf, "tags", None)
+        if tags is None:
+            return None
+        pics: list = []
+        if hasattr(tags, "pictures"):  # FLAC/APE
+            pics = list(tags.pictures or [])
+        elif hasattr(tags, "getall"):  # ID3
+            pics = list(tags.getall("APIC") or [])
+        elif hasattr(tags, "get"):
+            covr = tags.get("covr")  # MP4
+            pics = list(covr) if covr else []
+        for pic in pics:
+            data = getattr(pic, "data", None)
+            if not data:
+                continue
+            mime = str(getattr(pic, "mime", "") or "")
+            if "/" not in mime:
+                mime = "image/jpeg"
+            return bytes(data), mime
+    except Exception as e:
+        logger.debug("embedded cover extract failed for %s: %s", guid, e)
+    return None
+
+
+def _placeholder_cover_response(guid: str) -> Response:
+    """占位图池确定性选取（guid 哈希），客户端缓存 1 天。"""
+    digest = hashlib.sha256(str(guid or "").encode()).hexdigest()
+    name = f"placeholder-{int(digest[:8], 16) % _PLACEHOLDER_COUNT}.png"
+    content = _PLACEHOLDER_CACHE.get(name)
+    if content is None:
+        try:
+            with open(os.path.join(_PLACEHOLDER_DIR, name), "rb") as f:
+                content = f.read()
+            _PLACEHOLDER_CACHE[name] = content
+        except OSError:
+            logger.warning("占位图缺失: %s", os.path.join(_PLACEHOLDER_DIR, name))
+            content = _TINY_GRAY_PNG
+    return Response(
+        content=content,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
@@ -2666,11 +3055,34 @@ async def static_cover(request: Request, subpath: str = ""):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     data = await _online_info(request, guid)
-    cover = (data or {}).get("cover_url") or ""
-    if cover:
+    cover = str((data or {}).get("cover_url") or "")
+    # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    if cover and _KW_TEXT_COVER_HOST not in cover:
         return RedirectResponse(cover, status_code=302)
-    # 无封面时返回 404，避免把 JSON 当成图片导致客户端裂图
-    return Response(status_code=404)
+
+    # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
+    direct = ""
+    kw_rid = _kw_rid_from_guid(guid)
+    if kw_rid:
+        direct = await _kw_cover_by_rid(kw_rid)
+    if not direct:
+        direct = _qq_cover_by_albummid((data or {}).get("albummid"))
+    if direct:
+        return RedirectResponse(direct, status_code=302)
+
+    # ③ 网易 cloudsearch 同名曲补全
+    enriched = await _enrich_cover_via_netease(request, guid, data or {})
+    if enriched:
+        return RedirectResponse(enriched, status_code=302)
+
+    # ④ 本地边听边存文件的内嵌专辑图
+    embedded = _embedded_cover_bytes(guid)
+    if embedded:
+        art, mime = embedded
+        return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+
+    # ⑤ 本地占位图池：在线曲目封面永不 404
+    return _placeholder_cover_response(guid)
 
 
 # === online favorites ===
@@ -3115,15 +3527,17 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
     task = asyncio.create_task(
         dailyrec.get_or_build_daily(
             user_guid=user_guid,
-            musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled", True) else None,
+            musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled") else None,
             musicbox_client=get_musicbox_client(request.app) if CONF["netease_enabled"] else None,
             llm_http=get_llm_client(request.app) if dailyrec.llm_enabled() else None,
             build_track=build_online_track,
             netease_enabled=CONF["netease_enabled"],
             favorite_items=favs,
-            lx_client=get_lx_client(request.app) if CONF.get("lx_enabled", True) else None,
-            lx_enabled=bool(CONF.get("lx_enabled", True)),
+            lx_client=get_lx_client(request.app) if CONF.get("lx_enabled") else None,
+            lx_enabled=bool(CONF.get("lx_enabled")),
             lx_sources=CONF.get("lx_sources") or None,
+            recommend_hot=bool(CONF.get("recommend_hot", True)),
+            recommend_daily=bool(CONF.get("recommend_daily", True)),
         )
     )
     _DAILY_TASKS[key] = task
@@ -3132,6 +3546,8 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
 
 async def _peek_daily_bundle(request: Request, user_guid: str) -> dict:
     """歌单列表用：有缓存立刻返回；否则后台生成，最多等 2s，超时仍返回占位歌单。"""
+    if not CONF.get("recommend_daily", True):
+        return dailyrec.empty_daily_bundle(user_guid)
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
     cached = dailyrec.load_daily_cache(user_guid, day)
@@ -3151,6 +3567,8 @@ async def _peek_daily_bundle(request: Request, user_guid: str) -> dict:
 
 
 async def _load_daily_bundle(request: Request, user_guid: str) -> dict:
+    if not CONF.get("recommend_daily", True):
+        return dailyrec.empty_daily_bundle(user_guid)
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
     cached = dailyrec.load_daily_cache(user_guid, day)
@@ -3193,6 +3611,10 @@ async def playlist_list(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed:
         return auth_resp or JSONResponse(content=envelope, headers=headers)
+
+    if not CONF.get("recommend_daily", True):
+        # FNMUSIC_RECOMMEND_DAILY=false：不注入每日推荐占位歌单
+        return JSONResponse(content=envelope, headers=headers)
 
     try:
         bundle = await _peek_daily_bundle(request, user_guid)

@@ -1,20 +1,21 @@
-"""lxmusic HTTP 服务：洛雪音乐 (LX Music) 风格免登录音源 API.
+"""lxmusic HTTP 服务：洛雪音乐 (LX Music) 风格音源 API.
 
 统一曲目 ID 契约: "lx:<source>:<identifier>"，例如：
-  - "lx:kg:<filehash>"   酷狗（trackercdn hash 解析直链）
-  - "lx:wy:<song_id>"    网易云（eapi 解析直链）
-  - "lx:mg:<copyrightId>" 咪咕（player_get_song_info 解析直链）
+  - "lx:kg:<filehash>"    酷狗
+  - "lx:wy:<song_id>"     网易云
+  - "lx:mg:<copyrightId>" 咪咕
 
-设计目标：全部免登录、无需任何账号 Cookie 即可搜索 + 高音质直链解析，
-供 fnmusic-ext 代理（以及其它消费方）以统一的 REST 契约调用。
+分工与洛雪桌面版一致：搜索/歌词/封面/热门榜单走内置平台免登录接口；
+播放直链解析只由用户提供的洛雪自定义源脚本完成（source_runtime.py，
+Node 沙箱执行，规范见 https://lxmusic.toside.cn/desktop/custom-source）。
 """
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -23,20 +24,19 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from source_runtime import (
+    SourceError,
+    SourceManager,
+    build_music_info,
+    script_quality_for_tier,
+)
 
 logger = logging.getLogger("lxmusic_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-try:
-    from Crypto.Cipher import AES  # pycryptodome
-
-    HAS_CRYPTO = True
-except ImportError:
-    AES = None  # type: ignore
-    HAS_CRYPTO = False
-    logger.warning("pycryptodome not installed, wy eapi resolution disabled")
-
-SERVICE_VERSION = "1.1.0"
+SERVICE_VERSION = "2.0.0"
 
 # 支持的音源别名归一化
 _SOURCE_ALIASES = {
@@ -81,25 +81,19 @@ CONF = {
     "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "10")),
     "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
     "cache_ttl": int(os.environ.get("LX_CACHE_TTL", "1800")),
-    # 第三方解析链路（移植自洛雪社区聚合源 qdy v9.3 链路清单）总开关
-    "third_party": os.environ.get("LX_THIRD_PARTY", "1").strip().lower() in ("1", "true", "yes", "on"),
+    # 用户自定义源脚本地址（state.json 持久化优先，env 仅作首次种子）
+    "source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
     "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "4.0")),
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
     # 搜索期 VIP/第三方直链曲目的探活结果有效期（秒）：过期后 track/url 重新解析
     "probe_fresh_s": int(os.environ.get("LX_PROBE_FRESH_S", "900")),
 }
 
+# 当前激活的用户自定义源（启动时从 state.json / LX_SOURCE_URL 恢复）
+SOURCE_MANAGER = SourceManager(seed_url=CONF["source_url"])
+
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 UA_MOBILE = "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-
-# 各源直链需要携带的额外请求头（供代理透传给 CDN）
-KG_HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36"}
-WY_HEADERS = {"User-Agent": UA_PC, "Referer": "https://music.163.com/"}
-MG_HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36", "Referer": "https://m.music.migu.cn/"}
-TX_HEADERS = {"User-Agent": UA_PC, "Referer": "https://y.qq.com/"}
-KW_HEADERS = {"User-Agent": UA_PC}
-
-_EAPI_KEY = b"e82ckenh8dichen8"
 
 # id -> {"item": {...}, "ts": float}
 _SONG_CACHE: dict[str, dict] = {}
@@ -112,11 +106,6 @@ def _record_failure(exc: Exception) -> None:
         failures.append(str(exc) or type(exc).__name__)
 
 
-def _check_resolver_status(response: httpx.Response) -> None:
-    if response.status_code >= 500 or response.status_code in (408, 429):
-        raise ChainTransportError(f"resolver HTTP {response.status_code}")
-
-
 _SEARCH_PARTIAL: ContextVar[list | None] = ContextVar("lx_search_partial", default=None)
 
 
@@ -127,6 +116,17 @@ def _publish(item: dict) -> None:
 
 
 _STATS = {"searches": 0, "url_resolutions": 0, "errors": 0}
+
+# 试运行（verify_source）只覆盖当前 asyncio 任务的解析运行时，
+# 不替换进程级 SOURCE_MANAGER，避免安装/WebUI 校验打挂正在播的源。
+_RUNTIME_OVERRIDE: ContextVar[Any] = ContextVar("lx_runtime_override", default=None)
+
+
+def current_runtime():
+    override = _RUNTIME_OVERRIDE.get()
+    if override is not None:
+        return override
+    return SOURCE_MANAGER.get()
 
 
 def _lenient_json(resp: httpx.Response, tag: str = "") -> dict | list | None:
@@ -195,17 +195,6 @@ def _quality_tiers(quality: str) -> list[str]:
     if q in ("high", "320", "exhigh", "hq"):
         return ["high", "standard"]
     return ["standard"]
-
-
-def _kg_hash_for_quality(item: dict, tier: str) -> str:
-    sq = str(item.get("hash_sq") or "")
-    hq = str(item.get("hash_hq") or "")
-    std = str(item.get("hash") or item.get("id", "").split(":")[-1] or "")
-    if tier == "lossless":
-        return sq or hq or std
-    if tier == "high":
-        return hq or std
-    return std or hq or sq
 
 
 # ------------------------------------------------------------------ 酷狗 kg ---
@@ -284,77 +273,6 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     return items[: limit + limit // 2]
 
 
-async def kg_resolve_url(
-    client: httpx.AsyncClient, item: dict | None, identifier: str, tier: str
-) -> dict | None:
-    fhash = _kg_hash_for_quality(item or {"hash": identifier}, tier)
-    if not fhash:
-        return None
-
-    # 1. 主接口：m.kugou.com 移动端 playInfo（免登录可用，返回 128k mp3 直链）
-    try:
-        r = await client.get(
-            "http://m.kugou.com/app/i/getSongInfo.php",
-            params={"cmd": "playInfo", "hash": fhash},
-            headers={"User-Agent": UA_MOBILE},
-            timeout=8.0,
-        )
-        _check_resolver_status(r)
-        data = _lenient_json(r, f"kg playInfo {fhash}")
-        if isinstance(data, dict) and data.get("errcode") == 0 and data.get("url"):
-            ext = str(data.get("extName") or "mp3").lower().lstrip(".") or "mp3"
-            candidate = {
-                "trial": _explicit_trial(data),
-                "url": str(data["url"]),
-                "ext": ext,
-                "file_size": int(data.get("fileSize") or 0) or 0,
-                "br": int(data.get("bitRate") or 0) * 1000 if int(data.get("bitRate") or 0) < 1000 else int(data.get("bitRate") or 0),
-                "headers": dict(KG_HEADERS),
-            }
-            result = await _verify_result(client, candidate, report_transport=True)
-            if result:
-                return result
-    except Exception as e:  # noqa: BLE001
-        _record_failure(e)
-        logger.warning("kg playInfo %s failed: %s", fhash, e)
-
-    # 2. 备用接口：老版 trackercdn（部分地区/IP 或自建反代可能可用）
-    last_err = None
-    for host in ("https://trackercdnbj.kugou.com", "http://trackercdn.kugou.com"):
-        try:
-            r = await client.get(
-                f"{host}/v1/url",
-                params={"hash": fhash, "pid": 1, "appid": 1010, "behavior": "play"},
-                headers={"User-Agent": UA_MOBILE},
-                timeout=6.0,
-            )
-            _check_resolver_status(r)
-            data = _lenient_json(r, f"kg trackercdn {fhash}")
-        except Exception as e:  # noqa: BLE001
-            _record_failure(e)
-            last_err = e
-            continue
-        if isinstance(data, dict) and data.get("code") == 0 and data.get("url"):
-            candidate = {
-                "trial": _explicit_trial(data),
-                "url": str(data["url"]),
-                "ext": str(data.get("ext") or "mp3").lower().lstrip(".") or "mp3",
-                "file_size": int(data.get("file_size") or 0) or 0,
-                "br": _bitrate_bps(data.get("bitRate") or data.get("bitrate")),
-                "headers": dict(KG_HEADERS),
-            }
-            try:
-                result = await _verify_result(client, candidate, report_transport=True)
-            except (httpx.HTTPError, ChainTransportError, TimeoutError) as exc:
-                _record_failure(exc)
-                continue
-            if result:
-                return result
-    if last_err:
-        logger.warning("kg trackercdn %s last error: %s", fhash, last_err)
-    return None
-
-
 async def kg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
     duration_ms = int(float(item.get("duration_s") or 0) * 1000)
     r = await client.get(
@@ -395,39 +313,6 @@ async def kg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
 
 
 # ------------------------------------------------------------------ 网易 wy ---
-
-def _eapi_params(eapi_path: str, payload: dict) -> str:
-    """网易 eapi 参数加密（AES-ECB + MD5 摘要，与 LX Music 源一致）。"""
-    import json as _json
-
-    from urllib.parse import urlparse
-
-    eapi_path = urlparse(eapi_path).path.replace("/eapi/", "/api/")
-    # Match the independent musicdl EapiCryptoUtils wire serialization.
-    text = _json.dumps(payload)
-    message = f"nobody{eapi_path}use{text}md5forencrypt"
-    digest = hashlib.md5(message.encode("utf-8")).hexdigest()
-    data = f"{eapi_path}-36cd479b6b5-{text}-36cd479b6b5-{digest}".encode("utf-8")
-    pad = 16 - len(data) % 16
-    data += bytes([pad]) * pad
-    cipher = AES.new(_EAPI_KEY, AES.MODE_ECB)
-    return cipher.encrypt(data).hex()
-
-
-_WY_EAPI_HEADER = {
-    "osver": "",
-    "deviceId": "",
-    "appver": "9.1.15",
-    "versioncode": "140",
-    "mobilename": "",
-    "buildver": "",
-    "resolution": "1920x1080",
-    "__nonce": "",
-    "os": "pc",
-    "countrycode": "",
-    "MUSIC_U": "",
-}
-
 
 async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
     fetch_limit = max(limit * 2, 20)
@@ -508,56 +393,6 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     return items[: limit + limit // 2]
 
 
-async def wy_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) -> dict | None:
-    # 1. 优先尝试官方 eapi 高音质解析（需 pycryptodome）
-    if HAS_CRYPTO:
-        br_map = {"lossless": 999000, "high": 320000, "standard": 128000}
-        brs = [br_map[_quality_tiers(tier)[0]]]
-        eapi_path = "/api/song/enhance/player/url"
-        for br in brs:
-            try:
-                r = await client.post(
-                    "https://interface3.music.163.com/eapi/song/enhance/player/url",
-                    data={"params": _eapi_params(eapi_path, {"header": dict(_WY_EAPI_HEADER), "ids": [int(identifier)], "br": br})},
-                    headers={
-                        "User-Agent": UA_PC,
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Cookie": "os=pc; appver=9.1.15; osver=Microsoft-Windows-10",
-                    },
-                    timeout=8.0,
-                )
-                _check_resolver_status(r)
-                if r.status_code in (401, 403, 404, 410):
-                    continue
-                data = (r.json() or {}).get("data") or []
-            except Exception as exc:  # noqa: BLE001
-                _record_failure(exc)
-                continue
-            for entry in data:
-                if isinstance(entry, dict) and entry.get("url"):
-                    candidate = {
-                        "url": str(entry["url"]),
-                        "trial": _explicit_trial(entry),
-                        "ext": str(entry.get("type") or "mp3").lower(),
-                        "file_size": int(entry.get("size") or 0) or 0,
-                        "br": int(entry.get("br") or 0),
-                        "headers": dict(WY_HEADERS),
-                    }
-                    try:
-                        result = await _verify_result(client, candidate, report_transport=True)
-                    except (httpx.HTTPError, ChainTransportError, TimeoutError) as exc:
-                        _record_failure(exc)
-                        continue
-                    if result:
-                        return result
-
-    # Standard-only outer URL; the shared pipeline owns the single probe.
-    if tier == "standard":
-        return {"url": f"https://music.163.com/song/media/outer/url?id={identifier}",
-                "ext": "mp3", "br": 128000, "headers": dict(WY_HEADERS)}
-    return None
-
-
 async def wy_resolve_lyric(client: httpx.AsyncClient, identifier: str) -> str:
     r = await client.get(
         "https://music.163.com/api/song/lyric",
@@ -618,37 +453,6 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     return await _probe_candidates(client, "mg", candidates, limit)
 
 
-async def mg_resolve_url(client: httpx.AsyncClient, identifier: str, tier: str) -> dict | None:
-    try:
-        r = await client.get(
-            "https://music.migu.cn/v3/api/music/audio/player_get_song_info",
-            params={"copyrightId": identifier, "resourceType": "E", "resourceLevel": {"lossless": "ZQ", "high": "PQ", "standard": "E"}.get(tier, tier)},
-            headers={"User-Agent": UA_PC, "Referer": "https://music.migu.cn/"},
-            timeout=8.0,
-        )
-        _check_resolver_status(r)
-        json_obj = _lenient_json(r, f"mg player_get_song_info {identifier}")
-        if not isinstance(json_obj, dict):
-            return None
-        data = json_obj.get("data") or {}
-        url = str(data.get("play_url") or data.get("url") or "")
-        if not url or url == "https://music.migu.cn/404/error.html":
-            return None
-        ext = str(data.get("format_type") or "mp3").lower().lstrip(".") or "mp3"
-        return {
-            "url": url,
-            "trial": _explicit_trial(data),
-            "ext": "flac" if ext in ("flac", "zq", "sq") else "mp3",
-            "file_size": int(data.get("fileSize") or data.get("overdue_size") or 0) or 0,
-            "br": _bitrate_bps(data.get("bitRate")),
-            "headers": dict(MG_HEADERS),
-        }
-    except Exception as e:  # noqa: BLE001
-        _record_failure(e)
-        logger.warning("mg resolve %s failed: %s", identifier, e)
-        return None
-
-
 async def mg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
     lrc_url = str(item.get("lrc_url") or "")
     if not lrc_url:
@@ -657,22 +461,11 @@ async def mg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
     return r.text or ""
 
 
-# --------------------------------------------- 第三方解析链路（移植自洛雪社区聚合源 qdy v9.3） ---
+# ------------------------------------------------------------ 用户源解析与熔断 ---
 #
-# 链路清单于 2026-09-09 逐条实测（qdy v9.3 全部 10 条链路）：
-#   [活] 长青kw    musicapi.haitangw.net/music/kw.php   302→酷我CDN，无损FLAC 206 实测 0.5~0.8s
-#   [活] 溯音咪咕  api.xcvts.cn/api/music/migu           JSON 返回 music_url(320k)+歌词
-#   [死] 星海主    music-api.gdstudio.xyz/api.php        source 枚举收缩(tencent 拒绝)、netease 解析返回空
-#   [死] 长青tx/wy 175.27.166.236                       tx 全曲返回 "has not any level"；wy 404
-#   [死] 长青kg    music.haitangw.cc                     code 201 error（多 hash/level 验证）
-#   [死] 念心      music.nxinxz.com                      404
-#   [死] 溯音QQ/163/酷我 oiapi.net                       DNS 不存在
-#   [死] 汽水      api.vsaa.cn                           404
-#   [死] Huibq/聆川 qdy 脚本内即为占位符（"your_key_here"）
-# 已死链路不注册；后续复活时在此追加即可，调度/探活/熔断逻辑无需改动。
-#
-# 第三方直链经有界媒体签名探测；verified 仅表示媒体前缀有效，
-# 不保证完整歌曲、授权状态或未来可用性；completeness 始终保守标记 unknown。
+# 播放直链解析的唯一通道是用户提供的洛雪自定义源脚本（source_runtime.py）。
+# 熔断器沿用原第三方链路机制：脚本连续解析失败达阈值后暂停调用一段时间，
+# 避免每次搜索白等超时；媒体探活（probe_url）仍由本模块统一执行。
 
 
 def _content_total_size(r: httpx.Response) -> int:
@@ -808,163 +601,36 @@ def _chain_report(name: str, ok: bool) -> None:
         h["breaks"] = int(h.get("breaks") or 0) + 1
 
 
-def _fuzzy_contains(a: str, b: str) -> bool:
-    """宽松匹配（去括号/空格/符号后双向包含），用于搜索式链路防错歌。"""
-
-    def norm(s: str) -> str:
-        import re as _re
-
-        s = _re.sub(r"\([^)]*\)", "", s or "")
-        s = _re.sub(r"[\s\-—·・]", "", s)
-        return s.lower()
-
-    na, nb = norm(a), norm(b)
-    return bool(na and nb) and (na in nb or nb in na)
-
-
-_TIER_TO_NETESE_LEVEL = {"lossless": "lossless", "high": "exhigh", "standard": "standard"}
-
-
-async def _chain_changqing_kw(client: httpx.AsyncClient, ctx: dict) -> "dict | None":
-    """长青 kw：URL 模板 → 302 → 酷我 CDN 直链（实测无损 FLAC）。"""
-    from urllib.parse import quote
-
-    level = _TIER_TO_NETESE_LEVEL.get(ctx["tier"], "standard")
-    url = f"https://musicapi.haitangw.net/music/kw.php?type=mp3&id={quote(str(ctx['identifier']))}&level={level}"
-    # Resolution only. The dispatcher owns the single media verification.
-    return {"url": url, "headers": dict(KW_HEADERS)}
-
-
-async def _chain_suyin_migu(client: httpx.AsyncClient, ctx: dict) -> "dict | None":
-    """溯音咪咕：关键词搜索式解析，返回 music_url(320k)。需标题模糊匹配防错歌。"""
-    keyword = " ".join(x for x in (ctx.get("title"), ctx.get("artist")) if x).strip()
-    if not keyword:
-        return None
-    try:
-        r = await client.get(
-            "https://api.xcvts.cn/api/music/migu",
-            params={"gm": keyword, "n": 1, "num": 1, "type": "json"},
-            headers={"User-Agent": UA_MOBILE},
-            timeout=CONF["resolver_timeout"],
-        )
-        if r.status_code >= 500 or r.status_code in (408, 429):
-            raise ChainTransportError(f"resolver HTTP {r.status_code}")
-        if r.status_code in (404, 410):
-            return None
-        r.raise_for_status()
-        data = _lenient_json(r, "suyin mg")
-        if not isinstance(data, dict):
-            raise ChainTransportError("invalid resolver response")
-    except httpx.HTTPError as exc:
-        raise ChainTransportError(str(exc)) from exc
-    if not isinstance(data, dict) or int(data.get("code") or 0) != 200:
-        return None
-    if ctx.get("title") and not _fuzzy_contains(str(data.get("title") or ""), str(ctx["title"])):
-        return None
-    if ctx.get("artist") and not _fuzzy_contains(str(data.get("singer") or ""), str(ctx["artist"])):
-        return None
-    url = str(data.get("music_url") or "")
-    if not url.startswith(("http://", "https://")):
-        return None
-    return {
-        "url": url,
-        "ext": "mp3",
-        "file_size": int(data.get("size") or 0),
-        "br": int(data.get("br") or 0),
-        "headers": dict(MG_HEADERS),
-        "trial": _explicit_trial(data),
-    }
-
-
-THIRD_PARTY_CHAIN: list[dict] = [
-    {
-        "name": "changqing_kw",
-        "platforms": {"kw"},
-        "needs_keyword": False,
-        "fn": _chain_changqing_kw,
-    },
-    {
-        "name": "suyin_mg",
-        "platforms": {"mg"},
-        "needs_keyword": True,
-        "fn": _chain_suyin_migu,
-    },
-]
-
-
-async def resolve_third_party(
-    client: httpx.AsyncClient,
-    platform: str,
-    identifier: str,
-    tier: str = "standard",
-    title: str = "",
-    artist: str = "",
-) -> "dict | None":
-    """按注册表顺序走第三方链路解析直链；返回结果均已通过探活。"""
-    if not CONF["third_party"]:
-        return None
-    for link in THIRD_PARTY_CHAIN:
-        if platform not in link["platforms"]:
-            continue
-        if link.get("needs_keyword") and not (title or artist):
-            continue
-        if not _chain_acquire(link["name"]):
-            _record_failure(ChainTransportError("resolver circuit open"))
-            continue
-        recovering = bool(_CHAIN_HEALTH.get(link["name"], {}).get("half_open"))
-        ctx = {"identifier": identifier, "tier": tier, "title": title, "artist": artist}
-        try:
-            result = await asyncio.wait_for(
-                link["fn"](client, ctx), timeout=CONF["resolver_timeout"] + CONF["probe_timeout"]
-            )
-            if result and result.get("url"):
-                result = await _verify_result(client, result, report_transport=True)
-        except asyncio.CancelledError:
-            # Deadline/client cancellation says nothing about provider health.
-            _CHAIN_HEALTH.get(link["name"], {}).pop("half_open", None)
-            raise
-        except Exception as exc:  # transport, timeout, or broken resolver protocol
-            _record_failure(exc)
-            _chain_report(link["name"], False)
-            continue
-        # A missing song, mismatch, or rejected media is not a provider outage.
-        # A late pre-open request must not close a circuit opened by siblings.
-        if recovering or not _CHAIN_HEALTH.get(link["name"], {}).get("open_until"):
-            _chain_report(link["name"], True)
-        if result:
-            result["resolver"] = link["name"]
-            result["third_party"] = True
-            return result
-    return None
-
-
 def chain_health_snapshot() -> dict:
     now = time.time()
-    snapshot = {}
-    for link in THIRD_PARTY_CHAIN:
-        name = link["name"]
-        h = _CHAIN_HEALTH.get(name, {})
-        state = ("disabled" if not CONF["third_party"] else
-                 "half_open" if h.get("half_open") else
-                 "open" if h.get("open_until", 0) > now else
-                 "recovery_ready" if h.get("open_until") else "closed")
-        snapshot[name] = {"fails": h.get("fails", 0), "open": state == "open",
-                          "breaks": h.get("breaks", 0), "state": state,
-                          "enabled": CONF["third_party"]}
-    return snapshot
+    h = _CHAIN_HEALTH.get("user_source", {})
+    state = ("half_open" if h.get("half_open") else
+             "open" if h.get("open_until", 0) > now else
+             "recovery_ready" if h.get("open_until") else "closed")
+    return {"user_source": {"fails": h.get("fails", 0), "open": state == "open",
+                            "breaks": h.get("breaks", 0), "state": state}}
 
 
 def source_capabilities() -> dict:
+    runtime = SOURCE_MANAGER.get()
+    ready = runtime is not None
+    configured = bool(SOURCE_MANAGER.active_url or SOURCE_MANAGER.seed_url)
     result = {}
     for src in _SEARCHERS:
-        official = src in ("kg", "wy", "mg")
-        links = [link for link in THIRD_PARTY_CHAIN if src in link["platforms"]]
-        available = CONF["third_party"] and any(_chain_available(link["name"]) for link in links)
-        reason = ("" if official or available else "third_party_disabled" if not CONF["third_party"]
-                  else "no_resolver_registered" if not links else "resolver_circuit_open")
-        result[src] = {"search_available": True, "playback_available": bool(official or available),
-                       "official_resolver": official, "third_party_enabled": CONF["third_party"],
-                       "chains": [link["name"] for link in links], "reason": reason,
+        supported = ready and src in runtime.platforms
+        available = supported and _chain_available("user_source")
+        if available:
+            reason = ""
+        elif not ready:
+            reason = "source_init_failed" if configured else "no_source_configured"
+        elif not supported:
+            reason = "platform_not_supported"
+        else:
+            reason = "source_circuit_open"
+        result[src] = {"search_available": bool(available), "playback_available": bool(available),
+                       "user_source": bool(supported),
+                       "qualitys": runtime.qualitys(src) if supported else [],
+                       "reason": reason,
                        "validation_status": "unverified", "completeness": "unknown"}
     return result
 
@@ -984,11 +650,6 @@ def _explicit_trial(data: dict) -> bool:
             return True
     return bool(data.get("freeTrialInfo") or data.get("trialInfo")
                 or data.get("trial_url") or data.get("trialUrl"))
-
-
-def _bitrate_bps(value: Any) -> int:
-    br = int(value or 0)
-    return br * 1000 if 0 < br < 1000 else br
 
 
 def _actual_tier(result: dict) -> str:
@@ -1025,7 +686,7 @@ def _fresh_probe(item: "dict | None", want_tier: str = "standard") -> "dict | No
     if not (isinstance(p, dict) and p.get("url") and p.get("probed")
             and p.get("validation_status") == "media_verified"):
         return None
-    if _explicit_trial(p) or (p.get("third_party") and not CONF["third_party"]):
+    if _explicit_trial(p):
         return None
     if time.time() - p.get("ts", 0) >= CONF["probe_fresh_s"]:
         return None
@@ -1038,8 +699,11 @@ def _fresh_probe(item: "dict | None", want_tier: str = "standard") -> "dict | No
 
 async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
                              tier: str = "standard", retained: dict | None = None) -> "dict | None":
-    """Shared search/URL pipeline: official -> verify -> fallback -> downgrade."""
+    """Shared search/URL pipeline: user source musicUrl -> verify -> downgrade."""
     if _explicit_trial(item) or any(m in str(item.get("title") or "") for m in _TRIAL_TITLE_MARKERS):
+        return None
+    runtime = current_runtime()
+    if runtime is None or src not in runtime.platforms:
         return None
     tiers = _quality_tiers(tier)
     cached = _fresh_probe(item, tiers[0])
@@ -1048,7 +712,8 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
     item.pop("_probe", None)
     item.update(verified=False, validation_status="unverified", completeness="unknown")
     identifier = parse_track_id(str(item.get("id") or ""))[1]
-    title, artist = str(item.get("title") or ""), str(item.get("artist") or "")
+    item.setdefault("_identifier", identifier)
+    music_info = build_music_info(item, src)
     attempted = []
     best = None
     failures = _RESOLUTION_FAILURES.get()
@@ -1057,28 +722,35 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
         if best and _TIER_RANK.get(best["actual_tier"], -1) >= _TIER_RANK[t]:
             break
         before = len(failures or [])
+        quality = script_quality_for_tier(t, runtime.qualitys(src))
+        if quality is None:
+            attempted.append(t)
+            continue
+        if not _chain_acquire("user_source"):
+            _record_failure(ChainTransportError("user source circuit open"))
+            break
+        recovering = bool(_CHAIN_HEALTH.get("user_source", {}).get("half_open"))
+        result = None
         try:
-            if src == "kg":
-                raw = await kg_resolve_url(client, item, identifier, t)
-            elif src == "wy":
-                raw = await wy_resolve_url(client, identifier, t)
-            elif src == "mg":
-                raw = await mg_resolve_url(client, identifier, t)
-            else:
-                raw = None
-            result = await _verify_result(client, raw, report_transport=True)
-        except Exception as exc:
+            url = await runtime.music_url(
+                music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
+            )
+            result = await _verify_result(client, {"url": url}, report_transport=True)
+        except asyncio.CancelledError:
+            # Deadline/client cancellation says nothing about source health.
+            _CHAIN_HEALTH.get("user_source", {}).pop("half_open", None)
+            raise
+        except Exception as exc:  # transport, timeout, or script rejection
             _record_failure(exc)
-            result = None
+            _chain_report("user_source", False)
+        else:
+            # A clean resolve without usable media is not a source outage.
+            # A late pre-open request must not close a circuit opened by siblings.
+            if recovering or not _CHAIN_HEALTH.get("user_source", {}).get("open_until"):
+                _chain_report("user_source", True)
         if result:
-            result["resolver"] = "official"
+            result["resolver"] = "user_source"
             if not best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(best["actual_tier"], -1):
-                best = result
-                if retained is not None:
-                    retained.update(best=best, attempted=attempted)
-        if not best or (t != "standard" and _TIER_RANK.get(best["actual_tier"], -1) < _TIER_RANK[t]):
-            result = await resolve_third_party(client, src, identifier, t, title, artist)
-            if result and (not best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(best["actual_tier"], -1)):
                 best = result
                 if retained is not None:
                     retained.update(best=best, attempted=attempted)
@@ -1174,7 +846,7 @@ TX_SEARCH_BODY = {
 
 
 async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
-    """QQ 音乐官方免登录搜索（musicu.fcg）。直链无官方免登录路径，全部经第三方链路探活。"""
+    """QQ 音乐官方免登录搜索（musicu.fcg）。直链由用户自定义源解析后探活。"""
     fetch_size = max(limit * 2, 20)
     body = {"req_1": {**TX_SEARCH_BODY["req_1"], "param": {**TX_SEARCH_BODY["req_1"]["param"], "query": keyword, "num_per_page": fetch_size}}}
     try:
@@ -1220,16 +892,8 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
                 "pay_type": int(pay.get("pay_play") or 0),
             }
         )
-    # tx 直链当前无存活链路 → 探活全部失败返回空；链路注册表新增 tx 链路后自动恢复
+    # 直链由用户自定义源解析+探活；用户源未声明 tx 平台时探活全败返回空
     return await _probe_candidates(client, "tx", candidates, limit)
-
-
-async def tx_resolve_url(
-    client: httpx.AsyncClient, item: "dict | None", identifier: str, tier: str
-) -> "dict | None":
-    return await resolve_and_probe(
-        client, "tx", item or {"id": f"lx:tx:{identifier}"}, tier
-    )
 
 
 async def tx_resolve_lyric(client: httpx.AsyncClient, identifier: str) -> str:
@@ -1301,7 +965,7 @@ def _title_relevance(title: str, keyword: str) -> int:
 
 
 async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
-    """酷我官方免登录搜索（r.s 老接口）。直链经长青 kw 链路（无损 FLAC，2026-09 实测存活）探活。"""
+    """酷我官方免登录搜索（r.s 老接口）。直链由用户自定义源解析后探活。"""
     import html as _html
 
     # r.s 相关度常把原版排在伴奏/翻唱之后，抓取窗口放大再按标题相关度重排
@@ -1356,14 +1020,6 @@ async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
     # 标题相关度排序：原版（title≈keyword）优先于伴奏/DJ/翻唱版本
     candidates.sort(key=lambda c: _title_relevance(c["title"], keyword))
     return await _probe_candidates(client, "kw", candidates, limit)
-
-
-async def kw_resolve_url(
-    client: httpx.AsyncClient, item: "dict | None", identifier: str, tier: str
-) -> "dict | None":
-    return await resolve_and_probe(
-        client, "kw", item or {"id": f"lx:kw:{identifier}"}, tier
-    )
 
 
 async def kw_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
@@ -1446,7 +1102,7 @@ async def kg_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
 
 
 async def kw_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
-    """酷我 kbang 免签飙升榜（老接口字段较旧）。酷我直链依赖第三方链路，全部探活。"""
+    """酷我 kbang 免签飙升榜（老接口字段较旧）。直链由用户自定义源解析，全部探活。"""
     import html as _html
 
     try:
@@ -1582,9 +1238,13 @@ async def lifespan(fastapi_app: FastAPI):
             follow_redirects=True,
         )
         created = True
+    loader = asyncio.create_task(SOURCE_MANAGER.load())
     try:
         yield
     finally:
+        loader.cancel()
+        await asyncio.gather(loader, return_exceptions=True)
+        await SOURCE_MANAGER.shutdown()
         if created:
             await fastapi_app.state.http.aclose()
 
@@ -1607,9 +1267,8 @@ async def healthz():
         "service": "fnmusic-lxmusic",
         "version": SERVICE_VERSION,
         "sources": CONF["sources"],
-        "eapi": HAS_CRYPTO,
-        "third_party": CONF["third_party"],
-        "chains": chain_health_snapshot(),
+        "user_source": SOURCE_MANAGER.describe(),
+        "circuit": chain_health_snapshot(),
         "capabilities": source_capabilities(),
         "charts": sorted(_CHARTERS),
     }
@@ -1784,3 +1443,58 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
     except Exception as e:  # noqa: BLE001
         logger.warning("lx lyric %s failed: %s", track_id, e)
     return {"ok": True, "data": {"id": track_id, "lyric": text or ""}}
+
+
+# ------------------------------------------------------------ 用户源管理端点 ---
+
+class SourceBody(BaseModel):
+    url: str
+
+
+@app.get("/api/v1/source")
+async def source_info():
+    return {"ok": True, "data": SOURCE_MANAGER.describe(), "circuit": chain_health_snapshot()}
+
+
+@app.post("/api/v1/source/verify")
+async def source_verify(body: SourceBody):
+    """端到端试运行一个源 URL（不改变当前激活源）。"""
+    from verify_source import verify_url  # 延迟导入：verify_source 反向 import 本模块
+
+    url = (body.url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        return _err("url 必须以 http:// 或 https:// 开头", 400)
+    try:
+        report = await asyncio.wait_for(verify_url(url), timeout=120.0)
+    except asyncio.TimeoutError:
+        return _err("校验超时（120s）", 504)
+    return {"ok": bool(report.get("ok")), "data": report}
+
+
+@app.post("/api/v1/source")
+async def source_set(body: SourceBody):
+    """校验并切换当前激活源（state.json 持久化，热生效）。"""
+    url = (body.url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        return _err("url 必须以 http:// 或 https:// 开头", 400)
+    try:
+        await SOURCE_MANAGER.activate(url)
+    except SourceError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+        )
+    return {"ok": True, "data": SOURCE_MANAGER.describe()}
+
+
+@app.delete("/api/v1/source")
+async def source_clear():
+    """停用当前源并清除持久化状态。"""
+    await SOURCE_MANAGER.shutdown()
+    SOURCE_MANAGER.active_url = ""
+    SOURCE_MANAGER.last_error = ""
+    for path in (SOURCE_MANAGER.state_path, SOURCE_MANAGER.script_cache):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return {"ok": True, "data": SOURCE_MANAGER.describe()}
