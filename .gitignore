@@ -27,4 +27,6 @@ __pycache__/
 **/.git.nested/
 TASK_*.md
 .tasks_archive/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
