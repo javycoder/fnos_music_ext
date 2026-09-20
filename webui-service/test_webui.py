@@ -320,6 +320,46 @@ def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
     assert env_file.read_text(encoding="utf-8") == before  # 校验失败不落盘
 
 
+def test_lx_verify_endpoint_survives_non_json_upstream(env_file, monkeypatch):
+    """lxmusic 返回裸 500 纯文本（如未捕获异常）时，WebUI 必须转成可读错误而不是自身也 500。"""
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Internal Server Error")
+
+    _mock_http(handler)
+    with TestClient(webui.app) as client:
+        r = client.post("/api/lx/verify", json={"values": {"url": "https://s/1.js"}})
+        assert r.status_code == 500
+        assert r.json()["ok"] is False
+        assert "非 JSON" in r.json()["error"]
+
+
+def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl, monkeypatch):
+    """保存时激活 lx 源，上游非 JSON 响应要落到 actions 的 error 字段，而不是让保存接口崩掉。"""
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/api/v1/source/verify"):
+            return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
+        if url.endswith("/api/v1/source") and request.method == "POST":
+            return httpx.Response(500, text="Internal Server Error")
+        return httpx.Response(200, json={"ok": True})
+
+    _mock_http(handler)
+    with TestClient(webui.app) as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false",
+            "FNMUSIC_LX_ENABLED": "true",
+            "LX_SOURCE_URL": "https://s/1.js",
+        }})
+        assert r.status_code == 200
+        activate = [a for a in r.json()["actions"] if a["kind"] == "lx_activate"]
+        assert activate and activate[0]["ok"] is False
+        assert "非 JSON" in activate[0]["error"]
+
+
 # ------------------------------------------------------------------ status / platforms ---
 
 def test_supervisor_status_parses_despite_nonzero_exit(monkeypatch):
