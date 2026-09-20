@@ -52,21 +52,22 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - **安装模式**：
   - `1) Docker 容器模式（推荐）`：音源服务容器化运行，隔离干净；
   - `2) Host 宿主机模式`：通过独立 Python venv 和 systemd 运行，免装 Docker。
-- **音源选择**（可多选，支持「源+平台」粒度）：
-  - `1 = musicbox`：网易云音源 [端口 8770]
-  - `2 = musicdl`：酷我/咪咕等聚合音源 [端口 8768]，可选具体平台（`9 mdl-酷我`、`10 mdl-酷狗`、`11 mdl-咪咕`、`12 mdl-QQ`、`13 mdl-千千`、`14 mdl-B站`；其余 57 个平台用编号或短名选择，见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）
-  - `3 = lxmusic`：洛雪免登录解析音源 [端口 8772]，可选具体平台（`3 lx-酷狗`、`4 lx-网易`、`5 lx-咪咕`、`6 lx-酷我`、`7 lx-QQ(仅搜索)`）
-  - 示例：输入 `1,6,9` = 网易云 + lx-酷我 + mdl-酷我（两个音源容器一起安装，搜索按多源并发策略聚合）
-  - 也可整源启用（默认平台）：`1,2,3`
+- **音源选择**（可多选；编号是全局「源+平台」ID，向导只列出精选）：
+  - `1` 网易云 musicbox [端口 8770]
+  - `2`–`7` 精选 musicdl：酷我 / 酷狗 / 咪咕 / QQ / 千千 / B站
+  - `59`–`62` 精选 lxmusic：酷狗 / 网易 / 咪咕 / 酷我（`63` lx-QQ 仅搜索，见文档）
+  - 其余平台对照 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md) 的编号直接输入，例如 `49` = mdl-gequhai
+  - 示例：输入 `1,2,62` = 网易云 + mdl-酷我 + lx-酷我（对应容器一起安装，搜索按多源并发策略聚合）
+  - 整源启用请写名字（默认平台）：`musicbox,musicdl,lxmusic`（**不要**再用 `1,2,3` 表示三整源）
 - **每日推荐**：默认使用音源原生推荐（网易云每日推荐/榜单 + 洛雪免登录榜单，榜单按所选 lx 平台自动过滤），无需额外配置；未启用网易音源时可选配置大模型作为兜底。
 
 > 💡 **进阶：非交互静默安装示例**（一行命令全自动完成并启用）：
 > ```bash
-> ./install.sh --non-interactive --mode docker --sources=1,2,3 --extend
+> ./install.sh --non-interactive --mode docker --sources=musicbox,musicdl,lxmusic --extend
 > # 或按平台粒度：网易云 + lx-酷我 + mdl-酷我
-> ./install.sh --non-interactive --mode docker --sources=netease,lx-kw,musicdl-kuwo --extend
+> ./install.sh --non-interactive --mode docker --sources=1,2,62 --extend
 > ```
-> musicdl 全部平台的编号/短名请查看 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)。
+> 全部平台编号请查看 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)（`1,2,3` 现为平台编号，不再表示三整源）。
 
 ---
 
