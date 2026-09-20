@@ -640,10 +640,22 @@ async def fetch_musicbox_recommend(
     return out
 
 
-async def fetch_lx_charts(client: httpx.AsyncClient, limit: int) -> list[dict]:
-    """调 lxmusic 免登录榜单端点，返回标准化候选。"""
+async def fetch_lx_charts(client: httpx.AsyncClient, limit: int, sources: "list[str] | None" = None) -> list[dict]:
+    """调 lxmusic 免登录榜单端点，返回标准化候选。
+
+    sources：lx 平台白名单（None=不限制）。榜单仅支持 kg/wy/kw，
+    与白名单交集为空时直接跳过 lx 榜单（不回退到全部平台）。
+    """
+    chart_sources: list[str] | None = None
+    if sources is not None:
+        chart_sources = [s for s in sources if s in ("kg", "wy", "kw")]
+        if not chart_sources:
+            return []
+    params: dict = {"limit": limit}
+    if chart_sources:
+        params["sources"] = ",".join(chart_sources)
     try:
-        r = await client.get("/api/v1/recommend", params={"limit": limit}, timeout=20.0)
+        r = await client.get("/api/v1/recommend", params=params, timeout=20.0)
         if r.status_code != 200:
             logger.debug("lx charts http %s", r.status_code)
             return []
@@ -687,6 +699,7 @@ async def _search_keyword(
     netease_enabled: bool,
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
+    lx_sources: "list[str] | None" = None,
 ) -> list[dict]:
     async def _mb() -> list[dict]:
         if not (netease_enabled and musicbox_client):
@@ -752,9 +765,12 @@ async def _search_keyword(
         if not (lx_enabled and lx_client):
             return []
         try:
+            params: dict = {"keyword": keyword, "limit": 5}
+            if lx_sources:
+                params["sources"] = ",".join(lx_sources)
             r = await lx_client.get(
                 "/api/v1/search",
-                params={"keyword": keyword, "limit": 5},
+                params=params,
                 timeout=8.0,
             )
             if r.status_code != 200:
@@ -812,6 +828,7 @@ async def resolve_recommendations(
     exclude_ta: set[tuple[str, str]] | None = None,
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
+    lx_sources: "list[str] | None" = None,
 ) -> list[dict]:
     """把候选歌名检索成可播放的在线 Track，跳过已收藏，凑满 limit 首。"""
     skip_ids = set(exclude_guids or ())
@@ -834,13 +851,13 @@ async def resolve_recommendations(
         async with sem:
             items = await _search_keyword(
                 keyword, musicdl_client, musicbox_client, netease_enabled,
-                lx_client=lx_client, lx_enabled=lx_enabled,
+                lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             )
         if not items and artist:
             async with sem:
                 items = await _search_keyword(
                     artist, musicdl_client, musicbox_client, netease_enabled,
-                    lx_client=lx_client, lx_enabled=lx_enabled,
+                    lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
                 )
         if not items:
             return []
@@ -1128,6 +1145,7 @@ async def get_or_build_daily(
     favorite_items: list[dict] | None = None,
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
+    lx_sources: "list[str] | None" = None,
 ) -> dict:
     day = today_key()
     guid = daily_playlist_guid(day, user_guid)
@@ -1195,7 +1213,7 @@ async def get_or_build_daily(
     async def from_lx_charts() -> list[dict]:
         if not (lx_enabled and lx_client):
             return []
-        items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT)
+        items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT, sources=lx_sources)
         if not items:
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
@@ -1212,7 +1230,7 @@ async def get_or_build_daily(
         return await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
-            lx_client=lx_client, lx_enabled=lx_enabled,
+            lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
         )
 
     async def from_fallback() -> list[dict]:
@@ -1220,7 +1238,7 @@ async def get_or_build_daily(
         return await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
-            lx_client=lx_client, lx_enabled=lx_enabled,
+            lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
         )
 
     tracks = list(existing)
