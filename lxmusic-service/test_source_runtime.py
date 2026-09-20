@@ -651,6 +651,15 @@ def test_bridge_console_exposes_full_standard_api():
     assert not missing, f"bridge.js sandboxConsole 缺少方法: {missing}"
 
 
+def test_bridge_request_body_aligns_with_desktop_json_parsing():
+    """桌面版 lx.request 对可 JSON 解析的响应体自动转对象（官方 preload.js 行为），
+    野生脚本普遍直接读 body.code 等字段；桥必须保持一致，否则脚本 undefined 崩溃。"""
+    bridge = Path(sr.__file__).with_name("js") / "bridge.js"
+    text = bridge.read_text(encoding="utf-8")
+    assert re.search(r"body\s*=\s*JSON\.parse\(text\)", text), \
+        "bridge.js 响应体必须尝试 JSON.parse（失败保持字符串）"
+
+
 # ------------------------------------------------------------------ Node 集成 ---
 
 @pytest.mark.skipif(NODE_BIN is None, reason="node runtime not available")
