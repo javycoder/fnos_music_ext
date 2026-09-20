@@ -69,6 +69,20 @@ async def verify_url(url: str, *, keyword: str = VERIFY_KEYWORD) -> dict:
 
         # 仅覆盖本任务的解析运行时：搜索期 VIP 探活走用户源，但不替换进程级 SOURCE_MANAGER
         override_token = lx_app._RUNTIME_OVERRIDE.set(runtime)
+        # 搜索探活失败的异常被 _probe_candidates 静默吞掉；记录首个源解析错误，
+        # 用于区分"真没搜到"和"源脚本解析全挂"（后者报搜索空会误导排查方向）
+        probe_errors: list[str] = []
+        original_music_url = runtime.music_url
+
+        async def recording_music_url(music_info, quality, *, platform, timeout=10.0):
+            try:
+                return await original_music_url(music_info, quality, platform=platform, timeout=timeout)
+            except SourceError as exc:
+                if not probe_errors:
+                    probe_errors.append(str(exc))
+                raise
+
+        runtime.music_url = recording_music_url
         client = lx_app.get_http(lx_app.app)
         try:
             item = None
@@ -86,6 +100,12 @@ async def verify_url(url: str, *, keyword: str = VERIFY_KEYWORD) -> dict:
                     report["search_platform"] = platform
                     break
             if item is None:
+                if probe_errors:
+                    report.update(
+                        category="resolve",
+                        message=f"源脚本解析失败，搜索探活全部未通过: {probe_errors[0]}",
+                    )
+                    return report
                 report.update(
                     category="resolve",
                     message=f"内置搜索未在任何交集平台返回曲目（关键词: {keyword}）",
@@ -97,10 +117,15 @@ async def verify_url(url: str, *, keyword: str = VERIFY_KEYWORD) -> dict:
             if quality not in runtime.qualitys(platform):
                 declared_q = runtime.qualitys(platform)
                 quality = declared_q[0] if declared_q else "128k"
-            url_resolved = await asyncio.wait_for(
-                runtime.music_url(build_music_info(item, platform), quality, platform=platform),
-                timeout=_PROBE_TIMEOUT,
-            )
+            try:
+                url_resolved = await asyncio.wait_for(
+                    runtime.music_url(build_music_info(item, platform), quality, platform=platform),
+                    timeout=_PROBE_TIMEOUT,
+                )
+            except SourceError as exc:
+                # 脚本解析失败（含沙箱桥 API 缺失等运行时错误）是正常的不可用结论，不能向上抛穿端点
+                report.update(category=exc.category, message=str(exc))
+                return report
             ok, final_url, content_type, size = await lx_app.probe_url(client, url_resolved)
             if not ok:
                 report.update(

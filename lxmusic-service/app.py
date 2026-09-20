@@ -1468,6 +1468,10 @@ async def source_verify(body: SourceBody):
         report = await asyncio.wait_for(verify_url(url), timeout=120.0)
     except asyncio.TimeoutError:
         return _err("校验超时（120s）", 504)
+    except SourceError as exc:
+        return JSONResponse(content={"ok": False, "data": {"category": exc.category, "message": str(exc)}})
+    except Exception as exc:  # noqa: BLE001  校验失败必须以结构化报告返回，绝不让 WebUI 收到裸 500 文本
+        return JSONResponse(content={"ok": False, "data": {"category": "internal", "message": f"校验过程出现内部错误: {exc}"}})
     return {"ok": bool(report.get("ok")), "data": report}
 
 

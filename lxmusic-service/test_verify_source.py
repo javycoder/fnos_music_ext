@@ -39,8 +39,8 @@ vsr = _load_verify()
 class UserSourceShim(FakeRuntime):
     """按 verify_source 的 UserSource(script, meta, script_dir=...) 构造签名适配替身。"""
 
-    def __init__(self, script, meta, *, script_dir=None, platforms=None):
-        super().__init__(platforms=platforms)
+    def __init__(self, script, meta, *, script_dir=None, platforms=None, resolver=None):
+        super().__init__(platforms=platforms, resolver=resolver)
         self.script = script
         self.meta = meta
         self.stopped = False
@@ -165,6 +165,25 @@ def test_verify_url_probe_failure(app_alias, isolated, monkeypatch):
     assert report["ok"] is False
     assert report["category"] == "resolve"
     assert "探活" in report["message"]
+
+
+def test_verify_url_music_url_source_error_returns_report(app_alias, isolated, monkeypatch):
+    """脚本解析抛 SourceError（如沙箱 console API 缺失）必须变成结构化报告，不能抛穿端点变裸 500。"""
+    async def fake_download(url):
+        return STUB_SCRIPT
+
+    monkeypatch.setattr(vsr, "download_script", fake_download)
+    shim = UserSourceShim(STUB_SCRIPT, {"name": "t"}, resolver=SourceError(
+        "resolve", "console.group is not a function"
+    ))
+    monkeypatch.setattr(vsr, "UserSource", lambda *a, **kw: shim)
+    lxapp.app.state.http = mock_client(_kw_handler())
+
+    report = asyncio.run(vsr.verify_url("https://src.test/1.js"))
+    assert report["ok"] is False
+    assert report["category"] == "resolve"
+    assert "console.group" in report["message"]
+    assert shim.stopped is True
 
 
 def test_verify_url_search_empty(app_alias, isolated, monkeypatch):

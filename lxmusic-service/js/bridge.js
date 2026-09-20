@@ -41,12 +41,44 @@ function logEvent(level, args) {
   sendOut({ type: 'log', level, message: message.length > 2000 ? message.slice(0, 2000) : message });
 }
 
+// 洛雪桌面端给脚本的是完整 console；野生脚本普遍使用 group/table/count/time 等，
+// 沙箱里缺任何一个方法都会让脚本抛 "console.xxx is not a function" 直接打断解析
+let groupDepth = 0;
+const consoleCounters = new Map();
+const consoleTimers = new Map();
+const indent = () => '  '.repeat(Math.max(0, groupDepth));
+
 const sandboxConsole = {
-  log: (...a) => logEvent('info', a),
-  info: (...a) => logEvent('info', a),
-  warn: (...a) => logEvent('warn', a),
-  error: (...a) => logEvent('error', a),
-  debug: (...a) => logEvent('debug', a),
+  log: (...a) => logEvent('info', [indent(), ...a]),
+  info: (...a) => logEvent('info', [indent(), ...a]),
+  warn: (...a) => logEvent('warn', [indent(), ...a]),
+  error: (...a) => logEvent('error', [indent(), ...a]),
+  debug: (...a) => logEvent('debug', [indent(), ...a]),
+  group: (...a) => { logEvent('info', [`${indent()}┌`, ...a]); groupDepth += 1; },
+  groupCollapsed: (...a) => { logEvent('info', [`${indent()}┌`, ...a]); groupDepth += 1; },
+  groupEnd: () => { groupDepth = Math.max(0, groupDepth - 1); },
+  table: (data) => logEvent('info', [indent(), data]),
+  dir: (...a) => logEvent('info', [indent(), ...a]),
+  dirxml: (...a) => logEvent('info', [indent(), ...a]),
+  trace: (...a) => logEvent('info', [indent(), 'trace', ...a]),
+  count: (label = 'default') => {
+    const n = (consoleCounters.get(label) || 0) + 1;
+    consoleCounters.set(label, n);
+    logEvent('info', [indent(), `${String(label)}: ${n}`]);
+  },
+  countReset: (label = 'default') => { consoleCounters.delete(label); },
+  assert: (condition, ...a) => { if (!condition) logEvent('warn', [indent(), 'assertion failed:', ...a]); },
+  time: (label = 'default') => { consoleTimers.set(label, process.hrtime.bigint()); },
+  timeLog: (label = 'default') => {
+    const start = consoleTimers.get(label);
+    if (start != null) logEvent('info', [indent(), `${String(label)}: ${Number(process.hrtime.bigint() - start) / 1e6}ms`]);
+  },
+  timeEnd: (label = 'default') => { sandboxConsole.timeLog(label); consoleTimers.delete(label); },
+  clear: () => {},
+  profile: () => {},
+  profileEnd: () => {},
+  timeStamp: () => {},
+  context: () => sandboxConsole,
 };
 
 function objHeaders(headers) {
@@ -280,5 +312,6 @@ process.on('uncaughtException', (err) => {
   logEvent('error', ['uncaughtException: ' + (err && err.stack ? err.stack : err)]);
 });
 process.on('unhandledRejection', (reason) => {
-  logEvent('error', ['unhandledRejection: ' + formatArg(reason)]);
+  const detail = reason && reason.message ? `${reason.message}${reason.stack ? '\n' + reason.stack : ''}` : formatArg(reason);
+  logEvent('error', ['unhandledRejection: ' + detail]);
 });
