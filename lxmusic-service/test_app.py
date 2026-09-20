@@ -132,13 +132,56 @@ def test_capabilities_declared_platforms_only(isolated):
 
 def test_capabilities_circuit_open(isolated):
     isolated._runtime = FakeRuntime()  # 默认声明 kw
-    lxapp._CHAIN_HEALTH["user_source"] = {"fails": 0, "open_until": time.time() + 60, "breaks": 1}
+    # 刚打开（距 open 不到 30s 试探窗口）：已声明平台被拦截
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 5, "breaks": 1,
+    }
     caps = lxapp.source_capabilities()
     # 已声明平台被熔断拦截；未声明平台仍报 platform_not_supported
     assert caps["kw"]["reason"] == "source_circuit_open"
     assert caps["kw"]["playback_available"] is False
     assert caps["kw"]["search_available"] is False
     assert caps["kg"]["reason"] == "platform_not_supported"
+
+
+def test_circuit_retry_window_allows_half_open_probe(isolated):
+    """熔断打开 30s 后放行一次试探：不能让搜索因第三方源偶发抽风空转整整 10 分钟冷却。"""
+    # 打开 31s：进入试探窗口，允许 half-open 一次
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 31, "breaks": 1,
+    }
+    assert lxapp._chain_available("user_source") is True
+    assert lxapp._chain_acquire("user_source") is True
+    assert lxapp._CHAIN_HEALTH["user_source"].get("half_open") is True
+    lxapp._chain_report("user_source", True)
+    snap = lxapp.chain_health_snapshot()
+    assert snap["user_source"]["state"] == "closed"
+
+    # 刚打开（5s 内）：不放行
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 5, "breaks": 1,
+    }
+    assert lxapp._chain_available("user_source") is False
+
+    # half_open 已被占用：其他请求不放行（单一试探者）
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 31, "breaks": 1,
+        "half_open": True,
+    }
+    assert lxapp._chain_available("user_source") is False
+
+
+def test_source_activation_resets_stale_circuit(isolated):
+    """换源必须清零熔断：旧源（坏源）攒下的 open 状态不能连带拦截新源。"""
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 2, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS, "breaks": 1,
+    }
+    with TestClient(lxapp.app) as client:
+        r = client.post("/api/v1/source", json={"url": "https://src.test/good.js"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+    assert "user_source" not in lxapp._CHAIN_HEALTH
+    assert isolated.activated == ["https://src.test/good.js"]
 
 
 def test_runtime_override_does_not_replace_manager(isolated):
