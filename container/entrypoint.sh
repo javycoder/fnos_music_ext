@@ -14,9 +14,11 @@ export_source_env
 supervisord -c "$SUP_CONF" &
 SUP_PID=$!
 
-# 等 supervisor 控制套接字就绪（最多 10s）
+# 等 supervisor 控制套接字就绪（最多 10s）。
+# 用 pid 而非 status：status 的退出码反映“是否全部程序 RUNNING”，全 STOPPED
+# （autostart=false 的初始态）也返回非 0，用它会白等满 10s 才超时跳出。
 _i=0
-until supervisorctl -c "$SUP_CONF" status >/dev/null 2>&1; do
+until supervisorctl -c "$SUP_CONF" pid >/dev/null 2>&1; do
     _i=$((_i + 1))
     if [ "$_i" -ge 100 ]; then
         log "supervisor 套接字未就绪，继续等待（进程状态将由 healthcheck 反映）"
