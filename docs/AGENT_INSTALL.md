@@ -16,7 +16,8 @@
 4. 绝对禁止擅自安装 Docker 引擎：fnOS 的 Docker 必须在「应用中心」由系统管理员安装。若环境未安装 Docker，必须选用 Host 宿主机模式，严禁执行 apt-get install docker 等命令。
 5. 核心代理运行原则：无论选择 Docker 模式还是 Host 模式，核心代理服务（fnmusic-ext）都必须由宿主机 systemd（运行在项目根目录 .venv-proxy 独立虚拟环境中）原生管理，负责无侵入接管 /var/run/trim_music.socket。两种模式的区别仅在于「音源服务（musicdl / musicbox / lxmusic）」以何种方式运行与隔离。
 6. 一键扩展 ./extend.sh 与一键还原 ./restore.sh（含彻底清理 ./restore.sh --full）必须始终保持可用；扩展失败必须安全秒级回滚到官方直连。
-7. 音源组件与端口规划：
+7. 单机单部署：代理单元名、音源容器名与安装锁全局唯一，本机以 /var/lib/fnmusic-ext/deployment 登记当前部署目录。从另一份仍存在的仓库副本执行安装/扩展/还原会被拒绝；Agent 不得用克隆目录绕过，应在原部署目录操作，或经用户确认后使用 --adopt 显式迁移部署。原登记目录已删除时不拦截。
+8. 音源组件与端口规划：
    - musicdl: https://github.com/CharlesPikachu/musicdl（酷我/咪咕聚合，127.0.0.1:8768）。
    - musicbox: https://github.com/darknessomi/musicbox（网易云；Docker/Host 均可映射 0.0.0.0:8770 便于局域网扫码 http://<NAS-IP>:8770/api/v1/auth/login/qr.png；凭证在 musicbox-data/）。
    - lxmusic: 洛雪风格免登录解析（酷狗/网易/咪咕），127.0.0.1:8772。

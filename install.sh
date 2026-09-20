@@ -41,6 +41,9 @@ LLM_MODEL=""
 LLM_MODEL_FROM_CLI=0
 DEFAULT_LLM_MODEL="gpt-4o-mini"
 RUN_EXTEND=0
+# --adopt: explicitly migrate the machine-wide deployment to this checkout
+# (the deployment registry otherwise refuses a second live checkout).
+ADOPT=0
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 ENABLE_LX=0
@@ -81,6 +84,8 @@ usage() {
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
+  --adopt                把本机部署迁移到当前目录（部署登记指向其他目录时使用；
+                        会跳过跨目录部署检查并重新登记）
   --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
@@ -383,6 +388,9 @@ while [ $# -gt 0 ]; do
             LLM_MODEL_FROM_CLI=1
             shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
+        --adopt)
+            # Explicit deployment migration; forwarded to extend.sh as well.
+            ADOPT=1; shift ;;
         --qr)
             bash "${BASE_DIR}/netease_login.sh"
             exit 0
@@ -495,6 +503,14 @@ ensure_docker_ready() {
 }
 
 check_proxy_unit_owner || exit 1
+# Refuse to install from a second checkout while the machine-wide deployment
+# registry names another live directory. NOTE: argument parsing above has
+# already consumed "$@", so the parsed ADOPT flag drives the bypass here.
+if [ "${ADOPT}" -eq 1 ]; then
+    check_deployment_owner --adopt || exit 1
+else
+    check_deployment_owner || exit 1
+fi
 
 precheck_environment
 
@@ -1173,5 +1189,13 @@ if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
 fi
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
+    # Forward --adopt so the chained extend also skips the registry check.
+    if [ "${ADOPT}" -eq 1 ]; then
+        exec /bin/bash "${BASE_DIR}/extend.sh" --force --adopt
+    fi
     exec /bin/bash "${BASE_DIR}/extend.sh" --force
 fi
+# Without --extend the socket is not taken over yet, but this checkout still
+# owns the machine-wide resources (containers/units); register it so a second
+# checkout cannot silently take them over later.
+takeover deployment-remember --base "${BASE_DIR}" || true

@@ -95,9 +95,11 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   ```bash
   ./restore.sh --full
   ```
-- **多副本部署提示**：容器名（`fnmusic-musicdl/musicbox/lxmusic`）与端口（8768/8770/8772）全局固定。
-  安装/恢复会检查部署归属并串行化操作；遇到其他目录的服务或容器会拒绝接管，不再自动删除。
-  请在现有部署目录维护服务。身份不明或官方 socket 已改变时，恢复会保留现场并报告未完成，禁止手工猜测后删除 socket。
+- **多副本部署提示**：容器名（`fnmusic-musicdl/musicbox/lxmusic`）与端口（8768/8770/8772）全局固定，
+  请只维护一份部署目录。本机会记录当前部署目录，第二份副本执行安装/扩展/还原会被拒绝；
+  挂起的旧安装会被新启动的命令自动接管清理；迁移部署请加 `--adopt`。
+  身份不明或官方 socket 已改变时，恢复会保留现场并报告未完成，禁止手工猜测后删除 socket。
+  细节见 [docs/INSTALL.md](docs/INSTALL.md) 的「单机多副本约束与部署迁移」。
 
 ---
 

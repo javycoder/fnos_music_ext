@@ -55,6 +55,30 @@ def process(pid):
         return None
 
 
+def process_info(pid):
+    """Kernel identity for installer-lock holders: pid/ppid/pgid + full cmdline.
+
+    pgid lets the shell wrapper terminate a whole hung installer tree (the
+    flock wrapper and every child it spawned); cmdline lets it verify the
+    holder actually runs one of this project's scripts before signalling.
+    Values come from /proc only, never from user input.
+    """
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+        fields = text[text.rindex(')') + 2:].split()
+        # fields[0]=state, [1]=ppid, [2]=pgrp; starttime is field 22 overall.
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = ''
+        return {"pid": pid, "ppid": int(fields[1]), "pgid": int(fields[2]),
+                "start": fields[19], "cwd": cwd,
+                "cmdline": cmdline.replace(b'\0', b' ').decode('utf-8', 'replace').strip()}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def connect(path, timeout=0.4):
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(timeout)
@@ -682,19 +706,134 @@ def prepare_install_lock():
         os.close(fd)
 
 
+def lock_holders(path='/run/fnmusic-ext-install/operation.lock'):
+    """Print which processes hold the installer operation lock, as JSON.
+
+    Read-only /proc scan (open fds pointing at the lock inode) so a freshly
+    started install/restore can NAME a hung holder instead of failing
+    silently. Nothing is signalled here; the shell wrapper decides. Without
+    root, other users' processes are simply invisible and go unreported.
+    """
+    lock = Path(path)
+    holders = []
+    try:
+        wanted = (os.stat(lock).st_dev, os.stat(lock).st_ino)
+    except OSError:
+        print(json.dumps({'holders': holders}))
+        return
+    if not Path('/proc').is_dir():
+        # Non-Linux platforms have no /proc; report no holders instead of
+        # failing (the shell wrapper then reports it cannot identify any).
+        print(json.dumps({'holders': holders}))
+        return
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            for fd_link in (entry / 'fd').iterdir():
+                try:
+                    if os.readlink(fd_link) != str(lock):
+                        continue
+                    # Match the inode too: a recreated lock file must not
+                    # misreport holders of the previous generation.
+                    st = os.stat(fd_link)
+                    if (st.st_dev, st.st_ino) != wanted:
+                        continue
+                except OSError:
+                    continue
+                info = process_info(int(entry.name))
+                if info:
+                    holders.append(info)
+                break
+        except OSError:
+            continue
+    print(json.dumps({'holders': holders}))
+
+
+# Which checkout owns the machine-wide deployment. The unit name, container
+# names and installer lock are all global; ownership checks on those resources
+# only work while the resource exists. This record survives their absence so a
+# second checkout cannot silently become the deployment without notice.
+DEPLOYMENT_FILE = Path('/var/lib/fnmusic-ext/deployment')
+
+
+def deployment_remember(base):
+    """Record this checkout as the active deployment (requires root)."""
+    record = {'base': str(Path(base).resolve()),
+              'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    DEPLOYMENT_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(DEPLOYMENT_FILE.parent))
+    try:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(record, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, 0o644)  # world-readable: unprivileged checks must work
+        os.replace(name, DEPLOYMENT_FILE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def deployment_conflict(base, file=None):
+    """Return a conflict dict when another live checkout owns the deployment.
+
+    None means this checkout may proceed: no record, the record names this
+    very directory (compared by realpath, so /home/x and /vol/home/x spellings
+    of one checkout agree), or the recorded directory was deleted (a moved or
+    removed checkout cannot be protected any more).
+    """
+    path = Path(file) if file else DEPLOYMENT_FILE
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    recorded = str(record.get('base') or '')
+    here = str(Path(base).resolve())
+    if not recorded or os.path.realpath(recorded) == os.path.realpath(here):
+        return None
+    if not os.path.isdir(recorded):
+        # The recorded deployment directory is gone; nothing left to protect.
+        print('[takeover] note: recorded deployment directory no longer exists; '
+              'this checkout may adopt the deployment', file=sys.stderr, flush=True)
+        return None
+    return {'conflict': recorded, 'here': here}
+
+
+def deployment_clear():
+    """Forget the deployment record (restore returns the machine to stock)."""
+    try:
+        os.unlink(DEPLOYMENT_FILE)
+    except FileNotFoundError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['run', 'preflight', 'remember', 'restore-plan', 'restore', 'ready', 'status', 'render-unit', 'prepare-install-lock'])
+    parser.add_argument('command', choices=['run', 'preflight', 'remember', 'restore-plan', 'restore', 'ready', 'status', 'render-unit', 'prepare-install-lock', 'lock-holders', 'deployment-remember', 'deployment-check', 'deployment-clear'])
     parser.add_argument('--base', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--target', default='/var/run/trim_music.socket')
     parser.add_argument('--upstream', default='/var/run/trim_music_upstream.socket')
     parser.add_argument('--state-dir', default='/run/fnmusic-ext')
     parser.add_argument('--timeout', type=float, default=30)
+    parser.add_argument('--lock-file', default='/run/fnmusic-ext-install/operation.lock',
+                        help='lock path for lock-holders (testing)')
     args = parser.parse_args()
     state = State(args.target, args.upstream, args.state_dir)
     try:
         if args.command == 'prepare-install-lock':
             prepare_install_lock()
+        elif args.command == 'lock-holders':
+            lock_holders(args.lock_file)
+        elif args.command == 'deployment-remember':
+            deployment_remember(args.base)
+        elif args.command == 'deployment-check':
+            conflict = deployment_conflict(args.base)
+            if conflict:
+                print(json.dumps(conflict))
+                return 2
+        elif args.command == 'deployment-clear':
+            deployment_clear()
         elif args.command == 'preflight':
             preflight(args.base, environment(args.base))
         elif args.command == 'render-unit':
