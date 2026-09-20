@@ -38,21 +38,6 @@ except ImportError:
 
 SERVICE_VERSION = "1.1.0"
 
-CONF = {
-    "sources": [s.strip() for s in os.environ.get("LX_SOURCES", "kg,wy,mg,kw").split(",") if s.strip()],
-    "search_timeout": float(os.environ.get("LX_SEARCH_TIMEOUT", "12")),
-    "limit_per_source": int(os.environ.get("LX_LIMIT_PER_SOURCE", "20")),
-    "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "10")),
-    "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
-    "cache_ttl": int(os.environ.get("LX_CACHE_TTL", "1800")),
-    # 第三方解析链路（移植自洛雪社区聚合源 qdy v9.3 链路清单）总开关
-    "third_party": os.environ.get("LX_THIRD_PARTY", "1").strip().lower() in ("1", "true", "yes", "on"),
-    "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "4.0")),
-    "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
-    # 搜索期 VIP/第三方直链曲目的探活结果有效期（秒）：过期后 track/url 重新解析
-    "probe_fresh_s": int(os.environ.get("LX_PROBE_FRESH_S", "900")),
-}
-
 # 支持的音源别名归一化
 _SOURCE_ALIASES = {
     "kg": "kg",
@@ -67,6 +52,41 @@ _SOURCE_ALIASES = {
     "tencent": "tx",
     "kw": "kw",
     "kuwo": "kw",
+}
+
+
+def normalize_source(raw: str) -> str:
+    return _SOURCE_ALIASES.get((raw or "").strip().lower(), "")
+
+
+def _normalize_sources(raw_list: list) -> list:
+    """LX_SOURCES → 规范平台代码，去重去非法；全部非法时回退默认。
+
+    别名（kugou/kuwo 等）若不归一，会被 /api/v1/search 的 `_SEARCHERS[src]`
+    查找静默跳过，表现为"配置了平台却搜不到结果"。"""
+    out: list = []
+    for item in raw_list:
+        code = normalize_source(item)
+        if code and code not in out:
+            out.append(code)
+    return out or ["kg", "wy", "mg", "kw"]
+
+
+CONF = {
+    "sources": _normalize_sources(
+        [s.strip() for s in os.environ.get("LX_SOURCES", "kg,wy,mg,kw").split(",") if s.strip()]
+    ),
+    "search_timeout": float(os.environ.get("LX_SEARCH_TIMEOUT", "12")),
+    "limit_per_source": int(os.environ.get("LX_LIMIT_PER_SOURCE", "20")),
+    "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "10")),
+    "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
+    "cache_ttl": int(os.environ.get("LX_CACHE_TTL", "1800")),
+    # 第三方解析链路（移植自洛雪社区聚合源 qdy v9.3 链路清单）总开关
+    "third_party": os.environ.get("LX_THIRD_PARTY", "1").strip().lower() in ("1", "true", "yes", "on"),
+    "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "4.0")),
+    "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
+    # 搜索期 VIP/第三方直链曲目的探活结果有效期（秒）：过期后 track/url 重新解析
+    "probe_fresh_s": int(os.environ.get("LX_PROBE_FRESH_S", "900")),
 }
 
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -132,9 +152,6 @@ def _lenient_json(resp: httpx.Response, tag: str = "") -> dict | list | None:
         logger.warning("%s: json parse failed: %s (%.80s)", tag, e, text)
         return None
 
-
-def normalize_source(raw: str) -> str:
-    return _SOURCE_ALIASES.get((raw or "").strip().lower(), "")
 
 
 def parse_track_id(track_id: str) -> "tuple[str, str]":

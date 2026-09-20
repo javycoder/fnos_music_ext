@@ -11,10 +11,10 @@
 - **全平台原生无感适配**：飞牛网页端、官方手机 App、车载端开箱即用，无需安装任何客户端第三方插件；
 - **多用户隔离收藏**：家庭多成员在 App 里点「红心」收藏在线歌曲，彼此数据独立隔离，与本地曲库完美融合；
 - **音源原生每日推荐**：默认采信音源原生推荐（网易每日推荐/榜单 + 洛雪免登录榜单，平台 ID 直连并复用可播性验证）；网易未启用时可选接入大模型兜底；
-- **多音源自由组合**：
+- **多音源自由组合（可选到平台粒度）**：
   - [musicbox](https://github.com/darknessomi/musicbox)（网易云高品质解析，支持扫码登录 VIP/收藏）；
-  - [musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等平台聚合）；
-  - **lxmusic**（洛雪风格解析：默认启用酷狗 kg / 网易 wy / 咪咕 mg / 酷我 kw。QQ tx 保留搜索/歌词适配，但当前没有可用播放解析链路，默认不启用）。解析结果会进行有限媒体探活；这不能保证完整歌曲、账户权限或直链后续始终可用，请仅访问您有权收听的内容。
+  - [musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等 57 个平台聚合，可按平台启用，全部平台编号见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）；
+  - **lxmusic**（洛雪风格解析：酷狗 kg / 网易 wy / 咪咕 mg / 酷我 kw / QQ tx，可按平台启用。QQ tx 保留搜索/歌词适配，但当前没有可用播放解析链路，默认不启用）。解析结果会进行有限媒体探活；这不能保证完整歌曲、账户权限或直链后续始终可用，请仅访问您有权收听的内容。
 
 ---
 
@@ -52,16 +52,22 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - **安装模式**：
   - `1) Docker 容器模式（推荐）`：音源服务容器化运行，隔离干净；
   - `2) Host 宿主机模式`：通过独立 Python venv 和 systemd 运行，免装 Docker。
-- **音源选择**：可多选（如 `1,2,3` 全开，或 `1,3` 自由组合）：
-  - `1 = musicbox`：网易云音源 [端口 8770]
-  - `2 = musicdl`：酷我/咪咕等聚合音源 [端口 8768]
-  - `3 = lxmusic`：洛雪免登录解析音源 [端口 8772]
-- **每日推荐**：默认使用音源原生推荐（网易云每日推荐/榜单 + 洛雪免登录榜单），无需额外配置；未启用网易音源时可选配置大模型作为兜底。
+- **音源选择**（可多选；编号是全局「源+平台」ID，向导只列出精选）：
+  - `1` 网易云 musicbox [端口 8770]
+  - `2`–`7` 精选 musicdl：酷我 / 酷狗 / 咪咕 / QQ / 千千 / B站
+  - `59`–`62` 精选 lxmusic：酷狗 / 网易 / 咪咕 / 酷我（`63` lx-QQ 仅搜索，见文档）
+  - 其余平台对照 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md) 的编号直接输入，例如 `49` = mdl-gequhai
+  - 示例：输入 `1,2,62` = 网易云 + mdl-酷我 + lx-酷我（对应容器一起安装，搜索按多源并发策略聚合）
+  - 整源启用请写名字（默认平台）：`musicbox,musicdl,lxmusic`（**不要**再用 `1,2,3` 表示三整源）
+- **每日推荐**：默认使用音源原生推荐（网易云每日推荐/榜单 + 洛雪免登录榜单，榜单按所选 lx 平台自动过滤），无需额外配置；未启用网易音源时可选配置大模型作为兜底。
 
 > 💡 **进阶：非交互静默安装示例**（一行命令全自动完成并启用）：
 > ```bash
-> ./install.sh --non-interactive --mode docker --sources=1,2,3 --extend
+> ./install.sh --non-interactive --mode docker --sources=musicbox,musicdl,lxmusic --extend
+> # 或按平台粒度：网易云 + lx-酷我 + mdl-酷我
+> ./install.sh --non-interactive --mode docker --sources=1,2,62 --extend
 > ```
+> 全部平台编号请查看 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)（`1,2,3` 现为平台编号，不再表示三整源）。
 
 ---
 
@@ -108,10 +114,11 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | `FNMUSIC_MUSICDL_URL` | `http://127.0.0.1:8768` | 聚合音源服务地址 |
 | `FNMUSIC_LX_ENABLED` | `true` | 是否启用洛雪免登录音源 (`lxmusic`) |
 | `FNMUSIC_LX_URL` | `http://127.0.0.1:8772` | 洛雪音源服务地址 |
-| `LX_SOURCES` | `kg,wy,mg,kw` | lxmusic 子源列表；根 `.env` 可覆盖容器/Host 配置，重装后生效 |
+| `LX_SOURCES` | `kg,wy,mg,kw` | lxmusic 启用的平台列表（`kg/wy/mg/kw/tx`）；`install.sh --sources lx-<平台>` 或向导选择后写入，代理搜索/播放/榜单按此过滤；修改后重装生效 |
 | `LX_THIRD_PARTY` | `1` | lxmusic 第三方解析链路总开关（关闭后退化为官方免登录直连，kw/tx 无结果） |
 | `LX_RESOLVER_TIMEOUT` | `4.0` | 第三方链路单次解析超时（秒） |
-| `FNMUSIC_ONLINE_SOURCES` | `MiguMusicClient,KuwoMusicClient` | musicdl 启用的子平台列表 |
+| `FNMUSIC_ONLINE_SOURCES` | `MiguMusicClient,KuwoMusicClient` | musicdl 启用的子平台列表（短名或全名均可）；`install.sh --sources musicdl-<平台>` 或向导选择后写入 |
+| `MUSICDL_SOURCES` | `KuwoMusicClient,MiguMusicClient` | musicdl 容器/服务的默认平台白名单（与上键联动写入，重装生效） |
 | `FNMUSIC_TEE_SAVE_ENABLED` | `true` | 边听边存开关：完整试听在线歌后自动保存到本地曲库 |
 | `FNMUSIC_TEE_SAVE_DIR` | *(空)* | 边听边存保存路径；留空=自动探测飞牛共享曲库，配置后以配置为准，不可用自动回退 |
 | `FNMUSIC_TEE_CACHE_MAX` | `2` | 关闭边听边存时滚动保留的最新试听缓存条数（仅在关闭时生效；restore 会清理） |

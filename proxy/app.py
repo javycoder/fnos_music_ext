@@ -44,6 +44,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 _HOME = dailyrec.home_dir()
 
+# lx 平台别名 → 规范代码（与 lxmusic-service/app.py 的 _SOURCE_ALIASES 保持一致）
+_LX_ALIASES = {
+    "kg": "kg",
+    "kugou": "kg",
+    "wy": "wy",
+    "netease": "wy",
+    "163": "wy",
+    "mg": "mg",
+    "migu": "mg",
+    "tx": "tx",
+    "qq": "tx",
+    "tencent": "tx",
+    "kw": "kw",
+    "kuwo": "kw",
+}
+
+
+def _normalize_lx_sources(raw: str) -> list[str]:
+    """LX_SOURCES 环境变量 → 规范平台代码列表；空 = 不限制（跟随 lx 服务配置）。"""
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        code = _LX_ALIASES.get(part.strip().lower(), "")
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
 CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
@@ -72,6 +99,9 @@ CONF = {
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
+    # lx 平台白名单（同 .env 的 LX_SOURCES；install.sh --sources lx-<平台> 写入）；
+    # 空 = 不限制。GUID 第 3 段携带平台（online:lx:kg:xxx），据此过滤与透传 ?sources=
+    "lx_sources": _normalize_lx_sources(os.environ.get("LX_SOURCES", "")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
@@ -161,7 +191,7 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
 
 
 def _source_config() -> dict:
-    return {k: v for k, v in CONF.items() if k.endswith(("_enabled", "_url", "_limit", "_quality")) or k == "online_sources"}
+    return {k: v for k, v in CONF.items() if k.endswith(("_enabled", "_url", "_limit", "_quality", "_sources")) or k == "online_sources"}
 
 
 def _search_scope(request: Request) -> str:
@@ -175,7 +205,14 @@ def _source_enabled(guid: str) -> bool:
     source = source_from_online_guid(guid)
     if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled"), True):
         return False
-    if source not in ("netease", "lx") and CONF.get("online_sources"):
+    if source == "lx":
+        # lx 平台白名单（online:lx:<platform>:<id>）；未配置 = 跟随 lx 服务全部已启用平台
+        selected = CONF.get("lx_sources") or []
+        if selected:
+            parts = guid.split(":")
+            return len(parts) >= 4 and parts[2] in selected
+        return True
+    if source != "netease" and CONF.get("online_sources"):
         selected = {name.strip().lower().removesuffix("musicclient") for name in str(CONF["online_sources"]).split(",")}
         return source.lower() in selected
     return True
@@ -1194,15 +1231,24 @@ class _SearchItems(list):
         self.partial = partial
 
 
-async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
-    """洛雪音乐源搜索：返回统一 item（id = "lx:<source>:<identifier>"）。"""
+async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: "list[str] | str | None" = None) -> list[dict]:
+    """洛雪音乐源搜索：返回统一 item（id = "lx:<source>:<identifier>"）。
+
+    sources：平台白名单（列表或逗号串），None = 用 CONF["lx_sources"]；空 = 跟随 lx 服务配置。
+    """
     if not keyword:
         return None  # type: ignore[return-value]
+    params: dict[str, Any] = {"keyword": keyword, "limit": limit}
+    selected = CONF.get("lx_sources") if sources is None else sources
+    if isinstance(selected, str):
+        selected = [s.strip() for s in selected.split(",") if s.strip()]
+    if selected:
+        params["sources"] = ",".join(selected)
     timeout = max(float(CONF.get("search_timeout") or 25), 8.0)
     try:
         r = await client.get(
             "/api/v1/search",
-            params={"keyword": keyword, "limit": limit},
+            params=params,
             timeout=timeout,
         )
         if r.status_code != 200:
@@ -2124,7 +2170,10 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
     if source == "netease":
         coro = fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
     elif source == "lx":
-        coro = fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"])
+        # 按目标 GUID 的平台精确重搜（GUID 第 3 段），对齐 musicdl 分支按引擎重搜的行为
+        parts = guid.split(":")
+        coro = fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"],
+                               sources=[parts[2]] if len(parts) >= 4 else None)
     else:
         selected = [name.strip() for name in str(CONF.get("online_sources") or "").split(",")
                     if name.strip().lower().removesuffix("musicclient") == source.lower()]
@@ -3006,6 +3055,7 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
             favorite_items=favs,
             lx_client=get_lx_client(request.app) if CONF.get("lx_enabled", True) else None,
             lx_enabled=bool(CONF.get("lx_enabled", True)),
+            lx_sources=CONF.get("lx_sources") or None,
         )
     )
     _DAILY_TASKS[key] = task
