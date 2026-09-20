@@ -3,18 +3,21 @@ set -euo pipefail
 
 # ==============================================================================
 # fnmusic-ext 一键安装 / 配置
-# - 音源可多选、至少选一个：
+# - 音源可按「源+平台」粒度多选、至少选一个：
 #     musicbox https://github.com/darknessomi/musicbox   (:8770 网易云)
-#     musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合)
-#     lxmusic  洛雪音乐源（LX Music 免登录解析）          (:8772)
+#     musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合, 可选平台)
+#     lxmusic  洛雪音乐源（LX Music 免登录解析）          (:8772, 可选平台)
+#   平台粒度: --sources lx-kw,musicdl-kuwo,netease 或全局编号 --sources 1,2,62
+#   （全部平台编号见 musicdl-service/PLATFORMS.md；数字=平台，不再表示整源）
 # - 每日推荐默认采信音源原生推荐（网易每日推荐/榜单 + lxmusic 免登录榜单）；
 #   大模型（OpenAI 兼容）仅当网易音源未启用时作为兜底，可选配置
 # - 不修改飞牛 nginx / 官方二进制 / 官方数据库写入
 # 用法:
 #   ./install.sh                         # 交互
 #   ./install.sh --mode host
-#   ./install.sh --mode docker --sources=1,2,3
+#   ./install.sh --mode docker --sources=1,2,62
 #   ./install.sh --mode docker --sources musicbox,lxmusic
+#   ./install.sh --mode docker --sources netease,lx-kw,musicdl-kuwo
 #   ./install.sh --non-interactive --mode docker --enable-recommend \
 #       --llm-base-url https://api.example.com/v1 --llm-api-key '***' --llm-model gpt-4o-mini
 # ==============================================================================
@@ -41,6 +44,11 @@ RUN_EXTEND=0
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 ENABLE_LX=0
+# 平台粒度（parse_sources 填充）：空 = 未显式选择，沿用 .env 既有值/默认平台
+LX_PLATFORMS=""
+MDL_PLATFORMS=""
+LX_EXPLICIT=0
+MDL_EXPLICIT=0
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
@@ -56,11 +64,14 @@ usage() {
 用法: ./install.sh [选项]
 
   --mode host|docker     安装模式（host=宿主机 venv；docker=音源容器）
-  --sources LIST         音源，逗号分隔，可多选，至少选一个（支持 --sources=1,2,3 形式）
-                         取值: musicbox, musicdl, lxmusic（或 1, 2, 3）
-                         1 = musicbox 网易云 [8770]
-                         2 = musicdl  聚合    [8768]
-                         3 = lxmusic  洛雪音乐源 [8772]
+  --sources LIST         音源，逗号分隔，可多选，至少选一个（支持 --sources=1,2,62 形式）
+                         整源启用（该源默认平台）: musicbox / musicdl / lxmusic
+                         精确到平台: 全局编号 / lx-<kg|wy|mg|kw|tx> / musicdl-<平台短名>
+                         示例: --sources 1,2,62
+                               --sources netease,lx-kw,musicdl-kuwo
+                               （1=网易云、2=mdl-酷我、62=lx-酷我；两个容器一起装）
+                         全部平台编号见 musicdl-service/PLATFORMS.md
+                         注意: 1,2,3 是平台编号，不再表示三整源
                          非交互缺省: musicdl
   --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
   --enable-recommend     开启大模型兜底推荐（需同时给 base-url 与 api-key；
@@ -77,28 +88,265 @@ usage() {
 EOF
 }
 
+# 全局音源-平台对照表：编号|提供者|短名|全名或代码|展示名|精选(1/0)
+# 与 musicdl-service/PLATFORMS.md 一一对应（proxy/tests/test_platform_table.py 同步校验）；
+# 每个「源+平台」一个独立编号；新增平台只在表末追加，避免挤掉已有 ID。
+SOURCE_PLATFORM_TABLE='
+1|musicbox|netease|musicbox|网易云音乐|1
+2|musicdl|kuwo|KuwoMusicClient|酷我音乐|1
+3|musicdl|kugou|KugouMusicClient|酷狗音乐|1
+4|musicdl|migu|MiguMusicClient|咪咕音乐|1
+5|musicdl|qq|QQMusicClient|QQ音乐|1
+6|musicdl|qianqian|QianqianMusicClient|千千音乐|1
+7|musicdl|bilibili|BilibiliMusicClient|哔哩哔哩|1
+8|musicdl|netease|NeteaseMusicClient|网易云|0
+9|musicdl|bodian|BodianMusicClient|波点音乐|0
+10|musicdl|soda|SodaMusicClient|汽水音乐|0
+11|musicdl|fivesing|FiveSingMusicClient|5sing 原创音乐|0
+12|musicdl|streetvoice|StreetVoiceMusicClient|街声|0
+13|musicdl|moov|MOOVMusicClient|MOOV|0
+14|musicdl|youtube|YouTubeMusicClient|YouTube Music|0
+15|musicdl|joox|JooxMusicClient|JOOX|0
+16|musicdl|apple|AppleMusicClient|Apple Music|0
+17|musicdl|jamendo|JamendoMusicClient|Jamendo|0
+18|musicdl|soundcloud|SoundCloudMusicClient|SoundCloud|0
+19|musicdl|deezer|DeezerMusicClient|Deezer|0
+20|musicdl|qobuz|QobuzMusicClient|Qobuz|0
+21|musicdl|spotify|SpotifyMusicClient|Spotify|0
+22|musicdl|tidal|TIDALMusicClient|TIDAL|0
+23|musicdl|fma|FMAMusicClient|Free Music Archive|0
+24|musicdl|jiosaavn|JioSaavnMusicClient|JioSaavn|0
+25|musicdl|opengameart|OpenGameArtMusicClient|OpenGameArt|0
+26|musicdl|suno|SunoMusicClient|Suno|0
+27|musicdl|wikimediacommons|WikimediaCommonsMusicClient|Wikimedia Commons|0
+28|musicdl|audius|AudiusMusicClient|Audius|0
+29|musicdl|ccmixter|CCMixterMusicClient|ccMixter|0
+30|musicdl|ximalaya|XimalayaMusicClient|喜马拉雅|0
+31|musicdl|lizhi|LizhiMusicClient|荔枝FM|0
+32|musicdl|qingting|QingtingMusicClient|蜻蜓FM|0
+33|musicdl|lrts|LRTSMusicClient|LRTS|0
+34|musicdl|itunes|ITunesMusicClient|iTunes|0
+35|musicdl|mp3juice|MP3JuiceMusicClient|MP3Juice|0
+36|musicdl|tunehub|TuneHubMusicClient|TuneHub|0
+37|musicdl|gdstudio|GDStudioMusicClient|GDStudio|0
+38|musicdl|myfreemp3|MyFreeMP3MusicClient|MyFreeMP3|0
+39|musicdl|jbsou|JBSouMusicClient|JBSou|0
+40|musicdl|xiaobai|XiaoBaiMusicClient|小白音乐|0
+41|musicdl|mitu|MituMusicClient|Mitu|0
+42|musicdl|buguyy|BuguyyMusicClient|Buguyy|0
+43|musicdl|gequbao|GequbaoMusicClient|Gequbao|0
+44|musicdl|yinyuedao|YinyuedaoMusicClient|Yinyuedao|0
+45|musicdl|xiageba|XiagebaMusicClient|Xiageba|0
+46|musicdl|fangpi|FangpiMusicClient|Fangpi|0
+47|musicdl|fivesong|FiveSongMusicClient|FiveSong|0
+48|musicdl|kkws|KKWSMusicClient|KKWS|0
+49|musicdl|gequhai|GequhaiMusicClient|Gequhai|0
+50|musicdl|livepoo|LivePOOMusicClient|LivePOO|0
+51|musicdl|htqyy|HTQYYMusicClient|HTQYY|0
+52|musicdl|twot58|TwoT58MusicClient|TwoT58|0
+53|musicdl|zhuolin|ZhuolinMusicClient|Zhuolin|0
+54|musicdl|liziyy|LiziYYMusicClient|LiziYY|0
+55|musicdl|mgmp3|MGMP3MusicClient|MGMP3|0
+56|musicdl|itingwa|ITingWaMusicClient|ITingWa|0
+57|musicdl|sgogo|SgogoMusicClient|Sgogo|0
+58|musicdl|xmfwav|XMFWAVMusicClient|XMFWAV|0
+59|lx|kg|kg|酷狗|1
+60|lx|wy|wy|网易|1
+61|lx|mg|mg|咪咕|1
+62|lx|kw|kw|酷我|1
+63|lx|tx|tx|QQ(仅搜索)|0
+'
+
+# lx 平台别名 → 规范代码（与 lxmusic-service/app.py 的 _SOURCE_ALIASES 一致）
+lx_alias() {
+    case "$1" in
+        kg|kugou) echo "kg" ;;
+        wy|netease|163) echo "wy" ;;
+        mg|migu) echo "mg" ;;
+        tx|qq|tencent) echo "tx" ;;
+        kw|kuwo) echo "kw" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 平台并入去重列表（操作全局变量 LX_PLATFORMS / MDL_PLATFORMS）
+lx_merge() {
+    case ",${LX_PLATFORMS}," in
+        *",$1,"*) ;;
+        *) LX_PLATFORMS="${LX_PLATFORMS:+${LX_PLATFORMS},}$1" ;;
+    esac
+}
+
+mdl_merge() {
+    case ",${MDL_PLATFORMS}," in
+        *",$1,"*) ;;
+        *) MDL_PLATFORMS="${MDL_PLATFORMS:+${MDL_PLATFORMS},}$1" ;;
+    esac
+}
+
+# 全局编号 → "提供者 短名 全名"；仅纯数字。未知编号返回非 0。
+source_lookup_by_id() {
+    local want="$1" id provider short full label star
+    want="$(printf '%s' "${want}" | tr -d '[:space:]')"
+    [ -z "${want}" ] && return 1
+    case "${want}" in
+        *[!0-9]*) return 1 ;;
+    esac
+    while [ "${#want}" -gt 1 ] && [ "${want#0}" != "${want}" ]; do
+        want="${want#0}"
+    done
+    while IFS='|' read -r id provider short full label star; do
+        [ -z "${id}" ] && continue
+        if [ "${want}" = "${id}" ]; then
+            echo "${provider} ${short} ${full}"
+            return 0
+        fi
+    done <<< "${SOURCE_PLATFORM_TABLE}"
+    return 1
+}
+
+# musicdl 平台解析：接受 全局编号/短名/全名（大小写不敏感），输出 "编号 短名 全名"
+mdl_platform_lookup() {
+    local want="$1" id provider short full label star full_l
+    want="$(printf '%s' "${want}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    [ -z "${want}" ] && return 1
+    while [ "${#want}" -gt 1 ] && [ "${want#0}" != "${want}" ]; do
+        want="${want#0}"
+    done
+    want="${want%musicclient}"
+    while IFS='|' read -r id provider short full label star; do
+        [ -z "${id}" ] && continue
+        [ "${provider}" = "musicdl" ] || continue
+        full_l="$(printf '%s' "${full}" | tr '[:upper:]' '[:lower:]')"
+        full_l="${full_l%musicclient}"
+        if [ "${want}" = "${id}" ] || [ "${want}" = "${short}" ] || [ "${want}" = "${full_l}" ]; then
+            echo "${id} ${short} ${full}"
+            return 0
+        fi
+    done <<< "${SOURCE_PLATFORM_TABLE}"
+    return 1
+}
+
+# 逗号分隔 musicdl 短名 → 逗号分隔客户端全名（供 MUSICDL_SOURCES 白名单）
+mdl_short_to_full() {
+    local shorts="$1" out="" s rec
+    local IFS=','
+    # shellcheck disable=SC2086
+    for s in ${shorts}; do
+        [ -z "${s}" ] && continue
+        rec="$(mdl_platform_lookup "${s}")" || return 1
+        out="${out:+${out},}${rec##* }"
+    done
+    printf '%s' "${out}"
+}
+
+apply_source_row() {
+    local provider="$1" short="$2"
+    case "${provider}" in
+        musicbox) ENABLE_MUSICBOX=1 ;;
+        musicdl)
+            ENABLE_MUSICDL=1
+            MDL_EXPLICIT=1
+            mdl_merge "${short}"
+            ;;
+        lx)
+            ENABLE_LX=1
+            LX_EXPLICIT=1
+            lx_merge "${short}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+print_featured_source_menu() {
+    local id provider short full label star
+    echo "请选择音源（可多选，逗号分隔编号；下列为精选，至少选一个）:"
+    while IFS='|' read -r id provider short full label star; do
+        [ -z "${id}" ] && continue
+        [ "${star}" = "1" ] || continue
+        case "${provider}" in
+            musicbox)
+                echo "  ${id}) ${label} (musicbox) [端口 8770] — 高品质/无损/歌词封面"
+                ;;
+            musicdl)
+                echo "  ${id}) mdl-${short} ${label}"
+                ;;
+            lx)
+                echo "  ${id}) lx-${short} ${label}"
+                ;;
+        esac
+    done <<< "${SOURCE_PLATFORM_TABLE}"
+    echo "完整编号见 musicdl-service/PLATFORMS.md（1=网易云, 2–58=musicdl, 59–63=lx）。"
+    echo "更多平台请对照文档编号直接输入，例如 49 = mdl-gequhai。"
+    echo "示例: 1,2,62 = 网易云 + mdl-酷我 + lx-酷我（对应容器一起装，搜索多源并发）"
+}
+
 parse_sources() {
     local raw="${1:-}"
     ENABLE_MUSICDL=0
     ENABLE_MUSICBOX=0
     ENABLE_LX=0
-    # 支持 --sources=1,2,3 与 --sources 1,2,3 两种形式
+    LX_PLATFORMS=""
+    MDL_PLATFORMS=""
+    LX_EXPLICIT=0
+    MDL_EXPLICIT=0
+    # 支持 --sources=1,2,62 与 --sources 1,2,62 两种形式
     raw="${raw#*=}"
     raw="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | tr ' ' ',')"
     local IFS=','
-    local part
+    local part plat code rec short provider
     # shellcheck disable=SC2086
     for part in ${raw}; do
         part="${part#"${part%%[![:space:]]*}"}"
         part="${part%"${part##*[![:space:]]}"}"
         [ -z "${part}" ] && continue
         case "${part}" in
-            1|musicbox|netease|netease-musicbox) ENABLE_MUSICBOX=1 ;;
-            2|musicdl|mdl) ENABLE_MUSICDL=1 ;;
-            3|lx|lxmusic) ENABLE_LX=1 ;;
+            musicbox|netease|netease-musicbox)
+                ENABLE_MUSICBOX=1 ;;
+            musicdl|mdl)
+                ENABLE_MUSICDL=1 ;;
+            lx|lxmusic)
+                ENABLE_LX=1 ;;
+            lx-all|lxmusic-all)
+                # 整源启用但视为显式平台选择，写入 .env 默认平台
+                ENABLE_LX=1
+                LX_EXPLICIT=1
+                for code in kg wy mg kw; do lx_merge "${code}"; done ;;
+            lx-*|lxmusic-*)
+                ENABLE_LX=1
+                LX_EXPLICIT=1
+                plat="${part#*-}"
+                code="$(lx_alias "${plat}")" || {
+                    log_err "未知 lx 平台: ${plat}（可选 kg/kugou 酷狗、wy/netease 网易、mg/migu 咪咕、kw/kuwo 酷我、tx/qq QQ）"
+                    exit 1
+                }
+                lx_merge "${code}" ;;
+            musicdl-all|mdl-all)
+                ENABLE_MUSICDL=1
+                MDL_EXPLICIT=1
+                mdl_merge "kuwo"
+                mdl_merge "migu" ;;
+            musicdl-*|mdl-*)
+                ENABLE_MUSICDL=1
+                MDL_EXPLICIT=1
+                plat="${part#*-}"
+                rec="$(mdl_platform_lookup "${plat}")" || {
+                    log_err "未知 musicdl 平台: ${plat}（全部平台的编号/短名见 musicdl-service/PLATFORMS.md）"
+                    exit 1
+                }
+                short="${rec#* }"; short="${short%% *}"
+                mdl_merge "${short}" ;;
             *)
-                log_err "未知音源: ${part}（可选 musicbox / musicdl / lxmusic，或 1 / 2 / 3）"
-                exit 1
+                rec="$(source_lookup_by_id "${part}")" || {
+                    log_err "未知音源: ${part}（可选 musicbox / musicdl[-平台] / lx[-平台]，或 musicdl-service/PLATFORMS.md 中的平台编号）"
+                    exit 1
+                }
+                provider="${rec%% *}"
+                short="${rec#* }"; short="${short%% *}"
+                apply_source_row "${provider}" "${short}" || {
+                    log_err "未知音源: ${part}"
+                    exit 1
+                }
                 ;;
         esac
     done
@@ -410,12 +658,8 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         esac
     fi
     if [ -z "${SOURCES_RAW}" ]; then
-        echo "请选择音源（可多选，逗号分隔，至少选一个）:"
-        echo "  1) 网易云音乐源 musicbox  [端口 8770] — 高品质/无损/歌词封面（darknessomi/musicbox）"
-        echo "  2) 聚合音源   musicdl    [端口 8768] — 酷我/咪咕等聚合，覆盖热门流行（CharlesPikachu/musicdl）"
-        echo "  3) 洛雪音乐源 lxmusic     [端口 8772] — 免登录高音质解析：酷狗 kg / 网易 wy / 咪咕 mg 直链"
-        echo "  1,2,3) 全部启用 — 三源并行（推荐）"
-        SOURCES_RAW="$(prompt "输入 1 / 2 / 3 / 1,2 / 1,3 / 1,2,3" "1,2,3")"
+        print_featured_source_menu
+        SOURCES_RAW="$(prompt "输入编号（精选或文档中的完整编号）" "1,2,4,59,60,61,62")"
     fi
     if [ -z "${ENABLE_RECOMMEND}" ]; then
         echo "大模型兜底推荐（可选选填）:"
@@ -479,10 +723,21 @@ fi
 
 parse_sources "${SOURCES_RAW}"
 
+# host 模式 systemd unit 的音源平台白名单（显式选择时用所选平台，否则默认值）
+MUSICDL_UNIT_SOURCES="KuwoMusicClient,MiguMusicClient"
+[ "${MDL_EXPLICIT}" -eq 1 ] && MUSICDL_UNIT_SOURCES="$(mdl_short_to_full "${MDL_PLATFORMS}")"
+LX_UNIT_SOURCES="kg,wy,mg,kw"
+[ "${LX_EXPLICIT}" -eq 1 ] && LX_UNIT_SOURCES="${LX_PLATFORMS}"
+
+MDL_SUMMARY=""
+[ -n "${MDL_PLATFORMS}" ] && MDL_SUMMARY="(${MDL_PLATFORMS})"
+LX_SUMMARY=""
+[ -n "${LX_PLATFORMS}" ] && LX_SUMMARY="(${LX_PLATFORMS})"
+
 SELECTED=""
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} musicbox[8770]"
-[ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]"
-[ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]"
+[ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]${MDL_SUMMARY}"
+[ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]${LX_SUMMARY}"
 
 log_info "fnmusic-ext v${FNMUSIC_VERSION}"
 log_info "安装模式: ${MODE}"
@@ -524,12 +779,21 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_NETEASE_ENABLED='${MUSICBOX_FLAG}'"
     echo "FNMUSIC_MUSICDL_URL='http://127.0.0.1:8768'"
     echo "FNMUSIC_MUSICBOX_URL='http://127.0.0.1:8770'"
-    echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
+    if [ "${MDL_EXPLICIT}" -eq 1 ]; then
+        # 显式平台选择：代理请求级白名单（短名）+ 容器级白名单（全名）
+        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "${MDL_PLATFORMS}")'"
+        echo "MUSICDL_SOURCES='$(dotenv_escape "$(mdl_short_to_full "${MDL_PLATFORMS}")")'"
+    else
+        echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
+    fi
     echo "FNMUSIC_TEE_SAVE_ENABLED='true'"
     echo "FNMUSIC_TEE_SAVE_DIR=''"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
+    if [ "${LX_EXPLICIT}" -eq 1 ]; then
+        echo "LX_SOURCES='$(dotenv_escape "${LX_PLATFORMS}")'"
+    fi
     echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
     echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
@@ -549,6 +813,9 @@ ENV_DESIRED="$(mktemp)"
 # 用户本次明确提供了新值的键（音源开关/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
+# 平台显式选择（向导菜单或 lx-kw/musicdl-kuwo 等 token）时覆盖平台键；裸音源 token 不动既有值
+[ "${LX_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCES"
+[ "${MDL_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_ONLINE_SOURCES,MUSICDL_SOURCES"
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     [ -n "${LLM_BASE_URL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL"
     [ -n "${LLM_API_KEY}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_API_KEY"
@@ -659,8 +926,9 @@ Type=simple
 User=root
 WorkingDirectory=${BASE_DIR}/musicdl-service
 Environment=PYTHONUNBUFFERED=1
-Environment=MUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient
+Environment=MUSICDL_SOURCES=${MUSICDL_UNIT_SOURCES}
 Environment=MUSICDL_WORK_DIR=/tmp/musicdl_outputs
+EnvironmentFile=-${BASE_DIR}/.env
 ExecStart=${BASE_DIR}/.venv-musicdl/bin/uvicorn app:app --host 127.0.0.1 --port 8768
 Restart=always
 RestartSec=5
@@ -780,7 +1048,7 @@ Type=simple
 User=root
 WorkingDirectory=${BASE_DIR}/lxmusic-service
 Environment=PYTHONUNBUFFERED=1
-Environment=LX_SOURCES=kg,wy,mg,kw
+Environment=LX_SOURCES=${LX_UNIT_SOURCES}
 Environment=LX_THIRD_PARTY=1
 Environment=LX_SEARCH_TIMEOUT=12
 Environment=LX_LIMIT_PER_SOURCE=20
@@ -867,8 +1135,8 @@ log_info "已启用音源（安装模式: ${MODE}）:${SELECTED}"
 log_info "------------------------------------------------------------"
 log_info "【音源服务状态】"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
-[ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源      http://127.0.0.1:8768/healthz"
-[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪音乐源    http://127.0.0.1:8772/healthz"
+[ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源${MDL_SUMMARY:+ 平台${MDL_SUMMARY}}   http://127.0.0.1:8768/healthz"
+[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪音乐源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
 log_info "------------------------------------------------------------"
 log_info "【后续验证与使用指引】"
 if [ "${RUN_EXTEND}" -eq 1 ]; then
