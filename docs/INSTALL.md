@@ -169,6 +169,24 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./restore.sh --full
 ```
 
+### 单机多副本约束与部署迁移（--adopt）
+
+代理单元名、音源容器名与安装锁在本机全局唯一，且本机会登记当前部署目录
+（`/var/lib/fnmusic-ext/deployment`）。因此：
+
+- 请只维护一份部署目录。从**另一份仍存在的仓库副本**执行安装/扩展/还原会被
+  拒绝，并提示先回到原部署目录操作；原目录执行 `./restore.sh` 释放部署后，
+  新目录即可正常安装；
+- 确认要把部署迁移到当前目录（例如旧目录准备废弃）时，追加 `--adopt`：
+  ```bash
+  ./install.sh --non-interactive --mode docker --sources musicbox,musicdl,lxmusic --adopt --extend
+  ```
+  接管成功后登记自动指向当前目录。`extend.sh` / `restore.sh` 同样支持 `--adopt`；
+- 原登记目录已被删除时不拦截，任意目录可直接重新安装；
+- 安装锁若被**本副本**挂起的旧进程占用（如向导停在扫码登录），新命令会自动
+  终止旧进程并接管（日志会打印被终止进程的 PID 与命令行）；锁若属于另一份
+  副本或无关进程则绝不终止，仅报告后退出。
+
 ---
 
 ## 4. 网易云登录扫码（若启用 musicbox）
