@@ -6,6 +6,8 @@ set -euo pipefail
 # 功能：停用代理服务并复位 trim-music 原生 Unix Socket
 # 语义：
 #   默认     还原官方直连 + 移除代理 unit + 停止并删除音源容器/宿主机 unit；
+#            兼容新旧两种部署形态：v1.x 三音源容器与宿主机 unit、
+#            v2.0.0 单容器 fnmusic-sources 均会清理；
 #            .env 与全部用户数据（网易云登录、在线收藏、播放历史、推荐缓存）保留，
 #            重装后无需重新填写大模型 Key 等任何配置；
 #            在线试听滚动缓存（cache 目录中 online_* 音频/歌词）会被清理。
@@ -32,7 +34,8 @@ for arg in "$@"; do
             ;;
         -h|--help)
             echo "用法: $0 [--full] [--adopt]"
-            echo "  默认:   还原官方直连，删除代理 unit 与音源容器/宿主机 unit；保留 .env 与全部数据"
+            echo "  默认:   还原官方直连，删除代理 unit 与音源容器/宿主机 unit"
+            echo "         （兼容 v1.x 三音源容器与 v2.0.0 单容器 fnmusic-sources）；保留 .env 与全部数据"
             echo "         （仅清理在线试听滚动缓存 cache/online_*，不影响已存入曲库的歌曲）"
             echo "  --full: 额外删除 .env（含备份）、网易云登录、缓存、在线收藏、播放历史、"
             echo "          推荐缓存与虚拟环境（保留代码），用于彻底重置"
@@ -72,7 +75,8 @@ run_docker() {
 purge_local_state() {
     local removed="" target
     for target in "${BASE_DIR}"/.env "${BASE_DIR}"/.env.bak.* \
-                  "${BASE_DIR}/musicbox-data" "${BASE_DIR}/cache" \
+                  "${BASE_DIR}/musicbox-data" "${BASE_DIR}/sources-data" \
+                  "${BASE_DIR}/cache" \
                   "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" \
                   "${BASE_DIR}/recommend_cache" "${BASE_DIR}"/.venv-*; do
         # 通配符未匹配时会原样出现，且仅允许清理本目录内的路径
@@ -133,8 +137,10 @@ fi
 sudo systemctl daemon-reload 2>/dev/null || true
 
 # 3. 停止并移除音源容器与宿主机 unit（默认动作；配置与数据一律保留）
-log_info "停止并移除音源容器与宿主机 unit..."
-for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+#    v1.x 部署形态：三音源容器 / 宿主机 unit；v2.0.0：单容器 fnmusic-sources。一并清理，
+#    保证本脚本能还原「旧版已安装的机器」（升级 git 到 v2 后直接执行本脚本）。
+log_info "停止并移除音源容器与宿主机 unit（v1.x 三容器与 v2 单容器）..."
+for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic fnmusic-sources; do
     remove_owned_container "${unit}"
     if owned_source_unit "${unit}"; then
         stop_owned_source_unit "${unit}"
@@ -143,7 +149,7 @@ for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
 done
 # 如实校验清理结果：容器可能被其他副本/并发任务重建，绝不静默假成功
 leftover=""
-for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic fnmusic-sources; do
     if run_docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${unit}"; then
         leftover="${leftover} ${unit}"
     fi
@@ -152,7 +158,7 @@ if [ -n "${leftover}" ]; then
     log_warn "以下容器仍存在（可能刚被其他副本或并发任务重建）:${leftover}"
     log_warn "如需彻底清理，请手动执行: docker rm -f${leftover}"
 else
-    log_info "musicdl / musicbox / lxmusic 容器与宿主机 unit 已清理完毕。"
+    log_info "音源容器（v1.x 三容器与 v2 单容器）与宿主机 unit 已清理完毕。"
 fi
 
 # 4. --full：工厂级清理配置与数据（代码与 git 保留）

@@ -1,0 +1,43 @@
+---
+description: Delegate subagent work via opencode (gemini-3.8-flash), never Cursor Task/built-in subagents
+alwaysApply: true
+---
+
+# Subagent dispatch: opencode only
+
+When Cursor would spawn a **subagent** (explore, generalPurpose, shell, parallel workers, etc.):
+
+1. **Do not** use the Cursor `Task` tool or any built-in subagent.
+2. **Do** dispatch via local `opencode` (this host model: `openai-proxy/gemini-3.8-flash-high`).
+3. Parent writes a self-contained brief; **blocks until opencode finishes**; then continues.
+
+## When / how
+
+- **Whether / how many** workers: Cursor’s normal judgment (0–N parallel ok).
+- **How** to dispatch: Shell → `opencode run` only (see skill `opencode-subagent`).
+
+## User-visible announce (required)
+
+Before the Shell call, tell the user in **one short sentence**, e.g.:
+
+- `派出 opencode 进行首次安装健壮性审查。`
+- `并行派出 2 个 opencode：分别梳理搜索链路与安装还原路径。`
+
+Do not go silent while waiting — silence looks like the session ended.
+
+## Permissions & continuity (critical)
+
+- First Shell call for opencode: always `required_permissions: ["all"]` (never start sandboxed then escalate mid-run).
+- Use `--auto` so opencode itself does not pause for approvals.
+- Prefer the helper (hard-kills after **900s** default; override `--timeout` / `OPENCODE_SUBAGENT_TIMEOUT_SEC`). Parent must **not** await forever: set Shell `block_until_ms` ≈ timeout+buffer, or AwaitShell with the same cap; on timeout/exit 124, report failure and continue (retry once or DIY).
+- Do **not** end the parent turn while workers are still running within the timeout window.
+- After stdout/timeout returns, parent **must** resume in the same session. Abandoning after a permission prompt is a failure mode.
+
+## Invoke sketch
+
+```bash
+~/.cursor/skills/opencode-subagent/scripts/run-opencode-subagent.sh \
+  --dir "<workspace>" --title "<id>" - <<'EOF'
+<self-contained brief>
+EOF
+```

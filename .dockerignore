@@ -1,0 +1,12 @@
+# 统一镜像构建上下文：只送四个服务目录 + container/，仓库其余内容（数据/缓存/密钥）不进镜像
+*
+!musicdl-service/
+!musicbox-service/
+!lxmusic-service/
+!webui-service/
+!container/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/test_*.py
+**/*.md

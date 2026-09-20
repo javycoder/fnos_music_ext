@@ -1,4 +1,4 @@
-musicdl>=2.13.6
+musicdl>=2.13.11
 fastapi>=0.110
 uvicorn>=0.29
 httpx>=0.27
