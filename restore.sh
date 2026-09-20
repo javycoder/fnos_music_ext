@@ -26,12 +26,17 @@ for arg in "$@"; do
         --full)
             FULL_RESTORE=1
             ;;
+        --adopt)
+            # Explicit deployment migration: skip the cross-checkout registry
+            # check so this checkout can retire the deployment (install_common.sh).
+            ;;
         -h|--help)
-            echo "用法: $0 [--full]"
+            echo "用法: $0 [--full] [--adopt]"
             echo "  默认:   还原官方直连，删除代理 unit 与音源容器/宿主机 unit；保留 .env 与全部数据"
             echo "         （仅清理在线试听滚动缓存 cache/online_*，不影响已存入曲库的歌曲）"
             echo "  --full: 额外删除 .env（含备份）、网易云登录、缓存、在线收藏、播放历史、"
             echo "          推荐缓存与虚拟环境（保留代码），用于彻底重置"
+            echo "  --adopt: 允许在部署登记指向其他目录时强制还原（迁移部署到当前目录的流程之一）"
             exit 0
             ;;
         *)
@@ -83,6 +88,9 @@ purge_local_state() {
 }
 
 check_proxy_unit_owner || exit 1
+# Refuse to restore from a second checkout while the machine-wide deployment
+# registry names another live directory (skip with the explicit --adopt flag).
+check_deployment_owner "$@" || exit 1
 
 log_info "==> 开始还原 fnmusic 原生直连模式..."
 
@@ -165,5 +173,8 @@ else
 fi
 
 log_info "============================================================"
+# Back to stock: forget which checkout owned the deployment so any checkout
+# may install fresh afterwards.
+takeover deployment-clear || true
 log_info "fnmusic 已成功还原为原生直连模式！"
 log_info "============================================================"
