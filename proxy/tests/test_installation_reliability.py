@@ -420,7 +420,7 @@ stop_owned_source_unit() { printf 'unit %s\\n' "$1"; }
 def install_platform_block():
     """提取 install.sh 的平台表 + 解析函数块（菜单表 → 参数解析 while 之前）。"""
     text = (BASE/'install.sh').read_text(encoding='utf-8')
-    start = text.index("MDL_PLATFORM_TABLE='")
+    start = text.index("SOURCE_PLATFORM_TABLE='")
     end = text.index('while [ $# -gt 0 ]')
     return text[start:end]
 
@@ -436,34 +436,53 @@ def test_parse_sources_platform_tokens():
 parse_sources "netease,lx-kw,musicdl-kuwo"
 printf "combo %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
 parse_sources "1,2,3"
+printf "ids123 %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
+parse_sources "1,2,62"
+printf "ids162 %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
+parse_sources "musicbox,musicdl,lxmusic"
 printf "bare %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
-parse_sources "lxmusic-KuGou,mdl-48,mdl-GequhaiMusicClient"
+parse_sources "lxmusic-KuGou,mdl-49,mdl-GequhaiMusicClient"
 printf "alias [%s] [%s]\\n" "$LX_PLATFORMS" "$MDL_PLATFORMS"
+parse_sources "49"
+printf "id49 [%s] [%s]\\n" "$LX_PLATFORMS" "$MDL_PLATFORMS"
+parse_sources "14"
+printf "id14 [%s]\\n" "$MDL_PLATFORMS"
 parse_sources "lx-kw,lx-kg,lx-kw"
 printf "union [%s]\\n" "$LX_PLATFORMS"
 parse_sources "musicdl-all"
 printf "all [%s] [%s]\\n" "$MDL_PLATFORMS" "$(mdl_short_to_full "$MDL_PLATFORMS")"
-printf "menu [%s]\\n" "$(menu_answer_to_tokens "1,6,9")"
-printf "menu [%s]\\n" "$(menu_answer_to_tokens "1,2,8")"
-printf "menu [%s]\\n" "$(menu_answer_to_tokens "lx-kw,musicdl-kuwo")"
+parse_sources "1,2,4,59,60,61,62"
+printf "default %s %s %s [%s] [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS"
+parse_sources "8"
+printf "id8 %s %s [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$MDL_PLATFORMS"
+parse_sources "netease"
+printf "name-netease %s %s [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$MDL_PLATFORMS"
 '''
     result = run_install_bash(body)
     assert result.returncode == 0, result.stderr
     rows = result.stdout.splitlines()
     # 显式平台 token：源开关 + 平台列表 + 显式标记
     assert rows[0] == 'combo 1 1 1 [kw] [kuwo] 1 1'
-    # 裸 token（旧写法）= 整源默认平台，不动平台键
-    assert rows[1] == 'bare 1 1 1 [] [] 0 0'
-    # lx 别名 / musicdl 编号与全名输入归一
-    assert rows[2] == 'alias [kg] [gequhai]'
+    # 全局编号 1,2,3 = 网易云 + mdl-酷我 + mdl-酷狗（不再是三整源）
+    assert rows[1] == 'ids123 1 1 0 [] [kuwo,kugou] 0 1'
+    # 1,2,62 = 网易云 + mdl-酷我 + lx-酷我
+    assert rows[2] == 'ids162 1 1 1 [kw] [kuwo] 1 1'
+    # 裸名字 token = 整源默认平台，不动平台键
+    assert rows[3] == 'bare 1 1 1 [] [] 0 0'
+    # lx 别名 / musicdl 全局编号与全名输入归一
+    assert rows[4] == 'alias [kg] [gequhai]'
+    assert rows[5] == 'id49 [] [gequhai]'
+    # 14 = mdl-youtube（非精选，文档编号可直接输入）
+    assert rows[6] == 'id14 [youtube]'
     # 同源多平台并集去重
-    assert rows[3] == 'union [kw,kg]'
+    assert rows[7] == 'union [kw,kg]'
     # musicdl-all = 显式默认平台，短名 → 全名映射
-    assert rows[4] == 'all [kuwo,migu] [KuwoMusicClient,MiguMusicClient]'
-    # 菜单编号 → token（1 网易云 / 6 lx-酷我 / 9 mdl-酷我；默认 1,2,8）
-    assert rows[5] == 'menu [musicbox,lx-kw,musicdl-kuwo]'
-    assert rows[6] == 'menu [musicbox,lx-all,musicdl-all]'
-    assert rows[7] == 'menu [lx-kw,musicdl-kuwo]'
+    assert rows[8] == 'all [kuwo,migu] [KuwoMusicClient,MiguMusicClient]'
+    # 向导默认精选组合
+    assert rows[9] == 'default 1 1 1 [kg,wy,mg,kw] [kuwo,migu]'
+    # 8 = musicdl 的网易云客户端；名字 netease 仍指向 musicbox
+    assert rows[10] == 'id8 0 1 [netease]'
+    assert rows[11] == 'name-netease 1 0 []'
 
 
 def test_parse_sources_rejects_unknown_platforms():
@@ -474,8 +493,14 @@ def test_parse_sources_rejects_unknown_platforms():
     assert result.returncode != 0 and '未知 musicdl 平台' in result.stderr
     result = run_install_bash(block + 'parse_sources "bogus"')
     assert result.returncode != 0 and '未知音源' in result.stderr
-    result = run_install_bash(block + 'menu_answer_to_tokens "15"')
-    assert result.returncode != 0 and '未知菜单编号' in result.stderr
+    result = run_install_bash(block + 'parse_sources "0"')
+    assert result.returncode != 0 and '未知音源' in result.stderr
+    result = run_install_bash(block + 'parse_sources "64"')
+    assert result.returncode != 0 and '未知音源' in result.stderr
+    result = run_install_bash(block + 'parse_sources "mdl-1"')
+    assert result.returncode != 0 and '未知 musicdl 平台' in result.stderr
+    result = run_install_bash(block + 'parse_sources "15"')
+    assert result.returncode == 0, result.stderr
 
 
 def test_env_write_platform_keys_explicit_only():
