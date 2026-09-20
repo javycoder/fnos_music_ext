@@ -325,7 +325,7 @@ $("#lx-test").addEventListener("click", async () => {
   if (!url) { toast("请先填写源 URL", "fail"); return; }
   box.hidden = false;
   box.className = "report";
-  box.textContent = "测试中（下载脚本 → 沙箱初始化 → 搜索 → 解析 → 探活）…";
+  box.textContent = "测试中（下载脚本 → 沙箱初始化 → 多首抽样搜索/解析/探活）…";
   const callVerify = () => api("/api/lx/verify", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

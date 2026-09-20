@@ -570,12 +570,25 @@ async def probe_url(
 # 链路熔断器：连续失败达阈值后暂停该链路一段时间，避免每次搜索白等超时
 _CHAIN_FAIL_THRESHOLD = 3
 _CHAIN_OPEN_SECONDS = 600
+# 熔断打开期间每 30s 放行一次 half-open 试探：第三方源 API 偶发抽风（连接重置等）
+# 会让搜索探活连续失败触发熔断，若只能干等 10 分钟冷却，用户看到的就是"搜索全空"。
+# 真实事故：换到健康源后熔断仍卡在 open，所有平台被 source_circuit_open 拦截。
+_CHAIN_RETRY_SECONDS = 30
 _CHAIN_HEALTH: dict[str, dict] = {}
 
 
 def _chain_available(name: str) -> bool:
     h = _CHAIN_HEALTH.get(name)
-    return not (h and (h.get("open_until", 0) > time.time() or h.get("half_open")))
+    if not h:
+        return True
+    if h.get("half_open"):
+        return False
+    open_until = h.get("open_until", 0)
+    if not open_until:
+        return True
+    # 冷却期内保留按需试探窗口：打开 RETRY 秒后即可 half-open 一次，
+    # 成功立即闭合、失败仅顺延下一个试探窗口（每 30s 至多一个请求打到故障源）
+    return time.time() >= open_until - (_CHAIN_OPEN_SECONDS - _CHAIN_RETRY_SECONDS)
 
 
 def _chain_acquire(name: str) -> bool:
@@ -1487,6 +1500,8 @@ async def source_set(body: SourceBody):
         return JSONResponse(
             content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
         )
+    # 旧源攒下的熔断状态（连续解析失败/open）不应连带拦截新源：换源即清零健康度
+    _CHAIN_HEALTH.pop("user_source", None)
     return {"ok": True, "data": SOURCE_MANAGER.describe()}
 
 
