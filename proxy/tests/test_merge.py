@@ -923,7 +923,7 @@ def test_lyric_cache_hit_skips_musicdl():
 
 
 def test_lyric_list_persists_sidecar():
-    """首次 /lyric/list 从 musicdl 取回后写入 .lrc。"""
+    """首次 /lyric/list 从 musicdl 取回后落 .lrc；无音频时只落 cache，不进曲库（孤儿歌词修复）。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
 
@@ -955,10 +955,11 @@ def test_lyric_list_persists_sidecar():
         resp = client.get("/music/api/v1/lyric/list?trackGUID=online:kuwo:228908")
         assert resp.status_code == 200
         assert info_calls["n"] == 1
-        lyric_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.lrc")
+        lyric_file = os.path.join(CONF["cache_dir"], "online_kuwo_228908.lrc")
         assert os.path.exists(lyric_file)
         with open(lyric_file, encoding="utf-8") as f:
             assert "晴天" in f.read()
+        assert not any(f.endswith(".lrc") for f in os.listdir(CONF["library_dir"]))
 
         resp2 = client.get("/music/api/v1/lyric/list?trackGUID=online:kuwo:228908")
         assert "晴天" in resp2.json()["data"]["list"][0]["content"]

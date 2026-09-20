@@ -3,7 +3,7 @@
 安装向导与 `--sources` 共用**一套全局编号**：每个「音乐源提供者 + 具体平台」一个独立 ID。
 向导只列出下表 ★ 精选；其余平台请对照本表编号，在同一个输入框里填写。
 
-> 编号保持稳定：新增平台只在表末追加，不插入、不复用旧号。
+> 编号保持稳定：新增平台只在表末追加，不插入、不复用旧号；上游下线的平台编号空缺退役。
 > 本表与 `install.sh` 内嵌的 `SOURCE_PLATFORM_TABLE` 由 `proxy/tests/test_platform_table.py` 同步校验。
 
 ## 怎么用
@@ -80,7 +80,6 @@
 | 50 | musicdl | livepoo | LivePOOMusicClient | LivePOO | 下载站/抓取 | |
 | 51 | musicdl | htqyy | HTQYYMusicClient | HTQYY | 下载站/抓取 | |
 | 52 | musicdl | twot58 | TwoT58MusicClient | TwoT58 | 下载站/抓取 | |
-| 53 | musicdl | zhuolin | ZhuolinMusicClient | Zhuolin | 下载站/抓取 | |
 | 54 | musicdl | liziyy | LiziYYMusicClient | LiziYY | 下载站/抓取 | |
 | 55 | musicdl | mgmp3 | MGMP3MusicClient | MGMP3 | 下载站/抓取 | |
 | 56 | musicdl | itingwa | ITingWaMusicClient | ITingWa | 下载站/抓取 | |
@@ -91,3 +90,7 @@
 | 61 | lx | mg | mg | 咪咕 | 洛雪免登录 | ★ |
 | 62 | lx | kw | kw | 酷我 | 洛雪免登录 | ★ |
 | 63 | lx | tx | tx | QQ(仅搜索) | 洛雪免登录 | |
+| 64 | musicdl | yinyueku | YinyuekuMusicClient | Yinyueku | 下载站/抓取 | |
+
+> 编号 53（zhuolin）已随上游 musicdl 2.13.11 移除而退役：编号永久空缺、不复用。
+> 此后新增平台一律从表末最大编号 +1 追加（如 64 = yinyueku）。

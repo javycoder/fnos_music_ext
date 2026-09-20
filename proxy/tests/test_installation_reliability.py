@@ -376,36 +376,35 @@ def function(text, name):
     return text[start:text.index('\n}', start)+2]+'\n'
 
 
-COMBINATIONS = [v for v in itertools.product((0, 1), repeat=3) if any(v)]
+PROVIDER_FLAGS = {
+    'musicdl': (1, 0, 0),
+    'musicbox': (0, 1, 0),
+    'lxmusic': (0, 0, 1),
+}
 
 
-@pytest.mark.parametrize('flags', COMBINATIONS)
-@pytest.mark.parametrize('mode', ['host', 'docker'])
-def test_source_config_and_lifecycle_matrix(tmp_path, flags, mode):
+@pytest.mark.parametrize('provider,flags', sorted(PROVIDER_FLAGS.items()))
+def test_source_config_and_single_choice(tmp_path, provider, flags):
     # Extract actual shell function definitions; every external action is mocked.
     install = (BASE/'install.sh').read_text()
-    names = ('musicdl', 'musicbox', 'lxmusic')
-    selected = ','.join(n for n, flag in zip(names, flags) if flag)
     script = 'set -euo pipefail\nlog_err() { printf "%s\\n" "$*" >&2; }\nlog_info() { :; }\n'
     script += function(install, 'parse_sources')
-    script += function(install, 'clear_opposite_mode')
-    script += function(install, 'stop_unselected')
+    script += function(install, 'cleanup_legacy_sources')
     script += '''remove_owned_container() { printf 'container %s\\n' "$1"; }
 stop_owned_source_unit() { printf 'unit %s\\n' "$1"; }
 '''
-    script += f'MODE={mode}\nparse_sources {selected}\nprintf "flags %s %s %s\\n" "$ENABLE_MUSICDL" "$ENABLE_MUSICBOX" "$ENABLE_LX"\nclear_opposite_mode\nstop_unselected\n'
+    script += f'parse_sources {provider}\nprintf "flags %s %s %s\\n" "$ENABLE_MUSICDL" "$ENABLE_MUSICBOX" "$ENABLE_LX"\ncleanup_legacy_sources\n'
     result = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=True)
     rows = result.stdout.splitlines()
     assert rows[0] == 'flags '+' '.join(map(str, flags))
-    opposite = 'container' if mode == 'host' else 'unit'
-    for name, flag in zip(names, flags):
-        assert f'{opposite} fnmusic-{name}' in rows
-        if not flag:
-            assert f'unit fnmusic-{name}' in rows and f'container fnmusic-{name}' in rows
-    # Actual app config import under all 14 deployment/source combinations.
+    # 旧 v1.x 三 unit + 三容器清理：单容器接管端口 8768/8770/8772 前全部回收
+    for name in ('musicdl', 'musicbox', 'lxmusic'):
+        assert f'unit fnmusic-{name}' in rows
+        assert f'container fnmusic-{name}' in rows
+    # Actual app config import under the selected provider.
     python = Path(sys.executable)
     env = os.environ.copy()
-    env.update(FNMUSIC_HOME=str(tmp_path), FNMUSIC_DEPLOY_MODE=mode,
+    env.update(FNMUSIC_HOME=str(tmp_path), FNMUSIC_DEPLOY_MODE='docker',
                FNMUSIC_MUSICDL_ENABLED=str(bool(flags[0])).lower(),
                FNMUSIC_NETEASE_ENABLED=str(bool(flags[1])).lower(),
                FNMUSIC_LX_ENABLED=str(bool(flags[2])).lower(), PYTHONDONTWRITEBYTECODE='1')
@@ -433,56 +432,67 @@ def run_install_bash(body):
 def test_parse_sources_platform_tokens():
     block = install_platform_block()
     body = block + '''
-parse_sources "netease,lx-kw,musicdl-kuwo"
-printf "combo %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
-parse_sources "1,2,3"
-printf "ids123 %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
-parse_sources "1,2,62"
-printf "ids162 %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
-parse_sources "musicbox,musicdl,lxmusic"
-printf "bare %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
-parse_sources "lxmusic-KuGou,mdl-49,mdl-GequhaiMusicClient"
-printf "alias [%s] [%s]\\n" "$LX_PLATFORMS" "$MDL_PLATFORMS"
+parse_sources "netease"
+printf "netease %s %s %s [%s] [%s] %s %s\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
+parse_sources "musicdl-kuwo,mdl-49"
+printf "mdl2 %s %s %s [%s] [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$MDL_PLATFORMS" "$LX_PLATFORMS"
+parse_sources "lxmusic-KuGou"
+printf "alias [%s]\\n" "$LX_PLATFORMS"
+parse_sources "2,3"
+printf "ids23 %s %s %s [%s]\\n" "$ENABLE_MUSICDL" "$ENABLE_MUSICBOX" "$ENABLE_LX" "$MDL_PLATFORMS"
+parse_sources "59,60"
+printf "ids5960 [%s]\\n" "$LX_PLATFORMS"
 parse_sources "49"
-printf "id49 [%s] [%s]\\n" "$LX_PLATFORMS" "$MDL_PLATFORMS"
+printf "id49 [%s]\\n" "$MDL_PLATFORMS"
+parse_sources "64"
+printf "id64 [%s]\\n" "$MDL_PLATFORMS"
 parse_sources "14"
 printf "id14 [%s]\\n" "$MDL_PLATFORMS"
 parse_sources "lx-kw,lx-kg,lx-kw"
 printf "union [%s]\\n" "$LX_PLATFORMS"
 parse_sources "musicdl-all"
 printf "all [%s] [%s]\\n" "$MDL_PLATFORMS" "$(mdl_short_to_full "$MDL_PLATFORMS")"
-parse_sources "1,2,4,59,60,61,62"
-printf "default %s %s %s [%s] [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$ENABLE_LX" "$LX_PLATFORMS" "$MDL_PLATFORMS"
 parse_sources "8"
 printf "id8 %s %s [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$MDL_PLATFORMS"
-parse_sources "netease"
-printf "name-netease %s %s [%s]\\n" "$ENABLE_MUSICBOX" "$ENABLE_MUSICDL" "$MDL_PLATFORMS"
+parse_sources "musicbox"
+printf "bare [%s] [%s] %s %s\\n" "$LX_PLATFORMS" "$MDL_PLATFORMS" "$LX_EXPLICIT" "$MDL_EXPLICIT"
 '''
     result = run_install_bash(body)
     assert result.returncode == 0, result.stderr
     rows = result.stdout.splitlines()
-    # 显式平台 token：源开关 + 平台列表 + 显式标记
-    assert rows[0] == 'combo 1 1 1 [kw] [kuwo] 1 1'
-    # 全局编号 1,2,3 = 网易云 + mdl-酷我 + mdl-酷狗（不再是三整源）
-    assert rows[1] == 'ids123 1 1 0 [] [kuwo,kugou] 0 1'
-    # 1,2,62 = 网易云 + mdl-酷我 + lx-酷我
-    assert rows[2] == 'ids162 1 1 1 [kw] [kuwo] 1 1'
     # 裸名字 token = 整源默认平台，不动平台键
-    assert rows[3] == 'bare 1 1 1 [] [] 0 0'
-    # lx 别名 / musicdl 全局编号与全名输入归一
-    assert rows[4] == 'alias [kg] [gequhai]'
-    assert rows[5] == 'id49 [] [gequhai]'
+    assert rows[0] == 'netease 1 0 0 [] [] 0 0'
+    # 同源多平台并集（musicdl 短名 + 全局编号）
+    assert rows[1] == 'mdl2 0 1 0 [kuwo,gequhai] []'
+    # lx 别名归一
+    assert rows[2] == 'alias [kg]'
+    # 全局编号 2,3 = mdl-酷我 + mdl-酷狗（不再是三整源）
+    assert rows[3] == 'ids23 1 0 0 [kuwo,kugou]'
+    # 59,60 = lx-酷狗 + lx-网易
+    assert rows[4] == 'ids5960 [kg,wy]'
+    assert rows[5] == 'id49 [gequhai]'
+    # 64 = yinyueku（musicdl 2.13.11 新增，表末追加）
+    assert rows[6] == 'id64 [yinyueku]'
     # 14 = mdl-youtube（非精选，文档编号可直接输入）
-    assert rows[6] == 'id14 [youtube]'
+    assert rows[7] == 'id14 [youtube]'
     # 同源多平台并集去重
-    assert rows[7] == 'union [kw,kg]'
+    assert rows[8] == 'union [kw,kg]'
     # musicdl-all = 显式默认平台，短名 → 全名映射
-    assert rows[8] == 'all [kuwo,migu] [KuwoMusicClient,MiguMusicClient]'
-    # 向导默认精选组合
-    assert rows[9] == 'default 1 1 1 [kg,wy,mg,kw] [kuwo,migu]'
+    assert rows[9] == 'all [kuwo,migu] [KuwoMusicClient,MiguMusicClient]'
     # 8 = musicdl 的网易云客户端；名字 netease 仍指向 musicbox
     assert rows[10] == 'id8 0 1 [netease]'
-    assert rows[11] == 'name-netease 1 0 []'
+    assert rows[11] == 'bare [] [] 0 0'
+
+
+def test_parse_sources_rejects_cross_provider_mix():
+    """v2.0.0 三源互斥：跨 provider 组合直接报错。"""
+    block = install_platform_block()
+    for raw in ('musicbox,musicdl', 'netease,lx-kw', 'musicdl,lxmusic',
+                '1,2', '1,2,4,59,60,61,62', 'musicdl-kuwo,lx-kw'):
+        result = run_install_bash(block + f'parse_sources "{raw}"')
+        assert result.returncode != 0, raw
+        assert '音源三选一' in result.stderr, raw
+        assert '互斥' in result.stderr, raw
 
 
 def test_parse_sources_rejects_unknown_platforms():
@@ -495,8 +505,13 @@ def test_parse_sources_rejects_unknown_platforms():
     assert result.returncode != 0 and '未知音源' in result.stderr
     result = run_install_bash(block + 'parse_sources "0"')
     assert result.returncode != 0 and '未知音源' in result.stderr
-    result = run_install_bash(block + 'parse_sources "64"')
+    result = run_install_bash(block + 'parse_sources "65"')
     assert result.returncode != 0 and '未知音源' in result.stderr
+    # 53 = zhuolin 已随上游 musicdl 2.13.11 下线退役，编号空缺不复用
+    result = run_install_bash(block + 'parse_sources "53"')
+    assert result.returncode != 0 and '未知音源' in result.stderr
+    result = run_install_bash(block + 'parse_sources "64"')
+    assert result.returncode == 0, result.stderr
     result = run_install_bash(block + 'parse_sources "mdl-1"')
     assert result.returncode != 0 and '未知 musicdl 平台' in result.stderr
     result = run_install_bash(block + 'parse_sources "15"')
@@ -508,17 +523,195 @@ def test_env_write_platform_keys_explicit_only():
     text = (BASE/'install.sh').read_text(encoding='utf-8')
     assert 'ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCES"' in text
     assert 'ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_ONLINE_SOURCES,MUSICDL_SOURCES"' in text
-    # 显式分支：短名白名单（代理请求级）+ 全名白名单（容器级）
+    # 显式分支：短名白名单（代理请求级）+ 全名白名单（musicdl 服务级，经 /repo/.env 生效）
     assert 'echo "FNMUSIC_ONLINE_SOURCES=\'$(dotenv_escape "${MDL_PLATFORMS}")\'"' in text
     assert 'echo "MUSICDL_SOURCES=\'$(dotenv_escape "$(mdl_short_to_full "${MDL_PLATFORMS}")")\'"' in text
     assert 'echo "LX_SOURCES=\'$(dotenv_escape "${LX_PLATFORMS}")\'"' in text
     # 非显式分支维持旧默认值（env_merge 沿用既有值）
     assert "echo \"FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'\"" in text
-    # host unit 与 compose 均按所选平台注入
-    assert 'Environment=MUSICDL_SOURCES=${MUSICDL_UNIT_SOURCES}' in text
-    assert 'Environment=LX_SOURCES=${LX_UNIT_SOURCES}' in text
-    assert 'MUSICDL_SOURCES=${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}' in \
-        (BASE/'docker-compose.yml').read_text(encoding='utf-8')
+    # v2.0.0：host unit 模板已移除；compose 单容器经挂载的 /repo/.env 读取平台白名单
+    compose = (BASE/'docker-compose.yml').read_text(encoding='utf-8')
+    assert 'MUSICDL_SOURCES' not in compose and 'LX_SOURCES' not in compose
+    assert './sources-data:/data' in compose and '.:/repo' in compose
+
+
+def test_docker_only_gate_blocks_without_docker(tmp_path):
+    """v2.0.0 仅 Docker：无 docker / daemon 未运行直接报错退出安装。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    block = text[text.index('while [ $# -gt 0 ]'):text.index('\nprecheck_environment')]
+    stubs = 'log_err() { printf "%s\\n" "$*" >&2; }\nusage() { :; }\n'
+    bash = shutil.which('bash')
+    argv = lambda script: [bash, '-c', stubs + script, 'install.sh', '--sources', 'musicdl']
+    # 1) PATH 里没有 docker
+    empty = tmp_path/'empty'; empty.mkdir()
+    result = subprocess.run(argv(block),
+                            env={**os.environ, 'PATH': str(empty)}, capture_output=True, text=True)
+    assert result.returncode != 0 and '未检测到 docker' in result.stderr
+    # 2) docker 命令存在但 daemon 不通（PATH 仅含 stub，避免 sudo 找到真 docker 兜底）
+    bindir = tmp_path/'bin'; bindir.mkdir()
+    (bindir/'docker').write_text('#!/bin/sh\nexit 1\n'); (bindir/'docker').chmod(0o755)
+    result = subprocess.run(argv(block),
+                            env={**os.environ, 'PATH': str(bindir)},
+                            capture_output=True, text=True)
+    assert result.returncode != 0 and 'docker 服务未运行' in result.stderr
+    # 3) docker 可用：闸门放行
+    (bindir/'docker').write_text('#!/bin/sh\nexit 0\n')
+    result = subprocess.run(argv(block + '\nprintf "gate-passed\\n"'),
+                            env={**os.environ, 'PATH': str(bindir)},
+                            capture_output=True, text=True)
+    assert result.returncode == 0 and 'gate-passed' in result.stdout, result.stderr
+
+
+def test_host_mode_removed():
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    # --mode 参数直接报错（给出明确迁移指引）
+    assert '--mode|--mode=*)' in text and 'host 模式已移除' in text
+    for fn in ('install_musicdl_host', 'install_musicbox_host', 'install_lxmusic_host',
+               'clear_opposite_mode', 'stop_unselected'):
+        assert fn not in text, f'{fn} 应随 host 模式移除'
+
+
+def test_lx_url_required_and_webui_choice_wiring():
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    # --lx-source-url 非交互必填；交互循环输入；http(s) 校验
+    assert '--lx-source-url)' in text
+    assert '非交互选择 lxmusic 必须提供 --lx-source-url' in text
+    assert '洛雪源 URL 必须是 http(s) 地址' in text
+    # 容器内校验必须 --json，安装脚本才能按 category 分类提示
+    assert 'verify_source.py --json' in text
+    # WebUI：CLI 双向开关 + 向导询问 + 非交互默认不装 + 写入 .env
+    assert '--webui) WEBUI_CHOICE="yes"' in text
+    assert '--no-webui) WEBUI_CHOICE="no"' in text
+    assert '是否安装管理 Web UI? [y/N]' in text
+    assert 'WEBUI_CHOICE="${WEBUI_CHOICE:-no}"' in text
+    assert "echo \"FNMUSIC_WEBUI_ENABLED='${WEBUI_FLAG}'\"" in text
+    # 旧 .env 多源并存的升级检测
+    assert '检测到旧版 .env 同时启用了多个音源' in text
+
+
+def test_env_flags_written_before_container_up():
+    """先写 .env 三源开关再 compose up：entrypoint 首启即按需加载正确进程集。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    env_write = text.index('env_merge.py')
+    up_call = text.index('\ninstall_sources_container\n')
+    assert env_write < up_call, '.env 开关必须先于单容器 up -d 写入'
+
+
+def test_data_migration_musicbox_to_sources_data(tmp_path):
+    """v1.x musicbox-data → v2.0.0 sources-data：登录态原样保留。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    start = text.index('# 数据卷迁移')
+    end = text.index('chmod -R 0755 "${SOURCES_DATA_DIR}"', start)
+    end = text.index('|| true', end) + len('|| true')
+    block = text[start:end]
+    login = tmp_path/'musicbox-data/netease-musicbox/login.json'
+    login.parent.mkdir(parents=True)
+    login.write_text('{"cookie":"x"}', encoding='utf-8')
+    script = f'set -euo pipefail\nlog_info() {{ :; }}\nBASE_DIR={tmp_path}\n{block}\n'
+    subprocess.run(['bash', '-c', script], check=True)
+    assert not (tmp_path/'musicbox-data').exists()
+    assert (tmp_path/'sources-data/netease-musicbox/login.json').read_text(encoding='utf-8') == '{"cookie":"x"}'
+    assert (tmp_path/'sources-data/lxmusic').is_dir()
+    assert (tmp_path/'sources-data/cache/netease-musicbox').is_dir()
+    assert (tmp_path/'sources-data/config/netease-musicbox').is_dir()
+
+
+def test_extend_lx_user_source_probe_states():
+    """extend.sh 洛雪用户源探测：ok / broken / unconfigured 三态输出。"""
+    extend = (BASE/'extend.sh').read_text(encoding='utf-8')
+    start = extend.index('# 洛雪用户源状态')
+    esac = extend.index('esac', start)
+    end = extend.index('fi', esac) + 2
+    block = extend[start:end]
+    stubs = ("set -uo pipefail\n"
+             "log_info() { printf 'info %s\\n' \"$*\"; }\n"
+             "log_warn() { printf 'warn %s\\n' \"$*\"; }\n"
+             "curl() { printf '%s' \"$LX_JSON\"; }\n"
+             "ENABLE_LX=1\nLX_URL=http://127.0.0.1:8772\n")
+    cases = [
+        ('{"user_source": {"initialized": true, "source": {"name": "Test Source", "version": "1.2"}}}',
+         'info 洛雪用户自定义源已加载: Test Source 1.2'),
+        ('{"user_source": {"configured": true, "initialized": false, "last_error": "init timeout"}}',
+         'warn 洛雪用户源初始化失败: init timeout'),
+        ('{"user_source": {"configured": false}}',
+         'warn 尚未配置洛雪用户自定义源'),
+        ('', 'warn 尚未配置洛雪用户自定义源'),
+    ]
+    for body, expected in cases:
+        result = subprocess.run(['bash', '-c', stubs + block],
+                                env={**os.environ, 'LX_JSON': body},
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert expected in result.stdout, (body, result.stdout)
+
+
+def test_extend_docker_only_and_single_container_probe():
+    text = (BASE/'extend.sh').read_text(encoding='utf-8')
+    # 仅 Docker 路径：无 host 分支，容器名固定 fnmusic-sources
+    assert '仅支持 Docker 部署' in text
+    assert 'CONTAINER_NAME="fnmusic-sources"' in text
+    assert 'DEPLOY_MODE' not in text
+    assert 'ensure_source ' not in text.replace('source_healthy ', '')
+    # 全就绪时校验容器归属，防止借用其他 checkout 的容器
+    assert 'reclaim_container "${CONTAINER_NAME}"' in text
+    # 改 .env 后重启容器让 entrypoint 重选进程集
+    assert 'run_docker restart "${CONTAINER_NAME}"' in text
+    # WebUI 探测与汇总提示
+    assert 'FNMUSIC_WEBUI_ENABLED' in text
+    assert 'http://<NAS_IP>:8774' in text
+    # v1.x 数据目录兜底迁移
+    assert 'musicbox-data -> sources-data' in text
+
+
+def test_extend_healthy_path_still_syncs_image_and_env(tmp_path):
+    """升级语义：服务全健康时也要 compose up -d --build 同步新代码（git pull 后生效）；
+    镜像未变且 .env 比容器启动新时才显式重启容器让 entrypoint 重读开关。"""
+    extend = (BASE/'extend.sh').read_text(encoding='utf-8')
+    start = extend.index('if [ "${need_start}" -eq 0 ]; then')
+    end = extend.index('\nfi', extend.index('run_docker restart "${CONTAINER_NAME}"', start)) + 3
+    block = extend[start:end]
+    funcs = function(extend, 'ensure_image_current') + function(extend, 'env_newer_than_container')
+    env_file = tmp_path/'.env'
+    env_file.write_text('FNMUSIC_NETEASE_ENABLED=true\n', encoding='utf-8')
+    log = tmp_path/'docker.log'
+
+    stub_tpl = """set -uo pipefail
+log_info() { printf 'info %s\\n' "$*"; }
+log_warn() { printf 'warn %s\\n' "$*"; }
+log_err() { printf 'err %s\\n' "$*"; }
+need_start=0
+CONTAINER_NAME=fnmusic-sources
+BASE_DIR=__BASE__
+BASE_IMAGE_ENSURED=1
+STARTED_AT='__STARTED__'
+DOCKER_LOG=__LOG__
+run_docker() {
+  printf '%s\\n' "$*" >> "${DOCKER_LOG}"
+  case "$1" in
+    container) return 0 ;;
+    inspect) if [ "$3" = '{{.Image}}' ]; then printf 'sha256:img'; else printf '%s' "${STARTED_AT}"; fi; return 0 ;;
+    compose|restart) return 0 ;;
+  esac
+}
+reclaim_container() { return 0; }
+"""
+    def run_case(started_at):
+        script = (stub_tpl + funcs + '\n' + block
+                  ).replace('__BASE__', str(tmp_path)).replace('__STARTED__', started_at
+                  ).replace('__LOG__', str(log))
+        log.write_text('', encoding='utf-8')
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return log.read_text(encoding='utf-8')
+
+    # 容器比 .env 新（未改配置的例行运行）：重建校验执行，但不重启
+    out = run_case('2100-01-01T00:00:00Z')
+    assert 'up -d --build' in out
+    assert 'restart' not in out
+    # .env 比容器启动新（安装/切源后）：重建之外还要重启容器
+    out = run_case('2000-01-01T00:00:00Z')
+    assert 'up -d --build' in out
+    assert 'restart fnmusic-sources' in out
 
 
 def test_host_install_unit_restarts_and_propagates_failure(tmp_path):
@@ -577,7 +770,8 @@ def test_restore_default_removes_sources_and_full_purges_state(tmp_path):
 
     # 行为验证：提取 purge_local_state 在临时目录执行，只删已知路径，代码保留
     base = tmp_path/'deploy'
-    for name in ('.env', '.env.bak.20260101000000', 'musicbox-data/x', 'cache/a.ref',
+    for name in ('.env', '.env.bak.20260101000000', 'musicbox-data/x', 'sources-data/y',
+                 'cache/a.ref',
                  'online_favorites/u.json', 'play_history/u.json', 'recommend_cache/u/d.json',
                  '.venv-proxy/bin/python'):
         p = base/name
@@ -593,11 +787,30 @@ def test_restore_default_removes_sources_and_full_purges_state(tmp_path):
     script += f'BASE_DIR="{base}"\npurge_local_state\n'
     subprocess.run(['bash', '-c', script], check=True)
 
-    for name in ('.env', '.env.bak.20260101000000', 'musicbox-data', 'cache',
+    for name in ('.env', '.env.bak.20260101000000', 'musicbox-data', 'sources-data', 'cache',
                  'online_favorites', 'play_history', 'recommend_cache', '.venv-proxy'):
         assert not (base/name).exists(), f'--full 应删除 {name}'
     for name in ('install.sh', 'restore.sh', 'proxy/app.py', 'musicdl_outputs/out.bin'):
         assert (base/name).exists(), f'--full 必须保留代码文件 {name}'
+
+
+def test_restore_cleans_legacy_and_v2_containers():
+    """restore 兼容新旧两种部署形态：v1.x 三容器与 v2 单容器 fnmusic-sources 一并清理。"""
+    text = (BASE/'restore.sh').read_text(encoding='utf-8')
+    block = text[text.index('# 3. 停止并移除音源容器'):text.index('# 4. --full')]
+    script = ('set -euo pipefail\n'
+              'log_info() { printf "info %s\\n" "$*"; }\n'
+              'log_warn() { printf "warn %s\\n" "$*"; }\n'
+              'remove_owned_container() { printf "container %s\\n" "$1"; }\n'
+              'owned_source_unit() { return 1; }\n'
+              'stop_owned_source_unit() { printf "unit %s\\n" "$1"; }\n'
+              'sudo() { printf "sudo %s\\n" "$*"; }\n'
+              'rm() { printf "rm %s\\n" "$*"; }\n'
+              'run_docker() { return 0; }\n')
+    result = subprocess.run(['bash', '-c', script + block], text=True, capture_output=True, check=True)
+    for name in ('fnmusic-musicdl', 'fnmusic-musicbox', 'fnmusic-lxmusic', 'fnmusic-sources'):
+        assert f'container {name}' in result.stdout, name
+    assert '已清理完毕' in result.stdout
 
 
 def test_preflight_invalid_config_never_touches_sockets_or_production(tmp_path):

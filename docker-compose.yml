@@ -1,80 +1,39 @@
-# 可选音源（至少启用一个）
-# musicdl: https://github.com/CharlesPikachu/musicdl
-# musicbox: https://github.com/darknessomi/musicbox
-# lxmusic:  洛雪音乐源（LX Music 风格免登录解析：酷狗/网易/咪咕）
+# fnmusic-ext v2.0.0：三音源 + WebUI 合并为单容器 fnmusic-sources（supervisor 按需加载）。
+# 音源三选一：FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED
+# 只写一个 true；entrypoint.sh 按 /repo/.env 只启动所选音源进程，未启用的不驻留内存。
+# 运行期切源在 WebUI（8774）内完成：写 .env + 同容器 supervisorctl stop/start，秒级生效。
 #
 # 基础镜像 / pip / apt 源可由根目录 .env 覆盖（FNMUSIC_BASE_IMAGE / FNMUSIC_PIP_INDEX /
 # FNMUSIC_APT_MIRROR），其中基础镜像由 ensure_base_image.sh 自动探测维护：
-# 国内镜像优先直连（绕开 daemon 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）；
-# apt 源默认清华镜像，仅在 musicdl 构建层内临时替换，失败自动回退官方源，最终镜像与宿主机不受影响
+# 国内镜像优先直连（绕开 daemon 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）。
 #
-# 音源平台白名单同样由根目录 .env 覆盖（install.sh --sources musicdl-<平台>,lx-<平台> 写入）：
-#   MUSICDL_SOURCES / LX_SOURCES；修改后需重跑 install.sh（docker 模式 compose up 重建容器）生效
+# 数据卷 ./sources-data:/data：网易登录态（XDG 目录）+ 洛雪源脚本缓存与 state.json。
+# 升级自 v1.x（musicbox-data 目录）：首次安装时 install.sh 自动迁移为 sources-data。
+# 仓库目录挂到 /repo：entrypoint / healthcheck 读 .env，WebUI 写 .env。
+# --no-webui 仍挂此卷（否则按需启动读不到开关）；不挂 docker.sock。
 services:
-  musicdl:
+  fnmusic-sources:
     build:
-      context: ./musicdl-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: container/Dockerfile
       args:
         BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
         PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
         APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn}
-    container_name: fnmusic-musicdl
+    image: fnmusic-sources:latest
+    container_name: fnmusic-sources
     ports:
-      - "127.0.0.1:8768:8000"
-    environment:
-      - MUSICDL_SOURCES=${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}
-      - MUSICDL_SEARCH_TIMEOUT=12
-      - MUSICDL_LIMIT_PER_SOURCE=10
-      - MUSICDL_URL_TTL=1800
-      - MUSICDL_CACHE_MAX=3000
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
-
-  musicbox:
-    build:
-      context: ./musicbox-service
-      dockerfile: Dockerfile
-      args:
-        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
-        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
-    container_name: fnmusic-musicbox
-    ports:
-      - "0.0.0.0:8770:8000"
+      - "127.0.0.1:8768:8001"  # musicdl（代理访问）
+      - "0.0.0.0:8770:8002"    # musicbox（扫码/调试，内网可访问）
+      - "127.0.0.1:8772:8003"  # lxmusic（代理访问）
+      - "0.0.0.0:8774:8004"    # WebUI（无鉴权：仅限可信内网，见 README 安全说明）
     volumes:
-      - ./musicbox-data:/data
+      - ./sources-data:/data
+      - .:/repo
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 10s
-
-  lxmusic:
-    build:
-      context: ./lxmusic-service
-      dockerfile: Dockerfile
-      args:
-        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
-        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
-    container_name: fnmusic-lxmusic
-    ports:
-      - "127.0.0.1:8772:8000"
-    environment:
-      - LX_SOURCES=${LX_SOURCES:-kg,wy,mg,kw}
-      - LX_SEARCH_TIMEOUT=${LX_SEARCH_TIMEOUT:-12}
-      - LX_LIMIT_PER_SOURCE=${LX_LIMIT_PER_SOURCE:-20}
-      - LX_THIRD_PARTY=${LX_THIRD_PARTY:-1}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
+      start_period: 20s

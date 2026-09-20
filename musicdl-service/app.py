@@ -183,6 +183,8 @@ def _normalize(song, keyword: str) -> dict:
         "ext": getattr(song, "ext", "") or "mp3",
         "file_size": getattr(song, "file_size_bytes", 0) or 0,
         "cover_url": getattr(song, "cover_url", "") or "",
+        # qq 曲目的专辑封面主键：封面兜底链用 albummid 直构 gtimg 图床 URL
+        "albummid": str(getattr(song, "albummid", "") or getattr(song, "album_mid", "") or ""),
         "download_url": getattr(song, "download_url", "") or "",
     }
 
