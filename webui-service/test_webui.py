@@ -64,7 +64,8 @@ def svctl(monkeypatch):
     def fake(*args, timeout=20.0):
         calls.append(tuple(args))
         if args[0] == "status":
-            return 0, "\n".join(status_output.values())
+            # 真实 supervisorctl：存在 STOPPED 程序时退出码为 3（按需加载的常态）
+            return 3, "\n".join(status_output.values())
         return 0, f"{args[0]}ed {args[1]}"
 
     monkeypatch.setattr(webui, "supervisorctl", fake)
@@ -249,6 +250,25 @@ def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
 
 
 # ------------------------------------------------------------------ status / platforms ---
+
+def test_supervisor_status_parses_despite_nonzero_exit(monkeypatch):
+    """按需加载下 status 必有 STOPPED 程序，supervisorctl 退出码 3 是常态而非失败。"""
+    monkeypatch.setattr(webui, "supervisorctl", lambda *a, timeout=20.0: (3, (
+        "musicdl                        STOPPED   Not started\n"
+        "musicbox                       RUNNING   pid 7, uptime 0:01:00\n"
+        "lxmusic                        FATAL     Exited too quickly"
+    )))
+    st = webui.supervisor_status()
+    assert st["musicdl"]["state"] == "STOPPED"
+    assert st["musicbox"]["state"] == "RUNNING"
+    assert st["lxmusic"]["state"] == "FATAL"
+
+
+def test_supervisor_status_connection_error_returns_empty(monkeypatch):
+    monkeypatch.setattr(webui, "supervisorctl",
+                        lambda *a, timeout=20.0: (1, "error: <class 'ConnectionRefusedError'>, [Errno 111]"))
+    assert webui.supervisor_status() == {}
+
 
 def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
     monkeypatch.setitem(webui.CONF, "musicdl_url", "http://md.test")

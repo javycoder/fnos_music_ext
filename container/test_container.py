@@ -136,7 +136,7 @@ class FakeSupervisor:
             #!/bin/sh
             echo "$@" >> "{log}"
             case "$1" in
-              status) exit 0 ;;
+              pid) exit 0 ;;
               *) exit 0 ;;
             esac
             """),
@@ -171,8 +171,8 @@ def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path) -> list[str]:
     assert proc.returncode == 0, proc.stderr
     calls = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln and not ln.startswith("supervisord ")]
     calls = [c.replace("-c /nonexistent/supervisord.conf ", "") for c in calls]
-    # 套接字就绪探测的 status 轮询不算启动动作
-    return [c for c in calls if c != "status"]
+    # 套接字就绪探测的 pid 轮询不算启动动作
+    return [c for c in calls if c != "pid"]
 
 
 @pytest.fixture()
