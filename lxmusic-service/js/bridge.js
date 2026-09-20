@@ -150,7 +150,11 @@ async function httpFetch(url, options) {
     }
     let text = '';
     try { text = await resp.text(); } catch (_) { text = ''; }
-    return { statusCode: resp.status, headers: objHeaders(resp.headers), body: text };
+    // 对齐桌面版（preload.js）：body 优先尝试 JSON.parse 成对象，失败保持字符串——
+    // 野生脚本普遍直接读 body.code 等字段，纯字符串会 undefined 崩溃
+    let body = text;
+    try { body = JSON.parse(text); } catch (_) { /* 非 JSON 保持字符串 */ }
+    return { statusCode: resp.status, statusMessage: resp.statusText, headers: objHeaders(resp.headers), body };
   }
   const err = new Error('too many redirects');
   err.tooManyRedirects = true;
