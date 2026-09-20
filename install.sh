@@ -277,7 +277,7 @@ apply_source_row() {
 
 print_featured_source_menu() {
     local id provider short full label star
-    echo "请选择音源（可多选，逗号分隔编号；下列为精选，至少选一个）:"
+    echo "精选编号对照（v2.0.0 音源三选一；musicdl 源内可多选平台）:"
     while IFS='|' read -r id provider short full label star; do
         [ -z "${id}" ] && continue
         [ "${star}" = "1" ] || continue
@@ -294,8 +294,7 @@ print_featured_source_menu() {
         esac
     done <<< "${SOURCE_PLATFORM_TABLE}"
     echo "完整编号见 musicdl-service/PLATFORMS.md（1=网易云, 2–58 及 64=musicdl, 59–63=lx；53 已退役）。"
-    echo "更多平台请对照文档编号直接输入，例如 49 = mdl-gequhai。"
-    echo "示例: 1,2,62 = 网易云 + mdl-酷我 + lx-酷我（对应容器一起装，搜索多源并发）"
+    echo "交互向导请输入 1/2/3 三选一；musicdl 平台用 2,4 这类编号，不可与 1 或 59–63 混选。"
 }
 
 # musicdl 平台多选子菜单（v2.0.0：音源三选一后，musicdl 源内可继续多选平台）
