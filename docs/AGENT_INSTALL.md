@@ -20,7 +20,7 @@
    - musicdl: https://github.com/CharlesPikachu/musicdl（酷我/咪咕聚合，127.0.0.1:8768）。
    - musicbox: https://github.com/darknessomi/musicbox（网易云；Docker/Host 均可映射 0.0.0.0:8770 便于局域网扫码 http://<NAS-IP>:8770/api/v1/auth/login/qr.png；凭证在 musicbox-data/）。
    - lxmusic: 洛雪风格免登录解析（酷狗/网易/咪咕），127.0.0.1:8772。
-   - 音源可多选、至少选一个（1=musicbox, 2=musicdl, 3=lxmusic）。非交互默认仅 musicdl；三源示例 --sources musicdl,musicbox,lxmusic 或 --sources=1,2,3。
+   - 音源可多选、至少选一个。编号是全局「源+平台」ID（见 musicdl-service/PLATFORMS.md）：1=网易云 musicbox，2=mdl-酷我，62=lx-酷我 等。向导只列精选，其余对照文档输入编号。非整源数字：1,2,3 现为三个具体平台。三整源示例 --sources musicbox,musicdl,lxmusic。非交互默认仅 musicdl。
    - 安装写入 FNMUSIC_DEPLOY_MODE；重装改源会停用未选项；install --extend 会带 --force 重载代理配置。
 
 【自动化部署执行步骤】

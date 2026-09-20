@@ -7,6 +7,9 @@
 # FNMUSIC_APT_MIRROR），其中基础镜像由 ensure_base_image.sh 自动探测维护：
 # 国内镜像优先直连（绕开 daemon 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）；
 # apt 源默认清华镜像，仅在 musicdl 构建层内临时替换，失败自动回退官方源，最终镜像与宿主机不受影响
+#
+# 音源平台白名单同样由根目录 .env 覆盖（install.sh --sources musicdl-<平台>,lx-<平台> 写入）：
+#   MUSICDL_SOURCES / LX_SOURCES；修改后需重跑 install.sh（docker 模式 compose up 重建容器）生效
 services:
   musicdl:
     build:
@@ -20,7 +23,7 @@ services:
     ports:
       - "127.0.0.1:8768:8000"
     environment:
-      - MUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient
+      - MUSICDL_SOURCES=${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}
       - MUSICDL_SEARCH_TIMEOUT=12
       - MUSICDL_LIMIT_PER_SOURCE=10
       - MUSICDL_URL_TTL=1800
