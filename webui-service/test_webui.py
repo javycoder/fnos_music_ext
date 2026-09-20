@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -48,6 +49,7 @@ def env_file(tmp_path, monkeypatch):
     (tmp_path / "VERSION").write_text("2.0.0\n", encoding="utf-8")
     monkeypatch.setattr(webui, "ENV_PATH", env)
     monkeypatch.setattr(webui, "VERSION_PATH", tmp_path / "VERSION")
+    webui._preview_until.clear()  # 预览状态是模块级全局，用例间隔离
     return env
 
 
@@ -168,6 +170,75 @@ def test_provider_switch_stops_old_starts_new(env_file, svctl):
         assert ("stop", "musicbox") in svctl.calls
         assert ("start", "lxmusic") in svctl.calls
         assert all(a["ok"] for a in actions if a["kind"] == "process")
+
+
+# ------------------------------------------------------------------ 音源预览 ---
+
+def _preview_http():
+    """预览接口的 healthz 轮询用 MockTransport 直接返回 200。"""
+    webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"ok": True})))
+
+
+def test_preview_endpoint_starts_unenabled_provider(env_file, svctl):
+    """点选未启用的音源卡片：临时拉起进程（不写 .env），注册 5 分钟倒计时。"""
+    with TestClient(webui.app) as client:
+        _preview_http()
+        r = client.post("/api/preview", json={"provider": "musicdl"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] and body["preview"] is True and body["seconds_left"] > 0
+        assert ("start", "musicdl") in svctl.calls
+        assert "musicdl" in webui._preview_until
+        # 已是当前启用的音源（musicbox）：不拉起、不进预览表
+        r2 = client.post("/api/preview", json={"provider": "musicbox"})
+        assert r2.status_code == 200 and r2.json()["preview"] is False
+    assert "FNMUSIC_MUSICDL_ENABLED='false'" in env_file.read_text(encoding="utf-8")
+
+
+def test_preview_endpoint_rejects_unknown_provider(env_file, svctl):
+    with TestClient(webui.app) as client:
+        r = client.post("/api/preview", json={"provider": "docker"})
+        assert r.status_code == 400
+    assert not svctl.calls
+
+
+def test_preview_reap_stops_expired_promotes_enabled(env_file, svctl):
+    """到期清退：未启用的停止进程；已随保存启用的转正（只移出预览表，不停）。"""
+    webui._preview_until.update({
+        "musicdl": time.monotonic() - 1,   # 未启用且到期 → stop
+        "musicbox": time.monotonic() - 1,  # .env 里启用中 → 转正
+        "lxmusic": time.monotonic() + 300, # 未到期 → 不动
+    })
+    stopped = webui.preview_reap()
+    assert stopped == ["musicdl"]
+    assert ("stop", "musicdl") in svctl.calls
+    assert ("stop", "musicbox") not in svctl.calls
+    assert set(webui._preview_until) == {"lxmusic"}
+
+
+def test_put_config_stops_leftover_preview(env_file, svctl):
+    """保存收尾：预览了 musicdl 但最终保存的还是 musicbox → musicdl 立即停止。"""
+    webui._preview_until["musicdl"] = time.monotonic() + 300
+    with TestClient(webui.app) as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "balanced"}})
+        assert r.status_code == 200
+        preview_stops = [a for a in r.json()["actions"] if a.get("preview")]
+        assert len(preview_stops) == 1 and preview_stops[0]["program"] == "musicdl"
+        assert ("stop", "musicdl") in svctl.calls
+    assert "musicdl" not in webui._preview_until
+
+
+def test_platforms_fetch_renews_preview(env_file, svctl, monkeypatch):
+    """预览期间查看平台列表（或测试 lx 源）视为活跃：倒计时续期。"""
+    monkeypatch.setitem(webui.CONF, "musicdl_url", "http://md.test")
+    webui._preview_until["musicdl"] = time.monotonic() + 1
+    webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"enabled": ["KuwoMusicClient"], "registered": ["KuwoMusicClient"]})))
+    with TestClient(webui.app) as client:
+        r = client.get("/api/platforms")
+        assert r.status_code == 200
+    assert webui._preview_until["musicdl"] - time.monotonic() > 250
 
 
 def test_musicdl_platform_change_restarts_process(env_file, svctl):

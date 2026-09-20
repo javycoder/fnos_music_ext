@@ -8,11 +8,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -168,6 +170,58 @@ def switch_provider_process(old: str, new: str) -> list[dict]:
     return actions
 
 
+# ------------------------------------------------------------------ 音源预览（临时拉起） --
+# WebUI 点选未启用的音源卡片时临时拉起对应进程（仅 supervisorctl，不写 .env），
+# 让 lx 测试 / musicdl 平台列表 / 网易扫码立即可用：
+# - 保存后转正（正式启用）或被立即清退（api_config 保存路径 reconcile）；
+# - 只点选未保存的，PREVIEW_TTL 秒无访问后自动停止（选平台/测试源/扫码会续期）。
+PREVIEW_TTL = 300.0
+_preview_until: dict[str, float] = {}
+
+PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}
+PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
+
+
+def preview_seconds_left(provider: str) -> float:
+    deadline = _preview_until.get(provider)
+    return max(0.0, deadline - time.monotonic()) if deadline else 0.0
+
+
+def preview_renew(provider: str) -> None:
+    if provider in _preview_until:
+        _preview_until[provider] = time.monotonic() + PREVIEW_TTL
+
+
+def preview_reap() -> list[str]:
+    """清退到期预览：已随保存启用的转正（移出预览表，进程常驻），其余停止。"""
+    stopped: list[str] = []
+    enabled = current_provider(read_env())
+    for provider, deadline in list(_preview_until.items()):
+        if provider == enabled:
+            _preview_until.pop(provider, None)
+        elif deadline <= time.monotonic():
+            _preview_until.pop(provider, None)
+            supervisorctl("stop", PROVIDER_PROGRAM[provider])
+            logger.info("预览到期，停止音源进程 %s", provider)
+            stopped.append(provider)
+    return stopped
+
+
+def preview_reconcile_after_save() -> list[dict]:
+    """保存成功后的收尾：预览转正的进程保留，其余预览进程立即停止。"""
+    enabled = current_provider(read_env())
+    actions: list[dict] = []
+    for provider in list(_preview_until):
+        if provider == enabled:
+            _preview_until.pop(provider, None)
+            continue
+        _preview_until.pop(provider, None)
+        code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
+        actions.append({"kind": "process", "program": PROVIDER_PROGRAM[provider], "op": "stop",
+                        "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
+    return actions
+
+
 # ------------------------------------------------------------------ 校验 --
 
 def _normalize_value(key: str, raw) -> str:
@@ -233,11 +287,22 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    yield
-    client = getattr(_app.state, "http", None)
-    if client is not None:
-        await client.aclose()
-        _app.state.http = None
+    async def _preview_reaper():
+        while True:
+            await asyncio.sleep(15.0)
+            try:
+                preview_reap()
+            except Exception:  # noqa: BLE001
+                logger.exception("预览清退循环异常")
+    reaper = asyncio.create_task(_preview_reaper())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        client = getattr(_app.state, "http", None)
+        if client is not None:
+            await client.aclose()
+            _app.state.http = None
 
 
 app = FastAPI(title="fnmusic-webui", version=SERVICE_VERSION, lifespan=_lifespan)
@@ -299,6 +364,7 @@ async def api_status(request: Request):
         "current_provider": provider or "none",
         "processes": {name: processes.get(name, {"state": "UNKNOWN", "detail": ""})
                       for name in ("musicdl", "musicbox", "lxmusic", "webui")},
+        "previews": {p: round(preview_seconds_left(p)) for p in list(_preview_until)},
         "services": services,
         "lx_source": lx_source,
     }
@@ -317,6 +383,37 @@ async def api_config():
 
 class ConfigBody(BaseModel):
     values: dict
+
+
+class PreviewBody(BaseModel):
+    provider: str
+
+
+@app.post("/api/preview")
+async def api_preview(body: PreviewBody, request: Request):
+    """点选未启用的音源卡片：临时拉起进程供预览（不写 .env，倒计时自动停止）。"""
+    provider = body.provider
+    if provider not in PROVIDERS:
+        raise HTTPException(status_code=400, detail="provider 必须是 musicdl/musicbox/lxmusic 之一")
+    if current_provider(read_env()) == provider:
+        return {"ok": True, "preview": False, "note": "该音源已启用，进程常驻"}
+    if preview_seconds_left(provider) > 0:
+        preview_renew(provider)
+        return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
+    code, out = supervisorctl("start", PROVIDER_PROGRAM[provider])
+    if code != 0:
+        return JSONResponse(content={"ok": False, "error": out or "supervisorctl start 失败"}, status_code=500)
+    client = get_http(request)
+    for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
+        try:
+            r = await client.get(f"{PROVIDER_HEALTH[provider]}/healthz", timeout=2.0)
+            if r.status_code == 200:
+                break
+        except httpx.HTTPError:
+            pass
+        await asyncio.sleep(0.5)
+    _preview_until[provider] = time.monotonic() + PREVIEW_TTL
+    return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
 
 
 @app.put("/api/config")
@@ -379,12 +476,16 @@ async def api_config_put(body: ConfigBody, request: Request):
         actions.append({"kind": "process", "program": "musicdl", "op": "restart",
                         "ok": code == 0, "error": "" if code == 0 else out})
 
+    # 预览收尾：保存启用的转正常驻，其余预览进程立即停止
+    actions.extend(preview_reconcile_after_save())
+
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
     return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys}
 
 
 @app.post("/api/lx/verify")
 async def api_lx_verify(body: ConfigBody, request: Request):
+    preview_renew("lxmusic")  # 预览期间测试源视为活跃，续期倒计时
     url = str((body.values or {}).get("url") or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="url 必须以 http:// 或 https:// 开头")
@@ -400,6 +501,7 @@ async def api_lx_verify(body: ConfigBody, request: Request):
 
 @app.get("/api/platforms")
 async def api_platforms(request: Request):
+    preview_renew("musicdl")  # 预览期间查看平台列表视为活跃，续期倒计时
     ok, data = await _fetch_json(request, f"{CONF['musicdl_url']}/sources")
     if not ok:
         return JSONResponse(
@@ -417,6 +519,7 @@ async def netease_auth_proxy(path: str, request: Request):
     """透传 musicbox 的 auth 接口（登录/轮询/状态），路径段白名单内。"""
     if path not in ("login", "login/check", "status"):
         raise HTTPException(status_code=404, detail="unknown auth endpoint")
+    preview_renew("musicbox")  # 预览期间扫码/查状态视为活跃，续期倒计时
     target = f"{CONF['musicbox_url']}/api/v1/auth/{path}"
     client = get_http(request)
     try:

@@ -178,6 +178,29 @@ async function saveConfig() {
 $("#save-btn").addEventListener("click", saveConfig);
 
 /* -------------------------------------------------------------- 音源选择 */
+function savedProvider() {
+  const v = configValues;
+  return v.FNMUSIC_NETEASE_ENABLED === "true" ? "musicbox"
+    : v.FNMUSIC_MUSICDL_ENABLED === "true" ? "musicdl"
+    : v.FNMUSIC_LX_ENABLED === "true" ? "lxmusic" : "";
+}
+
+// 点选未启用的音源：临时拉起其进程供预览（不写配置；5 分钟内未保存自动停止）
+async function startPreview(provider) {
+  try {
+    const r = await api("/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider }),
+    });
+    if (r.preview) toast(`已临时启动 ${PROVIDER_LABEL[provider]}（预览）：5 分钟内未保存将自动停止`);
+    return true;
+  } catch (exc) {
+    toast(`临时启动 ${PROVIDER_LABEL[provider]} 失败：${exc.message}`, "fail");
+    return false;
+  }
+}
+
 function syncProviderPanels(provider) {
   $$(".provider-card").forEach((el) => el.classList.toggle("selected", el.dataset.provider === provider));
   $("#panel-musicbox").hidden = provider !== "musicbox";
@@ -185,19 +208,41 @@ function syncProviderPanels(provider) {
   $("#panel-lxmusic").hidden = provider !== "lxmusic";
 }
 $$("input[name=provider]").forEach((el) =>
-  el.addEventListener("change", () => { syncProviderPanels(el.value); markDirty("音源切换需保存后生效"); }));
+  el.addEventListener("change", async () => {
+    syncProviderPanels(el.value);
+    markDirty("音源切换需保存后生效");
+    if (el.value && el.value !== savedProvider() && await startPreview(el.value)) {
+      if (el.value === "musicdl") await loadPlatforms(false);
+    }
+  }));
 
 /* -------------------------------------------------------------- musicdl 平台 */
-async function loadPlatforms() {
-  try {
-    const data = await api("/api/platforms");
-    platforms = { enabled: data.enabled || [], registered: data.registered || [] };
-    $("#platform-note").textContent = `共 ${platforms.registered.length} 个注册平台，已启用 ${platforms.enabled.length} 个`;
-  } catch (exc) {
-    platforms = { enabled: (configValues.FNMUSIC_ONLINE_SOURCES || "").split(",").filter(Boolean), registered: [] };
-    $("#platform-note").textContent = "musicdl 进程未运行，暂无法获取平台列表（保存切换到 musicdl 后自动加载）";
-  }
+function setPlatformFallback() {
+  platforms = { enabled: (configValues.FNMUSIC_ONLINE_SOURCES || "").split(",").filter(Boolean), registered: [] };
+  $("#platform-note").textContent = "musicdl 进程未运行，暂无法获取平台列表（点选 musicdl 音源可临时启动预览）";
   renderPlatformChips();
+}
+
+async function fetchPlatforms() {
+  const data = await api("/api/platforms");
+  platforms = { enabled: data.enabled || [], registered: data.registered || [] };
+  $("#platform-note").textContent = `共 ${platforms.registered.length} 个注册平台，已启用 ${platforms.enabled.length} 个`;
+  renderPlatformChips();
+}
+
+async function loadPlatforms(autoPreview = true) {
+  try {
+    await fetchPlatforms();
+  } catch (_) {
+    // 进程未运行：autoPreview（用户点选/刷新触发）时临时拉起后重试；页面加载不自动拉起
+    if (!autoPreview) { setPlatformFallback(); return; }
+    try {
+      if (await startPreview("musicdl")) await fetchPlatforms();
+      else setPlatformFallback();
+    } catch (_) {
+      setPlatformFallback();
+    }
+  }
 }
 
 function renderPlatformChips() {
@@ -226,8 +271,16 @@ async function startQrLogin() {
   stopQrPolling();
   $("#qr-status").textContent = "正在生成二维码…";
   $("#qr-img").hidden = true;
+  const callLogin = () => api("/api/netease/auth/login", { method: "POST" });
   try {
-    const data = await api("/api/netease/auth/login", { method: "POST" });
+    let data;
+    try {
+      data = await callLogin();
+    } catch (exc) {
+      // musicbox 进程未运行（未点选/预览过期）：临时拉起后重试一次
+      if (!await startPreview("musicbox")) throw exc;
+      data = await callLogin();
+    }
     const unikey = data.unikey || data.codekey || (data.data && (data.data.unikey || data.data.codekey)) || "";
     if (!unikey) throw new Error("未获取到 unikey");
     $("#qr-img").src = `/api/netease/qr?unikey=${encodeURIComponent(unikey)}`;
@@ -235,7 +288,7 @@ async function startQrLogin() {
     $("#qr-status").textContent = "请用手机网易云音乐 App 扫码";
     pollQr(unikey);
   } catch (exc) {
-    $("#qr-status").textContent = "生成失败：" + exc.message + "（需先切换到网易音源并保存）";
+    $("#qr-status").textContent = "生成失败：" + exc.message;
   }
 }
 
@@ -273,12 +326,20 @@ $("#lx-test").addEventListener("click", async () => {
   box.hidden = false;
   box.className = "report";
   box.textContent = "测试中（下载脚本 → 沙箱初始化 → 搜索 → 解析 → 探活）…";
+  const callVerify = () => api("/api/lx/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ values: { url } }),
+  });
   try {
-    const r = await api("/api/lx/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values: { url } }),
-    });
+    let r;
+    try {
+      r = await callVerify();
+    } catch (exc) {
+      // lxmusic 进程未运行（未点选/预览过期）：临时拉起后重试一次
+      if (!await startPreview("lxmusic")) throw exc;
+      r = await callVerify();
+    }
     if (r.ok) {
       const d = r.data || {};
       const meta = d.meta || {};
@@ -322,6 +383,6 @@ window.addEventListener("beforeunload", (ev) => {
 (async function boot() {
   await loadConfig();
   await loadStatus();
-  await loadPlatforms();
+  await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   setInterval(loadStatus, 15000);
 })();
