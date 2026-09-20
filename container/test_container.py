@@ -4,6 +4,7 @@
 """
 import configparser
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -262,3 +263,20 @@ def test_dockerignore_whitelist_build_context():
     assert code_lines[0] == "*"
     for keep in ("!musicdl-service/", "!musicbox-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
         assert keep in code_lines
+
+
+def test_dockerfile_copies_proxy_modules_imported_by_services():
+    """镜像内服务允许 import proxy.*（webui 复用 .env 安全合并）。
+
+    回归：v2.0.0 首次安装时 webui 进程在容器内 ModuleNotFoundError 崩溃——
+    Dockerfile 没有 COPY proxy/，.dockerignore 白名单也没放行。
+    """
+    text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
+    ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
+        for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
+            for m in re.finditer(r"^\s*from proxy\.([A-Za-z_][\w]*)", py.read_text(encoding="utf-8"), re.M):
+                mod = f"proxy/{m.group(1)}.py"
+                assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"
+                assert f"!{mod}" in ignore, f"{mod} 被 .dockerignore 排除，构建上下文拿不到"
