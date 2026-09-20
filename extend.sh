@@ -29,9 +29,14 @@ for arg in "$@"; do
         --force)
             FORCE_RELOAD=1
             ;;
+        --adopt)
+            # Explicit deployment migration: skip the cross-checkout registry
+            # check so this checkout can become the deployment (install_common.sh).
+            ;;
         -h|--help)
-            echo "用法: $0 [--force] [--qr]"
+            echo "用法: $0 [--force] [--adopt] [--qr]"
             echo "  --force  强制重写 unit 并重启代理（安装改配置后使用）"
+            echo "  --adopt  把部署迁移到当前目录（部署登记指向其他目录时使用）"
             echo "  --qr     启动终端网易云扫码登录流程"
             exit 0
             ;;
@@ -105,6 +110,9 @@ print(http_port, https_port)
 }
 
 check_proxy_unit_owner || exit 1
+# Refuse to extend from a second checkout while the machine-wide deployment
+# registry names another live directory (skip with the explicit --adopt flag).
+check_deployment_owner "$@" || exit 1
 
 if [ ! -f "${BASE_DIR}/.env" ]; then
     if [ -t 0 ]; then
@@ -444,6 +452,23 @@ fi
 ensure_source() {
     local name="$1" url="$2" compose_svc="$3" unit="$4"
     if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
+        # A healthy endpoint alone must not silently borrow another checkout's
+        # container/unit: verify ownership before reusing the ready service.
+        local mode="${DEPLOY_MODE}"
+        if [ -z "${mode}" ]; then
+            # Same fallback as the pull-up branch below when .env is silent.
+            if [ -f "/etc/systemd/system/${unit}.service" ]; then
+                mode="host"
+            else
+                mode="docker"
+            fi
+        fi
+        if [ "${mode}" = "docker" ]; then
+            reclaim_container "fnmusic-${name}" || return 1
+        else
+            owned_source_unit "${unit%.service}" \
+                || { log_err "音源 unit ${unit} 不属于当前目录；保留并拒绝接管。"; return 1; }
+        fi
         log_info "${name} 已就绪 (${url}/healthz)。"
         return 0
     fi
@@ -527,6 +552,9 @@ elif takeover ready --timeout 5; then
     log_info "检测到代理服务已在运行且上游健康 (处于扩展接管态)。"
     log_info "直接运行验收测试确认状态..."
     if verify_acceptance; then
+        # This checkout is the live deployment; refresh the machine-wide
+        # registry so a second checkout cannot silently take over later.
+        takeover deployment-remember --base "${BASE_DIR}" || true
         log_info "============================================================"
         log_info "fnmusic-ext 当前已处于扩展态且运行正常，无需重复操作！"
         log_info "============================================================"
@@ -579,6 +607,9 @@ fi
 
 log_info "============================================================"
 trap - ERR INT TERM
+# Deployment registry: mark this checkout as the machine-wide deployment so
+# a second checkout cannot silently steal the unit/containers/lock later.
+takeover deployment-remember --base "${BASE_DIR}" || true
 log_info "fnmusic-ext v${FNMUSIC_VERSION} 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
 log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"
