@@ -125,12 +125,12 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 向导将自动执行环境安全预检，并提供直观的交互选择：
 1. **安装模式**：输入 `1`（Docker 模式）或 `2`（Host 模式）；
-2. **音源选择**（平铺组合菜单，可多选编号，至少选一个）：
+2. **音源选择**（全局平铺编号，可多选，至少选一个；向导只列精选）：
    * `1`：网易云 `musicbox`；
-   * `2`-`7`：lxmusic 按平台（全部默认/酷狗/网易/咪咕/酷我/QQ）；
-   * `8`-`14`：musicdl 按平台（全部默认/酷我/酷狗/咪咕/QQ/千千/B站）；
-   * `0`：其他 musicdl 平台（输编号或短名，全部 57 个平台见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
-   * 示例：`1,6,9` = 网易云 + lx-酷我 + mdl-酷我，对应容器一起安装、搜索多源并发聚合；`1,2,3` 整源默认全开；
+   * `2`–`7`：musicdl 精选（酷我/酷狗/咪咕/QQ/千千/B站）；
+   * `59`–`62`：lxmusic 精选（酷狗/网易/咪咕/酷我）；
+   * 更多平台对照 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md) 的编号直接输入（例如 `49` = mdl-gequhai）；
+   * 示例：`1,2,62` = 网易云 + mdl-酷我 + lx-酷我；整源请写 `musicbox,musicdl,lxmusic`（`1,2,3` 不再表示三整源）；
 3. **每日推荐（可选）**：支持填入兼容 OpenAI 规范的 API Key，自动为登录用户定制每日歌单；若不使用直接回车跳过；
 4. **一键启用**：向导完成后直接确认即可调用 `./extend.sh` 自动接管上线。
 
