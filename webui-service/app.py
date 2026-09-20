@@ -141,9 +141,11 @@ def supervisorctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
 
 
 def supervisor_status() -> dict[str, dict]:
-    code, out = supervisorctl("status")
-    if code != 0:
-        return {}
+    # supervisorctl status 的退出码语义是“是否全部 RUNNING”（存在 STOPPED 即 3、
+    # 存在 FATAL 即 4），按需加载架构下未选中的音源常驻 STOPPED 是正常态，
+    # 不能用退出码判成败：只认输出里能解析出的状态行；连接失败等异常输出
+    # 解析不出任何状态行，自然返回空表（前端显示未知）。
+    _, out = supervisorctl("status")
     result: dict[str, dict] = {}
     for line in out.splitlines():
         parts = line.split()
