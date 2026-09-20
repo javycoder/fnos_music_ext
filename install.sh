@@ -2,24 +2,27 @@
 set -euo pipefail
 
 # ==============================================================================
-# fnmusic-ext 一键安装 / 配置
-# - 音源可按「源+平台」粒度多选、至少选一个：
-#     musicbox https://github.com/darknessomi/musicbox   (:8770 网易云)
-#     musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合, 可选平台)
-#     lxmusic  洛雪音乐源（LX Music 免登录解析）          (:8772, 可选平台)
-#   平台粒度: --sources lx-kw,musicdl-kuwo,netease 或全局编号 --sources 1,2,62
-#   （全部平台编号见 musicdl-service/PLATFORMS.md；数字=平台，不再表示整源）
+# fnmusic-ext 一键安装 / 配置（v2.0.0：Docker 单容器·按需加载）
+# - 仅支持 Docker 部署：三音源 + WebUI 合并为单容器 fnmusic-sources，
+#   supervisor 管理四个程序，只启动当前所选音源（切源秒级，不重建容器）
+# - 音源三选一（互斥单选，可随时在 WebUI 里切换）：
+#     1 musicbox https://github.com/darknessomi/musicbox  (:8770 网易云，推荐扫码登录)
+#     2 musicdl  https://github.com/CharlesPikachu/musicdl (:8768 聚合, 可选平台)
+#     3 lxmusic  洛雪音乐自定义源（用户自带源 URL 解析播放）
+#   musicdl 平台粒度: --sources musicdl-kuwo,musicdl-migu 或全局编号 --sources 2,4
+#   （全部平台编号见 musicdl-service/PLATFORMS.md）
+# - 管理 Web UI（可选，端口 8774，无鉴权·仅限可信内网）：
+#   源切换 / 平台选择 / 扫码登录 / 音质模式 / 边听边存 / LLM 配置
 # - 每日推荐默认采信音源原生推荐（网易每日推荐/榜单 + lxmusic 免登录榜单）；
 #   大模型（OpenAI 兼容）仅当网易音源未启用时作为兜底，可选配置
 # - 不修改飞牛 nginx / 官方二进制 / 官方数据库写入
 # 用法:
-#   ./install.sh                         # 交互
-#   ./install.sh --mode host
-#   ./install.sh --mode docker --sources=1,2,62
-#   ./install.sh --mode docker --sources musicbox,lxmusic
-#   ./install.sh --mode docker --sources netease,lx-kw,musicdl-kuwo
-#   ./install.sh --non-interactive --mode docker --enable-recommend \
-#       --llm-base-url https://api.example.com/v1 --llm-api-key '***' --llm-model gpt-4o-mini
+#   ./install.sh                                        # 交互
+#   ./install.sh --sources musicdl --sources=2,4 形式同下
+#   ./install.sh --sources musicbox
+#   ./install.sh --sources lxmusic --lx-source-url 'https://example.com/lx.js'
+#   ./install.sh --non-interactive --sources musicdl --webui \
+#       --enable-recommend --llm-base-url https://api.example.com/v1 --llm-api-key '***'
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +31,6 @@ source "${BASE_DIR}/proxy/install_common.sh"
 installation_lock "$@"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
-MODE=""
 SOURCES_RAW=""
 NON_INTERACTIVE=0
 ENABLE_RECOMMEND=""
@@ -52,6 +54,11 @@ LX_PLATFORMS=""
 MDL_PLATFORMS=""
 LX_EXPLICIT=0
 MDL_EXPLICIT=0
+# 洛雪自定义源脚本 URL（CLI 或向导输入；安装后校验通过才激活）
+LX_SOURCE_URL_CLI=""
+# WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
+WEBUI_CHOICE=""
+CONTAINER_NAME="fnmusic-sources"
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
@@ -66,17 +73,20 @@ usage() {
     cat <<'EOF'
 用法: ./install.sh [选项]
 
-  --mode host|docker     安装模式（host=宿主机 venv；docker=音源容器）
-  --sources LIST         音源，逗号分隔，可多选，至少选一个（支持 --sources=1,2,62 形式）
-                         整源启用（该源默认平台）: musicbox / musicdl / lxmusic
-                         精确到平台: 全局编号 / lx-<kg|wy|mg|kw|tx> / musicdl-<平台短名>
-                         示例: --sources 1,2,62
-                               --sources netease,lx-kw,musicdl-kuwo
-                               （1=网易云、2=mdl-酷我、62=lx-酷我；两个容器一起装）
-                         全部平台编号见 musicdl-service/PLATFORMS.md
-                         注意: 1,2,3 是平台编号，不再表示三整源
+  --sources LIST         音源三选一（互斥，只能选一个源）：
+                         1) musicbox  网易云音乐盒子（安装后扫码登录）
+                         2) musicdl   聚合音源，可精确到平台：
+                             --sources musicdl[-<平台短名>,...]
+                             或全局编号 --sources 2,4（编号见 musicdl-service/PLATFORMS.md）
+                         3) lxmusic   洛雪音乐自定义源（需 --lx-source-url 或交互输入）
+                         示例: --sources musicbox
+                               --sources musicdl-kuwo,musicdl-migu
+                               --sources lxmusic --lx-source-url https://example.com/lx.js
                          非交互缺省: musicdl
-  --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
+  --lx-source-url URL    洛雪自定义源脚本地址（--sources lxmusic 时必填；交互模式可向导输入）
+  --webui                安装管理 Web UI（端口 8774；无鉴权，仅限可信内网使用）
+  --no-webui             不安装管理 Web UI（非交互默认）
+  --non-interactive      无交互，缺省值：音源=musicdl，不装 WebUI，不开启每日推荐
   --enable-recommend     开启大模型兜底推荐（需同时给 base-url 与 api-key；
                         仅当网易音源未启用时生效，平时每日推荐走音源原生推荐）
   --disable-recommend    明确关闭大模型兜底，并清除 .env 中已保存的 LLM 配置
@@ -89,6 +99,8 @@ usage() {
   --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
+v2.0.0 起仅支持 Docker 部署（单容器按需加载）；宿主机 host 模式已移除，
+未安装 Docker 的机器将直接报错退出。核心代理仍在宿主机 systemd 运行。
 密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
 EOF
 }
@@ -149,7 +161,6 @@ SOURCE_PLATFORM_TABLE='
 50|musicdl|livepoo|LivePOOMusicClient|LivePOO|0
 51|musicdl|htqyy|HTQYYMusicClient|HTQYY|0
 52|musicdl|twot58|TwoT58MusicClient|TwoT58|0
-53|musicdl|zhuolin|ZhuolinMusicClient|Zhuolin|0
 54|musicdl|liziyy|LiziYYMusicClient|LiziYY|0
 55|musicdl|mgmp3|MGMP3MusicClient|MGMP3|0
 56|musicdl|itingwa|ITingWaMusicClient|ITingWa|0
@@ -160,6 +171,7 @@ SOURCE_PLATFORM_TABLE='
 61|lx|mg|mg|咪咕|1
 62|lx|kw|kw|酷我|1
 63|lx|tx|tx|QQ(仅搜索)|0
+64|musicdl|yinyueku|YinyuekuMusicClient|Yinyueku|0
 '
 
 # lx 平台别名 → 规范代码（与 lxmusic-service/app.py 的 _SOURCE_ALIASES 一致）
@@ -281,9 +293,23 @@ print_featured_source_menu() {
                 ;;
         esac
     done <<< "${SOURCE_PLATFORM_TABLE}"
-    echo "完整编号见 musicdl-service/PLATFORMS.md（1=网易云, 2–58=musicdl, 59–63=lx）。"
+    echo "完整编号见 musicdl-service/PLATFORMS.md（1=网易云, 2–58 及 64=musicdl, 59–63=lx；53 已退役）。"
     echo "更多平台请对照文档编号直接输入，例如 49 = mdl-gequhai。"
     echo "示例: 1,2,62 = 网易云 + mdl-酷我 + lx-酷我（对应容器一起装，搜索多源并发）"
+}
+
+# musicdl 平台多选子菜单（v2.0.0：音源三选一后，musicdl 源内可继续多选平台）
+print_featured_mdl_menu() {
+    local id provider short full label star
+    echo "  精选平台（musicdl 源内可多选，逗号分隔编号）:"
+    while IFS='|' read -r id provider short full label star; do
+        [ -z "${id}" ] && continue
+        [ "${star}" = "1" ] || continue
+        [ "${provider}" = "musicdl" ] || continue
+        echo "    ${id}) mdl-${short} ${label}"
+    done <<< "${SOURCE_PLATFORM_TABLE}"
+    echo "  完整编号见 musicdl-service/PLATFORMS.md（2–58 及 64 均为 musicdl 平台）。"
+    echo "  直接回车 = 默认精选（酷我+咪咕）；输入 all = 平台白名单维持 .env 既有值。"
 }
 
 parse_sources() {
@@ -295,6 +321,7 @@ parse_sources() {
     MDL_PLATFORMS=""
     LX_EXPLICIT=0
     MDL_EXPLICIT=0
+    local picked=()
     # 支持 --sources=1,2,62 与 --sources 1,2,62 两种形式
     raw="${raw#*=}"
     raw="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | tr ' ' ',')"
@@ -307,32 +334,33 @@ parse_sources() {
         [ -z "${part}" ] && continue
         case "${part}" in
             musicbox|netease|netease-musicbox)
-                ENABLE_MUSICBOX=1 ;;
+                ENABLE_MUSICBOX=1; picked+=("musicbox") ;;
             musicdl|mdl)
-                ENABLE_MUSICDL=1 ;;
+                ENABLE_MUSICDL=1; picked+=("musicdl") ;;
             lx|lxmusic)
-                ENABLE_LX=1 ;;
-            lx-all|lxmusic-all)
-                # 整源启用但视为显式平台选择，写入 .env 默认平台
-                ENABLE_LX=1
-                LX_EXPLICIT=1
-                for code in kg wy mg kw; do lx_merge "${code}"; done ;;
-            lx-*|lxmusic-*)
-                ENABLE_LX=1
-                LX_EXPLICIT=1
-                plat="${part#*-}"
-                code="$(lx_alias "${plat}")" || {
-                    log_err "未知 lx 平台: ${plat}（可选 kg/kugou 酷狗、wy/netease 网易、mg/migu 咪咕、kw/kuwo 酷我、tx/qq QQ）"
-                    exit 1
-                }
-                lx_merge "${code}" ;;
+                ENABLE_LX=1; picked+=("lxmusic") ;;
+            lx-all|lxmusic-all|lx-*|lxmusic-*)
+                ENABLE_LX=1; picked+=("lxmusic")
+                # lx 平台 token 仅作 LX_SOURCES 显式覆盖（音源仍是三选一里的 lxmusic）
+                if [ "${part}" = "lx-all" ] || [ "${part}" = "lxmusic-all" ]; then
+                    LX_EXPLICIT=1
+                    for code in kg wy mg kw; do lx_merge "${code}"; done
+                else
+                    LX_EXPLICIT=1
+                    plat="${part#*-}"
+                    code="$(lx_alias "${plat}")" || {
+                        log_err "未知 lx 平台: ${plat}（可选 kg/kugou 酷狗、wy/netease 网易、mg/migu 咪咕、kw/kuwo 酷我、tx/qq QQ）"
+                        exit 1
+                    }
+                    lx_merge "${code}"
+                fi ;;
             musicdl-all|mdl-all)
-                ENABLE_MUSICDL=1
+                ENABLE_MUSICDL=1; picked+=("musicdl")
                 MDL_EXPLICIT=1
                 mdl_merge "kuwo"
                 mdl_merge "migu" ;;
             musicdl-*|mdl-*)
-                ENABLE_MUSICDL=1
+                ENABLE_MUSICDL=1; picked+=("musicdl")
                 MDL_EXPLICIT=1
                 plat="${part#*-}"
                 rec="$(mdl_platform_lookup "${plat}")" || {
@@ -343,7 +371,7 @@ parse_sources() {
                 mdl_merge "${short}" ;;
             *)
                 rec="$(source_lookup_by_id "${part}")" || {
-                    log_err "未知音源: ${part}（可选 musicbox / musicdl[-平台] / lx[-平台]，或 musicdl-service/PLATFORMS.md 中的平台编号）"
+                    log_err "未知音源: ${part}（可选 musicbox / musicdl[-平台] / lxmusic，或 musicdl-service/PLATFORMS.md 中的平台编号）"
                     exit 1
                 }
                 provider="${rec%% *}"
@@ -352,11 +380,25 @@ parse_sources() {
                     log_err "未知音源: ${part}"
                     exit 1
                 }
+                [ "${provider}" != "lx" ] || picked+=("lxmusic")
+                [ "${provider}" != "musicdl" ] || picked+=("musicdl")
+                [ "${provider}" != "musicbox" ] || picked+=("musicbox")
                 ;;
         esac
     done
     if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
         log_err "至少选择一个音源（musicbox / musicdl / lxmusic）"
+        exit 1
+    fi
+    # v2.0.0 三源互斥：token 只能映射到一个 provider，跨 provider 直接拒绝
+    local unique_providers
+    unique_providers="$(printf '%s\n' "${picked[@]}" | sort -u | tr '\n' ' ' | tr -s ' ')"
+    local provider_count
+    provider_count="$(printf '%s\n' "${picked[@]}" | sort -u | wc -l | tr -d ' ')"
+    if [ "${provider_count}" -gt 1 ]; then
+        log_err "音源三选一：检测到同时选择了 ${unique_providers}(v2.0.0 起三个音源互斥单选)"
+        log_err "请只保留一个音源重新执行；已装 WebUI 时可随时在 WebUI(8774) 里秒级切换音源"
+        log_err "旧版本 .env 中的多源配置请重新选择一个后继续"
         exit 1
     fi
 }
@@ -365,14 +407,20 @@ parse_sources() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --mode)
-            [ $# -ge 2 ] || { log_err "--mode 需要参数 host|docker"; exit 1; }
-            MODE="${2}"; shift 2 ;;
-        --mode=*) MODE="${1#*=}"; shift ;;
+        --mode|--mode=*)
+            # v2.0.0：host 模式移除，docker 为唯一部署形态（兼容旧命令行给出明确报错）
+            log_err "v2.0.0 起不再需要 --mode：安装固定为 Docker 单容器模式（host 模式已移除）"
+            exit 1 ;;
         --sources)
             [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
             SOURCES_RAW="${2}"; shift 2 ;;
         --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
+        --lx-source-url)
+            [ $# -ge 2 ] || { log_err "--lx-source-url 需要 URL 参数"; exit 1; }
+            LX_SOURCE_URL_CLI="${2}"; shift 2 ;;
+        --lx-source-url=*) LX_SOURCE_URL_CLI="${1#*=}"; shift ;;
+        --webui) WEBUI_CHOICE="yes"; shift ;;
+        --no-webui) WEBUI_CHOICE="no"; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
         --disable-recommend) ENABLE_RECOMMEND="no"; LLM_CLEAR=1; shift ;;
@@ -409,6 +457,17 @@ run_docker() {
         return 1
     fi
 }
+
+# v2.0.0 仅支持 Docker：无 Docker 的机器直接报错退出安装（不再回退宿主机模式）
+if ! command -v docker >/dev/null 2>&1; then
+    log_err "未检测到 docker：v2.0.0 起 fnmusic-ext 仅支持 Docker 部署（三音源+WebUI 单容器）。"
+    log_err "请先在 fnOS「应用中心」安装 Docker 后重试。"
+    exit 1
+fi
+if ! run_docker info >/dev/null 2>&1; then
+    log_err "docker 服务未运行（docker info 失败）：请启动 Docker 后重试。"
+    exit 1
+fi
 
 
 precheck_environment() {
@@ -464,27 +523,19 @@ precheck_environment() {
         log_info "飞牛音乐运行套接字检测正常。"
     fi
 
-    # 4. 检查 Docker 环境
+    # 4. 检查 Docker 环境（v2.0.0 仅支持 Docker：核心代理仍在宿主机 systemd）
     if command -v docker >/dev/null 2>&1; then
         if run_docker info >/dev/null 2>&1; then
             log_info "Docker 容器环境已就绪。"
         else
-            log_warn "检测到 docker 命令，但当前用户无法连通 Docker daemon。"
-            if [ "${MODE}" = "docker" ]; then
-                log_err "【权限不足】Docker 模式需要可用的 docker（或 sudo docker）。"
-                precheck_failed=1
-            fi
+            log_err "【权限不足】检测到 docker 命令，但当前用户无法连通 Docker daemon。"
+            log_err "请将当前用户加入 docker 组或使用 sudo，然后重试。"
+            precheck_failed=1
         fi
     else
-        log_warn "【提示】系统未检测到 Docker 环境。"
-        if [ "${MODE}" = "docker" ]; then
-            log_err "【缺少组件】当前指定了 Docker 模式，但系统未安装 Docker。"
-            log_err "请先在 fnOS 应用中心安装 Docker，或改用 --mode host 模式。"
-            precheck_failed=1
-        else
-            log_warn "若计划使用 Docker 容器模式运行音源，请先在 fnOS 应用中心安装 Docker；"
-            log_warn "您也可以在向导中选择宿主机 (host) 模式直接通过 Python 虚拟环境运行。"
-        fi
+        log_err "【缺少组件】v2.0.0 起 fnmusic-ext 仅支持 Docker 部署（三音源+WebUI 单容器）。"
+        log_err "请先在 fnOS 应用中心安装 Docker，然后重试。"
+        precheck_failed=1
     fi
 
     if [ "${precheck_failed}" -ne 0 ]; then
@@ -496,8 +547,8 @@ precheck_environment() {
 
 ensure_docker_ready() {
     if ! command -v docker >/dev/null 2>&1 || ! run_docker info >/dev/null 2>&1; then
-        log_err "【缺少组件】已选择 Docker 模式，但 Docker 不可用。"
-        log_err "请先在 fnOS 应用中心安装 Docker，或改用 --mode host。"
+        log_err "【缺少组件】Docker 不可用：v2.0.0 起仅支持 Docker 部署（host 模式已移除）。"
+        log_err "请先在 fnOS 应用中心安装 Docker 并确保其运行，然后重试。"
         exit 1
     fi
 }
@@ -647,35 +698,40 @@ prompt_llm_model() {
 
 if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
-    echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}"
+    echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}（Docker 单容器·按需加载）"
     echo " 音源: ${MUSICBOX_REPO}"
     echo "       ${MUSICDL_REPO}"
-    echo "       lxmusic — 洛雪音乐源（免登录解析：酷狗/网易/咪咕）"
+    echo "       lxmusic — 洛雪音乐自定义源（用户自带源 URL）"
     echo "============================================================"
-    if [ -z "${MODE}" ]; then
-        echo "【安装模式说明】"
-        echo "  无论选哪种模式，核心代理（fnmusic-ext）均以宿主机 systemd 运行接管 Socket。"
-        echo "  两种模式区别仅在于音源服务（musicbox/musicdl/lxmusic）的部署运行形态："
-        if command -v docker >/dev/null 2>&1; then
-            echo "  1) docker  — [推荐] Docker 容器模式："
-            echo "               通过 compose 运行轻量容器（端口 8768/8770/8772，无特权，数据隔离在 musicbox-data/）"
-            echo "  2) host    — Host 宿主机本地服务模式（纯净无 Docker）："
-            echo "               创建独立 Python venv 并注册为 systemd 服务（监听 127.0.0.1，不污染全局环境）"
-            local_choice="$(prompt "请选择安装模式 (输入 1 或 2)" "1")"
-        else
-            echo "  1) docker  — Docker 容器模式（未检测到 Docker，若选此项请先在 fnOS「应用中心」安装 Docker）"
-            echo "  2) host    — [推荐当前环境] Host 宿主机本地服务模式："
-            echo "               纯净无 Docker，通过项目内独立 Python venv 运行并注册为 systemd 服务"
-            local_choice="$(prompt "请选择安装模式 (输入 1 或 2)" "2")"
-        fi
-        case "${local_choice}" in
-            2|host) MODE="host" ;;
-            *) MODE="docker" ;;
-        esac
-    fi
     if [ -z "${SOURCES_RAW}" ]; then
-        print_featured_source_menu
-        SOURCES_RAW="$(prompt "输入编号（精选或文档中的完整编号）" "1,2,4,59,60,61,62")"
+        echo "【音源三选一】（互斥单选；安装后可在 WebUI 里随时切换，秒级生效）"
+        echo "  1) musicbox — 网易云音乐盒子（高品质/无损/歌词封面；推荐安装后扫码登录）"
+        echo "  2) musicdl  — 聚合音源（多平台可选：酷我/咪咕/酷狗/QQ/B站等）"
+        echo "  3) lxmusic  — 洛雪音乐自定义源（需提供源脚本 URL，解析播放只走该源）"
+        local_choice="$(prompt "请选择音源 (输入 1/2/3)" "2")"
+        case "${local_choice}" in
+            1) SOURCES_RAW="musicbox" ;;
+            3) SOURCES_RAW="lxmusic" ;;
+            *) SOURCES_RAW="musicdl" ;;
+        esac
+        if [ "${SOURCES_RAW}" = "musicdl" ]; then
+            echo "【musicdl 平台多选】输入平台编号（逗号分隔），直接回车用默认精选（酷我+咪咕）"
+            print_featured_mdl_menu
+            mdl_choice="$(prompt "输入编号（2=酷我 4=咪咕 3=酷狗 5=QQ ...）" "2,4")"
+            case "${mdl_choice}" in
+                ''|all|ALL) : ;;  # 空=默认精选；all=沿用 .env 既有平台白名单
+                *) SOURCES_RAW="$(printf '%s' "${mdl_choice}" | tr ' ' ',')" ;;
+            esac
+        fi
+    fi
+    if [ -z "${WEBUI_CHOICE}" ]; then
+        echo "【管理 Web UI】(端口 8774)：音源切换 / 扫码登录 / 平台选择 / 音质模式 /"
+        echo "  边听边存 / LLM 配置，手机/桌面自适应。无鉴权，仅限可信内网使用。"
+        webui_choice="$(prompt "是否安装管理 Web UI? [y/N]" "N")"
+        case "${webui_choice}" in
+            y|Y|yes|YES) WEBUI_CHOICE="yes" ;;
+            *) WEBUI_CHOICE="no" ;;
+        esac
     fi
     if [ -z "${ENABLE_RECOMMEND}" ]; then
         echo "大模型兜底推荐（可选选填）:"
@@ -712,8 +768,8 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         *) RUN_EXTEND=1 ;;
     esac
 else
-    MODE="${MODE:-docker}"
     SOURCES_RAW="${SOURCES_RAW:-musicdl}"
+    WEBUI_CHOICE="${WEBUI_CHOICE:-no}"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
             log_err "--enable-recommend 需要同时提供 --llm-base-url 与 --llm-api-key"
@@ -728,22 +784,28 @@ else
     fi
 fi
 
-MODE="${MODE:-docker}"
-if [ "${MODE}" != "host" ] && [ "${MODE}" != "docker" ]; then
-    log_err "mode 必须是 host 或 docker"
-    exit 1
-fi
-if [ "${MODE}" = "docker" ]; then
-    ensure_docker_ready
-fi
+ensure_docker_ready
 
 parse_sources "${SOURCES_RAW}"
 
-# host 模式 systemd unit 的音源平台白名单（显式选择时用所选平台，否则默认值）
-MUSICDL_UNIT_SOURCES="KuwoMusicClient,MiguMusicClient"
-[ "${MDL_EXPLICIT}" -eq 1 ] && MUSICDL_UNIT_SOURCES="$(mdl_short_to_full "${MDL_PLATFORMS}")"
-LX_UNIT_SOURCES="kg,wy,mg,kw"
-[ "${LX_EXPLICIT}" -eq 1 ] && LX_UNIT_SOURCES="${LX_PLATFORMS}"
+# 洛雪自定义源：必须拿到脚本 URL（非交互 --lx-source-url 必填；交互循环输入）
+if [ "${ENABLE_LX}" -eq 1 ]; then
+    if [ -z "${LX_SOURCE_URL_CLI}" ] && [ "${NON_INTERACTIVE}" -eq 1 ]; then
+        log_err "非交互选择 lxmusic 必须提供 --lx-source-url（洛雪自定义源脚本地址）"
+        exit 1
+    fi
+    while [ -z "${LX_SOURCE_URL_CLI}" ]; do
+        LX_SOURCE_URL_CLI="$(prompt "请输入洛雪自定义源脚本 URL（https://.../*.js，可改选其他音源后重跑安装）")"
+        [ -n "${LX_SOURCE_URL_CLI}" ] || log_warn "选择 lxmusic 必须提供源脚本 URL"
+    done
+    case "${LX_SOURCE_URL_CLI}" in
+        http://*|https://*) : ;;
+        *)
+            log_err "洛雪源 URL 必须是 http(s) 地址: ${LX_SOURCE_URL_CLI}"
+            exit 1
+            ;;
+    esac
+fi
 
 MDL_SUMMARY=""
 [ -n "${MDL_PLATFORMS}" ] && MDL_SUMMARY="(${MDL_PLATFORMS})"
@@ -755,23 +817,49 @@ SELECTED=""
 [ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]${MDL_SUMMARY}"
 [ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]${LX_SUMMARY}"
 
-log_info "fnmusic-ext v${FNMUSIC_VERSION}"
-log_info "安装模式: ${MODE}"
+# v2.0.0 升级检测：旧 .env 三源并存（多 true）时强制重新三选一
+if [ -f "${BASE_DIR}/.env" ]; then
+    legacy_flags="$(grep -E "^\s*(export\s+)?FNMUSIC_(MUSICDL|NETEASE|LX)_ENABLED=" "${BASE_DIR}/.env" 2>/dev/null \
+        | tail -20 | sed -e "s/^.*=//" -e "s/['\"]//g" | tr '[:upper:]' '[:lower:]' \
+        | grep -c -E '^(true|1|yes)$' || true)"
+    if [ "${legacy_flags:-0}" -gt 1 ]; then
+        if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+            log_err "检测到旧版 .env 同时启用了多个音源；v2.0.0 起三音源互斥单选。"
+            log_err "请用 --sources 指定唯一音源后重试（musicbox / musicdl / lxmusic）。"
+            exit 1
+        fi
+        log_warn "检测到旧版 .env 同时启用了多个音源；v2.0.0 起三音源互斥单选，请重新选择。"
+    fi
+fi
+
+log_info "fnmusic-ext v${FNMUSIC_VERSION}（Docker 单容器·按需加载）"
 log_info "音源:${SELECTED}"
+[ "${WEBUI_CHOICE}" = "yes" ] && log_info "管理 WebUI: 启用 (8774)" || log_info "管理 WebUI: 不安装"
 log_info "每日推荐: ${ENABLE_RECOMMEND}"
 log_info "项目目录: ${BASE_DIR}"
 
+# 数据卷迁移：v1.x musicbox-data → v2.0.0 sources-data（网易登录态保留）
+SOURCES_DATA_DIR="${BASE_DIR}/sources-data"
+if [ -d "${BASE_DIR}/musicbox-data" ] && [ ! -d "${SOURCES_DATA_DIR}" ]; then
+    log_info "迁移数据目录: musicbox-data -> sources-data（网易登录态/缓存原样保留）"
+    mv "${BASE_DIR}/musicbox-data" "${SOURCES_DATA_DIR}"
+fi
 mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
-    "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
-    "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
-    "${BASE_DIR}/musicbox-data/netease-musicbox"
-chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
+    "${SOURCES_DATA_DIR}/cache/netease-musicbox" \
+    "${SOURCES_DATA_DIR}/config/netease-musicbox" \
+    "${SOURCES_DATA_DIR}/netease-musicbox" \
+    "${SOURCES_DATA_DIR}/lxmusic"
+chmod -R 0755 "${SOURCES_DATA_DIR}" 2>/dev/null || true
 
 # 归一化服务源码权限：umask 077 环境检出的文件为 600，会导致镜像内 appuser 读不到 app.py
 chmod 0644 \
     "${BASE_DIR}/musicdl-service/app.py" "${BASE_DIR}/musicdl-service/hardening.py" \
     "${BASE_DIR}/musicbox-service/app.py" "${BASE_DIR}/musicbox-service/runner.py" \
-    "${BASE_DIR}/musicbox-service/netease_ext.py" "${BASE_DIR}/lxmusic-service/app.py" \
+    "${BASE_DIR}/musicbox-service/netease_ext.py" \
+    "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
+    "${BASE_DIR}/lxmusic-service/verify_source.py" "${BASE_DIR}/lxmusic-service/js/bridge.js" \
+    "${BASE_DIR}/webui-service/app.py" "${BASE_DIR}/webui-service/static/index.html" \
+    "${BASE_DIR}/webui-service/static/app.js" "${BASE_DIR}/webui-service/static/style.css" \
     2>/dev/null || true
 
 MUSICDL_FLAG="false"
@@ -780,8 +868,11 @@ LX_FLAG="false"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && MUSICDL_FLAG="true"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && MUSICBOX_FLAG="true"
 [ "${ENABLE_LX}" -eq 1 ] && LX_FLAG="true"
+WEBUI_FLAG="false"
+[ "${WEBUI_CHOICE}" = "yes" ] && WEBUI_FLAG="true"
 
 # --- 写 .env（防覆盖：安全增量合并，脱敏：不打印 key） ---
+# 三源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
 ENV_DESIRED="$(mktemp)"
@@ -807,10 +898,15 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
+    if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then
+        # 源 URL 种子：容器首启加载，安装后校验通过再激活并推导 LX_SOURCES
+        echo "LX_SOURCE_URL='$(dotenv_escape "${LX_SOURCE_URL_CLI}")'"
+    fi
     if [ "${LX_EXPLICIT}" -eq 1 ]; then
         echo "LX_SOURCES='$(dotenv_escape "${LX_PLATFORMS}")'"
     fi
-    echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
+    echo "FNMUSIC_WEBUI_ENABLED='${WEBUI_FLAG}'"
+    echo "FNMUSIC_DEPLOY_MODE='docker'"
     echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
@@ -826,9 +922,11 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
-# 用户本次明确提供了新值的键（音源开关/版本/部署模式为安装时部署选项，始终采用新值）
-ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
+# 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
+ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
+# lx 源 URL 种子（校验通过后会再写一次推导出的 LX_SOURCES）
+[ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_URL"
 # 平台显式选择（向导菜单或 lx-kw/musicdl-kuwo 等 token）时覆盖平台键；裸音源 token 不动既有值
 [ "${LX_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCES"
 [ "${MDL_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_ONLINE_SOURCES,MUSICDL_SOURCES"
@@ -906,239 +1004,158 @@ install_unit() {
     return 0
 }
 
-# --- musicdl ---
-install_musicdl_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
-        return 1
-    fi
-    log_info "构建并启动 musicdl 容器（基于 ${MUSICDL_REPO}）..."
-    reclaim_container fnmusic-musicdl || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
-    if wait_http "http://127.0.0.1:8768/healthz" 60 2; then
-        log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
-        return 0
-    fi
-    log_err "等待 musicdl healthz 超时"
-    return 1
-}
-
-install_musicdl_host() {
-    log_info "宿主机安装 musicdl 服务（pip 包来自 ${MUSICDL_REPO}）..."
-    if [ ! -x "${BASE_DIR}/.venv-musicdl/bin/python" ]; then
-        python3 -m venv "${BASE_DIR}/.venv-musicdl"
-    fi
-    "${BASE_DIR}/.venv-musicdl/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-    "${BASE_DIR}/.venv-musicdl/bin/pip" install -q -r "${BASE_DIR}/musicdl-service/requirements.txt" -i "${PIP_INDEX}"
+# --- v2.0.0 单容器安装：fnmusic-sources（supervisor 按需加载） ---
+cleanup_legacy_sources() {
+    # 旧 v1.x 部署形态清理：宿主机三 unit + 三容器（单容器接管端口 8768/8770/8772）
     local unit
-    unit="$(mktemp)"
-    cat > "${unit}" <<EOF
-[Unit]
-Description=fnmusic-ext musicdl source (${MUSICDL_REPO})
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}/musicdl-service
-Environment=PYTHONUNBUFFERED=1
-Environment=MUSICDL_SOURCES=${MUSICDL_UNIT_SOURCES}
-Environment=MUSICDL_WORK_DIR=/tmp/musicdl_outputs
-EnvironmentFile=-${BASE_DIR}/.env
-ExecStart=${BASE_DIR}/.venv-musicdl/bin/uvicorn app:app --host 127.0.0.1 --port 8768
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    if ! install_unit "${unit}" /etc/systemd/system/fnmusic-musicdl.service; then
-        return 1
-    fi
-    if wait_http "http://127.0.0.1:8768/healthz" 30 1; then
-        log_info "宿主机 musicdl 已就绪"
-        return 0
-    fi
-    log_warn "musicdl systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicdl"
-    return 1
+    for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
+        stop_owned_source_unit "${unit}"
+        remove_owned_container "${unit}"
+    done
 }
 
-# --- musicbox ---
-install_musicbox_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
-        return 1
+install_sources_container() {
+    log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
+    cleanup_legacy_sources
+    reclaim_container "${CONTAINER_NAME}" || return 1
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build || return 1
+    # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）
+    local waited=0
+    if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
+            log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
+        else
+            log_err "等待 musicbox healthz 超时"
+            return 1
+        fi
     fi
-    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
-        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
-        "${BASE_DIR}/musicbox-data/netease-musicbox"
-    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
-    log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
-    reclaim_container fnmusic-musicbox || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
-    if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
-        log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
-        return 0
+    if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8768/healthz" 90 2; then
+            log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
+        else
+            log_err "等待 musicdl healthz 超时"
+            return 1
+        fi
     fi
-    log_err "等待 musicbox healthz 超时"
-    return 1
+    if [ "${ENABLE_LX}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
+            log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
+        else
+            log_err "等待 lxmusic healthz 超时"
+            return 1
+        fi
+    fi
+    if [ "${WEBUI_FLAG}" = "true" ]; then
+        if wait_http "http://127.0.0.1:8774/healthz" 60 2; then
+            log_info "WebUI 已就绪 http://127.0.0.1:8774/healthz"
+        else
+            log_err "等待 WebUI healthz 超时"
+            return 1
+        fi
+    fi
+    [ "${waited}" -eq 1 ] || log_warn "未选择任何音源（仅安装容器框架）"
+    return 0
 }
 
-install_musicbox_host() {
-    log_info "宿主机安装 musicbox 服务（pip 包来自 ${MUSICBOX_REPO}）..."
-    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
-        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
-        "${BASE_DIR}/musicbox-data/netease-musicbox"
-    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
-    if [ ! -x "${BASE_DIR}/.venv-musicbox/bin/python" ]; then
-        python3 -m venv "${BASE_DIR}/.venv-musicbox"
-    fi
-    "${BASE_DIR}/.venv-musicbox/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-    "${BASE_DIR}/.venv-musicbox/bin/pip" install -q -r "${BASE_DIR}/musicbox-service/requirements.txt" -i "${PIP_INDEX}"
-    local unit
-    unit="$(mktemp)"
-    cat > "${unit}" <<EOF
-[Unit]
-Description=fnmusic-ext musicbox source (${MUSICBOX_REPO})
-After=network.target
+# 洛雪源校验回路：容器内 verify_source.py 全链路校验（下载→init→搜索→解析→探活），
+# 成功则 POST /api/v1/source 激活持久化 + 推导平台写回 .env；失败按分类提示循环重输
+lx_verify_and_activate() {
+    local url="${1}"
+    local report platforms
+    while :; do
+        log_info "校验洛雪源（下载→init→搜索→解析→探活）..."
+        report="$(run_docker exec -w /srv/lxmusic-service "${CONTAINER_NAME}" \
+            python3 verify_source.py --json "${url}" 2>/dev/null || true)"
+        if [ -n "${report}" ] && printf '%s' "${report}" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("ok") else 1)
+' 2>/dev/null; then
+            platforms="$(printf '%s' "${report}" | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+print(",".join(d.get("platforms") or []))
+' 2>/dev/null || true)"
+            break
+        fi
+        # 失败：提取错误分类提示（verify 输出 JSON 的 error 字段）
+        local err_kind
+        err_kind="$(printf '%s' "${report}" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+print(d.get("category") or d.get("message") or "unknown")
+' 2>/dev/null || true)"
+        log_warn "洛雪源校验未通过（${err_kind:-无输出}）：${url}"
+        if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+            log_err "非交互模式：--lx-source-url 校验未通过，安装中止（.env 中 LX_SOURCE_URL 已保留可修正后重跑）"
+            return 1
+        fi
+        url="$(prompt "请重新输入洛雪源 URL（直接回车保留原值重试，输入 q 放弃激活）" "${url}")"
+        case "${url}" in
+            q|Q|quit|exit)
+                log_warn "跳过洛雪源激活：lxmusic 以无源状态运行，可稍后在 WebUI 中配置"
+                return 0
+                ;;
+        esac
+    done
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}/musicbox-service
-Environment=PYTHONUNBUFFERED=1
-Environment=XDG_DATA_HOME=${BASE_DIR}/musicbox-data
-Environment=XDG_CACHE_HOME=${BASE_DIR}/musicbox-data/cache
-Environment=XDG_CONFIG_HOME=${BASE_DIR}/musicbox-data/config
-ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 0.0.0.0 --port 8770
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    if ! install_unit "${unit}" /etc/systemd/system/fnmusic-musicbox.service; then
-        return 1
-    fi
-    if wait_http "http://127.0.0.1:8770/healthz" 30 1; then
-        log_info "宿主机 musicbox 已就绪"
-        return 0
-    fi
-    log_warn "musicbox systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicbox"
-    return 1
-}
-
-# --- lxmusic（洛雪音乐源） ---
-install_lxmusic_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
-        return 1
-    fi
-    log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
-    reclaim_container fnmusic-lxmusic || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
-    if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
-        log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
-        return 0
-    fi
-    log_err "等待 lxmusic healthz 超时"
-    return 1
-}
-
-install_lxmusic_host() {
-    log_info "宿主机安装 lxmusic 服务（洛雪音乐源）..."
-    if [ ! -x "${BASE_DIR}/.venv-lxmusic/bin/python" ]; then
-        python3 -m venv "${BASE_DIR}/.venv-lxmusic"
-    fi
-    "${BASE_DIR}/.venv-lxmusic/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-    "${BASE_DIR}/.venv-lxmusic/bin/pip" install -q -r "${BASE_DIR}/lxmusic-service/requirements.txt" -i "${PIP_INDEX}"
-    local unit
-    unit="$(mktemp)"
-    cat > "${unit}" <<EOF
-[Unit]
-Description=fnmusic-ext lxmusic source (LX Music style: kg/wy/mg/tx/kw)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${BASE_DIR}/lxmusic-service
-Environment=PYTHONUNBUFFERED=1
-Environment=LX_SOURCES=${LX_UNIT_SOURCES}
-Environment=LX_THIRD_PARTY=1
-Environment=LX_SEARCH_TIMEOUT=12
-Environment=LX_LIMIT_PER_SOURCE=20
-EnvironmentFile=-${BASE_DIR}/.env
-ExecStart=${BASE_DIR}/.venv-lxmusic/bin/uvicorn app:app --host 127.0.0.1 --port 8772
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    if ! install_unit "${unit}" /etc/systemd/system/fnmusic-lxmusic.service; then
-        return 1
-    fi
-    if wait_http "http://127.0.0.1:8772/healthz" 30 1; then
-        log_info "宿主机 lxmusic 已就绪"
-        return 0
-    fi
-    log_warn "lxmusic systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-lxmusic"
-    return 1
-}
-
-clear_opposite_mode() {
-    # 交叉模式切换时清理对侧，避免端口占用冲突
-    if [ "${MODE}" = "docker" ]; then
-        log_info "Docker 模式：停用宿主机音源 systemd unit（若存在）..."
-        for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-            stop_owned_source_unit "${unit}"
-        done
+    # 激活并持久化（state.json 存 /data/lxmusic，容器重启自动恢复）
+    if curl -sf -X POST "http://127.0.0.1:8772/api/v1/source" \
+        -H "Content-Type: application/json" \
+        -d "{\"url\": \"$(dotenv_escape "${url}")\"}" >/dev/null 2>&1; then
+        log_info "洛雪源已激活并持久化"
     else
-        log_info "Host 模式：停止 Docker 音源容器（若存在）..."
-        for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-            remove_owned_container "${unit}"
-        done
+        log_warn "洛雪源激活请求失败（服务仍以种子 URL 运行，可稍后在 WebUI 重试）"
     fi
-}
 
-stop_unselected() {
-    if [ "${ENABLE_MUSICDL}" -eq 0 ]; then
-        remove_owned_container fnmusic-musicdl
-        stop_owned_source_unit fnmusic-musicdl
+    # 校验通过的 URL 与推导平台写回 .env（LX_SOURCES=内置可搜索平台 ∩ 源声明平台）
+    if [ -n "${url}" ] && [ "${url}" != "${LX_SOURCE_URL_CLI}" ]; then
+        ENV_DESIRED2="$(mktemp)"
+        {
+            echo "LX_SOURCE_URL='$(dotenv_escape "${url}")'"
+        } > "${ENV_DESIRED2}"
+        python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
+            --desired "${ENV_DESIRED2}" --output "${ENV_PATH}" \
+            --explicit "LX_SOURCE_URL" --quiet
+        rm -f "${ENV_DESIRED2}"
     fi
-    if [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-        remove_owned_container fnmusic-musicbox
-        stop_owned_source_unit fnmusic-musicbox
+    if [ -n "${platforms}" ]; then
+        ENV_DESIRED2="$(mktemp)"
+        {
+            echo "LX_SOURCES='$(dotenv_escape "${platforms}")'"
+        } > "${ENV_DESIRED2}"
+        python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
+            --desired "${ENV_DESIRED2}" --output "${ENV_PATH}" \
+            --explicit "LX_SOURCES" --quiet
+        rm -f "${ENV_DESIRED2}"
+        log_info "洛雪源可用平台: ${platforms}（已写回 .env）"
     fi
-    if [ "${ENABLE_LX}" -eq 0 ]; then
-        remove_owned_container fnmusic-lxmusic
-        stop_owned_source_unit fnmusic-lxmusic
-    fi
+    chmod 600 "${ENV_PATH}"
+    return 0
 }
 
 # Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
 # 结果写入 .env 的 FNMUSIC_BASE_IMAGE 供 compose build.args 使用；失败直接退出，不动现有部署
-if [ "${MODE}" = "docker" ]; then
-    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
-        bash "${BASE_DIR}/ensure_base_image.sh"; then
-        log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源，或改用 --mode host。"
-        exit 1
-    fi
+if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
+    bash "${BASE_DIR}/ensure_base_image.sh"; then
+    log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源后重试。"
+    exit 1
 fi
 
 takeover preflight --base "${BASE_DIR}"
-clear_opposite_mode
-if [ "${MODE}" = "docker" ]; then
-    [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
-    [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_docker
-    [ "${ENABLE_LX}" -eq 1 ] && install_lxmusic_docker
-else
-    [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_host
-    [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_host
-    [ "${ENABLE_LX}" -eq 1 ] && install_lxmusic_host
+install_sources_container
+if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then
+    lx_verify_and_activate "${LX_SOURCE_URL_CLI}"
 fi
-stop_unselected
 
 takeover preflight --base "${BASE_DIR}"
 for script in extend.sh restore.sh proxy/run_proxy.sh proxy/install_common.sh netease_login.sh ensure_base_image.sh; do
@@ -1147,12 +1164,15 @@ done
 
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
-log_info "已启用音源（安装模式: ${MODE}）:${SELECTED}"
+log_info "已启用音源（Docker 单容器·按需加载）:${SELECTED}"
 log_info "------------------------------------------------------------"
-log_info "【音源服务状态】"
+log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源${MDL_SUMMARY:+ 平台${MDL_SUMMARY}}   http://127.0.0.1:8768/healthz"
-[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪音乐源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
+[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪自定义源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
+if [ "${WEBUI_FLAG}" = "true" ]; then
+    log_info "  • WebUI     [8774] 管理界面      http://<NAS_IP>:8774（无鉴权，仅限可信内网）"
+fi
 log_info "------------------------------------------------------------"
 log_info "【后续验证与使用指引】"
 if [ "${RUN_EXTEND}" -eq 1 ]; then
@@ -1165,19 +1185,25 @@ fi
 log_info "2. 验证搜索与试听："
 log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌曲（例如“晴天”或“周杰伦”），"
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
+if [ "${WEBUI_FLAG}" = "true" ]; then
+    log_info "3. 管理 Web UI：http://<NAS_IP>:8774"
+    log_info "   • 音源三选一随时切换（秒级）、musicdl 平台多选、网易扫码登录"
+    log_info "   • 音质模式（高音质/平衡/流畅）、边听边存、推荐开关、LLM 配置"
+    log_info "   • 无鉴权设计：请勿暴露到公网，仅限可信内网使用"
+fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
-    log_info "3. 网易云扫码登录（可选）："
+    log_info "4. 网易云扫码登录（可选）："
     log_info "   部分网易云 VIP/无损歌曲需要账号凭证："
     log_info "   • 命令行扫码登录（推荐）: ./install.sh --qr 或 ./netease_login.sh"
     log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
     log_info "   • 局域网浏览器图片（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
-    log_info "   • 检查登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
+    log_info "   • WebUI 内扫码（安装了 WebUI 时最方便）"
 fi
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
-    log_info "4. 大模型每日推荐："
+    log_info "5. 大模型每日推荐："
     log_info "   已成功配置大模型！登录飞牛音乐后，左侧歌单列表顶部会自动出现「每日推荐」。"
 fi
-log_info "5. 状态探测与一键还原："
+log_info "6. 状态探测与一键还原："
 log_info "   • 探测健康状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 随时一键还原: ./restore.sh (立即恢复官方出厂直连状态)"
 log_info "============================================================"

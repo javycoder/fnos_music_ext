@@ -1,0 +1,264 @@
+"""容器组装离线测试：supervisord.conf / entrypoint 开关选择 / compose 单服务 / Dockerfile。
+
+不依赖 docker：entrypoint 用假的 supervisord/supervisorctl 走真 shell 逻辑。
+"""
+import configparser
+import os
+import subprocess
+import textwrap
+from pathlib import Path
+
+import pytest
+import yaml
+
+CONTAINER_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+
+@pytest.fixture(scope="module")
+def supervisord_conf():
+    cp = configparser.ConfigParser()
+    cp.read(CONTAINER_DIR / "supervisord.conf")
+    return cp
+
+
+def test_supervisord_four_programs_all_autostart_false(supervisord_conf):
+    programs = sorted(s for s in supervisord_conf.sections() if s.startswith("program:"))
+    assert programs == [
+        "program:lxmusic", "program:musicbox", "program:musicdl", "program:webui",
+    ]
+    for section in programs:
+        assert supervisord_conf.get(section, "autostart") == "false"
+        assert supervisord_conf.get(section, "autorestart") == "true"
+        # 日志汇到容器 stdout，组内进程一起停，避免 uvicorn 子进程残留
+        assert supervisord_conf.get(section, "stdout_logfile") == "/dev/stdout"
+        assert supervisord_conf.get(section, "stdout_logfile_maxbytes") == "0"
+        assert supervisord_conf.get(section, "redirect_stderr") == "true"
+        assert supervisord_conf.get(section, "stopasgroup") == "true"
+        assert supervisord_conf.get(section, "killasgroup") == "true"
+
+
+def test_supervisord_ports_and_directories(supervisord_conf):
+    expected = {
+        "musicdl": ("8001", "/srv/musicdl-service"),
+        "musicbox": ("8002", "/srv/musicbox-service"),
+        "lxmusic": ("8003", "/srv/lxmusic-service"),
+        "webui": ("8004", "/srv/webui-service"),
+    }
+    for prog, (port, directory) in expected.items():
+        section = f"program:{prog}"
+        command = supervisord_conf.get(section, "command")
+        assert f"--port {port}" in command
+        assert supervisord_conf.get(section, "directory") == directory
+
+
+def test_supervisord_daemon_section(supervisord_conf):
+    assert supervisord_conf.get("supervisord", "nodaemon") == "true"
+    assert supervisord_conf.get("unix_http_server", "chmod") == "0700"
+    assert supervisord_conf.get("supervisorctl", "serverurl") == "unix:///tmp/supervisor.sock"
+
+
+# ---------------------------------------------------------------- env_flag.sh
+
+def _run_env_flag(env_file: Path, key: str, env_extra: dict | None = None, default: str = "") -> str:
+    """source env_flag.sh 后调用 env_flag key，返回标准化输出。"""
+    lib = CONTAINER_DIR / "env_flag.sh"
+    script = f'. "{lib}"; env_flag {key} {default}\n'
+    env = {"PATH": os.environ["PATH"], "FNMUSIC_ENV_FILE": str(env_file)}
+    env.update(env_extra or {})
+    out = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, env=env, timeout=15,
+    )
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
+def test_env_flag_reads_quoted_and_export_lines(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FNMUSIC_LX_ENABLED='true'\n"
+        "export FNMUSIC_WEBUI_ENABLED=\"true\"\n"
+        "FNMUSIC_MUSICDL_ENABLED=false\n",
+        encoding="utf-8",
+    )
+    assert _run_env_flag(env_file, "FNMUSIC_LX_ENABLED") == "true"
+    assert _run_env_flag(env_file, "FNMUSIC_WEBUI_ENABLED") == "true"
+    assert _run_env_flag(env_file, "FNMUSIC_MUSICDL_ENABLED") == "false"
+
+
+def test_env_flag_env_var_and_default_fallback(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("OTHER_KEY=1\n", encoding="utf-8")
+    # .env 无该键 → 进程环境变量
+    assert _run_env_flag(env_file, "FNMUSIC_LX_ENABLED", {"FNMUSIC_LX_ENABLED": "yes"}) == "true"
+    # 都没有 → 默认值
+    assert _run_env_flag(env_file, "FNMUSIC_NETEASE_ENABLED") == "false"
+    assert _run_env_flag(env_file, "FNMUSIC_NETEASE_ENABLED", default="true") == "true"
+    # 非真值关键词一律 false
+    assert _run_env_flag(env_file, "FNMUSIC_X", {"FNMUSIC_X": "随便"}) == "false"
+
+
+def test_env_flag_last_definition_wins(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_LX_ENABLED=false\nFNMUSIC_LX_ENABLED=true\n", encoding="utf-8")
+    assert _run_env_flag(env_file, "FNMUSIC_LX_ENABLED") == "true"
+
+
+def test_export_source_env_from_env_file(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LX_SOURCE_URL='https://example.com/lx.js'\n"
+        "LX_SOURCES=kw,kg\n"
+        "MUSICDL_SOURCES=kugou,netease\n",
+        encoding="utf-8",
+    )
+    lib = CONTAINER_DIR / "env_flag.sh"
+    script = f'. "{lib}"; export_source_env; printenv LX_SOURCE_URL; printenv LX_SOURCES; printenv MUSICDL_SOURCES\n'
+    out = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True,
+        env={"PATH": os.environ["PATH"], "FNMUSIC_ENV_FILE": str(env_file)}, timeout=15,
+    )
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.strip().splitlines()
+    assert lines == ["https://example.com/lx.js", "kw,kg", "kugou,netease"]
+
+
+# ---------------------------------------------------------------- entrypoint.sh
+
+class FakeSupervisor:
+    """假 supervisord/supervisorctl：记录调用，status 恒可用。"""
+
+    def __init__(self, bindir: Path, log: Path):
+        ctl = bindir / "supervisorctl"
+        ctl.write_text(
+            textwrap.dedent(f"""\
+            #!/bin/sh
+            echo "$@" >> "{log}"
+            case "$1" in
+              status) exit 0 ;;
+              *) exit 0 ;;
+            esac
+            """),
+            encoding="utf-8",
+        )
+        ctl.chmod(0o755)
+        daemon = bindir / "supervisord"
+        daemon.write_text(
+            textwrap.dedent(f"""\
+            #!/bin/sh
+            echo "supervisord $*" >> "{log}"
+            sleep 0.3
+            exit 0
+            """),
+            encoding="utf-8",
+        )
+        daemon.chmod(0o755)
+
+
+def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path) -> list[str]:
+    """跑真实 entrypoint.sh，返回 supervisorctl 的调用序列（去掉 supervisord 行）。"""
+    proc = subprocess.run(
+        ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
+        capture_output=True, text=True, timeout=30,
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "ENV_FLAG_LIB": str(CONTAINER_DIR / "env_flag.sh"),
+            "SUPERVISOR_CONF": "/nonexistent/supervisord.conf",
+            "FNMUSIC_ENV_FILE": str(env_file),
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    calls = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln and not ln.startswith("supervisord ")]
+    calls = [c.replace("-c /nonexistent/supervisord.conf ", "") for c in calls]
+    # 套接字就绪探测的 status 轮询不算启动动作
+    return [c for c in calls if c != "status"]
+
+
+@pytest.fixture()
+def entrypoint_env(tmp_path):
+    log = tmp_path / "ctl.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    FakeSupervisor(fake_bin, log)
+    env_file = tmp_path / ".env"
+
+    def run(env_text: str) -> list[str]:
+        env_file.write_text(env_text, encoding="utf-8")
+        log.write_text("", encoding="utf-8")
+        return _run_entrypoint(fake_bin, env_file, log)
+
+    return run
+
+
+@pytest.mark.parametrize("env_text,expected", [
+    # 单源：只启动所选音源
+    ("FNMUSIC_MUSICDL_ENABLED=true\n", ["start musicdl"]),
+    ("FNMUSIC_NETEASE_ENABLED=true\n", ["start musicbox"]),
+    ("FNMUSIC_LX_ENABLED=true\n", ["start lxmusic"]),
+    # WebUI 独立开关
+    ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\n", ["start lxmusic", "start webui"]),
+    ("FNMUSIC_WEBUI_ENABLED=true\n", ["start webui"]),
+    # 旧多源并存：只取第一个命中（musicdl 优先），不重复拉起
+    ("FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\n",
+     ["start musicdl"]),
+    # 全关：什么源都不启动
+    ("FNMUSIC_MUSICDL_ENABLED=false\n", []),
+])
+def test_entrypoint_starts_selected_programs(entrypoint_env, env_text, expected):
+    assert entrypoint_env(env_text) == expected
+
+
+# ---------------------------------------------------------------- compose / Dockerfile
+
+def test_compose_single_service_layout():
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    assert list(compose["services"]) == ["fnmusic-sources"]
+    svc = compose["services"]["fnmusic-sources"]
+    assert svc["build"]["dockerfile"] == "container/Dockerfile"
+    assert svc["image"] == "fnmusic-sources:latest"
+    # 端口避开知名服务：解析/管理走 127.0.0.1，扫码与 WebUI 面向局域网
+    assert sorted(svc["ports"]) == sorted([
+        "127.0.0.1:8768:8001",
+        "0.0.0.0:8770:8002",
+        "127.0.0.1:8772:8003",
+        "0.0.0.0:8774:8004",
+    ])
+    assert "./sources-data:/data" in svc["volumes"]
+    assert any(v.startswith(".:/repo") for v in svc["volumes"])
+    assert svc["restart"] == "unless-stopped"
+    assert svc["healthcheck"]["test"] == ["CMD", "/usr/local/bin/healthcheck.sh"]
+
+
+def test_compose_build_args_mirror_passthrough():
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    args = compose["services"]["fnmusic-sources"]["build"]["args"]
+    for name in ("BASE_IMAGE", "PIP_INDEX_URL", "APT_MIRROR"):
+        assert name in args and "${" in args[name], f"构建参数 {name} 需从 .env 透传"
+
+
+def test_dockerfile_assembly():
+    text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    # 单镜像运行时：python + node(lx 沙箱) + ffmpeg(musicdl 试听) + supervisor
+    for pkg in ("nodejs", "ffmpeg", "supervisor"):
+        assert pkg in text
+    for req in ("musicdl-service/requirements.txt", "musicbox-service/requirements.txt",
+                "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
+        assert req in text
+    assert "lxmusic-service/js/bridge.js" in text
+    assert text.count("HEALTHCHECK") >= 1
+    assert 'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' in text
+    assert "EXPOSE 8001 8002 8003 8004" in text
+    # 非特权运行
+    assert "USER appuser" in text
+    # 数据卷与仓库挂载点；目录不可 world-writable（bind 挂载后跟宿主机权限）
+    assert "/data" in text and "/repo" in text
+    assert "chmod 0777" not in text
+
+
+def test_dockerignore_whitelist_build_context():
+    text = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    # 白名单模式：先忽略一切，再放行四个服务目录与 container/
+    assert code_lines[0] == "*"
+    for keep in ("!musicdl-service/", "!musicbox-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
+        assert keep in code_lines
