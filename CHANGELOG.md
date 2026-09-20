@@ -12,16 +12,18 @@
   `--sources` 均支持组合写法，例如 `--sources netease,lx-kw,musicdl-kuwo`
   表示：网易云整源 + lxmusic 仅启用酷我 + musicdl 仅启用酷我（两个音源
   容器一起安装，搜索仍按多源并发策略聚合、去重与换源兜底）。
-  - 交互向导改为平铺组合菜单：`1` 网易云、`2`-`7` lx 按平台（全部默认/
-    酷狗/网易/咪咕/酷我/QQ）、`8`-`14` musicdl 精选平台（全部默认/酷我/
-    酷狗/咪咕/QQ/千千/B站）、`0` 其他 musicdl 平台（输编号或短名）；
-  - musicdl 内置 57 个平台，全部平台的编号/短名对照表见
-    `musicdl-service/PLATFORMS.md`（与安装脚本内嵌表由测试同步校验）；
+  - 交互向导改为全局平铺编号：每个「源+平台」一个独立 ID（`1` 网易云、
+    `2`–`58` musicdl、`59`–`63` lx），向导只列出精选（`1`、`2`–`7`、
+    `59`–`62`）；其余平台对照 `musicdl-service/PLATFORMS.md` 在同一输入框
+    填写编号（例如 `49` = mdl-gequhai）。不再使用菜单 `0` 二次询问，也
+    不再把 `1/2/3` 当作三整源；
+  - 全部平台的编号/短名对照表见 `musicdl-service/PLATFORMS.md`
+    （与安装脚本内嵌 `SOURCE_PLATFORM_TABLE` 由测试同步校验）；
   - 所选平台自动写入 `.env`（`LX_SOURCES` / `FNMUSIC_ONLINE_SOURCES` /
     `MUSICDL_SOURCES`），容器与宿主机两种部署形态均按所选平台启动，
     代理的搜索、翻页、播放、每日推荐榜单全链路按平台过滤；
-  - 旧写法完全兼容：`--sources musicbox,musicdl,lxmusic` 或 `1,2,3`
-    仍是"整源 + 默认平台"，不覆盖 `.env` 中已有的平台自定义值。
+  - 整源仍用名字：`--sources musicbox,musicdl,lxmusic` 或 `lx-all` /
+    `musicdl-all`；`--sources=1,2,3` 现为网易云 + mdl-酷我 + mdl-酷狗。
 - **lxmusic 平台白名单打通代理层**：`lx /api/v1/search` 的 `?sources=`
   参数此前未被代理使用，现按所选平台透传；`online:lx:<平台>:<id>` 条目
   在翻页与播放时按白名单过滤；后端丢失内存 ID 的按平台精确重搜；洛雪
