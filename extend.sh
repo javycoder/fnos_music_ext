@@ -485,17 +485,9 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ] && ! source_healthy "${MUSICBOX_URL}"; then ne
 if [ "${ENABLE_LX}" -eq 1 ] && ! source_healthy "${LX_URL}"; then need_start=1; fi
 if [ "${ENABLE_WEBUI}" -eq 1 ] && ! source_healthy "http://127.0.0.1:8774"; then need_start=1; fi
 
-if [ "${need_start}" -eq 0 ]; then
-    # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
-    if run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-        reclaim_container "${CONTAINER_NAME}" || exit 1
-        log_info "音源容器 ${CONTAINER_NAME} 已就绪（按需加载：仅所选音源进程驻留内存）。"
-    else
-        log_warn "音源 healthz 已就绪，但未发现 ${CONTAINER_NAME} 容器（疑似 v1.x 宿主机服务残留）。"
-        log_warn "建议重新运行 ./install.sh 完成 v2.0.0 单容器迁移。"
-    fi
-else
-    log_info "音源服务未全部就绪，拉起单容器 ${CONTAINER_NAME}..."
+# 构建并确保容器与当前代码同步。compose up -d --build 幂等：镜像与配置均未变时
+# 不动运行中的容器（仅秒级缓存校验）；镜像有变（git pull 升级后）则自动换新容器。
+ensure_image_current() {
     # 基础镜像源保障（国内镜像优先/官方兜底，见 ensure_base_image.sh），整次运行只执行一次
     if [ "${BASE_IMAGE_ENSURED:-0}" -ne 1 ]; then
         if bash "${BASE_DIR}/ensure_base_image.sh"; then
@@ -505,11 +497,43 @@ else
             exit 1
         fi
     fi
-    reclaim_container "${CONTAINER_NAME}" || exit 1
     if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "构建/启动 ${CONTAINER_NAME} 失败。"
         exit 1
     fi
+}
+
+# .env 比容器启动新（安装/切源改了开关）且镜像未变时，compose 不会重建容器：
+# 需显式重启让 entrypoint 重读 .env 重选进程集。
+env_newer_than_container() {
+    local started epoch_start epoch_env
+    started="$(run_docker inspect -f '{{.State.StartedAt}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
+    epoch_start="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
+    epoch_env="$(stat -c %Y "${BASE_DIR}/.env" 2>/dev/null)" || return 1
+    [ "${epoch_env}" -gt "${epoch_start}" ]
+}
+
+if [ "${need_start}" -eq 0 ]; then
+    # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
+    if run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        reclaim_container "${CONTAINER_NAME}" || exit 1
+        log_info "音源容器 ${CONTAINER_NAME} 已就绪（按需加载：仅所选音源进程驻留内存）。"
+        # 升级同步：服务健康也要重建镜像，否则 git pull 后新代码永远不生效
+        img_before="$(run_docker inspect -f '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+        ensure_image_current
+        img_after="$(run_docker inspect -f '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+        if [ "${img_before}" = "${img_after}" ] && env_newer_than_container; then
+            log_info "检测到 .env 更新，重启容器使音源开关生效..."
+            run_docker restart "${CONTAINER_NAME}" || exit 1
+        fi
+    else
+        log_warn "音源 healthz 已就绪，但未发现 ${CONTAINER_NAME} 容器（疑似 v1.x 宿主机服务残留）。"
+        log_warn "建议重新运行 ./install.sh 完成 v2.0.0 单容器迁移。"
+    fi
+else
+    log_info "音源服务未全部就绪，拉起单容器 ${CONTAINER_NAME}..."
+    reclaim_container "${CONTAINER_NAME}" || exit 1
+    ensure_image_current
     # compose 对配置未变的运行中容器不会重启：手动 restart 让 entrypoint 按最新 .env 重选进程集
     run_docker restart "${CONTAINER_NAME}" || exit 1
 fi
