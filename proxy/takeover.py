@@ -762,6 +762,11 @@ def deployment_remember(base):
     record = {'base': str(Path(base).resolve()),
               'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     DEPLOYMENT_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    # Explicit chmod: the install chain may run under `umask 077` (install.sh
+    # protects .env writes), which would silently tighten a fresh mkdir to
+    # 0700 and keep unprivileged deployment-check out of the directory.
+    # Same hardening prepare_install_lock() applies to /run/fnmusic-ext-install.
+    os.chmod(DEPLOYMENT_FILE.parent, 0o755)
     fd, name = tempfile.mkstemp(dir=str(DEPLOYMENT_FILE.parent))
     try:
         with os.fdopen(fd, 'w') as out:

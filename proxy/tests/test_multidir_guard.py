@@ -187,6 +187,27 @@ def test_registry_record_is_world_readable_json(tmp_path, monkeypatch):
     assert data['recorded_at']
 
 
+def test_registry_survives_restrictive_umask(tmp_path, monkeypatch):
+    """install.sh runs under `umask 077`; the registry must stay world-readable.
+
+    A plain mkdir(0o755) under that umask yields 0700 and would lock
+    unprivileged deployment-check out of the directory, silently disabling
+    the whole guard.
+    """
+    record = tmp_path / 'deployment'
+    monkeypatch.setattr(takeover, 'DEPLOYMENT_FILE', record)
+    checkout = tmp_path / 'checkout'
+    checkout.mkdir()
+    old_umask = os.umask(0o077)
+    try:
+        takeover.deployment_remember(checkout)
+        takeover.deployment_remember(checkout)  # second call must also fix mode
+    finally:
+        os.umask(old_umask)
+    assert record.parent.stat().st_mode & 0o055 == 0o055  # dir: r-x for others
+    assert record.stat().st_mode & 0o044 == 0o044         # file: r-- for others
+
+
 # --------------------------------------------------- shell: hung installer ---
 
 def _make_fake_installer(directory, name='install.sh'):
