@@ -199,6 +199,43 @@ def test_verify_url_search_empty(app_alias, isolated, monkeypatch):
     assert report["category"] == "resolve"
 
 
+def test_verify_url_samples_multiple_artists(app_alias, isolated, monkeypatch):
+    """前 3 首歌（不同歌手）全部搜不到、第 4 首才命中：证明抽样确实覆盖多首不同歌手，
+    且第一首成功即判可用、成功即停。"""
+    async def fake_download(url):
+        return STUB_SCRIPT
+
+    monkeypatch.setattr(vsr, "download_script", fake_download)
+    monkeypatch.setattr(vsr, "UserSource", UserSourceShim)
+
+    from urllib.parse import urlparse, parse_qs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "search.kuwo.cn" in url:
+            kw = parse_qs(urlparse(url).query).get("all", [""])[0]
+            if "倔强" not in kw:
+                return httpx.Response(200, text="{'abslist':[]}")
+            return httpx.Response(200, text=_KW_RS_BODY)
+        if "media.test" in url:
+            return httpx.Response(
+                206,
+                headers={"Content-Type": "audio/x-flac", "Content-Range": "bytes 0-1/38210000"},
+                content=b"fLaC",
+            )
+        return httpx.Response(404)
+
+    lxapp.app.state.http = mock_client(handler)
+    report = asyncio.run(vsr.verify_url("https://src.test/1.js"))
+    assert report["ok"] is True
+    assert report["probe"]["title"] == "晴天"
+    results = [a["result"] for a in report["attempts"]]
+    # 前 3 个关键词（晴天/江南/十年）搜不到，第 4 个（倔强）命中即停
+    assert results == ["no_items", "no_items", "no_items", "ok"]
+    assert report["sampled"] == 4
+    assert report["probe"]["keyword"] == "倔强"
+
+
 def test_format_report_renders():
     report = {
         "ok": True, "meta": {"name": "测试源", "version": "1.0"},
