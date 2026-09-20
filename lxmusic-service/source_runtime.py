@@ -1,0 +1,538 @@
+"""洛雪自定义源运行时：脚本下载/校验 + Node 沙箱进程管理 + musicUrl 解析。
+
+对齐洛雪桌面版自定义源规范（https://lxmusic.toside.cn/desktop/custom-source）：
+- 脚本必须以 ``/* ... */`` 头部注释块开头，元数据字段 @name/@description/@version/@author/@homepage；
+- 脚本通过 ``globalThis.lx`` 与宿主交互，事件仅 inited / request / updateAlert；
+- 非 local 源的 actions 仅支持 musicUrl（搜索/歌词/封面/榜单走本服务内置平台接口）。
+
+与 js/bridge.js 的进程协议见该文件头注释。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+logger = logging.getLogger("lxmusic_service.runtime")
+
+SCRIPT_MAX_BYTES = 9_000_000
+MAX_REDIRECTS = 3
+INIT_TIMEOUT_S = 10.0
+MUSIC_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
+
+_META_LIMITS = {"name": 24, "description": 36, "author": 56, "homepage": 1024, "version": 36}
+_HEADER_BLOCK_RE = re.compile(r"^/\*[\S\s]+?\*/")
+_META_LINE_RE = re.compile(r"^\s?\*\s?@(\w+)\s(.+)$", re.M)
+_URL_RE = re.compile(r"^https?://", re.I)
+
+# tier（本服务内部档位）→ 期望的脚本档位（洛雪规范 qualitys 取值）
+_TIER_QUALITY_PREFERENCE = {
+    "lossless": ["flac", "flac24bit", "hires"],
+    "high": ["320k"],
+    "standard": ["128k"],
+}
+
+
+class SourceError(Exception):
+    """带错误类别的源操作失败；category ∈ download/invalid/init/no_platform/resolve。"""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
+def parse_script_meta(script: str) -> dict:
+    """解析脚本头部元数据；头部块或 @name 缺失视为无效脚本（对齐桌面版校验）。"""
+    header = _HEADER_BLOCK_RE.match(script or "")
+    if header is None:
+        raise SourceError("invalid", "自定义源脚本必须以 /* ... */ 头部注释块开头")
+    meta: dict[str, str] = {}
+    for key, value in _META_LINE_RE.findall(header.group(0)):
+        limit = _META_LIMITS.get(key)
+        if limit is None:
+            continue
+        value = value.strip()
+        meta[key] = (value[:limit] + "...") if len(value) > limit else value
+    if not meta.get("name"):
+        raise SourceError("invalid", "脚本头部必须声明 @name 元数据")
+    return meta
+
+
+async def download_script(url: str) -> str:
+    """下载源脚本（重定向≤3、≤9MB、UTF-8），并完成头部校验。"""
+    if not _URL_RE.match((url or "").strip()):
+        raise SourceError("download", "源地址必须以 http:// 或 https:// 开头")
+    url = url.strip()
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            max_redirects=MAX_REDIRECTS,
+            timeout=httpx.Timeout(20.0, connect=8.0),
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            declared = resp.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > SCRIPT_MAX_BYTES:
+                raise SourceError("download", "脚本超过 9MB 大小上限")
+            raw = resp.content
+    except SourceError:
+        raise
+    except httpx.TooManyRedirects as exc:
+        raise SourceError("download", "重定向次数超过 3 次") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise SourceError("download", f"下载失败: {exc}") from exc
+    if len(raw) > SCRIPT_MAX_BYTES:
+        raise SourceError("download", "脚本超过 9MB 大小上限")
+    try:
+        script = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SourceError("invalid", "脚本不是有效的 UTF-8 文本") from exc
+    parse_script_meta(script)
+    return script
+
+
+def script_quality_for_tier(tier: str, declared: list[str]) -> "str | None":
+    """tier → 脚本声明中最合适的档位；无匹配返回 None（由上层降档重试）。"""
+    for quality in _TIER_QUALITY_PREFERENCE.get(tier or "standard", []):
+        if quality in declared:
+            return quality
+    return None
+
+
+def build_music_info(item: dict, platform: str) -> dict:
+    """本服务条目 → 洛雪脚本期望的 musicInfo 结构。
+
+    主键约定（与主流洛雪源一致）：kg 用 hash，其余平台用 songmid；
+    tx 用 strMediaMid，mg 用 copyrightId，一并冗余提供。"""
+    identifier = str(item.get("_identifier") or "")
+
+    def minutes_seconds(seconds: Any) -> str:
+        try:
+            total = int(float(seconds) or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    info = {
+        "songmid": identifier,
+        "songId": identifier,
+        "name": str(item.get("title") or ""),
+        "singer": str(item.get("artist") or ""),
+        "source": platform,
+        "interval": minutes_seconds(item.get("duration_s")),
+        "albumName": str(item.get("album") or ""),
+        "meta": {
+            "songId": identifier,
+            "albumName": str(item.get("album") or ""),
+            "picUrl": str(item.get("cover_url") or "") or None,
+        },
+    }
+    # identifier 即 "lx:<platform>:<identifier>" 的平台主键：条目缺字段时兜底，
+    # 保证脚本总能拿到本平台的规范主键（kg 读 hash、kw 读 rid……）
+    platform_key = {
+        "kg": ("hash", item.get("hash") or identifier),
+        "tx": ("songmid", item.get("songmid") or identifier),
+        "mg": ("copyrightId", item.get("copyright_id") or identifier),
+        "kw": ("rid", item.get("rid") or identifier),
+        "wy": ("songId", item.get("song_id") or identifier),
+    }.get(platform)
+    if platform_key and platform_key[1]:
+        info[platform_key[0]] = str(platform_key[1])
+    if platform == "kg" and item.get("hash"):
+        info["songmid"] = str(item["hash"])  # 部分脚本读 songmid
+    return info
+
+
+class UserSource:
+    """一个已加载的用户自定义源：持久 Node 子进程 + 请求多路复用。"""
+
+    def __init__(self, script: str, meta: dict, *, script_dir: "str | None" = None):
+        self.script = script
+        self.meta = meta
+        self.node_bin = os.environ.get("LX_NODE_BIN", "node")
+        self._script_dir = Path(script_dir or tempfile.gettempdir())
+        self._script_path: "Path | None" = None
+        self._proc: "asyncio.subprocess.Process | None" = None
+        self._pending: dict[str, asyncio.Future] = {}
+        self._write_lock = asyncio.Lock()
+        self._reader_task: "asyncio.Task | None" = None
+        self._stderr_task: "asyncio.Task | None" = None
+        self._next_id = 0
+        self._started = False
+        self._inited_event = asyncio.Event()
+        self._inited_payload: Any = None
+        self._init_error: "str | None" = None
+        self.inited: dict = {}
+        self.platforms: dict[str, dict] = {}
+        self.started_at = 0.0
+
+    # ------------------------------------------------------------------ 生命周期
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        bridge = Path(__file__).resolve().parent / "js" / "bridge.js"
+        if not bridge.exists():
+            raise SourceError("init", f"bridge script missing: {bridge}")
+        try:
+            self._script_dir.mkdir(parents=True, exist_ok=True)
+            self._script_path = self._script_dir / f"lx-source-{os.getpid()}-{int(time.time() * 1000)}.js"
+            self._script_path.write_text(self.script, encoding="utf-8")
+        except OSError as exc:
+            raise SourceError("init", f"无法写入脚本缓存: {exc}") from exc
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                self.node_bin,
+                str(bridge),
+                str(self._script_path),
+                json.dumps(self.meta, ensure_ascii=False),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise SourceError("init", f"未找到 Node.js 运行时（{self.node_bin}）") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise SourceError("init", f"启动 Node 沙箱失败: {exc}") from exc
+        self._reader_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+        try:
+            self.inited = await asyncio.wait_for(self._wait_inited(), INIT_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            await self.stop()
+            raise SourceError("init", f"脚本 {INIT_TIMEOUT_S:.0f}s 内未完成初始化（inited）") from exc
+        except SourceError:
+            await self.stop()
+            raise
+        sources = self.inited.get("sources")
+        platforms: dict[str, dict] = {}
+        if isinstance(sources, dict):
+            for key, info in sources.items():
+                code = str(key or "").lower()
+                if code not in MUSIC_PLATFORMS or not isinstance(info, dict):
+                    continue
+                actions = [str(a) for a in (info.get("actions") or [])]
+                if "musicUrl" not in actions:
+                    continue
+                platforms[code] = {
+                    "name": str(info.get("name") or key),
+                    "actions": actions,
+                    "qualitys": [str(q) for q in (info.get("qualitys") or []) if q],
+                }
+        if not platforms:
+            await self.stop()
+            raise SourceError(
+                "init", "脚本未声明任何可用的音乐平台（需 kw/kg/tx/wy/mg 之一且 actions 含 musicUrl）"
+            )
+        self.platforms = platforms
+        self._started = True
+        self.started_at = time.time()
+        logger.info(
+            "lx user source loaded: %s v%s (platforms=%s)",
+            self.meta.get("name"), self.meta.get("version"), ",".join(sorted(platforms)),
+        )
+
+    async def _wait_inited(self) -> dict:
+        await self._inited_event.wait()
+        if self._init_error:
+            raise SourceError("init", self._init_error)
+        payload = self._inited_payload
+        if not isinstance(payload, dict) or payload.get("status") is False:
+            message = "脚本初始化失败（inited status=false）"
+            if isinstance(payload, dict) and payload.get("message"):
+                message = f"{message}: {payload['message']}"
+            raise SourceError("init", message)
+        return payload
+
+    async def stop(self) -> None:
+        self._started = False
+        self._inited_event.set()
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
+        proc = self._proc
+        if proc is not None:
+            try:
+                if proc.returncode is None:
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), 3.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+            except ProcessLookupError:
+                pass
+        self._proc = None
+        self._fail_pending("source stopped")
+        if self._script_path is not None and self._script_path.exists():
+            try:
+                self._script_path.unlink()
+            except OSError:
+                pass
+            self._script_path = None
+
+    # ------------------------------------------------------------------ 协议读写
+
+    async def _read_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(msg, dict):
+                    self._dispatch(msg)
+        finally:
+            self._fail_pending("node process exited")
+            if not self._inited_event.is_set():
+                self._init_error = "Node 进程提前退出"
+                self._inited_event.set()
+
+    async def _read_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    logger.warning("lx bridge stderr: %s", text[:500])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _dispatch(self, msg: dict) -> None:
+        mtype = msg.get("type")
+        if mtype == "event":
+            name = msg.get("name")
+            payload = msg.get("payload")
+            if name == "inited":
+                if not self._inited_event.is_set():
+                    self._inited_payload = payload
+                    self._inited_event.set()
+            elif name == "fatal":
+                if not self._inited_event.is_set():
+                    self._init_error = str((payload or {}).get("error") or "bridge fatal")
+                    self._inited_event.set()
+                else:
+                    self._fail_pending("bridge fatal")
+            elif name == "updateAlert":
+                logger.info("lx source update alert: %s", str(payload or "")[:200])
+        elif mtype == "log":
+            level = str(msg.get("level") or "info")
+            message = str(msg.get("message") or "")
+            bound = getattr(logger, "warning" if level in ("warn", "error") else "info", logger.info)
+            bound("[%s] %s", self.meta.get("name") or "lx-source", message[:500])
+        elif mtype == "pong":
+            pass
+        elif "id" in msg:
+            fut = self._pending.pop(str(msg["id"]), None)
+            if fut is None or fut.done():
+                return
+            if msg.get("ok"):
+                fut.set_result(msg.get("result"))
+            else:
+                fut.set_exception(SourceError("resolve", str(msg.get("error") or "script request failed")))
+
+    def _fail_pending(self, reason: str) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(SourceError("resolve", reason))
+        self._pending.clear()
+
+    @property
+    def running(self) -> bool:
+        return self._started and self._proc is not None and self._proc.returncode is None
+
+    def qualitys(self, platform: str) -> list[str]:
+        return list(self.platforms.get(platform, {}).get("qualitys") or [])
+
+    def music_platforms(self) -> list[str]:
+        return [p for p in MUSIC_PLATFORMS if p in self.platforms]
+
+    async def music_url(self, music_info: dict, quality: "str | None", *, platform: str,
+                        timeout: float = 10.0) -> str:
+        """调用脚本 musicUrl；quality 为洛雪规范档位（128k/320k/flac/...）。"""
+        if not self.running:
+            raise SourceError("init", "源运行时未就绪")
+        self._next_id += 1
+        req_id = f"r{self._next_id}"
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[req_id] = fut
+        payload = {
+            "type": "request",
+            "id": req_id,
+            "source": platform,
+            "action": "musicUrl",
+            "info": {"type": quality, "musicInfo": music_info},
+        }
+        try:
+            async with self._write_lock:
+                proc = self._proc
+                if proc is None or proc.stdin is None:
+                    raise SourceError("init", "源运行时未就绪")
+                proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                await proc.stdin.drain()
+            result = await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(req_id, None)
+            raise SourceError("resolve", f"musicUrl 解析超时（{timeout:.0f}s）") from exc
+        url = str(result or "")
+        if not url.startswith(("http://", "https://")):
+            raise SourceError("resolve", "脚本未返回有效的 http 直链")
+        return url
+
+    def describe(self) -> dict:
+        return {
+            "name": self.meta.get("name") or "",
+            "version": self.meta.get("version") or "",
+            "author": self.meta.get("author") or "",
+            "description": self.meta.get("description") or "",
+            "homepage": self.meta.get("homepage") or "",
+            "platforms": {
+                code: {"name": info["name"], "qualitys": info["qualitys"]}
+                for code, info in sorted(self.platforms.items())
+            },
+            "running": self.running,
+            "started_at": self.started_at,
+        }
+
+
+class SourceManager:
+    """当前激活源管理：state.json 持久化（URL + 脚本缓存），env 仅作首次种子。"""
+
+    def __init__(self, state_dir: "str | None" = None, seed_url: str = ""):
+        base = state_dir or os.environ.get("LX_DATA_DIR") or "/data/lxmusic"
+        try:
+            self.state_dir = Path(base)
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            _probe = self.state_dir / ".write-probe"
+            _probe.write_text("", encoding="utf-8")
+            _probe.unlink()
+        except OSError:
+            self.state_dir = Path(tempfile.mkdtemp(prefix="lxmusic-state-"))
+            logger.warning("lx data dir %s not writable, falling back to %s", base, self.state_dir)
+        self.state_path = self.state_dir / "state.json"
+        self.script_cache = self.state_dir / "source.js"
+        self.seed_url = (seed_url or os.environ.get("LX_SOURCE_URL") or "").strip()
+        self._runtime: "UserSource | None" = None
+        self._lock = asyncio.Lock()
+        self.active_url = ""
+        self.last_error = ""
+
+    # ------------------------------------------------------------------ 状态
+
+    def read_state(self) -> dict:
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_state(self, url: str, script: str) -> None:
+        try:
+            self.state_path.write_text(
+                json.dumps({"url": url, "activated_at": time.time()}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.script_cache.write_text(script, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("cannot persist lx source state: %s", exc)
+
+    # ------------------------------------------------------------------ 激活/加载
+
+    async def activate(self, url: str, *, script: "str | None" = None) -> UserSource:
+        """校验并切换到给定 URL 的源（成功后旧运行时立即停用）。"""
+        async with self._lock:
+            script = script if script is not None else await download_script(url)
+            meta = parse_script_meta(script)
+            runtime = UserSource(script, meta, script_dir=str(self.state_dir))
+            await runtime.start()
+            old = self._runtime
+            self._runtime = runtime
+            self.active_url = url
+            self.last_error = ""
+            self._write_state(url, script)
+            if old is not None:
+                await old.stop()
+            return runtime
+
+    async def load(self) -> None:
+        """服务启动时加载：state.json 的 URL 优先，env 为种子；下载失败回退缓存脚本。"""
+        async with self._lock:
+            if self._runtime is not None:
+                return
+            state = self.read_state()
+            url = str(state.get("url") or "").strip() or self.seed_url
+            if not url:
+                logger.info("no lx source configured (state/env both empty)")
+                return
+            script = None
+            try:
+                script = await download_script(url)
+            except SourceError as exc:
+                self.last_error = f"{exc.category}: {exc}"
+                logger.warning("lx source download failed (%s), trying cache", exc)
+                if self.script_cache.exists():
+                    try:
+                        script = self.script_cache.read_text(encoding="utf-8")
+                        parse_script_meta(script)
+                    except (OSError, SourceError, UnicodeDecodeError):
+                        script = None
+            if script is None:
+                logger.warning("lx source unavailable: no script (url=%s)", url[:120])
+                return
+            try:
+                meta = parse_script_meta(script)
+                runtime = UserSource(script, meta, script_dir=str(self.state_dir))
+                await runtime.start()
+                self._runtime = runtime
+                self.active_url = url
+                logger.info("lx source restored from %s", "cache" if self.last_error else "download")
+            except SourceError as exc:
+                self.last_error = f"{exc.category}: {exc}"
+                logger.warning("lx source init failed: %s", exc)
+
+    async def shutdown(self) -> None:
+        async with self._lock:
+            runtime = self._runtime
+            self._runtime = None
+            if runtime is not None:
+                await runtime.stop()
+
+    def get(self) -> "UserSource | None":
+        runtime = self._runtime
+        if runtime is not None and runtime.running:
+            return runtime
+        return None
+
+    def describe(self) -> dict:
+        runtime = self.get()
+        return {
+            "configured": bool(self.active_url or self.seed_url),
+            "url": self.active_url or self.seed_url,
+            "initialized": runtime is not None,
+            "last_error": self.last_error,
+            "source": runtime.describe() if runtime is not None else None,
+        }

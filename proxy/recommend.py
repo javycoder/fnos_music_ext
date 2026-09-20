@@ -1146,6 +1146,8 @@ async def get_or_build_daily(
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
     lx_sources: "list[str] | None" = None,
+    recommend_hot: bool = True,
+    recommend_daily: bool = True,
 ) -> dict:
     day = today_key()
     guid = daily_playlist_guid(day, user_guid)
@@ -1190,7 +1192,7 @@ async def get_or_build_daily(
         }
 
     async def from_netease_daily() -> list[dict]:
-        if not (netease_enabled and musicbox_client):
+        if not (recommend_daily and netease_enabled and musicbox_client):
             return []
         items = await fetch_musicbox_recommend(
             musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
@@ -1200,7 +1202,7 @@ async def get_or_build_daily(
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_netease_charts() -> list[dict]:
-        if not (netease_enabled and musicbox_client):
+        if not (recommend_hot and netease_enabled and musicbox_client):
             return []
         items = await fetch_musicbox_recommend(
             musicbox_client, "/api/v1/toplist",
@@ -1211,7 +1213,7 @@ async def get_or_build_daily(
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_lx_charts() -> list[dict]:
-        if not (lx_enabled and lx_client):
+        if not (recommend_hot and lx_enabled and lx_client):
             return []
         items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT, sources=lx_sources)
         if not items:
@@ -1220,7 +1222,7 @@ async def get_or_build_daily(
 
     async def from_llm() -> list[dict]:
         # 仅当网易音源未启用时才走大模型（采信音源原生推荐优先）
-        if llm_http is None or not llm_enabled() or netease_enabled:
+        if llm_http is None or not llm_enabled() or netease_enabled or not recommend_daily:
             return []
         recs = await call_llm(
             llm_http, build_llm_prompt(play_seeds, fav_seeds[:40], LLM_CANDIDATE_COUNT)
@@ -1264,13 +1266,18 @@ async def get_or_build_daily(
                 contributing.append(name)
 
     # 优先级单链：网易真每日推荐 -> 网易榜单（未登录）-> lx 免登录榜单
-    # -> LLM（仅网易未启用）-> 种子关键词兜底；每级不足 20 首由下一级补齐
-    await run_tier("netease-daily", from_netease_daily)
-    await run_tier("netease-charts", from_netease_charts)
-    await run_tier("lx-charts", from_lx_charts)
-    if not netease_enabled:
+    # -> LLM（仅网易未启用）-> 种子关键词兜底；每级不足 20 首由下一级补齐。
+    # FNMUSIC_RECOMMEND_DAILY 门控“每日”梯队（daily/llm/种子兜底），
+    # FNMUSIC_RECOMMEND_HOT 门控榜单梯队（网易榜单/lx 榜单）。
+    if recommend_daily:
+        await run_tier("netease-daily", from_netease_daily)
+    if recommend_hot:
+        await run_tier("netease-charts", from_netease_charts)
+        await run_tier("lx-charts", from_lx_charts)
+    if not netease_enabled and recommend_daily:
         await run_tier("llm", from_llm)
-    await run_tier("fallback", from_fallback)
+    if recommend_daily:
+        await run_tier("fallback", from_fallback)
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
     cover_id = tracks[0].get("coverId") or tracks[0].get("guid") if tracks else guid
