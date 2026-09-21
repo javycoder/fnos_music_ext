@@ -88,7 +88,7 @@ def test_build_music_info_platform_keys():
     info = sr.build_music_info(item, "kg")
     assert info["hash"] == "KGHASH"
     assert info["songmid"] == "KGHASH"  # 部分脚本读 songmid
-    assert info["interval"] == "04:29"
+    assert info["interval"] == "269"  # 官方 musicInfo.interval 是纯秒数字符串
     assert info["meta"]["picUrl"] == "https://img/1.jpg"
 
     kw = sr.build_music_info({"_identifier": "228908", "rid": "228908", "title": "t"}, "kw")
@@ -98,7 +98,7 @@ def test_build_music_info_platform_keys():
     tx = sr.build_music_info({"_identifier": "MID", "songmid": "MID"}, "tx")
     assert tx["songmid"] == "MID"
     assert sr.build_music_info({"_identifier": "1"}, "wy")["meta"]["picUrl"] is None
-    assert sr.build_music_info({"_identifier": "1", "duration_s": 61.6}, "kg")["interval"] == "01:01"
+    assert sr.build_music_info({"_identifier": "1", "duration_s": 61.6}, "kg")["interval"] == "61"
 
 
 # ------------------------------------------------------------------ 下载防护 ---
@@ -666,6 +666,26 @@ def test_bridge_request_body_aligns_with_desktop_json_parsing():
     block = text[start:end]
     assert len(re.findall(r"\blet body\b", block)) == 1, \
         "httpFetch 内出现第二处 let body（TDZ 会打断带请求体的请求）"
+
+
+def test_bridge_sandbox_aligns_with_desktop_contract():
+    """沙箱契约关键点静态断言（行为级验证见 js/test_bridge.js，需 node）：
+    - rsaEncrypt 必须 NO_PADDING + 左零填充（官方 preload 精确复刻，网易 weapi 依赖）
+    - 沙箱必须提供桌面渲染上下文里脚本惯用的 Web API（缺任一个即 ReferenceError）
+    - lx.request 默认超时/重定向上限对齐桌面版（60s / 10 跳）
+    """
+    bridge = Path(sr.__file__).with_name("js") / "bridge.js"
+    text = bridge.read_text(encoding="utf-8")
+    assert "RSA_NO_PADDING" in text, "rsaEncrypt 必须使用官方 NO_PADDING 语义"
+    assert "Buffer.alloc(128 - " in text, "rsaEncrypt 必须左零填充到 128 字节"
+    sandbox_start = text.index("const sandbox = {")
+    sandbox_end = text.index("};", sandbox_start)
+    sandbox_block = text[sandbox_start:sandbox_end]
+    for api in ("setInterval", "atob", "btoa", "TextEncoder", "TextDecoder",
+                "fetch", "performance", "webcrypto"):
+        assert re.search(rf"\b{api}\b", sandbox_block), f"沙箱缺少桌面版可用的 {api}"
+    assert "Math.min(Number(options.timeout), 60000)" in text, \
+        "lx.request 超时必须对齐桌面版 60s 上限"
 
 
 # ------------------------------------------------------------------ Node 集成 ---

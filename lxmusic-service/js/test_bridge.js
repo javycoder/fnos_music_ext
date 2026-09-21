@@ -6,8 +6,11 @@
  * 覆盖最近线上事故的全部行为面：
  *   - console 全 API 可调用（沙箱缺方法曾让野生脚本直接崩）
  *   - lx.request 响应体 JSON 自动转对象 / 非 JSON 保持字符串
- *   - 重定向 ≤3 次、303 改 GET、超时中断、form 编码
+ *   - 重定向、303 改 GET、超时中断、form 编码、object body 编码（对齐 needle）
  *   - musicUrl 协议往返、ping/pong、utils（buffer/crypto/zlib）冒烟
+ *   - rsaEncrypt 对齐官方 NO_PADDING + 左零填充（网易 weapi 依赖此语义）
+ *   - 沙箱 Web API（setInterval/atob/btoa/TextEncoder/crypto.getRandomValues 等）
+ *   - 未 inited 前异步崩溃按官方语义报 fatal；inited 后仅记日志
  *   - 沙箱全局白名单（process/require/Buffer 不可见）
  *
  * 运行：node lxmusic-service/js/test_bridge.js   （退出码 0=全部通过）
@@ -15,6 +18,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
@@ -417,6 +421,162 @@ async function test_missing_request_handler_replies_error() {
   });
 }
 
+// 固定 1024bit 测试公钥（仅用于验证 rsaEncrypt 算法，无对应私钥分发问题）
+const RSA_TEST_PUB = [
+  '-----BEGIN PUBLIC KEY-----',
+  'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDicHAMeR7q+Gfj8XsKItVSgZCe',
+  'AQr1OC9baofzrjTtH9BAN9pM0VxWrIUhtoeFG1cYkSh8aoCNtioorN+qXeY+xGu9',
+  'E4XLq/Q/PrXNOZlY+ZxawDqg+djkeDjVfFEmgkuTrWMl39l7eUsxXIxk9Qx9R6S0',
+  'aTp2+NOxQS79tRMCWwIDAQAB',
+  '-----END PUBLIC KEY-----',
+].join('\n');
+
+async function test_rsa_encrypt_no_padding() {
+  const pubLiteral = RSA_TEST_PUB.split('\n').map((l) => `'${l}'`).join(',');
+  const script = `
+const PUB = [${pubLiteral}].join('\\n') + '\\n';
+const a = lx.utils.crypto.rsaEncrypt('test-payload', PUB);
+const b = lx.utils.crypto.rsaEncrypt('test-payload', PUB);
+console.log('RSA_LEN=' + a.length + ' HEX=' + a.toString('hex') + ' SAME=' + a.equals(b));
+lx.on(lx.EVENT_NAMES.request, () => {});
+`;
+  await bridgeCase(script, {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('RSA_LEN=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('RSA_LEN='));
+      assert.ok(message.includes('RSA_LEN=128'), message);
+      assert.ok(message.includes('SAME=true'),
+        'NO_PADDING 无随机填充，同输入必须确定性输出（PKCS1 则每次不同）');
+      // 桌面版 preload 算法逐字节复刻：左零填充到 128 字节 + RSA_NO_PADDING
+      const payload = Buffer.from('test-payload');
+      const expected = crypto.publicEncrypt(
+        { key: RSA_TEST_PUB, padding: crypto.constants.RSA_NO_PADDING },
+        Buffer.concat([Buffer.alloc(128 - payload.length), payload]),
+      ).toString('hex');
+      const got = (message.match(/HEX=([0-9a-f]+)/) || [])[1];
+      assert.equal(got, expected, 'rsaEncrypt 输出必须与官方 preload 算法一致');
+    },
+  });
+}
+
+async function test_object_body_form_encoded_by_default() {
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.request(BASE + '/echo-form', { method: 'POST', body: { a: '1', b: 'x y' } }, (err, resp, body) => {
+  console.log('OBJ=' + (body && body.ct) + '&' + (body && body.body));
+});
+`;
+  await bridgeCase(inject(script), {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('OBJ=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('OBJ='));
+      assert.ok(message.includes('OBJ=application/x-www-form-urlencoded'),
+        `needle 默认把 object body 编码为 urlencoded; 实际: ${message}`);
+      assert.ok(message.includes('&a=1&b=x+y'), message);
+    },
+  });
+}
+
+async function test_object_body_json_with_content_type() {
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.request(BASE + '/echo-form', { method: 'POST',
+  headers: { 'Content-Type': 'application/json' }, body: { a: 1 } }, (err, resp, body) => {
+  console.log('JSON=' + (body && body.ct) + '&' + (body && body.body));
+});
+`;
+  await bridgeCase(inject(script), {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('JSON=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('JSON='));
+      assert.ok(message.includes('JSON=application/json&{"a":1}'),
+        `显式 json 头时 object body 必须 JSON 序列化; 实际: ${message}`);
+    },
+  });
+}
+
+async function test_sandbox_web_api_available() {
+  const script = `
+const results = [];
+results.push('interval=' + typeof setInterval + ':' + typeof clearInterval);
+let ticks = 0;
+const timer = setInterval(() => {
+  ticks += 1;
+  if (ticks >= 2) { clearInterval(timer); done(); }
+}, 40);
+function done() {
+  results.push('ticks=' + ticks);
+  results.push('atob=' + atob('aGk='));
+  results.push('btoa=' + btoa('hi'));
+  results.push('te=' + new TextEncoder().encode('ab').length);
+  results.push('td=' + new TextDecoder('utf-8').decode(new Uint8Array([104, 105])));
+  results.push('rand=' + crypto.getRandomValues(new Uint8Array(4)).length);
+  results.push('perf=' + typeof performance.now);
+  results.push('fetch=' + typeof fetch);
+  console.log('WEBAPI=' + results.join('|'));
+}
+lx.on(lx.EVENT_NAMES.request, () => {});
+`;
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('WEBAPI=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('WEBAPI='));
+      assert.ok(message.includes('interval=function:function'), message);
+      assert.ok(message.includes('ticks=2'), `setInterval 必须真实触发; 实际: ${message}`);
+      assert.ok(message.includes('atob=hi'), message);
+      assert.ok(message.includes('btoa=aGk='), message);
+      assert.ok(message.includes('te=2'), message);
+      assert.ok(message.includes('td=hi'), message);
+      assert.ok(message.includes('rand=4'), message);
+      assert.ok(message.includes('perf=function'), message);
+      assert.ok(message.includes('fetch=function'), message);
+    },
+  });
+}
+
+async function test_async_crash_before_init_is_fatal() {
+  // 官方语义：inited 前任何未捕获错误 = 初始化失败（fatal + 退出码 3）。
+  // 不走 bridgeCase：stdin.end() 会触发 rl close 的 exit(0)，抢在 fatal 的
+  // 50ms 延迟退出之前，必须让 fatal 自己退出进程。
+  const script = `
+setTimeout(() => { throw new Error('boom-before-init'); }, 50);
+`;
+  const b = new BridgeProc(script);
+  try {
+    const ok = await b.waitUntil((evs) => evs.some((e) => e.type === 'event' && e.name === 'fatal'), 10000);
+    assert.ok(ok, '未 inited 前的异步崩溃必须报 fatal; 已收到: ' + b.outLines.slice(-4).join(' | '));
+    const code = await Promise.race([
+      b.exitPromise,
+      delay(5000).then(() => { b.child.kill('SIGKILL'); return -1; }),
+    ]);
+    assert.equal(code, 3, 'fatal 后应以退出码 3 结束');
+    const fatal = b.events().find((e) => e.type === 'event' && e.name === 'fatal');
+    assert.ok(String(fatal.payload.error).includes('boom-before-init'),
+      JSON.stringify(fatal));
+    assert.ok(String(fatal.payload.error).includes('uncaughtException'), JSON.stringify(fatal));
+  } finally {
+    await b.finish(true);
+  }
+}
+
+async function test_async_crash_after_init_only_logs() {
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+setTimeout(() => { throw new Error('boom-after-init'); }, 50);
+`;
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => e.type === 'log' && String(e.message || '').includes('boom-after-init')),
+    then: (b) => {
+      assert.equal(b.exitCode, 0, 'inited 后的未捕获错误只记日志，进程不退出');
+      const fatal = b.events().find((e) => e.type === 'event' && e.name === 'fatal');
+      assert.ok(!fatal, `不应有 fatal: ${JSON.stringify(fatal)}`);
+    },
+  });
+}
+
 // ------------------------------------------------------------------ 运行 ---
 
 async function main() {
@@ -435,6 +595,12 @@ async function main() {
     ['musicUrl 协议往返', test_musicurl_protocol_roundtrip],
     ['ping/pong', test_ping_pong],
     ['utils 冒烟', test_utils_smoke],
+    ['rsaEncrypt NO_PADDING 对齐官方', test_rsa_encrypt_no_padding],
+    ['object body 默认 urlencoded', test_object_body_form_encoded_by_default],
+    ['object body json 头序列化', test_object_body_json_with_content_type],
+    ['沙箱 Web API 可用', test_sandbox_web_api_available],
+    ['init 前异步崩溃报 fatal', test_async_crash_before_init_is_fatal],
+    ['init 后异步崩溃仅记日志', test_async_crash_after_init_only_logs],
     ['沙箱全局白名单', test_sandbox_global_whitelist],
     ['未注册 handler 明确报错', test_missing_request_handler_replies_error],
   ];
