@@ -115,12 +115,13 @@ def build_music_info(item: dict, platform: str) -> dict:
     tx 用 strMediaMid，mg 用 copyrightId，一并冗余提供。"""
     identifier = str(item.get("_identifier") or "")
 
-    def minutes_seconds(seconds: Any) -> str:
+    def seconds_str(seconds: Any) -> str:
+        # 洛雪官方 musicInfo.interval 是纯秒数字符串（如 "253"），不是 MM:SS
         try:
             total = int(float(seconds) or 0)
         except (TypeError, ValueError):
             total = 0
-        return f"{total // 60:02d}:{total % 60:02d}"
+        return str(total)
 
     info = {
         "songmid": identifier,
@@ -128,7 +129,7 @@ def build_music_info(item: dict, platform: str) -> dict:
         "name": str(item.get("title") or ""),
         "singer": str(item.get("artist") or ""),
         "source": platform,
-        "interval": minutes_seconds(item.get("duration_s")),
+        "interval": seconds_str(item.get("duration_s")),
         "albumName": str(item.get("album") or ""),
         "meta": {
             "songId": identifier,
