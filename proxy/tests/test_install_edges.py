@@ -321,13 +321,38 @@ def test_lx_activation_success_writes_platforms_to_env(tmp_path):
 def test_lx_activation_noninteractive_failure_aborts(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("LX_SOURCE_URL='http://bad/x.js'\n", encoding="utf-8")
-    report = json.dumps({"ok": False, "category": "music_url"})
+    report = json.dumps({"ok": False, "category": "music_url", "message": "源脚本解析失败"})
     result = run_bash(lx_activation_script(tmp_path, "http://bad/x.js", env_file),
                       env={**os.environ, "VERIFY_REPORT_1": report,
                            "STUB_STATE_DIR": str(tmp_path / "lxstate")})
     assert result.returncode == 1
-    assert "非交互模式" in result.stderr
-    assert "校验未通过（music_url）" in result.stdout  # 错误分类透出给用户
+    # 错误分类与报告原文都透出（install_callback 会把 [ERROR] 行顶进应用中心弹窗）
+    assert "校验未通过（music_url）" in result.stdout
+    assert "源脚本解析失败" in result.stderr
+    assert "--lx-skip-verify" in result.stderr  # 给出可操作的跳过校验指引
+
+
+def test_lx_activation_skip_verify_activates_without_probe(tmp_path):
+    """--lx-skip-verify：不做全链路校验，直接 POST 激活并继续。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LX_SOURCE_URL='http://s/x.js'\n", encoding="utf-8")
+    state = tmp_path / "lxstate"
+    state.mkdir()
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    script = ("set -uo pipefail\n" + LX_STUBS
+              + function(install, "dotenv_escape")
+              + f'NON_INTERACTIVE=1\nCONTAINER_NAME=fnmusic-sources\nLX_SKIP_VERIFY=1\n'
+              f'BASE_DIR="{BASE}"\nENV_PATH="{env_file}"\n'
+              f'STUB_STATE_DIR="{state}"\nLX_SOURCE_URL_CLI="http://s/x.js"\n'
+              + function(install, "lx_verify_and_activate")
+              + 'lx_verify_and_activate "http://s/x.js"\n')
+    result = run_bash(script, env={**os.environ, "STUB_STATE_DIR": str(state)})
+    assert result.returncode == 0, result.stderr
+    assert "跳过洛雪源可用性校验" in result.stdout
+    # 未走 docker exec 校验（校验次数文件不存在），只有激活 POST
+    assert not (state / "n").exists()
+    assert "-X POST http://127.0.0.1:8772/api/v1/source" in (
+        state / "curl.log").read_text(encoding="utf-8")
 
 
 def test_lx_activation_empty_report_aborts(tmp_path):

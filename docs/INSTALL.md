@@ -106,9 +106,10 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --llm-api-key '<KEY>' --llm-model 'gpt-4o-mini' --extend
 ```
 
-常用参数：`--sources`（音源三选一）、`--lx-source-url`、`--webui` / `--no-webui`、
-`--extend`（安装后自动接管）、`--adopt`（迁移部署登记）、`--qr`（仅扫码登录）。
-`--mode` 参数已随 host 模式移除。
+常用参数：`--sources`（音源三选一）、`--lx-source-url`、`--lx-skip-verify`
+（跳过洛雪源可用性校验直接激活，源是否可用装好后在管理页 WebUI 查看）、
+`--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--adopt`（迁移部署登记）、
+`--qr`（仅扫码登录）。`--mode` 参数已随 host 模式移除。
 
 ---
 
