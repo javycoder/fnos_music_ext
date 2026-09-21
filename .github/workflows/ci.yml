@@ -23,13 +23,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # 显式安装 node：lxmusic-service/test_bridge_node.py 依赖 node 跑 js/test_bridge.js，
+      # 只靠 runner 预装一旦变动，桥的 13 个行为测试会静默 skip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install audio test tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install test dependencies
         run: >
           python -m pip install -r proxy/requirements.txt
-          pytest mutagen qrcode pillow PyYAML
+          pytest mutagen qrcode pillow PyYAML pytest-cov
 
       - name: Shell script syntax check
         run: |
@@ -45,8 +51,12 @@ jobs:
           musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py
           webui-service/app.py
 
+      # 覆盖率仅作摘要展示（不设门槛）；cov 参数只出现在 CI，本地 pytest 无需装 pytest-cov
       - name: Run tests
-        run: python -m pytest
+        run: >
+          python -m pytest
+          --cov=proxy --cov=lxmusic-service --cov=musicdl-service --cov=musicbox-service --cov=webui-service
+          --cov-report=term
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -54,7 +64,41 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Shellcheck errors
-        run: git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+        run: |
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+          # fpk 生命周期脚本（无 .sh 后缀）同样纳入检查
+          git ls-files -z 'packaging/fpk/cmd/*' | xargs -0 shellcheck -S error
+
+  fpk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          chmod +x fnpack && sudo mv fnpack /usr/local/bin/fnpack
+        env:
+          FNPACK_VERSION: "1.2.3"
+
+      - name: Build fpk package
+        run: |
+          ./packaging/fpk/build.sh
+          ls -la dist/
+
+      - name: Verify package artifact
+        run: |
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          test -s "$fpk_file"
+          test -s "${fpk_file}.sha256"
+          # fpk 为 tar.gz，内层 app.tgz + cmd/config/wizard/manifest/ICON 齐全
+          tar -tzf "$fpk_file" | grep -E '^app\.tgz$'
+          tar -tzf "$fpk_file" | grep -E '^cmd/main$'
+          tar -tzf "$fpk_file" | grep -E '^manifest$'
+          tar -tzf "$fpk_file" | grep -E '^ICON\.PNG$'
+          ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
+
 
   production:
     runs-on: ubuntu-latest

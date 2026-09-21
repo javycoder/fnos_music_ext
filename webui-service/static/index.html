@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>fnmusic-ext 管理台</title>
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/png" href="/static/icon.png">
 </head>
 <body>
   <div class="layout">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <span class="brand-mark">♪</span>
+        <img class="brand-mark" src="/static/icon.png" width="38" height="38" alt="">
         <div>
           <div class="brand-name">fnmusic-ext</div>
           <div class="brand-sub" id="brand-version">管理台</div>
@@ -127,8 +127,8 @@
         </div>
         <div class="card">
           <div class="card-title">推荐</div>
-          <label class="switch-row"><span>热门榜单推荐<div class="sub">音源支持时提供热门/飙升榜单</div></span><input type="checkbox" id="recommend-hot"></label>
-          <label class="switch-row"><span>每日推荐<div class="sub">网易每日歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
+          <label class="switch-row"><span>热门榜单推荐<div class="sub">独立「热门推荐」歌单：热歌榜/飙升榜原味</div></span><input type="checkbox" id="recommend-hot"></label>
+          <label class="switch-row"><span>每日推荐<div class="sub">独立「每日推荐」歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
         </div>
       </section>
 
