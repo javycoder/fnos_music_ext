@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(head -n1 VERSION | tr -d '[:space:]')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v${tag} 与 VERSION 文件 ${version} 不一致" >&2
+            exit 1
+          fi
+
+      - name: Run packaging tests
+        run: |
+          python -m pip install pytest
+          python -m pytest packaging/tests/
+
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          chmod +x fnpack && sudo mv fnpack /usr/local/bin/fnpack
+        env:
+          FNPACK_VERSION: "1.2.3"
+
+      - name: Build fpk package
+        run: |
+          ./packaging/fpk/build.sh
+          ls -la dist/
+
+      - name: Extract changelog for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "CHANGELOG.md 中未找到 ## [$version] 段落" >&2
+            exit 1
+          fi
+          head -5 /tmp/release-notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          title="fnmusic-ext ${GITHUB_REF_NAME#v}"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --title "$title" --notes-file /tmp/release-notes.md
+            gh release upload "${GITHUB_REF_NAME}" "$fpk_file" "$fpk_file.sha256" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "$title" \
+              --notes-file /tmp/release-notes.md \
+              "$fpk_file" "$fpk_file.sha256"
+          fi
+

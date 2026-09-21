@@ -193,17 +193,24 @@ def preview_renew(provider: str) -> None:
 
 
 def preview_reap() -> list[str]:
-    """清退到期预览：已随保存启用的转正（移出预览表，进程常驻），其余停止。"""
+    """清退到期预览：已随保存启用的转正（移出预览表，进程常驻），其余停止。
+
+    stop 失败（supervisorctl 抖动/超时）不 pop 表项：deadline 仍过期，
+    下一轮 reaper 会重试——否则预览进程漏停后常驻，无人再管。
+    """
     stopped: list[str] = []
     enabled = current_provider(read_env())
     for provider, deadline in list(_preview_until.items()):
         if provider == enabled:
             _preview_until.pop(provider, None)
         elif deadline <= time.monotonic():
-            _preview_until.pop(provider, None)
-            supervisorctl("stop", PROVIDER_PROGRAM[provider])
-            logger.info("预览到期，停止音源进程 %s", provider)
-            stopped.append(provider)
+            code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
+            if code == 0:
+                _preview_until.pop(provider, None)
+                logger.info("预览到期，停止音源进程 %s", provider)
+                stopped.append(provider)
+            else:
+                logger.warning("预览到期但停止失败（下轮重试）%s: %s", provider, out)
     return stopped
 
 

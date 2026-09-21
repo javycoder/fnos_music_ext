@@ -653,11 +653,19 @@ def test_bridge_console_exposes_full_standard_api():
 
 def test_bridge_request_body_aligns_with_desktop_json_parsing():
     """桌面版 lx.request 对可 JSON 解析的响应体自动转对象（官方 preload.js 行为），
-    野生脚本普遍直接读 body.code 等字段；桥必须保持一致，否则脚本 undefined 崩溃。"""
+    野生脚本普遍直接读 body.code 等字段；桥必须保持一致，否则脚本 undefined 崩溃。
+    行为级验证见 js/test_bridge.js（需 node）；本断言在无 node 环境仍然生效。"""
     bridge = Path(sr.__file__).with_name("js") / "bridge.js"
     text = bridge.read_text(encoding="utf-8")
-    assert re.search(r"body\s*=\s*JSON\.parse\(text\)", text), \
+    assert re.search(r"=\s*JSON\.parse\(text\)", text), \
         "bridge.js 响应体必须尝试 JSON.parse（失败保持字符串）"
+    # httpFetch 内只允许一处 let body（外层请求体）：循环内再声明同名变量会触发
+    # let TDZ，带 body/form 的 POST 在发送前即 ReferenceError（2.1.1 修复的回归）
+    start = text.index("async function httpFetch")
+    end = text.index("\n}", start)
+    block = text[start:end]
+    assert len(re.findall(r"\blet body\b", block)) == 1, \
+        "httpFetch 内出现第二处 let body（TDZ 会打断带请求体的请求）"
 
 
 # ------------------------------------------------------------------ Node 集成 ---

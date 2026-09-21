@@ -1,0 +1,41 @@
+#!/bin/bash
+# Restore the official music app first (socket, systemd unit, containers),
+# then always archive user data to the storage volume root before removal
+# (uninstall deletes the app directory; the archive is the user's escape hatch).
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/restore.sh" ]; then
+    if ! bash "${FNMUSIC_REPO_DIR}/restore.sh" >> "${FNMUSIC_LOG}" 2>&1; then
+        tail -n 5 "${FNMUSIC_LOG}" >&2 || true
+        fnmusic_fail "还原官方音乐直连失败，已中止卸载：详见 ${FNMUSIC_LOG}"
+    fi
+fi
+
+# 兼容旧的向导开关（历史版本安装时可能记录）：显式 false 才跳过备份
+KEEP="${wizard_keep_data:-true}"
+case "${KEEP}" in
+    false|False|FALSE|0|no) exit 0 ;;
+esac
+
+if [ -z "${FNMUSIC_REPO_DIR}" ]; then
+    exit 0
+fi
+
+ITEMS="$(fnmusic_data_items)"
+[ -n "${ITEMS}" ] || exit 0
+
+# target symlink looks like /vol{n}/@appcenter/fnmusic-ext
+VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+\/\).*#\1#p')"
+VOL="${VOL:-/vol1}"
+ARCHIVE="${VOL}fnmusic-ext-backup-$(date +%Y%m%d%H%M%S).tar.gz"
+# shellcheck disable=SC2086
+if ! tar -czf "${ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
+    fnmusic_fail "备份数据到 ${ARCHIVE} 失败，已中止卸载（可重试或手动备份）"
+fi
+echo "[fnmusic-ext] 卸载前已备份配置与数据到 ${ARCHIVE}" >> "${FNMUSIC_LOG}"
+echo "${ARCHIVE}"
+
+exit 0
