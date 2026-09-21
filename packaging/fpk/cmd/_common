@@ -1,0 +1,59 @@
+#!/bin/bash
+# Shared helpers for fnmusic-ext App Center lifecycle scripts (sourced, not run).
+# The sourcing script must set SELF_DIR to its own directory first.
+
+FNMUSIC_APP_ROOT="$(cd "${SELF_DIR}/.." && pwd)"
+# cmd/ lives at /var/apps/fnmusic-ext/cmd; the repo payload lands at target/repo
+# (TRIM_APPDEST may point at either root depending on fnOS version).
+FNMUSIC_REPO_DIR=""
+for _cand in "${TRIM_APPDEST:-}/repo" "${FNMUSIC_APP_ROOT}/target/repo" "${FNMUSIC_APP_ROOT}/repo"; do
+    if [ -n "${_cand}" ] && [ -f "${_cand}/install.sh" ]; then
+        FNMUSIC_REPO_DIR="$(cd "${_cand}" && pwd)"
+        break
+    fi
+done
+unset _cand
+
+FNMUSIC_LOG="${TRIM_PKGVAR:-/tmp}/fnmusic-app.log"
+mkdir -p "$(dirname "${FNMUSIC_LOG}")" 2>/dev/null || true
+
+fnmusic_fail() {
+    # Short, actionable message surfaced in the App Center progress UI.
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "$1" > "${TRIM_TEMP_LOGFILE}" || true
+    fi
+    echo "[fnmusic-ext] $1" >&2
+    exit 1
+}
+
+fnmusic_env_source() {
+    # 0 when the selected audio source recorded in .env matches $1.
+    [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
+    local key="$1"
+    grep -q "^${key}=true" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
+}
+
+fnmusic_saved_source() {
+    # Map the flags written by install.sh back to a --sources value.
+    if fnmusic_env_source FNMUSIC_NETEASE_ENABLED; then echo musicbox
+    elif fnmusic_env_source FNMUSIC_LX_ENABLED; then echo lxmusic
+    elif fnmusic_env_source FNMUSIC_MUSICDL_ENABLED; then echo musicdl
+    else echo ""; fi
+}
+
+fnmusic_saved_lx_url() {
+    [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
+    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+}
+
+fnmusic_data_items() {
+    # User data living inside the repo dir (relative paths, existing ones only).
+    local p items=""
+    for p in .env .env.bak* sources-data online_favorites online_favorites.json play_history; do
+        # shellcheck disable=SC2086
+        if ls -d "${FNMUSIC_REPO_DIR}"/${p} >/dev/null 2>&1; then
+            items="${items} ${p}"
+        fi
+    done
+    echo "${items# }"
+}

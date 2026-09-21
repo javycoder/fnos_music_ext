@@ -3,6 +3,37 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.0] - 2026-09-21
+
+v2.1.0 新增 **fnOS 应用中心 fpk 打包与发布**：本扩展可以作为飞牛第三方应用
+一键安装，桌面图标直达管理页，发布流程全自动产出 fpk 到 GitHub Release。
+
+### 新增
+
+- **应用中心 fpk 包（重要）**：新增 `packaging/fpk/` 应用骨架与
+  `packaging/fpk/build.sh` 打包脚本（组装仓库主体 → 注入版本 → fnpack 校验 →
+  `dist/fnmusic-ext-<版本>.fpk`）。在应用中心「手动安装」fpk 即完成部署：安装向导
+  选择初始音源（musicdl / musicbox / lxmusic）与是否立即启用扩展；应用中心内可
+  启动/停止（停止=秒级还原官方直连）、卸载前自动把用户数据备份到存储卷根目录
+  （`fnmusic-ext-backup-<时间戳>.tar.gz`）；升级钩子自动备份并恢复用户数据。
+  生命周期脚本全部复用既有 `install.sh` / `extend.sh` / `restore.sh`，无重复实现。
+- **桌面入口**：安装后桌面出现「fnMusic 扩展管理」图标，点击在飞牛桌面窗口内
+  打开管理页（iframe 嵌入 `:8774`，仅管理员可见）。
+- **fpk 自动发布**：推送 `v<版本>` tag 即自动构建 fpk 并附 SHA-256 发布到
+  GitHub Release（`.github/workflows/release.yml`，tag 需与 `VERSION` 一致）；
+  CI 每次 push/PR 额外构建一次 fpk 防结构回归（`ci.yml` 新增 `fpk` job）。
+- **fpk 结构离线测试**：`packaging/tests/test_fpk_pack.py` 校验 manifest/入口/
+  图标/生命周期脚本/组装目录不泄漏开发文件，并固化 fnpack 实测校验规则
+  （`initValue` 必须字符串、tips 用 `helpText`、入口名必须以应用名开头）。
+- **安装卸载自动测试（实机）**：`tests/integration/fpk_lifecycle.py` 基于
+  `appcenter-cli` 对 fpk 做安装→健康断言（WebUI/socket 接管）→停止→启动→
+  卸载→清理与数据备份断言的全生命周期验证（飞牛设备上以 root 运行）。
+
+### 变更
+
+- 版本号 `2.0.0` → `2.1.0`；README 与 docs/INSTALL.md 将 fpk 应用中心安装
+  提升为推荐安装方式，git clone 脚本安装保留为进阶方式。
+
 ## [2.0.0] - 2026-09-20
 
 v2.0.0 是一次架构级重构：三个音源与 WebUI 合并为**单个 Docker 容器、按需加载**，

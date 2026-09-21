@@ -1,0 +1,11 @@
+#!/bin/bash
+# Fast prechecks before the package files are laid down; install.sh re-checks
+# everything with detailed messages, so keep this to the two hard prerequisites.
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+command -v docker >/dev/null 2>&1 || fnmusic_fail "未检测到 Docker：请在应用中心安装 Docker 后重试"
+[ -S /var/run/trim_music.socket ] || fnmusic_fail "未检测到官方\"飞牛音乐\"：请先在应用中心安装并启动飞牛音乐"
+
+exit 0
