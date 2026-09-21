@@ -96,6 +96,7 @@ function applyConfigToForm() {
     : v.FNMUSIC_LX_ENABLED === "true" ? "lxmusic" : "";
   $$("input[name=provider]").forEach((el) => { el.checked = el.value === provider; });
   syncProviderPanels(provider);
+  if (provider === "musicbox") syncNeteaseAccount();
   const quality = v.FNMUSIC_QUALITY_MODE || "high";
   $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
@@ -210,6 +211,7 @@ function syncProviderPanels(provider) {
 $$("input[name=provider]").forEach((el) =>
   el.addEventListener("change", async () => {
     syncProviderPanels(el.value);
+    if (el.value === "musicbox") syncNeteaseAccount();
     markDirty("音源切换需保存后生效");
     if (el.value && el.value !== savedProvider() && await startPreview(el.value)) {
       if (el.value === "musicdl") await loadPlatforms(false);
@@ -267,10 +269,27 @@ $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
 
 /* -------------------------------------------------------------- 网易扫码 */
+async function syncNeteaseAccount(retries = 0) {
+  // 把网易账号态同步到 #qr-check（已登录显示昵称；未登录/失败清空）
+  for (let i = 0; ; i++) {
+    try {
+      const st = await api("/api/netease/auth/status");
+      const d = st.data || st;
+      if (d.logged_in) {
+        $("#qr-check").textContent = `当前登录：${d.nickname || d.user_id || "已登录用户"}`;
+        return;
+      }
+    } catch (_) { /* status 不可达视为未登录 */ }
+    if (i >= retries) { $("#qr-check").textContent = ""; return; }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
 async function startQrLogin() {
   stopQrPolling();
   $("#qr-status").textContent = "正在生成二维码…";
   $("#qr-img").hidden = true;
+  syncNeteaseAccount(); // 生成前同步当前账号态（非致命，不阻塞出码）
   const callLogin = () => api("/api/netease/auth/login", { method: "POST" });
   try {
     let data;
@@ -292,25 +311,28 @@ async function startQrLogin() {
   }
 }
 
-function pollQr(unikey) {
-  qrTimer = setInterval(async () => {
-    try {
-      const st = await api(`/api/netease/auth/login/check?unikey=${encodeURIComponent(unikey)}`);
-      const code = st.code;
-      if (code === 803) {
-        stopQrPolling();
-        $("#qr-status").textContent = "登录成功 ✓";
-        toast("网易账号登录成功", "ok");
-      } else if (code === 802) {
-        $("#qr-status").textContent = "已扫码，请在手机上确认";
-      } else if (code === 800) {
-        stopQrPolling();
-        $("#qr-status").textContent = "二维码已过期，请重新生成";
-      } else {
-        $("#qr-status").textContent = "等待扫码…";
-      }
-    } catch (_) { /* 轮询失败静默重试 */ }
-  }, 2000);
+async function checkQrStatus(unikey) {
+  const st = await api(`/api/netease/auth/login/check?unikey=${encodeURIComponent(unikey)}`);
+  // musicbox CLI 返回 {ok, data:{code}} 信封结构；兼容扁平 {code}
+  const code = st?.data?.code ?? st?.code;
+  if (code === 803) {
+    stopQrPolling();
+    $("#qr-status").textContent = "登录成功 ✓";
+    syncNeteaseAccount(2); // 803 后 cookie 落盘需要一点时间，带重试取昵称
+    toast("网易账号登录成功", "ok");
+  } else if (code === 802) {
+    $("#qr-status").textContent = "已扫码，请在手机上确认";
+  } else if (code === 800) {
+    stopQrPolling();
+    $("#qr-status").textContent = "二维码已过期，请重新生成";
+  } else {
+    $("#qr-status").textContent = "等待扫码…";
+  }
+}
+
+function pollQr(unikey, intervalMs = 2000) {
+  stopQrPolling();
+  qrTimer = setInterval(() => { checkQrStatus(unikey).catch(() => {}); }, intervalMs);
 }
 
 function stopQrPolling() {

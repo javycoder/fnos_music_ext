@@ -3,6 +3,22 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+
+- **WebUI 网易扫码登录"扫码后没有反应"（重要）**：musicbox CLI 的
+  `auth login/check` 返回 `{ok, data:{code}}` 信封结构（与
+  `netease_login.sh`、musicbox 服务契约一致），而 `static/app.js` 的
+  `pollQr` 读的是顶层 `st.code`——恒为 `undefined`，801/802/803/800
+  全部分支失配，界面永远停在"等待扫码…"。现改为 `st?.data?.code ?? st?.code`
+  （信封优先、扁平兼容），并把轮询主体拆成 `checkQrStatus` 便于测试。
+  同时补齐登录成功后的状态同步：803 后经 `/api/netease/auth/status`
+  （带重试）取昵称写入 `#qr-check`（此前该元素从未被写入），生成二维码
+  前也先同步一次当前账号态。新增 `test_app_js.js/.py`（node 原生
+  assert + 最小 DOM/fetch 桩）锁信封解析行为，`test_webui.py` 反代
+  mock 由失真的扁平结构改为真实信封并补上游异常用例。
+
 ## [2.2.3] - 2026-09-21
 
 ### 修复
