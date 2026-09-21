@@ -1,0 +1,14 @@
+#!/bin/bash
+# Belt-and-braces cleanup after the repo payload is gone; never fails uninstall.
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+systemctl disable fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+rm -f /etc/systemd/system/fnmusic-ext.service
+systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
+
+docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+
+exit 0

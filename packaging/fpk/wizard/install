@@ -1,0 +1,49 @@
+[
+    {
+        "stepTitle": "音源选择",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "本应用需要应用中心已安装并启动官方\"飞牛音乐\"（安装时自动检测）。音源安装后可随时在管理页切换，秒级生效。"
+            },
+            {
+                "type": "radio",
+                "field": "wizard_sources",
+                "label": "初始音源（三选一）",
+                "initValue": "musicdl",
+                "options": [
+                    {
+                        "label": "musicdl — 聚合音源（免登录，酷我/咪咕等多平台可选）",
+                        "value": "musicdl"
+                    },
+                    {
+                        "label": "musicbox — 网易云音乐（高品质/无损，安装后在管理页扫码登录）",
+                        "value": "musicbox"
+                    },
+                    {
+                        "label": "lxmusic — 洛雪自定义源（需提供源脚本 URL）",
+                        "value": "lxmusic"
+                    }
+                ],
+                "rules": [
+                    {
+                        "required": true,
+                        "message": "请选择一个初始音源"
+                    }
+                ]
+            },
+            {
+                "type": "text",
+                "field": "wizard_lx_url",
+                "label": "洛雪源脚本 URL（仅选择 lxmusic 时必填，https://.../*.js）",
+                "initValue": ""
+            },
+            {
+                "type": "switch",
+                "field": "wizard_extend",
+                "label": "安装完成后立即启用扩展（接管官方音乐入口，可随时在应用中心停止还原）",
+                "initValue": "true"
+            }
+        ]
+    }
+]

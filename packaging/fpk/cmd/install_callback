@@ -1,0 +1,36 @@
+#!/bin/bash
+# Run the repo installer with the wizard answers (wizard_* env vars).
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+[ -n "${FNMUSIC_REPO_DIR}" ] || fnmusic_fail "应用文件缺失（install.sh 不存在）"
+
+SOURCES="${wizard_sources:-}"
+case "${SOURCES}" in
+    musicdl|musicbox|lxmusic) ;;
+    *) SOURCES="musicdl" ;;
+esac
+
+EXTEND="${wizard_extend:-true}"
+case "${EXTEND}" in
+    true|True|TRUE|1|yes) EXTEND=1 ;;
+    *) EXTEND=0 ;;
+esac
+
+ARGS=(--non-interactive --sources "${SOURCES}" --webui)
+if [ "${SOURCES}" = "lxmusic" ]; then
+    LX_URL="${wizard_lx_url:-}"
+    [ -n "${LX_URL}" ] || fnmusic_fail "选择 lxmusic 音源时必须填写洛雪源脚本 URL"
+    ARGS+=(--lx-source-url "${LX_URL}")
+fi
+[ "${EXTEND}" -eq 1 ] && ARGS+=(--extend)
+
+cd "${FNMUSIC_REPO_DIR}"
+if ! bash ./install.sh "${ARGS[@]}" >> "${FNMUSIC_LOG}" 2>&1; then
+    tail -n 5 "${FNMUSIC_LOG}" >&2 || true
+    fnmusic_fail "安装失败：详见 ${FNMUSIC_LOG}"
+fi
+
+exit 0
