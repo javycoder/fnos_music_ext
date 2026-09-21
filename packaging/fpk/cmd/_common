@@ -48,8 +48,9 @@ fnmusic_saved_lx_url() {
 
 fnmusic_data_items() {
     # User data living inside the repo dir (relative paths, existing ones only).
+    # 模式必须加引号：否则 for 列表在调用者 cwd 提前展开，repo 内的 .env.bak* 会被漏备份
     local p items=""
-    for p in .env .env.bak* sources-data online_favorites online_favorites.json play_history; do
+    for p in ".env" ".env.bak*" "sources-data" "online_favorites" "online_favorites.json" "play_history"; do
         # shellcheck disable=SC2086
         if ls -d "${FNMUSIC_REPO_DIR}"/${p} >/dev/null 2>&1; then
             items="${items} ${p}"
