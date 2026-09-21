@@ -1,0 +1,14 @@
+{
+  "captured_at": "2026-09-21T12:36:31.636326+00:00",
+  "keyword": "晴天",
+  "notes": {
+    "mg_search.json": "录制失败：ConnectError: [Errno -2] Name or service not known",
+    "kg_search.json": "kg 候选 30 条",
+    "kg_lyric_search.json": "已保存（无校验规则）",
+    "kg_lyric_download.json": "kg 歌词 base64 可解码",
+    "wy_search.json": "wy 候选 30 条",
+    "wy_lyric.json": "wy 歌词非空",
+    "tx_search.json": "tx 候选 30 条",
+    "kw_search.txt": "kw 候选 60 条"
+  }
+}
