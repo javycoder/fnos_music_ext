@@ -10,6 +10,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # secrets 不能用于 steps.if，先映射到 job 级 env 供条件判断与脚本共用
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,9 +76,8 @@ jobs:
       # Gitee 镜像只同步分支/标签/提交，发行版需经 API 发布；发布的是同一份
       # fpk（字节一致，sha256 两边相同）。未配置 GITEE_TOKEN 密钥时本步跳过。
       - name: Publish release to Gitee
-        if: ${{ secrets.GITEE_TOKEN != '' }}
+        if: env.GITEE_TOKEN != ''
         env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: javycoder/fnos_music_ext
         run: |
           set -euo pipefail
