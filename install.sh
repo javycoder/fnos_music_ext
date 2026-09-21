@@ -537,6 +537,24 @@ precheck_environment() {
         precheck_failed=1
     fi
 
+    # 5. 宿主机 DNS 形态检查（仅提醒）：nameserver 全部指向本机时，Docker 构建容器
+    #    无法复用宿主 DNS（Docker 剔除 127.x 后回退 8.8.8.8，国内不可达）；
+    #    构建层会自动注入备用公共 DNS 兜底，这里提前告知原因与手动方案
+    local usable_ns="" ns
+    for ns in $(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null); do
+        case "${ns}" in
+            127.*|::1|localhost) ;;
+            *) usable_ns="${ns}"; break ;;
+        esac
+    done
+    if [ -z "${usable_ns}" ]; then
+        log_warn "【前置提醒】宿主机 DNS 全部指向本机（/etc/resolv.conf 无容器可用的 nameserver）。"
+        log_warn "Docker 构建容器无法复用此类 DNS，构建时 apt/pip 将自动注入备用公共 DNS（223.5.5.5）兜底；"
+        log_warn "如构建仍报域名解析失败，可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker。"
+    else
+        log_info "宿主机 DNS 可供构建容器使用（${usable_ns}）。"
+    fi
+
     if [ "${precheck_failed}" -ne 0 ]; then
         log_err "环境预检未通过，请处理上述问题后再试。"
         exit 1
@@ -976,13 +994,9 @@ if ! command -v python3 >/dev/null 2>&1; then
     log_err "需要 python3"
     exit 1
 fi
-if [ ! -x "${BASE_DIR}/.venv-proxy/bin/python" ]; then
-    log_info "创建 .venv-proxy ..."
-    python3 -m venv "${BASE_DIR}/.venv-proxy"
-fi
 log_info "安装代理依赖..."
-"${BASE_DIR}/.venv-proxy/bin/pip" install -q -U pip -i "${PIP_INDEX}"
-"${BASE_DIR}/.venv-proxy/bin/pip" install -q -r "${BASE_DIR}/proxy/requirements.txt" -i "${PIP_INDEX}"
+# venv 创建 + 多源回退（清华→阿里→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
+PIP_INDEX="${PIP_INDEX}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
 
 install_unit() {
     local src="$1" dest="$2"
