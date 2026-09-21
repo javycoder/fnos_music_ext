@@ -16,6 +16,7 @@ services:
     build:
       context: .
       dockerfile: container/Dockerfile
+      network: host
       args:
         BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
         PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}

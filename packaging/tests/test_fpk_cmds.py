@@ -250,10 +250,11 @@ def test_common_data_items_only_existing(sb, tmp_path):
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     items = set(out.stdout.split())
-    # .env.bak* 以模式原样返回，由最终 tar 命令对 repo 目录展开
-    assert items == {".env", ".env.bak*", "sources-data",
+    # 返回 repo 内真实文件名（已展开），不得带入调用方 cwd 的诱饵
+    assert items == {".env", ".env.bak.20260101000000", "sources-data",
                      "play_history", "online_favorites.json"}
     assert "FROM_CWD" not in out.stdout
+    assert ".env.bak*" not in items
     # 全空仓库 → 空串（后续 tar/归档直接跳过）
     shutil.rmtree(repo)
     sb.make_repo(env_text=None)
@@ -388,6 +389,24 @@ def test_install_callback_install_failure_surfaces_error_lines(sb):
     assert "\033[31m" not in trim_log
 
 
+def test_install_callback_ignores_buildkit_run_title_with_error_echo(sb):
+    """BuildKit 步骤标题含 echo "[ERROR]" 时弹窗必须显示真实 [ERROR]，不能是 fix_dns。"""
+    sb.make_repo()
+    log = sb.pkgvar / "fnmusic-app.log"
+    log.write_text(
+        "#18 [ 3/20] RUN set -eu;  fix_dns() { probe_host=\"deb.debian.org\"; "
+        "echo \"[ERROR] apt 镜像源与官方源均未取到索引\"; }\n"
+        "\033[31m[ERROR]\033[0m 等待 musicdl healthz 超时\n",
+        encoding="utf-8")
+    result = sb.run("install_callback", wizard_sources="musicdl",
+                    STUB_INSTALL_RC="7")
+    assert result.returncode == 1
+    trim_log = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    assert "等待 musicdl healthz 超时" in trim_log
+    assert "fix_dns" not in trim_log
+    assert "apt 镜像源" not in trim_log
+
+
 def test_install_callback_requires_repo_payload(sb):
     result = sb.run("install_callback", wizard_sources="musicdl")
     assert result.returncode == 1
@@ -395,6 +414,27 @@ def test_install_callback_requires_repo_payload(sb):
 
 
 # ------------------------------------------------------------ upgrade_init ---
+
+def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
+    """调用方 cwd 有 .env.bak* 时，tar 不得按 cwd 展开导致备份失败。"""
+    repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
+    (repo / ".env.bak.20260101000000").write_text("X=0\n", encoding="utf-8")
+    sb.add_data(repo)
+    sb.add_systemctl()
+    decoy = tmp_path / "decoy-cwd"
+    decoy.mkdir()
+    (decoy / ".env.bak.FROM_CWD").write_text("", encoding="utf-8")
+    result = subprocess.run([str(sb.cmd / "upgrade_init")],
+                            env=sb.env(), cwd=decoy,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    backup = sb.pkgvar / "upgrade-backup" / "data.tar.gz"
+    assert backup.is_file()
+    listing = subprocess.run(["tar", "-tzf", str(backup)],
+                             capture_output=True, text=True, check=True).stdout
+    assert ".env.bak.20260101000000" in listing.splitlines()
+    assert "FROM_CWD" not in listing
+
 
 def test_upgrade_init_backs_up_data_and_stops_service(sb):
     repo = sb.make_repo(env_text="FNMUSIC_LX_ENABLED=true\n")
