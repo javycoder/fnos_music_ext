@@ -3,6 +3,103 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 新增
+
+- **推荐歌单封面图标**：「每日推荐」与「热门推荐」歌单在左侧歌单列表显示
+  封面图——取歌单列表里第一首带可用封面直链的曲目（第一首没封面就依次
+  向后找），歌单 `coverId` 以官方 `track_+32hex` 形态下发（官方 App 按
+  id 格式过滤，`online:` 原样下发的 coverId 不会被渲染成图标，这正是此
+  前"只有文字没有图标"的原因）；服务重启后伪装 id 反解注册表会从推荐
+  缓存重建，当天图标不失效。
+- **「热门推荐」独立歌单**：`FNMUSIC_RECOMMEND_HOT` 现在注入一个独立的
+  「热门推荐」歌单（网易热歌榜 → lxmusic 榜单，榜单原味、不排除已收藏），
+  不再只是每日推荐歌单的补位梯队；只开热门、关每日时也会显示；榜单全部
+  不可用时不挂空壳歌单。
+
+### 变更
+
+- **每日推荐歌单不再借用榜单补位**：网易未登录时由 LLM/关键词兜底生成，
+  榜单内容整体移入「热门推荐」歌单；推荐缓存文件按歌单类型拆分为
+  `daily-*.json` / `hot-*.json`，旧格式缓存换日清理后自动重建。
+- **推荐歌单全无封面时封面接口返回 404**：客户端显示自带默认样式，不再
+  伪造占位图（曲目封面的占位图兜底不变，仍永不 404）。
+
+## [2.1.1] - 2026-09-21
+
+补齐 bash 编排层与沙箱桥的测试空洞（近期安装/搜索类回归多落在这些无执行测试的
+环节），过程中发现并修复三处真实缺陷。
+
+### 修复
+
+- **洛雪自定义源的 `lx.request` 带请求体请求全部失败（重要）**：v2.1.0 给桥
+  （bridge.js）加"响应体 JSON 自动转对象"时，解析变量与外层请求体变量同名，
+  `let` 提升导致发送前就抛 "Cannot access 'body' before initialization"——
+  所有 POST（body/form/formData）请求失败，GET 不受影响所以难以察觉。
+- **fpk 升级/卸载备份可能漏掉 `.env` 历史备份**：`packaging/fpk/cmd/_common`
+  的数据项通配未加引号，`for` 列表在调用者目录提前展开，恰有 `.env.bak*`
+  文件时仓库内的同名文件会被漏备份。
+- **WebUI 预览音源到期停止失败后进程漏停**：`preview_reap` 在 supervisorctl
+  停止失败时也移除预览表项，偶发失败（如容器重启窗口）后无人重试、进程常驻；
+  现在失败保留表项，下一轮清退循环重试。
+
+### 新增
+
+- **fpk 生命周期钩子行为测试（32 项）**：`packaging/tests/test_fpk_cmds.py`
+  用桩命令在沙箱里执行真实的 install/upgrade/uninstall 钩子脚本，覆盖备份
+  内容、恢复链、向导映射、失败中止等分支。
+- **安装脚本深水区测试（30 项）**：`proxy/tests/test_install_edges.py` 覆盖
+  基础镜像候选与缓存、extend 验收/回滚、洛雪源校验激活、网易扫码登录的
+  关键分支。
+- **内置搜索器回放契约测试**：`lxmusic-service/test_searchers_replay.py` 用
+  真实录制的酷狗/网易/酷我/QQ 响应 fixture 回放断言解析输出；配套手动录制
+  工具 `tests/integration/capture_search_fixtures.py` 便于接口改版后刷新。
+- **洛雪源沙箱桥 Node 行为测试（13 项）**：`lxmusic-service/js/test_bridge.js`
+  起 http 服务器真实驱动 bridge.js，锁死 console 全 API、重定向/303/超时、
+  musicUrl 协议往返等行为；`test_bridge_node.py` 包装进 pytest（无 node
+  自动跳过，CI 显式安装 node 保证执行）。
+- **实机升级链测试**：`tests/integration/fpk_lifecycle.py` 新增直调
+  `upgrade_init`/`upgrade_callback` 阶段（appcenter-cli 不支持升级），
+  覆盖"备份→模拟覆盖→恢复重装"全链。
+- **熔断半开并发用例**：半开窗口内连续请求只放行一个试探、失败试探顺延窗口。
+- CI：test job 显式安装 node（避免桥测试静默跳过）、输出测试覆盖率摘要。
+
+### 变更
+
+- 版本号 `2.1.0` → `2.1.1`。
+
+## [2.1.0] - 2026-09-21
+
+v2.1.0 新增 **fnOS 应用中心 fpk 打包与发布**：本扩展可以作为飞牛第三方应用
+一键安装，桌面图标直达管理页，发布流程全自动产出 fpk 到 GitHub Release。
+
+### 新增
+
+- **应用中心 fpk 包（重要）**：新增 `packaging/fpk/` 应用骨架与
+  `packaging/fpk/build.sh` 打包脚本（组装仓库主体 → 注入版本 → fnpack 校验 →
+  `dist/fnmusic-ext-<版本>.fpk`）。在应用中心「手动安装」fpk 即完成部署：安装向导
+  选择初始音源（musicdl / musicbox / lxmusic）与是否立即启用扩展；应用中心内可
+  启动/停止（停止=秒级还原官方直连）、卸载前自动把用户数据备份到存储卷根目录
+  （`fnmusic-ext-backup-<时间戳>.tar.gz`）；升级钩子自动备份并恢复用户数据。
+  生命周期脚本全部复用既有 `install.sh` / `extend.sh` / `restore.sh`，无重复实现。
+- **桌面入口**：安装后桌面出现「fnMusic 扩展管理」图标，点击在飞牛桌面窗口内
+  打开管理页（iframe 嵌入 `:8774`，仅管理员可见）。
+- **fpk 自动发布**：推送 `v<版本>` tag 即自动构建 fpk 并附 SHA-256 发布到
+  GitHub Release（`.github/workflows/release.yml`，tag 需与 `VERSION` 一致）；
+  CI 每次 push/PR 额外构建一次 fpk 防结构回归（`ci.yml` 新增 `fpk` job）。
+- **fpk 结构离线测试**：`packaging/tests/test_fpk_pack.py` 校验 manifest/入口/
+  图标/生命周期脚本/组装目录不泄漏开发文件，并固化 fnpack 实测校验规则
+  （`initValue` 必须字符串、tips 用 `helpText`、入口名必须以应用名开头）。
+- **安装卸载自动测试（实机）**：`tests/integration/fpk_lifecycle.py` 基于
+  `appcenter-cli` 对 fpk 做安装→健康断言（WebUI/socket 接管）→停止→启动→
+  卸载→清理与数据备份断言的全生命周期验证（飞牛设备上以 root 运行）。
+
+### 变更
+
+- 版本号 `2.0.0` → `2.1.0`；README 与 docs/INSTALL.md 将 fpk 应用中心安装
+  提升为推荐安装方式，git clone 脚本安装保留为进阶方式。
+
 ## [2.0.0] - 2026-09-20
 
 v2.0.0 是一次架构级重构：三个音源与 WebUI 合并为**单个 Docker 容器、按需加载**，

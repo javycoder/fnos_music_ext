@@ -151,10 +151,12 @@ async function httpFetch(url, options) {
     let text = '';
     try { text = await resp.text(); } catch (_) { text = ''; }
     // 对齐桌面版（preload.js）：body 优先尝试 JSON.parse 成对象，失败保持字符串——
-    // 野生脚本普遍直接读 body.code 等字段，纯字符串会 undefined 崩溃
-    let body = text;
-    try { body = JSON.parse(text); } catch (_) { /* 非 JSON 保持字符串 */ }
-    return { statusCode: resp.status, statusMessage: resp.statusText, headers: objHeaders(resp.headers), body };
+    // 野生脚本普遍直接读 body.code 等字段，纯字符串会 undefined 崩溃。
+    // 变量名不能叫 body：外层请求体也叫 body，let 提升的 TDZ 会让上面 fetch
+    // options 里的 `body` 在初始化前被引用，带请求体的 POST 全部 ReferenceError
+    let parsed = text;
+    try { parsed = JSON.parse(text); } catch (_) { /* 非 JSON 保持字符串 */ }
+    return { statusCode: resp.status, statusMessage: resp.statusText, headers: objHeaders(resp.headers), body: parsed };
   }
   const err = new Error('too many redirects');
   err.tooManyRedirects = true;
