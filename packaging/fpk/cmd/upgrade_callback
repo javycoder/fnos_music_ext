@@ -1,0 +1,36 @@
+#!/bin/bash
+# Restore the pre-upgrade data backup, then re-run the installer against the
+# saved .env so the container and proxy unit come back up on the new files.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+[ -n "${FNMUSIC_REPO_DIR}" ] || fnmusic_fail "应用文件缺失（install.sh 不存在）"
+
+BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/upgrade-backup"
+if [ -f "${BACKUP_DIR}/data.tar.gz" ]; then
+    if ! tar -xzf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" >> "${FNMUSIC_LOG}" 2>&1; then
+        fnmusic_fail "恢复用户数据失败：备份保留在 ${BACKUP_DIR}/data.tar.gz"
+    fi
+fi
+
+SOURCES="$(fnmusic_saved_source)"
+[ -n "${SOURCES}" ] || SOURCES="musicdl"
+
+ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend)
+if [ "${SOURCES}" = "lxmusic" ]; then
+    LX_URL="$(fnmusic_saved_lx_url)"
+    [ -n "${LX_URL}" ] || fnmusic_fail "升级失败：.env 中缺少 LX_SOURCE_URL，请卸载后重新安装"
+    ARGS+=(--lx-source-url "${LX_URL}")
+fi
+
+cd "${FNMUSIC_REPO_DIR}"
+if ! bash ./install.sh "${ARGS[@]}" >> "${FNMUSIC_LOG}" 2>&1; then
+    tail -n 5 "${FNMUSIC_LOG}" >&2 || true
+    fnmusic_fail "升级失败（数据备份保留在 ${BACKUP_DIR}/data.tar.gz）：详见 ${FNMUSIC_LOG}"
+fi
+
+rm -rf "${BACKUP_DIR}"
+
+exit 0

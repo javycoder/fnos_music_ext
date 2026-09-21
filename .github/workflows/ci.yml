@@ -54,7 +54,41 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Shellcheck errors
-        run: git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+        run: |
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+          # fpk 生命周期脚本（无 .sh 后缀）同样纳入检查
+          git ls-files -z 'packaging/fpk/cmd/*' | xargs -0 shellcheck -S error
+
+  fpk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          chmod +x fnpack && sudo mv fnpack /usr/local/bin/fnpack
+        env:
+          FNPACK_VERSION: "1.2.3"
+
+      - name: Build fpk package
+        run: |
+          ./packaging/fpk/build.sh
+          ls -la dist/
+
+      - name: Verify package artifact
+        run: |
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          test -s "$fpk_file"
+          test -s "${fpk_file}.sha256"
+          # fpk 为 tar.gz，内层 app.tgz + cmd/config/wizard/manifest/ICON 齐全
+          tar -tzf "$fpk_file" | grep -E '^app\.tgz$'
+          tar -tzf "$fpk_file" | grep -E '^cmd/main$'
+          tar -tzf "$fpk_file" | grep -E '^manifest$'
+          tar -tzf "$fpk_file" | grep -E '^ICON\.PNG$'
+          ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
+
 
   production:
     runs-on: ubuntu-latest

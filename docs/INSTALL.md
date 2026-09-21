@@ -17,7 +17,7 @@
 - **官方音乐应用**：必须先在 fnOS「应用中心」安装并启动「飞牛音乐」（确保存在 `/var/run/trim_music.socket`）；
 - **Docker（必需）**：v2.0.0 起**仅支持 Docker 部署**，必须先在 fnOS「应用中心」安装 Docker。未安装 Docker 的机器执行 `install.sh` 会直接报错退出；**脚本绝不会擅自安装 Docker 引擎**。
 
-克隆项目并进入根目录赋予执行权限：
+克隆项目并进入根目录赋予执行权限（**仅脚本安装需要**，fpk 安装可跳过）：
 
 ```bash
 git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
@@ -47,7 +47,31 @@ v2.0.0 起部署形态固定为两部分：
 
 ## 2. 一键安装与配置
 
-### 交互向导安装（推荐）
+### 方式 A：应用中心 fpk 安装（推荐）
+
+从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件：
+
+1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic，选 lxmusic 需填写源脚本 URL）；
+2. 保持「安装完成后立即启用扩展」开启，安装即自动完成容器构建、代理接管与全链路验收；
+3. 桌面出现「fnMusic 扩展管理」图标，点击在飞牛桌面窗口内打开管理页（`http://<NAS_IP>:8774`）。
+
+日常启停在应用中心完成：「停止」秒级还原官方直连，「启动」恢复扩展。卸载会先自动备份配置与数据到存储卷根目录（`fnmusic-ext-backup-<时间戳>.tar.gz`）再清理。
+
+命令行等价操作（需 root）：
+
+```bash
+sudo appcenter-cli install-fpk fnmusic-ext-<版本>.fpk   # 安装
+sudo appcenter-cli list                                 # 查看状态
+sudo appcenter-cli stop fnmusic-ext                     # 停止（还原官方直连）
+sudo appcenter-cli start fnmusic-ext                    # 启动（恢复扩展）
+sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份后清理）
+```
+
+> 升级请在应用中心内安装新版本 fpk；`install-fpk` 在已安装时不会自动升级。升级脚本会自动备份并恢复用户数据（.env、网易云登录、收藏、播放历史）。
+>
+> 曾用 git clone 脚本方式部署的用户：请先在原部署目录执行 `sudo ./restore.sh` 释放部署登记，再安装 fpk，否则安装会因部署冲突而中止（保护既有部署不被静默接管）。
+
+### 方式 B：交互向导安装（脚本方式）
 
 ```bash
 ./install.sh

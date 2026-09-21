@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "fnmusic-ext.main": {
+            "title": "fnMusic 扩展管理",
+            "desc": "音源切换 / 扫码登录 / 平台选择",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "8774",
+            "url": "/",
+            "allUsers": false
+        }
+    }
+}
