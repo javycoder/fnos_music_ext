@@ -26,6 +26,27 @@ fnmusic_fail() {
     exit 1
 }
 
+fnmusic_error_brief() {
+    # Installer [ERROR] lines for the App Center popup. BuildKit prints the
+    # whole RUN script as a step title; if that script contains echo "[ERROR]",
+    # a naive grep matches the title and the 300-char popup becomes fix_dns.
+    local log="${1:-${FNMUSIC_LOG}}"
+    [ -f "${log}" ] || return 0
+    sed $'s/\x1b\\[[0-9;]*m//g' "${log}" 2>/dev/null \
+        | grep -a '\[ERROR\]' \
+        | grep -avE '\[ [0-9]+/[0-9]+\] RUN ' \
+        | tail -n 5 \
+        | tr '\n' ' ' \
+        | cut -c1-400
+}
+
+fnmusic_cleanup_sources_container() {
+    # App Center rolls back TRIM_PKGVAR / target on install failure but does
+    # not remove the compose container; an empty-mount orphan then occupies
+    # the global name fnmusic-sources.
+    docker rm -f fnmusic-sources >/dev/null 2>&1 || true
+}
+
 fnmusic_env_source() {
     # 0 when the selected audio source recorded in .env matches $1.
     [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
@@ -48,13 +69,17 @@ fnmusic_saved_lx_url() {
 
 fnmusic_data_items() {
     # User data living inside the repo dir (relative paths, existing ones only).
-    # 模式必须加引号：否则 for 列表在调用者 cwd 提前展开，repo 内的 .env.bak* 会被漏备份
-    local p items=""
+    # 在仓库目录内展开通配：调用方 cwd 若也有 .env.bak*，tar -C repo ${ITEMS}
+    # 会按 cwd 展开，把不存在于 repo 的文件名传给 tar 导致备份失败。
+    local p f rel items=""
+    [ -n "${FNMUSIC_REPO_DIR}" ] || return 0
     for p in ".env" ".env.bak*" "sources-data" "online_favorites" "online_favorites.json" "play_history"; do
         # shellcheck disable=SC2086
-        if ls -d "${FNMUSIC_REPO_DIR}"/${p} >/dev/null 2>&1; then
-            items="${items} ${p}"
-        fi
+        for f in "${FNMUSIC_REPO_DIR}"/${p}; do
+            [ -e "${f}" ] || continue
+            rel="${f#"${FNMUSIC_REPO_DIR}"/}"
+            items="${items} ${rel}"
+        done
     done
     echo "${items# }"
 }
