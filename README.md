@@ -87,7 +87,8 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 # musicdl（酷我+咪咕精选）
 ./install.sh --non-interactive --sources musicdl --extend
 
-# 洛雪自定义源（--lx-source-url 非交互必填，安装时全链路校验）
+# 洛雪自定义源（--lx-source-url 非交互必填，安装时全链路校验；
+# 源故障不让安装卡死可加 --lx-skip-verify，装好在管理页 WebUI 查看）
 ./install.sh --non-interactive --sources lxmusic \
   --lx-source-url 'https://example.com/your-source.js' --extend
 ```
