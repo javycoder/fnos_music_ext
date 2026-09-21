@@ -6,6 +6,7 @@
  * 覆盖最近线上事故的全部行为面：
  *   - console 全 API 可调用（沙箱缺方法曾让野生脚本直接崩）
  *   - lx.request 响应体 JSON 自动转对象 / 非 JSON 保持字符串
+ *   - lx.request Promise 形式（无 callback 时 resolve 响应对象 / 失败 reject）
  *   - 重定向、303 改 GET、超时中断、form 编码、object body 编码（对齐 needle）
  *   - musicUrl 协议往返、ping/pong、utils（buffer/crypto/zlib）冒烟
  *   - rsaEncrypt 对齐官方 NO_PADDING + 左零填充（网易 weapi 依赖此语义）
@@ -237,6 +238,77 @@ lx.request(BASE + '/plain', {}, (err, resp, body) => {
     waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('PTYPE=')),
     then: (b) => {
       assert.ok(b.logs().some((m) => m.includes('PTYPE=string')), '非 JSON 响应体必须保持字符串');
+    },
+  });
+}
+
+async function test_lx_request_promise_form() {
+  // 官方 preload 实际行为：不传 callback 时 lx.request 返回 Promise，
+  // resolve 整个响应对象（statusCode/headers/body/bytes）。
+  // 主流服务端中转源全部用 await lx.request(...) 拿响应，缺此契约解析全挂。
+  const script = `
+Promise.resolve().then(async () => {
+  try {
+    const resp = await lx.request(BASE + '/final', {});
+    console.log('PROMISE=' + resp.statusCode + ':' + resp.body.code + ':' + typeof resp.body
+      + ':bytes=' + typeof resp.bytes);
+  } catch (err) {
+    console.log('PROMISE_UNEXPECTED_ERR=' + err.message);
+  }
+});
+lx.on(lx.EVENT_NAMES.request, () => {});
+`;
+  await bridgeCase(inject(script), {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('PROMISE=')
+      || String(e.message || '').includes('PROMISE_UNEXPECTED_ERR')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('PROMISE=') || m.includes('PROMISE_UNEXPECTED_ERR'));
+      assert.ok(message.includes('PROMISE=200:0:object'),
+        `Promise 形式必须 resolve 含 body 的响应对象; 实际: ${message}`);
+      assert.ok(message.includes('bytes=number'), `响应对象应含 bytes; 实际: ${message}`);
+    },
+  });
+}
+
+async function test_lx_request_promise_form_rejects() {
+  const script = `
+Promise.resolve().then(async () => {
+  try {
+    await lx.request(BASE + '/loop', {});
+    console.log('PROMISE_NO_ERR');
+  } catch (err) {
+    console.log('PROMISE_REJECTED=' + err.message);
+  }
+});
+lx.on(lx.EVENT_NAMES.request, () => {});
+`;
+  await bridgeCase(inject(script), {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('PROMISE_REJECTED=')
+      || String(e.message || '').includes('PROMISE_NO_ERR')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('PROMISE_REJECTED=') || m.includes('PROMISE_NO_ERR'));
+      assert.ok(message.includes('PROMISE_REJECTED=too many redirects'),
+        `Promise 形式失败必须 reject; 实际: ${message}`);
+    },
+  });
+}
+
+async function test_lx_request_callback_form_still_returns_cancel_fn() {
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+const ret = lx.request(BASE + '/final', {}, (err, resp, body) => {
+  console.log('CB=' + resp.statusCode + ':' + body.code);
+});
+console.log('CBRET=' + typeof ret);
+`;
+  await bridgeCase(inject(script), {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('CB=')),
+    then: (b) => {
+      const logs = b.logs();
+      assert.ok(logs.some((m) => m.includes('CB=200:0')), 'callback 形式行为不变');
+      assert.ok(logs.some((m) => m.includes('CBRET=function')),
+        `callback 形式仍须返回取消函数（官方文档契约）; 实际: ${logs.join(' | ')}`);
     },
   });
 }
@@ -587,6 +659,9 @@ async function main() {
     ['console 全 API 不崩', test_console_full_api_never_crashes],
     ['lx.request JSON 自动转对象', test_lx_request_json_body_auto_parsed],
     ['lx.request 非 JSON 保持字符串', test_lx_request_plain_body_stays_string],
+    ['lx.request Promise 形式 resolve 响应对象', test_lx_request_promise_form],
+    ['lx.request Promise 形式失败 reject', test_lx_request_promise_form_rejects],
+    ['lx.request callback 形式仍返回取消函数', test_lx_request_callback_form_still_returns_cancel_fn],
     ['重定向链跟随', test_redirect_chain_followed],
     ['303 转 GET', test_303_changes_method_to_get],
     ['重定向上限报错', test_too_many_redirects_errors],
