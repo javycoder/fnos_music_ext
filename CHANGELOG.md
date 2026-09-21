@@ -3,6 +3,49 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.1.1] - 2026-09-21
+
+补齐 bash 编排层与沙箱桥的测试空洞（近期安装/搜索类回归多落在这些无执行测试的
+环节），过程中发现并修复三处真实缺陷。
+
+### 修复
+
+- **洛雪自定义源的 `lx.request` 带请求体请求全部失败（重要）**：v2.1.0 给桥
+  （bridge.js）加"响应体 JSON 自动转对象"时，解析变量与外层请求体变量同名，
+  `let` 提升导致发送前就抛 "Cannot access 'body' before initialization"——
+  所有 POST（body/form/formData）请求失败，GET 不受影响所以难以察觉。
+- **fpk 升级/卸载备份可能漏掉 `.env` 历史备份**：`packaging/fpk/cmd/_common`
+  的数据项通配未加引号，`for` 列表在调用者目录提前展开，恰有 `.env.bak*`
+  文件时仓库内的同名文件会被漏备份。
+- **WebUI 预览音源到期停止失败后进程漏停**：`preview_reap` 在 supervisorctl
+  停止失败时也移除预览表项，偶发失败（如容器重启窗口）后无人重试、进程常驻；
+  现在失败保留表项，下一轮清退循环重试。
+
+### 新增
+
+- **fpk 生命周期钩子行为测试（32 项）**：`packaging/tests/test_fpk_cmds.py`
+  用桩命令在沙箱里执行真实的 install/upgrade/uninstall 钩子脚本，覆盖备份
+  内容、恢复链、向导映射、失败中止等分支。
+- **安装脚本深水区测试（30 项）**：`proxy/tests/test_install_edges.py` 覆盖
+  基础镜像候选与缓存、extend 验收/回滚、洛雪源校验激活、网易扫码登录的
+  关键分支。
+- **内置搜索器回放契约测试**：`lxmusic-service/test_searchers_replay.py` 用
+  真实录制的酷狗/网易/酷我/QQ 响应 fixture 回放断言解析输出；配套手动录制
+  工具 `tests/integration/capture_search_fixtures.py` 便于接口改版后刷新。
+- **洛雪源沙箱桥 Node 行为测试（13 项）**：`lxmusic-service/js/test_bridge.js`
+  起 http 服务器真实驱动 bridge.js，锁死 console 全 API、重定向/303/超时、
+  musicUrl 协议往返等行为；`test_bridge_node.py` 包装进 pytest（无 node
+  自动跳过，CI 显式安装 node 保证执行）。
+- **实机升级链测试**：`tests/integration/fpk_lifecycle.py` 新增直调
+  `upgrade_init`/`upgrade_callback` 阶段（appcenter-cli 不支持升级），
+  覆盖"备份→模拟覆盖→恢复重装"全链。
+- **熔断半开并发用例**：半开窗口内连续请求只放行一个试探、失败试探顺延窗口。
+- CI：test job 显式安装 node（避免桥测试静默跳过）、输出测试覆盖率摘要。
+
+### 变更
+
+- 版本号 `2.1.0` → `2.1.1`。
+
 ## [2.1.0] - 2026-09-21
 
 v2.1.0 新增 **fnOS 应用中心 fpk 打包与发布**：本扩展可以作为飞牛第三方应用
