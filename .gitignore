@@ -30,3 +30,7 @@ TASK_*.md
 .cursor/*
 !.cursor/rules/
 !.cursor/rules/**
+.tools/
+dist/
+packaging/fpk/.build/
+

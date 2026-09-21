@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(head -n1 VERSION | tr -d '[:space:]')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v${tag} 与 VERSION 文件 ${version} 不一致" >&2
+            exit 1
+          fi
+
+      - name: Run packaging tests
+        run: |
+          python -m pip install pytest
+          python -m pytest packaging/tests/
+
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          chmod +x fnpack && sudo mv fnpack /usr/local/bin/fnpack
+        env:
+          FNPACK_VERSION: "1.2.3"
+
+      - name: Build fpk package
+        run: |
+          ./packaging/fpk/build.sh
+          ls -la dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "fnmusic-ext ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            "$fpk_file" "$fpk_file.sha256"

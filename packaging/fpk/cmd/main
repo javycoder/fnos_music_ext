@@ -1,0 +1,42 @@
+#!/bin/bash
+# App Center start/stop/status for fnmusic-ext.
+#   start  = bring the sources container up and enable the socket-takeover proxy
+#   stop   = stop the proxy (unit ExecStopPost restores the official socket) and the container
+#   status = exit 0 running / exit 3 stopped
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+UNIT="fnmusic-ext.service"
+
+case "${1:-}" in
+    start)
+        [ -n "${FNMUSIC_REPO_DIR}" ] || fnmusic_fail "应用文件缺失（install.sh 不存在），请卸载后重新安装"
+        [ -f "${FNMUSIC_REPO_DIR}/.env" ] || fnmusic_fail "尚未完成安装配置（.env 缺失），请卸载后重新安装"
+        # extend.sh is idempotent: ensures the unit exists, starts the proxy and
+        # takes over /var/run/trim_music.socket. Non-TTY never prompts.
+        if ! bash "${FNMUSIC_REPO_DIR}/extend.sh" >> "${FNMUSIC_LOG}" 2>&1; then
+            tail -n 5 "${FNMUSIC_LOG}" >&2 || true
+            fnmusic_fail "启动失败：详见 ${FNMUSIC_LOG}"
+        fi
+        exit 0
+        ;;
+    stop)
+        # Stopping the unit restores the official socket via ExecStopPost.
+        systemctl stop "${UNIT}" >> "${FNMUSIC_LOG}" 2>&1 || true
+        if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/docker-compose.yml" ]; then
+            docker compose -f "${FNMUSIC_REPO_DIR}/docker-compose.yml" stop >> "${FNMUSIC_LOG}" 2>&1 || true
+        fi
+        exit 0
+        ;;
+    status)
+        if systemctl is-active --quiet "${UNIT}"; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)
+        exit 1
+        ;;
+esac
