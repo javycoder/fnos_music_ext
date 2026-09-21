@@ -32,7 +32,18 @@ function toast(message, kind) {
 
 function markDirty(note) {
   dirty = true;
-  $("#save-note").textContent = note || "有未保存的修改";
+  const bar = $("#save-bar");
+  if (bar) bar.classList.add("show");
+  const noteEl = $("#save-note");
+  if (noteEl) noteEl.textContent = note || "有未保存的修改";
+}
+
+function clearDirty() {
+  dirty = false;
+  const bar = $("#save-bar");
+  if (bar) bar.classList.remove("show");
+  const noteEl = $("#save-note");
+  if (noteEl) noteEl.textContent = "";
 }
 
 /* -------------------------------------------------------------- 导航 */
@@ -85,8 +96,7 @@ async function loadConfig() {
   const cfg = await api("/api/config");
   configValues = cfg.values;
   applyConfigToForm();
-  dirty = false;
-  $("#save-note").textContent = "";
+  clearDirty();
 }
 
 function applyConfigToForm() {
@@ -165,8 +175,7 @@ async function saveConfig() {
     } else {
       toast(parts.join("；") || "配置无变化", "ok");
     }
-    dirty = false;
-    $("#save-note").textContent = "";
+    clearDirty();
     await loadConfig();
     await loadStatus();
   } catch (exc) {
