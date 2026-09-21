@@ -40,6 +40,12 @@
             },
             {
                 "type": "switch",
+                "field": "wizard_lx_skip_verify",
+                "label": "跳过洛雪源可用性校验（仅 lxmusic 生效：校验失败不中断安装，装好后到管理页 WebUI 查看与重配）",
+                "initValue": "false"
+            },
+            {
+                "type": "switch",
                 "field": "wizard_extend",
                 "label": "安装完成后立即启用扩展（接管官方音乐入口，可随时在应用中心停止还原）",
                 "initValue": "true"

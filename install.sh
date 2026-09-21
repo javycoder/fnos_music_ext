@@ -56,6 +56,9 @@ LX_EXPLICIT=0
 MDL_EXPLICIT=0
 # 洛雪自定义源脚本 URL（CLI 或向导输入；安装后校验通过才激活）
 LX_SOURCE_URL_CLI=""
+# 跳过洛雪源可用性校验（--lx-skip-verify）：直接激活，源好坏交给 WebUI 观察；
+# 用于向导/升级场景不想因源服务器临时故障中断安装
+LX_SKIP_VERIFY=0
 # WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
 WEBUI_CHOICE=""
 CONTAINER_NAME="fnmusic-sources"
@@ -84,6 +87,8 @@ usage() {
                                --sources lxmusic --lx-source-url https://example.com/lx.js
                          非交互缺省: musicdl
   --lx-source-url URL    洛雪自定义源脚本地址（--sources lxmusic 时必填；交互模式可向导输入）
+  --lx-skip-verify       跳过洛雪源可用性校验（下载→init→搜索→解析→探活）直接激活；
+                         源是否可用装好后在管理页 WebUI 查看，适合不想因源故障中断安装的场景
   --webui                安装管理 Web UI（端口 8774；无鉴权，仅限可信内网使用）
   --no-webui             不安装管理 Web UI（非交互默认）
   --non-interactive      无交互，缺省值：音源=musicdl，不装 WebUI，不开启每日推荐
@@ -418,6 +423,7 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { log_err "--lx-source-url 需要 URL 参数"; exit 1; }
             LX_SOURCE_URL_CLI="${2}"; shift 2 ;;
         --lx-source-url=*) LX_SOURCE_URL_CLI="${1#*=}"; shift ;;
+        --lx-skip-verify) LX_SKIP_VERIFY=1; shift ;;
         --webui) WEBUI_CHOICE="yes"; shift ;;
         --no-webui) WEBUI_CHOICE="no"; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
@@ -1074,10 +1080,22 @@ install_sources_container() {
 }
 
 # 洛雪源校验回路：容器内 verify_source.py 全链路校验（下载→init→搜索→解析→探活），
-# 成功则 POST /api/v1/source 激活持久化 + 推导平台写回 .env；失败按分类提示循环重输
+# 成功则 POST /api/v1/source 激活持久化 + 推导平台写回 .env；失败按分类提示循环重输。
+# --lx-skip-verify：跳过全链路校验直接激活（可用性交给 WebUI 观察，安装不中断）。
 lx_verify_and_activate() {
     local url="${1}"
     local report platforms
+    if [ "${LX_SKIP_VERIFY:-0}" -eq 1 ]; then
+        log_warn "已指定 --lx-skip-verify：跳过洛雪源可用性校验，直接激活"
+        if curl -sf -X POST "http://127.0.0.1:8772/api/v1/source" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"$(dotenv_escape "${url}")\"}" >/dev/null 2>&1; then
+            log_info "洛雪源已激活并持久化（未做可用性校验，如不可用请在 WebUI 中查看/更换）"
+        else
+            log_warn "洛雪源激活失败（脚本无法加载或 URL 不可达）：请在 WebUI(8774) 中检查源 URL"
+        fi
+        return 0
+    fi
     while :; do
         log_info "校验洛雪源（下载→init→搜索→解析→探活）..."
         report="$(run_docker exec -w /srv/lxmusic-service "${CONTAINER_NAME}" \
@@ -1097,19 +1115,29 @@ print(",".join(d.get("platforms") or []))
 ' 2>/dev/null || true)"
             break
         fi
-        # 失败：提取错误分类提示（verify 输出 JSON 的 error 字段）
-        local err_kind
+        # 失败：提取错误分类与报告原文（verify 输出 JSON 的 error 字段）
+        local err_kind err_msg
         err_kind="$(printf '%s' "${report}" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
     sys.exit(0)
-print(d.get("category") or d.get("message") or "unknown")
+print(d.get("category") or "unknown")
+' 2>/dev/null || true)"
+        err_msg="$(printf '%s' "${report}" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+print((d.get("message") or "")[:160])
 ' 2>/dev/null || true)"
         log_warn "洛雪源校验未通过（${err_kind:-无输出}）：${url}"
         if [ "${NON_INTERACTIVE}" -eq 1 ]; then
-            log_err "非交互模式：--lx-source-url 校验未通过，安装中止（.env 中 LX_SOURCE_URL 已保留可修正后重跑）"
+            log_err "洛雪源校验未通过（${err_kind:-unknown}）：${err_msg:-verify_source.py 无输出}"
+            log_err "安装已中止。可：1) 更换源脚本 URL 后重试；2) 改选 musicdl/musicbox 音源；"
+            log_err "3) 重装时勾选/追加 --lx-skip-verify 跳过校验（装好后在管理页 WebUI 查看/重配）"
             return 1
         fi
         url="$(prompt "请重新输入洛雪源 URL（直接回车保留原值重试，输入 q 放弃激活）" "${url}")"

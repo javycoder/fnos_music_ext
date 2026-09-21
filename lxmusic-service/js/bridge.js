@@ -188,11 +188,21 @@ async function httpFetch(url, options) {
 }
 
 function lxRequest(url, options, callback) {
-  const cb = typeof callback === 'function' ? callback : function () {};
-  httpFetch(url, options)
-    .then((resp) => cb(null, { statusCode: resp.statusCode, statusMessage: resp.statusMessage || '',
-                               headers: resp.headers, bytes: resp.bytes }, resp.body))
-    .catch((err) => cb(err, null, null));
+  // 双契约：传入 callback 时按官方文档走 (err, resp, body) 回调并返回取消函数；
+  // 不传 callback 时按官方 preload 实际行为返回 Promise，resolve 整个响应对象
+  // （statusCode/statusMessage/headers/bytes/body）。Promise 风格（await
+  // lx.request(...)）是野生脚本的普遍写法，主流服务端中转源全靠它拿响应，
+  // 只实现回调式会让这类源拿不到响应、解析全挂（脚本只能抛自家通用错误）。
+  const useCb = typeof callback === 'function';
+  const cb = useCb ? callback : function () {};
+  const p = httpFetch(url, options).then((resp) => {
+    const respObj = { statusCode: resp.statusCode, statusMessage: resp.statusMessage || '',
+                      headers: resp.headers, bytes: resp.bytes, body: resp.body };
+    cb(null, respObj, resp.body);
+    return respObj;
+  });
+  if (!useCb) return p;
+  p.catch((err) => cb(err, null, null));
   // 规范要求返回取消函数；Python 侧持有总超时，桥内无需真实取消
   return function () {};
 }
