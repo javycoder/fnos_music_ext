@@ -3,6 +3,26 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.2.3] - 2026-09-21
+
+### 修复
+
+- **应用中心安装失败弹窗误报 Dockerfile `fix_dns`（重要）**：BuildKit 把整段
+  apt `RUN` 打成步骤标题，而脚本里有 `echo "[ERROR] ..."`，弹窗的
+  `grep '[ERROR]'` 命中标题后 300 字截断，只剩 `fix_dns` / `getent hosts`，
+  把后面真正的 installer `[ERROR]` 吞掉。现过滤 `#N [ n/m] RUN` 标题，
+  Dockerfile 失败文案改为不带方括号的 `ERROR:`；`compose up --build` 失败
+  时 install.sh 补一条短 `log_err`。
+- **fpk 安装失败回滚留下孤儿容器**：应用中心删掉 target/repo 但不删
+  `fnmusic-sources`，空挂载容器继续占名、healthcheck 报「未配置任何音源」。
+  `install_callback` 失败时先 `docker rm -f`。
+- **构建层 DNS 自愈不再依赖 getent**：始终把 223.5.5.5 / 119.29.29.29 写到
+  resolv 最前（写入失败不中断），`find` 取 apt 索引加 `|| true` 避免
+  `set -e` 打死；compose 构建使用 `network: host` 以便复用宿主 DNS。
+- **fpk 升级备份在调用方目录展开 `.env.bak*` 会失败**：`fnmusic_data_items`
+  改为在仓库目录内展开通配并返回真实相对路径，`tar -C repo` 不再吃到
+  调用方 cwd 里的同名文件。
+
 ## [2.2.2] - 2026-09-21
 
 ### 修复

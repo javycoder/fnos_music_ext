@@ -36,9 +36,10 @@ fi
 cd "${FNMUSIC_REPO_DIR}"
 if ! bash ./install.sh "${ARGS[@]}" >> "${FNMUSIC_LOG}" 2>&1; then
     # 安装失败后应用中心会回滚删除 TRIM_PKGVAR（fnmusic-app.log 随之消失），
-    # 必须把日志里的真实错误行带进 fnmusic_fail，弹窗才能显示失败原因
-    err_brief="$(sed $'s/\x1b\\[[0-9;]*m//g' "${FNMUSIC_LOG}" 2>/dev/null \
-        | grep -a '\[ERROR\]' | tail -n 3 | tr '\n' ' ' | cut -c1-300)"
+    # 必须把日志里的真实错误行带进 fnmusic_fail，弹窗才能显示失败原因。
+    # 回滚不删 compose 容器，这里先清掉，避免空挂载孤儿占名。
+    fnmusic_cleanup_sources_container
+    err_brief="$(fnmusic_error_brief)"
     tail -n 5 "${FNMUSIC_LOG}" >&2 || true
     if [ -n "${err_brief}" ]; then
         fnmusic_fail "安装失败：${err_brief}"
