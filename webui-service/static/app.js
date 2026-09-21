@@ -46,7 +46,7 @@ $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPag
 async function loadStatus() {
   try {
     const st = await api("/api/status");
-    $("#brand-version").textContent = `v${st.version} · ${st.deploy_mode}`;
+    $("#brand-version").textContent = `v${st.version}`;
     $("#sidebar-foot").textContent = `${PROVIDER_LABEL[st.current_provider] || st.current_provider}`;
     $("#ov-provider-body").innerHTML =
       `<span class="state-line"><span class="dot ok"></span>${PROVIDER_LABEL[st.current_provider] || st.current_provider}</span>`;
