@@ -111,28 +111,47 @@ jobs:
             cat /tmp/gitee-release.json >&2 || true
             exit 1
           fi
+          ver="${tag#v}"
           if [ -n "${release_id}" ]; then
-            # 重发时清理旧附件（gitee 未公开文档化，尽力而为，失败不阻断）
-            for attach_id in $(jq -r '.attach_files[]?.id' /tmp/gitee-release.json); do
+            # 重发时清理同名旧附件（不动 gitee 自动生成的源码包）；by-tag 响应的
+            # assets 不带附件 id，需走附件列表接口
+            curl -sSf -o /tmp/gitee-att-list.json \
+              "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
+            for attach_id in $(jq -r --arg fpk "fnmusic-ext-${ver}.fpk" --arg sum "fnmusic-ext-${ver}.fpk.sha256" \
+                '.[]? | select(.name == $fpk or .name == $sum) | .id' /tmp/gitee-att-list.json); do
               curl -sS -o /dev/null -X DELETE \
                 "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
             done
           else
-            release_id="$(curl -sS --fail-with-body "${api}/releases" \
+            # 创建：gitee 要求 target_commitish 必传（tag 已存在时仅作落点声明）
+            create_http="$(curl -sS -o /tmp/gitee-create.json -w '%{http_code}' "${api}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
               -d "tag_name=${tag}" \
-              -d "name=fnmusic-ext ${tag#v}" \
-              --data-urlencode "body@/tmp/release-notes.md" \
-              | jq -r '.id')"
+              -d "target_commitish=${tag}" \
+              -d "name=fnmusic-ext ${ver}" \
+              --data-urlencode "body@/tmp/release-notes.md")"
+            if [ "${create_http}" != 201 ] && [ "${create_http}" != 200 ]; then
+              echo "ERROR: 创建 Gitee 发行版失败 HTTP ${create_http}" >&2
+              cat /tmp/gitee-create.json >&2 || true
+              exit 1
+            fi
+            release_id="$(jq -r '.id' /tmp/gitee-create.json)"
           fi
 
-          # 上传 fpk + sha256，收集下载链接（兼容数组/对象两种返回形态）
+          # 上传 fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
+          # 保留数组/对象兼容解析以防变动）
           attach_links=""
           for f in "${fpk_file}" "${fpk_file}.sha256"; do
-            url="$(curl -sS --fail-with-body "${api}/releases/${release_id}/attach_files" \
+            att_http="$(curl -sS -o /tmp/gitee-att-one.json -w '%{http_code}' \
+              "${api}/releases/${release_id}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${f}" \
-              | jq -r 'if type == "array" then .[0].url else (.url // .browser_download_url) end')"
+              -F "file=@${f}")"
+            if [ "${att_http}" != 201 ] && [ "${att_http}" != 200 ]; then
+              echo "ERROR: 上传附件 ${f} 失败 HTTP ${att_http}" >&2
+              cat /tmp/gitee-att-one.json >&2 || true
+              exit 1
+            fi
+            url="$(jq -r 'if type == "array" then .[0].url else (.url // .browser_download_url) end' /tmp/gitee-att-one.json)"
             if [ -z "${url}" ] || [ "${url}" = "null" ]; then
               echo "ERROR: Gitee 附件上传后未解析到下载 URL（响应形态可能变了）" >&2
               exit 1
@@ -140,15 +159,22 @@ jobs:
             attach_links="${attach_links}- [$(basename "${f}")](${url})"$'\n'
           done
 
-          # 更新说明 = changelog + 附件下载链接
+          # 更新说明 = changelog + 附件下载链接；PATCH 必须重传 tag_name 与 name
           {
             cat /tmp/release-notes.md
             echo
             echo "### 附件"
             printf '%s' "${attach_links}"
           } > /tmp/gitee-body.md
-          curl -sS --fail-with-body -X PATCH \
+          patch_http="$(curl -sS -o /tmp/gitee-patch.json -w '%{http_code}' -X PATCH \
             "${api}/releases/${release_id}?access_token=${GITEE_TOKEN}" \
-            --data-urlencode "body@/tmp/gitee-body.md"
+            -d "tag_name=${tag}" \
+            -d "name=fnmusic-ext ${ver}" \
+            --data-urlencode "body@/tmp/gitee-body.md")"
+          if [ "${patch_http}" != 200 ]; then
+            echo "ERROR: 更新 Gitee 发行版说明失败 HTTP ${patch_http}" >&2
+            cat /tmp/gitee-patch.json >&2 || true
+            exit 1
+          fi
           echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
 
