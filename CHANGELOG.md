@@ -3,7 +3,13 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [2.2.1] - 2026-09-21
+
+### 新增
+
+- **Gitee 镜像发版**：Release 流水线在 GitHub 发版后，自动将同一份 fpk 与
+  校验文件发布到 Gitee 镜像仓库的发行版（依赖仓库密钥 `GITEE_TOKEN`，
+  未配置时自动跳过）。
 
 ### 修复
 
