@@ -1494,7 +1494,9 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
             r = await client.get(
                 "/api/v1/track/url",
                 params={"id": song_id, "quality": q},
-                timeout=15.0,
+                # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 20s）：让端点自己
+                # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
+                timeout=22.0,
             )
             if r.status_code == 200:
                 data = r.json()
