@@ -61,7 +61,7 @@ jobs:
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
           title="fnmusic-ext ${GITHUB_REF_NAME#v}"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" --title "$title" --notes-file /tmp/release-notes.md
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --title "$title" --notes-file /tmp/release-notes.md
             gh release upload "${GITHUB_REF_NAME}" "$fpk_file" "$fpk_file.sha256" --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
