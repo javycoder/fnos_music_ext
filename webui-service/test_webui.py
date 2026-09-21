@@ -480,3 +480,7 @@ def test_index_served():
         assert r.status_code == 200
         assert "fnmusic-ext" in r.text
         assert "text/html" in r.headers["content-type"]
+        assert "/static/icon.png" in r.text
+        icon = client.get("/static/icon.png")
+        assert icon.status_code == 200
+        assert icon.content[:8] == b"\x89PNG\r\n\x1a\n"
