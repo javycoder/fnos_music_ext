@@ -32,7 +32,7 @@ BASH = shutil.which("bash")
 # 沙箱 PATH 需要的真实工具白名单（cmd 脚本内部使用；docker/systemctl/readlink
 # 按测试意图用桩覆盖，tar 在需要验证备份内容时用真 tar、需要故障注入时用桩覆盖）
 REAL_TOOLS = ("dirname", "mkdir", "cp", "mv", "rm", "tar", "gzip", "date", "grep",
-              "sed", "ls", "tail", "cat", "chmod", "head")
+              "sed", "ls", "tail", "cat", "chmod", "head", "tr", "cut")
 
 INSTALLER_STUB = """#!/bin/bash
 printf '%s\\n' "$*" >> "${STUB_INSTALL_LOG}"
@@ -333,6 +333,27 @@ def test_install_callback_lx_url_passthrough_and_extend_off(sb):
         "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js"]
 
 
+def test_install_callback_lx_skip_verify_flag(sb):
+    """向导勾选跳过洛雪源校验 → 追加 --lx-skip-verify（源故障不中断安装）。"""
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="lxmusic",
+                    wizard_lx_url="http://s/y.js", wizard_lx_skip_verify="true")
+    assert result.returncode == 0, result.stderr
+    # wizard_extend 缺省为 true（install_callback 既有默认），故带 --extend
+    assert sb.install_args() == [
+        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js"
+        " --lx-skip-verify --extend"]
+
+
+def test_install_callback_lx_skip_verify_off_by_default(sb):
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="lxmusic",
+                    wizard_lx_url="http://s/y.js", wizard_lx_skip_verify="false")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == [
+        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js --extend"]
+
+
 def test_install_callback_install_failure_tails_log(sb):
     sb.make_repo()
     log = sb.pkgvar / "fnmusic-app.log"
@@ -345,6 +366,26 @@ def test_install_callback_install_failure_tails_log(sb):
     for i in range(3, 8):
         assert f"line{i}" in result.stderr
     assert "line2" not in result.stderr
+
+
+def test_install_callback_install_failure_surfaces_error_lines(sb):
+    """安装失败：日志里的 [ERROR] 行必须进入弹窗文案（回滚会删除日志文件）。"""
+    sb.make_repo()
+    log = sb.pkgvar / "fnmusic-app.log"
+    log.write_text(
+        "[INFO] ok step\n"
+        "\033[31m[ERROR]\033[0m 洛雪源校验未通过（resolve）：源脚本解析失败\n"
+        "\033[31m[ERROR]\033[0m 可更换源 URL 或勾选跳过校验\n",
+        encoding="utf-8")
+    result = sb.run("install_callback", wizard_sources="musicdl",
+                    STUB_INSTALL_RC="7")
+    assert result.returncode == 1
+    # 错误行进入 stderr（fnmusic_fail），tail 原始日志允许带色码
+    assert "洛雪源校验未通过（resolve）" in result.stderr
+    # 失败原因写入 TRIM_TEMP_LOGFILE（应用中心弹窗文案），必须剥离 ANSI 色码
+    trim_log = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    assert "洛雪源校验未通过（resolve）" in trim_log
+    assert "\033[31m" not in trim_log
 
 
 def test_install_callback_requires_repo_payload(sb):
@@ -417,10 +458,11 @@ def test_upgrade_callback_restores_backup_and_reinstalls_lx(sb):
     sb.add_data(repo)
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
-    # 备份里的 .env 已恢复（升级后音源与 URL 都来自备份）
+    # 备份里的 .env 已恢复（升级后音源与 URL 都来自备份）；
+    # 升级跳过洛雪源可用性校验（--lx-skip-verify）：源服务器临时故障不得卡死升级
     assert "FNMUSIC_LX_ENABLED=true" in (repo / ".env").read_text(encoding="utf-8")
     assert sb.install_args() == [
-        "--non-interactive --sources lxmusic --webui --extend --lx-source-url http://s/x.js"]
+        "--non-interactive --sources lxmusic --webui --extend --lx-source-url http://s/x.js --lx-skip-verify"]
     # 成功后备份目录删除
     assert not (sb.pkgvar / "upgrade-backup").exists()
 
