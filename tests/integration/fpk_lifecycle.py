@@ -3,7 +3,10 @@
 
 基于官方 appcenter-cli 对 build.sh 产出的 .fpk 做完整生命周期验证：
   安装（向导 env 注入）→ 健康断言（WebUI 8774 + socket 接管 /_ext/healthz）
-  → stop（官方直连还原断言）→ start（恢复断言）→ 卸载 → 清理与数据备份断言。
+  → stop（官方直连还原断言）→ start（恢复断言）
+  → 升级链（直调 upgrade_init/upgrade_callback，伪造 TRIM_PKGVAR：
+     备份→模拟覆盖→恢复重装，CLI 不支持升级故绕行）
+  → 卸载 → 清理与数据备份断言。
 
 实机行为备注（fnOS 1.2.0604 / appcenter-cli 1.0.1 实测）:
   - install-fpk 不做版本升级（已安装时直接跳过），升级需在应用中心 Web UI 操作；
@@ -42,8 +45,8 @@ WEBUI = "http://127.0.0.1:8774/healthz"
 RESULTS: list[tuple[str, str, str]] = []  # (status, name, detail)
 
 
-def run(cmd, timeout=None):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def run(cmd, timeout=None, env=None):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def cli(app_args, timeout=None):
@@ -226,6 +229,71 @@ def assert_start(args) -> None:
     record(wait_for(lambda: http_ok(WEBUI), 120), "WebUI 恢复 200")
 
 
+def run_upgrade_hooks(args) -> None:
+    """直调升级钩子：appcenter-cli 不支持升级（升级只在应用中心 Web UI 触发），
+    但 fnOS 升级时对 target/ 整体换新后只会执行 upgrade_init/upgrade_callback，
+    这条链可以在实机直接驱动验证。
+
+    伪造 TRIM_PKGVAR 指向临时目录，完整走一遍：
+    打标 → upgrade_init（停服+备份）→ 模拟 fnOS 覆盖（清空 repo 用户数据）
+    → upgrade_callback（恢复备份 + 按恢复的 .env 重装）→ 健康断言。
+    """
+    print("[upgrade] 直调 upgrade_init / upgrade_callback（TRIM_PKGVAR=临时目录）", flush=True)
+    cmd_dir = Path(f"/var/apps/{APPNAME}/target/cmd")
+    upgrade_init = cmd_dir / "upgrade_init"
+    upgrade_callback = cmd_dir / "upgrade_callback"
+    repo = Path(f"/var/apps/{APPNAME}/target/repo")
+    if not (upgrade_init.is_file() and upgrade_callback.is_file() and repo.joinpath("install.sh").is_file()):
+        record(False, "升级钩子就位", f"{cmd_dir} 或 {repo} 内容不完整")
+        return
+
+    pkgvar = Path(tempfile.mkdtemp(prefix="fnmusic-upgrade-"))
+    env = {**os.environ, "TRIM_PKGVAR": str(pkgvar)}
+    backup = pkgvar / "upgrade-backup" / "data.tar.gz"
+
+    marker = f"CUSTOM_UPGRADE_MARKER='{int(time.time())}'"
+    env_file = repo / ".env"
+    base_env = env_file.read_text()
+    env_file.write_text(base_env + f"\n{marker}\n")
+    try:
+        out = run(["bash", str(upgrade_init)], timeout=120, env=env)
+        record(out.returncode == 0, "upgrade_init 成功", (out.stderr or "").strip()[:120])
+        record(not systemd_active(), "upgrade_init 已停服务")
+        record(backup.is_file(), "备份 data.tar.gz 已生成")
+        if backup.is_file():
+            members = run(["tar", "-tzf", str(backup)]).stdout.split()
+            record(".env" in members, "备份包含 .env")
+            record(marker in run(["tar", "-xzOf", str(backup), ".env"]).stdout,
+                   "备份内容是打标后的 .env（备份先于覆盖）")
+
+        # 模拟 fnOS 升级覆盖 target/：新包不含用户数据，repo 内数据项消失
+        for item in (".env", "online_favorites", "online_favorites.json", "play_history"):
+            p = repo / item
+            if p.is_dir():
+                shutil.rmtree(p)
+            elif p.exists():
+                p.unlink()
+        record(not env_file.exists(), "已模拟升级覆盖（repo 用户数据清空）")
+
+        out = run(["bash", str(upgrade_callback)], timeout=args.timeout, env=env)
+        record(out.returncode == 0, "upgrade_callback 成功", (out.stderr or "").strip()[:200])
+        record(env_file.is_file() and marker in env_file.read_text(), "用户数据已恢复（.env 标记回归）")
+        record(not pkgvar.joinpath("upgrade-backup").exists(), "升级备份已按设计清理")
+        record(wait_for(systemd_active, 180), "服务随重装恢复 active")
+        record(wait_for(socket_ext_healthy, 300), "socket 接管恢复（/_ext/healthz 200）")
+        record(wait_for(lambda: http_ok(WEBUI), 120), "WebUI 恢复 200")
+    finally:
+        # 保底去标记：升级链中途失败时不把测试标记留在真实 .env 里。
+        # 仅在数据确认恢复后才清理临时目录——失败时该备份可能是用户数据唯一副本，
+        # 与 upgrade_callback 自身"失败保留备份"的契约一致。
+        restored = env_file.is_file() and marker in env_file.read_text()
+        if restored:
+            env_file.write_text(base_env)
+            shutil.rmtree(pkgvar, ignore_errors=True)
+        else:
+            print(f"    升级链未完成：用户数据备份保留在 {backup}", flush=True)
+
+
 def uninstall(args) -> None:
     print(f"[uninstall] appcenter-cli uninstall {APPNAME}", flush=True)
     # 实际存储卷从 target 符号链接解析（如 /vol2/@appcenter/fnmusic-ext → /vol2/）
@@ -285,6 +353,7 @@ def main() -> int:
     assert_installed(args)
     assert_stop(args)
     assert_start(args)
+    run_upgrade_hooks(args)
     if not args.skip_uninstall:
         uninstall(args)
         print("\n提示：如需恢复原有 git clone 部署，请在原部署目录执行 sudo ./extend.sh")
