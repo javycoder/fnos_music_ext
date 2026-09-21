@@ -171,6 +171,46 @@ def test_circuit_retry_window_allows_half_open_probe(isolated):
     assert lxapp._chain_available("user_source") is False
 
 
+def test_circuit_half_open_single_concurrent_probe(isolated):
+    """半开窗口内并发请求只允许一个获准试探：试探打到故障源的流量必须收敛到 1。
+
+    换算成场景：源刚熔断 30 秒后恢复窗口打开，此时用户连续点搜索/播放，
+    10 个并发解析请求里只能有 1 个真的去请求源，其余立即走熔断短路返回，
+    否则"冷却"形同虚设。claim 在 _chain_acquire 内同步完成（无 await 点），
+    顺序连续调用即可锁定该语义——若中间出现让出点，第 2 个调用也会通过。
+    """
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 31, "breaks": 1,
+    }
+
+    results = [lxapp._chain_acquire("user_source") for _ in range(10)]
+    assert sum(results) == 1, "连续 10 个 acquire 必须只有 1 个获准"
+    h = lxapp._CHAIN_HEALTH["user_source"]
+    assert h.get("half_open") is True, "获准者必须同步占住 half_open 名额"
+
+    # 试探失败：顺延一个完整冷却窗口，且清掉 half_open 让下一窗口可再试探
+    before_breaks = h.get("breaks", 0)
+    lxapp._chain_report("user_source", False)
+    h = lxapp._CHAIN_HEALTH["user_source"]
+    assert "half_open" not in h
+    assert h["breaks"] == before_breaks + 1
+    assert h["open_until"] > time.time() + lxapp._CHAIN_OPEN_SECONDS - 5
+
+
+def test_circuit_successful_probe_closes_and_next_acquire_free(isolated):
+    """试探成功立即闭合：后续请求无需再过窗口判断，直接放行。"""
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 31, "breaks": 1,
+    }
+    assert lxapp._chain_acquire("user_source") is True
+    lxapp._chain_report("user_source", True)
+    h = lxapp._CHAIN_HEALTH["user_source"]
+    assert h["open_until"] == 0.0 and "half_open" not in h
+    assert lxapp._chain_available("user_source") is True
+    assert lxapp._chain_acquire("user_source") is True  # 不再设置 half_open
+    assert "half_open" not in lxapp._CHAIN_HEALTH["user_source"]
+
+
 def test_source_activation_resets_stale_circuit(isolated):
     """换源必须清零熔断：旧源（坏源）攒下的 open 状态不能连带拦截新源。"""
     lxapp._CHAIN_HEALTH["user_source"] = {
