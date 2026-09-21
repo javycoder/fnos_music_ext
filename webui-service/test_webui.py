@@ -217,6 +217,31 @@ def test_preview_reap_stops_expired_promotes_enabled(env_file, svctl):
     assert set(webui._preview_until) == {"lxmusic"}
 
 
+def test_preview_reap_stop_failure_keeps_entry_for_retry(env_file, monkeypatch):
+    """stop 失败（supervisorctl 抖动）不吞掉预览表项：保留过期 deadline，
+    下一轮 reaper 重试；恢复成功后才真正清退——否则预览进程漏停常驻。"""
+    calls: list[tuple] = []
+
+    def failing_then_ok(*args, timeout=20.0):
+        calls.append(tuple(args))
+        if len(calls) <= 1:  # 第一次 stop 失败（如容器重启窗口）
+            return 1, "spurious supervisor error"
+        return 0, "stopped"
+
+    monkeypatch.setattr(webui, "supervisorctl", failing_then_ok)
+    webui._preview_until["musicdl"] = time.monotonic() - 1
+
+    # 第一轮：停止失败——不崩、不计入 stopped、表项保留
+    assert webui.preview_reap() == []
+    assert "musicdl" in webui._preview_until
+    assert calls == [("stop", "musicdl")]
+
+    # 第二轮（reaper 每 15s 一轮）：重试成功，表项清掉
+    assert webui.preview_reap() == ["musicdl"]
+    assert "musicdl" not in webui._preview_until
+    assert calls == [("stop", "musicdl"), ("stop", "musicdl")]
+
+
 def test_put_config_stops_leftover_preview(env_file, svctl):
     """保存收尾：预览了 musicdl 但最终保存的还是 musicbox → musicdl 立即停止。"""
     webui._preview_until["musicdl"] = time.monotonic() + 300
