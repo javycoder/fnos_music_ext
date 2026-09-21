@@ -34,8 +34,7 @@ body {
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
 .brand-mark {
   width: 38px; height: 38px; border-radius: 10px; flex: none;
-  background: var(--accent); color: #fff; font-size: 20px;
-  display: flex; align-items: center; justify-content: center;
+  object-fit: cover; display: block;
 }
 .brand-name { font-weight: 700; }
 .brand-sub { font-size: 12px; color: var(--muted); }
