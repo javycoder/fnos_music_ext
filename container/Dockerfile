@@ -18,32 +18,71 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
-# nodejs（洛雪自定义源 Node 沙箱，bookworm 自带 18.x）/ ffmpeg（musicdl 转封装）/ supervisor
-# apt 源默认国内镜像（与 pip 同策略，APT_MIRROR 可覆盖），仅在本构建层内临时替换：
-# apt update 失败自动回退官方 deb.debian.org 重试；安装完成后恢复官方源，宿主机与最终镜像不受影响
+# nodejs（洛雪自定义源 Node 沙箱，trixie 自带 20.x）/ ffmpeg（musicdl 转封装）/ supervisor
+# apt 源默认国内镜像（与 pip 同策略，APT_MIRROR 可覆盖），仅在本构建层内临时替换。
+# 构建容器无法复用"指向本机"的宿主 DNS（Docker 会剔除 127.x 并回退 8.8.8.8，国内不可达），
+# 解析失败时先注入备用公共 DNS 自愈；apt-get update 对 DNS 失败只报 W: 警告且退出码为 0，
+# 因此回退判定看「索引是否真正落地」而非退出码；镜像源与官方源都取不到索引才判失败。
+# 安装完成后恢复官方源，宿主机与最终镜像不受影响。
 RUN set -eu; \
+    fix_dns() { \
+        probe_host="deb.debian.org"; \
+        if [ -n "${APT_MIRROR}" ]; then probe_host="$(printf '%s' "${APT_MIRROR}" | sed -E 's#^https?://##; s#/.*##')"; fi; \
+        if ! getent hosts "${probe_host}" >/dev/null 2>&1; then \
+            echo "[WARN] 容器内 DNS 解析失败（${probe_host}），注入备用公共 DNS 223.5.5.5/119.29.29.29 ..." >&2; \
+            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > /etc/resolv.conf 2>/dev/null \
+            || echo "[WARN] 备用 DNS 注入失败，继续尝试原 DNS ..." >&2; \
+        fi; \
+    }; \
     swap_apt_host() { \
         for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
             [ -f "${f}" ] && sed -i -E "s#${1}#${2}#g" "${f}" || true; \
         done; \
     }; \
+    apt_update() { apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || true; }; \
+    lists_fetched() { [ -n "$(find /var/lib/apt/lists -name '*Packages*' -print -quit 2>/dev/null)" ]; }; \
+    fix_dns; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host 'https?://deb\.debian\.org' "${APT_MIRROR}"; fi; \
-    if ! apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15; then \
-        echo "[WARN] apt update 失败，回退官方源 deb.debian.org 重试..." >&2; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt_update; \
+    if ! lists_fetched; then \
+        echo "[WARN] apt 镜像源未取到任何索引，回退官方源 deb.debian.org 重试..." >&2; \
+        fix_dns; \
         rm -rf /var/lib/apt/lists/*; \
         if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
-        apt-get update; \
+        apt_update; \
+    fi; \
+    if ! lists_fetched; then \
+        echo "[ERROR] apt 镜像源与官方源均未取到索引：构建容器无法访问 Debian 源。" >&2; \
+        echo "[ERROR] 若宿主机 /etc/resolv.conf 的 DNS 指向本机（127.x），Docker 容器无法复用，" >&2; \
+        echo "[ERROR] 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
+        exit 1; \
     fi; \
     apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
 
 # 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装）
+# 构建容器 DNS 失败自愈同 apt 步骤（resolv.conf 改写不跨 RUN 层持久，需每步自带）；
+# 镜像源安装失败自动回退官方 PyPI 重试
 COPY musicdl-service/requirements.txt /srv/req.musicdl
 COPY musicbox-service/requirements.txt /srv/req.musicbox
 COPY lxmusic-service/requirements.txt /srv/req.lxmusic
 COPY webui-service/requirements.txt /srv/req.webui
-RUN pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui \
+RUN set -eu; \
+    fix_dns() { \
+        probe_host="$(printf '%s' "${PIP_INDEX_URL:-https://pypi.org/simple}" | sed -E 's#^https?://##; s#/.*##')"; \
+        if ! getent hosts "${probe_host}" >/dev/null 2>&1; then \
+            echo "[WARN] 容器内 DNS 解析失败（${probe_host}），注入备用公共 DNS 223.5.5.5/119.29.29.29 ..." >&2; \
+            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > /etc/resolv.conf 2>/dev/null \
+            || echo "[WARN] 备用 DNS 注入失败，继续尝试原 DNS ..." >&2; \
+        fi; \
+    }; \
+    fix_dns; \
+    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui \
+    || { echo "[WARN] pip 镜像源（${PIP_INDEX_URL}）安装失败，回退官方 PyPI 重试..." >&2; \
+         pip install --no-cache-dir -i https://pypi.org/simple \
+            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
 RUN useradd -m -u 1000 appuser \
@@ -66,7 +105,10 @@ RUN find /srv -name "*.py" -exec chmod 0644 {} + \
 
 COPY container/supervisord.conf /etc/supervisor/supervisord.conf
 COPY container/env_flag.sh container/entrypoint.sh container/healthcheck.sh /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/env_flag.sh /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
+# COPY 保留上下文文件 mode：umask 077 检出下 supervisord.conf 会以 600 进镜像，
+# appuser 读不了配置导致容器起不来；权限全部显式规范化，不依赖构建上下文
+RUN chmod 0755 /usr/local/bin/env_flag.sh /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh \
+    && chmod 0644 /etc/supervisor/supervisord.conf
 
 USER appuser
 EXPOSE 8001 8002 8003 8004
