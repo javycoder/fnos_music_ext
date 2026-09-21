@@ -78,12 +78,16 @@ CONF = {
     ),
     "search_timeout": float(os.environ.get("LX_SEARCH_TIMEOUT", "12")),
     "limit_per_source": int(os.environ.get("LX_LIMIT_PER_SOURCE", "20")),
-    "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "10")),
+    # 播放端 track/url 端点总预算：容纳单档解析（12s）+ 探活（5s）后再降档，
+    # 需略低于 proxy 侧 resolve_lx_url 的单档 HTTP 超时（22s）
+    "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "20")),
     "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
     "cache_ttl": int(os.environ.get("LX_CACHE_TTL", "1800")),
     # 用户自定义源脚本地址（state.json 持久化优先，env 仅作首次种子）
     "source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
-    "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "4.0")),
+    # 用户源单次 musicUrl 解析预算：野生源多为二级转发（脚本→中转服务→平台），
+    # 实证水位在 3-8s（verify_source 用 12s），4s 会把慢源全部掐死
+    "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "12.0")),
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
     # 搜索期 VIP/第三方直链曲目的探活结果有效期（秒）：过期后 track/url 重新解析
     "probe_fresh_s": int(os.environ.get("LX_PROBE_FRESH_S", "900")),
