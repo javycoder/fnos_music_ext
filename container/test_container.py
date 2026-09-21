@@ -232,9 +232,11 @@ def test_compose_single_service_layout():
 
 def test_compose_build_args_mirror_passthrough():
     compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
-    args = compose["services"]["fnmusic-sources"]["build"]["args"]
+    build = compose["services"]["fnmusic-sources"]["build"]
+    args = build["args"]
     for name in ("BASE_IMAGE", "PIP_INDEX_URL", "APT_MIRROR"):
         assert name in args and "${" in args[name], f"构建参数 {name} 需从 .env 透传"
+    assert build.get("network") == "host"
 
 
 def test_dockerfile_assembly():
@@ -260,26 +262,31 @@ def test_dockerfile_assembly():
 
 
 def test_dockerfile_network_fallback_resilience():
-    """构建容器网络自愈：DNS 失败注入备用公共 DNS；apt 回退看索引落地而非退出码；pip 回退官方源。
+    """构建容器网络自愈：始终注入备用公共 DNS；apt 回退看索引落地而非退出码；pip 回退官方源。
 
     背景：宿主 DNS 指向本机（127.x）时 Docker 构建容器回退 8.8.8.8（国内不可达），
     apt-get update 对 DNS 失败只报 W: 警告且退出码为 0，旧版 `if ! apt-get update`
-    的回退永远不触发，最终误报 Unable to locate package。
+    的回退永远不触发，最终误报 Unable to locate package。getent 探测本身依赖
+    DNS/NSS，缺失或失败还可能被 set -e 打死，因此改为不探测、始终注入。
     """
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
     apt_step = text.split("# nodejs（洛雪自定义源")[1].split("# 四个服务的")[0]
-    # DNS 自愈：探测失败注入备用公共 DNS（仅本构建层内生效）
-    assert "getent hosts" in apt_step
+    # DNS 自愈：始终注入备用公共 DNS（仅本构建层内生效），不依赖 getent
+    assert "getent hosts" not in apt_step
     assert "223.5.5.5" in apt_step and "119.29.29.29" in apt_step
+    assert "cat /tmp/resolv.fnmusic" in apt_step
     # 回退触发不能依赖 apt-get update 退出码，必须校验索引真正落地
     assert "if ! apt-get update" not in text
     assert "lists_fetched" in apt_step and "/var/lib/apt/lists" in apt_step
-    # 镜像源与官方源双失败要给出带排查建议的明确错误
+    assert "|| true)" in apt_step  # find 失败不得被 set -e 打死
+    # 镜像源与官方源双失败要给出带排查建议的明确错误；禁止 [ERROR] 污染弹窗 grep
     assert "均未取到索引" in apt_step
     assert "daemon.json" in apt_step
+    assert 'echo "[ERROR]' not in text
     # pip 步骤：同样自带 DNS 自愈（resolv.conf 改写不跨 RUN 层）+ 官方 PyPI 回退
     pip_step = text.split("# 四个服务的")[1]
-    assert "getent hosts" in pip_step
+    assert "getent hosts" not in pip_step
+    assert "223.5.5.5" in pip_step
     assert "https://pypi.org/simple" in pip_step
 
 
