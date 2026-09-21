@@ -14,7 +14,7 @@
 - **管理 WebUI**（可选，端口 8774）：浏览器里完成音源切换、musicdl 平台勾选、网易扫码、洛雪源测试与保存、音质偏好、边听边存、推荐开关与 LLM 配置，全部热生效；
 - **音质偏好**：`高音质`（从高到低）/ `平衡`（取中间档）/ `流畅`（优先最低）三种模式，覆盖全部音源；
 - **智能边听边存**：在线听歌时后台自动缓存，再次播放本地秒开；可选完整试听后保存进本地曲库；
-- **推荐体系**：热门榜单与每日推荐两个独立开关；默认采信音源原生推荐，未启用网易时可配 OpenAI 兼容大模型兜底；
+- **推荐体系**：「热门推荐」与「每日推荐 MM-DD」两个独立歌单、独立开关；默认采信音源原生推荐，未启用网易时可配 OpenAI 兼容大模型兜底；歌单封面取列表里第一首有封面的曲目；
 - **多用户隔离收藏**：家庭多成员的红心收藏彼此独立，与本地曲库融合。
 
 ## 架构
@@ -51,15 +51,25 @@
 ### 前置条件
 
 1. fnOS 已在「应用中心」安装并启动官方**飞牛音乐**应用；
-2. fnOS 已安装 **Docker**（v2.0.0 起仅支持 Docker 部署音源，未安装 Docker 会直接报错退出）；
-3. 宿主机具备 Python 3.11+ 与 venv（核心代理运行环境）：
-   ```bash
-   sudo apt-get update && sudo apt-get install -y python3 python3-venv git
-   ```
+2. fnOS 已安装 **Docker**（v2.0.0 起仅支持 Docker 部署音源，未安装 Docker 会直接报错退出）。
 
-### 安装
+### 安装（推荐：应用中心 fpk 包）
+
+从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
+
+- 桌面会出现「fnMusic 扩展管理」图标，点击即在飞牛桌面窗口内打开管理页（音源切换/扫码登录/平台选择）；
+- 在应用中心可随时「停止」（秒级还原官方直连）与「启动」（恢复扩展）；
+- 卸载前会自动把配置与数据（.env、网易云登录、收藏、播放历史）备份为存储卷根目录的 `fnmusic-ext-backup-<时间戳>.tar.gz`，需要彻底清理时手动删除该文件即可；
+- 也可用命令行安装：`sudo appcenter-cli install-fpk fnmusic-ext-<版本>.fpk`。
+
+> 升级：应用中心内直接安装新版本 fpk（升级前自动备份用户数据，升级后恢复）。命令行 `install-fpk` 在已安装时不会升级，请在应用中心操作。
+
+### 安装（进阶：git clone 脚本安装）
+
+适合需要修改代码或精细控制参数的用户：
 
 ```bash
+sudo apt-get update && sudo apt-get install -y python3 python3-venv git
 git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
 chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
@@ -119,7 +129,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | `FNMUSIC_QUALITY_MODE` | `high` | 音质偏好：`high` / `balanced` / `smooth`（热重载） |
 | `FNMUSIC_TEE_SAVE_ENABLED` | `true` | 边听边存开关；`FNMUSIC_TEE_SAVE_DIR` 留空自动探测飞牛共享曲库 |
 | `FNMUSIC_TEE_CACHE_MAX` | `2` | 关闭边听边存时滚动保留的试听缓存条数（仅关闭时生效） |
-| `FNMUSIC_RECOMMEND_HOT` / `FNMUSIC_RECOMMEND_DAILY` | `true` | 热门榜单 / 每日推荐开关（热重载） |
+| `FNMUSIC_RECOMMEND_HOT` / `FNMUSIC_RECOMMEND_DAILY` | `true` | 「热门推荐」/「每日推荐」两个独立歌单的开关（热重载） |
 | `FNMUSIC_COVER_ENRICH` | `true` | 缺失封面用网易曲库补全（热重载） |
 | `FNMUSIC_LLM_BASE_URL` 等 | *(空)* | 大模型每日推荐兜底（OpenAI 兼容，热重载） |
 | `FNMUSIC_ENV_WATCH` | `true` | .env 热重载总开关 |
@@ -158,7 +168,22 @@ git pull
 python3 -m pytest        # 全量测试（无需 Docker/飞牛环境）
 ```
 
-仓库结构：`proxy/`（核心代理）、`musicdl-service/`、`musicbox-service/`、`lxmusic-service/`（容器内音源）、`webui-service/`（管理界面）、`container/`（单容器构建与编排）。
+仓库结构：`proxy/`（核心代理）、`musicdl-service/`、`musicbox-service/`、`lxmusic-service/`（容器内音源）、`webui-service/`（管理界面）、`container/`（单容器构建与编排）、`packaging/fpk/`（应用中心 fpk 打包）。
+
+### fpk 打包与发布
+
+```bash
+./packaging/fpk/build.sh   # 本地打包：组装 + fnpack 校验 → dist/fnmusic-ext-<版本>.fpk
+```
+
+- 版本号唯一来源为根目录 `VERSION`，打包时注入 manifest；
+- CI 在每次 push/PR 都会构建一次 fpk 防止结构回归；推送 `v<版本>` tag 会自动构建并把 `.fpk` 与校验和发布到 GitHub Release（tag 需与 `VERSION` 一致）；
+- 打包结构由 `packaging/tests/test_fpk_pack.py` 离线校验（含 fnpack 实测校验规则）；
+- 实机安装/卸载自动测试（需在飞牛设备上以 root 运行）：
+
+```bash
+sudo python3 tests/integration/fpk_lifecycle.py --auto-restore
+```
 
 ## 免责与版权声明
 

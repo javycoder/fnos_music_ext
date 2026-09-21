@@ -1,0 +1,28 @@
+#!/bin/bash
+# fnOS replaces everything under target/ on upgrade; user data (.env, login
+# state, favorites, history) lives inside the repo dir, so back it up first.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+
+if [ -z "${FNMUSIC_REPO_DIR}" ]; then
+    exit 0
+fi
+
+BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/upgrade-backup"
+rm -rf "${BACKUP_DIR}"
+mkdir -p "${BACKUP_DIR}"
+
+ITEMS="$(fnmusic_data_items)"
+if [ -n "${ITEMS}" ]; then
+    # shellcheck disable=SC2086
+    if ! tar -czf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
+        rm -rf "${BACKUP_DIR}"
+        fnmusic_fail "升级前备份数据失败，已中止（未改动任何数据）"
+    fi
+fi
+
+exit 0
