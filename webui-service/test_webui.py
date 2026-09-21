@@ -463,6 +463,15 @@ def test_platforms_unreachable_503(env_file):
 
 # ------------------------------------------------------------------ 网易反代/二维码 ---
 
+# musicbox CLI（auth ... --json）的真实输出契约：{ok, data:{...}} 信封结构。
+# 前端 static/app.js pollQr/checkQrStatus 与 netease_login.sh 均按此解析（code 在 data 里），
+# 与 proxy/tests/test_musicbox_service.py 的 CLI mock 保持一致。
+NETEASE_LOGIN_ENVELOPE = {"ok": True, "data": {"unikey": "KEY1", "qr_ascii": "QR",
+                                               "qr_url": "https://music.163.com/login?codekey=KEY1"}}
+NETEASE_CHECK_ENVELOPE = {"ok": True, "data": {"code": 801, "message": "等待扫码"}}
+NETEASE_STATUS_ENVELOPE = {"ok": True, "data": {"logged_in": False}}
+
+
 def test_netease_auth_proxy_passthrough(env_file, monkeypatch):
     monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
     hits = {}
@@ -471,20 +480,40 @@ def test_netease_auth_proxy_passthrough(env_file, monkeypatch):
         path = request.url.path
         hits[path] = dict(request.url.params)
         if path == "/api/v1/auth/login":
-            return httpx.Response(200, json={"code": 200, "unikey": "KEY1"})
+            return httpx.Response(200, json=NETEASE_LOGIN_ENVELOPE)
         if path == "/api/v1/auth/login/check":
-            return httpx.Response(200, json={"code": 801})
+            return httpx.Response(200, json=NETEASE_CHECK_ENVELOPE)
+        if path == "/api/v1/auth/status":
+            return httpx.Response(200, json=NETEASE_STATUS_ENVELOPE)
         return httpx.Response(404)
 
     _mock_http(handler)
     with TestClient(webui.app) as client:
         r = client.post("/api/netease/auth/login")
-        assert r.status_code == 200 and r.json()["unikey"] == "KEY1"
+        assert r.status_code == 200 and r.json()["data"]["unikey"] == "KEY1"
         r2 = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
-        assert r2.status_code == 200 and r2.json()["code"] == 801
+        # 信封结构原样透传：code 必须在 data 里（前端据此解析，回归见 test_app_js.py）
+        assert r2.status_code == 200 and r2.json()["data"]["code"] == 801
         assert hits["/api/v1/auth/login/check"]["unikey"] == "KEY1"  # 查询串透传
+        r4 = client.get("/api/netease/auth/status")
+        assert r4.status_code == 200 and r4.json()["data"]["logged_in"] is False
         r3 = client.get("/api/netease/auth/evil")
         assert r3.status_code == 404  # 白名单外
+
+
+def test_netease_auth_proxy_upstream_errors(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    # 上游非 2xx：状态码原样透传（前端轮询把非 2xx 当瞬时失败静默重试）
+    _mock_http(lambda r: httpx.Response(500))
+    with TestClient(webui.app) as client:
+        r = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
+        assert r.status_code == 500
+    # 上游不可达（连接失败）：统一 502 + detail 提示
+    _mock_http(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused")))
+    with TestClient(webui.app) as client:
+        r = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
+        assert r.status_code == 502
+        assert "musicbox" in r.json()["detail"]
 
 
 def test_netease_qr_svg(env_file):
