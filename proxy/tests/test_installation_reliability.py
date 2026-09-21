@@ -1074,3 +1074,74 @@ def test_official_only_restore_clears_old_record(state, servers):
     with state.lock(): state.save({'proxy': {'inode': [0, 0]}})
     state.restore()
     assert 'proxy' not in state.load()
+
+
+# ---------------------------------------------------------------- 网络脆弱性修复（v2.1.0）
+
+def test_install_scripts_delegate_proxy_deps_to_fallback_helper():
+    """宿主机代理依赖安装必须走 ensure_proxy_deps.sh 多源回退，不允许退回单源裸 pip。"""
+    for name in ('install.sh', 'extend.sh'):
+        text = (BASE/name).read_text(encoding='utf-8')
+        assert 'ensure_proxy_deps.sh' in text, f'{name} 应调用 ensure_proxy_deps.sh'
+        assert 'venv-proxy/bin/pip" install' not in text, f'{name} 不应残留单源裸 pip 安装'
+    helper = (BASE/'ensure_proxy_deps.sh').read_text(encoding='utf-8')
+    # 候选链：用户自定义 PIP_INDEX 永远第一位，阿里与官方兜底
+    assert 'https://mirrors.aliyun.com/pypi/simple/' in helper
+    assert 'https://pypi.org/simple' in helper
+    assert 'PIP_INDEX:-' in helper
+
+
+def test_precheck_warns_when_host_dns_unusable_in_containers():
+    """预检含宿主 DNS 形态检查：nameserver 全为本机时提示构建容器 DNS 兜底方案。"""
+    text = (BASE/'install.sh').read_text(encoding='utf-8')
+    block = text[text.index('precheck_environment() {'):text.index('ensure_docker_ready()')]
+    assert 'resolv.conf' in block and 'nameserver' in block
+    assert '223.5.5.5' in block
+
+
+def _deploy_helper_with_stub_pip(tmp_path, fail_urls):
+    """复制 ensure_proxy_deps.sh 到临时目录，伪造 venv 与 pip（按 -i 源决定成败）。"""
+    deploy = tmp_path/'base'; deploy.mkdir()
+    shutil.copy2(BASE/'ensure_proxy_deps.sh', deploy/'ensure_proxy_deps.sh')
+    (deploy/'proxy').mkdir()
+    (deploy/'proxy/requirements.txt').write_text('fastapi>=0.110\n')
+    venv = tmp_path/'venv'; (venv/'bin').mkdir(parents=True)
+    (venv/'bin/python').write_text('#!/bin/sh\nexit 0\n'); (venv/'bin/python').chmod(0o755)
+    calls = tmp_path/'calls.log'
+    # case 是整串匹配：URL 前后加 * 才是"参数里含该源即失败"
+    cases = ''.join(f'    *{url}*) exit 1;;\n' for url in fail_urls)
+    stub = venv/'bin/pip'
+    stub.write_text('#!/bin/sh\n'
+                    f'printf \'%s\\n\' "$*" >> "{calls}"\n'
+                    f'case "$*" in\n{cases}*) exit 0;;\nesac\n')
+    stub.chmod(0o755)
+    return deploy, venv, calls
+
+
+def test_ensure_proxy_deps_falls_back_across_indexes(tmp_path):
+    """行为验证：首选源不可达时按 自定义→阿里→官方 链回退，最终成功退出 0。"""
+    deploy, venv, calls = _deploy_helper_with_stub_pip(tmp_path, ['https://pypi.invalid/simple'])
+    env = os.environ.copy()
+    env.update(PIP_INDEX='https://pypi.invalid/simple', FNMUSIC_VENV_DIR=str(venv))
+    result = subprocess.run(['bash', str(deploy/'ensure_proxy_deps.sh')], env=env,
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    tried = calls.read_text()
+    assert 'https://pypi.invalid/simple' in tried
+    assert 'https://mirrors.aliyun.com/pypi/simple/' in tried
+    assert '切换下一候选源' in result.stdout
+    assert '代理依赖安装完成' in result.stdout
+
+
+def test_ensure_proxy_deps_reports_guidance_when_all_indexes_fail(tmp_path):
+    """全源失败：非零退出 + 带换源/排查指引的错误信息。"""
+    deploy, venv, _ = _deploy_helper_with_stub_pip(
+        tmp_path,
+        ['https://pypi.invalid/simple', 'https://mirrors.aliyun.com/pypi/simple/', 'https://pypi.org/simple'])
+    env = os.environ.copy()
+    env.update(PIP_INDEX='https://pypi.invalid/simple', FNMUSIC_VENV_DIR=str(venv))
+    result = subprocess.run(['bash', str(deploy/'ensure_proxy_deps.sh')], env=env,
+                            text=True, capture_output=True)
+    assert result.returncode != 0
+    assert '排查建议' in result.stderr
+    assert 'PIP_INDEX=' in result.stderr
