@@ -70,3 +70,79 @@ jobs:
               "$fpk_file" "$fpk_file.sha256"
           fi
 
+      # Gitee 镜像只同步分支/标签/提交，发行版需经 API 发布；发布的是同一份
+      # fpk（字节一致，sha256 两边相同）。未配置 GITEE_TOKEN 密钥时本步跳过。
+      - name: Publish release to Gitee
+        if: ${{ secrets.GITEE_TOKEN != '' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: javycoder/fnos_music_ext
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+
+          # 镜像同步有延迟，轮询等 tag 出现在 Gitee（公开仓库 ls-remote 无需认证）
+          synced=0
+          for _ in $(seq 1 20); do
+            if [ -n "$(git ls-remote "https://gitee.com/${GITEE_REPO}.git" "refs/tags/${tag}")" ]; then
+              synced=1
+              break
+            fi
+            sleep 30
+          done
+          if [ "${synced}" != 1 ]; then
+            echo "ERROR: Gitee 镜像 10 分钟内未同步到 tag ${tag}" >&2
+            exit 1
+          fi
+
+          # 发行版已存在则复用（重跑安全），否则创建
+          http="$(curl -sS -o /tmp/gitee-release.json -w '%{http_code}' \
+            "${api}/releases/tags/${tag}?access_token=${GITEE_TOKEN}")"
+          if [ "${http}" = 404 ]; then
+            release_id="$(curl -sS --fail-with-body "${api}/releases" \
+              -d "access_token=${GITEE_TOKEN}" \
+              -d "tag_name=${tag}" \
+              -d "name=fnmusic-ext ${tag#v}" \
+              --data-urlencode "body@/tmp/release-notes.md" \
+              | jq -r '.id')"
+          elif [ "${http}" = 200 ]; then
+            release_id="$(jq -r '.id' /tmp/gitee-release.json)"
+            # 重发时清理旧附件（gitee 未公开文档化，尽力而为，失败不阻断）
+            for attach_id in $(jq -r '.attach_files[]?.id' /tmp/gitee-release.json); do
+              curl -sS -o /dev/null -X DELETE \
+                "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
+            done
+          else
+            echo "ERROR: 查询 Gitee 发行版失败 HTTP ${http}" >&2
+            cat /tmp/gitee-release.json >&2 || true
+            exit 1
+          fi
+
+          # 上传 fpk + sha256，收集下载链接（兼容数组/对象两种返回形态）
+          attach_links=""
+          for f in "${fpk_file}" "${fpk_file}.sha256"; do
+            url="$(curl -sS --fail-with-body "${api}/releases/${release_id}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${f}" \
+              | jq -r 'if type == "array" then .[0].url else (.url // .browser_download_url) end')"
+            if [ -z "${url}" ] || [ "${url}" = "null" ]; then
+              echo "ERROR: Gitee 附件上传后未解析到下载 URL（响应形态可能变了）" >&2
+              exit 1
+            fi
+            attach_links="${attach_links}- [$(basename "${f}")](${url})"$'\n'
+          done
+
+          # 更新说明 = changelog + 附件下载链接
+          {
+            cat /tmp/release-notes.md
+            echo
+            echo "### 附件"
+            printf '%s' "${attach_links}"
+          } > /tmp/gitee-body.md
+          curl -sS --fail-with-body -X PATCH \
+            "${api}/releases/${release_id}?access_token=${GITEE_TOKEN}" \
+            --data-urlencode "body@/tmp/gitee-body.md"
+          echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
+
