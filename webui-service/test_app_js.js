@@ -14,10 +14,20 @@ const vm = require("node:vm");
 
 /* ------------------------------------------------ 最小 DOM/浏览器桩 -------- */
 function stubEl() {
+  const classes = new Set();
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
     checked: false, disabled: false, src: "", dataset: {}, _t: null,
-    classList: { add() {}, remove() {}, toggle() {} },
+    classList: {
+      add(...c) { c.forEach((x) => classes.add(x)); },
+      remove(...c) { c.forEach((x) => classes.delete(x)); },
+      toggle(c, force) {
+        if (force === undefined) { classes.has(c) ? classes.delete(c) : classes.add(c); }
+        else if (force) { classes.add(c); }
+        else { classes.delete(c); }
+      },
+      contains(c) { return classes.has(c); },
+    },
     addEventListener() {},
     querySelectorAll() { return []; },
   };
@@ -176,6 +186,16 @@ test("syncNeteaseAccount：未登录清空 / 请求失败清空", async () => {
   enqueue("/api/netease/auth/status", new Error("down"));
   await global.syncNeteaseAccount();
   assert.strictEqual(els.get("#qr-check").textContent, "");
+});
+
+test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () => {
+  reset();
+  global.markDirty("已修改配置");
+  assert.strictEqual(els.get("#save-note").textContent, "已修改配置");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  global.clearDirty();
+  assert.strictEqual(els.get("#save-note").textContent, "");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */
