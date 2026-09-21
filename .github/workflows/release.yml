@@ -40,12 +40,33 @@ jobs:
           ./packaging/fpk/build.sh
           ls -la dist/
 
-      - name: Create GitHub Release
+      - name: Extract changelog for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "CHANGELOG.md 中未找到 ## [$version] 段落" >&2
+            exit 1
+          fi
+          head -5 /tmp/release-notes.md
+
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "fnmusic-ext ${GITHUB_REF_NAME#v}" \
-            --generate-notes \
-            "$fpk_file" "$fpk_file.sha256"
+          title="fnmusic-ext ${GITHUB_REF_NAME#v}"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --title "$title" --notes-file /tmp/release-notes.md
+            gh release upload "${GITHUB_REF_NAME}" "$fpk_file" "$fpk_file.sha256" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "$title" \
+              --notes-file /tmp/release-notes.md \
+              "$fpk_file" "$fpk_file.sha256"
+          fi
+
