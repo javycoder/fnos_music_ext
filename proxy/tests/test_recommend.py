@@ -343,11 +343,15 @@ def test_purge_stale_daily_cache_keeps_today_only(tmp_path, monkeypatch):
     user = "user-rec-1"
     folder = os.path.join(dailyrec.recommend_cache_dir(), dailyrec._safe_user_name(user))
     os.makedirs(folder, exist_ok=True)
-    open(os.path.join(folder, "20260830.json"), "w").write("{}")
-    open(os.path.join(folder, "20260831.json"), "w").write("{}")
+    open(os.path.join(folder, "20260830.json"), "w").write("{}")            # 旧格式（无前缀）
+    open(os.path.join(folder, "daily-20260831.json"), "w").write("{}")
+    open(os.path.join(folder, "hot-20260831.json"), "w").write("{}")
+    open(os.path.join(folder, "daily-20260901.json"), "w").write("{}")
     dailyrec.purge_stale_daily_cache(user, "20260831")
-    assert not os.path.exists(os.path.join(folder, "20260830.json"))
-    assert os.path.exists(os.path.join(folder, "20260831.json"))
+    assert not os.path.exists(os.path.join(folder, "20260830.json"))        # 旧格式一并清理
+    assert not os.path.exists(os.path.join(folder, "daily-20260901.json"))
+    assert os.path.exists(os.path.join(folder, "daily-20260831.json"))
+    assert os.path.exists(os.path.join(folder, "hot-20260831.json"))
 
 
 def test_collect_exclude_sets_from_favorites():
@@ -575,13 +579,13 @@ async def test_daily_prefers_netease_daily_and_skips_llm(tmp_path, monkeypatch):
     assert "网易日推0" not in titles  # 已收藏跳过
     assert "网易日推1" in titles
     assert llm_calls["n"] == 0  # 网易启用时绝不调 LLM
-    summary = dailyrec.last_recommend_summary().get("u-netease-daily")
+    summary = dailyrec.last_recommend_summary().get("u-netease-daily:daily")
     assert summary and summary["tiers"] == ["netease-daily"]
 
 
 @pytest.mark.anyio
-async def test_daily_falls_back_to_netease_charts_when_not_logged_in(tmp_path, monkeypatch):
-    """网易推荐返回 not_logged_in 时自动降级榜单，同一音源内补齐。"""
+async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
+    """热门推荐歌单：网易热歌榜免登录可用，封面取第一首有封面的歌。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
 
@@ -606,15 +610,57 @@ async def test_daily_falls_back_to_netease_charts_when_not_logged_in(tmp_path, m
             llm_http=None,
             build_track=build_online_track,
             netease_enabled=True,
+            kind="hot",
         )
+    assert payload["kind"] == "hot"
     assert payload["tiers"] == ["netease-charts"]
+    assert payload["guid"].startswith("online:playlist:hot:")
+    assert payload["playlist"]["name"] == "热门推荐"
     assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
     assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
+    # 封面 = 第一个有 cover_url 的歌（第一首在列）
+    assert payload["playlist"]["coverId"] == payload["tracks"][0]["guid"]
+    assert str(payload["tracks"][0].get("cover_url") or "").startswith("http://img/70000")
 
 
 @pytest.mark.anyio
-async def test_daily_uses_lx_charts_when_musicbox_unavailable(tmp_path, monkeypatch):
-    """musicbox 全挂时降级 lxmusic 免登录榜单。"""
+async def test_daily_skips_charts_when_not_logged_in(tmp_path, monkeypatch):
+    """未登录时每日推荐不再借用榜单（榜单归热门歌单），无 LLM/音源则为空。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+    paths = []
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/v1/recommend/songs":
+            return httpx.Response(
+                200,
+                json={"ok": False, "error": {"type": "not_logged_in", "message": "未登录或登录已过期"}},
+            )
+        if request.url.path == "/api/v1/toplist":
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "热歌榜", sid_base=70000), "index": 3})
+        return httpx.Response(404, json={"ok": False})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770") as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-daily-no-charts",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=None,
+            build_track=build_online_track,
+            netease_enabled=True,
+        )
+    assert "/api/v1/toplist" not in paths  # daily 链不再请求榜单
+    assert payload["kind"] == "daily"
+    assert payload["tracks"] == []
+    assert payload["tiers"] == []
+
+
+@pytest.mark.anyio
+async def test_hot_uses_lx_charts_when_musicbox_unavailable(tmp_path, monkeypatch):
+    """musicbox 全挂时热门歌单降级 lxmusic 免登录榜单；全无封面则 coverId 指向歌单自身。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
 
@@ -649,7 +695,115 @@ async def test_daily_uses_lx_charts_when_musicbox_unavailable(tmp_path, monkeypa
             netease_enabled=True,
             lx_client=lx,
             lx_enabled=True,
+            kind="hot",
         )
+    assert payload["kind"] == "hot"
     assert payload["tiers"] == ["lx-charts"]
     assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
     assert all(str(t["guid"]).startswith("online:lx:kg:") for t in payload["tracks"])
+    # lx 榜单曲目 cover_url 全为空：无可用封面，coverId 落到歌单自身 guid
+    assert payload["playlist"]["coverId"] == payload["guid"]
+
+
+# ------------------------------------------------ 推荐歌单封面取曲
+
+def test_pick_playlist_cover_track():
+    tracks = [
+        {"guid": "online:a:1", "cover_url": ""},
+        {"guid": "online:a:2", "cover_url": f"https://{dailyrec.KW_TEXT_COVER_HOST}/pic?rid=1"},  # 酷我文本页假封面
+        {"guid": "online:a:3", "cover_url": "https://img.example/3.jpg"},
+        {"guid": "online:a:4", "cover_url": "https://img.example/4.jpg"},
+    ]
+    assert dailyrec.pick_playlist_cover_track(tracks)["guid"] == "online:a:3"
+    assert dailyrec.pick_playlist_cover_track([]) is None
+    assert dailyrec.pick_playlist_cover_track(None) is None
+    assert dailyrec.pick_playlist_cover_track([{"guid": "x", "cover_url": ""}]) is None
+    assert dailyrec.pick_playlist_cover_track(
+        [{"guid": "x", "cover_url": ""}, {"guid": "y", "cover_url": "https://a/1.jpg"}]
+    )["guid"] == "y"
+
+
+def test_recommend_playlist_guid_kinds():
+    day = "20260921"
+    daily = dailyrec.recommend_playlist_guid("daily", day, "user-x")
+    hot = dailyrec.recommend_playlist_guid("hot", day, "user-x")
+    assert daily.startswith("online:playlist:daily:20260921:")
+    assert hot.startswith("online:playlist:hot:20260921:")
+    assert dailyrec.online_playlist_kind(daily) == "daily"
+    assert dailyrec.online_playlist_kind(hot) == "hot"
+    assert dailyrec.online_playlist_kind("online:migu:1") == ""
+    assert dailyrec.is_recommend_playlist_guid(daily) and dailyrec.is_recommend_playlist_guid(hot)
+    assert not dailyrec.is_recommend_playlist_guid("online:migu:1")
+
+
+@pytest.mark.anyio
+async def test_daily_cover_skips_coverless_tracks(tmp_path, monkeypatch):
+    """构建出的歌单封面 = 第一个有封面直链的歌（第一首无封面时跳到第二首）。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
+
+    rows = [
+        {
+            "song_id": 51000, "name": "无封面歌", "artist": "歌手A", "album_name": "专辑A",
+            "album_pic_url": "", "duration_ms": 210000, "has_sq": False, "has_hr": False,
+        },
+    ] + _mb_detail_rows(24, "有封面歌", sid_base=51001)
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/recommend/songs"
+        return httpx.Response(200, json={"ok": True, "data": rows, "logged_in": True})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770") as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-cover-pick",
+            musicdl_client=None,
+            musicbox_client=mb,
+            llm_http=None,
+            build_track=build_online_track,
+            netease_enabled=True,
+        )
+    assert payload["tracks"][0]["title"] == "无封面歌"
+    assert not payload["tracks"][0].get("cover_url")
+    assert payload["playlist"]["coverId"] == payload["tracks"][1]["guid"]
+    assert payload["tracks"][1].get("cover_url")
+
+
+def test_playlist_list_injects_both_playlists_with_disguised_cover(tmp_path, monkeypatch):
+    """双开关开启：每日推荐与热门推荐两条歌单都注入，coverId 伪装为官方 track_+32hex。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setitem(CONF, "recommend_daily", True)
+    monkeypatch.setitem(CONF, "recommend_hot", True)
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/recommend/songs":
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "网易日推"), "logged_in": True})
+        if request.url.path == "/api/v1/toplist":
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "热歌榜", sid_base=70000), "index": 3})
+        return httpx.Response(404, json={"ok": False})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_auth_user()), base_url="http://unix")
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8768"
+    )
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/playlist/list")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        recs = [it for it in data["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
+        assert len(recs) == 2
+        assert data["total"] == len(data["list"])
+        daily = next(it for it in recs if dailyrec.online_playlist_kind(str(it["guid"])) == "daily")
+        hot = next(it for it in recs if dailyrec.online_playlist_kind(str(it["guid"])) == "hot")
+        assert "每日推荐" in daily["name"]
+        assert hot["name"] == "热门推荐"
+        # coverId 伪装为官方形态（track_ + 32hex），且可反解回第一个有封面的歌
+        for rec in (daily, hot):
+            cover = str(rec["coverId"])
+            assert cover.startswith("track_") and len(cover) == 6 + 32
+            resolved = resolve_real_guid(cover)
+            assert str(resolved).startswith("online:netease:")

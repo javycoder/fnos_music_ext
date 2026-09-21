@@ -1638,33 +1638,58 @@ def _register_fakes_from_items(items) -> None:
                 fake_official_guid(g)
 
 
+def _iter_registry_jsons(directory: str):
+    """列出目录下的 json 文件（含一层子目录，兼容 recommend_cache/<user>/x.json）。"""
+    try:
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
+            if name.endswith(".json") and os.path.isfile(path):
+                yield path
+            elif os.path.isdir(path):
+                for sub in sorted(os.listdir(path)):
+                    if sub.endswith(".json"):
+                        yield os.path.join(path, sub)
+    except Exception:
+        return
+
+
+def _register_fakes_from_recommend_bundle(data) -> None:
+    if not isinstance(data, dict):
+        return
+    _register_fakes_from_items(data.get("tracks"))
+    playlist = data.get("playlist")
+    if isinstance(playlist, dict):
+        for key in ("guid", "coverId"):
+            g = str(playlist.get(key) or "")
+            if is_online_guid(g):
+                fake_official_guid(g)
+
+
 def ensure_registry_warm() -> None:
-    """从收藏/历史存储重建 fake→real 映射（假 id 是确定性 md5，可完整重建）。
+    """从收藏/历史/推荐缓存重建 fake→real 映射（假 id 是确定性 md5，可完整重建）。
 
     服务重启后内存注册表为空，而客户端仍持有重启前学到的假 id；此时上报的
     播放/收藏事件若反解失败会被当作官方事件透传而丢失。收藏与历史存储里
-    出现过的 guid 恰好覆盖客户端会回传的全部假 id。
+    出现过的 guid 覆盖客户端会回传的曲目假 id；推荐缓存里的歌单/曲目 guid
+    覆盖客户端会回传的歌单封面假 id（歌单 coverId 也走伪装下发）。
     """
     global _REGISTRY_WARMED
     if _REGISTRY_WARMED:
         return
     _REGISTRY_WARMED = True
     for directory in (CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites"),
-                      dailyrec.play_history_dir()):
-        try:
-            if not os.path.isdir(directory):
+                      dailyrec.play_history_dir(),
+                      dailyrec.recommend_cache_dir()):
+        for path in _iter_registry_jsons(directory):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
                 continue
-            for name in os.listdir(directory):
-                if not name.endswith(".json"):
-                    continue
-                try:
-                    with open(os.path.join(directory, name), "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    _register_fakes_from_items(data.get("items") if isinstance(data, dict) else data)
-                except Exception:
-                    continue
-        except Exception:
-            continue
+            if isinstance(data, dict) and data.get("tracks") is not None:
+                _register_fakes_from_recommend_bundle(data)
+                continue
+            _register_fakes_from_items(data.get("items") if isinstance(data, dict) else data)
 
 
 def resolve_real_guid(candidate: str) -> str:
@@ -1676,6 +1701,10 @@ def resolve_real_guid(candidate: str) -> str:
         stripped = candidate[6:]
         if stripped in _FAKE_GUID_REVERSE:
             return _FAKE_GUID_REVERSE[stripped]
+        if re.fullmatch(r"[0-9a-f]{32}", stripped):
+            ensure_registry_warm()
+            if stripped in _FAKE_GUID_REVERSE:
+                return _FAKE_GUID_REVERSE[stripped]
     if re.fullmatch(r"[0-9a-f]{32}", candidate or ""):
         ensure_registry_warm()
         if candidate in _FAKE_GUID_REVERSE:
@@ -2840,7 +2869,7 @@ async def track_metadata(request: Request, subpath: str = ""):
 # 在线曲目封面永不 404（空封面是客户端裂图的主要来源）。 ===
 _COVER_CDN_CACHE: dict[str, tuple[str, float]] = {}
 _COVER_CDN_TTL_S = 7 * 86400.0
-_KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
+_KW_TEXT_COVER_HOST = dailyrec.KW_TEXT_COVER_HOST
 _PLACEHOLDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "covers")
 _PLACEHOLDER_COUNT = 6
 _PLACEHOLDER_CACHE: dict[str, bytes] = {}
@@ -3040,17 +3069,20 @@ async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
-    if dailyrec.is_daily_playlist_guid(guid):
+    playlist_kind = dailyrec.online_playlist_kind(guid)
+    if playlist_kind:
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key())
+        cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
-        if tracks:
-            first_guid = str(tracks[0].get("guid") or "")
-            if is_online_guid(first_guid):
-                guid = first_guid
+        picked = dailyrec.pick_playlist_cover_track(tracks)
+        picked_guid = str((picked or {}).get("guid") or "")
+        if not (picked and is_online_guid(picked_guid)):
+            # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
+            return Response(status_code=404)
+        guid = picked_guid
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -3495,22 +3527,32 @@ async def favorite_track_list(request: Request):
 # === daily recommend + play history ===
 
 _HISTORY_LOCK = asyncio.Lock()
-_DAILY_TASKS: dict[str, asyncio.Task] = {}
+_DAILY_TASKS: dict[str, asyncio.Task] = {}  # key: f"{user}:{kind}:{day}"
 
 
 def _prune_stale_daily_tasks(day: str) -> None:
-    suffix = f":{day}"
-    stale = [k for k in list(_DAILY_TASKS) if not str(k).endswith(suffix)]
+    stale = [k for k in list(_DAILY_TASKS) if not str(k).endswith(f":{day}")]
     for k in stale:
         old = _DAILY_TASKS.pop(k, None)
         if old is not None and not old.done():
             old.cancel()
 
 
-async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
+def _recommend_kind_enabled(kind: str) -> bool:
+    if kind == "hot":
+        return bool(CONF.get("recommend_hot", True))
+    return bool(CONF.get("recommend_daily", True))
+
+
+def _recommend_kinds_enabled() -> list[str]:
+    """按开关返回要注入的推荐歌单类型（顺序即歌单列表顺序）。"""
+    return [k for k in ("daily", "hot") if _recommend_kind_enabled(k)]
+
+
+async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "daily") -> asyncio.Task:
     day = dailyrec.today_key()
     _prune_stale_daily_tasks(day)
-    key = f"{user_guid}:{day}"
+    key = f"{user_guid}:{kind}:{day}"
     task = _DAILY_TASKS.get(key)
     if task is not None and not task.done():
         return task
@@ -3538,58 +3580,67 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
             lx_sources=CONF.get("lx_sources") or None,
             recommend_hot=bool(CONF.get("recommend_hot", True)),
             recommend_daily=bool(CONF.get("recommend_daily", True)),
+            kind=kind,
         )
     )
     _DAILY_TASKS[key] = task
     return task
 
 
-async def _peek_daily_bundle(request: Request, user_guid: str) -> dict:
+async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
     """歌单列表用：有缓存立刻返回；否则后台生成，最多等 2s，超时仍返回占位歌单。"""
-    if not CONF.get("recommend_daily", True):
-        return dailyrec.empty_daily_bundle(user_guid)
+    if not _recommend_kind_enabled(kind):
+        return dailyrec.empty_daily_bundle(user_guid, kind)
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
-    cached = dailyrec.load_daily_cache(user_guid, day)
+    cached = dailyrec.load_daily_cache(user_guid, day, kind)
     if cached and cached.get("tracks"):
         return cached
-    task = await _ensure_daily_task(request, user_guid)
+    task = await _ensure_daily_task(request, user_guid, kind)
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
     except asyncio.TimeoutError:
-        cached = dailyrec.load_daily_cache(user_guid, day)
+        cached = dailyrec.load_daily_cache(user_guid, day, kind)
         if cached and cached.get("tracks"):
             return cached
-        return dailyrec.empty_daily_bundle(user_guid)
+        return dailyrec.empty_daily_bundle(user_guid, kind)
     except Exception as e:
         logger.warning("daily recommend peek failed: %s", e)
-        return dailyrec.empty_daily_bundle(user_guid)
+        return dailyrec.empty_daily_bundle(user_guid, kind)
 
 
-async def _load_daily_bundle(request: Request, user_guid: str) -> dict:
-    if not CONF.get("recommend_daily", True):
-        return dailyrec.empty_daily_bundle(user_guid)
+async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
+    if not _recommend_kind_enabled(kind):
+        return dailyrec.empty_daily_bundle(user_guid, kind)
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
-    cached = dailyrec.load_daily_cache(user_guid, day)
+    cached = dailyrec.load_daily_cache(user_guid, day, kind)
     if cached and cached.get("tracks"):
         return cached
 
-    task = await _ensure_daily_task(request, user_guid)
+    task = await _ensure_daily_task(request, user_guid, kind)
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=20.0)
     except asyncio.TimeoutError:
-        cached = dailyrec.load_daily_cache(user_guid, day)
+        cached = dailyrec.load_daily_cache(user_guid, day, kind)
         if cached and cached.get("tracks"):
             return cached
-        return dailyrec.empty_daily_bundle(user_guid)
+        return dailyrec.empty_daily_bundle(user_guid, kind)
 
 
-def _playlist_public_fields(record: dict) -> dict:
+def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
+    # 封面取曲在下发时重算（兼容当天旧缓存），并伪装成官方 track_+32hex 形态：
+    # 官方 App 按 id 格式过滤，online: 原样下发的 coverId 不会被渲染成图标。
+    cover = ""
+    picked = dailyrec.pick_playlist_cover_track(tracks)
+    if picked:
+        cover = str(picked.get("coverId") or picked.get("guid") or "")
+    if not cover:
+        cover = str(record.get("coverId") or record.get("guid") or "")
     return {
         "guid": record.get("guid"),
         "name": record.get("name") or "每日推荐",
-        "coverId": record.get("coverId") or record.get("guid"),
+        "coverId": "track_" + fake_official_guid(str(cover or "")),
         "createdAt": int(record.get("createdAt") or time.time()),
         "updatedAt": int(record.get("updatedAt") or time.time()),
         "trackCount": int(record.get("trackCount") or 0),
@@ -3612,14 +3663,9 @@ async def playlist_list(request: Request):
     if not is_authed:
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
-    if not CONF.get("recommend_daily", True):
-        # FNMUSIC_RECOMMEND_DAILY=false：不注入每日推荐占位歌单
-        return JSONResponse(content=envelope, headers=headers)
-
-    try:
-        bundle = await _peek_daily_bundle(request, user_guid)
-    except Exception as e:
-        logger.warning("daily recommend list inject failed: %s", e)
+    kinds = _recommend_kinds_enabled()
+    if not kinds:
+        # 两个推荐开关全关：不注入任何推荐占位歌单
         return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
@@ -3630,30 +3676,43 @@ async def playlist_list(request: Request):
     if not isinstance(official, list):
         official = []
         data["list"] = official
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(bundle.get("tracks") or [])
+    recs: list[dict] = []
+    for kind in kinds:
+        try:
+            bundle = await _peek_daily_bundle(request, user_guid, kind)
+        except Exception as e:
+            logger.warning("%s recommend list inject failed: %s", kind, e)
+            continue
+        tracks = bundle.get("tracks") or []
+        if kind == "hot" and not tracks:
+            # 热门歌单构建失败/无可用榜单时不挂空壳（每日推荐保留占位等待后台生成）
+            continue
+        rec = _playlist_public_fields(bundle.get("playlist") or {}, tracks)
+        rec["trackCount"] = len(tracks)
+        recs.append(rec)
     official = [
         it for it in official
-        if not (isinstance(it, dict) and dailyrec.is_daily_playlist_guid(str(it.get("guid") or "")))
+        if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
     ]
-    data["list"] = [rec] + official
+    data["list"] = recs + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + 1
+    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs)
     return JSONResponse(content=envelope, headers=headers)
 
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
-    if not dailyrec.is_daily_playlist_guid(guid):
+    kind = dailyrec.online_playlist_kind(guid)
+    if not kind:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
+    bundle = await _load_daily_bundle(request, user_guid, kind)
+    rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
     rec["trackCount"] = len(bundle.get("tracks") or [])
     return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
 
@@ -3662,12 +3721,12 @@ async def playlist_detail(request: Request):
 async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
-    daily_ids = [g for g in guids if dailyrec.is_daily_playlist_guid(g)]
-    if not daily_ids:
+    recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
+    if not recommend_ids:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
-    rest = [g for g in guids if not dailyrec.is_daily_playlist_guid(g)]
+    rest = [g for g in guids if not dailyrec.is_recommend_playlist_guid(g)]
     official_list: list = []
     if rest:
         headers = copy_incoming_headers(request)
@@ -3692,10 +3751,14 @@ async def playlist_batch_detail(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(bundle.get("tracks") or [])
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": [rec] + official_list}})
+    recs: list[dict] = []
+    for g in recommend_ids:
+        kind = dailyrec.online_playlist_kind(g) or "daily"
+        bundle = await _load_daily_bundle(request, user_guid, kind)
+        rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
+        rec["trackCount"] = len(bundle.get("tracks") or [])
+        recs.append(rec)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
 
 
 @app.get("/music/api/v1/track/playlist-detail/list")
@@ -3706,14 +3769,15 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
-    if not dailyrec.is_daily_playlist_guid(guid):
+    kind = dailyrec.online_playlist_kind(guid)
+    if not kind:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
+    bundle = await _load_daily_bundle(request, user_guid, kind)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
     try:
         page = max(int(request.query_params.get("page") or 1), 1)

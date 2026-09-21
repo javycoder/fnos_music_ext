@@ -1,5 +1,6 @@
 """v2.0.0 新特性回归：音质模式 / .env 热重载 / 推荐双开关 / 封面兜底链。"""
 import asyncio
+import json
 import os
 
 import httpx
@@ -272,7 +273,7 @@ async def test_daily_disabled_skips_all_tiers(tmp_path, monkeypatch):
 
 @pytest.mark.anyio
 async def test_daily_off_keeps_hot_charts(tmp_path, monkeypatch):
-    """仅关“每日”（开着榜单）：daily 梯队不打，toplist 正常请求。"""
+    """仅关“每日”（开着榜单）：热门歌单正常打 toplist，daily 链不请求。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
     paths = []
@@ -296,9 +297,11 @@ async def test_daily_off_keeps_hot_charts(tmp_path, monkeypatch):
             build_track=build_online_track,
             netease_enabled=True,
             recommend_daily=False,
+            kind="hot",
         )
     assert "/api/v1/recommend/songs" not in paths
     assert "/api/v1/toplist" in paths
+    assert payload["kind"] == "hot"
     assert payload["tracks"] == []
 
 
@@ -561,3 +564,122 @@ async def test_aggregate_search_dispatches_single_provider(monkeypatch, enabled,
     entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0}
     await _aggregate_search(_Req(), "晴天", entry)
     assert called == expect
+
+
+# ------------------------------------------------ 推荐歌单封面端点
+
+def _write_recommend_bundle(rec_dir: str, user_guid: str, tracks: list, kind: str = "daily") -> str:
+    day = dailyrec.today_key()
+    guid = dailyrec.recommend_playlist_guid(kind, day, user_guid)
+    folder = os.path.join(rec_dir, dailyrec._safe_user_name(user_guid))
+    os.makedirs(folder, exist_ok=True)
+    picked = dailyrec.pick_playlist_cover_track(tracks) or {}
+    cover = str(picked.get("coverId") or picked.get("guid") or guid)
+    payload = {
+        "day": day, "kind": kind, "guid": guid, "status": "ready",
+        "playlist": {"guid": guid, "name": "test", "coverId": cover,
+                     "createdAt": 1, "updatedAt": 1, "trackCount": len(tracks), "isDaily": True},
+        "tracks": tracks, "tiers": [], "seedCount": 0, "favoriteCount": 0, "builtAt": 1,
+    }
+    with open(os.path.join(folder, f"{kind}-{day}.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    return guid
+
+
+def _cover_env(tmp_path, monkeypatch, user_guid="user-cover", musicdl_handler=None):
+    """封面端点测试环境：upstream 提供登录态，三个音源默认 404（可传 musicdl 覆盖）。
+
+    注意不能复用 _setup_clients——它会无条件把 upstream 覆盖成 400，导致鉴权探测失败。
+    """
+    rec_dir = str(tmp_path / "rc")
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", rec_dir)
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "hist"))
+    monkeypatch.setitem(CONF, "fav_dir", str(tmp_path / "favs"))
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": user_guid}})
+        return httpx.Response(400, text="no upstream")
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler or (lambda r: httpx.Response(404))),
+        base_url="http://127.0.0.1:8768",
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770"
+    )
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8772"
+    )
+    return rec_dir
+
+
+def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
+    """歌单封面请求：第一首无封面 → 跳到第二首（musicdl 只收到第二首的 info）。"""
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/info"
+        assert request.url.params.get("id") == "migu:2"
+        return httpx.Response(200, json={"ok": True, "id": "migu:2", "title": "歌", "artist": "手",
+                                          "cover_url": "http://img.music.migu.cn/2.jpg"})
+
+    rec_dir = _cover_env(tmp_path, monkeypatch, musicdl_handler=musicdl_handler)
+    tracks = [
+        {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
+        {"guid": "online:migu:2", "coverId": "online:migu:2", "cover_url": "http://img.music.migu.cn/2.jpg"},
+    ]
+    pl_guid = _write_recommend_bundle(rec_dir, "user-cover", tracks)
+    with TestClient(app) as client:
+        resp = client.get(f"/music/api/v1/static/cover?coverId={pl_guid}&size=120", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers.get("location") == "http://img.music.migu.cn/2.jpg"
+
+
+def test_static_cover_playlist_without_covers_returns_404(tmp_path, monkeypatch):
+    """歌单内全部曲目无封面 → 404（客户端回落自带默认样式，不再给占位图）。"""
+    rec_dir = _cover_env(tmp_path, monkeypatch)
+    tracks = [
+        {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
+        {"guid": "online:migu:2", "coverId": "online:migu:2", "cover_url": ""},
+    ]
+    pl_guid = _write_recommend_bundle(rec_dir, "user-cover", tracks, kind="hot")
+
+    with TestClient(app) as client:
+        resp = client.get(f"/music/api/v1/static/cover?coverId={pl_guid}&size=120", follow_redirects=False)
+    assert resp.status_code == 404
+
+
+def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkeypatch):
+    """重启后内存注册表为空：伪装 coverId（track_+32hex）经 warm 从推荐缓存反解仍能出图。"""
+    import hashlib
+
+    from proxy.app import _FAKE_GUID_REVERSE, _REGISTRY_WARMED
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("id") == "migu:2"
+        return httpx.Response(200, json={"ok": True, "id": "migu:2", "title": "歌", "artist": "手",
+                                          "cover_url": "http://img.music.migu.cn/2.jpg"})
+
+    rec_dir = _cover_env(tmp_path, monkeypatch, musicdl_handler=musicdl_handler)
+    tracks = [
+        {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
+        {"guid": "online:migu:2", "coverId": "online:migu:2", "cover_url": "http://img.music.migu.cn/2.jpg"},
+    ]
+    pl_guid = _write_recommend_bundle(rec_dir, "user-cover", tracks)
+    fake_cover = "track_" + hashlib.md5(f"fnmusic-ext::{pl_guid}".encode()).hexdigest()
+
+    backup = dict(_FAKE_GUID_REVERSE)
+    warmed = _REGISTRY_WARMED
+    _FAKE_GUID_REVERSE.clear()
+    _REGISTRY_WARMED = False
+    try:
+        with TestClient(app) as client:
+            resp = client.get(f"/music/api/v1/static/cover?coverId={fake_cover}&size=120", follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers.get("location") == "http://img.music.migu.cn/2.jpg"
+    finally:
+        _FAKE_GUID_REVERSE.clear()
+        _FAKE_GUID_REVERSE.update(backup)
+        _REGISTRY_WARMED = warmed

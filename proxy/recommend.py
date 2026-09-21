@@ -1,11 +1,14 @@
-"""每日推荐：采信音源原生推荐生成可播放在线歌单。
+"""推荐歌单：采信音源原生推荐生成可播放在线歌单。
 
-优先级单链（取第一个能凑满 PLAYLIST_SIZE 首的来源，不足则逐级补齐）：
-  1. netease-daily  网易真·每日推荐（musicbox，已登录为个性化）
-  2. netease-charts 网易榜单（musicbox toplist，免登录）
-  3. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
-  4. llm            大模型候选 + 搜索匹配（仅当网易音源未启用且配置了 FNMUSIC_LLM_*）
-  5. fallback       种子歌手 + 热门池关键词检索（最终保险）
+两个独立歌单，各自受开关门控（见 .env FNMUSIC_RECOMMEND_*）：
+  - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：优先级单链，逐级补齐至 PLAYLIST_SIZE 首：
+      1. netease-daily  网易真·每日推荐（musicbox，已登录为个性化）
+      2. llm            大模型候选 + 搜索匹配（仅当网易音源未启用且配置了 FNMUSIC_LLM_*）
+      3. fallback       种子歌手 + 热门池关键词检索（最终保险）
+  - 热门推荐（hot，FNMUSIC_RECOMMEND_HOT）：榜单原味（不排除已收藏/最近播放）：
+      1. netease-charts 网易热歌榜（musicbox toplist，免登录）
+      2. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
+歌单封面取曲：第一个带可用封面直链的曲目（跳过无封面与酷我文本页假链接）。
 密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
 """
 from __future__ import annotations
@@ -26,6 +29,9 @@ import httpx
 logger = logging.getLogger("fnmusic_proxy.recommend")
 
 DAILY_GUID_PREFIX = "online:playlist:daily:"
+HOT_GUID_PREFIX = "online:playlist:hot:"
+# 酷我文本封面 host：该“封面 URL”实为含图片链接的文本页，不能当直链用（app.py 引用同一常量）
+KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
 DEFAULT_MODEL = "gpt-4o-mini"
 SEED_LIMIT = 20
 LLM_CANDIDATE_COUNT = 30
@@ -88,16 +94,54 @@ def today_key(now: datetime | None = None) -> str:
     return (now or datetime.now()).strftime("%Y%m%d")
 
 
-def daily_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
+def recommend_playlist_guid(kind: str, day: str | None = None, user_guid: str = "") -> str:
+    prefix = HOT_GUID_PREFIX if kind == "hot" else DAILY_GUID_PREFIX
     day = day or today_key()
     suffix = re.sub(r"[^A-Za-z0-9]", "", user_guid)[:12]
     if suffix:
-        return f"{DAILY_GUID_PREFIX}{day}:{suffix}"
-    return f"{DAILY_GUID_PREFIX}{day}"
+        return f"{prefix}{day}:{suffix}"
+    return f"{prefix}{day}"
+
+
+def daily_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
+    return recommend_playlist_guid("daily", day, user_guid)
+
+
+def hot_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
+    return recommend_playlist_guid("hot", day, user_guid)
+
+
+def online_playlist_kind(guid: str | None) -> str:
+    """解析推荐歌单 guid 的类型：daily / hot，非推荐歌单返回空串。"""
+    s = str(guid or "")
+    if s.startswith(DAILY_GUID_PREFIX):
+        return "daily"
+    if s.startswith(HOT_GUID_PREFIX):
+        return "hot"
+    return ""
+
+
+def is_recommend_playlist_guid(guid: str | None) -> bool:
+    return online_playlist_kind(guid) != ""
 
 
 def is_daily_playlist_guid(guid: str | None) -> bool:
     return str(guid or "").startswith(DAILY_GUID_PREFIX)
+
+
+def pick_playlist_cover_track(tracks: list[dict] | None) -> dict | None:
+    """歌单封面取曲：第一个带可用封面直链的曲目。
+
+    跳过 cover_url 为空与酷我文本页假链接（KW_TEXT_COVER_HOST）的曲目；
+    全都无封面返回 None（封面端点据此 404，客户端显示自带默认样式）。
+    """
+    for t in tracks or []:
+        if not isinstance(t, dict):
+            continue
+        url = str(t.get("cover_url") or "")
+        if url and KW_TEXT_COVER_HOST not in url:
+            return t
+    return None
 
 
 def infer_language(title: str = "", artist: str = "", album: str = "") -> str:
@@ -1033,12 +1077,13 @@ def _dedupe_extend(base: list[dict], extra: list[dict], limit: int) -> list[dict
     return out[:limit]
 
 
-def cache_path(user_guid: str, day: str) -> str:
-    return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"{day}.json")
+def cache_path(user_guid: str, day: str, kind: str = "daily") -> str:
+    kind = "hot" if kind == "hot" else "daily"
+    return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"{kind}-{day}.json")
 
 
-def load_daily_cache(user_guid: str, day: str) -> dict | None:
-    path = cache_path(user_guid, day)
+def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
+    path = cache_path(user_guid, day, kind)
     if not os.path.exists(path):
         return None
     try:
@@ -1059,17 +1104,17 @@ def load_daily_cache(user_guid: str, day: str) -> dict | None:
     return None
 
 
-def save_daily_cache(user_guid: str, day: str, payload: dict) -> None:
-    _atomic_write_json(cache_path(user_guid, day), payload)
+def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily") -> None:
+    _atomic_write_json(cache_path(user_guid, day, kind), payload)
 
 
 def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
     folder = os.path.join(recommend_cache_dir(), _safe_user_name(user_guid))
     if not os.path.isdir(folder):
         return
-    keep = f"{keep_day}.json"
+    keep = {f"daily-{keep_day}.json", f"hot-{keep_day}.json"}
     for name in os.listdir(folder):
-        if not name.endswith(".json") or name == keep:
+        if not name.endswith(".json") or name in keep:
             continue
         path = os.path.join(folder, name)
         try:
@@ -1079,12 +1124,15 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
             logger.warning("failed to purge %s: %s", path, e)
 
 
-# 每用户最近一次每日推荐构建结果（仅供 /_ext/healthz 观测，非持久化）
+# 每用户最近一次推荐歌单构建结果（仅供 /_ext/healthz 观测，非持久化）
 _LAST_DAILY_INFO: dict[str, dict] = {}
 
 
 def _remember_daily_result(user_guid: str, payload: dict) -> None:
-    _LAST_DAILY_INFO[user_guid] = {
+    kind = str(payload.get("kind") or "daily")
+    _LAST_DAILY_INFO[f"{user_guid}:{kind}"] = {
+        "user": user_guid,
+        "kind": kind,
         "day": payload.get("day"),
         "status": payload.get("status"),
         "tiers": list(payload.get("tiers") or []),
@@ -1115,17 +1163,26 @@ def build_playlist_record(
     }
 
 
-def empty_daily_bundle(user_guid: str) -> dict:
+def playlist_display_name(kind: str, day: str | None = None) -> str:
+    if kind == "hot":
+        return "热门推荐"
+    day = day or today_key()
+    return f"每日推荐 {day[4:6]}-{day[6:8]}"
+
+
+def empty_daily_bundle(user_guid: str, kind: str = "daily") -> dict:
+    kind = "hot" if kind == "hot" else "daily"
     day = today_key()
-    guid = daily_playlist_guid(day, user_guid)
+    guid = recommend_playlist_guid(kind, day, user_guid)
     playlist = build_playlist_record(
         guid=guid,
-        name=f"每日推荐 {day[4:6]}-{day[6:8]}",
+        name=playlist_display_name(kind, day),
         cover_id=guid,
         track_count=0,
     )
     return {
         "day": day,
+        "kind": kind,
         "guid": guid,
         "playlist": playlist,
         "tracks": [],
@@ -1148,43 +1205,51 @@ async def get_or_build_daily(
     lx_sources: "list[str] | None" = None,
     recommend_hot: bool = True,
     recommend_daily: bool = True,
+    kind: str = "daily",
 ) -> dict:
+    kind = "hot" if kind == "hot" else "daily"
     day = today_key()
-    guid = daily_playlist_guid(day, user_guid)
+    guid = recommend_playlist_guid(kind, day, user_guid)
     purge_stale_daily_cache(user_guid, day)
-    cached = load_daily_cache(user_guid, day)
+    cached = load_daily_cache(user_guid, day, kind)
     existing = list(cached.get("tracks") or []) if cached else []
     if len(existing) >= PLAYLIST_SIZE:
         _remember_daily_result(user_guid, cached)
         return cached
 
-    local_seeds = read_local_recent_tracks(music_db_path(), user_guid, SEED_LIMIT)
-    online_seeds = seeds_from_online_history(user_guid)
-    local_favs = read_local_favorite_tracks(music_db_path(), user_guid)
-    online_favs = [x for x in (favorite_items or []) if isinstance(x, dict)]
-    fav_seeds: list[dict] = []
-    for it in online_favs + local_favs:
-        title, artist = _item_title_artist(it)
-        album = ""
-        track = it.get("track") if isinstance(it.get("track"), dict) else it
-        if isinstance(track.get("album"), dict):
-            album = str(track["album"].get("name") or "")
-        elif track.get("albumName"):
-            album = str(track.get("albumName") or "")
-        elif track.get("album"):
-            album = str(track.get("album") or "")
-        fav_seeds.append({
-            "guid": str(it.get("guid") or track.get("guid") or ""),
-            "title": title,
-            "artist": artist,
-            "album": album,
-            "genre": "",
-            "language": infer_language(title, artist, album),
-            "playedAt": int(it.get("createdAt") or it.get("playedAt") or 0),
-            "source": "favorite",
-        })
-    play_seeds = merge_recent_seeds(local_seeds, online_seeds, extra_seeds, SEED_LIMIT)
-    exclude_guids, exclude_ta = collect_exclude_sets(play_seeds, fav_seeds, extra_seeds, online_favs, local_favs)
+    if kind == "hot":
+        # 热门歌单：榜单原味，不排除已收藏/最近播放，也不用种子（不走 llm/fallback）
+        play_seeds: list[dict] = []
+        fav_seeds: list[dict] = []
+        exclude_guids, exclude_ta = set(), set()
+    else:
+        local_seeds = read_local_recent_tracks(music_db_path(), user_guid, SEED_LIMIT)
+        online_seeds = seeds_from_online_history(user_guid)
+        local_favs = read_local_favorite_tracks(music_db_path(), user_guid)
+        online_favs = [x for x in (favorite_items or []) if isinstance(x, dict)]
+        fav_seeds = []
+        for it in online_favs + local_favs:
+            title, artist = _item_title_artist(it)
+            album = ""
+            track = it.get("track") if isinstance(it.get("track"), dict) else it
+            if isinstance(track.get("album"), dict):
+                album = str(track["album"].get("name") or "")
+            elif track.get("albumName"):
+                album = str(track.get("albumName") or "")
+            elif track.get("album"):
+                album = str(track.get("album") or "")
+            fav_seeds.append({
+                "guid": str(it.get("guid") or track.get("guid") or ""),
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "genre": "",
+                "language": infer_language(title, artist, album),
+                "playedAt": int(it.get("createdAt") or it.get("playedAt") or 0),
+                "source": "favorite",
+            })
+        play_seeds = merge_recent_seeds(local_seeds, online_seeds, extra_seeds, SEED_LIMIT)
+        exclude_guids, exclude_ta = collect_exclude_sets(play_seeds, fav_seeds, extra_seeds, online_favs, local_favs)
     if existing:
         exclude_guids = exclude_guids | {str(t.get("guid") or "") for t in existing}
         exclude_ta = exclude_ta | {
@@ -1265,30 +1330,32 @@ async def get_or_build_daily(
             if len(tracks) > before:
                 contributing.append(name)
 
-    # 优先级单链：网易真每日推荐 -> 网易榜单（未登录）-> lx 免登录榜单
-    # -> LLM（仅网易未启用）-> 种子关键词兜底；每级不足 20 首由下一级补齐。
-    # FNMUSIC_RECOMMEND_DAILY 门控“每日”梯队（daily/llm/种子兜底），
-    # FNMUSIC_RECOMMEND_HOT 门控榜单梯队（网易榜单/lx 榜单）。
-    if recommend_daily:
-        await run_tier("netease-daily", from_netease_daily)
-    if recommend_hot:
+    # 每日推荐链：网易真每日推荐 -> LLM（仅网易未启用）-> 种子关键词兜底；
+    # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。
+    # FNMUSIC_RECOMMEND_DAILY / FNMUSIC_RECOMMEND_HOT 分别门控两条链的构建。
+    if kind == "hot":
         await run_tier("netease-charts", from_netease_charts)
         await run_tier("lx-charts", from_lx_charts)
-    if not netease_enabled and recommend_daily:
-        await run_tier("llm", from_llm)
-    if recommend_daily:
-        await run_tier("fallback", from_fallback)
+    else:
+        if recommend_daily:
+            await run_tier("netease-daily", from_netease_daily)
+        if not netease_enabled and recommend_daily:
+            await run_tier("llm", from_llm)
+        if recommend_daily:
+            await run_tier("fallback", from_fallback)
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
-    cover_id = tracks[0].get("coverId") or tracks[0].get("guid") if tracks else guid
+    picked = pick_playlist_cover_track(tracks)
+    cover_id = str((picked or {}).get("coverId") or (picked or {}).get("guid") or guid)
     playlist = build_playlist_record(
         guid=guid,
-        name=f"每日推荐 {day[4:6]}-{day[6:8]}",
-        cover_id=str(cover_id or guid),
+        name=playlist_display_name(kind, day),
+        cover_id=cover_id,
         track_count=len(tracks),
     )
     payload = {
         "day": day,
+        "kind": kind,
         "guid": guid,
         "status": "ready" if len(tracks) >= PLAYLIST_SIZE else "partial",
         "playlist": playlist,
@@ -1299,10 +1366,10 @@ async def get_or_build_daily(
         "builtAt": int(time.time()),
     }
     if tracks:
-        save_daily_cache(user_guid, day, payload)
+        save_daily_cache(user_guid, day, payload, kind)
         logger.info(
-            "daily recommend %s tracks=%s status=%s tiers=%s",
-            guid, len(tracks), payload["status"], ",".join(contributing) or "-",
+            "%s recommend %s tracks=%s status=%s tiers=%s",
+            kind, guid, len(tracks), payload["status"], ",".join(contributing) or "-",
         )
     _remember_daily_result(user_guid, payload)
     return payload
