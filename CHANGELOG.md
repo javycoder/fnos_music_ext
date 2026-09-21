@@ -3,6 +3,30 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+
+- **洛雪自定义源大部分不可用——沙箱桥与官方客户端契约不兼容（重要）**：逐项
+  对照洛雪桌面版官方注入实现（`lx-music-desktop` 的 `preload.js`）修复四处实质
+  差异，这些差异会让"在洛雪客户端里可用"的源在本服务里解析失败：
+  - `lx.utils.crypto.rsaEncrypt` 误用 PKCS1 填充，官方是 **NO_PADDING + 左侧零
+    填充到 128 字节**——依赖该语义加密参数的源（如网易 weapi 系）签名必错，
+    相关平台解析全部失败；
+  - 沙箱全局过窄：官方脚本跑在完整桌面渲染上下文，`setInterval`、`atob/btoa`、
+    `TextEncoder/TextDecoder`、`fetch`、`performance`、`crypto.getRandomValues`
+    均可用，沙箱缺任何一个都是 `ReferenceError` 直接打断解析；
+  - `lx.request` 的 object 请求体未序列化（官方底层 needle 按 Content-Type 做
+    JSON 或 urlencoded 编码，沙箱原样交给 fetch 会直接抛错）；
+  - `lx.request` 默认超时 20s → 官方 60s、重定向 3 跳 → 官方 10 跳；响应补
+    `statusMessage`/`bytes`；`bufToString` 对齐 binary 语义。
+  另对齐官方"初始化前任何未捕获异常视为初始化失败"的语义（此前异步崩溃的
+  脚本会假 inited，之后每次解析失败）。
+- **慢源被解析超时掐死**：`LX_RESOLVER_TIMEOUT` 默认 4s → 12s（洛雪源多为二级
+  转发，实证耗时 3-8s，4s 全部超时并连锁触发熔断，观感即"整源不可用"）；
+  播放端 `LX_URL_TIMEOUT` 10s → 20s，代理层每档等待同步放宽到 22s 让降档
+  缓存收敛；`musicInfo.interval` 从 `MM:SS` 改为官方的纯秒数字符串。
+
 ## [2.2.0] - 2026-09-21
 
 ### 新增
