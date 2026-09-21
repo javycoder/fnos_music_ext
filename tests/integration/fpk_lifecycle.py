@@ -239,10 +239,15 @@ def run_upgrade_hooks(args) -> None:
     → upgrade_callback（恢复备份 + 按恢复的 .env 重装）→ 健康断言。
     """
     print("[upgrade] 直调 upgrade_init / upgrade_callback（TRIM_PKGVAR=临时目录）", flush=True)
-    cmd_dir = Path(f"/var/apps/{APPNAME}/target/cmd")
+    # cmd/ 在应用根（/var/apps/<app>/cmd）；repo 在 target/repo（TRIM_APPDEST）。
+    cmd_dir = Path(f"/var/apps/{APPNAME}/cmd")
+    if not (cmd_dir / "upgrade_init").is_file():
+        cmd_dir = Path(f"/var/apps/{APPNAME}/target/cmd")
     upgrade_init = cmd_dir / "upgrade_init"
     upgrade_callback = cmd_dir / "upgrade_callback"
     repo = Path(f"/var/apps/{APPNAME}/target/repo")
+    if not repo.joinpath("install.sh").is_file():
+        repo = Path(f"/var/apps/{APPNAME}/repo")
     if not (upgrade_init.is_file() and upgrade_callback.is_file() and repo.joinpath("install.sh").is_file()):
         record(False, "升级钩子就位", f"{cmd_dir} 或 {repo} 内容不完整")
         return
