@@ -18,7 +18,7 @@
 4. 绝对禁止擅自安装 Docker 引擎：fnOS 的 Docker 必须在「应用中心」由系统管理员安装。v2.0.0 仅支持 Docker 部署：若环境未安装 Docker 或 docker daemon 不可用，install.sh 会直接报错退出——此时应报告用户先安装 Docker，严禁执行 apt-get install docker 等命令，严禁尝试任何 host 模式替代。
 5. 部署形态：核心代理由宿主机 systemd（项目根 .venv-proxy 虚拟环境）运行并接管 /var/run/trim_music.socket；音源（musicdl 8768 / musicbox 8770 / lxmusic 8772）与 WebUI（8774）全部在单容器 fnmusic-sources 内按需运行。
 6. 音源三选一互斥：--sources 与 .env 的三个 FNMUSIC_*_ENABLED 开关只能有一个为 true，跨音源组合会被 install.sh 拒绝。换源属于运行期操作（WebUI 或改 .env 后 ./extend.sh），不要通过重装切换。
-7. 洛雪 lxmusic 源：播放解析依赖用户提供的洛雪自定义源脚本 URL（LX_SOURCE_URL）。非交互安装选 lxmusic 时必须携带 --lx-source-url '<URL>'；安装器会在容器内做全链路校验（下载→初始化→搜索→解析→探活）。校验失败分类提示，Agent 应把原始错误转告用户而不是自行编造 URL。
+7. 洛雪 lxmusic 源：播放解析依赖用户提供的洛雪自定义源脚本 URL（LX_SOURCE_URL）。非交互安装选 lxmusic 时必须携带 --lx-source-url '<URL>'；安装器会在容器内做全链路校验（下载→初始化→搜索→解析→探活）。校验失败分类提示，Agent 应把原始错误转告用户而不是自行编造 URL。仅当用户明确接受“源暂不可用也要先装好”时才可追加 --lx-skip-verify（跳过校验直接激活，源状态装好后在 WebUI 查看）。
 8. 一键扩展 ./extend.sh 与一键还原 ./restore.sh（含彻底清理 ./restore.sh --full）必须始终保持可用；扩展失败必须安全秒级回滚到官方直连。
 9. 单机单部署：代理单元名、音源容器名与安装锁全局唯一，本机以 /var/lib/fnmusic-ext/deployment 登记当前部署目录。从另一份仍存在的仓库副本执行安装/扩展/还原会被拒绝；Agent 不得用克隆目录绕过，应在原部署目录操作，或经用户确认后使用 --adopt 显式迁移部署。原登记目录已删除时不拦截。
 10. WebUI（端口 8774）无鉴权，仅限可信内网；安装开关为 --webui / --no-webui，非交互默认不装。

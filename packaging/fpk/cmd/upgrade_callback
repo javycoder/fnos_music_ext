@@ -23,12 +23,22 @@ if [ "${SOURCES}" = "lxmusic" ]; then
     LX_URL="$(fnmusic_saved_lx_url)"
     [ -n "${LX_URL}" ] || fnmusic_fail "升级失败：.env 中缺少 LX_SOURCE_URL，请卸载后重新安装"
     ARGS+=(--lx-source-url "${LX_URL}")
+    # 源是用户装机时已确认过的：升级不得因源服务器临时故障（校验不过）而卡死，
+    # 跳过可用性校验，只做激活；源状态装好后在管理页 WebUI 查看
+    ARGS+=(--lx-skip-verify)
 fi
 
 cd "${FNMUSIC_REPO_DIR}"
 if ! bash ./install.sh "${ARGS[@]}" >> "${FNMUSIC_LOG}" 2>&1; then
+    # 升级失败弹窗要能看到真实错误行（回滚会带走 TRIM_PKGVAR 里的日志）
+    err_brief="$(sed $'s/\x1b\\[[0-9;]*m//g' "${FNMUSIC_LOG}" 2>/dev/null \
+        | grep -a '\[ERROR\]' | tail -n 3 | tr '\n' ' ' | cut -c1-300)"
     tail -n 5 "${FNMUSIC_LOG}" >&2 || true
-    fnmusic_fail "升级失败（数据备份保留在 ${BACKUP_DIR}/data.tar.gz）：详见 ${FNMUSIC_LOG}"
+    if [ -n "${err_brief}" ]; then
+        fnmusic_fail "升级失败（数据备份保留在 ${BACKUP_DIR}）：${err_brief}"
+    else
+        fnmusic_fail "升级失败（数据备份保留在 ${BACKUP_DIR}）：详见 ${FNMUSIC_LOG}"
+    fi
 fi
 
 rm -rf "${BACKUP_DIR}"
