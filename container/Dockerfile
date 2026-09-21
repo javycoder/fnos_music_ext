@@ -21,18 +21,17 @@ WORKDIR /srv
 # nodejs（洛雪自定义源 Node 沙箱，trixie 自带 20.x）/ ffmpeg（musicdl 转封装）/ supervisor
 # apt 源默认国内镜像（与 pip 同策略，APT_MIRROR 可覆盖），仅在本构建层内临时替换。
 # 构建容器无法复用"指向本机"的宿主 DNS（Docker 会剔除 127.x 并回退 8.8.8.8，国内不可达），
-# 解析失败时先注入备用公共 DNS 自愈；apt-get update 对 DNS 失败只报 W: 警告且退出码为 0，
-# 因此回退判定看「索引是否真正落地」而非退出码；镜像源与官方源都取不到索引才判失败。
-# 安装完成后恢复官方源，宿主机与最终镜像不受影响。
+# 因此不探测、始终把国内可达的公共 DNS 写到最前（写入失败不中断）；apt-get update
+# 对 DNS 失败只报 W: 警告且退出码为 0，回退判定看「索引是否真正落地」而非退出码；
+# 镜像源与官方源都取不到索引才判失败。安装完成后恢复官方源，宿主机与最终镜像不受影响。
+# 失败文案用 "ERROR:" 不用 "[ERROR]"：后者会被应用中心弹窗 grep 成整段 RUN 标题。
 RUN set -eu; \
     fix_dns() { \
-        probe_host="deb.debian.org"; \
-        if [ -n "${APT_MIRROR}" ]; then probe_host="$(printf '%s' "${APT_MIRROR}" | sed -E 's#^https?://##; s#/.*##')"; fi; \
-        if ! getent hosts "${probe_host}" >/dev/null 2>&1; then \
-            echo "[WARN] 容器内 DNS 解析失败（${probe_host}），注入备用公共 DNS 223.5.5.5/119.29.29.29 ..." >&2; \
-            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > /etc/resolv.conf 2>/dev/null \
-            || echo "[WARN] 备用 DNS 注入失败，继续尝试原 DNS ..." >&2; \
-        fi; \
+        { \
+            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n'; \
+            grep -vE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1|localhost)' /etc/resolv.conf 2>/dev/null || true; \
+        } > /tmp/resolv.fnmusic 2>/dev/null || true; \
+        cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     swap_apt_host() { \
         for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
@@ -40,7 +39,7 @@ RUN set -eu; \
         done; \
     }; \
     apt_update() { apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || true; }; \
-    lists_fetched() { [ -n "$(find /var/lib/apt/lists -name '*Packages*' -print -quit 2>/dev/null)" ]; }; \
+    lists_fetched() { [ -n "$(find /var/lib/apt/lists -name '*Packages*' -print -quit 2>/dev/null || true)" ]; }; \
     fix_dns; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host 'https?://deb\.debian\.org' "${APT_MIRROR}"; fi; \
     rm -rf /var/lib/apt/lists/*; \
@@ -53,9 +52,9 @@ RUN set -eu; \
         apt_update; \
     fi; \
     if ! lists_fetched; then \
-        echo "[ERROR] apt 镜像源与官方源均未取到索引：构建容器无法访问 Debian 源。" >&2; \
-        echo "[ERROR] 若宿主机 /etc/resolv.conf 的 DNS 指向本机（127.x），Docker 容器无法复用，" >&2; \
-        echo "[ERROR] 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
+        echo "ERROR: apt 镜像源与官方源均未取到索引：构建容器无法访问 Debian 源。" >&2; \
+        echo "ERROR: 若宿主机 /etc/resolv.conf 的 DNS 指向本机（127.x），Docker 容器无法复用，" >&2; \
+        echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
         exit 1; \
     fi; \
     apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates; \
@@ -71,12 +70,11 @@ COPY lxmusic-service/requirements.txt /srv/req.lxmusic
 COPY webui-service/requirements.txt /srv/req.webui
 RUN set -eu; \
     fix_dns() { \
-        probe_host="$(printf '%s' "${PIP_INDEX_URL:-https://pypi.org/simple}" | sed -E 's#^https?://##; s#/.*##')"; \
-        if ! getent hosts "${probe_host}" >/dev/null 2>&1; then \
-            echo "[WARN] 容器内 DNS 解析失败（${probe_host}），注入备用公共 DNS 223.5.5.5/119.29.29.29 ..." >&2; \
-            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > /etc/resolv.conf 2>/dev/null \
-            || echo "[WARN] 备用 DNS 注入失败，继续尝试原 DNS ..." >&2; \
-        fi; \
+        { \
+            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n'; \
+            grep -vE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1|localhost)' /etc/resolv.conf 2>/dev/null || true; \
+        } > /tmp/resolv.fnmusic 2>/dev/null || true; \
+        cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     fix_dns; \
     pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui \

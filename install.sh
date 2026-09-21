@@ -1037,7 +1037,10 @@ install_sources_container() {
     log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
     reclaim_container "${CONTAINER_NAME}" || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build || return 1
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+        log_err "Docker 镜像构建或启动失败（compose up --build）。"
+        return 1
+    fi
     # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）
     local waited=0
     if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
