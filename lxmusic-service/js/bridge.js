@@ -11,8 +11,10 @@
  *                 {"id":"r1","ok":false,"error":"..."}
  *                 {"type":"log","level":"info","message":"..."}
  *
- * 用户脚本在 vm 隔离上下文中执行，只能访问 globalThis.lx、setTimeout/clearTimeout、
- * console（转发为 log 事件，绝不污染协议 stdout）。对齐洛雪桌面版自定义源规范：
+ * 用户脚本在 vm 隔离上下文中执行，除 globalThis.lx 外还提供桌面版渲染上下文里
+ * 脚本惯用的 Web API（setInterval、atob/btoa、TextEncoder、fetch、performance、
+ * crypto.getRandomValues 等——官方 preload 在完整渲染进程执行脚本，这些全部可用），
+ * 不暴露 process/require/Buffer。对齐洛雪桌面版自定义源规范：
  * 事件 inited / request / updateAlert；非 local 源 action 仅 musicUrl。
  */
 'use strict';
@@ -23,7 +25,8 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const readline = require('readline');
 
-const MAX_REDIRECTS = 3;
+// needle（桌面版 lx.request 底层）默认 follow 最多 10 跳
+const MAX_REDIRECTS = 10;
 
 function sendOut(obj) {
   try {
@@ -116,8 +119,28 @@ async function httpFetch(url, options) {
       else fd.append(k, v == null ? '' : String(v));
     }
     body = fd;
+  } else if (body != null && typeof body === 'object'
+             && typeof body.arrayBuffer !== 'function'          // Blob/File
+             && !(body instanceof URLSearchParams)
+             && !ArrayBuffer.isView(body) && !(body instanceof ArrayBuffer)) {
+    // 桌面版底层是 needle：body 为普通对象时按 Content-Type 决定编码——
+    // json 头 → JSON 序列化，否则 form-urlencoded。原样交给 fetch 只会抛
+    // "RequestInit: body must be a string/Buffer/..."，野生脚本常直接传对象。
+    const ctKey = Object.keys(headers).find((h) => h.toLowerCase() === 'content-type');
+    const contentType = ctKey ? String(headers[ctKey]) : '';
+    if (/json/i.test(contentType)) {
+      body = JSON.stringify(body);
+    } else {
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(body)) {
+        params.append(k, v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v)));
+      }
+      body = params.toString();
+      if (!contentType) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
   }
-  const timeoutMs = Number(options.timeout) > 0 ? Number(options.timeout) : 20000;
+  // 桌面版 preload：response_timeout = timeout ? Math.min(timeout, 60_000) : 60_000
+  const timeoutMs = Number(options.timeout) > 0 ? Math.min(Number(options.timeout), 60000) : 60000;
   let current = String(url);
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const controller = new AbortController();
@@ -156,7 +179,8 @@ async function httpFetch(url, options) {
     // options 里的 `body` 在初始化前被引用，带请求体的 POST 全部 ReferenceError
     let parsed = text;
     try { parsed = JSON.parse(text); } catch (_) { /* 非 JSON 保持字符串 */ }
-    return { statusCode: resp.status, statusMessage: resp.statusText, headers: objHeaders(resp.headers), body: parsed };
+    return { statusCode: resp.status, statusMessage: resp.statusText, headers: objHeaders(resp.headers),
+             bytes: Buffer.byteLength(text), body: parsed };
   }
   const err = new Error('too many redirects');
   err.tooManyRedirects = true;
@@ -166,7 +190,8 @@ async function httpFetch(url, options) {
 function lxRequest(url, options, callback) {
   const cb = typeof callback === 'function' ? callback : function () {};
   httpFetch(url, options)
-    .then((resp) => cb(null, { statusCode: resp.statusCode, statusMessage: '', headers: resp.headers }, resp.body))
+    .then((resp) => cb(null, { statusCode: resp.statusCode, statusMessage: resp.statusMessage || '',
+                               headers: resp.headers, bytes: resp.bytes }, resp.body))
     .catch((err) => cb(err, null, null));
   // 规范要求返回取消函数；Python 侧持有总超时，桥内无需真实取消
   return function () {};
@@ -186,7 +211,8 @@ const lxUtils = {
       return toBuf(data);
     },
     bufToString(buffer, encoding) {
-      return Buffer.from(buffer).toString(encoding || 'utf8');
+      // 桌面版 preload：Buffer.from(buf, 'binary').toString(format)
+      return Buffer.from(buffer, 'binary').toString(encoding || 'utf8');
     },
   },
   crypto: {
@@ -205,7 +231,13 @@ const lxUtils = {
       return Buffer.concat([decipher.update(toBuf(data)), decipher.final()]);
     },
     rsaEncrypt(data, key) {
-      return crypto.publicEncrypt({ key: String(key), padding: crypto.constants.RSA_PKCS1_PADDING }, toBuf(data));
+      // 桌面版 preload 精确复刻：左侧零填充到 128 字节 + RSA_NO_PADDING。
+      // 网易 weapi 等协议依赖无填充语义，PKCS1 算出的密文上游必拒。
+      const buf = toBuf(data);
+      return crypto.publicEncrypt(
+        { key: String(key), padding: crypto.constants.RSA_NO_PADDING },
+        Buffer.concat([Buffer.alloc(128 - buf.length), buf]),
+      );
     },
   },
   zlib: {
@@ -218,6 +250,7 @@ const lxUtils = {
 
 const EVENT_NAMES = { inited: 'inited', request: 'request', updateAlert: 'updateAlert' };
 const handlers = {};
+let scriptInited = false; // inited 前的未捕获异常按官方语义视为初始化失败
 
 const lx = {
   version: '2.0.0',
@@ -227,8 +260,12 @@ const lx = {
     if (typeof handler === 'function') handlers[event] = handler;
   },
   send(event, data) {
-    if (event === EVENT_NAMES.inited) sendOut({ type: 'event', name: 'inited', payload: data });
-    else if (event === EVENT_NAMES.updateAlert) sendOut({ type: 'event', name: 'updateAlert', payload: data });
+    if (event === EVENT_NAMES.inited) {
+      scriptInited = true;
+      sendOut({ type: 'event', name: 'inited', payload: data });
+    } else if (event === EVENT_NAMES.updateAlert) {
+      sendOut({ type: 'event', name: 'updateAlert', payload: data });
+    }
   },
   request: lxRequest,
   utils: lxUtils,
@@ -266,13 +303,31 @@ lx.currentScriptInfo = {
   rawScript,
 };
 
+// 脚本注册的 interval 不能阻止宿主进程退出（rl close 时统一 process.exit）
+const sandboxSetInterval = (...args) => {
+  const timer = setInterval(...args);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  return timer;
+};
+
 const sandbox = {
   lx,
   setTimeout,
   clearTimeout,
+  setInterval: sandboxSetInterval,
+  clearInterval,
   console: sandboxConsole,
   URL,
   URLSearchParams,
+  // 官方 preload 在完整渲染进程上下文执行脚本，以下 Web API 全部真实可用；
+  // 野生脚本普遍直接使用它们，缺任何一个都是 ReferenceError 打断解析
+  atob,
+  btoa,
+  TextEncoder,
+  TextDecoder,
+  fetch,
+  performance,
+  crypto: crypto.webcrypto,
 };
 sandbox.globalThis = sandbox;
 sandbox.global = sandbox;
@@ -314,10 +369,21 @@ rl.on('line', (line) => {
 rl.on('close', () => process.exit(0));
 process.stdin.on('error', () => process.exit(0));
 
+// 桌面版把 window error/unhandledrejection 在未初始化时上报为 init 失败；
+// 沙箱对齐该语义，避免异步崩溃的脚本“假 inited”后每次解析都失败
 process.on('uncaughtException', (err) => {
-  logEvent('error', ['uncaughtException: ' + (err && err.stack ? err.stack : err)]);
+  const detail = err && err.stack ? err.stack : String(err);
+  if (!scriptInited) {
+    fatal('script init error (uncaughtException): ' + detail);
+    return;
+  }
+  logEvent('error', ['uncaughtException: ' + detail]);
 });
 process.on('unhandledRejection', (reason) => {
   const detail = reason && reason.message ? `${reason.message}${reason.stack ? '\n' + reason.stack : ''}` : formatArg(reason);
+  if (!scriptInited) {
+    fatal('script init error (unhandledRejection): ' + detail);
+    return;
+  }
   logEvent('error', ['unhandledRejection: ' + detail]);
 });
