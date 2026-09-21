@@ -99,27 +99,31 @@ jobs:
             exit 1
           fi
 
-          # 发行版已存在则复用（重跑安全），否则创建
+          # 查发行版是否已存在（重跑安全）：gitee 对不存在的发行版返回 200 + body
+          # 为 null 而非 404，必须按 body 里有无 id 判断，不能只看 HTTP 码
           http="$(curl -sS -o /tmp/gitee-release.json -w '%{http_code}' \
             "${api}/releases/tags/${tag}?access_token=${GITEE_TOKEN}")"
-          if [ "${http}" = 404 ]; then
-            release_id="$(curl -sS --fail-with-body "${api}/releases" \
-              -d "access_token=${GITEE_TOKEN}" \
-              -d "tag_name=${tag}" \
-              -d "name=fnmusic-ext ${tag#v}" \
-              --data-urlencode "body@/tmp/release-notes.md" \
-              | jq -r '.id')"
-          elif [ "${http}" = 200 ]; then
-            release_id="$(jq -r '.id' /tmp/gitee-release.json)"
+          release_id=""
+          if [ "${http}" = 200 ]; then
+            release_id="$(jq -r 'if .id then .id else "" end' /tmp/gitee-release.json)"
+          elif [ "${http}" != 404 ]; then
+            echo "ERROR: 查询 Gitee 发行版失败 HTTP ${http}" >&2
+            cat /tmp/gitee-release.json >&2 || true
+            exit 1
+          fi
+          if [ -n "${release_id}" ]; then
             # 重发时清理旧附件（gitee 未公开文档化，尽力而为，失败不阻断）
             for attach_id in $(jq -r '.attach_files[]?.id' /tmp/gitee-release.json); do
               curl -sS -o /dev/null -X DELETE \
                 "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
             done
           else
-            echo "ERROR: 查询 Gitee 发行版失败 HTTP ${http}" >&2
-            cat /tmp/gitee-release.json >&2 || true
-            exit 1
+            release_id="$(curl -sS --fail-with-body "${api}/releases" \
+              -d "access_token=${GITEE_TOKEN}" \
+              -d "tag_name=${tag}" \
+              -d "name=fnmusic-ext ${tag#v}" \
+              --data-urlencode "body@/tmp/release-notes.md" \
+              | jq -r '.id')"
           fi
 
           # 上传 fpk + sha256，收集下载链接（兼容数组/对象两种返回形态）
