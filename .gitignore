@@ -27,10 +27,8 @@ __pycache__/
 **/.git.nested/
 TASK_*.md
 .tasks_archive/
-.cursor/*
-!.cursor/rules/
-!.cursor/rules/**
 .tools/
 dist/
 packaging/fpk/.build/
 
+.cursor/
