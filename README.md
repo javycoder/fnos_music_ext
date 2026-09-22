@@ -1,3 +1,5 @@
+> **本分支为 AI Agent 自动迭代分支**：由 AI Agent 自动进行迭代开发与 Bug 修复，稳定性未经人工充分验证。
+
 # fnmusic-ext 飞牛音乐扩展代理
 
 Gitee：https://gitee.com/javycoder/fnos_music_ext
