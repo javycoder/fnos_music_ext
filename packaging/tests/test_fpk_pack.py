@@ -24,7 +24,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FPK_DIR = REPO_ROOT / "packaging" / "fpk"
 APPNAME = "fnmusic-ext"
 ENTRY_ID = "fnmusic-ext.main"
-WEBUI_PORT = "8774"
 
 
 def _png_size(path: Path) -> tuple[int, int]:
@@ -86,9 +85,12 @@ class TestUiConfig:
         cfg = json.loads((stage / "app" / "ui" / "config").read_text())
         entry = cfg[".url"][ENTRY_ID]
         assert entry["type"] == "iframe"
-        assert entry["port"] == WEBUI_PORT
+        # 空端口 + 网关路径：桌面是 HTTPS，不能把管理页嵌成 http://主机:8774
+        assert entry["port"] == ""
         assert entry["protocol"] == "http"
-        assert entry["url"] == "/"
+        assert entry["url"] == "/app/fnmusic-ext/"
+        assert entry["gatewayPrefix"] == "/app/fnmusic-ext"
+        assert entry["gatewaySocket"] == "fnmusic-ext.sock"
         assert entry["allUsers"] is False
         assert entry["icon"] == "images/icon_{0}.png"
         # fnpack 强制入口名以应用名开头（实测规则）

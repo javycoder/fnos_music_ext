@@ -6,9 +6,11 @@
             "icon": "images/icon_{0}.png",
             "type": "iframe",
             "protocol": "http",
-            "port": "8774",
-            "url": "/",
-            "allUsers": false
+            "port": "",
+            "url": "/app/fnmusic-ext/",
+            "allUsers": false,
+            "gatewaySocket": "fnmusic-ext.sock",
+            "gatewayPrefix": "/app/fnmusic-ext"
         }
     }
 }
