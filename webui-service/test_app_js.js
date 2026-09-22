@@ -68,9 +68,9 @@ global.setTimeout = (fn, ms, ...a) => {
 
 /* ------------------------------------------------ fetch 桩（可编排队列）---- */
 const defaults = new Map([
-  ["/api/config", { values: {} }],
-  ["/api/status", { version: "t", current_provider: "none", processes: {}, services: {}, lx_source: null }],
-  ["/api/platforms", { ok: true, enabled: [], registered: [] }],
+  ["/app/fnmusic-ext/api/config", { values: {} }],
+  ["/app/fnmusic-ext/api/status", { version: "t", current_provider: "none", processes: {}, services: {}, lx_source: null }],
+  ["/app/fnmusic-ext/api/platforms", { ok: true, enabled: [], registered: [] }],
 ]);
 let routes = new Map(); // path -> bodies 队列（Error 表示 HTTP 非 2xx）
 
@@ -118,7 +118,7 @@ test("checkQrStatus：信封 data.code 各状态分支文案", async () => {
   ];
   for (const [code, text] of cases) {
     reset();
-    enqueue("/api/netease/auth/login/check", { ok: true, data: { code, message: "x" } });
+    enqueue("/app/fnmusic-ext/api/netease/auth/login/check", { ok: true, data: { code, message: "x" } });
     await global.checkQrStatus("K1");
     assert.strictEqual(els.get("#qr-status").textContent, text);
   }
@@ -126,8 +126,8 @@ test("checkQrStatus：信封 data.code 各状态分支文案", async () => {
 
 test("checkQrStatus：803 信封 → 登录成功并同步账号昵称", async () => {
   reset();
-  enqueue("/api/netease/auth/login/check", { ok: true, data: { code: 803, cookie: "c" } });
-  enqueue("/api/netease/auth/status", { ok: true, data: { logged_in: true, nickname: "小明", user_id: 1 } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/login/check", { ok: true, data: { code: 803, cookie: "c" } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: true, nickname: "小明", user_id: 1 } });
   await global.checkQrStatus("K1");
   await tick(5); // 等 syncNeteaseAccount 的异步 fetch 落定
   assert.ok(els.get("#qr-status").textContent.includes("登录成功"));
@@ -136,8 +136,8 @@ test("checkQrStatus：803 信封 → 登录成功并同步账号昵称", async (
 
 test("checkQrStatus：803 扁平 {code} 结构兼容", async () => {
   reset();
-  enqueue("/api/netease/auth/login/check", { code: 803 });
-  enqueue("/api/netease/auth/status", { ok: true, data: { logged_in: true, user_id: 42 } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/login/check", { code: 803 });
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: true, user_id: 42 } });
   await global.checkQrStatus("K1");
   await tick(5);
   assert.ok(els.get("#qr-status").textContent.includes("登录成功"));
@@ -149,8 +149,8 @@ test("checkQrStatus：803 停止轮询定时器", async () => {
   const before = openIntervals;
   global.pollQr("K1"); // 默认 2000ms，测试期内不会自然触发
   assert.strictEqual(openIntervals, before + 1);
-  enqueue("/api/netease/auth/login/check", { ok: true, data: { code: 803 } });
-  enqueue("/api/netease/auth/status", { ok: true, data: { logged_in: false } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/login/check", { ok: true, data: { code: 803 } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: false } });
   await global.checkQrStatus("K1");
   await tick(5);
   assert.strictEqual(openIntervals, before); // 803 后停表
@@ -159,10 +159,10 @@ test("checkQrStatus：803 停止轮询定时器", async () => {
 test("startQrLogin：信封 data.unikey 出码并启动轮询", async () => {
   reset();
   const before = openIntervals;
-  enqueue("/api/netease/auth/status", { ok: true, data: { logged_in: false } });
-  enqueue("/api/netease/auth/login", { ok: true, data: { unikey: "KEY9", qr_url: "u" } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: false } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/login", { ok: true, data: { unikey: "KEY9", qr_url: "u" } });
   await global.startQrLogin();
-  assert.strictEqual(els.get("#qr-img").src, "/api/netease/qr?unikey=KEY9");
+  assert.strictEqual(els.get("#qr-img").src, "/app/fnmusic-ext/api/netease/qr?unikey=KEY9");
   assert.strictEqual(els.get("#qr-img").hidden, false);
   assert.strictEqual(els.get("#qr-status").textContent, "请用手机网易云音乐 App 扫码");
   assert.strictEqual(openIntervals, before + 1); // 轮询已启动
@@ -171,7 +171,7 @@ test("startQrLogin：信封 data.unikey 出码并启动轮询", async () => {
 
 test("startQrLogin：上游不可达 → 生成失败文案", async () => {
   reset();
-  enqueue("/api/netease/auth/login", new Error("musicbox 服务不可达"), new Error("musicbox 服务不可达"));
+  enqueue("/app/fnmusic-ext/api/netease/auth/login", new Error("musicbox 服务不可达"), new Error("musicbox 服务不可达"));
   await global.startQrLogin();
   assert.ok(els.get("#qr-status").textContent.startsWith("生成失败："));
   assert.strictEqual(els.get("#qr-img").hidden, true);
@@ -179,11 +179,11 @@ test("startQrLogin：上游不可达 → 生成失败文案", async () => {
 
 test("syncNeteaseAccount：未登录清空 / 请求失败清空", async () => {
   reset();
-  enqueue("/api/netease/auth/status", { ok: true, data: { logged_in: false } });
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: false } });
   await global.syncNeteaseAccount();
   assert.strictEqual(els.get("#qr-check").textContent, "");
   reset();
-  enqueue("/api/netease/auth/status", new Error("down"));
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", new Error("down"));
   await global.syncNeteaseAccount();
   assert.strictEqual(els.get("#qr-check").textContent, "");
 });
