@@ -109,6 +109,8 @@ CONF = {
     "lx_sources": _normalize_lx_sources(os.environ.get("LX_SOURCES", "")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
+    "search_empty_retry_delay": float(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY_DELAY", "1.2")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "3.0")),
     "fav_dir": os.environ.get(
@@ -2156,46 +2158,106 @@ async def search_track(request: Request):
 
 
 async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
-    sources = []
+    source_factories: list[tuple[str, Callable[[], Coroutine]]] = []
     if CONF.get("netease_enabled"):
-        sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
+        source_factories.append((
+            "musicbox",
+            lambda: fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]),
+        ))
     if CONF.get("musicdl_enabled"):
-        sources.append(fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
+        source_factories.append((
+            "musicdl",
+            lambda: fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]),
+        ))
     if CONF.get("lx_enabled"):
-        sources.append(fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
-    tasks = [asyncio.create_task(coro) for coro in sources]
-    pending = set(tasks)
-    partial = False
+        source_factories.append((
+            "lx",
+            lambda: fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]),
+        ))
+
+    all_tasks: list[asyncio.Task] = []
+    active_sources = list(source_factories)
     results: dict[asyncio.Task, list] = {}
+    partial = False
+
+    max_retries = max(0, int(CONF.get("search_empty_retry", 1)))
+    retry_delay = max(0.0, float(CONF.get("search_empty_retry_delay", 1.2)))
+
     try:
         deadline = asyncio.get_running_loop().time() + max(1.0, float(CONF["search_timeout"]))
-        while pending:
-            done, pending = await asyncio.wait(pending, timeout=max(0, deadline - asyncio.get_running_loop().time()), return_when=asyncio.FIRST_COMPLETED)
-            if not done:
-                partial = True
-                break
-            for task in tasks:
-                if task not in done:
+        round_idx = 0
+        while True:
+            round_tasks = [asyncio.create_task(create_coro()) for _, create_coro in active_sources]
+            all_tasks.extend(round_tasks)
+            task_to_source = {task: src for (src, _), task in zip(active_sources, round_tasks)}
+            pending = set(round_tasks)
+
+            while pending:
+                remaining_time = deadline - asyncio.get_running_loop().time()
+                if remaining_time <= 0:
+                    partial = True
+                    break
+                done, pending = await asyncio.wait(pending, timeout=max(0, remaining_time), return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    partial = True
+                    break
+                for task in round_tasks:
+                    if task not in done:
+                        continue
+                    try:
+                        data = task.result()
+                    except Exception:
+                        data = None
+                    partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
+                    items = data.get("items", []) if isinstance(data, dict) else (data or [])
+                    results[task] = items
+                    if not entry["pages"]:
+                        ordered = [item for source_task in all_tasks for item in results.get(source_task, [])]
+                    else:
+                        ordered = entry["items"] + items
+                    entry["items"] = deduplicate_online_items(ordered)[:2000]
+
+            failed_sources: list[tuple[str, Callable[[], Coroutine]]] = []
+            failed_names: list[str] = []
+            for src_tuple, task in zip(active_sources, round_tasks):
+                name, _ = src_tuple
+                if not task.done():
                     continue
                 try:
-                    data = task.result()
+                    res = task.result()
                 except Exception:
-                    data = None
-                partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
-                items = data.get("items", []) if isinstance(data, dict) else (data or [])
-                results[task] = items
-                if not entry["pages"]:
-                    ordered = [item for source_task in tasks for item in results.get(source_task, [])]
-                else:
-                    ordered = entry["items"] + items
-                entry["items"] = deduplicate_online_items(ordered)[:2000]
+                    res = None
+                if res is None:
+                    failed_sources.append(src_tuple)
+                    failed_names.append(name)
+
+            if not entry["items"] and failed_sources and round_idx < max_retries:
+                now = asyncio.get_running_loop().time()
+                if now + retry_delay >= deadline:
+                    logger.warning("搜索首屏空结果重试跳过(超期): keyword=%r failed=%s", keyword, ",".join(failed_names))
+                    break
+                logger.info("搜索首屏空结果触发重试: keyword=%r round=%d/%d failed=%s delay=%.2fs",
+                            keyword, round_idx + 1, max_retries, ",".join(failed_names), retry_delay)
+                if retry_delay > 0:
+                    await asyncio.sleep(min(retry_delay, max(0.0, deadline - asyncio.get_running_loop().time())))
+                round_idx += 1
+                active_sources = failed_sources
+                continue
+
+            if round_idx > 0:
+                logger.info("搜索首屏重试结束: keyword=%r items=%d partial=%s",
+                            keyword, len(entry["items"]), partial)
+            break
+
+        if not entry["items"]:
+            partial = True
         entry["partial"] = partial
         entry["ts"] = time.time()
     finally:
-        for task in tasks:
+        for task in all_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
 
 def _session_page(entry: dict, page: int, size: int) -> list[dict]:
