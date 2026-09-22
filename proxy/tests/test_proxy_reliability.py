@@ -123,6 +123,7 @@ def test_strict_identity_alternatives_and_scope(monkeypatch):
     monkeypatch.setitem(p.CONF, "online_sources", "Other")
     assert p._search_scope(request()) != old
     assert p._search_ttl({"items": [original]}) > p._search_ttl({"items": [original], "partial": True}) > p._search_ttl({"items": []})
+    assert p._search_ttl({"items": [], "partial": True}) == p._search_ttl({"items": []})
 
 
 @pytest.mark.anyio
