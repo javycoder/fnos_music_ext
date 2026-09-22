@@ -22,7 +22,7 @@ def test_version_file_exists_with_semver():
     assert version_file.is_file(), "仓库根目录必须存在 VERSION 文件"
     ver = _read_repo_version()
     parts = ver.split(".")
-    assert len(parts) == 3 and all(p.isdigit() for p in parts), f"VERSION 必须是 x.y.z 形式，当前为 {ver!r}"
+    assert len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isalnum(), f"VERSION 必须是 x.y.z 形式，当前为 {ver!r}"
 
 
 def test_get_version_reads_file(monkeypatch):
