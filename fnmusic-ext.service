@@ -9,6 +9,7 @@ User=root
 WorkingDirectory=@BASE_DIR@
 ExecStart=/bin/bash "@BASE_DIR@/proxy/run_proxy.sh"
 ExecStartPost=/usr/bin/python3 "@BASE_DIR@/proxy/takeover.py" ready --timeout 65
+ExecStartPost=/usr/bin/python3 "@BASE_DIR@/proxy/webui_gateway.py" "@BASE_DIR@"
 ExecStopPost=/usr/bin/python3 "@BASE_DIR@/proxy/takeover.py" restore
 TimeoutStartSec=75
 TimeoutStopSec=20

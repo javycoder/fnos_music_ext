@@ -538,3 +538,8 @@ def test_index_served():
         icon = client.get("/static/icon.png")
         assert icon.status_code == 200
         assert icon.content[:8] == b"\x89PNG\r\n\x1a\n"
+        # 桌面网关把整段 /app/fnmusic-ext 前缀转到这里
+        via_desktop = client.get("/app/fnmusic-ext/")
+        assert via_desktop.status_code == 200
+        assert "/app/fnmusic-ext/static/app.js" in via_desktop.text
+        assert client.get("/app/fnmusic-ext/static/icon.png").status_code == 200

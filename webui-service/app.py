@@ -577,3 +577,27 @@ async def index():
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# 飞牛桌面 iframe 不能嵌 http://主机:8774（桌面是 HTTPS，混合内容会被浏览器丢掉，窗口一片空白）。
+# 入口改走网关同源路径 /app/fnmusic-ext，这里把该前缀剥掉，直连 :8774 的 /api 不受影响。
+DESKTOP_PREFIX = "/app/fnmusic-ext"
+
+
+class DesktopPrefixMiddleware:
+    def __init__(self, app, prefix: str = DESKTOP_PREFIX):
+        self.app = app
+        self.prefix = prefix
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path") or ""
+            if path == self.prefix or path.startswith(self.prefix + "/"):
+                scope = dict(scope)
+                stripped = path[len(self.prefix):] or "/"
+                scope["path"] = stripped
+                if isinstance(scope.get("raw_path"), (bytes, bytearray)):
+                    scope["raw_path"] = stripped.encode("ascii")
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(DesktopPrefixMiddleware)

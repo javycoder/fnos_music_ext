@@ -52,7 +52,11 @@ CONF = {
     "neg_cache_ttl": int(os.environ.get("MUSICDL_NEG_TTL", "30")),
     # 自适应熔断/降级
     "slow_degrade_s": float(os.environ.get("MUSICDL_SLOW_DEGRADE_S", "8")),
-    "adaptive_min_timeout": float(os.environ.get("MUSICDL_ADAPTIVE_MIN_TIMEOUT", "3")),
+    # 一页 10 首的上游搜索大约要 4 秒，再留出探活。压到 3 秒时搜索函数还没返回，
+    # 进度里一首都没有，界面就是 0 条，并且会把下一次超时继续压在地板上。
+    "adaptive_min_timeout": float(os.environ.get("MUSICDL_ADAPTIVE_MIN_TIMEOUT", "8")),
+    "search_page_cap": max(1, int(os.environ.get("MUSICDL_SEARCH_PAGE_CAP", "10"))),
+    "probe_timeout": max(0.2, float(os.environ.get("MUSICDL_PROBE_TIMEOUT", "2"))),
     "fast_return_items": int(os.environ.get("MUSICDL_FAST_RETURN_ITEMS", "12")),
     "slow_grace_s": float(os.environ.get("MUSICDL_SLOW_GRACE_S", "2")),
 }
@@ -158,7 +162,9 @@ def _search_one_source(source: str, keyword: str, limit: int) -> list:
         music_sources=[source],
         init_music_clients_cfg={
             source: {
-                "search_size_per_source": max(limit, 5),
+                # 库按这个数量翻页，并且每首都会先解析直链。30 条限额会变成 6 页，
+                # 整次 search() 返回前一首都交不出来。封顶一页，够首屏，也放得进超时。
+                "search_size_per_source": min(max(int(limit or 1), 1), int(CONF["search_page_cap"])),
                 "work_dir": CONF["work_dir"],
                 "max_retries": 1,
             },
@@ -234,7 +240,7 @@ def _probe_playable_sync(url: str, headers: dict) -> bool:
                 headers=hdrs,
                 impersonate="chrome",
                 allow_redirects=True,
-                timeout=5,
+                timeout=CONF["probe_timeout"],
             )
             if r.status_code == 405:
                 hdrs["Range"] = "bytes=0-1"
@@ -244,7 +250,7 @@ def _probe_playable_sync(url: str, headers: dict) -> bool:
                     impersonate="chrome",
                     allow_redirects=True,
                     stream=True,
-                    timeout=5,
+                    timeout=CONF["probe_timeout"],
                 )
             if r.status_code in (200, 206):
                 ct = (r.headers.get("content-type") or "").lower()
@@ -256,7 +262,7 @@ def _probe_playable_sync(url: str, headers: dict) -> bool:
             return False
     else:
         try:
-            with httpx.Client(follow_redirects=True, timeout=5.0) as cx:
+            with httpx.Client(follow_redirects=True, timeout=CONF["probe_timeout"]) as cx:
                 r = cx.head(url, headers=hdrs)
                 if r.status_code == 405:
                     hdrs["Range"] = "bytes=0-1"
@@ -533,7 +539,9 @@ async def search(
                 latency = time.monotonic() - started
                 items = collect(source)
                 if progress.partial:
-                    ADAPTIVE.record_failure(source)
+                    # 已经交出歌就不要再把超时往下压。压到搜不完一页后，下次还是 0 条。
+                    if not items:
+                        ADAPTIVE.record_failure(source)
                     return source, items, "partial results (probe deadline reached)"
                 ADAPTIVE.record_success(source, latency)
                 if items:
@@ -543,9 +551,10 @@ async def search(
                 # Admission rejection is not another upstream failure.
                 return source, collect(source), str(exc)
             except asyncio.TimeoutError:
-                SOURCE_BREAKER.record_failure(source)
-                ADAPTIVE.record_failure(source)
                 items = collect(source)
+                if not items:
+                    SOURCE_BREAKER.record_failure(source)
+                    ADAPTIVE.record_failure(source)
                 suffix = " (partial results)" if items else ""
                 return source, items, f"timeout after {timeout:.1f}s{suffix}"
             except asyncio.CancelledError:
@@ -595,9 +604,9 @@ async def search(
             for task, src in pending.items():
                 items = collect(src)
                 results.append((src, items, skip_reason + (" (partial results)" if items else "")))
-                # 被放弃的慢源：收紧自适应超时；若是全局超时放弃，同时计入熔断失败
-                ADAPTIVE.record_failure(src)
-                if not skipped_fast_return:
+                # 没等到歌才收紧。已经有结果、或因为别的源够了而提前返回，都不是这个源坏了。
+                if not items and not skipped_fast_return:
+                    ADAPTIVE.record_failure(src)
                     SOURCE_BREAKER.record_failure(src)
 
         all_items = []
