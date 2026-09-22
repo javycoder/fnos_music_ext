@@ -43,6 +43,8 @@ BUILD_BUDGET_S = 25.0
 NETEASE_DAILY_LIMIT = 40
 NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜
 CHART_FETCH_COUNT = 40
+RECOMMEND_SEARCH_CONCURRENCY = int(os.environ.get("FNMUSIC_REC_SEARCH_CONCURRENCY", "2"))
+RECOMMEND_SEARCH_INTERVAL = float(os.environ.get("FNMUSIC_REC_SEARCH_INTERVAL", "0.15"))
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HIRA_KATA = re.compile(r"[\u3040-\u30ff]")
@@ -880,7 +882,7 @@ async def resolve_recommendations(
     out: list[dict] = []
     seen_ids: set[str] = set()
     seen_ta: set[tuple[str, str]] = set()
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(RECOMMEND_SEARCH_CONCURRENCY)
 
     def _excluded(guid: str, title: str, artist: str) -> bool:
         if guid and guid in skip_ids:
@@ -893,12 +895,16 @@ async def resolve_recommendations(
         artist = rec.get("artist") or ""
         keyword = " ".join(x for x in (artist, title) if x).strip() or title
         async with sem:
+            if RECOMMEND_SEARCH_INTERVAL > 0:
+                await asyncio.sleep(RECOMMEND_SEARCH_INTERVAL)
             items = await _search_keyword(
                 keyword, musicdl_client, musicbox_client, netease_enabled,
                 lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             )
         if not items and artist:
             async with sem:
+                if RECOMMEND_SEARCH_INTERVAL > 0:
+                    await asyncio.sleep(RECOMMEND_SEARCH_INTERVAL)
                 items = await _search_keyword(
                     artist, musicdl_client, musicbox_client, netease_enabled,
                     lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
@@ -1312,6 +1318,32 @@ async def get_or_build_daily(
     t0 = time.monotonic()
     contributing: list[str] = []
 
+    def _save_checkpoint() -> None:
+        if not tracks:
+            return
+        stamped = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
+        picked = pick_playlist_cover_track(stamped)
+        cover_id = str((picked or {}).get("coverId") or (picked or {}).get("guid") or guid)
+        pl = build_playlist_record(
+            guid=guid,
+            name=playlist_display_name(kind, day),
+            cover_id=cover_id,
+            track_count=len(stamped),
+        )
+        cp = {
+            "day": day,
+            "kind": kind,
+            "guid": guid,
+            "status": "ready" if len(stamped) >= PLAYLIST_SIZE else "partial",
+            "playlist": pl,
+            "tracks": stamped,
+            "tiers": list(contributing),
+            "seedCount": len(play_seeds),
+            "favoriteCount": len(fav_seeds),
+            "builtAt": int(time.time()),
+        }
+        save_daily_cache(user_guid, day, cp, kind)
+
     async def run_tier(name: str, tier_factory) -> None:
         nonlocal tracks
         if len(tracks) >= PLAYLIST_SIZE:
@@ -1329,6 +1361,7 @@ async def get_or_build_daily(
             tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
             if len(tracks) > before:
                 contributing.append(name)
+                _save_checkpoint()
 
     # 每日推荐链：网易真每日推荐 -> LLM（仅网易未启用）-> 种子关键词兜底；
     # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。

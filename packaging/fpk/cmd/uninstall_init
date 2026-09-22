@@ -28,8 +28,13 @@ ITEMS="$(fnmusic_data_items)"
 [ -n "${ITEMS}" ] || exit 0
 
 # target symlink looks like /vol{n}/@appcenter/fnmusic-ext
-VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+\/\).*#\1#p')"
-VOL="${VOL:-/vol1}"
+VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
+# 解析失败时落到存储卷根目录。缺斜杠会变成 /vol1fnmusic-ext-backup-… 写到文件系统根上。
+VOL="${VOL:-/vol1/}"
+case "${VOL}" in
+    */) ;;
+    *) VOL="${VOL}/" ;;
+esac
 ARCHIVE="${VOL}fnmusic-ext-backup-$(date +%Y%m%d%H%M%S).tar.gz"
 # shellcheck disable=SC2086
 if ! tar -czf "${ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then

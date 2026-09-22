@@ -260,6 +260,7 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "hash": fhash,
             "hash_hq": hq,
             "hash_sq": sq,
+            "album_id": str(it.get("album_id") or ""),
             "mixsongid": str(it.get("mixsongid") or ""),
             "pay_type": pay_type,
         }
@@ -714,6 +715,48 @@ def _fresh_probe(item: "dict | None", want_tier: str = "standard") -> "dict | No
     return {k: v for k, v in p.items() if k not in ("ts", "tier")}
 
 
+async def _fill_script_meta(client: httpx.AsyncClient, src: str, item: dict, identifier: str) -> None:
+    """缓存过期后的播放只剩平台主键。QQ 的 media mid、酷狗的 albumId 要补回来再交给脚本。"""
+    if not identifier:
+        return
+    try:
+        if src == "tx" and (not item.get("str_media_mid") or not item.get("album_id")):
+            r = await client.get(
+                "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg",
+                params={"songmid": identifier, "format": "json"},
+                headers={"User-Agent": UA_PC, "Referer": "https://y.qq.com/"},
+            )
+            song = ((r.json() or {}).get("data") or [None])[0] or {}
+            if isinstance(song, dict):
+                file_obj = song.get("file") if isinstance(song.get("file"), dict) else {}
+                album = song.get("album") if isinstance(song.get("album"), dict) else {}
+                media = str(file_obj.get("media_mid") or "").strip()
+                if media:
+                    item["str_media_mid"] = media
+                album_id = str(album.get("id") or "").strip()
+                if album_id and album_id not in ("0", "None"):
+                    item["album_id"] = album_id
+                if not item.get("title"):
+                    item["title"] = str(song.get("name") or song.get("title") or "")
+                if not item.get("songmid"):
+                    item["songmid"] = str(song.get("mid") or identifier)
+        elif src == "kg" and not str(item.get("album_id") or "").strip():
+            r = await client.get(
+                "http://m.kugou.com/app/i/getSongInfo.php",
+                params={"cmd": "playInfo", "hash": identifier},
+                headers={"User-Agent": UA_MOBILE},
+            )
+            data = r.json() or {}
+            if isinstance(data, dict):
+                album_id = str(data.get("albumid") or data.get("req_albumid") or "").strip()
+                if album_id and album_id not in ("0", "None"):
+                    item["album_id"] = album_id
+                if not item.get("hash"):
+                    item["hash"] = identifier
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("lx meta fill %s %s failed: %s", src, identifier, exc)
+
+
 async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
                              tier: str = "standard", retained: dict | None = None) -> "dict | None":
     """Shared search/URL pipeline: user source musicUrl -> verify -> downgrade."""
@@ -730,6 +773,7 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
     item.update(verified=False, validation_status="unverified", completeness="unknown")
     identifier = parse_track_id(str(item.get("id") or ""))[1]
     item.setdefault("_identifier", identifier)
+    await _fill_script_meta(client, src, item, identifier)
     music_info = build_music_info(item, src)
     attempted = []
     best = None
@@ -887,7 +931,8 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         if any(marker in title for marker in _TRIAL_TITLE_MARKERS):
             continue
         singers = it.get("singer") or []
-        album = it.get("album") or {}
+        album = it.get("album") if isinstance(it.get("album"), dict) else {}
+        file_obj = it.get("file") if isinstance(it.get("file"), dict) else {}
         pay = it.get("pay") or {}
         candidates.append(
             {
@@ -906,6 +951,8 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
                 "file_size": 0,
                 "lyric": "",
                 "songmid": mid,
+                "str_media_mid": str(file_obj.get("media_mid") or ""),
+                "album_id": str(album.get("id") or ""),
                 "pay_type": int(pay.get("pay_play") or 0),
             }
         )
