@@ -1,4 +1,5 @@
 """Tests for daily recommend, play-history merge, and LLM config gating."""
+import asyncio
 import json
 import os
 import sqlite3
@@ -807,3 +808,50 @@ def test_playlist_list_injects_both_playlists_with_disguised_cover(tmp_path, mon
             assert cover.startswith("track_") and len(cover) == 6 + 32
             resolved = resolve_real_guid(cover)
             assert str(resolved).startswith("online:netease:")
+
+
+@pytest.mark.asyncio
+async def test_resolve_recommendations_concurrency_and_throttle(monkeypatch):
+    active = 0
+    max_active = 0
+    search_timestamps = []
+
+    async def mock_search_keyword(keyword, *args, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        search_timestamps.append(time.monotonic())
+        try:
+            await asyncio.sleep(0.02)
+        finally:
+            active -= 1
+            return [{
+                "id": f"netease:{keyword}",
+                "source": "netease",
+                "title": keyword,
+                "artist": "Artist",
+                "album": "Album",
+                "duration_s": 200,
+                "ext": "mp3",
+            }]
+
+    monkeypatch.setattr(dailyrec, "_search_keyword", mock_search_keyword)
+    monkeypatch.setattr(dailyrec, "RECOMMEND_SEARCH_CONCURRENCY", 2)
+    monkeypatch.setattr(dailyrec, "RECOMMEND_SEARCH_INTERVAL", 0.05)
+
+    recs = [{"title": f"Song {i}", "artist": "Artist"} for i in range(6)]
+    t0 = time.monotonic()
+    results = await dailyrec.resolve_recommendations(
+        recs=recs,
+        musicdl_client=None,
+        musicbox_client=None,
+        netease_enabled=True,
+        build_track=lambda pick: {"guid": f"online:{pick['id']}", "title": pick["title"], "artist": pick["artist"]},
+        limit=6,
+    )
+
+    assert max_active <= 2
+    assert len(results) == 6
+    assert len(search_timestamps) >= 6
+    assert time.monotonic() - t0 >= 0.12
+
