@@ -65,6 +65,7 @@ def run(coro):
 def _kg_payload() -> dict:
     return {"data": {"info": [
         {"hash": "h1", "songname": "晴天", "singername": "周杰伦", "album_name": "叶惠美",
+         "album_id": 966846,
          "duration": 269000, "pay_type": 0, "sqhash": "sq1", "hqhash": "hq1",
          "sq_size": 27000000, "filesize": 4300000,
          "origin_cover": "http://img/x{size}.jpg", "mixsongid": 77},
@@ -92,6 +93,7 @@ def test_kg_search_contract(with_source):
     assert first["cover_url"] == "http://img/x480.jpg"  # {size} → 480
     assert first["file_size"] == 27000000  # 优先 sq_size
     assert first["lx_source"] == "kg"
+    assert first["album_id"] == "966846"
     # 付费曲不丢弃：转探活队列，探活通过后以 verified 补进结果
     vip = by_id["lx:kg:h2"]
     assert vip["validation_status"] == "media_verified"
@@ -196,10 +198,67 @@ def test_mg_search_contract(with_source):
 
 # ------------------------------------------------------------ 合成负载：tx ---
 
+def test_cold_tx_resolve_fills_media_mid(with_source):
+    """播放缓存过期后只剩 songmid，解析前要补回 media mid 和专辑 id。"""
+    detail = {"data": [{
+        "mid": "m9", "name": "晴天",
+        "file": {"media_mid": "media9"},
+        "album": {"id": 8220, "name": "叶惠美"},
+    }]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "fcg_play_single_song" in url:
+            return httpx.Response(200, json=detail)
+        if url.startswith("https://media.test/"):
+            return httpx.Response(
+                206, content=_FLAC,
+                headers={"content-range": f"bytes 0-{len(_FLAC)-1}/{len(_FLAC)+123456}"},
+            )
+        return httpx.Response(404)
+
+    http = mock_client(handler)
+    item = {"id": "lx:tx:m9", "lx_source": "tx", "title": "晴天", "artist": "周杰伦"}
+    try:
+        result = run(lxapp.resolve_and_probe(http, "tx", item, "standard"))
+    finally:
+        run(http.aclose())
+    assert result and str(result.get("url") or "").startswith("http")
+    info = with_source._runtime.calls[0]["info"]
+    assert info["songmid"] == "m9"
+    assert info["strMediaMid"] == "media9"
+    assert info["albumId"] == "8220"
+
+
+def test_cold_kg_resolve_fills_album_id(with_source):
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "getSongInfo.php" in url:
+            return httpx.Response(200, json={"albumid": 966846, "songName": "晴天", "hash": "h9"})
+        if url.startswith("https://media.test/"):
+            return httpx.Response(
+                206, content=_FLAC,
+                headers={"content-range": f"bytes 0-{len(_FLAC)-1}/{len(_FLAC)+123456}"},
+            )
+        return httpx.Response(404)
+
+    http = mock_client(handler)
+    item = {"id": "lx:kg:h9", "lx_source": "kg", "title": "晴天", "artist": "周杰伦", "hash": "h9"}
+    try:
+        result = run(lxapp.resolve_and_probe(http, "kg", item, "standard"))
+    finally:
+        run(http.aclose())
+    assert result and str(result.get("url") or "").startswith("http")
+    info = with_source._runtime.calls[0]["info"]
+    assert info["hash"] == "h9"
+    assert info["albumId"] == "966846"
+
+
 def test_tx_search_contract(with_source):
     songs = {"list": [
         {"mid": "m1", "title": "晴天", "singer": [{"name": "周杰伦"}],
-         "album": {"name": "叶惠美", "mid": "am1"}, "interval": 269,
+         "album": {"name": "叶惠美", "mid": "am1", "id": 8220}, "interval": 269,
+         "file": {"media_mid": "media1"},
          "pay": {"pay_play": 0}},
         {"mid": "", "title": "无mid", "singer": [], "album": {}, "interval": 1},
         {"mid": "m3", "title": "试听版", "singer": [], "album": {}, "interval": 1,
@@ -217,6 +276,8 @@ def test_tx_search_contract(with_source):
     assert item["artist"] == "周杰伦" and item["album"] == "叶惠美"
     assert item["duration_s"] == 269
     assert item["cover_url"].startswith("https://y.gtimg.cn/music/photo_new/T002R300x300M000am1")
+    assert item["str_media_mid"] == "media1"
+    assert item["album_id"] == "8220"
     assert item["validation_status"] == "media_verified"
 
 
