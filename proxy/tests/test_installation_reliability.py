@@ -1078,6 +1078,25 @@ def test_official_only_restore_clears_old_record(state, servers):
 
 # ---------------------------------------------------------------- 网络脆弱性修复（v2.1.0）
 
+def test_extend_reloads_version_without_read_eof_failure(tmp_path):
+    """VERSION 无末尾换行时 read 会返回 1。extend 在 set -e 下必须改用 head。"""
+    text = (BASE / "extend.sh").read_text(encoding="utf-8")
+    assert "read -r FNMUSIC_VERSION" not in text
+    version = tmp_path / "VERSION"
+    version.write_bytes(b"9.9.9")
+    script = (
+        "set -euo pipefail\n"
+        f'BASE_DIR="{tmp_path}"\n'
+        'FNMUSIC_VERSION="stale-from-dotenv"\n'
+        'FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d \'[:space:]\' || true)"\n'
+        'FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"\n'
+        'printf "%s\\n" "${FNMUSIC_VERSION}"\n'
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "9.9.9"
+
+
 def test_install_scripts_delegate_proxy_deps_to_fallback_helper():
     """宿主机代理依赖安装必须走 ensure_proxy_deps.sh 多源回退，不允许退回单源裸 pip。"""
     for name in ('install.sh', 'extend.sh'):
