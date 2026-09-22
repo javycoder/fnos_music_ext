@@ -32,7 +32,7 @@ BASH = shutil.which("bash")
 # 沙箱 PATH 需要的真实工具白名单（cmd 脚本内部使用；docker/systemctl/readlink
 # 按测试意图用桩覆盖，tar 在需要验证备份内容时用真 tar、需要故障注入时用桩覆盖）
 REAL_TOOLS = ("dirname", "mkdir", "cp", "mv", "rm", "tar", "gzip", "date", "grep",
-              "sed", "ls", "tail", "cat", "chmod", "head", "tr", "cut")
+              "sed", "ls", "tail", "cat", "chmod", "head", "tr", "cut", "tee")
 
 INSTALLER_STUB = """#!/bin/bash
 printf '%s\\n' "$*" >> "${STUB_INSTALL_LOG}"
@@ -81,6 +81,7 @@ class Sandbox:
                 (self.bindir / tool).symlink_to(real)
         self.install_log = tmp_path / "logs" / "install.log"
         self.install_log.parent.mkdir()
+        self.durable_log = self.install_log.parent / "durable-install.log"
         self.ctl_log = tmp_path / "logs" / "systemctl.log"
         self.docker_log = tmp_path / "logs" / "docker.log"
         self.tar_log = tmp_path / "logs" / "tar.log"
@@ -140,6 +141,7 @@ esac
             "TRIM_PKGVAR": str(self.pkgvar),
             "TRIM_TEMP_LOGFILE": str(self.tmp / "trim-log.txt"),
             "STUB_INSTALL_LOG": str(self.install_log),
+            "FNMUSIC_DURABLE_LOG": str(self.durable_log),
             "HOME": str(self.tmp),
         }
         env.update({k: v for k, v in extra.items() if v is not None})
@@ -405,6 +407,24 @@ def test_install_callback_ignores_buildkit_run_title_with_error_echo(sb):
     assert "等待 musicdl healthz 超时" in trim_log
     assert "fix_dns" not in trim_log
     assert "apt 镜像源" not in trim_log
+
+
+def test_install_callback_copies_output_to_durable_log(sb):
+    """安装过程写到回滚删不掉的日志，弹窗给出该路径而不是 TRIM_PKGVAR。"""
+    sb.make_repo(stub="""#!/bin/bash
+echo "durable-marker"
+echo -e "\\033[31m[ERROR]\\033[0m 容器健康检查失败"
+exit 7
+""")
+    result = sb.run("install_callback", wizard_sources="musicdl", wizard_extend="false")
+    assert result.returncode == 1
+    durable = sb.durable_log.read_text(encoding="utf-8")
+    assert "durable-marker" in durable
+    assert "容器健康检查失败" in durable
+    trim_log = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    assert str(sb.durable_log) in trim_log
+    assert "容器健康检查失败" in trim_log
+    assert str(sb.pkgvar / "fnmusic-app.log") not in trim_log
 
 
 def test_install_callback_requires_repo_payload(sb):

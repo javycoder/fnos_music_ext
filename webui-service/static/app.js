@@ -1,6 +1,10 @@
 /* fnmusic-ext WebUI — 原生 JS，无框架无外部资产。 */
 "use strict";
 
+// 飞牛桌面用 HTTPS 打开管理窗，页面必须挂在同源路径 /app/fnmusic-ext 下。
+// WebUI 自己也会剥掉这个前缀，所以直连 :8774 同样可用。
+const APP_BASE = "/app/fnmusic-ext";
+
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
@@ -14,7 +18,7 @@ let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 
 async function api(path, options) {
-  const resp = await fetch(path, options);
+  const resp = await fetch(APP_BASE + path, options);
   let body = {};
   try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
   if (!resp.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
@@ -311,7 +315,7 @@ async function startQrLogin() {
     }
     const unikey = data.unikey || data.codekey || (data.data && (data.data.unikey || data.data.codekey)) || "";
     if (!unikey) throw new Error("未获取到 unikey");
-    $("#qr-img").src = `/api/netease/qr?unikey=${encodeURIComponent(unikey)}`;
+    $("#qr-img").src = `${APP_BASE}/api/netease/qr?unikey=${encodeURIComponent(unikey)}`;
     $("#qr-img").hidden = false;
     $("#qr-status").textContent = "请用手机网易云音乐 App 扫码";
     pollQr(unikey);

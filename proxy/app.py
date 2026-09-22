@@ -178,10 +178,12 @@ _SEARCH_CACHE: dict[str, dict] = {}
 
 def _search_ttl(entry: dict) -> float:
     # Backend IDs/URLs are memory scoped; positive results revalidate in 5m.
-    if entry.get("partial"):
-        return 30.0
+    # 超时交回的空列表也是 partial。先看有没有歌，避免把 0 条缓存半分钟，
+    # 用户紧接着再搜同词还是空的。
     if not entry.get("items"):
         return 10.0
+    if entry.get("partial"):
+        return 30.0
     return min(float(CONF.get("search_cache_ttl", 604800)), 300.0)
 
 
