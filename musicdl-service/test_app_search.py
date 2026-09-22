@@ -74,6 +74,7 @@ def clean_state(monkeypatch):
     monkeypatch.setattr(app_module, "SINGLE_FLIGHT", SingleFlight())
     monkeypatch.setattr(app_module, "_probe_playable_sync", lambda url, headers: True)
     monkeypatch.setitem(app_module.CONF, "search_timeout", 4.0)
+    monkeypatch.setitem(app_module.CONF, "adaptive_min_timeout", 1.0)
     monkeypatch.setitem(app_module.CONF, "slow_grace_s", 1.0)
     monkeypatch.setitem(app_module.CONF, "fast_return_items", 3)
     monkeypatch.setitem(app_module.CONF, "slow_degrade_s", 2.0)
@@ -387,6 +388,10 @@ def test_musicdl_receives_supported_network_limits(clean_state, monkeypatch):
         "KuwoMusicClient": {"timeout": app_module.CONF["request_timeout"]}}
     assert captured["clients_threadings"] == {"KuwoMusicClient": 1}
     assert captured["init_music_clients_cfg"]["KuwoMusicClient"]["max_retries"] == 1
+    assert captured["init_music_clients_cfg"]["KuwoMusicClient"]["search_size_per_source"] == 10
+    captured.clear()
+    app_module._search_one_source("KuwoMusicClient", "offline", 60)
+    assert captured["init_music_clients_cfg"]["KuwoMusicClient"]["search_size_per_source"] == app_module.CONF["search_page_cap"]
 
 
 def test_restart_errors_and_one_research_restore_same_id(clean_state, monkeypatch):

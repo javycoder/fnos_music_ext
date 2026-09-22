@@ -138,8 +138,10 @@ set -a
 # shellcheck disable=SC1091
 source "${BASE_DIR}/.env"
 set +a
-# Release diagnostics must not be replaced by stale dotenv version metadata.
-read -r FNMUSIC_VERSION < "${BASE_DIR}/VERSION"
+# .env 里的 FNMUSIC_VERSION 可能是上次安装写进去的旧值，以 VERSION 文件为准。
+# 不用 read：文件末尾没有换行时 read 返回 1，set -e 会在打出任何日志前静默退出。
+FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
