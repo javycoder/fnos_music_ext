@@ -810,7 +810,7 @@ def test_playlist_list_injects_both_playlists_with_disguised_cover(tmp_path, mon
             assert str(resolved).startswith("online:netease:")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resolve_recommendations_concurrency_and_throttle(monkeypatch):
     active = 0
     max_active = 0
