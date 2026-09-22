@@ -29,15 +29,9 @@ if [ "${SOURCES}" = "lxmusic" ]; then
 fi
 
 cd "${FNMUSIC_REPO_DIR}"
-if ! bash ./install.sh "${ARGS[@]}" >> "${FNMUSIC_LOG}" 2>&1; then
+if ! fnmusic_run_logged bash ./install.sh "${ARGS[@]}"; then
     # 升级失败弹窗要能看到真实错误行（回滚会带走 TRIM_PKGVAR 里的日志）
-    err_brief="$(fnmusic_error_brief)"
-    tail -n 5 "${FNMUSIC_LOG}" >&2 || true
-    if [ -n "${err_brief}" ]; then
-        fnmusic_fail "升级失败（数据备份保留在 ${BACKUP_DIR}）：${err_brief}"
-    else
-        fnmusic_fail "升级失败（数据备份保留在 ${BACKUP_DIR}）：详见 ${FNMUSIC_LOG}"
-    fi
+    fnmusic_fail_from_log "升级失败（数据备份保留在 ${BACKUP_DIR}）"
 fi
 
 rm -rf "${BACKUP_DIR}"

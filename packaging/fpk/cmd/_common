@@ -17,6 +17,18 @@ unset _cand
 FNMUSIC_LOG="${TRIM_PKGVAR:-/tmp}/fnmusic-app.log"
 mkdir -p "$(dirname "${FNMUSIC_LOG}")" 2>/dev/null || true
 
+# 应用中心安装失败会回滚删除 TRIM_PKGVAR，fnmusic-app.log 会一起消失。
+# 过程输出同时追加到这份不随回滚删除的日志。测试用 FNMUSIC_DURABLE_LOG 覆盖。
+if [ -z "${FNMUSIC_DURABLE_LOG:-}" ]; then
+    FNMUSIC_DURABLE_LOG="/var/log/apps/fnmusic-ext-install.log"
+    if ! { mkdir -p /var/log/apps && touch "${FNMUSIC_DURABLE_LOG}"; } 2>/dev/null; then
+        FNMUSIC_DURABLE_LOG="/tmp/fnmusic-ext-install.log"
+    fi
+fi
+mkdir -p "$(dirname "${FNMUSIC_DURABLE_LOG}")" 2>/dev/null || true
+touch "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+chmod a+r "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+
 fnmusic_fail() {
     # Short, actionable message surfaced in the App Center progress UI.
     if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
@@ -38,6 +50,47 @@ fnmusic_error_brief() {
         | tail -n 5 \
         | tr '\n' ' ' \
         | cut -c1-400
+}
+
+fnmusic_log_tail_brief() {
+    # Last lines when the installer exited without an [ERROR] marker
+    # (for example set -e on a command that prints nothing).
+    local log="${1:-${FNMUSIC_LOG}}"
+    [ -f "${log}" ] || return 0
+    sed $'s/\x1b\\[[0-9;]*m//g' "${log}" 2>/dev/null \
+        | tail -n 5 \
+        | tr '\n' ' ' \
+        | cut -c1-300
+}
+
+fnmusic_run_logged() {
+    # Run a command, appending a timestamped copy of its combined output to
+    # FNMUSIC_DURABLE_LOG. The return status is the command's, not tee's.
+    local stamp rc pipefail_on=0
+    stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)"
+    printf '\n===== %s %s =====\n' "${stamp}" "$*" >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+    if set -o | grep -q 'pipefail[[:space:]]*on'; then
+        pipefail_on=1
+    fi
+    set +o pipefail
+    "$@" 2>&1 | tee -a "${FNMUSIC_DURABLE_LOG}" >> "${FNMUSIC_LOG}"
+    rc=${PIPESTATUS[0]}
+    if [ "${pipefail_on}" -eq 1 ]; then
+        set -o pipefail
+    fi
+    return "${rc}"
+}
+
+fnmusic_fail_from_log() {
+    # $1 is the short prefix ("安装失败" / "升级失败……"). Popup keeps the
+    # durable path first so rollback of TRIM_PKGVAR cannot hide the log.
+    local prefix="$1" err_brief
+    err_brief="$(fnmusic_error_brief)"
+    if [ -z "${err_brief}" ]; then
+        err_brief="$(fnmusic_log_tail_brief)"
+    fi
+    tail -n 5 "${FNMUSIC_LOG}" >&2 || true
+    fnmusic_fail "${prefix}。日志：${FNMUSIC_DURABLE_LOG}。${err_brief:-未捕获到错误行}"
 }
 
 fnmusic_cleanup_sources_container() {
