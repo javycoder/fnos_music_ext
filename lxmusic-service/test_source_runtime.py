@@ -85,9 +85,12 @@ def test_build_music_info_platform_keys():
         "id": "lx:kg:KGHASH", "_identifier": "KGHASH", "title": "晴天", "artist": "周杰伦",
         "album": "叶惠美", "duration_s": 269, "cover_url": "https://img/1.jpg", "hash": "KGHASH",
     }
+    item["album_id"] = "966846"
     info = sr.build_music_info(item, "kg")
     assert info["hash"] == "KGHASH"
     assert info["songmid"] == "KGHASH"  # 部分脚本读 songmid
+    assert info["id"] == "KGHASH"
+    assert info["albumId"] == "966846"  # 六音酷狗 musicUrl 解构 albumId
     assert info["interval"] == "269"  # 官方 musicInfo.interval 是纯秒数字符串
     assert info["meta"]["picUrl"] == "https://img/1.jpg"
 
@@ -95,8 +98,14 @@ def test_build_music_info_platform_keys():
     assert kw["rid"] == "228908"
     wy = sr.build_music_info({"_identifier": "186016", "song_id": "186016"}, "wy")
     assert wy["songId"] == "186016"
-    tx = sr.build_music_info({"_identifier": "MID", "songmid": "MID"}, "tx")
+    tx = sr.build_music_info(
+        {"_identifier": "MID", "songmid": "MID", "str_media_mid": "MEDIA", "album_id": "8220"},
+        "tx",
+    )
     assert tx["songmid"] == "MID"
+    assert tx["strMediaMid"] == "MEDIA"  # 与 songmid 不是同一个字段
+    assert tx["albumId"] == "8220"
+    assert "strMediaMid" not in sr.build_music_info({"_identifier": "MID", "songmid": "MID"}, "tx")
     assert sr.build_music_info({"_identifier": "1"}, "wy")["meta"]["picUrl"] is None
     assert sr.build_music_info({"_identifier": "1", "duration_s": 61.6}, "kg")["interval"] == "61"
 
