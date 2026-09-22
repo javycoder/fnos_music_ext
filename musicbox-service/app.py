@@ -3,15 +3,24 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from netease_ext import batch_song_details, check_is_logged_in, filter_playable_song_ids, song_lyric_pair
+from netease_ext import (
+    batch_song_details,
+    check_is_logged_in,
+    filter_playable_song_ids,
+    search_web_fallback,
+    song_lyric_pair,
+)
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
+
+logger = logging.getLogger("musicbox_service.app")
 
 ensure_xdg_dirs()
 
@@ -100,25 +109,64 @@ def search(
         raise HTTPException(status_code=400, detail="keyword cannot be empty")
     if type not in SEARCH_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type {type!r}")
-    res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
-    if type == "song" and isinstance(res, dict):
-        raw_list = res.get("data")
-        if isinstance(raw_list, list):
 
-            def _song_id(item: dict) -> int:
-                # 畸形数据（非数字 id）一律归零，零不可能命中 playable 集合
-                try:
-                    return int(item.get("song_id") or item.get("id") or 0)
-                except (ValueError, TypeError):
-                    return 0
+    res = None
+    fallback_needed = False
 
-            song_ids = [sid for it in raw_list if isinstance(it, dict) for sid in [_song_id(it)] if sid]
-            if song_ids:
-                playable = filter_playable_song_ids(song_ids)
-                res["data"] = [it for it in raw_list if isinstance(it, dict) and _song_id(it) in playable]
-            else:
-                res["data"] = []
-    return res
+    try:
+        res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
+        if isinstance(res, dict):
+            code = res.get("code")
+            msg = str(res.get("message") or res.get("msg") or "")
+            if code == 405 or res.get("ok") is False or "405" in msg or "频繁" in msg:
+                fallback_needed = True
+            elif type == "song":
+                raw_list = res.get("data")
+                if isinstance(raw_list, list):
+                    def _song_id(item: dict) -> int:
+                        try:
+                            return int(item.get("song_id") or item.get("id") or 0)
+                        except (ValueError, TypeError):
+                            return 0
+
+                    song_ids = [sid for it in raw_list if isinstance(it, dict) for sid in [_song_id(it)] if sid]
+                    if song_ids:
+                        playable = filter_playable_song_ids(song_ids)
+                        res["data"] = [it for it in raw_list if isinstance(it, dict) and _song_id(it) in playable]
+                    else:
+                        res["data"] = []
+                    if not res["data"]:
+                        fallback_needed = True
+                else:
+                    fallback_needed = True
+            elif not res.get("data"):
+                fallback_needed = True
+        else:
+            fallback_needed = True
+    except (UpstreamException, MusicboxTimeoutError, Exception) as exc:
+        logger.warning("exec_musicbox search failed or blocked: %s, falling back to web endpoint", exc)
+        fallback_needed = True
+
+    if fallback_needed:
+        try:
+            fallback_items = search_web_fallback(keyword, stype=type, limit=limit)
+            if fallback_items:
+                if type == "song":
+                    song_ids = [it["song_id"] for it in fallback_items if it.get("song_id")]
+                    if song_ids:
+                        playable = filter_playable_song_ids(song_ids)
+                        filtered = [it for it in fallback_items if it.get("song_id") in playable]
+                        if filtered:
+                            fallback_items = filtered
+                return {"ok": True, "code": 200, "data": fallback_items}
+        except Exception as exc:
+            logger.warning("fallback search failed: %s", exc)
+
+    if res is not None and isinstance(res, dict) and "data" in res:
+        return res
+    if res is not None:
+        return res
+    return {"ok": True, "code": 200, "data": []}
 
 
 @app.get("/api/v1/song/{song_id}/url")

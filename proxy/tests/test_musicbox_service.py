@@ -275,6 +275,133 @@ def test_musicbox_search_logged_in_vip_playable(monkeypatch):
         assert data["data"][0]["song_id"] == 201
 
 
+def test_musicbox_search_fallback_on_405_upstream_exception(monkeypatch):
+    import netease_ext
+
+    def mock_run_musicbox(args, timeout=30.0):
+        # 模拟 CLI 触发 405 操作频繁
+        return 1, '{"code": 405, "message": "操作频繁，请稍候再试"}', "405 Too Many Requests"
+
+    fallback_called = []
+    def mock_search_web_fallback(keyword, stype="song", limit=20):
+        fallback_called.append((keyword, stype, limit))
+        return [
+            {
+                "song_id": 99901,
+                "id": 99901,
+                "song_name": "海阔天空",
+                "title": "海阔天空",
+                "artist": "Beyond",
+                "album_name": "Words & Music",
+                "album": "Words & Music",
+                "duration": 240.0,
+                "quality": "lossless",
+            }
+        ]
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "search_web_fallback", mock_search_web_fallback)
+    monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/search", params={"keyword": "海阔天空", "type": "song", "limit": 10})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert len(data["data"]) == 1
+        assert data["data"][0]["song_id"] == 99901
+        assert data["data"][0]["song_name"] == "海阔天空"
+        assert len(fallback_called) == 1
+        assert fallback_called[0][0] == "海阔天空"
+
+
+def test_musicbox_search_fallback_on_filtered_empty(monkeypatch):
+    import netease_ext
+
+    # 主接口返回了曲目，但全部不可播，过滤后为空
+    mock_search_data = {
+        "ok": True,
+        "data": [{"song_id": 301, "song_name": "Unplayable", "artist": "A", "quality": "standard"}],
+    }
+
+    def mock_run_musicbox(args, timeout=30.0):
+        import json
+        return 0, json.dumps(mock_search_data), ""
+
+    def mock_search_web_fallback(keyword, stype="song", limit=20):
+        return [
+            {
+                "song_id": 88801,
+                "id": 88801,
+                "song_name": "Fallback Song",
+                "title": "Fallback Song",
+                "artist": "Artist",
+                "album_name": "Album",
+                "album": "Album",
+                "duration": 210.0,
+                "quality": "lossless",
+            }
+        ]
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "search_web_fallback", mock_search_web_fallback)
+    # filter_playable_song_ids: 301 is not playable, but 88801 is playable
+    monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: {88801} if 88801 in ids else set())
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/search", params={"keyword": "test", "type": "song", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert len(data["data"]) == 1
+        assert data["data"][0]["song_id"] == 88801
+
+
+def test_search_web_fallback_function(monkeypatch):
+    import netease_ext
+
+    fake_resp_data = {
+        "result": {
+            "songs": [
+                {
+                    "id": 1357375695,
+                    "name": "海阔天空",
+                    "artists": [{"id": 11127, "name": "Beyond"}],
+                    "album": {"id": 78372827, "name": "精选系列"},
+                    "duration": 239560,
+                }
+            ],
+            "songCount": 1,
+        },
+        "code": 200,
+    }
+
+    class MockResponse:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return fake_resp_data
+
+    class MockHttpxClient:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def post(self, url, headers=None, data=None):
+            assert url == "https://music.163.com/api/search/get/web"
+            assert data["s"] == "海阔天空"
+            assert data["type"] == "1"
+            return MockResponse()
+
+    monkeypatch.setattr(netease_ext, "httpx", type("MockHttpxMod", (), {"Client": MockHttpxClient}))
+
+    items = netease_ext.search_web_fallback("海阔天空", stype="song", limit=5)
+    assert len(items) == 1
+    assert items[0]["song_id"] == 1357375695
+    assert items[0]["song_name"] == "海阔天空"
+    assert items[0]["artist"] == "Beyond"
+    assert items[0]["album_name"] == "精选系列"
+    assert abs(items[0]["duration"] - 239.56) < 0.01
+
+
 
 
 # ------------------------------------------------ 未覆盖端点与错误信封补测 ---
