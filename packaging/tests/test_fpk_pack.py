@@ -75,8 +75,12 @@ class TestManifest:
     def test_version_matches_repo(self, stage: Path):
         m = _parse_manifest((stage / "manifest").read_text())
         repo_version = (REPO_ROOT / "VERSION").read_text().strip()
-        assert m["version"] == repo_version
-        assert re.fullmatch(r"\d+\.\d+\.\d+(-[\w.]+)?", m["version"])
+        # fnpack 只收 x.y.z：带字母后缀的自动迭代版本（2.2.9a/b/…）在 manifest
+        # 落基础三段，完整版本保留在 VERSION 与产物文件名上。
+        assert re.fullmatch(r"\d+\.\d+\.\d+[a-z]?", repo_version), \
+            f"VERSION 必须是 x.y.z（自动迭代可加单字母后缀），当前为 {repo_version!r}"
+        assert m["version"] == re.match(r"\d+\.\d+\.\d+", repo_version).group()
+        assert re.fullmatch(r"\d+\.\d+\.\d+", m["version"])
 
     def test_template_has_placeholder(self):
         assert "@VERSION@" in (FPK_DIR / "manifest.in").read_text()

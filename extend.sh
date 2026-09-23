@@ -36,7 +36,7 @@ for arg in "$@"; do
         -h|--help)
             echo "用法: $0 [--force] [--adopt] [--qr]"
             echo "  --force  强制重写 unit 并重启代理（安装改配置后使用）"
-            echo "  --adopt  把部署迁移到当前目录（部署登记指向其他目录时使用）"
+            echo "  --adopt  把部署迁移到当前目录（部署登记或代理 unit 属于其他目录时使用）"
             echo "  --qr     启动终端网易云扫码登录流程"
             exit 0
             ;;
@@ -109,7 +109,7 @@ print(http_port, https_port)
 ' 2>/dev/null || echo "5666 5667"
 }
 
-check_proxy_unit_owner || exit 1
+check_proxy_unit_owner "$@" || exit 1
 # Refuse to extend from a second checkout while the machine-wide deployment
 # registry names another live directory (skip with the explicit --adopt flag).
 check_deployment_owner "$@" || exit 1

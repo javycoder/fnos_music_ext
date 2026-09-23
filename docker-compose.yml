@@ -19,8 +19,8 @@ services:
       network: host
       args:
         BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
-        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}
-        APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.aliyun.com}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}
+        APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tencent.com}
     image: fnmusic-sources:latest
     container_name: fnmusic-sources
     ports:

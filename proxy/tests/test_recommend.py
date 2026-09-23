@@ -308,6 +308,58 @@ def test_play_history_merges_online(tmp_path, monkeypatch):
         assert body["data"]["total"] == 2
 
 
+def test_play_history_delete_online_and_official(tmp_path, monkeypatch):
+    """删除闭环：online 条目（客户端持有伪装假 id）删本地存储；官方条目原样转发。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    dailyrec.record_online_play("user-rec-1", "online:migu:99", {"title": "在线歌", "artist": "歌手"})
+    forwarded = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-rec-1"}})
+        forwarded.append((request.method, request.url.path))
+        return httpx.Response(200, json={"code": 0, "msg": "", "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    with TestClient(app) as client:
+        fake = fake_official_guid("online:migu:99")
+        resp = client.post("/music/api/v1/play-history/delete", json={"trackGUID": fake})
+        assert resp.json()["code"] == 0
+        assert all(it["guid"] != "online:migu:99" for it in dailyrec.load_online_play_history("user-rec-1"))
+
+        # DELETE 方法与 guid 字段名同样受理（TestClient.delete 不收 json，用 request）
+        dailyrec.record_online_play("user-rec-1", "online:migu:99", {"title": "在线歌"})
+        resp2 = client.request("DELETE", "/music/api/v1/play-history/delete", json={"guid": fake})
+        assert resp2.json()["code"] == 0
+        assert dailyrec.load_online_play_history("user-rec-1") == []
+
+        # 官方条目：改写后转发上游，不打官方之外的接口
+        resp3 = client.post("/music/api/v1/play-history/delete", json={"trackGUID": "official-guid-1"})
+        assert resp3.json()["code"] == 0
+    assert forwarded == [("POST", "/music/api/v1/play-history/delete")]
+
+
+def test_playlist_detail_size_minus_one_returns_all(tmp_path, monkeypatch):
+    """size=-1 激活"返回全部"约定；0/乱值仍回退默认 50。"""
+    tracks = [{"guid": f"online:migu:{i}", "title": f"歌{i}", "artist": "歌手A"} for i in range(60)]
+
+    async def fake_bundle(request, user_guid, kind="daily"):
+        return {"playlist": {"guid": "dp-test", "name": "每日"}, "tracks": [dict(t) for t in tracks]}
+
+    monkeypatch.setattr("proxy.app._load_daily_bundle", fake_bundle)
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_auth_user()), base_url="http://unix")
+    with TestClient(app) as client:
+        guid = dailyrec.daily_playlist_guid(user_guid="user-rec-1")
+        base = "/music/api/v1/track/playlist-detail/list"
+        all_resp = client.get(base, params={"playlistGUID": guid, "page": 1, "size": -1})
+        assert all_resp.json()["data"]["total"] == 60
+        assert len(all_resp.json()["data"]["list"]) == 60
+        page_resp = client.get(base, params={"playlistGUID": guid, "page": 1, "size": 50})
+        assert len(page_resp.json()["data"]["list"]) == 50
+        zero_resp = client.get(base, params={"playlistGUID": guid, "page": 1, "size": 0})
+        assert len(zero_resp.json()["data"]["list"]) == 50
+
+
 def test_read_local_recent_tracks(tmp_path):
     db = tmp_path / "music.db"
     con = sqlite3.connect(db)

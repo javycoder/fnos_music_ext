@@ -964,6 +964,19 @@ def test_safe_child_logs_retain_outcomes_without_credentials(capsys):
         assert secret not in output
 
 
+def test_safe_child_logs_retain_stream_probe_and_abort_lines(capsys):
+    """流探针与流中断日志必须能进 journal：后台播放卡住排查时唯一的证据来源。"""
+    import io
+    lines = (
+        "INFO:     stream probe: GET online:kuwo:123456 range='bytes=0-' cached=False tee_eligible=True\n"
+        "2026-09-10 12:00:00,124 [WARNING] fnmusic_proxy: Stream aborted mid-way for online:kuwo:123456: ReadTimeout\n"
+    )
+    takeover.drain_diagnostics(io.StringIO(lines))
+    output = capsys.readouterr().err
+    assert 'stream probe: GET online:kuwo:123456' in output
+    assert 'Stream aborted mid-way for online:kuwo:123456: ReadTimeout' in output
+
+
 def test_safe_child_logs_discard_oversized_line_tail(capsys):
     import io
     oversized = 'x' * 16384 + 'INFO:     Application startup complete.\n'
@@ -1041,6 +1054,87 @@ if reclaim_container fnmusic-musicdl; then printf 'foreign-accepted\\n'; else pr
     assert 'foreign-refused' in result.stdout
 
 
+def _run_proxy_unit_owner(tmp_path, *, unit_text, show_value, args=()):
+    """check_proxy_unit_owner on a stubbed unit file / systemctl, BASE_DIR=checkout."""
+    checkout = tmp_path/'checkout'
+    checkout.mkdir(exist_ok=True)
+    unit = tmp_path/'fnmusic-ext.service'
+    unit.write_text(unit_text)
+    helper = tmp_path/'common.sh'
+    helper.write_text(
+        (BASE/'proxy/install_common.sh').read_text()
+        .replace('/etc/systemd/system/fnmusic-ext.service', str(unit))
+        .replace('systemctl show fnmusic-ext.service -p WorkingDirectory --value',
+                 f"printf '%s\\n' '{show_value}'")
+    )
+    script = tmp_path/'check.sh'
+    script.write_text(f"""#!/bin/bash
+set -euo pipefail
+BASE_DIR='{checkout}'
+log_err() {{ printf '[ERROR] %s\\n' "$*" >&2; }}
+log_warn() {{ printf '[WARN] %s\\n' "$*" >&2; }}
+source '{helper}'
+check_proxy_unit_owner "$@"
+""")
+    return subprocess.run(['bash', str(script), *args], capture_output=True, text=True)
+
+
+def test_proxy_unit_owner_adopts_when_owner_directory_deleted(tmp_path):
+    """原部署目录已删除：放行接管（与 deployment_conflict 语义一致），不再死锁。"""
+    gone = tmp_path/'gone'  # 从不创建
+    result = _run_proxy_unit_owner(
+        tmp_path,
+        unit_text=f'[Service]\nWorkingDirectory={gone}\n',
+        show_value=str(gone),
+    )
+    assert result.returncode == 0, result.stderr
+    assert '已不存在' in result.stderr
+    assert '直接接管' in result.stderr
+
+
+def test_proxy_unit_owner_adopt_flag_bypasses_live_foreign_unit(tmp_path):
+    """原目录仍存在：默认拒绝且报错给出双方路径与出路；--adopt 显式迁移放行。"""
+    other = tmp_path/'other'
+    other.mkdir()
+    checkout = tmp_path/'checkout'
+    kwargs = dict(
+        unit_text=f'[Service]\nWorkingDirectory={other}\n',
+        show_value=str(other),
+    )
+    refused = _run_proxy_unit_owner(tmp_path, **kwargs)
+    assert refused.returncode != 0
+    assert str(other) in refused.stderr
+    assert str(checkout) in refused.stderr
+    assert '--adopt' in refused.stderr
+    assert 'restore.sh' in refused.stderr
+    adopted = _run_proxy_unit_owner(tmp_path, **kwargs, args=('--adopt',))
+    assert adopted.returncode == 0, adopted.stderr
+    assert '--adopt 迁移' in adopted.stderr
+
+
+def test_proxy_unit_owner_falls_back_to_unit_file_when_show_empty(tmp_path):
+    """systemctl show 返回空：回退读 unit 文件本身，同目录仍判定为自己人。"""
+    checkout = tmp_path/'checkout'
+    result = _run_proxy_unit_owner(
+        tmp_path,
+        unit_text=f'[Service]\nWorkingDirectory={checkout}\n',
+        show_value='',
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_proxy_unit_owner_rejects_when_working_directory_unreadable(tmp_path):
+    """show 与 unit 文件都取不到 WorkingDirectory：明确报错而非静默失败。"""
+    result = _run_proxy_unit_owner(
+        tmp_path,
+        unit_text='[Service]\nExecStart=/bin/true\n',
+        show_value='',
+    )
+    assert result.returncode != 0
+    assert '无法读取' in result.stderr
+    assert 'fnmusic-ext.service' in result.stderr
+
+
 def test_socket_mutation_lock_serializes_processes(state):
     with state.lock():
         command = [sys.executable, str(BASE/'proxy/takeover.py'), 'remember', '--target', str(state.target),
@@ -1106,7 +1200,9 @@ def test_install_scripts_delegate_proxy_deps_to_fallback_helper():
         assert 'ensure_proxy_deps.sh' in text, f'{name} 应调用 ensure_proxy_deps.sh'
         assert 'venv-proxy/bin/pip" install' not in text, f'{name} 不应残留单源裸 pip 安装'
     helper = (BASE/'ensure_proxy_deps.sh').read_text(encoding='utf-8')
-    # 候选链：用户自定义 PIP_INDEX 永远第一位（默认阿里云），清华与官方兜底
+    # 候选链：用户自定义 PIP_INDEX 永远第一位（默认腾讯云，H1.1 不限速），
+    # 阿里云/清华/官方依次兜底
+    assert 'https://mirrors.tencent.com/pypi/simple/' in helper
     assert 'https://mirrors.aliyun.com/pypi/simple/' in helper
     assert 'https://pypi.tuna.tsinghua.edu.cn/simple' in helper
     assert 'https://pypi.org/simple' in helper
@@ -1141,9 +1237,12 @@ def _deploy_helper_with_stub_pip(tmp_path, fail_urls):
 
 
 def test_ensure_proxy_deps_falls_back_across_indexes(tmp_path):
-    """行为验证：首选源不可达时按 自定义→清华→官方 链回退，最终成功退出 0。"""
+    """行为验证：首选源不可达时按 自定义→阿里云→清华→官方 链回退，最终成功退出 0。"""
     deploy, venv, calls = _deploy_helper_with_stub_pip(
-        tmp_path, ['https://pypi.invalid/simple', 'https://pypi.tuna.tsinghua.edu.cn/simple'])
+        tmp_path,
+        ['https://pypi.invalid/simple',
+         'https://mirrors.aliyun.com/pypi/simple/',
+         'https://pypi.tuna.tsinghua.edu.cn/simple'])
     env = os.environ.copy()
     env.update(PIP_INDEX='https://pypi.invalid/simple', FNMUSIC_VENV_DIR=str(venv))
     result = subprocess.run(['bash', str(deploy/'ensure_proxy_deps.sh')], env=env,
@@ -1151,6 +1250,7 @@ def test_ensure_proxy_deps_falls_back_across_indexes(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     tried = calls.read_text()
     assert 'https://pypi.invalid/simple' in tried
+    assert 'https://mirrors.aliyun.com/pypi/simple/' in tried
     assert 'https://pypi.tuna.tsinghua.edu.cn/simple' in tried
     assert 'https://pypi.org/simple' in tried
     assert '切换下一候选源' in result.stdout
@@ -1162,6 +1262,7 @@ def test_ensure_proxy_deps_reports_guidance_when_all_indexes_fail(tmp_path):
     deploy, venv, _ = _deploy_helper_with_stub_pip(
         tmp_path,
         ['https://pypi.invalid/simple',
+         'https://mirrors.aliyun.com/pypi/simple/',
          'https://pypi.tuna.tsinghua.edu.cn/simple',
          'https://pypi.org/simple'])
     env = os.environ.copy()

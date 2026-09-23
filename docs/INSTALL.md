@@ -149,8 +149,10 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   ```bash
   ./install.sh --non-interactive --sources musicbox --webui --adopt --extend
   ```
-  接管成功后登记自动指向当前目录。`extend.sh` / `restore.sh` 同样支持 `--adopt`；
-- 原登记目录已被删除时不拦截，任意目录可直接重新安装；
+  接管成功后登记自动指向当前目录。`--adopt` 同时作用于部署登记与代理 unit 的
+  跨目录检查；`extend.sh` / `restore.sh` 同样支持 `--adopt`；
+- 原登记目录或代理 unit 指向的目录已被删除时不拦截，任意目录可直接重新安装
+  （无法保护的废弃部署会被自动接管）；
 - 安装锁若被**本副本**挂起的旧进程占用（如向导停在扫码登录），新命令会自动
   终止旧进程并接管；锁若属于另一份副本或无关进程则绝不终止，仅报告后退出。
 
