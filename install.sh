@@ -62,7 +62,7 @@ LX_SKIP_VERIFY=0
 # WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
 WEBUI_CHOICE=""
 CONTAINER_NAME="fnmusic-sources"
-PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
 BASE_IMAGE="${BASE_IMAGE:-}"
@@ -1016,6 +1016,20 @@ else
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
     log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
 fi
+
+# 存量迁移：2.2.8 之前的安装会把当时的默认清华源写进 .env；env_merge 对该键
+# 保留旧值，老机器升级后仍会拿故障源构建。仅当值恰好等于历史默认值时替换为
+# 阿里云新默认；用户自定义的源地址（无论哪家）一律保留不动。
+migrate_default_mirror() {
+    local key="$1" old="$2" new="$3" current
+    current="$(sed -n "s/^${key}=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
+    if [ "${current}" = "${old}" ]; then
+        sed -i "s|^${key}=.*|${key}='${new}'|" "${ENV_PATH}"
+        log_info "已将 ${key} 的历史默认源迁移为阿里云（${new}）。"
+    fi
+}
+migrate_default_mirror FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple" "https://mirrors.aliyun.com/pypi/simple/"
+migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.aliyun.com"
 rm -f "${ENV_DESIRED}"
 chmod 600 "${ENV_PATH}"
 
@@ -1025,7 +1039,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 log_info "安装代理依赖..."
-# venv 创建 + 多源回退（清华→阿里→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
+# venv 创建 + 多源回退（阿里→清华→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
 PIP_INDEX="${PIP_INDEX}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
 
 install_unit() {
