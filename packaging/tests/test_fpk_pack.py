@@ -69,6 +69,8 @@ class TestManifest:
         assert "trim.music" in m["install_dep_apps"]
         assert m["checkport"] == "false"
         assert m["maintainer_url"].startswith("https://github.com/")
+        # JS SDK（pickUserFile NAS 文件选择）要求微应用环境
+        assert m["micro_app"] == "true"
 
     def test_version_matches_repo(self, stage: Path):
         m = _parse_manifest((stage / "manifest").read_text())
@@ -103,7 +105,9 @@ class TestConfig:
         assert priv["defaults"]["run-as"] == "root"
 
     def test_resource_is_json(self, stage: Path):
-        json.loads((stage / "config" / "resource").read_text())
+        resource = json.loads((stage / "config" / "resource").read_text())
+        # NAS 文件选择（pickUserFile）需要声明的开放 API scope
+        assert resource.get("api-scope") == ["trim.file.userAccess"]
 
 
 class TestWizard:

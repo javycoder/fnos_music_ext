@@ -122,6 +122,7 @@ function applyConfigToForm() {
   $("#llm-base").value = v.FNMUSIC_LLM_BASE_URL || "";
   $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
+  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
   $("#lx-url").value = v.LX_SOURCE_URL || "";
   lxVerifiedUrl = v.LX_SOURCE_URL || null;
   renderPlatformChips();
@@ -142,6 +143,7 @@ function collectConfig() {
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
     FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
+    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
   };
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
@@ -397,8 +399,108 @@ $("#lx-test").addEventListener("click", async () => {
   }
 });
 
+/* -------------------------------------------------- lx 源：文件上传 / NAS 选择 */
+async function lxUploadScript(filename, script) {
+  // 先确保 lxmusic 进程可用（预览拉起），再转发落盘
+  const callUpload = () => api("/api/lx/upload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename, script }),
+  });
+  try {
+    return await callUpload();
+  } catch (exc) {
+    if (!await startPreview("lxmusic")) throw exc;
+    return await callUpload();
+  }
+}
+
+async function lxAfterUpload(r) {
+  const d = r.data || {};
+  $("#lx-url").value = d.url || "";
+  lxVerifiedUrl = null; // 上传地址仍需走一次"测试"
+  $("#lx-upload-note").textContent = d.meta && d.meta.name ? `已上传：${d.meta.name}` : "已上传";
+  markDirty("洛雪源已更新为上传脚本，测试后保存生效");
+  toast("脚本已上传，请点「测试」验证后保存", "ok");
+}
+
+$("#lx-upload").addEventListener("click", () => $("#lx-file").click());
+$("#lx-file").addEventListener("change", async () => {
+  const file = $("#lx-file").files && $("#lx-file").files[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".js")) { toast("只支持 .js 后缀文件", "fail"); return; }
+  if (file.size > 9_000_000) { toast("脚本超过 9MB 上限", "fail"); return; }
+  $("#lx-upload-note").textContent = "读取并上传中…";
+  try {
+    const script = await file.text();
+    const r = await lxUploadScript(file.name, script);
+    await lxAfterUpload(r);
+  } catch (exc) {
+    $("#lx-upload-note").textContent = "";
+    toast("上传失败：" + exc.message, "fail");
+  } finally {
+    $("#lx-file").value = ""; // 允许重复选择同一文件
+  }
+});
+
+/* NAS 文件选择：仅桌面环境（统一网关 /app/fnmusic-ext 内）可用。
+   选中的主机路径经 /api/host-file 代读（webui_gateway 本地处理），再走上传落盘。 */
+let lxTrimSdk = null;
+async function lxLoadTrimSdk() {
+  if (lxTrimSdk !== null) return lxTrimSdk;
+  try {
+    const mod = await import("/app/fnmusic-ext/static/vendor/trim-web-app.js");
+    lxTrimSdk = new mod.TrimApp();
+  } catch (_) {
+    lxTrimSdk = false;
+  }
+  return lxTrimSdk;
+}
+
+async function lxPickFromNas() {
+  const sdk = await lxLoadTrimSdk();
+  if (!sdk) { toast("当前环境不支持 NAS 文件选择（直连 8774 时请用上传或 URL）", "fail"); return; }
+  try {
+    const result = await sdk.pickUserFile({
+      directory: false,
+      accept: [".js"],
+      title: "选择洛雪源脚本",
+      okText: "选择",
+      sidebarGroup: ["myFiles", "otherShare", "favorites"],
+    });
+    const paths = (result && result.data) || [];
+    if (!paths.length) return;
+    const hostPath = paths[0];
+    $("#lx-upload-note").textContent = "读取 NAS 文件中…";
+    const resp = await fetch(APP_BASE + "/api/host-file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: hostPath }),
+    });
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+    const filename = hostPath.split("/").pop() || "source.js";
+    const r = await lxUploadScript(filename, body.script || "");
+    await lxAfterUpload(r);
+  } catch (exc) {
+    $("#lx-upload-note").textContent = "";
+    toast("NAS 选择失败：" + exc.message, "fail");
+  }
+}
+$("#lx-pick").addEventListener("click", lxPickFromNas);
+
+(async function detectNasPicker() {
+  // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
+  const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
+  if (pathname.startsWith("/app/")) {
+    const sdk = await lxLoadTrimSdk();
+    if (sdk) $("#lx-pick").hidden = false;
+  }
+})();
+
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url"].forEach((sel) =>
+["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#tee-enabled"].forEach((sel) =>

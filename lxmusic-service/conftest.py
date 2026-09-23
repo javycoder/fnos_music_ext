@@ -133,6 +133,7 @@ def isolated(monkeypatch) -> FakeManager:
     lxapp._SONG_CACHE.clear()
     lxapp._CHAIN_HEALTH.clear()
     lxapp._STATS.update(searches=0, url_resolutions=0, errors=0)
+    lxapp.LX_SEARCH_GATE.reset()
     lxapp.app.state.http = None
     manager = FakeManager()
     monkeypatch.setattr(lxapp, "SOURCE_MANAGER", manager)

@@ -4,6 +4,7 @@
 .venv-musicdl/
 .venv-musicbox/
 musicbox-data/
+sources-data/
 cache/
 backup/
 musicdl_outputs/

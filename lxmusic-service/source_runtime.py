@@ -32,6 +32,9 @@ _META_LIMITS = {"name": 24, "description": 36, "author": 56, "homepage": 1024, "
 _HEADER_BLOCK_RE = re.compile(r"^/\*[\S\s]+?\*/")
 _META_LINE_RE = re.compile(r"^\s?\*\s?@(\w+)\s(.+)$", re.M)
 _URL_RE = re.compile(r"^https?://", re.I)
+_FILE_URL_RE = re.compile(r"^file://", re.I)
+# 上传脚本落盘目录（容器内 /data/lxmusic/uploads，随数据卷持久化）
+UPLOAD_DIR_NAME = "uploads"
 
 # tier（本服务内部档位）→ 期望的脚本档位（洛雪规范 qualitys 取值）
 _TIER_QUALITY_PREFERENCE = {
@@ -66,11 +69,42 @@ def parse_script_meta(script: str) -> dict:
     return meta
 
 
+def is_source_url(url: str) -> bool:
+    """合法源地址：http(s):// 或 file://（本服务数据目录内的上传脚本）。"""
+    raw = (url or "").strip()
+    return bool(_URL_RE.match(raw) or _FILE_URL_RE.match(raw))
+
+
+def _validate_script_text(script: str) -> None:
+    """脚本文本统一校验：UTF-8 已由调用方解码；头部元数据必须合法。"""
+    if len(script.encode("utf-8")) > SCRIPT_MAX_BYTES:
+        raise SourceError("download", "脚本超过 9MB 大小上限")
+    parse_script_meta(script)
+
+
 async def download_script(url: str) -> str:
-    """下载源脚本（重定向≤3、≤9MB、UTF-8），并完成头部校验。"""
-    if not _URL_RE.match((url or "").strip()):
-        raise SourceError("download", "源地址必须以 http:// 或 https:// 开头")
-    url = url.strip()
+    """下载/读取源脚本（重定向≤3、≤9MB、UTF-8），并完成头部校验。
+
+    file:// URL 直接读本地文件——仅用于本服务数据目录（uploads/）内的
+    上传脚本与 state 缓存，路径已在落盘时净化。
+    """
+    url = (url or "").strip()
+    if _FILE_URL_RE.match(url):
+        path = url[len("file://"):]
+        if not path.startswith("/"):
+            raise SourceError("download", "file:// 路径必须是绝对路径")
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as exc:
+            raise SourceError("download", f"读取脚本文件失败: {exc}") from exc
+        try:
+            script = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceError("invalid", "脚本不是有效的 UTF-8 文本") from exc
+        _validate_script_text(script)
+        return script
+    if not _URL_RE.match(url):
+        raise SourceError("download", "源地址必须以 http:// 、https:// 或 file:// 开头")
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -98,6 +132,35 @@ async def download_script(url: str) -> str:
         raise SourceError("invalid", "脚本不是有效的 UTF-8 文本") from exc
     parse_script_meta(script)
     return script
+
+
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+")
+
+
+def sanitize_upload_filename(filename: str) -> str:
+    """上传文件名净化：basename、去控制字符、强制 .js 后缀。"""
+    name = os.path.basename((filename or "").strip())
+    name = _SAFE_FILENAME_RE.sub("_", name).strip("._") or "source"
+    if not name.lower().endswith(".js"):
+        name = f"{name}.js"
+    return name[:120]
+
+
+def save_upload(state_dir: "str | Path", filename: str, script: str) -> "tuple[str, str]":
+    """把上传脚本写入数据目录 uploads/，返回 (容器内绝对路径, file:// URL)。
+
+    同名冲突时追加时间戳；调用方负责先做脚本校验（parse_script_meta）。
+    """
+    _validate_script_text(script)
+    uploads = Path(state_dir) / UPLOAD_DIR_NAME
+    uploads.mkdir(parents=True, exist_ok=True)
+    name = sanitize_upload_filename(filename)
+    target = uploads / name
+    if target.exists():
+        stem = target.stem
+        target = uploads / f"{stem}-{int(time.time() * 1000) % 10_000_000_000}.js"
+    target.write_text(script, encoding="utf-8")
+    return str(target), f"file://{target}"
 
 
 def script_quality_for_tier(tier: str, declared: list[str]) -> "str | None":
