@@ -105,6 +105,9 @@ CONF = {
     # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
     # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
     "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
+    # 落盘进曲库后通知官方重扫的接口路径（POST）；空=禁用。官方无公开文档，
+    # 真机在官方 App 手动点一次扫描、从代理请求日志捕获真实路径后填入启用
+    "library_scan_path": (os.environ.get("FNMUSIC_LIBRARY_SCAN_PATH", "") or "").strip(),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     # lx 平台白名单（同 .env 的 LX_SOURCES；install.sh --sources lx-<平台> 写入）；
@@ -425,6 +428,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
+    "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
@@ -1426,6 +1430,14 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
     )
     resp = await client.send(req, stream=True)
     resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    # 上游请求强制 accept-encoding: identity，其 Content-Length 即精确字节数；原样
+    # 透传可让依赖总长度的播放内核走定长帧（对齐官方直连行为）。无 body 的状态
+    # 码不能带；上游无视 identity 仍压缩时长度描述的是编码体，透传必错位，弃用。
+    content_length = resp.headers.get("content-length")
+    content_encoding = (resp.headers.get("content-encoding") or "").strip().lower()
+    if (content_length and content_encoding in ("", "identity")
+            and resp.status_code >= 200 and resp.status_code not in (204, 304)):
+        resp_headers["content-length"] = content_length
 
     async def body_stream() -> AsyncGenerator[bytes, None]:
         try:
@@ -2578,6 +2590,79 @@ async def search_suggest(request: Request):
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
+def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool) -> None:
+    """落盘转正：边听边存开→进曲库（定名/权限/标签/歌词随迁），关→进滚动缓存。
+
+    part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
+    """
+    title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
+    if tee_enabled:
+        dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+        os.replace(part, dest)
+        remember_media_path(guid, dest)
+        adopt_library_perms(dest)
+        write_audio_tags(dest, title, artist, album)
+        # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+        promote_shadow_lyric(guid, dest)
+    else:
+        # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
+        dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
+        os.replace(part, dest)
+    lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
+    if lyric.strip():
+        write_lyric_cache(guid, lyric, title, artist)
+    if not tee_enabled:
+        try:
+            purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
+        except Exception as e:
+            logger.warning("Rolling cache purge failed: %s", e)
+
+
+_SCAN_TTL_S = 90.0
+_SCAN_MERGE_S = 3.0
+_scan_last_attempt = 0.0
+_scan_task: "asyncio.Task | None" = None
+
+
+def _schedule_library_scan(headers: dict | None) -> None:
+    """落盘进曲库后通知官方重扫（FNMUSIC_LIBRARY_SCAN_PATH 为空=禁用）。
+
+    官方扫描接口无公开资料：路径可配置、默认禁用；3 秒合并窗口（连续落盘多首
+    只发一次）+ 90 秒 TTL（成功与失败都节流，路径配错不会风暴）。凭证头取自
+    触发请求（copy_incoming_headers），只在任务内一次性使用，不落盘。
+    """
+    global _scan_task, _scan_last_attempt
+    if not str(CONF.get("library_scan_path") or "").strip() or not headers:
+        return
+    if time.monotonic() - _scan_last_attempt < _SCAN_TTL_S:
+        return
+    if _scan_task is not None and not _scan_task.done():
+        return
+
+    async def _run() -> None:
+        global _scan_last_attempt
+        await asyncio.sleep(_SCAN_MERGE_S)
+        scan_path = str(CONF.get("library_scan_path") or "").strip()
+        if not scan_path:
+            return
+        _scan_last_attempt = time.monotonic()
+        try:
+            client = get_upstream_client(app)
+            req = client.build_request("POST", scan_path, headers=dict(headers))
+            resp = await client.send(req)
+            if resp.status_code == 200:
+                logger.info("Library scan triggered via %s", scan_path)
+            else:
+                logger.warning(
+                    "Library scan %s returned %s (check FNMUSIC_LIBRARY_SCAN_PATH)",
+                    scan_path, resp.status_code,
+                )
+        except Exception as e:
+            logger.warning("Library scan trigger failed: %s", e)
+
+    _scan_task = asyncio.create_task(_run())
+
+
 def stream_tee_response(
     resp: httpx.Response,
     guid: str,
@@ -2588,6 +2673,7 @@ def stream_tee_response(
     pre_info: dict | None = None,
     chunks: Any = None,
     first_chunk: bytes = b"",
+    scan_headers_factory: Callable[[], dict] | None = None,
 ) -> Response:
     headers = {"Accept-Ranges": "bytes"}
     for key in ("content-type", "content-length", "content-range"):
@@ -2656,34 +2742,13 @@ def stream_tee_response(
                 except Exception:
                     info = None
             if part and eof and written >= 1024 and (expected is None or written == expected):
-
-                def finalize() -> None:
-                    title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
-                    if tee_enabled:
-                        dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-                        os.replace(part, dest)
-                        remember_media_path(guid, dest)
-                        adopt_library_perms(dest)
-                        write_audio_tags(dest, title, artist, album)
-                        # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-                        promote_shadow_lyric(guid, dest)
-                    else:
-                        # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
-                        dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
-                        os.replace(part, dest)
-                    lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
-                    if lyric.strip():
-                        write_lyric_cache(guid, lyric, title, artist)
-                    if not tee_enabled:
-                        try:
-                            purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
-                        except Exception as e:
-                            logger.warning("Rolling cache purge failed: %s", e)
-
                 # 落盘转正、mutagen 打标签与滚动清缓全是同步磁盘操作：放线程池执
                 # 行，避免曲目结束的瞬间阻塞事件循环（单 worker 下会拖住切歌、
                 # 心跳等全部并发请求）。
-                await asyncio.to_thread(finalize)
+                await asyncio.to_thread(_tee_finalize, part, guid, ext, info, tee_enabled)
+                part = None
+                if scan_headers_factory is not None:
+                    _schedule_library_scan(scan_headers_factory())
         finally:
             if fp:
                 fp.close()
@@ -2822,6 +2887,97 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             await owned.aclose()
 
 
+_FULL_FETCH_COOLDOWN_S = 1800.0
+_full_fetch_tasks: "dict[str, asyncio.Task]" = {}
+_full_fetch_failed: "dict[str, float]" = {}
+
+
+def _prune_full_fetch_state(now: float) -> None:
+    if len(_full_fetch_failed) > 1000:
+        for g in [g for g, at in _full_fetch_failed.items() if now - at >= _FULL_FETCH_COOLDOWN_S]:
+            del _full_fetch_failed[g]
+
+
+def _register_full_fetch(request: Request, guid: str) -> None:
+    """定长窗口拉流客户端的边听边存兜底：注册后台整轨下载，客户端请求照常服务。
+
+    should_cache 只认"无 Range / bytes=0-"，窗口内核（如 bytes=0-1048575 一段）
+    永远过不了 tee 写盘门；由服务端另起整轨下载落盘补齐。同 guid 去重、
+    失败后冷却期内不重试，防止坏源反复打上游。
+    """
+    if not CONF.get("tee_save_enabled") or find_cache_file(guid):
+        return
+    task = _full_fetch_tasks.get(guid)
+    if task is not None and not task.done():
+        return
+    now = time.monotonic()
+    _prune_full_fetch_state(now)
+    if now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
+        return
+    headers = copy_incoming_headers(request)
+    _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, headers))
+
+
+async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
+    """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。"""
+    part = None
+    resp = None
+    owned = None
+    try:
+        # 合成最小 Request scope（触发请求的凭证头 + app 实例），完整复用在线取
+        # 流的解析/元数据/首字节校验逻辑；Range 传 None 保证拿到完整资源。
+        scope_headers = [
+            (str(k).lower().encode("latin-1"), str(v).encode("latin-1"))
+            for k, v in (cred_headers or {}).items()
+        ]
+        fake_request = Request({"type": "http", "headers": scope_headers, "app": app})
+        opened = await _open_online_stream(fake_request, guid, None)
+        if not opened:
+            raise RuntimeError("open failed")
+        resp, owned, ext, info, chunks, first = opened
+        expected = None
+        length = resp.headers.get("content-length", "")
+        if length.isdigit():
+            expected = int(length)
+        directory = tee_save_dir()
+        os.makedirs(directory, exist_ok=True)
+        part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
+        written = 0
+        with open(part, "wb") as fp:
+            if first:
+                fp.write(first)
+                written += len(first)
+            async for chunk in chunks:
+                if chunk:
+                    fp.write(chunk)
+                    written += len(chunk)
+        if written < 1024 or (expected is not None and written != expected):
+            raise RuntimeError(f"size mismatch written={written} expected={expected}")
+        ext = ext or (info or {}).get("ext") or "mp3"
+        await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True)
+        part = None
+        logger.info("Background full fetch saved %s (%d bytes)", guid, written)
+        _schedule_library_scan(cred_headers)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _full_fetch_failed[guid] = time.monotonic()
+        logger.warning("Background full fetch failed for %s: %s", guid, type(e).__name__)
+    finally:
+        if part and os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        with anyio.CancelScope(shield=True):
+            if resp:
+                await resp.aclose()
+            if owned:
+                await owned.aclose()
+        if _full_fetch_tasks.get(guid) is asyncio.current_task():
+            del _full_fetch_tasks[guid]
+
+
 async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
     """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源轻量试开一次即关。"""
     if cached:
@@ -2913,7 +3069,8 @@ async def stream_track(request: Request, subpath: str = ""):
             if remaining <= 0:
                 break
             try:
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(4.0, remaining))
+                # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐
+                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(6.0, remaining))
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None
@@ -2937,9 +3094,13 @@ async def stream_track(request: Request, subpath: str = ""):
                     return RedirectResponse(location, status_code=307, headers={"Cache-Control": "no-store"})
                 # Cache the selected source's bytes under its own GUID, never
                 # splice a failed stream or alias different encodings for seeks.
+                if not should_cache(range_header):
+                    # 定长窗口客户端：本响应过不了 tee 写盘门，注册后台整轨下载兜底
+                    _register_full_fetch(request, candidate)
                 return stream_tee_response(resp, candidate, range_header,
                     coro_factory=lambda: _online_info(request, candidate), client_to_close=owned,
-                    resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first)
+                    resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
+                    scan_headers_factory=lambda: copy_incoming_headers(request))
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
             if not await _recover_source(request, candidate, entry):
@@ -4114,10 +4275,13 @@ async def playlist_track_list(request: Request):
         size = int(request.query_params.get("size") or 50)
     except (TypeError, ValueError):
         size = 50
+    if size == -1:
+        # -1 是"返回全部"的约定值，须在 <1 兜底之前归一，否则永远到不了全量分支
+        size = max(len(tracks), 1)
     if size < 1:
         size = 50
     start = (page - 1) * size
-    page_tracks = tracks[start:start + size] if size != -1 else tracks
+    page_tracks = tracks[start:start + size]
     return JSONResponse(
         content=disguise_client_json({
             "code": 0,
@@ -4291,6 +4455,43 @@ async def play_history_list(request: Request):
         official_total = len(official)
     data["total"] = official_total + len(merged_online)
     return JSONResponse(content=envelope, headers=headers)
+
+
+@app.api_route("/music/api/v1/play-history/delete", methods=["POST", "DELETE"])
+async def play_history_delete(request: Request):
+    """删除播放历史：online 条目删本地存储，官方条目原样转发官方后端。
+
+    列表是代理拼的（list 合并本地在线历史），删除闭环也必须在代理完成，否则
+    带（伪装成官方 32-hex 的）在线 id 的删除请求直达官方被拒。方法双注册、
+    字段兼容 trackGUID/guid（含 query 透传），与 favorite-track/delete 同款分工。
+    """
+    upstream_client = get_upstream_client(request.app)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    guid = ""
+    if isinstance(body, dict):
+        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+    if not guid:
+        guid = str(request.query_params.get("trackGUID") or request.query_params.get("guid") or "").strip()
+    guid = resolve_real_guid(guid)
+
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, upstream_client)
+
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+
+    async with _HISTORY_LOCK:
+        try:
+            dailyrec.remove_online_play(user_guid, guid)
+        except Exception as e:
+            logger.warning("Error deleting from online play history for user %s: %s", user_guid, e)
+
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])

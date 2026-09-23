@@ -2112,3 +2112,35 @@ def test_merge_online_tracks_filters_unplayable_defense():
 
 
 
+
+
+def test_forward_to_upstream_keeps_content_length():
+    """identity 响应透传精确 Content-Length（对齐官方直连行为）；204 不带。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/echo":
+            return httpx.Response(200, content=b"hello", headers={"content-type": "text/plain"})
+        if request.url.path == "/music/api/v1/nocontent":
+            return httpx.Response(204)
+        if request.url.path == "/music/api/v1/range":
+            return httpx.Response(
+                206, content=b"ab",
+                headers={"content-range": "bytes 0-1/10"},
+            )
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    with TestClient(app) as client:
+        r = client.get("/music/api/v1/echo")
+        assert r.status_code == 200
+        assert r.headers.get("content-length") == "5"
+        assert r.content == b"hello"
+
+        r204 = client.get("/music/api/v1/nocontent")
+        assert r204.status_code == 204
+        assert "content-length" not in r204.headers
+
+        # Range 分段：Content-Length 与 Content-Range 同时到达客户端
+        r206 = client.get("/music/api/v1/range")
+        assert r206.headers.get("content-length") == "2"
+        assert r206.headers.get("content-range") == "bytes 0-1/10"
+        assert r206.content == b"ab"

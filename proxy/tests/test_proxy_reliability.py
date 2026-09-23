@@ -402,7 +402,8 @@ async def test_startup_stall_is_bounded_and_closes_transport(monkeypatch):
     before = time.monotonic()
     response = await p.stream_track(request("guid=online:kuwo:1"))
     assert response.status_code == 404
-    assert 3.8 < time.monotonic() - before < 4.5
+    # 单次解析预算 6 秒（与进程内取链+网络抖动余量对齐），stall 必须被掐断
+    assert 5.8 < time.monotonic() - before < 6.6
     assert audio.closed
 
 

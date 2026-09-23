@@ -1,6 +1,8 @@
 import io
+import json
 import os
 import sys
+import time
 import importlib.util
 from pathlib import Path
 import pytest
@@ -14,6 +16,7 @@ if str(MUSICBOX_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(MUSICBOX_SERVICE_DIR))
 
 import runner
+import netease_ext
 
 _spec = importlib.util.spec_from_file_location("musicbox_service_app", MUSICBOX_SERVICE_DIR / "app.py")
 musicbox_app = importlib.util.module_from_spec(_spec)
@@ -22,6 +25,14 @@ _spec.loader.exec_module(musicbox_app)
 
 app = musicbox_app.app
 UpstreamException = musicbox_app.UpstreamException
+
+
+@pytest.fixture(autouse=True)
+def reset_netease_ext_state(monkeypatch):
+    """登录态 TTL 缓存与取链缓存是模块级状态，测试间必须隔离。"""
+    monkeypatch.setattr(netease_ext, "_login_state", None)
+    monkeypatch.setattr(netease_ext, "_url_cache", {})
+    yield
 
 
 def test_ensure_xdg_dirs_creates_all_directories(tmp_path, monkeypatch):
@@ -182,7 +193,7 @@ def test_musicbox_search_filters_unplayable_songs(monkeypatch):
             return {"code": 200, "account": None, "profile": None}
 
     monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
-    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
 
     with TestClient(app) as client:
         resp = client.get("/api/v1/search", params={"keyword": "test", "type": "song", "limit": 20})
@@ -221,7 +232,7 @@ def test_musicbox_songs_detail_filters_unplayable(monkeypatch):
         def get_account_info(self):
             return {"code": 200, "account": None, "profile": None}
 
-    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
 
     with TestClient(app) as client:
         resp = client.get("/api/v1/songs/detail", params={"ids": "101,102,103"})
@@ -265,7 +276,7 @@ def test_musicbox_search_logged_in_vip_playable(monkeypatch):
             return {"code": 200, "account": {"id": 12345}, "profile": {"nickname": "VIPUser"}}
 
     monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
-    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
 
     with TestClient(app) as client:
         resp = client.get("/api/v1/search", params={"keyword": "test", "type": "song", "limit": 20})
@@ -429,6 +440,8 @@ def test_song_url_passes_quality_to_cli(monkeypatch):
         captured["args"] = args
         return 0, '{"ok": true, "data": {"code": 200, "url": "http://m.test/a.flac"}}', ""
 
+    # 本测试校验 CLI 参数透传：进程内路径置为失败，强制走 CLI 兜底
+    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q: None)
     monkeypatch.setattr(runner, "run_musicbox", mock_run)
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/123/url", params={"quality": "lossless"})
@@ -471,7 +484,7 @@ def test_song_lyric_ok_and_upstream_error(monkeypatch):
         def song_tlyric(self, sid):
             return []
 
-    monkeypatch.setattr(netease_ext, "_get_api", lambda: FakeApi())
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: FakeApi())
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/123/lyric")
     assert resp.status_code == 200
@@ -568,7 +581,7 @@ def _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False):
             return ({"account": {"id": 1}, "profile": {"nickname": "u"}} if logged_in
                     else {"account": None, "profile": None})
 
-    monkeypatch.setattr(netease_ext, "_get_api", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
 
 
 def test_recommend_songs_hydrates_and_filters_playable(monkeypatch):
@@ -659,3 +672,128 @@ def test_toplist_with_index_hydrates_playable_songs(monkeypatch):
     assert data["ok"] is True
     assert data["index"] == 3
     assert [row["song_id"] for row in data["data"]] == [501]
+
+
+def test_auth_login_check_resets_resident_api_on_803(monkeypatch):
+    """扫码成功（803）必须丢弃常驻 NetEase 实例，否则服务进程内仍是旧登录态。"""
+    resets = []
+    monkeypatch.setattr(musicbox_app, "reset_api", lambda reason="": resets.append(reason))
+
+    def mock_run_musicbox(args, timeout=30.0):
+        return 0, json.dumps({"ok": True, "data": {"status": "success", "code": 803, "nickname": "u"}}), ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/login/check", params={"unikey": "k1"})
+        assert resp.status_code == 200
+        assert resp.json()["data"]["code"] == 803
+    assert resets == ["qr login success"]
+
+
+def test_auth_login_check_keeps_api_before_803(monkeypatch):
+    """待扫码（801）/已扫待确认（802）不重置实例。"""
+    resets = []
+    monkeypatch.setattr(musicbox_app, "reset_api", lambda reason="": resets.append(reason))
+
+    def mock_run_musicbox(args, timeout=30.0):
+        return 0, json.dumps({"ok": True, "data": {"code": 801, "message": "waiting"}}), ""
+
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/auth/login/check", params={"unikey": "k1"})
+        assert resp.json()["data"]["code"] == 801
+    assert resets == []
+
+
+def test_check_is_logged_in_ttl_cache_and_rebuild(monkeypatch):
+    """成功态 300s 内复用缓存；过期先重建实例（重读磁盘 cookie）再探测。"""
+    probes = {"n": 0}
+
+    class FakeApi:
+        def get_account_info(self):
+            probes["n"] += 1
+            return {"account": {"id": 1}}
+
+    resets = []
+    monkeypatch.setattr(netease_ext, "_api_instance", FakeApi())
+    monkeypatch.setattr(netease_ext, "_login_state", None)
+    monkeypatch.setattr(netease_ext, "reset_api", lambda reason="": resets.append(reason))
+    try:
+        assert netease_ext.check_is_logged_in() is True
+        assert probes["n"] == 1
+        # TTL 内：直接复用缓存结果
+        assert netease_ext.check_is_logged_in() is True
+        assert probes["n"] == 1
+        # 缓存过期：重建实例后重新探测一次
+        monkeypatch.setattr(netease_ext, "_login_state", (True, time.monotonic() - 301.0))
+        assert netease_ext.check_is_logged_in() is True
+        assert resets == ["login-state ttl expired"]
+        assert probes["n"] == 2
+    finally:
+        netease_ext._login_state = None
+
+
+def test_get_song_url_inproc_with_quality_and_cache(monkeypatch):
+    """进程内取链：临时改写全局音质并恢复，结果短缓存，不同音质另查。"""
+    import types
+
+    calls = {"n": 0}
+
+    class FakeApi:
+        def songs_url(self, ids):
+            calls["n"] += 1
+            return [{"id": ids[0], "code": 200, "url": "http://cdn/1.flac", "fee": 8}]
+
+    class FakeConfig:
+        def __init__(self):
+            self.config = {"music_quality": {"value": "standard"}}
+
+        def get(self, name):
+            return self.config[name]["value"]
+
+    # CI 不安装 NEMbox：注入 fake 模块（get_song_url 内部延迟 from NEMbox.config import Config）
+    fake_pkg = types.ModuleType("NEMbox")
+    fake_mod = types.ModuleType("NEMbox.config")
+    fake_mod.Config = FakeConfig
+    fake_pkg.config = fake_mod
+    monkeypatch.setitem(sys.modules, "NEMbox", fake_pkg)
+    monkeypatch.setitem(sys.modules, "NEMbox.config", fake_mod)
+
+    monkeypatch.setattr(netease_ext, "_api_instance", FakeApi())
+    monkeypatch.setattr(netease_ext, "_url_cache", {})
+    item = netease_ext.get_song_url(186016, "lossless")
+    assert item["url"] == "http://cdn/1.flac"
+    # 全局音质已恢复（CLI cmd_song_url 同款临时改写）
+    assert FakeConfig().config["music_quality"]["value"] == "standard"
+    # 缓存命中：不再发起请求
+    assert netease_ext.get_song_url(186016, "lossless") == item
+    assert calls["n"] == 1
+    # 不同音质：另查
+    netease_ext.get_song_url(186016, "exhigh")
+    assert calls["n"] == 2
+
+
+def test_song_url_prefers_inproc_falls_back_to_cli(monkeypatch):
+    """进程内解析失败时降级 CLI 子进程（保留结构化错误语义）。"""
+    cli_calls = []
+
+    def mock_run_musicbox(args, timeout=30.0):
+        cli_calls.append(args)
+        return 0, json.dumps({"ok": True, "data": {"url": "http://cli/1.mp3", "code": 200}}), ""
+
+    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q: None)
+    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    with TestClient(app) as client:
+        r = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
+        assert r.json()["data"]["url"] == "http://cli/1.mp3"
+    assert cli_calls == [["song", "url", "42", "--quality", "exhigh", "--json"]]
+
+    # 进程内成功：不再起 CLI 子进程
+    def boom(args, timeout=30.0):
+        raise AssertionError("CLI 不应被调用")
+
+    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q: {"url": "http://inproc/1.flac", "code": 200})
+    monkeypatch.setattr(runner, "run_musicbox", boom)
+    with TestClient(app) as client:
+        r2 = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
+        assert r2.json() == {"ok": True, "data": {"url": "http://inproc/1.flac", "code": 200}}

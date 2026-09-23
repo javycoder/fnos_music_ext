@@ -222,6 +222,17 @@ def record_online_play(user_guid: str, guid: str, track: dict | None = None) -> 
     save_online_play_history(user_guid, items)
 
 
+def remove_online_play(user_guid: str, guid: str) -> bool:
+    """从在线播放历史删除一条（guid 精确匹配）。返回是否有条目被删除。"""
+    if not guid:
+        return False
+    items = load_online_play_history(user_guid)
+    kept = [it for it in items if it.get("guid") != guid]
+    if len(kept) == len(items):
+        return False
+    return save_online_play_history(user_guid, kept)
+
+
 def user_id_from_guid(db_path: str, user_guid: str) -> int | None:
     if not db_path or not os.path.exists(db_path) or not user_guid:
         return None
