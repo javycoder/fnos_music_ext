@@ -1041,6 +1041,87 @@ if reclaim_container fnmusic-musicdl; then printf 'foreign-accepted\\n'; else pr
     assert 'foreign-refused' in result.stdout
 
 
+def _run_proxy_unit_owner(tmp_path, *, unit_text, show_value, args=()):
+    """check_proxy_unit_owner on a stubbed unit file / systemctl, BASE_DIR=checkout."""
+    checkout = tmp_path/'checkout'
+    checkout.mkdir(exist_ok=True)
+    unit = tmp_path/'fnmusic-ext.service'
+    unit.write_text(unit_text)
+    helper = tmp_path/'common.sh'
+    helper.write_text(
+        (BASE/'proxy/install_common.sh').read_text()
+        .replace('/etc/systemd/system/fnmusic-ext.service', str(unit))
+        .replace('systemctl show fnmusic-ext.service -p WorkingDirectory --value',
+                 f"printf '%s\\n' '{show_value}'")
+    )
+    script = tmp_path/'check.sh'
+    script.write_text(f"""#!/bin/bash
+set -euo pipefail
+BASE_DIR='{checkout}'
+log_err() {{ printf '[ERROR] %s\\n' "$*" >&2; }}
+log_warn() {{ printf '[WARN] %s\\n' "$*" >&2; }}
+source '{helper}'
+check_proxy_unit_owner "$@"
+""")
+    return subprocess.run(['bash', str(script), *args], capture_output=True, text=True)
+
+
+def test_proxy_unit_owner_adopts_when_owner_directory_deleted(tmp_path):
+    """原部署目录已删除：放行接管（与 deployment_conflict 语义一致），不再死锁。"""
+    gone = tmp_path/'gone'  # 从不创建
+    result = _run_proxy_unit_owner(
+        tmp_path,
+        unit_text=f'[Service]\nWorkingDirectory={gone}\n',
+        show_value=str(gone),
+    )
+    assert result.returncode == 0, result.stderr
+    assert '已不存在' in result.stderr
+    assert '直接接管' in result.stderr
+
+
+def test_proxy_unit_owner_adopt_flag_bypasses_live_foreign_unit(tmp_path):
+    """原目录仍存在：默认拒绝且报错给出双方路径与出路；--adopt 显式迁移放行。"""
+    other = tmp_path/'other'
+    other.mkdir()
+    checkout = tmp_path/'checkout'
+    kwargs = dict(
+        unit_text=f'[Service]\nWorkingDirectory={other}\n',
+        show_value=str(other),
+    )
+    refused = _run_proxy_unit_owner(tmp_path, **kwargs)
+    assert refused.returncode != 0
+    assert str(other) in refused.stderr
+    assert str(checkout) in refused.stderr
+    assert '--adopt' in refused.stderr
+    assert 'restore.sh' in refused.stderr
+    adopted = _run_proxy_unit_owner(tmp_path, **kwargs, args=('--adopt',))
+    assert adopted.returncode == 0, adopted.stderr
+    assert '--adopt 迁移' in adopted.stderr
+
+
+def test_proxy_unit_owner_falls_back_to_unit_file_when_show_empty(tmp_path):
+    """systemctl show 返回空：回退读 unit 文件本身，同目录仍判定为自己人。"""
+    checkout = tmp_path/'checkout'
+    result = _run_proxy_unit_owner(
+        tmp_path,
+        unit_text=f'[Service]\nWorkingDirectory={checkout}\n',
+        show_value='',
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_proxy_unit_owner_rejects_when_working_directory_unreadable(tmp_path):
+    """show 与 unit 文件都取不到 WorkingDirectory：明确报错而非静默失败。"""
+    result = _run_proxy_unit_owner(
+        tmp_path,
+        unit_text='[Service]\nExecStart=/bin/true\n',
+        show_value='',
+    )
+    assert result.returncode != 0
+    assert '无法读取' in result.stderr
+    assert 'fnmusic-ext.service' in result.stderr
+
+
 def test_socket_mutation_lock_serializes_processes(state):
     with state.lock():
         command = [sys.executable, str(BASE/'proxy/takeover.py'), 'remember', '--target', str(state.target),
