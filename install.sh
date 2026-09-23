@@ -895,7 +895,7 @@ if [ -d "${BASE_DIR}/musicbox-data" ] && [ ! -d "${SOURCES_DATA_DIR}" ]; then
     log_info "迁移数据目录: musicbox-data -> sources-data（网易登录态/缓存原样保留）"
     mv "${BASE_DIR}/musicbox-data" "${SOURCES_DATA_DIR}"
 fi
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlist_tracks" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
     "${SOURCES_DATA_DIR}/cache/netease-musicbox" \
     "${SOURCES_DATA_DIR}/config/netease-musicbox" \
     "${SOURCES_DATA_DIR}/netease-musicbox" \
@@ -931,6 +931,7 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
     echo "FNMUSIC_CACHE_DIR='$(dotenv_escape "${BASE_DIR}/cache")'"
     echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${BASE_DIR}/online_favorites")'"
+    echo "FNMUSIC_PLT_DIR='$(dotenv_escape "${BASE_DIR}/playlist_tracks")'"
     echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${BASE_DIR}/play_history")'"
     echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"
     echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"

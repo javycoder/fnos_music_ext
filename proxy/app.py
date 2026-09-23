@@ -120,6 +120,10 @@ CONF = {
     "fav_dir": os.environ.get(
         "FNMUSIC_FAV_DIR", os.path.join(_HOME, "online_favorites")
     ),
+    # 官方歌单内在线附加条目的存储目录（同 fav_dir 按用户分文件）
+    "plt_dir": os.environ.get(
+        "FNMUSIC_PLT_DIR", os.path.join(_HOME, "playlist_tracks")
+    ),
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
     # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order）；
@@ -1919,19 +1923,29 @@ def _register_fakes_from_recommend_bundle(data) -> None:
                 fake_official_guid(g)
 
 
+def _register_fakes_from_plt(data) -> bool:
+    """playlist_tracks 存储：items 是 {歌单guid: [条目]} 字典形状，逐桶注册曲目假 id。"""
+    if isinstance(data, dict) and isinstance(data.get("items"), dict):
+        for bucket in data["items"].values():
+            _register_fakes_from_items(bucket)
+        return True
+    return False
+
+
 def ensure_registry_warm() -> None:
-    """从收藏/历史/推荐缓存重建 fake→real 映射（假 id 是确定性 md5，可完整重建）。
+    """从收藏/历史/歌单附加/推荐缓存重建 fake→real 映射（假 id 是确定性 md5，可完整重建）。
 
     服务重启后内存注册表为空，而客户端仍持有重启前学到的假 id；此时上报的
     播放/收藏事件若反解失败会被当作官方事件透传而丢失。收藏与历史存储里
-    出现过的 guid 覆盖客户端会回传的曲目假 id；推荐缓存里的歌单/曲目 guid
-    覆盖客户端会回传的歌单封面假 id（歌单 coverId 也走伪装下发）。
+    出现过的 guid 覆盖客户端会回传的曲目假 id；歌单附加条目同理；推荐缓存
+    里的歌单/曲目 guid 覆盖客户端会回传的歌单封面假 id（歌单 coverId 也走伪装下发）。
     """
     global _REGISTRY_WARMED
     if _REGISTRY_WARMED:
         return
     _REGISTRY_WARMED = True
     for directory in (CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites"),
+                      CONF.get("plt_dir") or os.path.join(_HOME, "playlist_tracks"),
                       dailyrec.play_history_dir(),
                       dailyrec.recommend_cache_dir()):
         for path in _iter_registry_jsons(directory):
@@ -1942,6 +1956,8 @@ def ensure_registry_warm() -> None:
                 continue
             if isinstance(data, dict) and data.get("tracks") is not None:
                 _register_fakes_from_recommend_bundle(data)
+                continue
+            if _register_fakes_from_plt(data):
                 continue
             _register_fakes_from_items(data.get("items") if isinstance(data, dict) else data)
 
@@ -3829,6 +3845,30 @@ async def _online_favorite_set(request: Request) -> set[str]:
         return set()
 
 
+async def _best_effort_online_info(request: Request, guid: str) -> dict:
+    """尽力获取在线曲目元数据：拉不到时从缓存反查兜底，绝不为 None（收藏/歌单快照共用）。"""
+    info = await _online_info(request, guid)
+    if info:
+        return info
+    cached_lyric = read_lyric_cache(guid)
+    title = ""
+    artist = ""
+    cached_media = find_cache_file(guid)
+    if cached_media:
+        base = os.path.splitext(os.path.basename(cached_media))[0]
+        if " - " in base:
+            artist, title = base.split(" - ", 1)
+        else:
+            title = base
+    return {
+        "id": song_id_from_online_guid(guid),
+        "source": source_from_online_guid(guid),
+        "title": title,
+        "artist": artist,
+        "lyric": cached_lyric,
+    }
+
+
 @app.post("/music/api/v1/favorite-track/create")
 async def favorite_track_create(request: Request):
     upstream_client = get_upstream_client(request.app)
@@ -3849,26 +3889,7 @@ async def favorite_track_create(request: Request):
         return auth_resp
 
     now = int(time.time())
-    info = await _online_info(request, guid)
-    if not info:
-        cached_lyric = read_lyric_cache(guid)
-        title = ""
-        artist = ""
-        cached_media = find_cache_file(guid)
-        if cached_media:
-            base = os.path.splitext(os.path.basename(cached_media))[0]
-            if " - " in base:
-                artist, title = base.split(" - ", 1)
-            else:
-                title = base
-        info = {
-            "id": song_id_from_online_guid(guid),
-            "source": source_from_online_guid(guid),
-            "title": title,
-            "artist": artist,
-            "lyric": cached_lyric,
-        }
-
+    info = await _best_effort_online_info(request, guid)
     track_obj = build_favorite_track_obj(guid, info, created_at=now)
 
     async with _FAV_LOCK:
@@ -4116,6 +4137,239 @@ async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "dail
         return dailyrec.empty_daily_bundle(user_guid, kind)
 
 
+# === playlist tracks（官方歌单内的在线附加条目）===
+# 官方 add-track/remove-track 对 DB 中不存在的 track guid 返回 100002，
+# 在线曲目（客户端持有伪装 32-hex 假 id）直达官方必被拒。与收藏三接口同款
+# 分工：在线条目记本地 JSON（按用户分文件，桶键=官方歌单 guid），官方条目
+# 照旧透传官方；读取接口透传官方信封后合并下发。
+
+_PLT_LOCK = asyncio.Lock()
+
+
+def plt_dir() -> str:
+    return CONF.get("plt_dir") or os.path.join(_HOME, "playlist_tracks")
+
+
+def plt_dir_has_data() -> bool:
+    """目录里存在任一用户文件才启用读接口拦截路径，否则纯透传（零开销零风险）。"""
+    try:
+        return any(name.endswith(".json") for name in os.listdir(plt_dir()))
+    except OSError:
+        return False
+
+
+def user_plt_path(user_guid: str) -> str:
+    return os.path.join(plt_dir(), f"{sanitize_user_guid(user_guid)}.json")
+
+
+def load_playlist_tracks(user_guid: str) -> dict[str, list[dict]]:
+    """返回 {歌单guid: [{"guid","addedAt","track"}, ...]}。"""
+    path = user_plt_path(user_guid)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("items"), dict):
+            return {str(k): v for k, v in data["items"].items() if isinstance(v, list)}
+    except Exception as e:
+        logger.warning("Failed to load playlist tracks for %s from %s: %s", user_guid, path, e)
+    return {}
+
+
+def save_playlist_tracks(user_guid: str, items: dict[str, list[dict]]) -> bool:
+    path = user_plt_path(user_guid)
+    parent = os.path.dirname(path) or "."
+    part_path = f"{path}.{uuid4().hex[:8]}.part"
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(part_path, "w", encoding="utf-8") as f:
+            json.dump({"items": items}, f, ensure_ascii=False, indent=2)
+        os.replace(part_path, path)
+        return True
+    except Exception as e:
+        logger.warning("Failed to save playlist tracks for %s to %s: %s", user_guid, path, e)
+        if os.path.exists(part_path):
+            try:
+                os.remove(part_path)
+            except Exception:
+                pass
+        return False
+
+
+def playlist_track_counts(user_guid: str) -> dict[str, int]:
+    return {k: len(v) for k, v in load_playlist_tracks(user_guid).items()}
+
+
+async def _parse_playlist_track_body(request: Request) -> tuple[str, list[str]]:
+    """解析 add/remove-track 的 {"guid": 歌单, "trackGUIDs": [...]}（官方契约，批量）。"""
+    try:
+        body = json.loads((await request.body()).decode("utf-8") or "{}")
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return "", []
+    playlist_guid = str(body.get("guid") or "").strip()
+    raw = body.get("trackGUIDs")
+    track_guids = [str(g or "").strip() for g in raw if str(g or "").strip()] if isinstance(raw, list) else []
+    return playlist_guid, track_guids
+
+
+async def _forward_official_playlist_tracks(
+    request: Request, client: httpx.AsyncClient, action: str,
+    playlist_guid: str, official: list[str],
+) -> Response | None:
+    """混合批次中官方部分先行。返回 None=官方成功，否则返回官方错误响应（本地不动）。"""
+    headers = copy_incoming_headers(request)
+    req = client.build_request(
+        "POST",
+        f"/music/api/v1/playlist/{action}",
+        headers=headers,
+        json={"guid": playlist_guid, "trackGUIDs": official},
+    )
+    resp = await client.send(req)
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    if resp.status_code != 200:
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if not (isinstance(payload, dict) and payload.get("code") == 0):
+        return JSONResponse(content=payload or {"code": -1, "msg": "upstream error", "data": None})
+    return None
+
+
+@app.post("/music/api/v1/playlist/add-track")
+async def playlist_add_track(request: Request):
+    """往歌单加曲目：在线条目记本地存储（幂等，重复加刷新 addedAt 对齐官方语义）。"""
+    upstream_client = get_upstream_client(request.app)
+    playlist_guid, track_guids = await _parse_playlist_track_body(request)
+    if not playlist_guid:
+        return await forward_to_upstream(request, upstream_client)
+
+    playlist_guid = resolve_real_guid(playlist_guid)
+    if dailyrec.is_recommend_playlist_guid(playlist_guid):
+        # 推荐歌单是按天重建的虚拟歌单，保持只读：吸收请求，避免伪装 id 直达官方被拒
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+    online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
+    if not online:
+        # 全官方（或空列表）：原样透传，官方语义兜底（含参数校验错误回传）
+        return await forward_to_upstream(request, upstream_client)
+
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+
+    official = [g for g in (resolve_real_guid(g) for g in track_guids) if not is_online_guid(g)]
+    if official:
+        err = await _forward_official_playlist_tracks(request, upstream_client, "add-track", playlist_guid, official)
+        if err is not None:
+            return err
+
+    now = int(time.time())
+    snapshots = {}
+    for g in online:
+        snapshots[g] = build_favorite_track_obj(g, await _best_effort_online_info(request, g), created_at=now)
+
+    async with _PLT_LOCK:
+        try:
+            items = load_playlist_tracks(user_guid)
+            bucket = items.setdefault(playlist_guid, [])
+            for g in online:
+                idx = next((i for i, it in enumerate(bucket) if it.get("guid") == g), None)
+                if idx is not None:
+                    bucket[idx]["addedAt"] = now
+                    bucket[idx]["track"] = snapshots[g]
+                else:
+                    bucket.append({"guid": g, "addedAt": now, "track": snapshots[g]})
+            save_playlist_tracks(user_guid, items)
+        except Exception as e:
+            logger.warning("Error updating playlist tracks for user %s: %s", user_guid, e)
+
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+@app.post("/music/api/v1/playlist/remove-track")
+async def playlist_remove_track(request: Request):
+    """从歌单移除曲目：在线条目删本地存储（幂等），官方条目照旧透传。"""
+    upstream_client = get_upstream_client(request.app)
+    playlist_guid, track_guids = await _parse_playlist_track_body(request)
+    if not playlist_guid:
+        return await forward_to_upstream(request, upstream_client)
+
+    playlist_guid = resolve_real_guid(playlist_guid)
+    if dailyrec.is_recommend_playlist_guid(playlist_guid):
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+    online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
+    if not online:
+        return await forward_to_upstream(request, upstream_client)
+
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+
+    official = [g for g in (resolve_real_guid(g) for g in track_guids) if not is_online_guid(g)]
+    if official:
+        err = await _forward_official_playlist_tracks(request, upstream_client, "remove-track", playlist_guid, official)
+        if err is not None:
+            return err
+
+    online_set = set(online)
+    async with _PLT_LOCK:
+        try:
+            items = load_playlist_tracks(user_guid)
+            bucket = items.get(playlist_guid)
+            if bucket:
+                kept = [it for it in bucket if it.get("guid") not in online_set]
+                if kept:
+                    items[playlist_guid] = kept
+                else:
+                    items.pop(playlist_guid, None)
+                save_playlist_tracks(user_guid, items)
+        except Exception as e:
+            logger.warning("Error removing playlist tracks for user %s: %s", user_guid, e)
+
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+@app.post("/music/api/v1/playlist/delete")
+async def playlist_delete(request: Request):
+    """删除歌单：透传官方；成功后清掉本地为该歌单存的在线附加条目（防孤儿数据）。"""
+    upstream_client = get_upstream_client(request.app)
+    envelope = await fetch_upstream_envelope(request, upstream_client)
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {})
+
+    if envelope.get("code") == 0:
+        try:
+            body = json.loads((await request.body()).decode("utf-8") or "{}")
+        except Exception:
+            body = {}
+        playlist_guid = str(body.get("guid") or "").strip() if isinstance(body, dict) else ""
+        resolved = resolve_real_guid(playlist_guid)
+        if playlist_guid and not dailyrec.is_recommend_playlist_guid(resolved) and plt_dir_has_data():
+            is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
+            if is_authed:
+                async with _PLT_LOCK:
+                    try:
+                        items = load_playlist_tracks(user_guid)
+                        if items.pop(resolved, None) is not None or items.pop(playlist_guid, None) is not None:
+                            save_playlist_tracks(user_guid, items)
+                    except Exception as e:
+                        logger.warning("Error purging playlist tracks for user %s: %s", user_guid, e)
+
+    return JSONResponse(content=envelope, headers=headers)
+
+
 def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
     # 封面取曲在下发时重算（兼容当天旧缓存），并伪装成官方 track_+32hex 形态：
     # 官方 App 按 id 格式过滤，online: 原样下发的 coverId 不会被渲染成图标。
@@ -4193,7 +4447,27 @@ async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 官方歌单：本地存在在线附加条目才拦截修正 trackCount，否则纯透传
+        if not plt_dir_has_data():
+            return await forward_to_upstream(request, get_upstream_client(request.app))
+        upstream_client = get_upstream_client(request.app)
+        envelope = await fetch_upstream_envelope(request, upstream_client)
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        if envelope.get("code") != 0:
+            return JSONResponse(content=envelope, headers=headers)
+        # 官方明细已成功，此时探测被拒不能回传鉴权错误，降级为官方原样（同收藏列表）
+        is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed:
+            return JSONResponse(content=envelope, headers=headers)
+        extras = load_playlist_tracks(user_guid).get(resolve_real_guid(guid)) or []
+        if extras:
+            data = envelope.get("data")
+            if isinstance(data, dict):
+                tc = data.get("trackCount")
+                data["trackCount"] = (tc if isinstance(tc, int) else 0) + len(extras)
+        return JSONResponse(content=envelope, headers=headers)
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -4210,7 +4484,7 @@ async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
     recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
-    if not recommend_ids:
+    if not recommend_ids and not plt_dir_has_data():
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
@@ -4239,6 +4513,15 @@ async def playlist_batch_detail(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
+    # 官方歌单 trackCount 并上本地在线附加条目
+    if official_list:
+        counts = playlist_track_counts(user_guid)
+        for it in official_list:
+            if isinstance(it, dict):
+                extra = counts.get(str(it.get("guid") or ""))
+                if extra:
+                    tc = it.get("trackCount")
+                    it["trackCount"] = (tc if isinstance(tc, int) else 0) + extra
     recs: list[dict] = []
     for g in recommend_ids:
         kind = dailyrec.online_playlist_kind(g) or "daily"
@@ -4259,7 +4542,71 @@ async def playlist_track_list(request: Request):
     ).strip()
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 官方歌单：本地存在在线附加条目才拦截合并，否则纯透传
+        if not plt_dir_has_data():
+            return await forward_to_upstream(request, get_upstream_client(request.app))
+        upstream_client = get_upstream_client(request.app)
+        envelope = await fetch_upstream_envelope(request, upstream_client)
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        if envelope.get("code") != 0:
+            return JSONResponse(content=envelope, headers=headers)
+        # 官方列表已成功，此时探测被拒不能回传鉴权错误，降级为官方原样（同收藏列表）
+        is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed:
+            return JSONResponse(content=envelope, headers=headers)
+        extras = load_playlist_tracks(user_guid).get(resolve_real_guid(guid)) or []
+        if not extras:
+            return JSONResponse(content=envelope, headers=headers)
+
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            data = {"list": [], "total": 0}
+            envelope["data"] = data
+        official_list = data.get("list") if isinstance(data.get("list"), list) else []
+        official_total = data.get("total") if isinstance(data.get("total"), int) else len(official_list)
+
+        # 在线附加条目接在官方条目之后（addedAt 倒序），逻辑区间
+        # [official_total, official_total+len)；按请求页窗口切片，翻页不重不漏
+        extras_sorted = sorted(extras, key=lambda x: x.get("addedAt", 0), reverse=True)
+        fav_guids = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+        template = official_track_template(official_list)
+        online_objs = []
+        for it in extras_sorted:
+            g = str(it.get("guid") or "")
+            if not g:
+                continue
+            snapshot = it.get("track") if isinstance(it.get("track"), dict) else None
+            obj = build_favorite_track_obj(
+                g, _snapshot_to_info(snapshot) if snapshot else None,
+                created_at=it.get("addedAt"), template=template,
+            )
+            obj["isFavorite"] = g in fav_guids
+            online_objs.append(obj)
+
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            online_page = online_objs
+        else:
+            if size < 1:
+                size = 50
+            start = (page - 1) * size
+            lo = max(0, start - official_total)
+            hi = max(0, start + size - official_total)
+            online_page = online_objs[lo:hi]
+
+        data["list"] = official_list + online_page
+        data["total"] = official_total + len(online_objs)
+        return JSONResponse(content=disguise_client_json(envelope), headers=headers)
+
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
