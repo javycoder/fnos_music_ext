@@ -319,12 +319,12 @@ def test_install_callback_defaults_invalid_source_to_musicdl(sb):
     assert sb.install_args() == ["--non-interactive --sources musicdl --webui --extend"]
 
 
-def test_install_callback_lx_requires_url(sb):
+def test_install_callback_lx_without_url_installs_sourceless(sb):
+    """向导不再索要洛雪源 URL：无值=无源安装（装后在管理页配置），不得失败。"""
     sb.make_repo()
     result = sb.run("install_callback", wizard_sources="lxmusic", wizard_lx_url="")
-    assert result.returncode == 1
-    assert "洛雪源脚本 URL" in result.stderr
-    assert sb.install_args() == []
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --extend"]
 
 
 def test_install_callback_lx_url_passthrough_and_extend_off(sb):
@@ -336,16 +336,14 @@ def test_install_callback_lx_url_passthrough_and_extend_off(sb):
         "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js"]
 
 
-def test_install_callback_lx_skip_verify_flag(sb):
-    """向导勾选跳过洛雪源校验 → 追加 --lx-skip-verify（源故障不中断安装）。"""
+def test_install_callback_legacy_lx_url_still_passthrough(sb):
+    """旧版向导写入的向导值仍透传（升级兼容）；skip-verify 开关随向导字段一并移除。"""
     sb.make_repo()
     result = sb.run("install_callback", wizard_sources="lxmusic",
                     wizard_lx_url="http://s/y.js", wizard_lx_skip_verify="true")
     assert result.returncode == 0, result.stderr
-    # wizard_extend 缺省为 true（install_callback 既有默认），故带 --extend
     assert sb.install_args() == [
-        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js"
-        " --lx-skip-verify --extend"]
+        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js --extend"]
 
 
 def test_install_callback_lx_skip_verify_off_by_default(sb):
@@ -540,15 +538,15 @@ def test_upgrade_callback_corrupt_backup_fails_and_keeps_it(sb):
     assert sb.install_args() == []
 
 
-def test_upgrade_callback_lx_without_url_fails_clearly(sb):
+def test_upgrade_callback_lx_without_url_still_upgrades(sb):
+    """v2.2.7+ 无源安装（装后管理页配置）：.env 缺 LX_SOURCE_URL 不阻塞升级。"""
     repo = sb.make_repo()
     _make_backup(sb, repo, "FNMUSIC_LX_ENABLED=true\n")  # 备份缺 LX_SOURCE_URL
     result = sb.run("upgrade_callback")
-    assert result.returncode == 1
-    assert "LX_SOURCE_URL" in result.stderr
-    assert sb.install_args() == []
-    # 备份保留
-    assert (sb.pkgvar / "upgrade-backup" / "data.tar.gz").is_file()
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --extend --lx-skip-verify"]
+    # 升级成功后备份清理
+    assert not (sb.pkgvar / "upgrade-backup" / "data.tar.gz").exists()
 
 
 def test_upgrade_callback_without_backup_uses_current_env(sb):

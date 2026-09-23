@@ -198,6 +198,33 @@ test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () =
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
+test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入框并标脏", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/lx/upload", {
+    ok: true,
+    data: { path: "/data/lxmusic/uploads/mine.js", url: "file:///data/lxmusic/uploads/mine.js", meta: { name: "上传源" } },
+  });
+  const r = await global.lxUploadScript("mine.js", "/*stub*/");
+  assert.strictEqual(r.data.url, "file:///data/lxmusic/uploads/mine.js");
+  await global.lxAfterUpload(r);
+  assert.strictEqual(els.get("#lx-url").value, "file:///data/lxmusic/uploads/mine.js");
+  assert.strictEqual(els.get("#lx-upload-note").textContent, "已上传：上传源");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+});
+
+test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {
+  reset();
+  // 第一次 upload 502（进程未起），预览成功后重试成功
+  enqueue("/app/fnmusic-ext/api/lx/upload", new Error("lxmusic 服务不可达"));
+  enqueue("/app/fnmusic-ext/api/preview", { ok: true, preview: true });
+  enqueue("/app/fnmusic-ext/api/lx/upload", {
+    ok: true,
+    data: { path: "/p", url: "file:///p", meta: { name: "n" } },
+  });
+  const r = await global.lxUploadScript("a.js", "/*s*/");
+  assert.strictEqual(r.ok, true);
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

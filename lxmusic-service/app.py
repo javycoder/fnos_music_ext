@@ -30,6 +30,9 @@ from source_runtime import (
     SourceError,
     SourceManager,
     build_music_info,
+    is_source_url,
+    parse_script_meta,
+    save_upload,
     script_quality_for_tier,
 )
 
@@ -1512,7 +1515,8 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
 # ------------------------------------------------------------ 用户源管理端点 ---
 
 class SourceBody(BaseModel):
-    url: str
+    url: str = ""
+    script: str = ""  # 上传场景：脚本文本（与 url 二选一；url 可为 file:// 上传地址）
 
 
 @app.get("/api/v1/source")
@@ -1526,8 +1530,8 @@ async def source_verify(body: SourceBody):
     from verify_source import verify_url  # 延迟导入：verify_source 反向 import 本模块
 
     url = (body.url or "").strip()
-    if not re.match(r"^https?://", url, re.I):
-        return _err("url 必须以 http:// 或 https:// 开头", 400)
+    if not is_source_url(url):
+        return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
         report = await asyncio.wait_for(verify_url(url), timeout=120.0)
     except asyncio.TimeoutError:
@@ -1539,12 +1543,53 @@ async def source_verify(body: SourceBody):
     return {"ok": bool(report.get("ok")), "data": report}
 
 
+class UploadBody(BaseModel):
+    filename: str
+    script: str
+
+
+@app.post("/api/v1/source/upload")
+async def source_upload(body: UploadBody):
+    """落盘一段上传的脚本文本（不激活）：校验头部元数据后写入 uploads/，返回 file:// URL。"""
+    try:
+        meta = parse_script_meta(body.script)
+    except SourceError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+        )
+    try:
+        path, url = save_upload(SOURCE_MANAGER.state_dir, body.filename, body.script)
+    except SourceError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+        )
+    except OSError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": f"写入上传文件失败: {exc}", "category": "download"}, status_code=500
+        )
+    return {"ok": True, "data": {"path": path, "url": url, "meta": meta}}
+
+
 @app.post("/api/v1/source")
 async def source_set(body: SourceBody):
     """校验并切换当前激活源（state.json 持久化，热生效）。"""
     url = (body.url or "").strip()
-    if not re.match(r"^https?://", url, re.I):
-        return _err("url 必须以 http:// 或 https:// 开头", 400)
+    if not url and body.script:
+        # 直接以脚本文本激活（先落盘为上传文件，再走统一 file:// 链路）
+        try:
+            meta = parse_script_meta(body.script)
+        except SourceError as exc:
+            return JSONResponse(
+                content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+            )
+        try:
+            _path, url = save_upload(SOURCE_MANAGER.state_dir, "source.js", body.script)
+        except (SourceError, OSError) as exc:
+            return JSONResponse(
+                content={"ok": False, "error": f"保存上传脚本失败: {exc}", "category": "download"}, status_code=500
+            )
+    if not is_source_url(url):
+        return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
         await SOURCE_MANAGER.activate(url)
     except SourceError as exc:

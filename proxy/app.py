@@ -2119,7 +2119,7 @@ async def search_track(request: Request):
     _clean_search_cache()
     entry = _SEARCH_CACHE.get(key)
     if entry is None:
-        entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0, "keyword": keyword,
+        entry = {"items": [], "ts": 0, "keyword": keyword,
                  "scope": _search_scope(request), "credentials": _credential_scope(request), "config": _source_config(), "task": None}
         _set_search_cache(key, entry)
     entry["accessed"] = time.time()
@@ -2143,10 +2143,14 @@ async def search_track(request: Request):
     local_keys = {(title_from_track(x), artist_from_track(x)) for x in local_list}
     total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
     original_total = upstream_json.get("data", {}).get("total", len(local_list))
-    selected = _session_page(entry, page, size)
+    if not isinstance(original_total, int):
+        original_total = len(local_list)
+    # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
+    # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
+    # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
+    selected = _online_window(entry, page, size, original_total)
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
-    if isinstance(original_total, int):
-        merged["data"]["total"] = original_total + total_online
+    merged["data"]["total"] = original_total + total_online
     fav_set = await _online_favorite_set(request)
     if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
@@ -2184,7 +2188,7 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                 partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
                 items = data.get("items", []) if isinstance(data, dict) else (data or [])
                 results[task] = items
-                if not entry["pages"]:
+                if not entry["items"]:
                     ordered = [item for source_task in tasks for item in results.get(source_task, [])]
                 else:
                     ordered = entry["items"] + items
@@ -2198,22 +2202,22 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _session_page(entry: dict, page: int, size: int) -> list[dict]:
-    pages = entry["pages"]
-    count = int(CONF["online_limit"]) if page == 1 else size
-    if page not in pages:
-        if len(pages) >= 2000:
-            return []
-        pages[page] = []
-    # Only the trailing page can grow; no published prefix ever moves. This
-    # also lets a repeated empty first page recover after its negative TTL.
-    if page == max(pages):
-        start = entry["cursor"]
-        allocated = entry["items"][start:start + max(0, count - len(pages[page]))]
-        pages[page].extend(online_guid_from_item(item) for item in allocated)
-        entry["cursor"] += len(allocated)
-    by_guid = {online_guid_from_item(item): item for item in entry["items"]}
-    return [by_guid[guid] for guid in pages[page] if guid in by_guid and _source_enabled(guid)]
+def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[dict]:
+    """本地优先布局下取本页的在线切片。
+
+    全局布局：[本地 0..local_total) [在线 local_total..local_total+len(items))。
+    本页全局区间 = [(page-1)*size, page*size)；与在线段求交集后映射到 items 下标。
+    items 只追加不重排，同一 (page,size,local_total) 的切片稳定；items 后续
+    增长只会让更靠后的页多出条目（已返回页的前缀不动）。
+    """
+    start_global = (page - 1) * size
+    end_global = page * size
+    start = max(0, start_global - local_total)
+    end = max(0, end_global - local_total)
+    if start >= end:
+        return []
+    window = [item for item in entry["items"][start:end] if _source_enabled(online_guid_from_item(item))]
+    return window
 
 
 @app.get("/music/api/v1/search/suggest")

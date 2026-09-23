@@ -93,21 +93,42 @@ async def test_health_one_source_suffices_but_reports_degradation(monkeypatch):
     assert result["details"]["musicbox"]["dependency"]["reason"] == "offline"
 
 
-@pytest.mark.parametrize("initial", [0, 1, 3])
-def test_actual_first_page_cursor_and_local_duplicates(initial, monkeypatch):
+@pytest.mark.parametrize("initial", [1, 3])
+def test_online_window_local_first_layout_and_local_duplicates(initial, monkeypatch):
+    """本地优先全局布局：在线条目在 items 上连续分页、不重不漏；本地重复由 merge 过滤。"""
     monkeypatch.setitem(p.CONF, "online_limit", 3)
-    entry = session(request(), [song(f"kuwo:{i}", str(i)) for i in range(initial)])
-    first = p._session_page(entry, 1, 2)
-    entry["items"] = p.deduplicate_online_items(entry["items"] + [song(f"netease:{i}", str(i)) for i in range(5)])
-    second = p._session_page(entry, 2, 2)
-    assert [x["title"] for x in second] == [str(initial), str(initial + 1)]
-    assert [p.build_online_track(x) for x in p._session_page(entry, 1, 2)] == [p.build_online_track(x) for x in first]
-    # Filtering a local duplicate on page two cannot shift page-three offsets.
-    envelope = {"data": {"list": [{"title": str(initial), "artist": "Artist"}], "total": 1}}
-    merged = p.merge_online_tracks(envelope, second, selected=True)
-    assert [x["title"] for x in merged["data"]["list"]] == [str(initial), str(initial + 1)]
-    third = p._session_page(entry, 3, 2)
-    assert [x["title"] for x in third] == [str(i) for i in range(initial + 2, min(initial + 4, 5))]
+    raw = [song(f"kuwo:{i}", str(i)) for i in range(initial)] + [song(f"netease:{i}", str(i)) for i in range(5)]
+    entry = session(request(), p.deduplicate_online_items(raw))
+    items = [x["title"] for x in entry["items"]]
+    # local_total=0（上游无本地条目）：翻页走完整个在线段（dedup 后同名条目已合并）
+    walked: list[str] = []
+    page = 1
+    while True:
+        window = p._online_window(entry, page, 2, local_total=0)
+        if not window:
+            break
+        walked.extend(x["title"] for x in window)
+        page += 1
+        assert page < 20
+    assert walked == items
+    # 本地重复过滤不影响窗口本身（过滤发生在 merge_online_tracks）
+    envelope = {"data": {"list": [{"title": walked[0], "artist": "Artist"}], "total": 1}}
+    window = p._online_window(entry, 1, 2, local_total=0)
+    merged = p.merge_online_tracks(envelope, window, selected=True)
+    assert [x["title"] for x in merged["data"]["list"]] == walked[0:2]
+
+
+def test_online_window_local_pages_have_no_online_items():
+    """纯本地页（分页区间未触及在线段）在线切片为空；边界页拼接本地尾部与在线头部。"""
+    entry = session(request(), [song(f"kuwo:{i}", str(i)) for i in range(5)])
+    # 本地 4 条、size 2：第 1-2 页纯本地，第 3 页起是在线段（无拼接边界，整页在线）
+    assert p._online_window(entry, 1, 2, local_total=4) == []
+    assert p._online_window(entry, 2, 2, local_total=4) == []
+    assert [x["title"] for x in p._online_window(entry, 3, 2, local_total=4)] == ["0", "1"]
+    assert [x["title"] for x in p._online_window(entry, 4, 2, local_total=4)] == ["2", "3"]
+    # 本地不满一页：首页 = 本地 1 条 + 在线 1 条（窗口只给在线头部 1 条）
+    assert [x["title"] for x in p._online_window(entry, 1, 2, local_total=1)] == ["0"]
+    assert [x["title"] for x in p._online_window(entry, 2, 2, local_total=1)] == ["1", "2"]
 
 
 def test_strict_identity_alternatives_and_scope(monkeypatch):
@@ -348,11 +369,11 @@ async def test_clean_unknown_length_eof_finalizes(tmp_path):
 def test_repeated_empty_page_recovers_without_replacing_prefix(monkeypatch):
     monkeypatch.setitem(p.CONF, "online_limit", 2)
     entry = session(request(), [])
-    assert p._session_page(entry, 1, 2) == []
+    assert p._online_window(entry, 1, 2, local_total=0) == []
     entry["items"] = [song("kuwo:1")]
-    assert p._session_page(entry, 1, 2)[0]["id"] == "kuwo:1"
+    assert p._online_window(entry, 1, 2, local_total=0)[0]["id"] == "kuwo:1"
     entry["items"] += [song("netease:2", title="Late")]
-    assert [item["id"] for item in p._session_page(entry, 1, 2)] == ["kuwo:1", "netease:2"]
+    assert [item["id"] for item in p._online_window(entry, 1, 2, local_total=0)] == ["kuwo:1", "netease:2"]
 
 
 @pytest.mark.anyio
@@ -371,9 +392,9 @@ async def test_late_priority_cannot_replace_published_first_page(monkeypatch):
     p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda r: httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})), base_url="http://test")
     import json
-    first = json.loads((await p.search_track(request("q=Song&page=1"))).body)
-    second = json.loads((await p.search_track(request("q=Song&page=2"))).body)
-    repeated = json.loads((await p.search_track(request("q=Song&page=1"))).body)
+    first = json.loads((await p.search_track(request("q=Song&page=1&size=1"))).body)
+    second = json.loads((await p.search_track(request("q=Song&page=2&size=1"))).body)
+    repeated = json.loads((await p.search_track(request("q=Song&page=1&size=1"))).body)
     assert first["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:1")
     assert second["data"]["list"][0]["guid"] == fake_official_guid("online:netease:2")
     assert repeated["data"]["list"] == first["data"]["list"]

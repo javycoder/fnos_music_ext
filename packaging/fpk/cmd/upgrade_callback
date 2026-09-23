@@ -21,8 +21,9 @@ SOURCES="$(fnmusic_saved_source)"
 ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend)
 if [ "${SOURCES}" = "lxmusic" ]; then
     LX_URL="$(fnmusic_saved_lx_url)"
-    [ -n "${LX_URL}" ] || fnmusic_fail "升级失败：.env 中缺少 LX_SOURCE_URL，请卸载后重新安装"
-    ARGS+=(--lx-source-url "${LX_URL}")
+    # 洛雪源 URL 可能为空（v2.2.7+ 支持无源安装、装后在管理页配置）：
+    # 有值才透传；无值不阻塞升级，升级后照旧到管理页配置。
+    [ -n "${LX_URL}" ] && ARGS+=(--lx-source-url "${LX_URL}")
     # 源是用户装机时已确认过的：升级不得因源服务器临时故障（校验不过）而卡死，
     # 跳过可用性校验，只做激活；源状态装好后在管理页 WebUI 查看
     ARGS+=(--lx-skip-verify)

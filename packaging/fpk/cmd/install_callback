@@ -20,16 +20,11 @@ case "${EXTEND}" in
 esac
 
 ARGS=(--non-interactive --sources "${SOURCES}" --webui)
-if [ "${SOURCES}" = "lxmusic" ]; then
-    LX_URL="${wizard_lx_url:-}"
-    [ -n "${LX_URL}" ] || fnmusic_fail "选择 lxmusic 音源时必须填写洛雪源脚本 URL"
-    ARGS+=(--lx-source-url "${LX_URL}")
-    # 向导可勾选“跳过洛雪源可用性校验”：源服务器临时故障不让安装卡死，
-    # 装好后在管理页 WebUI(8774) 里查看/重配源
-    SKIP_LX_VERIFY="${wizard_lx_skip_verify:-}"
-    case "${SKIP_LX_VERIFY}" in
-        true|True|TRUE|1|yes) ARGS+=(--lx-skip-verify) ;;
-    esac
+# 洛雪源脚本（URL/电脑上传/NAS 选择）统一装好后在管理页 WebUI 配置：
+# 安装向导平台没有文件上传组件，URL 也不再向安装者索要，无源安装不阻塞。
+if [ -n "${wizard_lx_url:-}" ]; then
+    # 兼容旧版向导写入的向导值（升级场景等）：有值就透传，无值不要求
+    ARGS+=(--lx-source-url "${wizard_lx_url}")
 fi
 [ "${EXTEND}" -eq 1 ] && ARGS+=(--extend)
 
