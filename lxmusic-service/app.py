@@ -22,7 +22,7 @@ from contextvars import ContextVar
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -1345,12 +1345,121 @@ def _err(msg: str, code: int = 404) -> JSONResponse:
     return JSONResponse(content={"ok": False, "error": msg}, status_code=code)
 
 
+class _LxSuperseded:
+    pass
+
+
+_LX_SUPERSEDED = _LxSuperseded()
+
+
+class LxSearchGate:
+    """同时只搜一个关键词。同一范围的新词取消正在跑的平台任务；其他范围排队。"""
+
+    def __init__(self):
+        self._epoch = 0
+        self._running: dict | None = None
+        self._queue: list[dict] = []
+
+    def reset(self) -> None:
+        self._epoch += 1
+        job = self._running
+        self._running = None
+        queued = self._queue
+        self._queue = []
+        if job and job.get("task") and not job["task"].done():
+            job["task"].cancel()
+        for slot in queued:
+            _lx_resolve(slot, _LX_SUPERSEDED)
+        if job:
+            _lx_resolve(job, _LX_SUPERSEDED)
+
+    async def run(self, scope: str, keyword: str, factory):
+        fut = asyncio.get_running_loop().create_future()
+        running = self._running
+        if running and running["scope"] == scope and running["keyword"] == keyword and not running.get("superseded"):
+            running["waiters"].append(fut)
+        elif running and running["scope"] == scope and running["keyword"] != keyword:
+            running["superseded"] = True
+            _lx_resolve(running, _LX_SUPERSEDED)
+            task = running.get("task")
+            if task and not task.done():
+                task.cancel()
+            self._upsert(scope, keyword, factory, fut, front=True)
+        else:
+            self._upsert(scope, keyword, factory, fut, front=False)
+        self._pump()
+        return await asyncio.shield(fut)
+
+    def _upsert(self, scope, keyword, factory, fut, front: bool) -> None:
+        for slot in self._queue:
+            if slot["scope"] != scope:
+                continue
+            if slot["keyword"] != keyword:
+                _lx_resolve(slot, _LX_SUPERSEDED)
+                slot["keyword"] = keyword
+                slot["factory"] = factory
+                slot["waiters"] = [fut]
+            else:
+                slot["waiters"].append(fut)
+            if front:
+                self._queue.remove(slot)
+                self._queue.insert(0, slot)
+            return
+        slot = {"scope": scope, "keyword": keyword, "factory": factory, "waiters": [fut]}
+        self._queue.insert(0, slot) if front else self._queue.append(slot)
+
+    def _pump(self) -> None:
+        if self._running is not None or not self._queue:
+            return
+        slot = self._queue.pop(0)
+        job = {
+            "scope": slot["scope"], "keyword": slot["keyword"], "factory": slot["factory"],
+            "waiters": slot["waiters"], "superseded": False, "epoch": self._epoch, "task": None,
+        }
+        self._running = job
+        job["task"] = asyncio.get_running_loop().create_task(self._execute(job))
+
+    async def _execute(self, job: dict) -> None:
+        result = _LX_SUPERSEDED
+        try:
+            result = await job["factory"]()
+        except asyncio.CancelledError:
+            result = _LX_SUPERSEDED
+        except Exception as exc:
+            result = exc
+        if job.get("epoch") != self._epoch:
+            _lx_resolve(job, _LX_SUPERSEDED)
+            return
+        if self._running is job:
+            self._running = None
+        if job.get("superseded") or result is _LX_SUPERSEDED:
+            _lx_resolve(job, _LX_SUPERSEDED)
+        elif isinstance(result, Exception):
+            _lx_resolve(job, result, error=True)
+        else:
+            _lx_resolve(job, result)
+        self._pump()
+
+
+def _lx_resolve(job: dict, result, error: bool = False) -> None:
+    for fut in job.get("waiters", []):
+        if not fut.done():
+            if error:
+                fut.set_exception(result)
+            else:
+                fut.set_result(result)
+
+
+LX_SEARCH_GATE = LxSearchGate()
+
+
 @app.get("/api/v1/search")
 async def search(
     keyword: str = Query("", alias="keyword"),
     q: str = Query("", alias="q"),
     limit: int = Query(0),
     sources: str = Query(""),
+    x_fnmusic_scope: str = Header(default=""),
 ):
     kw = (keyword or q or "").strip()
     if not kw:
@@ -1361,7 +1470,18 @@ async def search(
     wanted_raw = [s.strip() for s in (sources or "").split(",") if s.strip()]
     wanted = [normalize_source(s) for s in wanted_raw]
     wanted = [s for s in wanted if s] or CONF["sources"]
+    scope = (x_fnmusic_scope or "").strip()
 
+    async def _run():
+        return await _search_platforms(kw, limit, wanted)
+
+    result = await LX_SEARCH_GATE.run(scope, kw, _run)
+    if result is _LX_SUPERSEDED:
+        return {"ok": True, "items": [], "superseded": True, "errors": {}}
+    return result
+
+
+async def _search_platforms(kw: str, limit: int, wanted: list[str]) -> dict:
     client = get_http(app)
     tasks = {}
     partials = {}

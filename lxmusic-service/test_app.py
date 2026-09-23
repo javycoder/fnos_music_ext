@@ -829,6 +829,72 @@ def test_fresh_probe_tier_and_expiry():
                                "trial": "1"}, "standard") is None
 
 
+def test_same_scope_cancels_search_other_scope_waits(monkeypatch):
+    """同范围的新搜索取消还在跑的平台任务；另一个范围排队，不取消当前搜索。"""
+    import asyncio
+
+    started = []
+    cancelled = []
+    release = {"one": asyncio.Event(), "two": asyncio.Event(), "three": asyncio.Event()}
+
+    async def slow(client, keyword, limit):
+        started.append(keyword)
+        try:
+            await release[keyword].wait()
+        except asyncio.CancelledError:
+            cancelled.append(keyword)
+            raise
+        return []
+
+    monkeypatch.setitem(lxapp._SEARCHERS, "kw", slow)
+    monkeypatch.setattr(lxapp, "source_capabilities", lambda: {"kw": {"playback_available": True, "reason": ""}})
+    monkeypatch.setitem(lxapp.CONF, "sources", ["kw"])
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=lxapp.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://lx") as client:
+            async def hit(keyword, scope):
+                return await client.get(
+                    "/api/v1/search",
+                    params={"keyword": keyword, "sources": "kw"},
+                    headers={"X-Fnmusic-Scope": scope},
+                )
+
+            first = asyncio.create_task(hit("one", "user-a"))
+            for _ in range(50):
+                if "one" in started:
+                    break
+                await asyncio.sleep(0.01)
+            assert started == ["one"]
+            second = asyncio.create_task(hit("two", "user-a"))
+            for _ in range(50):
+                if "two" in started and "one" in cancelled:
+                    break
+                await asyncio.sleep(0.01)
+            assert cancelled == ["one"]
+            assert started == ["one", "two"]
+            third = asyncio.create_task(hit("three", "user-b"))
+            await asyncio.sleep(0.05)
+            assert started == ["one", "two"]
+            release["two"].set()
+            second_resp = await second
+            for _ in range(50):
+                if "three" in started:
+                    break
+                await asyncio.sleep(0.01)
+            assert "three" not in cancelled
+            assert started == ["one", "two", "three"]
+            release["three"].set()
+            third_resp = await third
+            first_resp = await first
+            assert first_resp.json()["superseded"] is True
+            assert second_resp.status_code == 200
+            assert third_resp.status_code == 200
+            assert third_resp.json().get("superseded") is not True
+
+    asyncio.run(scenario())
+
+
 def test_title_relevance_ranking():
     r = lxapp._title_relevance
     assert r("晴天", "晴天 周杰伦") == 1  # 原版

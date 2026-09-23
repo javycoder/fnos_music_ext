@@ -54,6 +54,7 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 604800.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
 
     def default_musicbox_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"ok": False, "data": []})
@@ -998,9 +999,9 @@ def test_ext_healthz():
 
 
 def test_search_track_late_wait_first_source_completed(monkeypatch):
-    """3s 内无任何源返回，进入超时外等待 5s：一旦首个源返回，立刻采用本地+首个结果返回。"""
-    monkeypatch.setitem(CONF, "netease_wait_s", 0.05)  # 模拟阶段一极短超时
-    monkeypatch.setitem(CONF, "late_page_wait_s", 2.0)  # 模拟阶段二等待
+    """等到各音源结束（上限 search_timeout）再回复，慢源的空结果不会丢掉先返回的歌曲。"""
+    monkeypatch.setitem(CONF, "search_timeout", 2.0)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
     monkeypatch.setitem(CONF, "lx_enabled", True)
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)

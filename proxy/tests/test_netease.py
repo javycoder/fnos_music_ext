@@ -44,6 +44,7 @@ def setup_netease_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
 
 
 # =========================================================================
