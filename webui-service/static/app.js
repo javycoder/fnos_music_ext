@@ -116,6 +116,7 @@ function applyConfigToForm() {
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
+  $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
   $("#tee-dir").value = v.FNMUSIC_TEE_SAVE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   updateTeeCountLabel();
@@ -138,6 +139,7 @@ function collectConfig() {
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
+    FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
     FNMUSIC_TEE_SAVE_DIR: $("#tee-dir").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
@@ -503,7 +505,7 @@ $("#lx-pick").addEventListener("click", lxPickFromNas);
 ["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#tee-enabled"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#tee-enabled", "#fav-autobind"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {
