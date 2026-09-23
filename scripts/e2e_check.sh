@@ -55,7 +55,7 @@ except Exception:
 # ── 1. 搜索 ─────────────────────────────────────────────
 SEARCH1=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=1&size=10")
 TOTAL1=$(echo "$SEARCH1" | jget data.total)
-LIST1_COUNT=$(echo "$SEARCH1" | jget data.list | python3 -c "import sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+LIST1_COUNT=$(echo "$SEARCH1" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
 ONLINE_GUID=$(sudo python3 - "$SEARCH1" <<'PY'
 import json, sqlite3, sys
 try:
@@ -87,7 +87,7 @@ fi
 
 # ── 2. 分页 ─────────────────────────────────────────────
 SEARCH2=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=2&size=10")
-LIST2_COUNT=$(echo "$SEARCH2" | jget data.list | python3 -c "import sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+LIST2_COUNT=$(echo "$SEARCH2" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
 if [ "${TOTAL1:-0}" -gt 10 ] && [ "${LIST1_COUNT:-0}" -eq 10 ] && [ "${LIST2_COUNT:-0}" -gt 0 ]; then
   ok "分页 page=2（page1=$LIST1_COUNT 条 / page2=$LIST2_COUNT 条 / total=$TOTAL1）"
 else
