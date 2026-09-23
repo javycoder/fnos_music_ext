@@ -964,6 +964,19 @@ def test_safe_child_logs_retain_outcomes_without_credentials(capsys):
         assert secret not in output
 
 
+def test_safe_child_logs_retain_stream_probe_and_abort_lines(capsys):
+    """流探针与流中断日志必须能进 journal：后台播放卡住排查时唯一的证据来源。"""
+    import io
+    lines = (
+        "INFO:     stream probe: GET online:kuwo:123456 range='bytes=0-' cached=False tee_eligible=True\n"
+        "2026-09-10 12:00:00,124 [WARNING] fnmusic_proxy: Stream aborted mid-way for online:kuwo:123456: ReadTimeout\n"
+    )
+    takeover.drain_diagnostics(io.StringIO(lines))
+    output = capsys.readouterr().err
+    assert 'stream probe: GET online:kuwo:123456' in output
+    assert 'Stream aborted mid-way for online:kuwo:123456: ReadTimeout' in output
+
+
 def test_safe_child_logs_discard_oversized_line_tail(capsys):
     import io
     oversized = 'x' * 16384 + 'INFO:     Application startup complete.\n'
