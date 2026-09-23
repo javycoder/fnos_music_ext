@@ -22,7 +22,7 @@ from contextvars import ContextVar
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -30,6 +30,9 @@ from source_runtime import (
     SourceError,
     SourceManager,
     build_music_info,
+    is_source_url,
+    parse_script_meta,
+    save_upload,
     script_quality_for_tier,
 )
 
@@ -1342,12 +1345,121 @@ def _err(msg: str, code: int = 404) -> JSONResponse:
     return JSONResponse(content={"ok": False, "error": msg}, status_code=code)
 
 
+class _LxSuperseded:
+    pass
+
+
+_LX_SUPERSEDED = _LxSuperseded()
+
+
+class LxSearchGate:
+    """同时只搜一个关键词。同一范围的新词取消正在跑的平台任务；其他范围排队。"""
+
+    def __init__(self):
+        self._epoch = 0
+        self._running: dict | None = None
+        self._queue: list[dict] = []
+
+    def reset(self) -> None:
+        self._epoch += 1
+        job = self._running
+        self._running = None
+        queued = self._queue
+        self._queue = []
+        if job and job.get("task") and not job["task"].done():
+            job["task"].cancel()
+        for slot in queued:
+            _lx_resolve(slot, _LX_SUPERSEDED)
+        if job:
+            _lx_resolve(job, _LX_SUPERSEDED)
+
+    async def run(self, scope: str, keyword: str, factory):
+        fut = asyncio.get_running_loop().create_future()
+        running = self._running
+        if running and running["scope"] == scope and running["keyword"] == keyword and not running.get("superseded"):
+            running["waiters"].append(fut)
+        elif running and running["scope"] == scope and running["keyword"] != keyword:
+            running["superseded"] = True
+            _lx_resolve(running, _LX_SUPERSEDED)
+            task = running.get("task")
+            if task and not task.done():
+                task.cancel()
+            self._upsert(scope, keyword, factory, fut, front=True)
+        else:
+            self._upsert(scope, keyword, factory, fut, front=False)
+        self._pump()
+        return await asyncio.shield(fut)
+
+    def _upsert(self, scope, keyword, factory, fut, front: bool) -> None:
+        for slot in self._queue:
+            if slot["scope"] != scope:
+                continue
+            if slot["keyword"] != keyword:
+                _lx_resolve(slot, _LX_SUPERSEDED)
+                slot["keyword"] = keyword
+                slot["factory"] = factory
+                slot["waiters"] = [fut]
+            else:
+                slot["waiters"].append(fut)
+            if front:
+                self._queue.remove(slot)
+                self._queue.insert(0, slot)
+            return
+        slot = {"scope": scope, "keyword": keyword, "factory": factory, "waiters": [fut]}
+        self._queue.insert(0, slot) if front else self._queue.append(slot)
+
+    def _pump(self) -> None:
+        if self._running is not None or not self._queue:
+            return
+        slot = self._queue.pop(0)
+        job = {
+            "scope": slot["scope"], "keyword": slot["keyword"], "factory": slot["factory"],
+            "waiters": slot["waiters"], "superseded": False, "epoch": self._epoch, "task": None,
+        }
+        self._running = job
+        job["task"] = asyncio.get_running_loop().create_task(self._execute(job))
+
+    async def _execute(self, job: dict) -> None:
+        result = _LX_SUPERSEDED
+        try:
+            result = await job["factory"]()
+        except asyncio.CancelledError:
+            result = _LX_SUPERSEDED
+        except Exception as exc:
+            result = exc
+        if job.get("epoch") != self._epoch:
+            _lx_resolve(job, _LX_SUPERSEDED)
+            return
+        if self._running is job:
+            self._running = None
+        if job.get("superseded") or result is _LX_SUPERSEDED:
+            _lx_resolve(job, _LX_SUPERSEDED)
+        elif isinstance(result, Exception):
+            _lx_resolve(job, result, error=True)
+        else:
+            _lx_resolve(job, result)
+        self._pump()
+
+
+def _lx_resolve(job: dict, result, error: bool = False) -> None:
+    for fut in job.get("waiters", []):
+        if not fut.done():
+            if error:
+                fut.set_exception(result)
+            else:
+                fut.set_result(result)
+
+
+LX_SEARCH_GATE = LxSearchGate()
+
+
 @app.get("/api/v1/search")
 async def search(
     keyword: str = Query("", alias="keyword"),
     q: str = Query("", alias="q"),
     limit: int = Query(0),
     sources: str = Query(""),
+    x_fnmusic_scope: str = Header(default=""),
 ):
     kw = (keyword or q or "").strip()
     if not kw:
@@ -1358,7 +1470,18 @@ async def search(
     wanted_raw = [s.strip() for s in (sources or "").split(",") if s.strip()]
     wanted = [normalize_source(s) for s in wanted_raw]
     wanted = [s for s in wanted if s] or CONF["sources"]
+    scope = (x_fnmusic_scope or "").strip()
 
+    async def _run():
+        return await _search_platforms(kw, limit, wanted)
+
+    result = await LX_SEARCH_GATE.run(scope, kw, _run)
+    if result is _LX_SUPERSEDED:
+        return {"ok": True, "items": [], "superseded": True, "errors": {}}
+    return result
+
+
+async def _search_platforms(kw: str, limit: int, wanted: list[str]) -> dict:
     client = get_http(app)
     tasks = {}
     partials = {}
@@ -1512,7 +1635,8 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
 # ------------------------------------------------------------ 用户源管理端点 ---
 
 class SourceBody(BaseModel):
-    url: str
+    url: str = ""
+    script: str = ""  # 上传场景：脚本文本（与 url 二选一；url 可为 file:// 上传地址）
 
 
 @app.get("/api/v1/source")
@@ -1526,8 +1650,8 @@ async def source_verify(body: SourceBody):
     from verify_source import verify_url  # 延迟导入：verify_source 反向 import 本模块
 
     url = (body.url or "").strip()
-    if not re.match(r"^https?://", url, re.I):
-        return _err("url 必须以 http:// 或 https:// 开头", 400)
+    if not is_source_url(url):
+        return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
         report = await asyncio.wait_for(verify_url(url), timeout=120.0)
     except asyncio.TimeoutError:
@@ -1539,12 +1663,53 @@ async def source_verify(body: SourceBody):
     return {"ok": bool(report.get("ok")), "data": report}
 
 
+class UploadBody(BaseModel):
+    filename: str
+    script: str
+
+
+@app.post("/api/v1/source/upload")
+async def source_upload(body: UploadBody):
+    """落盘一段上传的脚本文本（不激活）：校验头部元数据后写入 uploads/，返回 file:// URL。"""
+    try:
+        meta = parse_script_meta(body.script)
+    except SourceError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+        )
+    try:
+        path, url = save_upload(SOURCE_MANAGER.state_dir, body.filename, body.script)
+    except SourceError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+        )
+    except OSError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": f"写入上传文件失败: {exc}", "category": "download"}, status_code=500
+        )
+    return {"ok": True, "data": {"path": path, "url": url, "meta": meta}}
+
+
 @app.post("/api/v1/source")
 async def source_set(body: SourceBody):
     """校验并切换当前激活源（state.json 持久化，热生效）。"""
     url = (body.url or "").strip()
-    if not re.match(r"^https?://", url, re.I):
-        return _err("url 必须以 http:// 或 https:// 开头", 400)
+    if not url and body.script:
+        # 直接以脚本文本激活（先落盘为上传文件，再走统一 file:// 链路）
+        try:
+            meta = parse_script_meta(body.script)
+        except SourceError as exc:
+            return JSONResponse(
+                content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
+            )
+        try:
+            _path, url = save_upload(SOURCE_MANAGER.state_dir, "source.js", body.script)
+        except (SourceError, OSError) as exc:
+            return JSONResponse(
+                content={"ok": False, "error": f"保存上传脚本失败: {exc}", "category": "download"}, status_code=500
+            )
+    if not is_source_url(url):
+        return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
         await SOURCE_MANAGER.activate(url)
     except SourceError as exc:

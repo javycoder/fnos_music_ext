@@ -82,7 +82,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 1. **音源三选一**（v2.0.0 起互斥单选）：
    - `1` 网易云 musicbox：安装后自动进入扫码登录；
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
-   - `3` 洛雪 lxmusic：输入自定义源脚本 URL，安装时进行「下载→初始化→搜索→解析→探活」全链路校验，失败可循环重输；
+   - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
 2. **是否安装管理 WebUI**（端口 8774，默认否；无鉴权，仅限可信内网）；
 3. **大模型每日推荐（可选）**：OpenAI 兼容 API，仅在未启用网易音源时作为推荐兜底；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
@@ -96,9 +96,12 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 # musicdl（酷我+咪咕；平台粒度用短名或编号）
 ./install.sh --non-interactive --sources musicdl-kuwo,musicdl-migu --extend
 
-# 洛雪自定义源（--lx-source-url 非交互必填）
+# 洛雪自定义源（--lx-source-url 可选：http(s) URL / 本机 .js 路径 / 留空无源安装）
 ./install.sh --non-interactive --sources lxmusic \
   --lx-source-url 'https://example.com/your-source.js' --extend
+./install.sh --non-interactive --sources lxmusic \
+  --lx-source-url "$HOME/scripts/my-source.js" --extend   # 本机路径自动复制进数据卷
+./install.sh --non-interactive --sources lxmusic --webui --extend  # 无源安装，装后在管理页配置
 
 # 附带大模型推荐兜底（密钥仅写入本地 .env，权限 600）
 ./install.sh --non-interactive --sources musicdl --enable-recommend \
@@ -106,7 +109,8 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --llm-api-key '<KEY>' --llm-model 'gpt-4o-mini' --extend
 ```
 
-常用参数：`--sources`（音源三选一）、`--lx-source-url`、`--lx-skip-verify`
+常用参数：`--sources`（音源三选一）、`--lx-source-url`（可选：http(s) URL 或
+宿主机 `.js` 路径，路径会自动复制进数据卷）、`--lx-skip-verify`
 （跳过洛雪源可用性校验直接激活，源是否可用装好后在管理页 WebUI 查看）、
 `--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--adopt`（迁移部署登记）、
 `--qr`（仅扫码登录）。`--mode` 参数已随 host 模式移除。
@@ -170,10 +174,20 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 播放解析依赖你提供的洛雪自定义源脚本（社区格式，`@name/@version` 头部注释的 JS）：
 
-- **安装时配置**：向导选 `3` 后输入 URL，或非交互 `--lx-source-url '<URL>'`；
-  安装器在容器内运行 `verify_source.py` 做全链路校验（下载→初始化→内置搜索→
-  128k 解析→Range 探活），失败按分类提示循环重输；
-- **运行期更换**：WebUI「音乐源 → 洛雪」输入 URL 点「测试」，通过后保存即热切换；
+- **管理页配置（推荐）**：WebUI「音乐源 → 洛雪自定义源」提供三种方式——
+  1. **粘贴 URL**：`http(s)://.../*.js`（原有方式）；
+  2. **上传 .js 文件**：从电脑选择脚本上传，落盘到数据卷
+     `sources-data/lxmusic/uploads/`，以 `file:///data/lxmusic/uploads/<名字>.js`
+     形态参与后续流程（随数据卷持久化，重启/升级不丢）；
+  3. **从 NAS 选择**：飞牛桌面内打开管理页时可用（走 fnOS 开放 API
+     `pickUserFile` 文件选择器；直连 8774 的浏览器环境自动隐藏该按钮），
+     选中 NAS 上的 `.js` 后由宿主侧网关代读内容，等效于上传。
+  任一方式选定后点「测试」（下载→初始化→内置搜索→128k 解析→Range 探活），
+  通过后保存即热切换；
+- **安装时配置（可选）**：非交互 `--lx-source-url` 接受 `http(s)` URL 或宿主机
+  `.js` 文件路径（自动复制进数据卷并转 `file://`）；安装器在容器内运行
+  `verify_source.py` 做全链路校验，失败按分类提示。不提供则无源安装，
+  装好后在管理页配置；fpk 安装向导不再出现任何洛雪源输入项；
 - **生效范围**：源脚本只在容器内 Node 沙箱中运行、仅可发起 HTTP 请求；
   搜索/歌词/热门榜单始终走内置平台接口，不依赖源脚本；
 - 未配置源时 lxmusic 的播放解析不可用（搜索/榜单不受影响），`/healthz` 的

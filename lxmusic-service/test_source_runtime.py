@@ -182,6 +182,67 @@ def test_download_script_missing_header(monkeypatch):
     assert ei.value.category == "invalid"
 
 
+# ------------------------------------------------------------ file:// 与上传 ---
+
+def test_download_script_file_url(tmp_path):
+    target = tmp_path / "my-source.js"
+    target.write_text(_VALID_HEADER, encoding="utf-8")
+    script = asyncio.run(sr.download_script(f"file://{target}"))
+    assert script == _VALID_HEADER
+
+
+def test_download_script_file_url_requires_absolute_path():
+    with pytest.raises(sr.SourceError) as ei:
+        asyncio.run(sr.download_script("file://relative/x.js"))
+    assert ei.value.category == "download"
+
+
+def test_download_script_file_url_missing_file(tmp_path):
+    with pytest.raises(sr.SourceError) as ei:
+        asyncio.run(sr.download_script(f"file://{tmp_path / 'nope.js'}"))
+    assert ei.value.category == "download"
+
+
+def test_download_script_file_url_invalid_script(tmp_path):
+    target = tmp_path / "bad.js"
+    target.write_text("var noHeader = 1", encoding="utf-8")
+    with pytest.raises(sr.SourceError) as ei:
+        asyncio.run(sr.download_script(f"file://{target}"))
+    assert ei.value.category == "invalid"
+
+
+def test_is_source_url_accepts_http_and_file():
+    assert sr.is_source_url("https://a.test/1.js")
+    assert sr.is_source_url("http://a.test/1.js")
+    assert sr.is_source_url("file:///data/lxmusic/uploads/x.js")
+    assert not sr.is_source_url("ftp://a.test/1.js")
+    assert not sr.is_source_url("")
+    assert not sr.is_source_url("/data/lxmusic/uploads/x.js")
+
+
+def test_sanitize_upload_filename():
+    assert sr.sanitize_upload_filename("../../etc/passwd") == "passwd.js"
+    assert sr.sanitize_upload_filename("我的源 v1.js") == "我的源_v1.js"  # 空格净化为下划线
+    assert sr.sanitize_upload_filename("no ext") == "no_ext.js"
+    assert sr.sanitize_upload_filename("  ") == "source.js"
+    assert sr.sanitize_upload_filename("a/b\\c:d.js") == "b_c_d.js"  # basename 先剥掉 a/（Linux）
+
+
+def test_save_upload_roundtrip_and_collision(tmp_path):
+    path1, url1 = sr.save_upload(tmp_path, "首次上传.js", _VALID_HEADER)
+    assert path1.startswith(str(tmp_path / "uploads")) and path1.endswith(".js")
+    assert url1 == f"file://{path1}"
+    assert asyncio.run(sr.download_script(url1)) == _VALID_HEADER
+    # 同名二次上传：不覆盖，追加时间戳后缀
+    path2, url2 = sr.save_upload(tmp_path, "首次上传.js", _VALID_HEADER)
+    assert path2 != path1 and url2 != url1
+
+
+def test_save_upload_rejects_invalid_script(tmp_path):
+    with pytest.raises(sr.SourceError):
+        sr.save_upload(tmp_path, "bad.js", "var noHeader = 1")
+
+
 # ------------------------------------------------------------ stdio 协议（FakeProc） ---
 
 class FakeReader:

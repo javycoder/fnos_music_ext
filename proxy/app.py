@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote
@@ -83,6 +84,8 @@ CONF = {
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
+    # 输入停满这么久才向音源发起搜索。窗口内的新词会替换旧词并重新计时。
+    "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "1.0")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -174,6 +177,210 @@ _FORMAT_ALIASES = {
 
 # 模块级搜索缓存
 _SEARCH_CACHE: dict[str, dict] = {}
+# 每个登录用户当前要搜的词。换词时作废这个用户其余关键词的缓存，不刷新 ts。
+_USER_SEARCH_GEN: dict[str, int] = {}
+_USER_SEARCH_WORD: dict[str, str] = {}
+# 每个用户正在等待的输入窗口。新词到达时 set，让上一词立刻结束等待。
+_SEARCH_DEBOUNCE: dict[str, asyncio.Event] = {}
+# fetch_* 读这个范围：搜索框用凭证哈希，补链加 ":play"，联想加 ":suggest"。
+_FETCH_SCOPE: ContextVar[str] = ContextVar("fnmusic_fetch_scope", default="")
+_SCOPE_HEADER = "X-Fnmusic-Scope"
+
+
+class _SupersededSearch:
+    """同一用户的更新关键词替换了这次搜索。"""
+
+
+_SUPERSEDED = _SupersededSearch()
+
+
+class SourceSearchGate:
+    """一个音源同时只跑一个关键词。每个用户在队列里只留最新词。
+
+    cancellable 时，同一用户的新词取消正在跑的搜索并立刻开始。
+    否则等当前请求自然结束，丢掉响应，再搜新词。其他用户按到达顺序排在后面。
+    """
+
+    def __init__(self, cancellable: bool):
+        self.cancellable = cancellable
+        self._epoch = 0
+        self._running: dict | None = None
+        self._queue: list[dict] = []
+
+    def reset(self) -> None:
+        self._epoch += 1
+        job = self._running
+        self._running = None
+        queued = self._queue
+        self._queue = []
+        if job and job.get("task") and not job["task"].done():
+            job["task"].cancel()
+        for slot in queued:
+            _resolve_waiters(slot, _SUPERSEDED)
+        if job:
+            _resolve_waiters(job, _SUPERSEDED)
+
+    async def run(self, scope: str, keyword: str, factory):
+        fut = asyncio.get_running_loop().create_future()
+        self._admit(scope, keyword, factory, fut)
+        self._pump()
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            self._detach(fut)
+            raise
+
+    def _admit(self, scope: str, keyword: str, factory, fut) -> None:
+        running = self._running
+        if running and running["scope"] == scope and running["keyword"] == keyword and not running.get("superseded"):
+            running["waiters"].append(fut)
+            return
+        if running and running["scope"] == scope and running["keyword"] != keyword:
+            running["superseded"] = True
+            _resolve_waiters(running, _SUPERSEDED)
+            if self.cancellable:
+                task = running.get("task")
+                if task and not task.done():
+                    task.cancel()
+            self._upsert(scope, keyword, factory, fut, front=True)
+            return
+        self._upsert(scope, keyword, factory, fut, front=False)
+
+    def _upsert(self, scope: str, keyword: str, factory, fut, front: bool) -> None:
+        for slot in self._queue:
+            if slot["scope"] != scope:
+                continue
+            if slot["keyword"] != keyword:
+                _resolve_waiters(slot, _SUPERSEDED)
+                slot["keyword"] = keyword
+                slot["factory"] = factory
+                slot["waiters"] = [fut]
+            else:
+                slot["waiters"].append(fut)
+            if front:
+                self._queue.remove(slot)
+                self._queue.insert(0, slot)
+            return
+        slot = {"scope": scope, "keyword": keyword, "factory": factory, "waiters": [fut]}
+        if front:
+            self._queue.insert(0, slot)
+        else:
+            self._queue.append(slot)
+
+    def _detach(self, fut) -> None:
+        running = self._running
+        if running and fut in running["waiters"]:
+            running["waiters"].remove(fut)
+            if self.cancellable and not running["waiters"]:
+                running["superseded"] = True
+                task = running.get("task")
+                if task and not task.done():
+                    task.cancel()
+            return
+        for slot in list(self._queue):
+            if fut in slot["waiters"]:
+                slot["waiters"].remove(fut)
+                if not slot["waiters"]:
+                    self._queue.remove(slot)
+                return
+
+    def _pump(self) -> None:
+        if self._running is not None or not self._queue:
+            return
+        slot = self._queue.pop(0)
+        job = {
+            "scope": slot["scope"],
+            "keyword": slot["keyword"],
+            "factory": slot["factory"],
+            "waiters": slot["waiters"],
+            "superseded": False,
+            "task": None,
+        }
+        job["epoch"] = self._epoch
+        self._running = job
+        job["task"] = asyncio.get_running_loop().create_task(self._execute(job))
+
+    async def _execute(self, job: dict) -> None:
+        result = _SUPERSEDED
+        try:
+            result = await job["factory"]()
+        except asyncio.CancelledError:
+            result = _SUPERSEDED
+        except Exception as exc:
+            result = exc
+        # 取消之后不能再 await，否则事件循环会把清理和下一词一起丢掉。
+        self._finish(job, result)
+
+    def _finish(self, job: dict, result) -> None:
+        if job.get("epoch") != self._epoch:
+            _resolve_waiters(job, _SUPERSEDED)
+            return
+        if self._running is job:
+            self._running = None
+        if job.get("superseded") or result is _SUPERSEDED:
+            _resolve_waiters(job, _SUPERSEDED)
+        elif isinstance(result, Exception):
+            _resolve_waiters(job, result, error=True)
+        else:
+            _resolve_waiters(job, result)
+        self._pump()
+
+
+def _resolve_waiters(job: dict, result, error: bool = False) -> None:
+    for fut in job.get("waiters", []):
+        if fut.done():
+            continue
+        if error:
+            fut.set_exception(result)
+        else:
+            fut.set_result(result)
+
+
+def _note_user_keyword(scope: str, keyword: str) -> int:
+    """记下这个用户正在搜的词。换词时清掉该用户其他词的缓存，ts 归零而不是续期。"""
+    if _USER_SEARCH_WORD.get(scope) != keyword:
+        _USER_SEARCH_GEN[scope] = _USER_SEARCH_GEN.get(scope, 0) + 1
+        _USER_SEARCH_WORD[scope] = keyword
+        for entry in _SEARCH_CACHE.values():
+            if entry.get("credentials") == scope and entry.get("keyword") != keyword:
+                entry["superseded"] = True
+                entry["items"] = []
+                entry["ts"] = 0
+        pending = _SEARCH_DEBOUNCE.get(scope)
+        if pending is not None:
+            pending.set()
+    return _USER_SEARCH_GEN.get(scope, 1)
+
+
+async def _wait_search_debounce(scope: str) -> asyncio.Event | None:
+    """停手满 search_debounce_s 才返回当前窗口。0 表示不延迟。"""
+    delay = float(CONF.get("search_debounce_s") or 0)
+    if delay <= 0:
+        return None
+    event = asyncio.Event()
+    _SEARCH_DEBOUNCE[scope] = event
+    try:
+        await asyncio.wait_for(event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        pass
+    return event
+
+
+def _user_search_stale(entry: dict, scope: str) -> bool:
+    return bool(entry.get("superseded")) or entry.get("gen") != _USER_SEARCH_GEN.get(scope)
+
+
+def reset_source_search_gates() -> None:
+    for gate in (_LX_SEARCH_GATE, _MUSICDL_SEARCH_GATE, _MUSICBOX_SEARCH_GATE):
+        gate.reset()
+    _USER_SEARCH_GEN.clear()
+    _USER_SEARCH_WORD.clear()
+    _SEARCH_DEBOUNCE.clear()
+
+
+_LX_SEARCH_GATE = SourceSearchGate(cancellable=True)
+_MUSICDL_SEARCH_GATE = SourceSearchGate(cancellable=False)
+_MUSICBOX_SEARCH_GATE = SourceSearchGate(cancellable=False)
 
 
 def _search_ttl(entry: dict) -> float:
@@ -224,6 +431,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
     "FNMUSIC_LLM_API_KEY": ("", "str"),
     "FNMUSIC_LLM_MODEL": ("llm_model", "str"),
+    "FNMUSIC_SEARCH_TIMEOUT": ("search_timeout", "seconds"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -250,6 +458,11 @@ def _env_watch_parse(raw: str, kind: str):
         return _normalize_lx_sources(raw)
     if kind == "llm_url":
         return raw.rstrip("/")
+    if kind == "seconds":
+        try:
+            return max(1.0, min(60.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
     return raw
 
 
@@ -1273,30 +1486,44 @@ async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -
 async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: str | None = None) -> dict | None:
     if not keyword:
         return None
-    params: dict[str, Any] = {"keyword": keyword, "limit": limit}
-    selected_sources = CONF["online_sources"] if sources is None else sources
-    if selected_sources:
-        params["sources"] = selected_sources
-    timeout = max(float(CONF.get("search_timeout") or 25), 8.0)
-    try:
-        r = await client.get("/search", params=params, timeout=timeout)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, dict):
-                if data.get("errors"):
-                    logger.warning("musicdl search partial errors: %s", data.get("errors"))
-                raw_items = data.get("items")
-                if isinstance(raw_items, list):
-                    data["items"] = [it for it in raw_items if is_playable_online_track(it)]
-                return data
-    except Exception as e:
-        logger.warning("Failed to fetch online search from musicdl: %s", e)
-    return None
+    scope = _FETCH_SCOPE.get()
+
+    async def _query():
+        params: dict[str, Any] = {"keyword": keyword, "limit": limit}
+        selected_sources = CONF["online_sources"] if sources is None else sources
+        if selected_sources:
+            params["sources"] = selected_sources
+        timeout = max(1.0, float(CONF.get("search_timeout") or 15))
+        try:
+            r = await client.get("/search", params=params, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    if data.get("errors"):
+                        logger.warning("musicdl search partial errors: %s", data.get("errors"))
+                    raw_items = data.get("items")
+                    if isinstance(raw_items, list):
+                        data["items"] = [it for it in raw_items if is_playable_online_track(it)]
+                    return data
+        except Exception as e:
+            logger.warning("Failed to fetch online search from musicdl: %s", e)
+        return None
+
+    return await _MUSICDL_SEARCH_GATE.run(scope, keyword, _query)
 
 
 async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
     if not keyword:
         return None
+    scope = _FETCH_SCOPE.get()
+
+    async def _query():
+        return await _musicbox_search_request(client, keyword, limit)
+
+    return await _MUSICBOX_SEARCH_GATE.run(scope, keyword, _query)
+
+
+async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
     try:
         r = await client.get(
             "/api/v1/search",
@@ -1395,17 +1622,28 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, s
     """
     if not keyword:
         return None  # type: ignore[return-value]
+    scope = _FETCH_SCOPE.get()
+
+    async def _query():
+        return await _lx_search_request(client, keyword, limit, sources, scope)
+
+    return await _LX_SEARCH_GATE.run(scope, keyword, _query)
+
+
+async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str) -> list[dict]:
     params: dict[str, Any] = {"keyword": keyword, "limit": limit}
     selected = CONF.get("lx_sources") if sources is None else sources
     if isinstance(selected, str):
         selected = [s.strip() for s in selected.split(",") if s.strip()]
     if selected:
         params["sources"] = ",".join(selected)
-    timeout = max(float(CONF.get("search_timeout") or 25), 8.0)
+    timeout = max(1.0, float(CONF.get("search_timeout") or 15))
+    headers = {_SCOPE_HEADER: scope} if scope else None
     try:
         r = await client.get(
             "/api/v1/search",
             params=params,
+            headers=headers,
             timeout=timeout,
         )
         if r.status_code != 200:
@@ -2064,6 +2302,8 @@ async def search_track(request: Request):
     musicdl_client = get_musicdl_client(request.app)
     musicbox_client = get_musicbox_client(request.app)
     keyword = extract_keyword(request)
+    if keyword:
+        _note_user_keyword(_credential_scope(request), keyword)
 
     page_str = request.query_params.get("page")
     try:
@@ -2115,38 +2355,54 @@ async def search_track(request: Request):
     if not keyword:
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
+    scope = _credential_scope(request)
+    if _USER_SEARCH_WORD.get(scope) != keyword:
+        return JSONResponse(content=disguise_client_json(upstream_json), status_code=upstream_resp.status_code, headers=resp_headers)
+
     key = _search_scope(request) + ":" + keyword
     _clean_search_cache()
     entry = _SEARCH_CACHE.get(key)
     if entry is None:
-        entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0, "keyword": keyword,
-                 "scope": _search_scope(request), "credentials": _credential_scope(request), "config": _source_config(), "task": None}
+        entry = {"items": [], "ts": 0, "keyword": keyword,
+                 "scope": _search_scope(request), "credentials": scope, "config": _source_config(), "task": None}
         _set_search_cache(key, entry)
+    entry["gen"] = _USER_SEARCH_GEN.get(scope, 0)
+    entry["superseded"] = False
     entry["accessed"] = time.time()
     task = entry.get("task")
     if (not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry):
         task = asyncio.create_task(_aggregate_search(request, keyword, entry))
         entry["task"] = task
-    # 首屏等待适用于当前唯一启用源（musicbox/musicdl/lx 同样需要：
-    # 不等待则首屏 total 不含在线条目，客户端不会翻页去取在线结果）
+    # 在线搜索只有一个超时。有在线条目就立刻回复（本地在前、在线在后）；
+    # 到点仍没有，就放弃这次还没回来的结果，只交本地列表。
     if task and not task.done():
-        if page == 1:
-            await asyncio.wait({task}, timeout=float(CONF["netease_wait_s"]))
-            # Empty/error completions do not exhaust the remaining wait budget.
-            if not entry["items"]:
-                deadline = asyncio.get_running_loop().time() + float(CONF["late_page_wait_s"])
-                while not entry["items"] and not task.done() and asyncio.get_running_loop().time() < deadline:
-                    await asyncio.wait({task}, timeout=min(0.02, max(0, deadline - asyncio.get_running_loop().time())))
-        else:
-            await asyncio.wait({task}, timeout=float(CONF["late_page_wait_s"]))
+        budget = max(0.05, float(CONF["search_timeout"])) + max(0.0, float(CONF.get("search_debounce_s") or 0))
+        deadline = asyncio.get_running_loop().time() + budget
+        while not task.done() and asyncio.get_running_loop().time() < deadline:
+            if entry.get("items"):
+                break
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.wait({task}, timeout=min(0.05, remaining))
+        if not entry.get("items") and not task.done():
+            entry["abandoned"] = True
+            entry["items"] = []
+            entry["partial"] = True
+            entry["ts"] = time.time()
+            task.cancel()
     local_list = ensure_search_list(upstream_json)
     local_keys = {(title_from_track(x), artist_from_track(x)) for x in local_list}
     total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
     original_total = upstream_json.get("data", {}).get("total", len(local_list))
-    selected = _session_page(entry, page, size)
+    if not isinstance(original_total, int):
+        original_total = len(local_list)
+    # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
+    # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
+    # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
+    selected = _online_window(entry, page, size, original_total)
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
-    if isinstance(original_total, int):
-        merged["data"]["total"] = original_total + total_online
+    merged["data"]["total"] = original_total + total_online
     fav_set = await _online_favorite_set(request)
     if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
@@ -2156,6 +2412,19 @@ async def search_track(request: Request):
 
 
 async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
+    scope = entry.get("credentials") or _credential_scope(request)
+    if _user_search_stale(entry, scope):
+        entry["items"] = []
+        entry["superseded"] = True
+        entry["ts"] = 0
+        return
+    window = await _wait_search_debounce(scope)
+    if _user_search_stale(entry, scope) or (window is not None and _SEARCH_DEBOUNCE.get(scope) is not window):
+        entry["items"] = []
+        entry["superseded"] = True
+        entry["ts"] = 0
+        return
+    token = _FETCH_SCOPE.set(scope)
     sources = []
     if CONF.get("netease_enabled"):
         sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
@@ -2168,8 +2437,8 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
     partial = False
     results: dict[asyncio.Task, list] = {}
     try:
-        deadline = asyncio.get_running_loop().time() + max(1.0, float(CONF["search_timeout"]))
-        while pending:
+        deadline = asyncio.get_running_loop().time() + max(0.05, float(CONF["search_timeout"]))
+        while pending and not _user_search_stale(entry, scope):
             done, pending = await asyncio.wait(pending, timeout=max(0, deadline - asyncio.get_running_loop().time()), return_when=asyncio.FIRST_COMPLETED)
             if not done:
                 partial = True
@@ -2181,39 +2450,62 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                     data = task.result()
                 except Exception:
                     data = None
+                if entry.get("abandoned") or data is _SUPERSEDED or _user_search_stale(entry, scope):
+                    if data is _SUPERSEDED or _user_search_stale(entry, scope):
+                        entry["superseded"] = True
+                    entry["items"] = []
+                    results[task] = []
+                    continue
                 partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
                 items = data.get("items", []) if isinstance(data, dict) else (data or [])
                 results[task] = items
-                if not entry["pages"]:
+                if not entry["items"]:
                     ordered = [item for source_task in tasks for item in results.get(source_task, [])]
                 else:
                     ordered = entry["items"] + items
                 entry["items"] = deduplicate_online_items(ordered)[:2000]
+        if entry.get("abandoned") or _user_search_stale(entry, scope):
+            entry["items"] = []
+            if _user_search_stale(entry, scope):
+                entry["superseded"] = True
+                entry["ts"] = 0
+            elif not entry.get("ts"):
+                entry["partial"] = True
+                entry["ts"] = time.time()
+            return
         entry["partial"] = partial
         entry["ts"] = time.time()
     finally:
+        _FETCH_SCOPE.reset(token)
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if entry.get("abandoned"):
+                entry["items"] = []
+                entry["partial"] = True
+                if not entry.get("ts"):
+                    entry["ts"] = time.time()
 
 
-def _session_page(entry: dict, page: int, size: int) -> list[dict]:
-    pages = entry["pages"]
-    count = int(CONF["online_limit"]) if page == 1 else size
-    if page not in pages:
-        if len(pages) >= 2000:
-            return []
-        pages[page] = []
-    # Only the trailing page can grow; no published prefix ever moves. This
-    # also lets a repeated empty first page recover after its negative TTL.
-    if page == max(pages):
-        start = entry["cursor"]
-        allocated = entry["items"][start:start + max(0, count - len(pages[page]))]
-        pages[page].extend(online_guid_from_item(item) for item in allocated)
-        entry["cursor"] += len(allocated)
-    by_guid = {online_guid_from_item(item): item for item in entry["items"]}
-    return [by_guid[guid] for guid in pages[page] if guid in by_guid and _source_enabled(guid)]
+def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[dict]:
+    """本地优先布局下取本页的在线切片。
+
+    全局布局：[本地 0..local_total) [在线 local_total..local_total+len(items))。
+    本页全局区间 = [(page-1)*size, page*size)；与在线段求交集后映射到 items 下标。
+    items 只追加不重排，同一 (page,size,local_total) 的切片稳定；items 后续
+    增长只会让更靠后的页多出条目（已返回页的前缀不动）。
+    """
+    start_global = (page - 1) * size
+    end_global = page * size
+    start = max(0, start_global - local_total)
+    end = max(0, end_global - local_total)
+    if start >= end:
+        return []
+    window = [item for item in entry["items"][start:end] if _source_enabled(online_guid_from_item(item))]
+    return window
 
 
 @app.get("/music/api/v1/search/suggest")
@@ -2232,8 +2524,10 @@ async def search_suggest(request: Request):
     headers = copy_incoming_headers(request)
 
     musicdl_task: asyncio.Task | None = None
+    suggest_scope = _FETCH_SCOPE.set(_credential_scope(request) + ":suggest")
     if keyword and CONF.get("musicdl_enabled"):
         musicdl_task = asyncio.create_task(fetch_musicdl_search(musicdl_client, keyword, 5))
+    _FETCH_SCOPE.reset(suggest_scope)
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
     upstream_resp = await upstream_client.send(req)
@@ -2275,7 +2569,7 @@ async def search_suggest(request: Request):
             musicdl_task.cancel()
 
     data_field = upstream_json.get("data")
-    if isinstance(data_field, list) and musicdl_data and "items" in musicdl_data:
+    if isinstance(data_field, list) and isinstance(musicdl_data, dict) and musicdl_data.get("items"):
         for item in musicdl_data.get("items", [])[:5]:
             title = item.get("title")
             if title and title not in data_field:
@@ -2420,24 +2714,32 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         return False
     entry[recovery_key] = time.monotonic()
     keyword = entry.get("keyword", "")
-    if source == "netease":
-        coro = fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
-    elif source == "lx":
-        # 按目标 GUID 的平台精确重搜（GUID 第 3 段），对齐 musicdl 分支按引擎重搜的行为
-        parts = guid.split(":")
-        coro = fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"],
-                               sources=[parts[2]] if len(parts) >= 4 else None)
-    else:
-        selected = [name.strip() for name in str(CONF.get("online_sources") or "").split(",")
-                    if name.strip().lower().removesuffix("musicclient") == source.lower()]
-        coro = fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"],
-                                   ",".join(selected) or source)
+    token = _FETCH_SCOPE.set(_credential_scope(request) + ":play")
     try:
-        result = await asyncio.wait_for(coro, timeout=3.0)
-        items = result.get("items", []) if isinstance(result, dict) else (result or [])
+        if source == "netease":
+            coro = fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
+        elif source == "lx":
+            # 按目标 GUID 的平台精确重搜（GUID 第 3 段），对齐 musicdl 分支按引擎重搜的行为
+            parts = guid.split(":")
+            coro = fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"],
+                                   sources=[parts[2]] if len(parts) >= 4 else None)
+        else:
+            selected = [name.strip() for name in str(CONF.get("online_sources") or "").split(",")
+                        if name.strip().lower().removesuffix("musicclient") == source.lower()]
+            coro = fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"],
+                                       ",".join(selected) or source)
+        try:
+            result = await asyncio.wait_for(coro, timeout=3.0)
+        except Exception:
+            return False
+        if result is _SUPERSEDED or not result:
+            return False
+        items = result.get("items", []) if isinstance(result, dict) else result
+        if not isinstance(items, list):
+            return False
         return any(online_guid_from_item(item) == guid for item in items)
-    except Exception:
-        return False
+    finally:
+        _FETCH_SCOPE.reset(token)
 
 
 async def _open_online_stream(request: Request, guid: str, range_header: str | None):

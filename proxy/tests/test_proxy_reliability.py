@@ -20,14 +20,17 @@ def anyio_backend():
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     p._SEARCH_CACHE.clear()
+    p.reset_source_search_gates()
     for key in ("cache_dir", "library_dir", "fav_dir"):
         monkeypatch.setitem(p.CONF, key, str(tmp_path / key))
     monkeypatch.setitem(p.CONF, "music_db", str(tmp_path / "missing.db"))
+    monkeypatch.setitem(p.CONF, "search_debounce_s", 0.0)
     for key in ("musicdl_enabled", "netease_enabled", "lx_enabled"):
         monkeypatch.setitem(p.CONF, key, True)
     for attr in ("upstream_client", "musicdl_client", "musicbox_client", "lx_client"):
         monkeypatch.setattr(p.app.state, attr, None, raising=False)
     yield
+    p.reset_source_search_gates()
     p._SEARCH_CACHE.clear()
 
 
@@ -93,21 +96,42 @@ async def test_health_one_source_suffices_but_reports_degradation(monkeypatch):
     assert result["details"]["musicbox"]["dependency"]["reason"] == "offline"
 
 
-@pytest.mark.parametrize("initial", [0, 1, 3])
-def test_actual_first_page_cursor_and_local_duplicates(initial, monkeypatch):
+@pytest.mark.parametrize("initial", [1, 3])
+def test_online_window_local_first_layout_and_local_duplicates(initial, monkeypatch):
+    """本地优先全局布局：在线条目在 items 上连续分页、不重不漏；本地重复由 merge 过滤。"""
     monkeypatch.setitem(p.CONF, "online_limit", 3)
-    entry = session(request(), [song(f"kuwo:{i}", str(i)) for i in range(initial)])
-    first = p._session_page(entry, 1, 2)
-    entry["items"] = p.deduplicate_online_items(entry["items"] + [song(f"netease:{i}", str(i)) for i in range(5)])
-    second = p._session_page(entry, 2, 2)
-    assert [x["title"] for x in second] == [str(initial), str(initial + 1)]
-    assert [p.build_online_track(x) for x in p._session_page(entry, 1, 2)] == [p.build_online_track(x) for x in first]
-    # Filtering a local duplicate on page two cannot shift page-three offsets.
-    envelope = {"data": {"list": [{"title": str(initial), "artist": "Artist"}], "total": 1}}
-    merged = p.merge_online_tracks(envelope, second, selected=True)
-    assert [x["title"] for x in merged["data"]["list"]] == [str(initial), str(initial + 1)]
-    third = p._session_page(entry, 3, 2)
-    assert [x["title"] for x in third] == [str(i) for i in range(initial + 2, min(initial + 4, 5))]
+    raw = [song(f"kuwo:{i}", str(i)) for i in range(initial)] + [song(f"netease:{i}", str(i)) for i in range(5)]
+    entry = session(request(), p.deduplicate_online_items(raw))
+    items = [x["title"] for x in entry["items"]]
+    # local_total=0（上游无本地条目）：翻页走完整个在线段（dedup 后同名条目已合并）
+    walked: list[str] = []
+    page = 1
+    while True:
+        window = p._online_window(entry, page, 2, local_total=0)
+        if not window:
+            break
+        walked.extend(x["title"] for x in window)
+        page += 1
+        assert page < 20
+    assert walked == items
+    # 本地重复过滤不影响窗口本身（过滤发生在 merge_online_tracks）
+    envelope = {"data": {"list": [{"title": walked[0], "artist": "Artist"}], "total": 1}}
+    window = p._online_window(entry, 1, 2, local_total=0)
+    merged = p.merge_online_tracks(envelope, window, selected=True)
+    assert [x["title"] for x in merged["data"]["list"]] == walked[0:2]
+
+
+def test_online_window_local_pages_have_no_online_items():
+    """纯本地页（分页区间未触及在线段）在线切片为空；边界页拼接本地尾部与在线头部。"""
+    entry = session(request(), [song(f"kuwo:{i}", str(i)) for i in range(5)])
+    # 本地 4 条、size 2：第 1-2 页纯本地，第 3 页起是在线段（无拼接边界，整页在线）
+    assert p._online_window(entry, 1, 2, local_total=4) == []
+    assert p._online_window(entry, 2, 2, local_total=4) == []
+    assert [x["title"] for x in p._online_window(entry, 3, 2, local_total=4)] == ["0", "1"]
+    assert [x["title"] for x in p._online_window(entry, 4, 2, local_total=4)] == ["2", "3"]
+    # 本地不满一页：首页 = 本地 1 条 + 在线 1 条（窗口只给在线头部 1 条）
+    assert [x["title"] for x in p._online_window(entry, 1, 2, local_total=1)] == ["0"]
+    assert [x["title"] for x in p._online_window(entry, 2, 2, local_total=1)] == ["1", "2"]
 
 
 def test_strict_identity_alternatives_and_scope(monkeypatch):
@@ -127,10 +151,42 @@ def test_strict_identity_alternatives_and_scope(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_search_timeout_returns_local_and_drops_late_online(monkeypatch):
+    """到点还没有在线结果就放弃这次搜索，晚到的歌曲不能再写进缓存。"""
+    monkeypatch.setitem(p.CONF, "search_timeout", 0.08)
+    monkeypatch.setitem(p.CONF, "search_debounce_s", 0.0)
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+
+    async def slow(*args):
+        await asyncio.sleep(0.4)
+        return {"items": [song("kuwo:1")]}
+
+    monkeypatch.setattr(p, "fetch_musicdl_search", slow)
+    p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"code": 0, "data": {"list": [{"guid": "local:1", "title": "本地"}], "total": 1}})),
+        base_url="http://test")
+    started = time.monotonic()
+    import json
+    body = json.loads((await p.search_track(request("q=Song"))).body)
+    assert time.monotonic() - started < 0.3
+    guids = [item["guid"] for item in body["data"]["list"]]
+    assert guids == ["local:1"]
+    entry = next(iter(p._SEARCH_CACHE.values()))
+    await asyncio.wait({entry["task"]})
+    assert entry.get("abandoned") is True
+    assert entry["items"] == []
+    assert not any(item.get("id") == "kuwo:1" for item in entry["items"])
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("fast_result", [None, []])
 async def test_empty_or_error_first_completion_still_waits_for_song(monkeypatch, fast_result):
+    monkeypatch.setitem(p.CONF, "search_timeout", 1.0)
+    monkeypatch.setitem(p.CONF, "search_debounce_s", 0.0)
+    # 旧的 3 秒 + 5 秒不再截断这次等待。
     monkeypatch.setitem(p.CONF, "netease_wait_s", .01)
-    monkeypatch.setitem(p.CONF, "late_page_wait_s", .15)
+    monkeypatch.setitem(p.CONF, "late_page_wait_s", .05)
     monkeypatch.setitem(p.CONF, "lx_enabled", False)
     async def fast(*args):
         await asyncio.sleep(.02)
@@ -348,11 +404,11 @@ async def test_clean_unknown_length_eof_finalizes(tmp_path):
 def test_repeated_empty_page_recovers_without_replacing_prefix(monkeypatch):
     monkeypatch.setitem(p.CONF, "online_limit", 2)
     entry = session(request(), [])
-    assert p._session_page(entry, 1, 2) == []
+    assert p._online_window(entry, 1, 2, local_total=0) == []
     entry["items"] = [song("kuwo:1")]
-    assert p._session_page(entry, 1, 2)[0]["id"] == "kuwo:1"
+    assert p._online_window(entry, 1, 2, local_total=0)[0]["id"] == "kuwo:1"
     entry["items"] += [song("netease:2", title="Late")]
-    assert [item["id"] for item in p._session_page(entry, 1, 2)] == ["kuwo:1", "netease:2"]
+    assert [item["id"] for item in p._online_window(entry, 1, 2, local_total=0)] == ["kuwo:1", "netease:2"]
 
 
 @pytest.mark.anyio
@@ -371,9 +427,10 @@ async def test_late_priority_cannot_replace_published_first_page(monkeypatch):
     p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda r: httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})), base_url="http://test")
     import json
-    first = json.loads((await p.search_track(request("q=Song&page=1"))).body)
-    second = json.loads((await p.search_track(request("q=Song&page=2"))).body)
-    repeated = json.loads((await p.search_track(request("q=Song&page=1"))).body)
+    first = json.loads((await p.search_track(request("q=Song&page=1&size=1"))).body)
+    await next(iter(p._SEARCH_CACHE.values()))["task"]
+    second = json.loads((await p.search_track(request("q=Song&page=2&size=1"))).body)
+    repeated = json.loads((await p.search_track(request("q=Song&page=1&size=1"))).body)
     assert first["data"]["list"][0]["guid"] == fake_official_guid("online:kuwo:1")
     assert second["data"]["list"][0]["guid"] == fake_official_guid("online:netease:2")
     assert repeated["data"]["list"] == first["data"]["list"]
@@ -415,3 +472,215 @@ async def test_gzip_audio_rejected_before_first_byte(tmp_path):
     response = await p.stream_track(request("guid=online:kuwo:1"))
     assert response.status_code == 404 and seen == ["identity"]
     assert not list(tmp_path.rglob("*.mp3"))
+
+
+def _titles(resp):
+    import json
+    body = json.loads(resp.body)
+    return [item.get("title") for item in body["data"]["list"]]
+
+
+def _cached(keyword):
+    return [entry for entry in p._SEARCH_CACHE.values() if entry.get("keyword") == keyword]
+
+
+def _upstream():
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})),
+        base_url="http://test",
+    )
+
+
+def _track(item_title):
+    return {
+        "id": "kuwo:1", "source": "kuwo", "title": item_title, "artist": "Artist",
+        "duration_s": 200, "ext": "mp3",
+    }
+
+
+async def _until(pred, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met")
+
+
+@pytest.mark.anyio
+async def test_same_user_keeps_only_latest_musicdl_keyword(monkeypatch):
+    """musicdl 不能取消：中间词不发上游，先发出的结果不进缓存，最终词会发。"""
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "netease_wait_s", 5.0)
+    monkeypatch.setitem(p.CONF, "late_page_wait_s", 5.0)
+    seen = []
+    hold = asyncio.Event()
+    started = asyncio.Event()
+
+    async def musicdl(request):
+        keyword = request.url.params["keyword"]
+        seen.append(keyword)
+        if keyword == "k1":
+            started.set()
+            await hold.wait()
+        return httpx.Response(200, json={"ok": True, "items": [_track(keyword)]})
+
+    p.app.state.upstream_client = _upstream()
+    p.app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(musicdl), base_url="http://test")
+    first = asyncio.create_task(p.search_track(request("q=k1", token="user")))
+    await started.wait()
+    second = asyncio.create_task(p.search_track(request("q=k2", token="user")))
+    await _until(lambda: second.done() or any(slot["keyword"] == "k2" for slot in p._MUSICDL_SEARCH_GATE._queue))
+    third = asyncio.create_task(p.search_track(request("q=k3", token="user")))
+    await second
+    assert _titles(second.result()) == []
+    hold.set()
+    await first
+    await third
+    assert seen == ["k1", "k3"]
+    assert _titles(first.result()) == []
+    assert _titles(third.result()) == ["k3"]
+    assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("k1"))
+    assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("k2"))
+    assert any(entry.get("ts") and entry.get("items") for entry in _cached("k3"))
+
+
+@pytest.mark.anyio
+async def test_lx_new_keyword_cancels_previous_request(monkeypatch):
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "musicdl_enabled", False)
+    monkeypatch.setitem(p.CONF, "netease_wait_s", 5.0)
+    monkeypatch.setitem(p.CONF, "late_page_wait_s", 5.0)
+    seen = []
+    cancelled = []
+    started = asyncio.Event()
+
+    async def lx(request):
+        keyword = request.url.params["keyword"]
+        seen.append(keyword)
+        assert request.headers.get("x-fnmusic-scope")
+        if keyword == "old":
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(keyword)
+                raise
+        return httpx.Response(200, json={"ok": True, "items": [{
+            "id": "lx:kw:1", "lx_source": "kw", "title": keyword, "artist": "Artist",
+            "duration_s": 200, "ext": "mp3",
+        }]})
+
+    p.app.state.upstream_client = _upstream()
+    p.app.state.lx_client = httpx.AsyncClient(transport=httpx.MockTransport(lx), base_url="http://test")
+    old = asyncio.create_task(p.search_track(request("q=old", token="user")))
+    await started.wait()
+    new = asyncio.create_task(p.search_track(request("q=new", token="user")))
+    await old
+    await new
+    assert seen == ["old", "new"]
+    assert cancelled == ["old"]
+    assert _titles(old.result()) == []
+    assert _titles(new.result()) == ["new"]
+    assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("old"))
+
+
+@pytest.mark.anyio
+async def test_other_user_keeps_result_and_waits(monkeypatch):
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "netease_wait_s", 5.0)
+    monkeypatch.setitem(p.CONF, "late_page_wait_s", 5.0)
+    seen = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def musicdl(request):
+        keyword = request.url.params["keyword"]
+        seen.append(keyword)
+        if keyword == "from-a":
+            started.set()
+            await release.wait()
+        return httpx.Response(200, json={"ok": True, "items": [_track(keyword)]})
+
+    p.app.state.upstream_client = _upstream()
+    p.app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(musicdl), base_url="http://test")
+    first = asyncio.create_task(p.search_track(request("q=from-a", token="alice")))
+    await started.wait()
+    second = asyncio.create_task(p.search_track(request("q=from-b", token="bob")))
+    await asyncio.sleep(0.05)
+    assert seen == ["from-a"]
+    release.set()
+    await first
+    await second
+    assert seen == ["from-a", "from-b"]
+    assert _titles(first.result()) == ["from-a"]
+    assert _titles(second.result()) == ["from-b"]
+
+
+@pytest.mark.anyio
+async def test_same_keyword_next_page_joins_inflight_search(monkeypatch):
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "netease_wait_s", 5.0)
+    monkeypatch.setitem(p.CONF, "late_page_wait_s", 5.0)
+    seen = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def musicdl(request):
+        seen.append(request.url.params["keyword"])
+        started.set()
+        await release.wait()
+        return httpx.Response(200, json={"ok": True, "items": [_track("song")]})
+
+    p.app.state.upstream_client = _upstream()
+    p.app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(musicdl), base_url="http://test")
+    first = asyncio.create_task(p.search_track(request("q=song&page=1&size=20", token="user")))
+    await started.wait()
+    second = asyncio.create_task(p.search_track(request("q=song&page=2&size=20", token="user")))
+    await asyncio.sleep(0.05)
+    assert seen == ["song"]
+    release.set()
+    await first
+    await second
+    assert seen == ["song"]
+
+
+@pytest.mark.anyio
+async def test_search_waits_until_keyword_is_quiet(monkeypatch):
+    """1 秒窗口内连续换词只搜最后一次，窗口从最后一次输入重新计算。"""
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "netease_wait_s", 5.0)
+    monkeypatch.setitem(p.CONF, "late_page_wait_s", 5.0)
+    monkeypatch.setitem(p.CONF, "search_debounce_s", 0.2)
+    seen = []
+    started_at = []
+
+    async def musicdl(request):
+        seen.append(request.url.params["keyword"])
+        started_at.append(time.monotonic())
+        return httpx.Response(200, json={"ok": True, "items": [_track(request.url.params["keyword"])]})
+
+    p.app.state.upstream_client = _upstream()
+    p.app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(musicdl), base_url="http://test")
+    origin = time.monotonic()
+    first = asyncio.create_task(p.search_track(request("q=k1", token="user")))
+    await asyncio.sleep(0.05)
+    second = asyncio.create_task(p.search_track(request("q=k2", token="user")))
+    await asyncio.sleep(0.05)
+    third = asyncio.create_task(p.search_track(request("q=k3", token="user")))
+    await asyncio.sleep(0.05)
+    assert seen == []
+    await first
+    await second
+    await third
+    assert seen == ["k3"]
+    assert _titles(first.result()) == []
+    assert _titles(second.result()) == []
+    assert _titles(third.result()) == ["k3"]
+    assert started_at[0] - origin >= 0.25
+    assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("k1"))
+    assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("k2"))

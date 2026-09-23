@@ -81,12 +81,16 @@ usage() {
                          2) musicdl   聚合音源，可精确到平台：
                              --sources musicdl[-<平台短名>,...]
                              或全局编号 --sources 2,4（编号见 musicdl-service/PLATFORMS.md）
-                         3) lxmusic   洛雪音乐自定义源（需 --lx-source-url 或交互输入）
+                         3) lxmusic   洛雪音乐自定义源（源脚本装后在管理页配置：
+                             URL / 上传 .js / NAS 选择；--lx-source-url 仍可选）
                          示例: --sources musicbox
                                --sources musicdl-kuwo,musicdl-migu
                                --sources lxmusic --lx-source-url https://example.com/lx.js
+                               --sources lxmusic（无源安装，装后在管理页配置）
                          非交互缺省: musicdl
-  --lx-source-url URL    洛雪自定义源脚本地址（--sources lxmusic 时必填；交互模式可向导输入）
+  --lx-source-url SRC    洛雪自定义源脚本地址：http(s) URL、file:// URL 或本机 .js 文件路径
+                         （本机路径会复制进 sources-data/lxmusic/uploads/ 并转为 file://；
+                          留空=无源安装，装好在管理页 WebUI 配置）
   --lx-skip-verify       跳过洛雪源可用性校验（下载→init→搜索→解析→探活）直接激活；
                          源是否可用装好后在管理页 WebUI 查看，适合不想因源故障中断安装的场景
   --webui                安装管理 Web UI（端口 8774；无鉴权，仅限可信内网使用）
@@ -724,13 +728,13 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}（Docker 单容器·按需加载）"
     echo " 音源: ${MUSICBOX_REPO}"
     echo "       ${MUSICDL_REPO}"
-    echo "       lxmusic — 洛雪音乐自定义源（用户自带源 URL）"
+    echo "       lxmusic — 洛雪音乐自定义源（装后在管理页配置源脚本）"
     echo "============================================================"
     if [ -z "${SOURCES_RAW}" ]; then
         echo "【音源三选一】（互斥单选；安装后可在 WebUI 里随时切换，秒级生效）"
         echo "  1) musicbox — 网易云音乐盒子（高品质/无损/歌词封面；推荐安装后扫码登录）"
         echo "  2) musicdl  — 聚合音源（多平台可选：酷我/咪咕/酷狗/QQ/B站等）"
-        echo "  3) lxmusic  — 洛雪音乐自定义源（需提供源脚本 URL，解析播放只走该源）"
+        echo "  3) lxmusic  — 洛雪音乐自定义源（解析播放只走用户源；源脚本装后在管理页配置：URL / 上传 .js / NAS 选择）"
         local_choice="$(prompt "请选择音源 (输入 1/2/3)" "2")"
         case "${local_choice}" in
             1) SOURCES_RAW="musicbox" ;;
@@ -811,20 +815,37 @@ ensure_docker_ready
 
 parse_sources "${SOURCES_RAW}"
 
-# 洛雪自定义源：必须拿到脚本 URL（非交互 --lx-source-url 必填；交互循环输入）
+# 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置）；
+# 传入主机上存在的 .js 文件路径时自动复制进 sources-data/lxmusic/uploads/ 并转 file:// URL
 if [ "${ENABLE_LX}" -eq 1 ]; then
-    if [ -z "${LX_SOURCE_URL_CLI}" ] && [ "${NON_INTERACTIVE}" -eq 1 ]; then
-        log_err "非交互选择 lxmusic 必须提供 --lx-source-url（洛雪自定义源脚本地址）"
-        exit 1
+    if [ -n "${LX_SOURCE_URL_CLI}" ] && [ ! "${LX_SOURCE_URL_CLI}" = "http://"* ] && [ ! "${LX_SOURCE_URL_CLI}" = "https://"* ] && [ ! "${LX_SOURCE_URL_CLI}" = "file://"* ]; then
+        # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
+        LX_HOST_FILE="${LX_SOURCE_URL_CLI}"
+        if [ ! -f "${LX_HOST_FILE}" ]; then
+            log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
+            exit 1
+        fi
+        case "${LX_HOST_FILE}" in
+            *.js|*.JS) : ;;
+            *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
+        esac
+        LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
+        mkdir -p "${LX_UPLOAD_DIR}"
+        LX_BASENAME="$(basename "${LX_HOST_FILE}")"
+        if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
+            LX_BASENAME="$(date +%s)-${LX_BASENAME}"
+        fi
+        cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
+        LX_SOURCE_URL_CLI="file:///data/lxmusic/uploads/${LX_BASENAME}"
+        log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
     fi
-    while [ -z "${LX_SOURCE_URL_CLI}" ]; do
-        LX_SOURCE_URL_CLI="$(prompt "请输入洛雪自定义源脚本 URL（https://.../*.js，可改选其他音源后重跑安装）")"
-        [ -n "${LX_SOURCE_URL_CLI}" ] || log_warn "选择 lxmusic 必须提供源脚本 URL"
-    done
+    if [ -z "${LX_SOURCE_URL_CLI}" ]; then
+        log_info "未提供洛雪源（无源安装）：装好后在管理页 WebUI（桌面「fnMusic 扩展管理」或 http://<NAS_IP>:8774）配置源脚本并激活"
+    fi
     case "${LX_SOURCE_URL_CLI}" in
-        http://*|https://*) : ;;
+        ""|http://*|https://*|file://*) : ;;
         *)
-            log_err "洛雪源 URL 必须是 http(s) 地址: ${LX_SOURCE_URL_CLI}"
+            log_err "洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径: ${LX_SOURCE_URL_CLI}"
             exit 1
             ;;
     esac

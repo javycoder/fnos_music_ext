@@ -21,7 +21,7 @@
                         "value": "musicbox"
                     },
                     {
-                        "label": "lxmusic — 洛雪自定义源（需提供源脚本 URL）",
+                        "label": "lxmusic — 洛雪自定义源（安装后在管理页配置源脚本：粘贴 URL / 上传 .js / NAS 选择）",
                         "value": "lxmusic"
                     }
                 ],
@@ -33,16 +33,8 @@
                 ]
             },
             {
-                "type": "text",
-                "field": "wizard_lx_url",
-                "label": "洛雪源脚本 URL（仅选择 lxmusic 时必填，https://.../*.js）",
-                "initValue": ""
-            },
-            {
-                "type": "switch",
-                "field": "wizard_lx_skip_verify",
-                "label": "跳过洛雪源可用性校验（仅 lxmusic 生效：校验失败不中断安装，装好后到管理页 WebUI 查看与重配）",
-                "initValue": "false"
+                "type": "tips",
+                "helpText": "选择洛雪自定义源时无需在此提供脚本：安装完成后打开管理页（桌面 fnMusic 扩展管理或 http://NAS_IP:8774），在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑上的 .js 文件或从 NAS 选择，测试可用后保存即激活。"
             },
             {
                 "type": "switch",
