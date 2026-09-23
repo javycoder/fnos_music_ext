@@ -2425,6 +2425,11 @@ async def search_track(request: Request):
     original_total = upstream_json.get("data", {}).get("total", len(local_list))
     if not isinstance(original_total, int):
         original_total = len(local_list)
+    # 官方搜索越界页不返回空列表而是钳制回第 1 页（total=4 时 page=2 仍返回
+    # 同样 4 条，收藏/歌单条目接口无此行为）。本页全局起点已越过官方段时必须
+    # 清空官方列表，否则官方条目会拼上在线切片在每个后续页重复出现。
+    if (page - 1) * size >= original_total and local_list:
+        local_list.clear()
     # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
     # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。

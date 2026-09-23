@@ -1200,7 +1200,9 @@ def test_install_scripts_delegate_proxy_deps_to_fallback_helper():
         assert 'ensure_proxy_deps.sh' in text, f'{name} 应调用 ensure_proxy_deps.sh'
         assert 'venv-proxy/bin/pip" install' not in text, f'{name} 不应残留单源裸 pip 安装'
     helper = (BASE/'ensure_proxy_deps.sh').read_text(encoding='utf-8')
-    # 候选链：用户自定义 PIP_INDEX 永远第一位（默认阿里云），清华与官方兜底
+    # 候选链：用户自定义 PIP_INDEX 永远第一位（默认腾讯云，H1.1 不限速），
+    # 阿里云/清华/官方依次兜底
+    assert 'https://mirrors.tencent.com/pypi/simple/' in helper
     assert 'https://mirrors.aliyun.com/pypi/simple/' in helper
     assert 'https://pypi.tuna.tsinghua.edu.cn/simple' in helper
     assert 'https://pypi.org/simple' in helper
@@ -1235,9 +1237,12 @@ def _deploy_helper_with_stub_pip(tmp_path, fail_urls):
 
 
 def test_ensure_proxy_deps_falls_back_across_indexes(tmp_path):
-    """行为验证：首选源不可达时按 自定义→清华→官方 链回退，最终成功退出 0。"""
+    """行为验证：首选源不可达时按 自定义→阿里云→清华→官方 链回退，最终成功退出 0。"""
     deploy, venv, calls = _deploy_helper_with_stub_pip(
-        tmp_path, ['https://pypi.invalid/simple', 'https://pypi.tuna.tsinghua.edu.cn/simple'])
+        tmp_path,
+        ['https://pypi.invalid/simple',
+         'https://mirrors.aliyun.com/pypi/simple/',
+         'https://pypi.tuna.tsinghua.edu.cn/simple'])
     env = os.environ.copy()
     env.update(PIP_INDEX='https://pypi.invalid/simple', FNMUSIC_VENV_DIR=str(venv))
     result = subprocess.run(['bash', str(deploy/'ensure_proxy_deps.sh')], env=env,
@@ -1245,6 +1250,7 @@ def test_ensure_proxy_deps_falls_back_across_indexes(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     tried = calls.read_text()
     assert 'https://pypi.invalid/simple' in tried
+    assert 'https://mirrors.aliyun.com/pypi/simple/' in tried
     assert 'https://pypi.tuna.tsinghua.edu.cn/simple' in tried
     assert 'https://pypi.org/simple' in tried
     assert '切换下一候选源' in result.stdout
@@ -1256,6 +1262,7 @@ def test_ensure_proxy_deps_reports_guidance_when_all_indexes_fail(tmp_path):
     deploy, venv, _ = _deploy_helper_with_stub_pip(
         tmp_path,
         ['https://pypi.invalid/simple',
+         'https://mirrors.aliyun.com/pypi/simple/',
          'https://pypi.tuna.tsinghua.edu.cn/simple',
          'https://pypi.org/simple'])
     env = os.environ.copy()
