@@ -20,8 +20,8 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${FNMUSIC_VENV_DIR:-${BASE_DIR}/.venv-proxy}"
 REQ_FILE="${BASE_DIR}/proxy/requirements.txt"
-PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
-FALLBACK_INDEXES="https://pypi.tuna.tsinghua.edu.cn/simple https://pypi.org/simple"
+PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
+FALLBACK_INDEXES="https://mirrors.aliyun.com/pypi/simple/ https://pypi.tuna.tsinghua.edu.cn/simple https://pypi.org/simple"
 
 log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
 log_warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
