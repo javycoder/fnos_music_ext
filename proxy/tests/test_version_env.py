@@ -1,5 +1,6 @@
 """版本号读取与 .env 安全合并（防覆盖/平滑升级）单元测试。"""
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -21,8 +22,10 @@ def test_version_file_exists_with_semver():
     version_file = REPO_ROOT / "VERSION"
     assert version_file.is_file(), "仓库根目录必须存在 VERSION 文件"
     ver = _read_repo_version()
-    parts = ver.split(".")
-    assert len(parts) == 3 and all(p.isdigit() for p in parts), f"VERSION 必须是 x.y.z 形式，当前为 {ver!r}"
+    base = re.sub(r"[a-z]$", "", ver)
+    parts = base.split(".")
+    assert len(parts) == 3 and all(p.isdigit() for p in parts), \
+        f"VERSION 必须是 x.y.z 形式（自动迭代构建可加单字母后缀），当前为 {ver!r}"
 
 
 def test_get_version_reads_file(monkeypatch):

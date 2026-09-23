@@ -1272,6 +1272,62 @@ def test_search_track_strict_local_first_pagination():
         assert all(not str(g).startswith("local:") for g in seen[first_online_idx:])
 
 
+def test_search_track_official_clamp_out_of_range_page():
+    """官方搜索越界页钳制回第 1 页（total=4 时 page≥2 仍返回同样 4 条，
+    收藏/歌单条目接口无此行为）。合并层必须丢弃该回声，否则官方条目
+    拼上在线切片在每个后续页重复出现。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        chunk = [
+            {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": f"歌手{i}"}
+            for i in range(4)
+        ]
+        return httpx.Response(200, json={"code": 0, "data": {"list": chunk, "total": 4}})
+
+    async def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": [
+                    {"song_id": f"mb_{i}", "song_name": f"在线歌{i}", "artist": f"在线歌手{i}", "duration": 200}
+                    for i in range(10)
+                ],
+            },
+        )
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True, "items": []})),
+        base_url="http://127.0.0.1:8768",
+    )
+
+    with TestClient(app) as client:
+        seen = []
+        for page in (1, 2, 3):
+            resp = client.get(f"/music/api/v1/search/track?q=歌&page={page}&size=10")
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert data["total"] == 4 + 10
+            items = data["list"]
+            if page == 1:
+                # 边界页：4 官方 + 6 在线
+                assert len(items) == 10
+            if page == 3:
+                # 在线段走完：纯空页（total 不变，客户端据此停页）
+                assert items == []
+            seen.extend(str(it["guid"]) for it in items)
+        locals_seen = [g for g in seen if g.startswith("local:")]
+        onlines_seen = [g for g in seen if not g.startswith("local:")]
+        assert locals_seen == [f"local:{i}" for i in range(4)]
+        assert len(onlines_seen) == 10
+        assert len(set(seen)) == 14
+
+
 def test_general_passthrough():
     """非拦截路径透传（如静态资源或登录接口）。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -2112,3 +2168,35 @@ def test_merge_online_tracks_filters_unplayable_defense():
 
 
 
+
+
+def test_forward_to_upstream_keeps_content_length():
+    """identity 响应透传精确 Content-Length（对齐官方直连行为）；204 不带。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/echo":
+            return httpx.Response(200, content=b"hello", headers={"content-type": "text/plain"})
+        if request.url.path == "/music/api/v1/nocontent":
+            return httpx.Response(204)
+        if request.url.path == "/music/api/v1/range":
+            return httpx.Response(
+                206, content=b"ab",
+                headers={"content-range": "bytes 0-1/10"},
+            )
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    with TestClient(app) as client:
+        r = client.get("/music/api/v1/echo")
+        assert r.status_code == 200
+        assert r.headers.get("content-length") == "5"
+        assert r.content == b"hello"
+
+        r204 = client.get("/music/api/v1/nocontent")
+        assert r204.status_code == 204
+        assert "content-length" not in r204.headers
+
+        # Range 分段：Content-Length 与 Content-Range 同时到达客户端
+        r206 = client.get("/music/api/v1/range")
+        assert r206.headers.get("content-length") == "2"
+        assert r206.headers.get("content-range") == "bytes 0-1/10"
+        assert r206.content == b"ab"

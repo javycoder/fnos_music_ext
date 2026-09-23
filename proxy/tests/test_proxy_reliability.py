@@ -1,6 +1,7 @@
 """Adversarial proxy tests: synthetic clients, temporary cache only."""
 import asyncio
 import importlib
+import logging
 import os
 import time
 
@@ -232,6 +233,22 @@ async def test_unknown_length_error_never_finalizes(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_mid_stream_abort_is_logged(tmp_path, caplog):
+    """流中途断开必须留痕：这是"播到一半卡住"排查时唯一的 journal 证据。"""
+    audio = Audio(fail=True)
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=audio, headers={"content-length": "4096"}),
+        "online:kuwo:1", None, pre_info=song("kuwo:1"))
+    with caplog.at_level(logging.WARNING, logger=p.logger.name):
+        with pytest.raises(httpx.ReadError):
+            async for _ in response.body_iterator:
+                pass
+    assert any("Stream aborted mid-way for online:kuwo:1" in rec.message
+               and "ReadError" in rec.message for rec in caplog.records)
+    assert not list(tmp_path.rglob("*.part")) and not list(tmp_path.rglob("*.mp3"))
+
+
+@pytest.mark.anyio
 async def test_disconnect_closes_stream_without_detached_downloader(tmp_path):
     audio = Audio()
     response = p.stream_tee_response(httpx.Response(200, stream=audio), "online:kuwo:1", None, pre_info={})
@@ -385,7 +402,8 @@ async def test_startup_stall_is_bounded_and_closes_transport(monkeypatch):
     before = time.monotonic()
     response = await p.stream_track(request("guid=online:kuwo:1"))
     assert response.status_code == 404
-    assert 3.8 < time.monotonic() - before < 4.5
+    # 单次解析预算 6 秒（与进程内取链+网络抖动余量对齐），stall 必须被掐断
+    assert 5.8 < time.monotonic() - before < 6.6
     assert audio.closed
 
 

@@ -7,9 +7,9 @@ systemctl/docker/tar/readlink）用 PATH 桩替代，验证各钩子的可观测
 - _common：repo 目录三候选定位与优先级、.env 布尔→--sources 推导、数据项通配
 - install_init：Docker/官方 socket 两项硬预检
 - install_callback：向导答案→install.sh 参数映射（默认回退/必填校验/失败透传）
-- upgrade_init：升级前数据 tar 备份（成功内容/失败中止清理）
+- upgrade_init：升级前数据 tar 备份（成功内容/失败中止清理）+ 失效 unit 自愈清理
 - upgrade_callback：备份恢复→按 .env 推导音源→重跑安装→删备份
-- uninstall_init：先还原官方直连，再按 /vol{n} 归档数据
+- uninstall_init：先还原官方直连（失败降级强制清理，永不阻断卸载），再归档数据
 - uninstall_callback：兜底清理永不失败
 - main：应用中心 start/stop/status 的退出码契约
 
@@ -32,7 +32,8 @@ BASH = shutil.which("bash")
 # 沙箱 PATH 需要的真实工具白名单（cmd 脚本内部使用；docker/systemctl/readlink
 # 按测试意图用桩覆盖，tar 在需要验证备份内容时用真 tar、需要故障注入时用桩覆盖）
 REAL_TOOLS = ("dirname", "mkdir", "cp", "mv", "rm", "tar", "gzip", "date", "grep",
-              "sed", "ls", "tail", "cat", "chmod", "head", "tr", "cut", "tee")
+              "sed", "ls", "tail", "cat", "chmod", "head", "tr", "cut", "tee",
+              "readlink")
 
 INSTALLER_STUB = """#!/bin/bash
 printf '%s\\n' "$*" >> "${STUB_INSTALL_LOG}"
@@ -442,8 +443,11 @@ def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
     decoy = tmp_path / "decoy-cwd"
     decoy.mkdir()
     (decoy / ".env.bak.FROM_CWD").write_text("", encoding="utf-8")
+    # FNMUSIC_UNIT_FILE 指向不存在的沙箱路径：开发机上 /etc 真有本服务 unit，
+    # 不注入会让自愈逻辑删掉真实文件，且用例行为随宿主机漂移
     result = subprocess.run([str(sb.cmd / "upgrade_init")],
-                            env=sb.env(), cwd=decoy,
+                            env=sb.env(FNMUSIC_UNIT_FILE=str(sb.tmp / "absent-unit.service")),
+                            cwd=decoy,
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     backup = sb.pkgvar / "upgrade-backup" / "data.tar.gz"
@@ -458,7 +462,7 @@ def test_upgrade_init_backs_up_data_and_stops_service(sb):
     repo = sb.make_repo(env_text="FNMUSIC_LX_ENABLED=true\n")
     sb.add_data(repo)
     sb.add_systemctl()
-    result = sb.run("upgrade_init")
+    result = sb.run("upgrade_init", FNMUSIC_UNIT_FILE=str(sb.tmp / "absent-unit.service"))
     assert result.returncode == 0, result.stderr
     # 先停服务
     assert "stop fnmusic-ext.service" in sb.ctl_log.read_text(encoding="utf-8")
@@ -477,7 +481,7 @@ def test_upgrade_init_tar_failure_aborts_and_cleans(sb):
     sb.add_data(repo)
     sb.add_tar(rc=1)
     before = (repo / ".env").read_text(encoding="utf-8")
-    result = sb.run("upgrade_init")
+    result = sb.run("upgrade_init", FNMUSIC_UNIT_FILE=str(sb.tmp / "absent-unit.service"))
     assert result.returncode == 1
     assert "备份数据失败" in result.stderr
     # 失败后备份目录清理、原数据不动
@@ -495,9 +499,39 @@ def test_upgrade_init_no_repo_still_stops_service(sb):
 def test_upgrade_init_empty_repo_makes_no_backup(sb):
     sb.make_repo(env_text=None)
     sb.add_systemctl()
-    result = sb.run("upgrade_init")
+    result = sb.run("upgrade_init", FNMUSIC_UNIT_FILE=str(sb.tmp / "absent-unit.service"))
     assert result.returncode == 0, result.stderr
     assert not (sb.pkgvar / "upgrade-backup" / "data.tar.gz").exists()
+
+
+def test_upgrade_init_removes_stale_unit_pointing_elsewhere(sb):
+    """迁卷自愈：unit 指向其他目录时删掉失效 unit 并 daemon-reload，升级不再卡死。"""
+    repo = sb.make_repo(env_text="FNMUSIC_LX_ENABLED=true\n")
+    sb.add_data(repo)
+    sb.add_systemctl()
+    stale = sb.tmp / "stale-unit.service"
+    stale.write_text("[Service]\nWorkingDirectory=/vol1/old/location\n", encoding="utf-8")
+    result = sb.run("upgrade_init", FNMUSIC_UNIT_FILE=str(stale))
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+    ctl = sb.ctl_log.read_text(encoding="utf-8")
+    assert "stop fnmusic-ext.service" in ctl
+    assert "daemon-reload" in ctl
+    # 自愈不阻断备份
+    assert (sb.pkgvar / "upgrade-backup" / "data.tar.gz").is_file()
+
+
+def test_upgrade_init_keeps_unit_matching_this_repo(sb):
+    """unit 属于本次安装目录：不删、不 daemon-reload，交由归属检查正常放行。"""
+    repo = sb.make_repo(env_text="FNMUSIC_LX_ENABLED=true\n")
+    sb.add_data(repo)
+    sb.add_systemctl()
+    unit = sb.tmp / "live-unit.service"
+    unit.write_text(f"[Service]\nWorkingDirectory={repo}\n", encoding="utf-8")
+    result = sb.run("upgrade_init", FNMUSIC_UNIT_FILE=str(unit))
+    assert result.returncode == 0, result.stderr
+    assert unit.exists()
+    assert "daemon-reload" not in sb.ctl_log.read_text(encoding="utf-8")
 
 
 # -------------------------------------------------------- upgrade_callback ---
@@ -575,16 +609,29 @@ def test_upgrade_callback_defaults_to_musicdl_when_env_silent(sb):
 
 # ---------------------------------------------------------- uninstall_init ---
 
-def test_uninstall_init_aborts_when_restore_fails(sb):
+def test_uninstall_init_degrades_when_restore_fails(sb):
+    """还原失败不再中止卸载：常规→--adopt 均失败后强制清理，数据归档照常完成。"""
     repo = sb.make_repo(with_restore=True)
     sb.add_data(repo)
     sb.add_tar()
-    result = sb.run("uninstall_init", STUB_RESTORE_RC="3")
-    assert result.returncode == 1
-    assert "还原官方音乐直连失败" in result.stderr
-    # 还原失败时绝不动数据：无 tar 调用、无归档
-    assert not sb.tar_log.exists() or "czf" not in sb.tar_log.read_text(encoding="utf-8")
-    assert "restore" in sb.install_log.read_text(encoding="utf-8")
+    sb.add_systemctl()
+    sb.add_docker()
+    unit = sb.tmp / "sandbox-unit.service"
+    unit.write_text(f"[Service]\nWorkingDirectory={repo}\n", encoding="utf-8")
+    result = sb.run("uninstall_init", STUB_RESTORE_RC="3", FNMUSIC_UNIT_FILE=str(unit))
+    assert result.returncode == 0, result.stderr
+    # 两种还原方式都尝试过：常规 + --adopt
+    calls = sb.install_log.read_text(encoding="utf-8").splitlines()
+    assert any(line.strip() == "restore" for line in calls)
+    assert "restore --adopt" in calls
+    # 降级清理：停用并删除 unit 文件、删音源容器
+    ctl = sb.ctl_log.read_text(encoding="utf-8")
+    assert "stop fnmusic-ext.service" in ctl
+    assert "daemon-reload" in ctl
+    assert not unit.exists()
+    assert "rm -f fnmusic-sources" in sb.docker_log.read_text(encoding="utf-8")
+    # 数据归档没有被还原失败阻断
+    assert "czf" in sb.tar_log.read_text(encoding="utf-8")
 
 
 def test_uninstall_init_keep_data_false_skips_archive(sb):

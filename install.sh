@@ -62,7 +62,7 @@ LX_SKIP_VERIFY=0
 # WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
 WEBUI_CHOICE=""
 CONTAINER_NAME="fnmusic-sources"
-PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
+PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
 BASE_IMAGE="${BASE_IMAGE:-}"
@@ -103,8 +103,8 @@ usage() {
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
-  --adopt                把本机部署迁移到当前目录（部署登记指向其他目录时使用；
-                        会跳过跨目录部署检查并重新登记）
+  --adopt                把本机部署迁移到当前目录（部署登记或代理 unit 属于其他
+                        目录时使用；会跳过跨目录检查并重新登记）
   --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
@@ -580,7 +580,11 @@ ensure_docker_ready() {
     fi
 }
 
-check_proxy_unit_owner || exit 1
+if [ "${ADOPT}" -eq 1 ]; then
+    check_proxy_unit_owner --adopt || exit 1
+else
+    check_proxy_unit_owner || exit 1
+fi
 # Refuse to install from a second checkout while the machine-wide deployment
 # registry names another live directory. NOTE: argument parsing above has
 # already consumed "$@", so the parsed ADOPT flag drives the bypass here.
@@ -891,7 +895,7 @@ if [ -d "${BASE_DIR}/musicbox-data" ] && [ ! -d "${SOURCES_DATA_DIR}" ]; then
     log_info "迁移数据目录: musicbox-data -> sources-data（网易登录态/缓存原样保留）"
     mv "${BASE_DIR}/musicbox-data" "${SOURCES_DATA_DIR}"
 fi
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlist_tracks" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
     "${SOURCES_DATA_DIR}/cache/netease-musicbox" \
     "${SOURCES_DATA_DIR}/config/netease-musicbox" \
     "${SOURCES_DATA_DIR}/netease-musicbox" \
@@ -927,6 +931,7 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
     echo "FNMUSIC_CACHE_DIR='$(dotenv_escape "${BASE_DIR}/cache")'"
     echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${BASE_DIR}/online_favorites")'"
+    echo "FNMUSIC_PLT_DIR='$(dotenv_escape "${BASE_DIR}/playlist_tracks")'"
     echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${BASE_DIR}/play_history")'"
     echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"
     echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"
@@ -1017,19 +1022,22 @@ else
     log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
 fi
 
-# 存量迁移：2.2.8 之前的安装会把当时的默认清华源写进 .env；env_merge 对该键
-# 保留旧值，老机器升级后仍会拿故障源构建。仅当值恰好等于历史默认值时替换为
-# 阿里云新默认；用户自定义的源地址（无论哪家）一律保留不动。
+# 存量迁移：历史安装会把当时的默认源写进 .env；env_merge 对该键保留旧值，
+# 老机器升级后仍会拿故障源构建。仅当值恰好等于历史默认值时替换为腾讯云新
+# 默认（apt/pip 走 HTTP/1.1，阿里云镜像 CDN 对 H1.1 限速 ~350KB/s，腾讯云实测
+# 20MB/s 不限）；用户自定义的源地址（无论哪家）一律保留不动。
 migrate_default_mirror() {
-    local key="$1" old="$2" new="$3" current
+    local key="$1" old="$2" current
     current="$(sed -n "s/^${key}=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
     if [ "${current}" = "${old}" ]; then
-        sed -i "s|^${key}=.*|${key}='${new}'|" "${ENV_PATH}"
-        log_info "已将 ${key} 的历史默认源迁移为阿里云（${new}）。"
+        sed -i "s|^${key}=.*|${key}='${3}'|" "${ENV_PATH}"
+        log_info "已将 ${key} 的历史默认源迁移为腾讯云（${3}）。"
     fi
 }
-migrate_default_mirror FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple" "https://mirrors.aliyun.com/pypi/simple/"
-migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.aliyun.com"
+migrate_default_mirror FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple" "https://mirrors.tencent.com/pypi/simple/"
+migrate_default_mirror FNMUSIC_PIP_INDEX "https://mirrors.aliyun.com/pypi/simple/" "https://mirrors.tencent.com/pypi/simple/"
+migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.tencent.com"
+migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.aliyun.com" "https://mirrors.tencent.com"
 rm -f "${ENV_DESIRED}"
 chmod 600 "${ENV_PATH}"
 
