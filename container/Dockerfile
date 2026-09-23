@@ -3,8 +3,8 @@
 ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE}
 
-ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-ARG APT_MIRROR="https://mirrors.aliyun.com"
+ARG PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/
+ARG APT_MIRROR="https://mirrors.tencent.com"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
