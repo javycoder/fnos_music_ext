@@ -360,6 +360,97 @@ def test_lx_verify_endpoint_survives_non_json_upstream(env_file, monkeypatch):
         assert "非 JSON" in r.json()["error"]
 
 
+def test_lx_verify_accepts_file_url(env_file, monkeypatch):
+    """file:// 上传地址必须能进入 verify 链路（透传 lxmusic 服务）。"""
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
+
+    _mock_http(handler)
+    with TestClient(webui.app) as client:
+        r = client.post("/api/lx/verify", json={"values": {"url": "file:///data/lxmusic/uploads/x.js"}})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert captured["body"]["url"] == "file:///data/lxmusic/uploads/x.js"
+        # 非 http/file 协议仍被拒
+        r2 = client.post("/api/lx/verify", json={"values": {"url": "ftp://s/1.js"}})
+        assert r2.status_code == 400
+
+
+_VALID_SCRIPT = "/*\n * @name 上传源\n * @version 1.0.0\n */\nconsole.log(1)\n"
+
+
+def test_lx_upload_proxies_to_lxmusic(env_file, monkeypatch):
+    """multipart .js → lxmusic /api/v1/source/upload，返回 file:// URL。"""
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        import json as _json
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={
+            "ok": True,
+            "data": {"path": "/data/lxmusic/uploads/mine.js",
+                     "url": "file:///data/lxmusic/uploads/mine.js",
+                     "meta": {"name": "上传源"}},
+        })
+
+    _mock_http(handler)
+    with TestClient(webui.app) as client:
+        r = client.post("/api/lx/upload",
+                        files={"file": ("mine.js", _VALID_SCRIPT.encode(), "text/javascript")})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["data"]["url"] == "file:///data/lxmusic/uploads/mine.js"
+        assert captured["path"] == "/api/v1/source/upload"
+        assert captured["body"]["filename"] == "mine.js"
+        assert captured["body"]["script"] == _VALID_SCRIPT
+
+
+def test_lx_upload_accepts_json_from_page(env_file, monkeypatch):
+    """管理页上传和 NAS 选择都 POST JSON，不能再拒掉非 multipart。"""
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={
+            "ok": True,
+            "data": {"url": "file:///data/lxmusic/uploads/mine.js", "meta": {"name": "上传源"}},
+        })
+
+    _mock_http(handler)
+    with TestClient(webui.app) as client:
+        r = client.post("/api/lx/upload", json={"filename": "mine.js", "script": _VALID_SCRIPT})
+        assert r.status_code == 200
+        assert r.json()["data"]["url"].startswith("file://")
+        assert captured["body"]["script"] == _VALID_SCRIPT
+        bad = client.post("/api/lx/upload", json={"filename": "a.txt", "script": _VALID_SCRIPT})
+        assert bad.status_code == 400
+
+
+def test_lx_upload_rejects_bad_requests(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    _mock_http(lambda r: httpx.Response(200, json={"ok": True}))
+    with TestClient(webui.app) as client:
+        # 非 .js 后缀
+        r = client.post("/api/lx/upload", files={"file": ("a.txt", b"hello", "text/plain")})
+        assert r.status_code == 400
+        # 非 UTF-8
+        r2 = client.post("/api/lx/upload", files={"file": ("a.js", b"\xff\xfe", "text/plain")})
+        assert r2.status_code == 400
+        # 缺 file 字段
+        r3 = client.post("/api/lx/upload", data={"x": "1"})
+        assert r3.status_code == 400
+
+
 def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl, monkeypatch):
     """保存时激活 lx 源，上游非 JSON 响应要落到 actions 的 error 字段，而不是让保存接口崩掉。"""
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")

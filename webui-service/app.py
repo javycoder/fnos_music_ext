@@ -65,7 +65,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LX_ENABLED": {"kind": "bool", "default": "false", "group": "provider", "reload": "process", "label": "洛雪自定义源"},
     "FNMUSIC_ONLINE_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 启用平台"},
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
-    "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本 URL"},
+    "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
@@ -504,12 +504,66 @@ async def api_config_put(body: ConfigBody, request: Request):
 async def api_lx_verify(body: ConfigBody, request: Request):
     preview_renew("lxmusic")  # 预览期间测试源视为活跃，续期倒计时
     url = str((body.values or {}).get("url") or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="url 必须以 http:// 或 https:// 开头")
+    if not url.lower().startswith(("http://", "https://", "file://")):
+        raise HTTPException(status_code=400, detail="url 必须以 http:// 、https:// 或 file:// 开头")
     client = get_http(request)
     try:
         resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
                                  json={"url": url}, timeout=130.0)
+        return JSONResponse(content=_resp_json(resp) or {"ok": False},
+                            status_code=resp.status_code)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+
+
+def _lx_script_limits(filename: str, script: str) -> None:
+    if not (filename or "").strip().lower().endswith(".js"):
+        raise HTTPException(status_code=400, detail="只支持 .js 后缀的洛雪源脚本文件")
+    if len(script.encode("utf-8")) > 9_000_000:
+        raise HTTPException(status_code=400, detail="脚本超过 9MB 大小上限")
+
+
+@app.post("/api/lx/upload")
+async def api_lx_upload(request: Request):
+    """上传 .js：管理页/NAS 选择发 JSON {filename, script}，也接受 multipart 文件。
+
+    校验后转给 lxmusic 落盘，返回 file:// URL。
+    """
+    preview_renew("lxmusic")
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+        filename = str(payload.get("filename") or "")
+        script = payload.get("script")
+        if not isinstance(script, str) or not script:
+            raise HTTPException(status_code=400, detail="缺少 script")
+    elif "multipart/form-data" in content_type:
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "filename"):
+            raise HTTPException(status_code=400, detail="缺少 file 字段")
+        filename = upload.filename or ""
+        raw = await upload.read()
+        if len(raw) > 9_000_000:
+            raise HTTPException(status_code=400, detail="脚本超过 9MB 大小上限")
+        try:
+            script = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="脚本不是有效的 UTF-8 文本") from exc
+    else:
+        raise HTTPException(
+            status_code=400, detail="请用 application/json 或 multipart/form-data 上传文件")
+    _lx_script_limits(filename, script)
+    client = get_http(request)
+    try:
+        resp = await client.post(f"{CONF['lx_url']}/api/v1/source/upload",
+                                 json={"filename": filename, "script": script},
+                                 timeout=30.0)
         return JSONResponse(content=_resp_json(resp) or {"ok": False},
                             status_code=resp.status_code)
     except httpx.HTTPError as exc:

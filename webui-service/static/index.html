@@ -100,14 +100,20 @@
           </div>
         </div>
 
-        <!-- lx：源 URL -->
+        <!-- lx：源 URL / 文件上传 -->
         <div class="subpanel" id="panel-lxmusic" hidden>
           <div class="card">
             <div class="card-title">洛雪自定义源</div>
-            <p class="hint">粘贴洛雪音乐自定义源脚本地址（以 http/https 开头）。保存前会自动做端到端校验。</p>
+            <p class="hint">三种方式任选：粘贴源脚本地址（http/https）、上传电脑上的 .js 文件、从 NAS 文件选择（桌面内可用）。保存前会自动做端到端校验。</p>
             <div class="btn-row">
-              <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js">
+              <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js 或 file:///data/lxmusic/uploads/xxx.js">
               <button class="btn" id="lx-test">测试</button>
+            </div>
+            <div class="btn-row">
+              <input type="file" id="lx-file" accept=".js" hidden>
+              <button class="btn" id="lx-upload">上传 .js 文件</button>
+              <button class="btn" id="lx-pick" hidden>从 NAS 选择</button>
+              <span id="lx-upload-note" class="muted"></span>
             </div>
             <div id="lx-report" class="report" hidden></div>
           </div>

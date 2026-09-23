@@ -1210,6 +1210,67 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
 
 
 
+def test_search_track_strict_local_first_pagination():
+    """多页严格本地优先：本地 60 条(size=20)占据前 3 页，第 4 页起为在线段。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        size = int(request.url.params.get("size", "20"))
+        start = (page - 1) * size
+        chunk = [
+            {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": f"歌手{i % 7}"}
+            for i in range(start, min(start + size, 60))
+        ]
+        return httpx.Response(200, json={"code": 0, "data": {"list": chunk, "total": 60}})
+
+    async def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": [
+                    {"song_id": f"mb_{i}", "song_name": f"在线歌{i}", "artist": f"在线歌手{i}", "duration": 200}
+                    for i in range(50)
+                ],
+            },
+        )
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True, "items": []})),
+        base_url="http://127.0.0.1:8768",
+    )
+
+    with TestClient(app) as client:
+        seen = []
+        for page in range(1, 7):
+            resp = client.get(f"/music/api/v1/search/track?q=歌&page={page}&size=20")
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert data["total"] == 60 + 50
+            items = data["list"]
+            seen.extend(it["guid"] for it in items)
+            if page <= 3:
+                # 纯本地页：全部是本地 guid
+                assert items and all(str(it["guid"]).startswith("local:") for it in items)
+            elif page == 4:
+                # 边界页：本地尾部 0 条（60 恰为 size 整数倍）+ 在线头部 20 条
+                assert all(not str(it["guid"]).startswith("local:") for it in items)
+        # 走完 6 页：60 本地 + 50 在线 = 110 条，无重复
+        locals_seen = [g for g in seen if str(g).startswith("local:")]
+        onlines_seen = [g for g in seen if not str(g).startswith("local:")]
+        assert len(locals_seen) == 60 and len(onlines_seen) == 50
+        assert len(set(seen)) == 110
+        # 本地全部出现在线之前
+        first_online_idx = seen.index(onlines_seen[0])
+        assert all(str(g).startswith("local:") for g in seen[:first_online_idx])
+        assert all(not str(g).startswith("local:") for g in seen[first_online_idx:])
+
+
 def test_general_passthrough():
     """非拦截路径透传（如静态资源或登录接口）。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:

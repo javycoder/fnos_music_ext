@@ -770,38 +770,33 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
     )
 
     with TestClient(app) as client:
-        # page=1 请求
+        # page=1 请求（本地优先布局：本地条目后紧跟全部在线条目，直到装满 size）
         resp1 = client.get("/music/api/v1/search/track?q=周杰伦&page=1&size=50")
         assert resp1.status_code == 200
         data1 = resp1.json()["data"]
         # total 抬升：本地 1 + 在线 15 (12 mb + 3 mdl) = 16
         assert data1["total"] == 16
-        # page=1 包含本地 1 条 + 在线前 10 条
+        # page=1 = 本地 1 条 + 全部 15 条在线
         list1 = data1["list"]
-        assert len(list1) == 11
+        assert len(list1) == 16
         assert list1[0]["guid"] == "local:101"
         assert list1[1]["guid"] == fake_official_guid("online:netease:mb_1")
-        assert list1[10]["guid"] == fake_official_guid("online:netease:mb_10")
+        assert list1[15]["guid"] == fake_official_guid("online:kuwo:kw_3")
 
-        # page=2 请求 (命中缓存，返回剩余 5 条在线：mb_11, mb_12, kw_1, kw_2, kw_3)
+        # page=2 请求（在线条目已在 page=1 装满，page=2 在线切片为空）
         resp2 = client.get("/music/api/v1/search/track?q=周杰伦&page=2&size=50")
         assert resp2.status_code == 200
         data2 = resp2.json()["data"]
         assert data2["total"] == 16
         list2 = data2["list"]
-        assert len(list2) == 5
-        assert list2[0]["guid"] == fake_official_guid("online:netease:mb_11")
-        assert list2[1]["guid"] == fake_official_guid("online:netease:mb_12")
-        assert list2[2]["guid"] == fake_official_guid("online:kuwo:kw_1")
-        assert list2[3]["guid"] == fake_official_guid("online:kuwo:kw_2")
-        assert list2[4]["guid"] == fake_official_guid("online:kuwo:kw_3")
+        assert len(list2) == 0
 
         # 断言 page=2 与 page=1 的在线条目无重叠
         guids1 = {it["guid"] for it in list1[1:]}
         guids2 = {it["guid"] for it in list2}
         assert guids1.isdisjoint(guids2)
 
-        # page=3 请求 (断言 page=2 与 page=3 的在线条目互不重叠且 page=3 为空切片)
+        # page=3 请求（同为空切片）
         resp3_page = client.get("/music/api/v1/search/track?q=周杰伦&page=3&size=50")
         assert resp3_page.status_code == 200
         data3 = resp3_page.json()["data"]
@@ -1002,10 +997,10 @@ def test_search_volume_and_default_limits(monkeypatch):
         data = resp.json()["data"]
         # netease_search_limit = 50
         assert "50" in captured_limits
-        # online_limit = 30，第一页最多 30 条在线
-        assert len(data["list"]) == 30
+        # 本地优先布局：本地 0 条，首页装满 size=50；musicbox 返回 40 首全部展示
+        assert len(data["list"]) == 40
         assert data["list"][0]["guid"] == fake_official_guid("online:netease:mb_1")
-        assert data["list"][29]["guid"] == fake_official_guid("online:netease:mb_30")
+        assert data["list"][39]["guid"] == fake_official_guid("online:netease:mb_40")
         # total 为 40
         assert data["total"] == 40
 
