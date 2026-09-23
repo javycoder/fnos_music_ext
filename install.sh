@@ -103,8 +103,8 @@ usage() {
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
-  --adopt                把本机部署迁移到当前目录（部署登记指向其他目录时使用；
-                        会跳过跨目录部署检查并重新登记）
+  --adopt                把本机部署迁移到当前目录（部署登记或代理 unit 属于其他
+                        目录时使用；会跳过跨目录检查并重新登记）
   --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
@@ -580,7 +580,11 @@ ensure_docker_ready() {
     fi
 }
 
-check_proxy_unit_owner || exit 1
+if [ "${ADOPT}" -eq 1 ]; then
+    check_proxy_unit_owner --adopt || exit 1
+else
+    check_proxy_unit_owner || exit 1
+fi
 # Refuse to install from a second checkout while the machine-wide deployment
 # registry names another live directory. NOTE: argument parsing above has
 # already consumed "$@", so the parsed ADOPT flag drives the bypass here.

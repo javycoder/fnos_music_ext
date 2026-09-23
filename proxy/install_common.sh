@@ -137,14 +137,42 @@ unit_working_dir() {
 }
 
 check_proxy_unit_owner() {
+    # Unit ownership is its WorkingDirectory. Accept the caller's "$@" so
+    # --adopt (explicit migration) can bypass, mirroring check_deployment_owner.
     local file="/etc/systemd/system/fnmusic-ext.service" wd
-    if [ -f "${file}" ]; then
-        wd="$(systemctl show fnmusic-ext.service -p WorkingDirectory --value)" || return 1
-        if ! same_dir "${wd}" "${BASE_DIR}"; then
-            log_err "代理 unit 属于其他目录；拒绝停止或覆盖。请先从原目录还原。"
-            return 1
-        fi
+    [ -f "${file}" ] || return 0
+    wd="$(systemctl show fnmusic-ext.service -p WorkingDirectory --value 2>/dev/null || true)"
+    if [ -z "${wd}" ]; then
+        # systemctl show can fail or lag behind a manual unit edit; the unit
+        # file itself is the ground truth for what would be overwritten.
+        wd="$(unit_working_dir "${file}")"
     fi
+    if [ -z "${wd}" ]; then
+        log_err "无法读取 ${file} 的 WorkingDirectory，拒绝盲目接管该 unit。"
+        log_err "请检查该 unit 文件后重试，或手动清理："
+        log_err "  sudo systemctl disable --now fnmusic-ext.service && sudo rm '${file}'"
+        return 1
+    fi
+    if same_dir "${wd}" "${BASE_DIR}"; then
+        return 0
+    fi
+    if [ ! -d "${wd}" ]; then
+        # Same semantics as takeover.py deployment_conflict for the registry:
+        # a deleted checkout cannot be protected, this one may adopt it.
+        log_warn "代理 unit 属于已不存在的目录 ${wd}，视为废弃部署，本次将直接接管。"
+        return 0
+    fi
+    case " ${*} " in
+        *' --adopt '*)
+            log_warn "代理 unit 属于目录 ${wd}，按 --adopt 迁移部署到当前目录 ${BASE_DIR}。"
+            return 0
+            ;;
+    esac
+    log_err "代理 unit 属于其他目录 ${wd}（当前目录 ${BASE_DIR}），拒绝停止或覆盖。"
+    log_err "  1) 到原目录 ${wd} 执行 ./restore.sh 释放部署；"
+    log_err "  2) 确认要把部署迁移到当前目录：追加 --adopt 重新运行；"
+    log_err "  3) 手动清理：sudo systemctl disable --now fnmusic-ext.service && sudo rm /etc/systemd/system/fnmusic-ext.service"
+    return 1
 }
 
 check_deployment_owner() {
