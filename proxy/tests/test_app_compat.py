@@ -29,6 +29,7 @@ def setup_compat_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "lx_enabled", False)
     monkeypatch.setitem(CONF, "merge_suggest", False)
     monkeypatch.setitem(CONF, "lyric_field", "data.lyric")
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
     app.state.musicbox_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
         base_url="http://127.0.0.1:8770",

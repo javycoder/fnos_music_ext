@@ -42,6 +42,7 @@ def setup_lx_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
     yield
     # 恢复全局 app.state，避免 mock 客户端泄漏到其它测试文件
     for attr in ("upstream_client", "musicdl_client", "musicbox_client", "lx_client"):

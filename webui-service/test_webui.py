@@ -150,6 +150,24 @@ def test_put_noop_returns_empty_change(env_file):
         assert r.json()["changed"] == []
 
 
+def test_search_timeout_defaults_and_saves(env_file):
+    with TestClient(webui.app) as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_SEARCH_TIMEOUT" in saved.json()["changed"]
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_SEARCH_TIMEOUT='9'" in text
+    with TestClient(webui.app) as client:
+        again = client.get("/api/config")
+        assert again.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "9"
+        clamped = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 99}})
+        assert clamped.status_code == 200
+    assert "FNMUSIC_SEARCH_TIMEOUT='60'" in env_file.read_text(encoding="utf-8")
+
+
 def test_put_int_clamps_and_bool_normalizes(env_file):
     with TestClient(webui.app) as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_TEE_CACHE_MAX": 999}})

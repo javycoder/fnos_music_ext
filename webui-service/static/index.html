@@ -118,6 +118,13 @@
             <div id="lx-report" class="report" hidden></div>
           </div>
         </div>
+
+        <div class="card">
+          <label class="field"><span>搜索超时时间</span>
+            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
+          </label>
+          <p class="hint">单位为秒，默认 15。在线结果一返回就交给播放页，本地歌曲在前；到时还没有就放弃这次在线结果，只返回本地歌曲。保存后立即生效。</p>
+        </div>
       </section>
 
       <!-- 播放与推荐 -->
