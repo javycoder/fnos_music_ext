@@ -818,27 +818,30 @@ parse_sources "${SOURCES_RAW}"
 # 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置）；
 # 传入主机上存在的 .js 文件路径时自动复制进 sources-data/lxmusic/uploads/ 并转 file:// URL
 if [ "${ENABLE_LX}" -eq 1 ]; then
-    if [ -n "${LX_SOURCE_URL_CLI}" ] && [ ! "${LX_SOURCE_URL_CLI}" = "http://"* ] && [ ! "${LX_SOURCE_URL_CLI}" = "https://"* ] && [ ! "${LX_SOURCE_URL_CLI}" = "file://"* ]; then
-        # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
-        LX_HOST_FILE="${LX_SOURCE_URL_CLI}"
-        if [ ! -f "${LX_HOST_FILE}" ]; then
-            log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
-            exit 1
-        fi
-        case "${LX_HOST_FILE}" in
-            *.js|*.JS) : ;;
-            *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
-        esac
-        LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
-        mkdir -p "${LX_UPLOAD_DIR}"
-        LX_BASENAME="$(basename "${LX_HOST_FILE}")"
-        if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
-            LX_BASENAME="$(date +%s)-${LX_BASENAME}"
-        fi
-        cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
-        LX_SOURCE_URL_CLI="file:///data/lxmusic/uploads/${LX_BASENAME}"
-        log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
-    fi
+    case "${LX_SOURCE_URL_CLI}" in
+        ""|http://*|https://*|file://*) ;;
+        *)
+            # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
+            LX_HOST_FILE="${LX_SOURCE_URL_CLI}"
+            if [ ! -f "${LX_HOST_FILE}" ]; then
+                log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
+                exit 1
+            fi
+            case "${LX_HOST_FILE}" in
+                *.js|*.JS) : ;;
+                *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
+            esac
+            LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
+            mkdir -p "${LX_UPLOAD_DIR}"
+            LX_BASENAME="$(basename "${LX_HOST_FILE}")"
+            if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
+                LX_BASENAME="$(date +%s)-${LX_BASENAME}"
+            fi
+            cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
+            LX_SOURCE_URL_CLI="file:///data/lxmusic/uploads/${LX_BASENAME}"
+            log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
+            ;;
+    esac
     if [ -z "${LX_SOURCE_URL_CLI}" ]; then
         log_info "未提供洛雪源（无源安装）：装好后在管理页 WebUI（桌面「fnMusic 扩展管理」或 http://<NAS_IP>:8774）配置源脚本并激活"
     fi
