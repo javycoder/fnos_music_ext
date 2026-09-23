@@ -102,6 +102,8 @@ CONF = {
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
+    # 收藏/加入歌单自动绑定本地：默认关；在线歌曲收藏后后台自动整轨下载并绑定本地文件
+    "fav_auto_bind": os.environ.get("FNMUSIC_FAV_AUTO_BIND", "false").lower() in ("true", "1", "yes"),
     # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
     # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
     "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
@@ -432,6 +434,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
+    "FNMUSIC_FAV_AUTO_BIND": ("fav_auto_bind", "bool"),
     "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
@@ -2919,6 +2922,22 @@ def _prune_full_fetch_state(now: float) -> None:
             del _full_fetch_failed[g]
 
 
+def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bool:
+    """后台整轨下载通用注册逻辑，按 gate_key 指定的 CONF 键做门禁。"""
+    if not CONF.get(gate_key) or find_cache_file(guid):
+        return False
+    task = _full_fetch_tasks.get(guid)
+    if task is not None and not task.done():
+        return False
+    now = time.monotonic()
+    _prune_full_fetch_state(now)
+    if now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
+        return False
+    headers = copy_incoming_headers(request)
+    _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, headers))
+    return True
+
+
 def _register_full_fetch(request: Request, guid: str) -> None:
     """定长窗口拉流客户端的边听边存兜底：注册后台整轨下载，客户端请求照常服务。
 
@@ -2926,17 +2945,12 @@ def _register_full_fetch(request: Request, guid: str) -> None:
     永远过不了 tee 写盘门；由服务端另起整轨下载落盘补齐。同 guid 去重、
     失败后冷却期内不重试，防止坏源反复打上游。
     """
-    if not CONF.get("tee_save_enabled") or find_cache_file(guid):
-        return
-    task = _full_fetch_tasks.get(guid)
-    if task is not None and not task.done():
-        return
-    now = time.monotonic()
-    _prune_full_fetch_state(now)
-    if now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
-        return
-    headers = copy_incoming_headers(request)
-    _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, headers))
+    _register_background_fetch(request, guid, "tee_save_enabled")
+
+
+def _register_fav_autobind(request: Request, guid: str) -> None:
+    """收藏/加入歌单的在线歌曲自动绑定本地：注册后台整轨下载并落盘转正。"""
+    _register_background_fetch(request, guid, "fav_auto_bind")
 
 
 async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
@@ -3897,6 +3911,7 @@ async def favorite_track_create(request: Request):
     info = await _best_effort_online_info(request, guid)
     track_obj = build_favorite_track_obj(guid, info, created_at=now)
 
+    saved = False
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
@@ -3912,8 +3927,12 @@ async def favorite_track_create(request: Request):
                     "track": track_obj,
                 })
             save_online_favorites(user_guid, items)
+            saved = True
         except Exception as e:
             logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
+
+    if saved:
+        _register_fav_autobind(request, guid)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
@@ -4283,6 +4302,7 @@ async def playlist_add_track(request: Request):
     for g in online:
         snapshots[g] = build_favorite_track_obj(g, await _best_effort_online_info(request, g), created_at=now)
 
+    saved = False
     async with _PLT_LOCK:
         try:
             items = load_playlist_tracks(user_guid)
@@ -4295,8 +4315,13 @@ async def playlist_add_track(request: Request):
                 else:
                     bucket.append({"guid": g, "addedAt": now, "track": snapshots[g]})
             save_playlist_tracks(user_guid, items)
+            saved = True
         except Exception as e:
             logger.warning("Error updating playlist tracks for user %s: %s", user_guid, e)
+
+    if saved:
+        for g in online:
+            _register_fav_autobind(request, g)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
