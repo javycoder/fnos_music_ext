@@ -2631,12 +2631,20 @@ def stream_tee_response(
                     fp.write(first_chunk)
                 written += len(first_chunk)
                 yield first_chunk
-            async for chunk in iterator:
-                if chunk:
-                    if fp:
-                        fp.write(chunk)
-                    written += len(chunk)
-                    yield chunk
+            try:
+                async for chunk in iterator:
+                    if chunk:
+                        if fp:
+                            fp.write(chunk)
+                        written += len(chunk)
+                        yield chunk
+            except Exception as exc:
+                # An aborted stream must not enter the cache, but it must leave
+                # a trace: CDN stalls mid-file were previously invisible in the
+                # journal. Client disconnects raise CancelledError (not caught
+                # here) and stay silent on purpose.
+                logger.warning("Stream aborted mid-way for %s: %s", guid, type(exc).__name__)
+                raise
             eof = True
             if fp:
                 fp.close()
@@ -2648,27 +2656,34 @@ def stream_tee_response(
                 except Exception:
                     info = None
             if part and eof and written >= 1024 and (expected is None or written == expected):
-                title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
-                if tee_enabled:
-                    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-                    os.replace(part, dest)
-                    remember_media_path(guid, dest)
-                    adopt_library_perms(dest)
-                    write_audio_tags(dest, title, artist, album)
-                    # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-                    promote_shadow_lyric(guid, dest)
-                else:
-                    # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
-                    dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
-                    os.replace(part, dest)
-                lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
-                if lyric.strip():
-                    write_lyric_cache(guid, lyric, title, artist)
-                if not tee_enabled:
-                    try:
-                        purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
-                    except Exception as e:
-                        logger.warning("Rolling cache purge failed: %s", e)
+
+                def finalize() -> None:
+                    title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
+                    if tee_enabled:
+                        dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+                        os.replace(part, dest)
+                        remember_media_path(guid, dest)
+                        adopt_library_perms(dest)
+                        write_audio_tags(dest, title, artist, album)
+                        # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+                        promote_shadow_lyric(guid, dest)
+                    else:
+                        # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
+                        dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
+                        os.replace(part, dest)
+                    lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
+                    if lyric.strip():
+                        write_lyric_cache(guid, lyric, title, artist)
+                    if not tee_enabled:
+                        try:
+                            purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
+                        except Exception as e:
+                            logger.warning("Rolling cache purge failed: %s", e)
+
+                # 落盘转正、mutagen 打标签与滚动清缓全是同步磁盘操作：放线程池执
+                # 行，避免曲目结束的瞬间阻塞事件循环（单 worker 下会拖住切歌、
+                # 心跳等全部并发请求）。
+                await asyncio.to_thread(finalize)
         finally:
             if fp:
                 fp.close()
@@ -2773,7 +2788,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 except Exception:
                     pass
             ext = ext or (info or {}).get("ext")
-            owned = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+            # Read timeout must tolerate CDN throttling mid-file: a flat 10s
+            # timeout kills long pauses between chunks and surfaces as playback
+            # stuck at ~70-80% of the track.
+            owned = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0),
+                follow_redirects=True,
+            )
             client = owned
             req = client.build_request("GET", url, headers=headers)
         else:
