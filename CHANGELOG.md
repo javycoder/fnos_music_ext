@@ -23,6 +23,7 @@
 - **healthz 超时取证**：`install.sh` 四个等待分支与 `extend.sh` 的 `wait_source` 超时后自动采集容器内 `supervisorctl status` 与容器日志尾部随安装日志落盘，「进程集与 .env 不一致 / 程序启动失败」一眼可辨；`env_newer_than_container` 移入共享库 `proxy/install_common.sh`。
 - **卸载/备份幂等加固**：卸载归档与升级备份的 tar 增加 `--ignore-failed-read`（播放历史等文件读取中途消失不再中止流程）；卸载归档卷根解析失败时先从 repo 路径推导 `/vol{n}/`，仍失败才落到 `/vol1/`。
 - **`_lookup_online_snapshot` 补扫歌单附加条目**：只加过歌单、从未收藏/播放的在线歌曲此前反查不到元数据（官方绑定与 tee 兜底会跳过或落 unknown），现 `playlist_tracks/` 一并纳入快照反查。
+- **CI 修复（纯测试改动）**：孤儿 bridge 清扫测试的断言改为顺序无关——`/proc` 目录迭代顺序随文件系统不同，列表严格相等断言在 GitHub runner 上必挂（本地恰好通过），改为按被杀集合比较。
 
 ### 变更：每日推荐按账户隔离
 

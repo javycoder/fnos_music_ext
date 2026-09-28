@@ -849,8 +849,9 @@ def test_reap_orphan_bridges_kills_only_path_matched_orphans(tmp_path, monkeypat
     monkeypatch.setattr(sr.os, "getpid", lambda: 4242)
 
     result = sr.reap_orphan_bridges(bridge_path=bridge, proc_root=proc)
-    assert result == [100, 102]
-    assert killed == [(100, 15), (102, 15)]
+    # /proc 目录迭代顺序随文件系统不同（CI runner 与本地不一致），杀掉的集合才是契约
+    assert sorted(result) == [100, 102]
+    assert sorted(killed) == [(100, 15), (102, 15)]
 
 
 def test_reap_orphan_bridges_skips_own_children(tmp_path, monkeypatch):
