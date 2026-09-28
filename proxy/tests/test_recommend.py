@@ -398,6 +398,107 @@ def test_read_local_recent_tracks(tmp_path):
     assert rows[0]["language"] == "中文"
 
 
+def _make_local_db(path, n_tracks=30, played_by_user=None):
+    """建最小可用的官方 music.db（local-random 层 / 按账户隔离测试用）。
+
+    用户 u1/u2；曲目 lt1..ltN（audio_file 真实存在）；played_by_user 形如
+    {"u1": [("lt1", "2026-09-28 10:00:00+08:00"), ...]} 写入各账户播放历史。
+    """
+    played_by_user = played_by_user or {}
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE user (id INTEGER PRIMARY KEY, guid TEXT);
+        CREATE TABLE album (id INTEGER PRIMARY KEY, guid TEXT, name TEXT, release_date TEXT);
+        CREATE TABLE artist (id INTEGER PRIMARY KEY, guid TEXT, name TEXT);
+        CREATE TABLE track (
+            id INTEGER PRIMARY KEY, guid TEXT, title TEXT, year INTEGER,
+            album_id INTEGER, cover_guid TEXT, disc_no INTEGER, track_no INTEGER,
+            isrc TEXT, duration_ms INTEGER, is_cue INTEGER,
+            audio_file_id INTEGER,
+            is_audio_file_deleted INTEGER DEFAULT 0,
+            is_admin_deleted INTEGER DEFAULT 0
+        );
+        CREATE TABLE audio_file (
+            id INTEGER PRIMARY KEY, path TEXT, suffix TEXT, size INTEGER,
+            bitrate INTEGER, sample_rate INTEGER, bit_depth INTEGER, channel INTEGER,
+            container TEXT, codec TEXT, is_physical_file_deleted INTEGER DEFAULT 0
+        );
+        CREATE TABLE track_artist (track_id INTEGER, artist_id INTEGER);
+        CREATE TABLE genre (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE track_genre (track_id INTEGER, genre_id INTEGER);
+        CREATE TABLE favorite_track (
+            id INTEGER PRIMARY KEY, user_id INTEGER, track_id INTEGER, updated_at TEXT
+        );
+        CREATE TABLE play_history (
+            id INTEGER PRIMARY KEY, user_id INTEGER, track_id INTEGER,
+            play_count INTEGER, updated_at TEXT
+        );
+        INSERT INTO user VALUES (1, 'u1');
+        INSERT INTO user VALUES (2, 'u2');
+        """
+    )
+    track_ids = {}
+    for i in range(1, n_tracks + 1):
+        con.execute("INSERT INTO album VALUES (?, ?, ?, ?)", (i, f"alg{i}", f"专辑{i}", "2020-01-01"))
+        con.execute("INSERT INTO artist VALUES (?, ?, ?)", (i, f"arg{i}", f"歌手{i}"))
+        con.execute(
+            "INSERT INTO audio_file VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (i, f"/vol1/music/t{i}.flac", "flac", 1000000 + i, 900, 44100, 16, 2, "flac", "flac"),
+        )
+        con.execute(
+            "INSERT INTO track VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0)",
+            (i, f"lt{i}", f"本地歌{i}", 2020, i, f"cover{i}", 1, i, f"ISRC{i}", 200000 + i * 1000, i),
+        )
+        con.execute("INSERT INTO track_artist VALUES (?, ?)", (i, i))
+        track_ids[f"lt{i}"] = i
+    uid_by_guid = {"u1": 1, "u2": 2}
+    for user_guid, plays in played_by_user.items():
+        for guid, updated_at in plays:
+            con.execute(
+                "INSERT INTO play_history (user_id, track_id, play_count, updated_at) VALUES (?, ?, 1, ?)",
+                (uid_by_guid[user_guid], track_ids[guid], updated_at),
+            )
+    con.commit()
+    con.close()
+    return track_ids
+
+
+def test_local_random_never_played_first_and_filters_deleted(tmp_path):
+    """local-random：从未听过优先随机、不足补最久未听；三级删除标记的曲目一律不选。"""
+    db = tmp_path / "music.db"
+    # u1：lt8 很久前听过、lt9 最近听过、其余从未听；lt10 物理文件已删、lt7 管理员已删
+    _make_local_db(
+        db, n_tracks=10,
+        played_by_user={"u1": [
+            ("lt8", "2026-01-01 08:00:00+08:00"),
+            ("lt9", "2026-09-27 22:00:00+08:00"),
+        ]},
+    )
+    con = sqlite3.connect(db)
+    con.execute("UPDATE audio_file SET is_physical_file_deleted = 1 WHERE id = 10")
+    con.execute("UPDATE track SET is_admin_deleted = 1 WHERE id = 7")
+    con.commit()
+    con.close()
+
+    rows = dailyrec.read_local_random_tracks(str(db), "u1", 10)
+    guids = [r["guid"] for r in rows]
+    assert "lt10" not in guids and "lt7" not in guids  # 已删文件不入池
+    never_played = {f"lt{i}" for i in range(1, 7)}
+    assert never_played <= set(guids[:6])  # 从未听过的 6 首排在最前
+    assert guids.index("lt8") < guids.index("lt9")     # 不足时最久未听（lt8）先于最近听过（lt9）
+    # 排除集生效：把最近听过的 lt9 排除后不再出现
+    rows2 = dailyrec.read_local_random_tracks(str(db), "u1", 10, exclude_guids={"lt9"})
+    assert "lt9" not in [r["guid"] for r in rows2]
+    # 行形状可直接构建官方形态 track
+    track = dailyrec.build_local_track(rows[0])
+    assert track["guid"] == rows[0]["guid"] and not track["guid"].startswith("online:")
+    assert track["artists"] and track["artists"][0]["name"]
+    assert track["album"]["name"] and isinstance(track["audioSpec"], dict)
+    assert track["audioSpec"]["path"].endswith(".flac")
+    assert track["duration"] == rows[0]["duration_ms"]
+
+
 def test_purge_stale_daily_cache_keeps_today_only(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
     user = "user-rec-1"
@@ -534,8 +635,9 @@ def test_healthz_includes_llm_flag():
         assert "llm" in resp.json()
         assert resp.json()["llm"] in ("disabled", "enabled")
         rec = resp.json()["recommend"]
-        assert rec["mode"] == "source-native"
+        assert rec["mode"] == "per-user: source-slot -> llm -> local-random"
         assert rec["netease"] is True
+        assert isinstance(rec["source_slot_claimed"], bool)
         assert isinstance(rec["recent"], dict)
 
 
@@ -1149,14 +1251,15 @@ async def test_resolve_recommendations_emits_progressively(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_llm_timeout_records_failure_and_fallback_protected_budget(monkeypatch):
-    """issue #29：LLM 层超时不再静默——失败原因落盘 tierFailures，
-    fallback 层保护预算保证兜底仍有执行机会，歌单不再为空。"""
-    monkeypatch.setenv("FNMUSIC_MUSIC_DB", "/nonexistent.db")
+async def test_llm_timeout_falls_back_to_local_random(tmp_path, monkeypatch):
+    """issue #29 延续：LLM 层超时不再静默——失败原因落盘 tierFailures，
+    local-random 层兜底保证歌单不再为空（本地曲库随机补齐）。"""
+    db = tmp_path / "music.db"
+    _make_local_db(db, n_tracks=25)
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
     monkeypatch.setattr(dailyrec, "build_budget_s", lambda: 3.0)
-    monkeypatch.setattr(dailyrec, "fallback_protected_budget_s", lambda: 5.0)
     from proxy.app import build_online_track
 
     slow_llm = _SlowTransport(30.0, httpx.Response(200, json={"choices": [{"message": {"content": "[]"}}]}))
@@ -1167,7 +1270,7 @@ async def test_llm_timeout_records_failure_and_fallback_protected_budget(monkeyp
                 transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770",
             ) as mb:
         payload = await dailyrec.get_or_build_daily(
-            user_guid="u-timeout",
+            user_guid="u1",
             musicdl_client=mdl,
             musicbox_client=mb,
             llm_http=llm_client,
@@ -1175,11 +1278,214 @@ async def test_llm_timeout_records_failure_and_fallback_protected_budget(monkeyp
             netease_enabled=False,
         )
     assert any(f.startswith("llm:") for f in payload.get("tierFailures") or [])
-    assert "fallback" in payload["tiers"]
-    assert len(payload["tracks"]) >= 1
+    assert "local-random" in payload["tiers"]
+    assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
+    assert all(not str(t["guid"]).startswith("online:") for t in payload["tracks"])
     # healthz 摘要同样带上失败原因
-    info = dailyrec.last_recommend_summary().get("u-timeout:daily") or {}
+    info = dailyrec.last_recommend_summary().get("u1:daily") or {}
     assert info.get("tierFailures")
+
+
+@pytest.mark.anyio
+async def test_daily_case1_no_source_no_llm_local_random(tmp_path, monkeypatch):
+    """情况1：音源不支持每日推荐且未配置 LLM -> 本地曲库随机，各账户内容不同。"""
+    db = tmp_path / "music.db"
+    _make_local_db(
+        db, n_tracks=30,
+        played_by_user={
+            "u1": [("lt1", "2026-09-27 21:00:00+08:00")],
+            "u2": [("lt2", "2026-09-27 21:00:00+08:00")],
+        },
+    )
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
+        base_url="http://127.0.0.1:8770",
+    ) as mb:
+        payload_a = await dailyrec.get_or_build_daily(
+            user_guid="u1", musicdl_client=None, musicbox_client=mb, llm_http=None,
+            build_track=build_online_track, netease_enabled=True,
+        )
+        payload_b = await dailyrec.get_or_build_daily(
+            user_guid="u2", musicdl_client=None, musicbox_client=mb, llm_http=None,
+            build_track=build_online_track, netease_enabled=True,
+        )
+    for payload in (payload_a, payload_b):
+        assert payload["tiers"] == ["local-random"]
+        assert payload["status"] == "ready"
+        assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
+        assert all(not str(t["guid"]).startswith("online:") for t in payload["tracks"])
+    guids_a = {t["guid"] for t in payload_a["tracks"]}
+    guids_b = {t["guid"] for t in payload_b["tracks"]}
+    assert guids_a != guids_b  # 各账户不同
+    assert "lt1" not in guids_a  # 最近听过被排除
+    assert "lt2" not in guids_b
+
+
+@pytest.mark.anyio
+async def test_daily_case2_source_slot_first_netease_others_local(tmp_path, monkeypatch):
+    """情况2：网易可用但无 LLM -> 第一个用户用网易日推并占名额，
+    第二个用户不再调网易、改走本地曲库随机，两份歌单不同。"""
+    db = tmp_path / "music.db"
+    _make_local_db(db, n_tracks=30)
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    mb_calls = {"n": 0}
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/recommend/songs":
+            mb_calls["n"] += 1
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "网易日推")})
+        return httpx.Response(404, json={"ok": False})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770") as mb:
+        first = await dailyrec.get_or_build_daily(
+            user_guid="u1", musicdl_client=None, musicbox_client=mb, llm_http=None,
+            build_track=build_online_track, netease_enabled=True,
+        )
+        assert first["tiers"] == ["netease-daily"]
+        assert len(first["tracks"]) == dailyrec.PLAYLIST_SIZE
+        assert dailyrec.source_slot_claimed()  # 名额已被第一个用户占用
+
+        second = await dailyrec.get_or_build_daily(
+            user_guid="u2", musicdl_client=None, musicbox_client=mb, llm_http=None,
+            build_track=build_online_track, netease_enabled=True,
+        )
+    assert mb_calls["n"] == 1  # 第二个用户没有再调网易日推
+    assert second["tiers"] == ["local-random"]
+    assert all(not str(t["guid"]).startswith("online:") for t in second["tracks"])
+    first_guids = {t["guid"] for t in first["tracks"]}
+    second_guids = {t["guid"] for t in second["tracks"]}
+    assert first_guids and second_guids and first_guids != second_guids
+
+    # 音源集合变化后名额释放：清缓存后下一个用户可重新用网易日推
+    dailyrec.invalidate_today_cache_all_users()
+    assert not dailyrec.source_slot_claimed()
+
+
+@pytest.mark.anyio
+async def test_daily_case3_source_slot_first_netease_others_llm(tmp_path, monkeypatch):
+    """情况3：网易可用且配置了 LLM -> 第一个用户用网易日推，其余用户走 LLM。"""
+    db = tmp_path / "music.db"
+    _make_local_db(db, n_tracks=30)
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("FNMUSIC_LLM_MODEL", "gpt-test")
+    mb_calls = {"n": 0}
+    llm_calls = {"n": 0}
+
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/recommend/songs":
+            mb_calls["n"] += 1
+            return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "网易日推")})
+        return httpx.Response(404, json={"ok": False})
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_calls["n"] += 1
+        content = json.dumps([
+            {"title": f"LLM歌{i}", "artist": f"LLM歌手{i}", "dimension": "llm", "reason": "test"}
+            for i in range(30)
+        ])
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        # 按关键词变化：每个 LLM 候选都能解析到不同可播曲目（身份去重后仍凑得满 20）
+        if request.url.path == "/stream":
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
+        kw = request.url.params.get("keyword") or ""
+        title = kw.split()[-1] if kw else "x"
+        return httpx.Response(200, json={"items": [{
+            "id": f"migu:{abs(hash(kw)) % 100000}", "source": "migu",
+            "title": title, "artist": "A", "duration_s": 180, "ext": "mp3",
+        }]})
+
+    from proxy.app import build_online_track
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(llm_handler), base_url="http://127.0.0.1:9") as llm_client, \
+            httpx.AsyncClient(transport=httpx.MockTransport(mb_handler), base_url="http://127.0.0.1:8770") as mb, \
+            httpx.AsyncClient(
+                transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768",
+            ) as mdl:
+        first = await dailyrec.get_or_build_daily(
+            user_guid="u1", musicdl_client=mdl, musicbox_client=mb, llm_http=llm_client,
+            build_track=build_online_track, netease_enabled=True,
+        )
+        llm_after_first = llm_calls["n"]
+        second = await dailyrec.get_or_build_daily(
+            user_guid="u2", musicdl_client=mdl, musicbox_client=mb, llm_http=llm_client,
+            build_track=build_online_track, netease_enabled=True,
+        )
+    assert first["tiers"] == ["netease-daily"] and llm_after_first == 0
+    assert mb_calls["n"] == 1
+    assert second["tiers"] == ["llm"]
+    assert llm_calls["n"] >= 1
+    assert all(str(t["guid"]).startswith("online:") for t in second["tracks"])
+
+
+def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, monkeypatch):
+    """本地随机歌单下发兼容：真实官方 guid 原样穿透（不做 online 伪装），
+    歌单封面取本地曲目官方 coverId 并透传官方静态封面端点。"""
+    db = tmp_path / "music.db"
+    _make_local_db(db, n_tracks=25)
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    monkeypatch.setitem(CONF, "recommend_hot", False)
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+
+    cover_calls = {"n": 0, "id": ""}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "u1"}})
+        if path.endswith("/playlist/list"):
+            return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
+        if path == "/music/api/v1/static/cover":
+            cover_calls["n"] += 1
+            cover_calls["id"] = request.url.params.get("coverId")
+            return httpx.Response(200, content=b"\x89PNG-fake", headers={"content-type": "image/png"})
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8768"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})), base_url="http://127.0.0.1:8770"
+    )
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/playlist/list")
+        names = [x.get("name") for x in resp.json()["data"]["list"]]
+        assert any("每日推荐" in str(n) for n in names)
+        daily = resp.json()["data"]["list"][0]
+        assert daily["trackCount"] == dailyrec.PLAYLIST_SIZE
+        assert not str(daily["coverId"]).startswith("track_")  # 官方封面 guid 原样下发
+        assert str(daily["coverId"]).startswith("cover")
+
+        tracks_resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": daily["guid"], "page": 1, "size": 50},
+        )
+        tracks = tracks_resp.json()["data"]["list"]
+        assert len(tracks) == dailyrec.PLAYLIST_SIZE
+        # 真实官方 guid 不做伪装，反解即自身；audioSpec 带真实路径与时长
+        for t in tracks:
+            g = str(t["guid"])
+            assert g.startswith("lt") and resolve_real_guid(g) == g
+            assert t["audioSpec"]["path"].endswith(".flac")
+            assert t["duration"] > 0
+            assert t["artists"] and t["artists"][0]["name"]
+            assert t["album"]["name"]
+
+        cover = client.get("/music/api/v1/static/cover", params={"coverId": daily["coverId"]})
+        assert cover.status_code == 200
+        assert cover_calls["n"] == 1
+        assert cover_calls["id"] == daily["coverId"]  # 官方封面 id 原样透传
 
 
 def test_invalidate_today_cache_all_users(tmp_path):
