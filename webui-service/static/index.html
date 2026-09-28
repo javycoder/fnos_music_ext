@@ -159,7 +159,7 @@
           <p class="hint">缓存数仅在关闭边听边存时生效；restore 还原时会一并清理这些滚动缓存。</p>
         </div>
         <div class="card">
-          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">收藏或加入歌单的在线歌曲先立即生效，随后在后台自动下载到本地曲库；下载完成且官方曲库收录后，自动把这次收藏/加歌单写进飞牛官方的收藏/歌单列表（成功后只在官方列表显示一次，不重复）。官方未收录前保留本地映射兜底并自动重试；下载不与边听边存重复。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
+          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">收藏或加入歌单的在线歌曲先立即生效，随后在后台自动下载到本地曲库；下载完成后收藏列表或歌单自动绑定已经下载好的本地歌曲而不是绑定在线歌曲。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
           <label class="field"><span>官方绑定等待（秒） <b id="bind-timeout-label"></b></span>
             <input class="input" id="bind-timeout" type="number" min="10" max="3600">
           </label>
