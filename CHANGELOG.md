@@ -3,6 +3,16 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.5.1] - 2026-09-28
+
+### 修复与加固
+
+- **应用中心 FPK 安装与升级健壮性加固（修复跨卷/手动部署迁移冲突）**：
+  - **安装/升级自动 adopt 接管**：FPK 回调（`install_callback` 与 `upgrade_callback`）默认透传 `--adopt`，彻底解决宿主机存在老部署（如 Git 手工部署或旧卷）时 `check_deployment_owner` 报错死锁的问题。
+  - **容器所有权 `--adopt` 接管支持**：`reclaim_container` 与 `remove_owned_container` 支持 `--adopt` 参数，发现老目录容器时自动移除并由当前目录重建，彻底消除 `容器 fnmusic-sources 不属于当前目录` 的报错。
+  - **存量数据自动平滑继承**：应用中心首次安装时若检测到系统存在老部署，自动平滑继承其 `.env`、收藏、播放历史与音源凭据，实现零成本无感迁移。
+  - **卸载与自愈清理闭环**：`upgrade_init` 补齐老容器清理；`uninstall_init` 与 `uninstall_callback` 卸载时彻底清理全局部署记录，避免残留冲突；修复 UI 弹窗截取错误日志时的 UTF-8 中文截断乱码。
+
 ## [2.5.0] - 2026-09-28
 
 ### 兼容适配（官方 2026-09-25 更新）
@@ -32,11 +42,6 @@
   - 长耗时阶段（镜像拉取、容器就绪等待）增加 30 秒心跳进度日志，BuildKit 默认开启 plain 模式，安装进度透明不卡死。
   - 优化错误提示：明确指出网络受限时的排查方法（支持自配代理或切换基础镜像）。
   - 新增只读环境诊断脚本 `scripts/collect_support_info.sh`，便于 issue 反馈时一键采集无敏环境日志。
-- **应用中心 FPK 安装与升级健壮性加固（修复跨卷/手动部署迁移冲突）**：
-  - **安装/升级自动 adopt 接管**：FPK 回调（`install_callback` 与 `upgrade_callback`）默认透传 `--adopt`，彻底解决宿主机存在老部署（如 Git 手工部署或旧卷）时 `check_deployment_owner` 报错死锁的问题。
-  - **容器所有权 `--adopt` 接管支持**：`reclaim_container` 与 `remove_owned_container` 支持 `--adopt` 参数，发现老目录容器时自动移除并由当前目录重建，彻底消除 `容器 fnmusic-sources 不属于当前目录` 的报错。
-  - **存量数据自动平滑继承**：应用中心首次安装时若检测到系统存在老部署，自动平滑继承其 `.env`、收藏、播放历史与音源凭据，实现零成本无感迁移。
-  - **卸载与自愈清理闭环**：`upgrade_init` 补齐老容器清理；`uninstall_init` 与 `uninstall_callback` 卸载时彻底清理全局部署记录，避免残留冲突；修复 UI 弹窗截取错误日志时的 UTF-8 中文截断乱码。
 
 ## [2.4.0] - 2026-09-24
 
