@@ -1,14 +1,17 @@
 """推荐歌单：采信音源原生推荐生成可播放在线歌单。
 
 两个独立歌单，各自受开关门控（见 .env FNMUSIC_RECOMMEND_*）：
-  - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：优先级单链，逐级补齐至 PLAYLIST_SIZE 首：
-      1. netease-daily  网易真·每日推荐（musicbox，已登录为个性化）
-      2. llm            大模型候选 + 搜索匹配（仅当网易音源未启用且配置了 FNMUSIC_LLM_*）
-      3. fallback       种子歌手 + 热门池关键词检索（最终保险）
+  - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：按账户隔离，逐级补齐至 PLAYLIST_SIZE 首：
+      1. netease-daily  网易真·每日推荐（musicbox）。音源每天只有一份内容，
+                        当天仅第一个构建的用户可用（占用"音源名额"，见 source-slot）
+      2. llm            大模型候选 + 搜索匹配（配置了 FNMUSIC_LLM_* 即启用，种子按用户）
+      3. local-random   本地曲库随机兜底（只读官方库；按账户播放历史选
+                        "从未听过优先、最久未听补齐"的本地现存曲目，各账户不同）
   - 热门推荐（hot，FNMUSIC_RECOMMEND_HOT）：榜单原味（不排除已收藏/最近播放）：
       1. netease-charts 网易热歌榜（musicbox toplist，免登录）
       2. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
-歌单封面取曲：第一个带可用封面直链的曲目（跳过无封面与酷我文本页假链接）。
+歌单封面取曲：第一个带可用封面直链的在线曲目；无在线封面回落第一首带官方
+coverId 的本地曲目（跳过酷我文本页假链接）。
 密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
 """
 from __future__ import annotations
@@ -34,17 +37,74 @@ HOT_GUID_PREFIX = "online:playlist:hot:"
 KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
 DEFAULT_MODEL = "gpt-4o-mini"
 SEED_LIMIT = 20
-LLM_CANDIDATE_COUNT = 30
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(os.environ.get(name, "") or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(os.environ.get(name, "") or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# issue #29：预算/候选数/超时全部可配（.env 热重载白名单同步放开）。
+LLM_CANDIDATE_COUNT = _env_int("FNMUSIC_RECOMMEND_CANDIDATES", 36, 10, 60)
 PLAYLIST_SIZE = 20
 RECOMMEND_COUNT = PLAYLIST_SIZE  # 兼容旧引用
-LLM_TIMEOUT_S = 20.0
-BUILD_BUDGET_S = 25.0
+LLM_TIMEOUT_S = _env_float("FNMUSIC_LLM_TIMEOUT_S", 20.0, 5.0, 60.0)
+BUILD_BUDGET_S = _env_float("FNMUSIC_RECOMMEND_BUDGET_S", 40.0, 10.0, 180.0)
+# local-random 层候选池读取量：排除集（最近播放/收藏）在 SQL 后过滤，
+# 池子放大几倍避免排除后不足 20 首；本地曲库本身很小时按库存返回
+LOCAL_RANDOM_POOL = 200
+# issue #23：推荐曲目逐首可播校验（解析直链 + 头部探活），默认开
+VERIFY_PLAYABLE = (os.environ.get("FNMUSIC_RECOMMEND_VERIFY_PLAYABLE", "true").strip().lower()
+                   in ("true", "1", "yes"))
+VERIFY_TIMEOUT_S = _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", 8.0, 2.0, 20.0)
 # 音源原生推荐抓取量（过滤已收藏/最近播放与不可播曲目后仍有余量）
 NETEASE_DAILY_LIMIT = 40
 NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜
 CHART_FETCH_COUNT = 40
-RECOMMEND_SEARCH_CONCURRENCY = int(os.environ.get("FNMUSIC_REC_SEARCH_CONCURRENCY", "2"))
-RECOMMEND_SEARCH_INTERVAL = float(os.environ.get("FNMUSIC_REC_SEARCH_INTERVAL", "0.15"))
+RECOMMEND_SEARCH_CONCURRENCY = _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", 2, 1, 6)
+RECOMMEND_SEARCH_INTERVAL = _env_float("FNMUSIC_REC_SEARCH_INTERVAL", 0.15, 0.0, 5.0)
+
+
+# ---- 运行期可调读取（app.py 的 .env 热重载只更新 os.environ，模块常量不会跟着变，
+# 所以推荐链路内部一律走这些 getter，WebUI/.env 改完立即生效无需重启） ----
+
+def build_budget_s() -> float:
+    return _env_float("FNMUSIC_RECOMMEND_BUDGET_S", BUILD_BUDGET_S, 10.0, 180.0)
+
+
+def llm_candidate_count() -> int:
+    return _env_int("FNMUSIC_RECOMMEND_CANDIDATES", LLM_CANDIDATE_COUNT, 10, 60)
+
+
+def llm_timeout_s() -> float:
+    return _env_float("FNMUSIC_LLM_TIMEOUT_S", LLM_TIMEOUT_S, 5.0, 60.0)
+
+
+def verify_playable_enabled() -> bool:
+    return (os.environ.get("FNMUSIC_RECOMMEND_VERIFY_PLAYABLE", "true").strip().lower()
+            in ("true", "1", "yes"))
+
+
+def verify_timeout_s() -> float:
+    return _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", VERIFY_TIMEOUT_S, 2.0, 20.0)
+
+
+def search_concurrency() -> int:
+    # issue #29 反馈者实测的参数：同样放开为运行期读取，.env 热重载立即生效
+    return _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", RECOMMEND_SEARCH_CONCURRENCY, 1, 6)
+
+
+def search_interval_s() -> float:
+    return _env_float("FNMUSIC_REC_SEARCH_INTERVAL", RECOMMEND_SEARCH_INTERVAL, 0.0, 5.0)
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HIRA_KATA = re.compile(r"[\u3040-\u30ff]")
@@ -132,18 +192,23 @@ def is_daily_playlist_guid(guid: str | None) -> bool:
 
 
 def pick_playlist_cover_track(tracks: list[dict] | None) -> dict | None:
-    """歌单封面取曲：第一个带可用封面直链的曲目。
+    """歌单封面取曲：优先第一个带可用封面直链的在线曲目；无在线封面时回落
+    第一首带官方 coverId 的本地曲目（封面端点对真实官方 guid 透传官方）。
 
     跳过 cover_url 为空与酷我文本页假链接（KW_TEXT_COVER_HOST）的曲目；
-    全都无封面返回 None（封面端点据此 404，客户端显示自带默认样式）。
+    都没有返回 None（封面端点据此 404，客户端显示自带默认样式）。
     """
+    local_fallback = None
     for t in tracks or []:
         if not isinstance(t, dict):
             continue
         url = str(t.get("cover_url") or "")
         if url and KW_TEXT_COVER_HOST not in url:
             return t
-    return None
+        cover_id = str(t.get("coverId") or "")
+        if local_fallback is None and cover_id and not cover_id.startswith("online:"):
+            local_fallback = t
+    return local_fallback
 
 
 def infer_language(title: str = "", artist: str = "", album: str = "") -> str:
@@ -340,6 +405,201 @@ def read_local_favorite_tracks(db_path: str, user_guid: str, limit: int = 200) -
             "source": "favorite-local",
         })
     return out
+
+
+def read_local_random_tracks(
+    db_path: str,
+    user_guid: str,
+    limit: int = PLAYLIST_SIZE,
+    exclude_guids: set[str] | None = None,
+    exclude_ta: set[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """本地曲库随机选曲（只读官方库，不写）。每日推荐 local-random 层数据源。
+
+    选取口径：
+      - 仅选本地文件真实存在的曲目（track/audio_file 三级软删除标记全为 0）
+      - 按账户自己的 play_history 判定"最近没有听过"：
+        从未听过优先随机，不足再按"最久未听"随机补齐（各账户天然不同）
+      - 排除集（最近播放/收藏 guid 与 歌名+歌手 身份键）在 SQL 后过滤，
+        候选池放大到 LOCAL_RANDOM_POOL 吸收排除损耗
+    返回的行是 build_local_track 的输入形状（含 audio_file/artist/album 明细）。
+    """
+    uid = user_id_from_guid(db_path, user_guid)
+    if uid is None:
+        return []
+    sql = """
+        SELECT t.guid, t.title, t.year, t.disc_no, t.track_no, t.isrc,
+               t.duration_ms, t.is_cue, t.cover_guid,
+               af.path, af.suffix, af.size, af.bitrate, af.sample_rate,
+               af.bit_depth, af.channel, af.container, af.codec,
+               (SELECT GROUP_CONCAT(a.name, '/')
+                  FROM track_artist ta JOIN artist a ON a.id = ta.artist_id
+                 WHERE ta.track_id = t.id) AS artists,
+               (SELECT GROUP_CONCAT(a.guid, '/')
+                  FROM track_artist ta JOIN artist a ON a.id = ta.artist_id
+                 WHERE ta.track_id = t.id) AS artist_guids,
+               al.guid AS album_guid, al.name AS album, al.release_date,
+               ph.updated_at AS last_played_at
+          FROM track t
+          JOIN audio_file af ON af.id = t.audio_file_id
+          LEFT JOIN album al ON al.id = t.album_id
+          LEFT JOIN play_history ph ON ph.track_id = t.id AND ph.user_id = ?
+         WHERE t.is_audio_file_deleted = 0 AND t.is_admin_deleted = 0
+           AND af.is_physical_file_deleted = 0
+         ORDER BY (ph.id IS NULL) DESC, ph.updated_at ASC, RANDOM()
+         LIMIT ?
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = con.execute(sql, (uid, LOCAL_RANDOM_POOL)).fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("failed to read local random tracks: %s", e)
+        return []
+    skip_ids = set(exclude_guids or ())
+    skip_ta = set(exclude_ta or ())
+    out: list[dict] = []
+    for (guid, title, year, disc_no, track_no, isrc, duration_ms, is_cue, cover_guid,
+         af_path, suffix, size, bitrate, sample_rate, bit_depth, channel, container, codec,
+         artists, artist_guids, album_guid, album, release_date, last_played_at) in rows:
+        guid_s = str(guid or "")
+        title_s = str(title or "")
+        artist_s = str(artists or "")
+        if not guid_s:
+            continue
+        if guid_s in skip_ids:
+            continue
+        key = identity_key(title_s, artist_s)
+        if key != ("", "") and key in skip_ta:
+            continue
+        out.append({
+            "guid": guid_s,
+            "title": title_s,
+            "artist": artist_s,
+            "artist_guids": str(artist_guids or ""),
+            "album": str(album or ""),
+            "album_guid": str(album_guid or ""),
+            "release_date": str(release_date or ""),
+            "year": year,
+            "disc_no": disc_no,
+            "track_no": track_no,
+            "isrc": str(isrc or ""),
+            "duration_ms": int(duration_ms or 0),
+            "is_cue": bool(is_cue),
+            "cover_guid": str(cover_guid or ""),
+            "path": str(af_path or ""),
+            "suffix": str(suffix or ""),
+            "size": int(size or 0),
+            "bitrate": int(bitrate or 0),
+            "sample_rate": int(sample_rate or 0),
+            "bit_depth": int(bit_depth or 0) if bit_depth else 0,
+            "channel": int(channel or 0),
+            "container": str(container or ""),
+            "codec": str(codec or ""),
+            "last_played_at": str(last_played_at or ""),
+            "source": "local",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_local_track(row: dict) -> dict:
+    """官方库曲目行（read_local_random_tracks 输出）-> 客户端官方形态 track 对象。
+
+    本地曲目 guid 是真实官方 32-hex：下发链路（disguise_client_json /
+    resolve_real_guid / 播放端点）对非 online: guid 原样穿透，播放与封面走
+    官方原生链路。字段形状对齐 app.py build_favorite_track_obj 的官方严格
+    形状（App 反序列化严格：artists/album.name 永不为空、artist.coverId 为
+    null、album 无 artists 键），audioSpec 用 DB 真实值。
+    """
+    guid = str(row.get("guid") or "")
+    ts = int(time.time())
+    title = str(row.get("title") or "").strip()
+    artist_names = [n.strip() for n in str(row.get("artist") or "").split("/") if n.strip()]
+    artist_guids = [g.strip() for g in str(row.get("artist_guids") or "").split("/") if g.strip()]
+    artists_list = []
+    for i, name in enumerate(artist_names or ["未知艺术家"]):
+        artists_list.append({
+            "guid": artist_guids[i] if i < len(artist_guids) else f"{guid}:artist",
+            "name": name,
+            "coverId": None,
+            "createdAt": ts,
+            "updatedAt": ts,
+        })
+    album_name = str(row.get("album") or "").strip() or "未知专辑"
+    cover_guid = str(row.get("cover_guid") or "")
+    duration_ms = int(row.get("duration_ms") or 0)
+    suffix = str(row.get("suffix") or "").lstrip(".").lower()
+    fmt = suffix or "mp3"
+    size = int(row.get("size") or 0)
+    bitrate = int(row.get("bitrate") or 0)
+    sample_rate = int(row.get("sample_rate") or 0)
+    bit_depth = int(row.get("bit_depth") or 0)
+    channel = int(row.get("channel") or 0)
+    codec = str(row.get("codec") or "").strip() or fmt
+    container = str(row.get("container") or "").strip() or fmt
+    audio_spec = {
+        "path": str(row.get("path") or ""),
+        "format": fmt,
+        "codec": codec,
+        "container": container,
+        "duration": duration_ms,
+        "size": size,
+        "channel": channel or 2,
+        "sampleRate": sample_rate or 44100,
+        "bitDepth": bit_depth if bit_depth else (16 if fmt in ("wav", "flac", "aiff") else None),
+        "bitrate": bitrate or (1411000 if fmt in ("flac", "wav", "ape", "wv") else 320000),
+    }
+    audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
+    release_date = str(row.get("release_date") or "").strip()
+    year = row.get("year")
+    return {
+        "guid": guid,
+        "id": guid,
+        "title": title,
+        "name": title,
+        "artist": "/".join(a["name"] for a in artists_list),
+        "artists": artists_list,
+        "album": {
+            "guid": str(row.get("album_guid") or "") or f"{guid}:album",
+            "name": album_name,
+            "coverId": cover_guid or guid,
+            "releaseDate": release_date or None,
+            "barcode": None,
+            "createdAt": ts,
+            "updatedAt": ts,
+        },
+        "albumName": album_name,
+        "audioSpec": audio_spec,
+        "duration": duration_ms,
+        "duration_ms": duration_ms,
+        "durationMs": duration_ms,
+        "duration_s": duration_ms / 1000.0,
+        "codec": fmt,
+        "codecName": fmt,
+        "format": fmt,
+        "ext": fmt,
+        "size": size,
+        "file_size": size,
+        "coverId": cover_guid or guid,
+        "cover_url": "",
+        "source": "local",
+        "is_local": True,
+        "isFavorite": False,
+        "isCue": bool(row.get("is_cue")),
+        "hasLyric": True,
+        "genres": [],
+        "year": year,
+        "discNo": row.get("disc_no"),
+        "trackNo": row.get("track_no"),
+        "isrc": str(row.get("isrc") or ""),
+        "accessStatus": 0,
+        "recommendDimension": "library",
+        "recommendReason": "最近没有听过的本地曲目",
+    }
 
 
 def _item_title_artist(item: dict) -> tuple[str, str]:
@@ -575,7 +835,7 @@ async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
         "Content-Type": "application/json",
     }
     try:
-        resp = await http_client.post(url, json=payload, headers=headers, timeout=LLM_TIMEOUT_S)
+        resp = await http_client.post(url, json=payload, headers=headers, timeout=llm_timeout_s())
         if resp.status_code >= 400:
             logger.warning("llm http %s", resp.status_code)
             return []
@@ -874,6 +1134,75 @@ async def _search_keyword(
                 t.cancel()
 
 
+async def verify_track_playable(
+    track: dict,
+    musicdl_client: httpx.AsyncClient | None,
+    musicbox_client: httpx.AsyncClient | None,
+    lx_client: httpx.AsyncClient | None,
+) -> bool:
+    """issue #23：推荐曲目入列前的逐首可播校验（短预算，只验存在性）。
+
+    - netease：musicbox 解析直链，data.url 非空即通过（quality 用最便宜的
+      standard 档，实际播放仍走完整音质阶梯与降档）
+    - lx：lxmusic /api/v1/track/url 解析直链；服务端解析成功即已含 Range
+      探活（900s 探活缓存复用，后续正式播放反而更快）
+    - musicdl：/stream Range 首 KB 头部探活（200/206 且非文本/JSON）
+    任何源校验异常一律按"不可播"处理——推荐宁缺毋滥，播放失败自动跳歌的
+    体验远差于列表少几首。
+    """
+    guid = str(track.get("guid") or "")
+    parts = guid.split(":")
+    if len(parts) < 3 or parts[0] != "online":
+        return True  # 非在线条目（理论不会出现）不拦截
+    src = parts[1]
+    timeout = verify_timeout_s()
+    try:
+        if src == "netease":
+            if musicbox_client is None:
+                return True
+            r = await musicbox_client.get(
+                f"/api/v1/song/{parts[2]}/url",
+                params={"quality": "standard"}, timeout=timeout,
+            )
+            if r.status_code != 200:
+                return False
+            body = r.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            return bool(isinstance(data, dict) and data.get("url"))
+        if src == "lx":
+            if lx_client is None:
+                return True
+            r = await lx_client.get(
+                "/api/v1/track/url",
+                params={"id": ":".join(parts[2:]), "quality": "standard"},
+                timeout=timeout,
+            )
+            if r.status_code != 200:
+                return False
+            body = r.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            return bool(isinstance(data, dict) and data.get("url"))
+        # musicdl 聚合引擎（migu/kuwo/...）：id 可能含冒号，取第 3 段之后的整体
+        if musicdl_client is None:
+            return True
+        r = await musicdl_client.send(
+            musicdl_client.build_request(
+                "GET", "/stream",
+                params={"id": ":".join(parts[2:]), "proxy": "true"},
+                headers={"Range": "bytes=0-1023", "Accept-Encoding": "identity"},
+            ),
+            stream=True,
+        )
+        try:
+            ctype = r.headers.get("content-type", "").lower()
+            return r.status_code in (200, 206) and "text/" not in ctype and "json" not in ctype
+        finally:
+            await r.aclose()
+    except Exception as e:
+        logger.debug("verify playable failed for %s: %s", guid, e)
+        return False
+
+
 async def resolve_recommendations(
     recs: list[dict],
     musicdl_client: httpx.AsyncClient | None,
@@ -886,14 +1215,22 @@ async def resolve_recommendations(
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
     lx_sources: "list[str] | None" = None,
+    on_track=None,
+    should_stop=None,
 ) -> list[dict]:
-    """把候选歌名检索成可播放的在线 Track，跳过已收藏，凑满 limit 首。"""
+    """把候选歌名检索成可播放的在线 Track，跳过已收藏，凑满 limit 首。
+
+    issue #23：每首入列前做可播校验（verify_track_playable），失败换下一候选。
+    issue #29：on_track(track) 每入列一首即回调（供上层渐进 checkpoint 落盘，
+    超时中断不再整块丢弃已完成部分）；should_stop() 为真时停止消费后续候选。
+    """
     skip_ids = set(exclude_guids or ())
     skip_ta = set(exclude_ta or ())
+    verify = verify_playable_enabled()
     out: list[dict] = []
     seen_ids: set[str] = set()
     seen_ta: set[tuple[str, str]] = set()
-    sem = asyncio.Semaphore(RECOMMEND_SEARCH_CONCURRENCY)
+    sem = asyncio.Semaphore(search_concurrency())
 
     def _excluded(guid: str, title: str, artist: str) -> bool:
         if guid and guid in skip_ids:
@@ -905,17 +1242,18 @@ async def resolve_recommendations(
         title = rec.get("title") or ""
         artist = rec.get("artist") or ""
         keyword = " ".join(x for x in (artist, title) if x).strip() or title
+        interval = search_interval_s()
         async with sem:
-            if RECOMMEND_SEARCH_INTERVAL > 0:
-                await asyncio.sleep(RECOMMEND_SEARCH_INTERVAL)
+            if interval > 0:
+                await asyncio.sleep(interval)
             items = await _search_keyword(
                 keyword, musicdl_client, musicbox_client, netease_enabled,
                 lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             )
         if not items and artist:
             async with sem:
-                if RECOMMEND_SEARCH_INTERVAL > 0:
-                    await asyncio.sleep(RECOMMEND_SEARCH_INTERVAL)
+                if interval > 0:
+                    await asyncio.sleep(interval)
                 items = await _search_keyword(
                     artist, musicdl_client, musicbox_client, netease_enabled,
                     lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
@@ -939,6 +1277,10 @@ async def resolve_recommendations(
             tt, ta = str(track.get("title") or ptitle), str(track.get("artist") or partist)
             if _excluded(tg, tt, ta):
                 continue
+            if verify and not await verify_track_playable(
+                track, musicdl_client, musicbox_client, lx_client,
+            ):
+                continue
             if rec.get("genre") and isinstance(track.get("genres"), list) and not track["genres"]:
                 track["genres"] = [rec["genre"]]
             track["recommendDimension"] = rec.get("dimension") or ""
@@ -951,6 +1293,8 @@ async def resolve_recommendations(
     tasks = [asyncio.create_task(one(rec)) for rec in recs]
     try:
         for fut in asyncio.as_completed(tasks):
+            if should_stop and should_stop():
+                break
             try:
                 tracks = await fut
             except Exception as e:
@@ -967,6 +1311,11 @@ async def resolve_recommendations(
                 if ta != ("", ""):
                     seen_ta.add(ta)
                 out.append(track)
+                if on_track is not None:
+                    try:
+                        on_track(track)
+                    except Exception as e:
+                        logger.debug("on_track callback failed: %s", e)
                 if len(out) >= limit:
                     break
             if len(out) >= limit:
@@ -976,63 +1325,6 @@ async def resolve_recommendations(
             if not t.done():
                 t.cancel()
     return out
-
-
-_FALLBACK_POOL = [
-    ("七里香", "周杰伦"), ("海阔天空", "Beyond"), ("Shape of You", "Ed Sheeran"),
-    ("夜に駆ける", "YOASOBI"), ("Dynamite", "BTS"), ("告白气球", "周杰伦"),
-    ("后来", "刘若英"), ("平凡之路", "朴树"), ("起风了", "买辣椒也用券"),
-    ("光年之外", "邓紫棋"), ("演员", "薛之谦"), ("消愁", "毛不易"),
-    ("成都", "赵雷"), ("南山南", "马頔"), ("岁月神偷", "金玟岐"),
-    ("Lemon", "米津玄師"), ("Pretender", "Official髭男dism"),
-    ("Blinding Lights", "The Weeknd"), ("Someone Like You", "Adele"),
-    ("Bohemian Rhapsody", "Queen"), ("Numb", "Linkin Park"),
-    ("Rolling in the Deep", "Adele"), ("Bad Guy", "Billie Eilish"),
-    ("Stay", "Justin Bieber"), ("Peaches", "Justin Bieber"),
-    ("花海", "周杰伦"), ("稻香", "周杰伦"), ("江南", "林俊杰"),
-    ("曹操", "林俊杰"), ("红豆", "王菲"), ("传奇", "王菲"),
-    ("小幸运", "田馥甄"), ("修炼爱情", "林俊杰"), ("突然好想你", "五月天"),
-    ("倔强", "五月天"), ("温柔", "五月天"), ("春风十里", "鹿先森乐队"),
-    ("理想三旬", "陈鸿宇"), ("董小姐", "宋冬野"),
-]
-
-
-def fallback_queries_from_seeds(seeds: list[dict], count: int = LLM_CANDIDATE_COUNT) -> list[dict]:
-    """LLM 失败或不足 30 首时：按种子歌手 + 常见在线曲目补候选。"""
-    recs: list[dict] = []
-    seen_artist: set[str] = set()
-    seen_ta: set[tuple[str, str]] = set()
-    for s in seeds:
-        artist = str(s.get("artist") or "").split("/")[0].strip()
-        if not artist or artist.lower() in seen_artist:
-            continue
-        seen_artist.add(artist.lower())
-        recs.append({
-            "title": "",
-            "artist": artist,
-            "album": "",
-            "language": s.get("language") or "",
-            "genre": s.get("genre") or "",
-            "type": "",
-            "dimension": "artist",
-            "reason": "fallback: same artist online",
-        })
-        if len(recs) >= count:
-            return recs[:count]
-    for title, artist in _FALLBACK_POOL:
-        key = identity_key(title, artist)
-        if key in seen_ta:
-            continue
-        seen_ta.add(key)
-        recs.append({
-            "title": title,
-            "artist": artist,
-            "dimension": "language",
-            "reason": "fallback",
-        })
-        if len(recs) >= count:
-            break
-    return recs[:count]
 
 
 def stamp_playlist_tracks(tracks: list[dict], now: int | None = None) -> list[dict]:
@@ -1141,6 +1433,109 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
             logger.warning("failed to purge %s: %s", path, e)
 
 
+def invalidate_today_cache_all_users() -> int:
+    """issue #22：音源集合变化后，清掉所有用户当日 daily/hot 推荐缓存。
+
+    切换音源（网易↔洛雪等）后旧缓存里的曲目可能已不可播（音源禁用/白名单
+    变化），当日缓存必须失效，下次打开歌单按新音源重建。返回删除的文件数。
+    """
+    root = recommend_cache_dir()
+    try:
+        users = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    except OSError:
+        return 0
+    day = today_key()
+    removed = 0
+    for user in users:
+        folder = os.path.join(root, user)
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if name not in (f"daily-{day}.json", f"hot-{day}.json"):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                os.remove(path)
+                removed += 1
+                logger.info("invalidated recommend cache (source set changed): %s", path)
+            except Exception as e:
+                logger.warning("failed to invalidate %s: %s", path, e)
+    # 音源名额一并释放：音源集合变了，"当天第一个用户"需要重新竞争
+    slot = source_slot_path(day)
+    try:
+        if os.path.exists(slot):
+            os.remove(slot)
+            removed += 1
+            logger.info("released daily source slot (source set changed): %s", slot)
+    except Exception as e:
+        logger.warning("failed to release source slot: %s", e)
+    return removed
+
+
+# ---- 每日推荐"音源名额"：网易日推每天只有一份内容，只允许当天第一个用户使用 ----
+# 名额 marker 落盘（跨重启有效）：recommend_cache/_source-slot-<day>.json；
+# 进程内 asyncio.Lock 收敛并发构建下"查名额→抓取→占名额"的竞态窗口。
+_SOURCE_SLOT_LOCK = asyncio.Lock()
+
+
+def source_slot_path(day: str | None = None) -> str:
+    return os.path.join(recommend_cache_dir(), f"_source-slot-{day or today_key()}.json")
+
+
+def read_source_slot(day: str | None = None) -> dict | None:
+    path = source_slot_path(day)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and str(data.get("day") or "") == (day or today_key()):
+            return data
+    except Exception as e:
+        logger.warning("failed to read daily source slot: %s", e)
+    return None
+
+
+def source_slot_claimed(day: str | None = None) -> bool:
+    return read_source_slot(day) is not None
+
+
+def claim_source_slot(day: str | None, user_guid: str) -> bool:
+    """占用当日音源名额。已被占用返回 False（幂等，不覆盖先占者）。"""
+    day = day or today_key()
+    if source_slot_claimed(day):
+        return False
+    ok = _atomic_write_json(source_slot_path(day), {
+        "day": day,
+        "kind": "daily",
+        "claimedBy": _safe_user_name(user_guid),
+        "at": int(time.time()),
+    })
+    return ok
+
+
+def purge_stale_source_slots(keep_day: str) -> None:
+    """清掉非当日的音源名额 marker（与 purge_stale_daily_cache 同生命周期）。"""
+    root = recommend_cache_dir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith("_source-slot-") and name.endswith(".json")):
+            continue
+        if name == f"_source-slot-{keep_day}.json":
+            continue
+        path = os.path.join(root, name)
+        try:
+            os.remove(path)
+            logger.info("purged stale daily source slot %s", path)
+        except Exception as e:
+            logger.warning("failed to purge source slot %s: %s", path, e)
+
+
 # 每用户最近一次推荐歌单构建结果（仅供 /_ext/healthz 观测，非持久化）
 _LAST_DAILY_INFO: dict[str, dict] = {}
 
@@ -1153,6 +1548,7 @@ def _remember_daily_result(user_guid: str, payload: dict) -> None:
         "day": payload.get("day"),
         "status": payload.get("status"),
         "tiers": list(payload.get("tiers") or []),
+        "tierFailures": list(payload.get("tierFailures") or []),
         "trackCount": len(payload.get("tracks") or []),
     }
 
@@ -1228,6 +1624,8 @@ async def get_or_build_daily(
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
     purge_stale_daily_cache(user_guid, day)
+    if kind == "daily":
+        purge_stale_source_slots(day)
     cached = load_daily_cache(user_guid, day, kind)
     existing = list(cached.get("tracks") or []) if cached else []
     if len(existing) >= PLAYLIST_SIZE:
@@ -1273,17 +1671,30 @@ async def get_or_build_daily(
             identity_key(str(t.get("title") or ""), str(t.get("artist") or "")) for t in existing
         }
 
-    async def from_netease_daily() -> list[dict]:
+    async def from_netease_daily(on_track=None, should_stop=None) -> list[dict]:
+        # 网易每日推荐每天只有一份内容：仅当天第一个构建的用户可用（占用"音源
+        # 名额"），其余用户由 llm / local-random 生成各自不同的每日推荐。
+        # 锁内二次检查名额，抓取成功即占名额（列表已生成过一次，即便被当前
+        # 用户的排除集过滤空也不再给后来用户重复使用）。
         if not (recommend_daily and netease_enabled and musicbox_client):
             return []
-        items = await fetch_musicbox_recommend(
-            musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
-        )
+        if source_slot_claimed(day):
+            return []
+        async with _SOURCE_SLOT_LOCK:
+            if source_slot_claimed(day):
+                return []
+            items = await fetch_musicbox_recommend(
+                musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
+            )
+            if items and claim_source_slot(day, user_guid):
+                logger.info(
+                    "daily source slot claimed by %s (%d candidates)", user_guid, len(items)
+                )
         if not items:
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
-    async def from_netease_charts() -> list[dict]:
+    async def from_netease_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and netease_enabled and musicbox_client):
             return []
         items = await fetch_musicbox_recommend(
@@ -1294,7 +1705,7 @@ async def get_or_build_daily(
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
-    async def from_lx_charts() -> list[dict]:
+    async def from_lx_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and lx_enabled and lx_client):
             return []
         items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT, sources=lx_sources)
@@ -1302,12 +1713,13 @@ async def get_or_build_daily(
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
-    async def from_llm() -> list[dict]:
-        # 仅当网易音源未启用时才走大模型（采信音源原生推荐优先）
-        if llm_http is None or not llm_enabled() or netease_enabled or not recommend_daily:
+    async def from_llm(on_track=None, should_stop=None) -> list[dict]:
+        # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源
+        # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
+        if llm_http is None or not llm_enabled() or not recommend_daily:
             return []
         recs = await call_llm(
-            llm_http, build_llm_prompt(play_seeds, fav_seeds[:40], LLM_CANDIDATE_COUNT)
+            llm_http, build_llm_prompt(play_seeds, fav_seeds[:40], llm_candidate_count())
         )
         if not recs:
             return []
@@ -1315,19 +1727,25 @@ async def get_or_build_daily(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
             lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+            on_track=on_track, should_stop=should_stop,
         )
 
-    async def from_fallback() -> list[dict]:
-        recs = fallback_queries_from_seeds(play_seeds + fav_seeds, LLM_CANDIDATE_COUNT)
-        return await resolve_recommendations(
-            recs, musicdl_client, musicbox_client, netease_enabled, build_track,
-            PLAYLIST_SIZE, exclude_guids, exclude_ta,
-            lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+    async def from_local_random(on_track=None, should_stop=None) -> list[dict]:
+        # 本地曲库兜底：无需网络，只读官方库按账户播放历史随机选"最近没听过"
+        # 的本地现存曲目；音源与大模型都不可用（或不足 20 首）时保证仍有内容
+        if not recommend_daily:
+            return []
+        rows = read_local_random_tracks(
+            music_db_path(), user_guid, PLAYLIST_SIZE, exclude_guids, exclude_ta
         )
+        return [build_local_track(r) for r in rows]
 
     tracks = list(existing)
     t0 = time.monotonic()
     contributing: list[str] = []
+    # issue #29：tier 中断原因（timeout/异常）随 payload 落盘并进 healthz，
+    # 不再静默空列表；空结果时用户能在 /_ext/healthz 里看到是谁断了
+    tier_failures: list[str] = []
 
     def _save_checkpoint() -> None:
         if not tracks:
@@ -1349,44 +1767,121 @@ async def get_or_build_daily(
             "playlist": pl,
             "tracks": stamped,
             "tiers": list(contributing),
+            "tierFailures": list(tier_failures),
             "seedCount": len(play_seeds),
             "favoriteCount": len(fav_seeds),
             "builtAt": int(time.time()),
         }
         save_daily_cache(user_guid, day, cp, kind)
 
+    last_progress_cp = 0.0
+
+    def _save_checkpoint_throttled() -> None:
+        # 渐进落盘节流：至少间隔 2s，避免每首歌刷一次磁盘
+        nonlocal last_progress_cp
+        now = time.monotonic()
+        if now - last_progress_cp >= 2.0:
+            last_progress_cp = now
+            _save_checkpoint()
+
+    def _cur_keys() -> tuple[set[str], set[tuple[str, str]]]:
+        guids = {str(t.get("guid") or "") for t in tracks}
+        tas = {identity_key(str(t.get("title") or ""), str(t.get("artist") or "")) for t in tracks}
+        return guids, tas
+
     async def run_tier(name: str, tier_factory) -> None:
+        """执行单层构建。issue #29 重构：
+
+        - 渐进：llm 层逐首经 _emit 入列并节流 checkpoint，wait_for 超时
+          只中断"后续候选"，已完成部分不丢；
+        - 可见：层失败 debug→warning，原因记入 tier_failures 落盘 + healthz。
+        """
         nonlocal tracks
         if len(tracks) >= PLAYLIST_SIZE:
             return
-        remaining = BUILD_BUDGET_S - (time.monotonic() - t0)
+        budget = build_budget_s()
+        remaining = budget - (time.monotonic() - t0)
         if remaining <= 0:
+            tier_failures.append(f"{name}:no-budget")
+            logger.warning("daily recommend tier %s skipped: no budget left (budget=%.1fs)", name, budget)
             return
+        # 本层截止时间：保护预算扩展的是这一层的可用时间，should_stop 也必须对齐它，
+        # 否则 fallback 层一启动就因"全局预算已耗尽"立即自停（保护预算形同虚设）
+        tier_deadline = time.monotonic() + remaining
+        added = 0
+
+        def _emit(track: dict) -> None:
+            nonlocal added
+            if len(tracks) >= PLAYLIST_SIZE:
+                return
+            cur_guids, cur_ta = _cur_keys()
+            tg = str(track.get("guid") or "")
+            tta = identity_key(str(track.get("title") or ""), str(track.get("artist") or ""))
+            if tg and tg in cur_guids:
+                return
+            if tta != ("", "") and tta in cur_ta:
+                return
+            tracks.append(track)
+            added += 1
+            if name not in contributing:
+                contributing.append(name)
+            _save_checkpoint_throttled()
+
+        def _should_stop() -> bool:
+            return len(tracks) >= PLAYLIST_SIZE or time.monotonic() >= tier_deadline
+
         try:
-            chunk = await asyncio.wait_for(tier_factory(), timeout=remaining)
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.debug("daily recommend tier %s failed: %s", name, e)
+            chunk = await asyncio.wait_for(
+                tier_factory(on_track=_emit, should_stop=_should_stop),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            tier_failures.append(f"{name}:timeout")
+            logger.warning(
+                "daily recommend tier %s timeout (remaining=%.1fs, 已渐进入列 %d 首)", name, remaining, added,
+            )
+            if added:
+                _save_checkpoint()
+            return
+        except Exception as e:
+            tier_failures.append(f"{name}:{type(e).__name__}")
+            logger.warning("daily recommend tier %s failed (已渐进入列 %d 首): %s", name, added, e)
+            if added:
+                _save_checkpoint()
             return
         if chunk:
             before = len(tracks)
             tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
             if len(tracks) > before:
-                contributing.append(name)
+                if name not in contributing:
+                    contributing.append(name)
                 _save_checkpoint()
 
-    # 每日推荐链：网易真每日推荐 -> LLM（仅网易未启用）-> 种子关键词兜底；
+    # 每日推荐链（按账户隔离）：网易真每日推荐（每天仅第一个用户，占用音源名额）
+    # -> LLM（配置即用，种子按用户）-> 本地曲库随机兜底（最近没听过优先）；
     # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。
     # FNMUSIC_RECOMMEND_DAILY / FNMUSIC_RECOMMEND_HOT 分别门控两条链的构建。
     if kind == "hot":
         await run_tier("netease-charts", from_netease_charts)
         await run_tier("lx-charts", from_lx_charts)
-    else:
-        if recommend_daily:
+    elif recommend_daily:
+        if not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
-        if not netease_enabled and recommend_daily:
-            await run_tier("llm", from_llm)
-        if recommend_daily:
-            await run_tier("fallback", from_fallback)
+        await run_tier("llm", from_llm)
+        if len(tracks) < PLAYLIST_SIZE:
+            # local-random 兜底：纯本地只读查询（毫秒级、无网络开销），不占构建
+            # 总预算——上层超时/全挂也保证歌单有内容（延续"每日推荐永不为空"）
+            try:
+                chunk = await from_local_random()
+                if chunk:
+                    before = len(tracks)
+                    tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
+                    if len(tracks) > before:
+                        contributing.append("local-random")
+                        _save_checkpoint()
+            except Exception as e:
+                tier_failures.append(f"local-random:{type(e).__name__}")
+                logger.warning("daily recommend tier local-random failed: %s", e)
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
     picked = pick_playlist_cover_track(tracks)
@@ -1405,6 +1900,7 @@ async def get_or_build_daily(
         "playlist": playlist,
         "tracks": tracks,
         "tiers": contributing,
+        "tierFailures": list(tier_failures),
         "seedCount": len(play_seeds),
         "favoriteCount": len(fav_seeds),
         "builtAt": int(time.time()),

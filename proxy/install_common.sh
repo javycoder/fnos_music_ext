@@ -197,22 +197,37 @@ takeover() {
 wait_http() {
     local url="$1" tries="${2:-60}" delay="${3:-2}"
     # timeout bounds the whole loop, including slow responses, not only sleeps.
+    # 心跳（issue #24）：fpk 安装 55% 阶段长时间无输出让用户以为卡死——等待环
+    # 每 30s 打一行已等秒数（随外层 tee 进 fnmusic-app.log / 安装弹窗日志）
     timeout --foreground "$((tries * delay))s" /bin/bash -c '
+        start=$(date +%s)
         while ! curl --fail --silent --max-time 4 "$1" >/dev/null 2>&1; do
             sleep "$2"
+            now=$(date +%s)
+            if (( now - start >= 30 && (now - start) % 30 < $2 )); then
+                echo "[INFO] 仍在等待服务就绪 ${3}（已等 $((now - start))s，属首次安装拉起慢的正常现象）..."
+            fi
         done
-    ' wait-http "${url}" "${delay}"
+    ' wait-http "${url}" "${delay}" "${url}"
 }
 
 reclaim_container() {
     # Compose can reconcile its own containers without destructive rm -f.
-    local name="$1" owner=""
+    # When --adopt is passed (explicit migration), remove the foreign container
+    # so the current checkout's Compose can recreate it cleanly.
+    local name="$1" owner="" adopt=0
+    case " ${*} " in *' --adopt '*) adopt=1 ;; esac
     if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
         return 0
     fi
     owner="$(run_docker container inspect "${name}" \
         --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
     if ! same_dir "${owner}" "${BASE_DIR}"; then
+        if [ "${adopt}" -eq 1 ]; then
+            log_warn "容器 ${name} 属于原目录 ${owner:-未知}，按 --adopt 移除并由当前目录接管。"
+            run_docker rm -f "${name}" >/dev/null 2>&1 || true
+            return 0
+        fi
         log_err "容器 ${name} 不属于当前目录；保留并拒绝接管。请先解决名称/端口冲突。"
         return 1
     fi
@@ -223,8 +238,31 @@ remove_owned_container() {
     if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
         return 0
     fi
-    reclaim_container "${name}" || return 1
+    reclaim_container "$@" || return 1
     run_docker rm -f "${name}"
+}
+
+env_newer_than_container() {
+    # .env 比容器启动新（安装/切源/升级恢复改了开关）且镜像未变时，compose 不会
+    # 重建容器：需要显式重启让 entrypoint 重读 .env 重选进程集。
+    local started epoch_start epoch_env
+    started="$(run_docker inspect -f '{{.State.StartedAt}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
+    epoch_start="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
+    epoch_env="$(stat -c %Y "${BASE_DIR}/.env" 2>/dev/null)" || return 1
+    [ "${epoch_env}" -gt "${epoch_start}" ]
+}
+
+diagnose_sources_container() {
+    # healthz 超时取证：supervisor 进程状态 + 容器日志尾部随安装日志落盘，
+    # 让「进程集与 .env 不一致 / 程序启动失败」一眼可辨（issue 反馈可直接贴）。
+    local name="$1" line
+    log_warn "采集 ${name} 诊断信息（supervisorctl status / 容器日志尾部）..."
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "  [supervisor] ${line}"
+    done < <(run_docker exec "${name}" supervisorctl -c /etc/supervisor/supervisord.conf status 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "  [container-log] ${line}"
+    done < <(run_docker logs --tail 40 "${name}" 2>&1 || true)
 }
 
 owned_source_unit() {
@@ -238,7 +276,15 @@ stop_owned_source_unit() {
     if owned_source_unit "${unit}"; then
         sudo systemctl disable --now "${unit}.service"
     elif systemctl is-active --quiet "${unit}.service"; then
-        log_err "宿主机 unit ${unit} 不属于当前目录；保留。"
-        return 1
+        case " ${*} " in
+            *' --adopt '*)
+                log_warn "宿主机 unit ${unit} 属于其他目录，按 --adopt 停止并禁用。"
+                sudo systemctl disable --now "${unit}.service"
+                ;;
+            *)
+                log_err "宿主机 unit ${unit} 不属于当前目录；保留。"
+                return 1
+                ;;
+        esac
     fi
 }

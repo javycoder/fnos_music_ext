@@ -278,11 +278,12 @@ def test_retire_reports_unidentifiable_holder(tmp_path):
 
 # ------------------------------------------------ shell: container ownership ---
 
-def _docker_stub(bindir, owner):
+def _docker_stub(bindir, owner, log_file=None):
     """A fake docker whose `container inspect` reports the given compose owner."""
     stub = bindir / 'docker'
+    log_clause = f'echo "$*" >> {shlex.quote(str(log_file))}\n' if log_file else ''
     stub.write_text(f'''#!/usr/bin/env bash
-if [ "$1" = "container" ] && [ "$2" = "inspect" ] && [ "$4" = "--format" ]; then
+{log_clause}if [ "$1" = "container" ] && [ "$2" = "inspect" ] && [ "$4" = "--format" ]; then
     echo {shlex.quote(str(owner))}
     exit 0
 fi
@@ -302,6 +303,19 @@ def test_reclaim_container_rejects_foreign_owner(tmp_path):
                          checkout, extra_env={'PATH': f'{stub_dir}:{os.environ["PATH"]}'})
     assert 'rc=1' in out, out
     assert '不属于当前目录' in out
+
+
+def test_reclaim_container_with_adopt_removes_foreign_container(tmp_path):
+    checkout = tmp_path / 'checkout'
+    checkout.mkdir()
+    stub_dir = tmp_path / 'bin'
+    stub_dir.mkdir()
+    docker_log = tmp_path / 'docker.log'
+    _docker_stub(stub_dir, tmp_path / 'other-checkout', log_file=docker_log)
+    rc, out = _run_shell('reclaim_container fnmusic-musicdl --adopt; echo rc=$?',
+                         checkout, extra_env={'PATH': f'{stub_dir}:{os.environ["PATH"]}'})
+    assert 'rc=0' in out, out
+    assert 'rm -f fnmusic-musicdl' in docker_log.read_text(encoding='utf-8')
 
 
 def test_reclaim_container_accepts_own_checkout(tmp_path):

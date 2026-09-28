@@ -2200,3 +2200,49 @@ def test_forward_to_upstream_keeps_content_length():
         assert r206.headers.get("content-length") == "2"
         assert r206.headers.get("content-range") == "bytes 0-1/10"
         assert r206.content == b"ab"
+
+
+def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
+    """issue #28：流式上下文元数据缺失时，从在线历史/收藏快照回查命名，
+    绝不以 unknown (n) 形态进曲库。"""
+    import json
+
+    from proxy import recommend as dailyrec
+    from proxy.app import _tee_finalize, _lookup_online_snapshot
+
+    tee_dir = str(tmp_path / "library")
+    os.makedirs(tee_dir, exist_ok=True)
+    monkeypatch.setitem(CONF, "tee_save_dir", tee_dir)
+    monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setitem(
+        CONF, "fav_dir", str(tmp_path / "online_favorites"),
+    )
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "play_history"))
+
+    guid = "online:kuwo:228908"
+    # 首播已上报 track_play：历史快照带完整元数据
+    dailyrec.record_online_play("user-1", guid, {
+        "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+    })
+    assert _lookup_online_snapshot(guid)["title"] == "晴天"
+
+    # tee 落盘时 info 解析失败（空 dict）——文件名仍应来自历史快照
+    part = os.path.join(tee_dir, "cache_safe_guid.abc.part")
+    with open(part, "wb") as f:
+        f.write(b"RIFF....FAKE_AUDIO" * 64)
+    _tee_finalize(part, guid, "mp3", None, tee_enabled=True)
+    files = os.listdir(tee_dir)
+    assert files == ["周杰伦 - 晴天.mp3"], f"应以快照元数据命名，实际: {files}"
+
+    # 收藏快照同样可兜底：无历史但收藏里有元数据
+    guid2 = "online:migu:9"
+    with open(os.path.join(CONF["fav_dir"], "user-1.json"), "w", encoding="utf-8") as f:
+        json.dump({"items": [{
+            "guid": guid2, "addedAt": 1,
+            "track": {"title": "七里香", "artist": "周杰伦", "album": "七里香"},
+        }]}, f)
+    part2 = os.path.join(tee_dir, "cache_safe_guid2.abc.part")
+    with open(part2, "wb") as f:
+        f.write(b"RIFF....FAKE_AUDIO2" * 64)
+    _tee_finalize(part2, guid2, "mp3", {}, tee_enabled=True)
+    assert "周杰伦 - 七里香.mp3" in os.listdir(tee_dir)

@@ -141,10 +141,16 @@ sudo systemctl daemon-reload 2>/dev/null || true
 #    保证本脚本能还原「旧版已安装的机器」（升级 git 到 v2 后直接执行本脚本）。
 log_info "停止并移除音源容器与宿主机 unit（v1.x 三容器与 v2 单容器）..."
 for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic fnmusic-sources; do
-    remove_owned_container "${unit}"
-    if owned_source_unit "${unit}"; then
-        stop_owned_source_unit "${unit}"
+    if [ "${ADOPT:-0}" -eq 1 ]; then
+        remove_owned_container "${unit}" --adopt
+        stop_owned_source_unit "${unit}" --adopt
         sudo rm -f "/etc/systemd/system/${unit}.service"
+    else
+        remove_owned_container "${unit}"
+        if owned_source_unit "${unit}"; then
+            stop_owned_source_unit "${unit}"
+            sudo rm -f "/etc/systemd/system/${unit}.service"
+        fi
     fi
 done
 # 如实校验清理结果：容器可能被其他副本/并发任务重建，绝不静默假成功

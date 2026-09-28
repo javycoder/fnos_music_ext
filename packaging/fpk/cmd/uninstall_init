@@ -15,12 +15,14 @@ if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/restore.sh" ]; then
         # 尽力恢复；若官方音乐异常，重装本扩展后再卸载一次即可修复。
         # FNMUSIC_UNIT_FILE 仅供测试注入；生产路径固定为 /etc/systemd/system。
         FNMUSIC_UNIT_FILE="${FNMUSIC_UNIT_FILE:-/etc/systemd/system/fnmusic-ext.service}"
+        FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
         echo "[fnmusic-ext] 常规还原失败，降级为强制清理继续卸载" >> "${FNMUSIC_LOG}" 2>&1
         systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
         systemctl disable fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
         rm -f "${FNMUSIC_UNIT_FILE}"
         systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
         docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+        rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
     fi
 fi
 
@@ -37,17 +39,21 @@ fi
 ITEMS="$(fnmusic_data_items)"
 [ -n "${ITEMS}" ] || exit 0
 
-# target symlink looks like /vol{n}/@appcenter/fnmusic-ext
+# target symlink looks like /vol{n}/@appcenter/fnmusic-ext；解析失败时依次从
+# repo 路径推导（同为 /vol{n}/@appcenter/... 形态），仍失败才落到固定卷根。
+# 缺斜杠会变成 /vol1fnmusic-ext-backup-… 写到文件系统根上。
 VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
-# 解析失败时落到存储卷根目录。缺斜杠会变成 /vol1fnmusic-ext-backup-… 写到文件系统根上。
+[ -n "${VOL}" ] || VOL="$(readlink -f "${FNMUSIC_REPO_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
 VOL="${VOL:-/vol1/}"
 case "${VOL}" in
     */) ;;
     *) VOL="${VOL}/" ;;
 esac
 ARCHIVE="${VOL}fnmusic-ext-backup-$(date +%Y%m%d%H%M%S).tar.gz"
+# --ignore-failed-read：播放历史等文件在归档读取中途消失（服务残余进程仍在写）
+# 不再中止卸载，缺失项仅记录 warning。
 # shellcheck disable=SC2086
-if ! tar -czf "${ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
+if ! tar --ignore-failed-read -czf "${ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
     fnmusic_fail "备份数据到 ${ARCHIVE} 失败，已中止卸载（可重试或手动备份）"
 fi
 echo "[fnmusic-ext] 卸载前已备份配置与数据到 ${ARCHIVE}" >> "${FNMUSIC_LOG}"

@@ -63,14 +63,15 @@ def run(coro):
 # ------------------------------------------------------------ 合成负载：kg ---
 
 def _kg_payload() -> dict:
+    # duration 单位为秒（v3 搜索接口实测：晴天=269 即 4:29）
     return {"data": {"info": [
         {"hash": "h1", "songname": "晴天", "singername": "周杰伦", "album_name": "叶惠美",
          "album_id": 966846,
-         "duration": 269000, "pay_type": 0, "sqhash": "sq1", "hqhash": "hq1",
+         "duration": 269, "pay_type": 0, "sqhash": "sq1", "hqhash": "hq1",
          "sq_size": 27000000, "filesize": 4300000,
          "origin_cover": "http://img/x{size}.jpg", "mixsongid": 77},
         {"hash": "h2", "songname": "付费曲", "singername": "歌手乙", "album_name": "B",
-         "duration": 200000, "pay_type": 1, "filesize": 3000000},
+         "duration": 200, "pay_type": 1, "filesize": 3000000},
         {"hash": "h3", "songname": "试听片段版", "singername": "x", "is_free_part": 1},
         {"songname": "没有hash", "singername": "x"},
         {"hash": "h5", "songname": "VIP拦截曲", "singername": "x", "fail_process": 4},

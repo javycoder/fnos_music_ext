@@ -1074,18 +1074,55 @@ cleanup_legacy_sources() {
     # 旧 v1.x 部署形态清理：宿主机三 unit + 三容器（单容器接管端口 8768/8770/8772）
     local unit
     for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-        stop_owned_source_unit "${unit}"
-        remove_owned_container "${unit}"
+        if [ "${ADOPT:-0}" -eq 1 ]; then
+            stop_owned_source_unit "${unit}" --adopt
+            remove_owned_container "${unit}" --adopt
+        else
+            stop_owned_source_unit "${unit}"
+            remove_owned_container "${unit}"
+        fi
     done
+}
+
+# 所选音源/WebUI 的 healthz 是否已全部就绪（单次探测不重试：仅用于判断是否需要
+# 重启容器对齐进程集，真正的就绪等待交给随后的 wait_http）。
+sources_quick_ready() {
+    local url urls=""
+    [ "${ENABLE_MUSICBOX}" -eq 1 ] && urls="${urls} http://127.0.0.1:8770/healthz"
+    [ "${ENABLE_MUSICDL}" -eq 1 ] && urls="${urls} http://127.0.0.1:8768/healthz"
+    [ "${ENABLE_LX}" -eq 1 ] && urls="${urls} http://127.0.0.1:8772/healthz"
+    [ "${WEBUI_FLAG}" = "true" ] && urls="${urls} http://127.0.0.1:8774/healthz"
+    # shellcheck disable=SC2086
+    for url in ${urls}; do
+        curl --fail --silent --max-time 3 "${url}" >/dev/null 2>&1 || return 1
+    done
+    return 0
 }
 
 install_sources_container() {
     log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
-    reclaim_container "${CONTAINER_NAME}" || return 1
+    if [ "${ADOPT:-0}" -eq 1 ]; then
+        reclaim_container "${CONTAINER_NAME}" --adopt || return 1
+    else
+        reclaim_container "${CONTAINER_NAME}" || return 1
+    fi
+    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
+    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
     if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
+        log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
+        log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
         return 1
+    fi
+    # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的
+    # 运行中容器不会重启（切源/升级恢复 .env 后输出仍是 "Container ... Running"）：
+    # 所选音源与旧进程集不一致时，下方 healthz 必然等满超时，先重启对齐再等待。
+    # 同参数幂等重跑（所选服务全部已健康）不重启，保持快速路径；restart 亦会重新
+    # 解析 bind mount，治愈 target 回滚重建目录后容器挂旧 inode 的现场。
+    if env_newer_than_container && ! sources_quick_ready; then
+        log_info "检测到 .env 更新且所选音源未运行，重启容器使音源开关生效..."
+        run_docker restart "${CONTAINER_NAME}" || return 1
     fi
     # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）
     local waited=0
@@ -1095,6 +1132,7 @@ install_sources_container() {
             log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
         else
             log_err "等待 musicbox healthz 超时"
+            diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
     fi
@@ -1104,6 +1142,7 @@ install_sources_container() {
             log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
         else
             log_err "等待 musicdl healthz 超时"
+            diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
     fi
@@ -1113,6 +1152,7 @@ install_sources_container() {
             log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
         else
             log_err "等待 lxmusic healthz 超时"
+            diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
     fi
@@ -1121,6 +1161,7 @@ install_sources_container() {
             log_info "WebUI 已就绪 http://127.0.0.1:8774/healthz"
         else
             log_err "等待 WebUI healthz 超时"
+            diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
     fi

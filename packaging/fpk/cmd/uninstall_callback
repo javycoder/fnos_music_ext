@@ -10,5 +10,7 @@ rm -f /etc/systemd/system/fnmusic-ext.service
 systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
 
 docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
+rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
 
 exit 0

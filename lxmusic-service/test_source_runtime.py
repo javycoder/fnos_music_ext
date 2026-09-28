@@ -98,6 +98,11 @@ def test_build_music_info_platform_keys():
     assert kw["rid"] == "228908"
     wy = sr.build_music_info({"_identifier": "186016", "song_id": "186016"}, "wy")
     assert wy["songId"] == "186016"
+    mg = sr.build_music_info(
+        {"_identifier": "600929", "copyright_id": "600929", "album_id": "11094"}, "mg",
+    )
+    assert mg["copyrightId"] == "600929"  # 主流洛雪源 mg 解构 copyrightId
+    assert mg["albumId"] == "11094"
     tx = sr.build_music_info(
         {"_identifier": "MID", "songmid": "MID", "str_media_mid": "MEDIA", "album_id": "8220"},
         "tx",
@@ -798,3 +803,65 @@ def test_bridge_end_to_end_with_stub_script(tmp_path):
             await rt.stop()
 
     asyncio.run(run())
+
+
+# ------------------------------------------------------------------ 孤儿 bridge 清扫（issue #29）
+
+
+def _write_fake_proc(root, pid, cmdline_args, ppid, extra_pids):
+    """构造最小 /proc 伪条目：cmdline（NUL 分隔）+ stat（ppid 在右括号后第 1 字段）。"""
+    proc = root / str(pid)
+    proc.mkdir(parents=True)
+    (proc / "cmdline").write_bytes(
+        b"\0".join(a.encode() for a in cmdline_args) + b"\0"
+    )
+    (proc / "stat").write_text(f"{pid} (node) S {ppid} ...")
+    for extra in extra_pids:
+        (root / str(extra)).mkdir(parents=True, exist_ok=True)
+
+
+def test_reap_orphan_bridges_kills_only_path_matched_orphans(tmp_path, monkeypatch):
+    """只清：引用本服务 bridge.js 路径且父进程已死的进程；父在/自子/异路径一律不动。"""
+    import os as _os
+
+    bridge = tmp_path / "srv" / "js" / "bridge.js"
+    bridge.parent.mkdir(parents=True)
+    bridge.write_text("//bridge", encoding="utf-8")
+    other = tmp_path / "other" / "bridge.js"
+    other.parent.mkdir(parents=True)
+    other.write_text("//other", encoding="utf-8")
+
+    proc = tmp_path / "proc"
+    # 孤儿：引用目标路径且父进程不存在（pid 9999 不在 proc 里）→ 杀
+    _write_fake_proc(proc, 100, ["node", str(bridge), "{}"], 9999, extra_pids=[])
+    # 父进程尚在（pid 500 存在）→ 保守跳过
+    _write_fake_proc(proc, 101, ["node", str(bridge), "{}"], 500, extra_pids=[500])
+    # 托孤（ppid=1）→ 杀
+    _write_fake_proc(proc, 102, ["node", str(bridge), "{}"], 1, extra_pids=[])
+    # 引用其他部署路径 → 不动
+    _write_fake_proc(proc, 103, ["node", str(other), "{}"], 1, extra_pids=[])
+    # 非进程目录（数字外的名字）与非法 stat → 忽略不抛
+    (proc / "self").mkdir()
+    _write_fake_proc(proc, 104, ["node", str(bridge), "{}"], "x", extra_pids=[])
+
+    killed = []
+    monkeypatch.setattr(_os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(sr.os, "getpid", lambda: 4242)
+
+    result = sr.reap_orphan_bridges(bridge_path=bridge, proc_root=proc)
+    # /proc 目录迭代顺序随文件系统不同（CI runner 与本地不一致），杀掉的集合才是契约
+    assert sorted(result) == [100, 102]
+    assert sorted(killed) == [(100, 15), (102, 15)]
+
+
+def test_reap_orphan_bridges_skips_own_children(tmp_path, monkeypatch):
+    """ppid 指向本进程的孩子归 UserSource 生命周期管，绝不清扫。"""
+    import os as _os
+
+    bridge = tmp_path / "bridge.js"
+    bridge.write_text("//b", encoding="utf-8")
+    proc = tmp_path / "proc"
+    _write_fake_proc(proc, 200, ["node", str(bridge)], 777, extra_pids=[])
+    monkeypatch.setattr(_os, "kill", lambda pid, sig: (_ for _ in ()).throw(AssertionError("must not kill")))
+    monkeypatch.setattr(sr.os, "getpid", lambda: 777)
+    assert sr.reap_orphan_bridges(bridge_path=bridge, proc_root=proc) == []

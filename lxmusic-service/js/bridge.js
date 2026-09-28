@@ -154,6 +154,19 @@ async function httpFetch(url, options) {
         redirect: 'manual',
         signal: controller.signal,
       });
+    } catch (e) {
+      // undici 把底层网络失败包装成 "fetch failed"，真实原因（DNS 不存在/IP 不可达/
+      // 连接被拒/超时中断）藏在 e.cause。透传脚本会原样抛出，不带 cause 时
+      // 宿主与用户无法区分"源服务端已失效"与脚本自身逻辑错误
+      const cause = e && e.cause;
+      const causeBits = [];
+      if (cause && cause.code) causeBits.push(cause.code);
+      if (cause && cause.host) causeBits.push(cause.host);
+      const enriched = new Error(
+        String((e && e.message) || e) + (causeBits.length ? ` (${causeBits.join(' ')})` : ''),
+      );
+      if (e && e.name === 'AbortError') enriched.message = `request timeout after ${timeoutMs}ms (${current})`;
+      throw enriched;
     } finally {
       clearTimeout(timer);
     }
@@ -313,19 +326,87 @@ lx.currentScriptInfo = {
   rawScript,
 };
 
-// 脚本注册的 interval 不能阻止宿主进程退出（rl close 时统一 process.exit）
-const sandboxSetInterval = (...args) => {
-  const timer = setInterval(...args);
+// 脚本注册的 interval 不能阻止宿主进程退出（rl close 时统一 process.exit）。
+// 常驻 Node 进程里野生脚本的短周期定时器会持续空烧 CPU（issue #29 实测空闲 ~50%），
+// 故对脚本侧 interval 做治理：周期下限钳制 + 活跃数量上限，过频/超限打 WARN。
+const INTERVAL_MIN_MS = 500;      // 脚本 interval 周期下限（低于则提到该值）
+const INTERVAL_MAX_ACTIVE = 32;   // 同时存活的脚本 interval 数量上限
+const liveIntervals = new Set();
+let intervalClampWarned = 0;
+
+const sandboxSetInterval = (fn, delay, ...rest) => {
+  const rawDelay = typeof delay === 'number' && Number.isFinite(delay) ? delay : 1;
+  if (rawDelay < INTERVAL_MIN_MS && intervalClampWarned < 3) {
+    intervalClampWarned += 1;
+    logEvent('warn', [
+      `[bridge] 脚本 interval 周期 ${rawDelay}ms 低于 ${INTERVAL_MIN_MS}ms，已钳制（防常驻进程空烧 CPU，issue #29）`,
+    ]);
+  }
+  const delayMs = Math.max(INTERVAL_MIN_MS, Math.min(rawDelay, 2147483647));
+  if (liveIntervals.size >= INTERVAL_MAX_ACTIVE) {
+    logEvent('warn', [`[bridge] 脚本存活 interval 已达上限 ${INTERVAL_MAX_ACTIVE}，拒绝新增（疑似失控脚本）`]);
+    // 返回哑定时器（unref + 永不触发回调），保证脚本 clearInterval(句柄) 不抛错
+    const dummy = setInterval(() => {}, 3600000);
+    if (dummy && typeof dummy.unref === 'function') dummy.unref();
+    return dummy;
+  }
+  const timer = setInterval(fn, delayMs, ...rest);
+  liveIntervals.add(timer);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  return timer;
+};
+
+const sandboxClearInterval = (timer) => {
+  if (timer) liveIntervals.delete(timer);
+  return clearInterval(timer);
+};
+
+// setTimeout 治理（issue #29 补充）：递归 setTimeout 链是野生脚本空烧 CPU 的另一
+// 常见形态——自替换句柄让"存活数量"恒为 1，数量上限拦不住，只能按"触发频率"治理：
+// 滑动窗口内触发过频（默认 10s 内 ≥200 次，即平均 >20/s）判定为失控，此后短周期
+// （<500ms）的 setTimeout 钳制到 500ms，窗口排空后自动恢复。一次性/低频定时器
+// （含 setTimeout(0) 让步写法）不受影响；最坏情形是每 10s 窗口内一段 ~200ms 的
+// 1ms 连发，CPU 占比可忽略。阈值可用环境变量覆盖（演练/排查用）。
+const TIMEOUT_FLOOD_WINDOW_MS = Math.max(1000, Number(process.env.LX_TIMEOUT_FLOOD_WINDOW_MS) || 10000);
+const TIMEOUT_FLOOD_MAX_FIRES = Math.max(10, Number(process.env.LX_TIMEOUT_FLOOD_MAX_FIRES) || 200);
+const TIMEOUT_FLOOD_CLAMP_MS = Math.max(50, Number(process.env.LX_TIMEOUT_FLOOD_CLAMP_MS) || 500);
+const timeoutFireTimes = [];
+let timeoutFloodWarned = 0;
+
+function timeoutFloodActive() {
+  const cutoff = Date.now() - TIMEOUT_FLOOD_WINDOW_MS;
+  while (timeoutFireTimes.length && timeoutFireTimes[0] <= cutoff) timeoutFireTimes.shift();
+  return timeoutFireTimes.length >= TIMEOUT_FLOOD_MAX_FIRES;
+}
+
+const sandboxSetTimeout = (fn, delay, ...rest) => {
+  const rawDelay = typeof delay === 'number' && Number.isFinite(delay) ? delay : 0;
+  let delayMs = rawDelay;
+  if (delayMs < TIMEOUT_FLOOD_CLAMP_MS && delayMs >= 0 && timeoutFloodActive()) {
+    delayMs = TIMEOUT_FLOOD_CLAMP_MS;
+    if (timeoutFloodWarned < 3) {
+      timeoutFloodWarned += 1;
+      logEvent('warn', [
+        `[bridge] 脚本 setTimeout 触发过频（${TIMEOUT_FLOOD_WINDOW_MS}ms 窗口内 ${timeoutFireTimes.length} 次），` +
+        `短周期定时器已钳制到 ${TIMEOUT_FLOOD_CLAMP_MS}ms（防递归链空烧 CPU，issue #29）`,
+      ]);
+    }
+  }
+  const timer = setTimeout(() => {
+    timeoutFireTimes.push(Date.now());
+    timeoutFloodActive(); // 顺带排空过期窗口，保持判定随时间自愈
+    return fn(...rest);
+  }, Math.min(delayMs, 2147483647));
   if (timer && typeof timer.unref === 'function') timer.unref();
   return timer;
 };
 
 const sandbox = {
   lx,
-  setTimeout,
+  setTimeout: sandboxSetTimeout,
   clearTimeout,
   setInterval: sandboxSetInterval,
-  clearInterval,
+  clearInterval: sandboxClearInterval,
   console: sandboxConsole,
   URL,
   URLSearchParams,

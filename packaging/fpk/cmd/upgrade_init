@@ -24,6 +24,17 @@ if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_UNIT_FILE}" ]; then
     fi
 fi
 
+# 迁卷/换目录容器自愈：如果存在 fnmusic-sources 容器且归属于旧卷/其他目录，提前清理
+if command -v docker >/dev/null 2>&1 && docker container inspect fnmusic-sources >/dev/null 2>&1; then
+    cnt_wd="$(docker container inspect fnmusic-sources --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    cnt_wd_real="$(readlink -f -- "${cnt_wd}" 2>/dev/null || true)"
+    repo_real="$(readlink -f -- "${FNMUSIC_REPO_DIR}" 2>/dev/null || true)"
+    if [ -n "${cnt_wd_real}" ] && [ "${cnt_wd_real}" != "${repo_real}" ]; then
+        docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+        echo "[fnmusic-ext] 已清理属于旧目录 ${cnt_wd} 的 fnmusic-sources 容器（升级流程会重建）" >> "${FNMUSIC_LOG}" 2>&1
+    fi
+fi
+
 if [ -z "${FNMUSIC_REPO_DIR}" ]; then
     exit 0
 fi
@@ -34,8 +45,10 @@ mkdir -p "${BACKUP_DIR}"
 
 ITEMS="$(fnmusic_data_items)"
 if [ -n "${ITEMS}" ]; then
+    # --ignore-failed-read：播放历史/缓存文件在打包读取中途消失（服务仍在写）时
+    # 不再让整个升级中止，缺失项仅记录 warning。
     # shellcheck disable=SC2086
-    if ! tar -czf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
+    if ! tar --ignore-failed-read -czf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
         rm -rf "${BACKUP_DIR}"
         fnmusic_fail "升级前备份数据失败，已中止（未改动任何数据）"
     fi

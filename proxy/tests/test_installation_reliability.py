@@ -669,10 +669,11 @@ def test_extend_healthy_path_still_syncs_image_and_env(tmp_path):
     """升级语义：服务全健康时也要 compose up -d --build 同步新代码（git pull 后生效）；
     镜像未变且 .env 比容器启动新时才显式重启容器让 entrypoint 重读开关。"""
     extend = (BASE/'extend.sh').read_text(encoding='utf-8')
+    common = (BASE/'proxy'/'install_common.sh').read_text(encoding='utf-8')
     start = extend.index('if [ "${need_start}" -eq 0 ]; then')
     end = extend.index('\nfi', extend.index('run_docker restart "${CONTAINER_NAME}"', start)) + 3
     block = extend[start:end]
-    funcs = function(extend, 'ensure_image_current') + function(extend, 'env_newer_than_container')
+    funcs = function(extend, 'ensure_image_current') + function(common, 'env_newer_than_container')
     env_file = tmp_path/'.env'
     env_file.write_text('FNMUSIC_NETEASE_ENABLED=true\n', encoding='utf-8')
     log = tmp_path/'docker.log'
@@ -714,6 +715,80 @@ reclaim_container() { return 0; }
     out = run_case('2000-01-01T00:00:00Z')
     assert 'up -d --build' in out
     assert 'restart fnmusic-sources' in out
+
+
+def test_install_aligns_container_process_set_before_healthz(tmp_path):
+    """升级/切源场景：compose 对镜像与配置均未变的运行中容器不重启，而 entrypoint
+    只在容器启动时读一次 .env——install.sh 必须在等待 healthz 之前对齐进程集：
+    .env 更新且所选音源未运行时显式 restart；全部已就绪（同参数幂等重跑）或
+    容器比 .env 新（全新安装）时不重启，保持快速路径。"""
+    install = (BASE/'install.sh').read_text(encoding='utf-8')
+    common = (BASE/'proxy'/'install_common.sh').read_text(encoding='utf-8')
+    funcs = (function(install, 'sources_quick_ready')
+             + function(common, 'env_newer_than_container'))
+    start = install.index('if env_newer_than_container && ! sources_quick_ready; then')
+    end = install.index('\n    fi', start) + len('\n    fi')
+    block = install[start:end]
+    env_file = tmp_path/'.env'
+    env_file.write_text('FNMUSIC_MUSICDL_ENABLED=true\n', encoding='utf-8')
+    log = tmp_path/'docker.log'
+
+    stub_tpl = """set -uo pipefail
+log_info() { printf 'info %s\\n' "$*"; }
+log_warn() { printf 'warn %s\\n' "$*"; }
+log_err() { printf 'err %s\\n' "$*"; }
+ENABLE_MUSICBOX=0
+ENABLE_MUSICDL=1
+ENABLE_LX=0
+WEBUI_FLAG=true
+CONTAINER_NAME=fnmusic-sources
+BASE_DIR=__BASE__
+STARTED_AT='__STARTED__'
+HEALTHZ_RC=__HEALTHZ__
+DOCKER_LOG=__LOG__
+run_docker() {
+  printf '%s\\n' "$*" >> "${DOCKER_LOG}"
+  case "$1" in
+    inspect) printf '%s' "${STARTED_AT}"; return 0 ;;
+    restart) return 0 ;;
+  esac
+}
+curl() { return "${HEALTHZ_RC}"; }
+"""
+    def run_case(started_at, healthz_rc):
+        script = (stub_tpl + funcs + '\n' + block
+                  ).replace('__BASE__', str(tmp_path)).replace('__STARTED__', started_at
+                  ).replace('__HEALTHZ__', str(healthz_rc)
+                  ).replace('__LOG__', str(log))
+        log.write_text('', encoding='utf-8')
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return log.read_text(encoding='utf-8')
+
+    # .env 更新 + 所选音源未运行（升级恢复了 musicdl，容器在跑别的源）→ 重启对齐
+    out = run_case('2000-01-01T00:00:00Z', 7)
+    assert 'restart fnmusic-sources' in out
+    # .env 更新 + 所选服务全部已就绪（同参数幂等重跑）→ 不重启
+    out = run_case('2000-01-01T00:00:00Z', 0)
+    assert 'restart' not in out
+    # 容器比 .env 新（全新安装/容器刚按新 .env 创建）→ 不重启
+    out = run_case('2100-01-01T00:00:00Z', 7)
+    assert 'restart' not in out
+
+
+def test_healthz_timeout_dumps_container_diagnostics():
+    """healthz 超时必须取证：install.sh 四个等待分支与 extend.sh 的 wait_source
+    都调用 diagnose_sources_container（supervisor 状态 + 容器日志尾部随安装日志
+    落盘），env_newer_than_container 移入共享库后 extend.sh 不再持有本地副本。"""
+    install = (BASE/'install.sh').read_text(encoding='utf-8')
+    extend = (BASE/'extend.sh').read_text(encoding='utf-8')
+    common = (BASE/'proxy'/'install_common.sh').read_text(encoding='utf-8')
+    assert install.count('diagnose_sources_container "${CONTAINER_NAME}"') == 4
+    assert 'diagnose_sources_container "${CONTAINER_NAME}"' in extend
+    assert 'supervisorctl' in common
+    assert 'logs --tail' in common
+    assert 'env_newer_than_container()' not in extend
+    assert 'env_newer_than_container()' in common
 
 
 def test_host_install_unit_restarts_and_propagates_failure(tmp_path):
@@ -975,6 +1050,29 @@ def test_safe_child_logs_retain_stream_probe_and_abort_lines(capsys):
     output = capsys.readouterr().err
     assert 'stream probe: GET online:kuwo:123456' in output
     assert 'Stream aborted mid-way for online:kuwo:123456: ReadTimeout' in output
+
+
+def test_safe_child_logs_retain_forward_unhandled_lines(capsys):
+    """官方新端点取证日志必须能进 journal（应用中心模式下唯一可见途径）。
+
+    官方 2026-09-25 更新后新增 forward-unhandled 采样日志，若被过滤器丢弃，
+    官方升级引入新端点时用户日志里将无迹可循（review 发现的回归）。
+    """
+    import io
+    lines = (
+        "2026-09-28 15:00:00,001 [INFO] fnmusic_proxy: "
+        "forward-unhandled GET /music/api/v1/download/track/detail (#1) —— 官方端点未被代理拦截，仅透传\n"
+        "2026-09-28 15:00:01,002 [INFO] fnmusic_proxy: "
+        "forward-unhandled POST /music/api/v1/search/index/rebuild (#50) —— 官方端点未被代理拦截，仅透传\n"
+        "forward-unhandled EVIL /x password=SECRET\n"
+    )
+    takeover.drain_diagnostics(io.StringIO(lines), ('SECRET',))
+    output = capsys.readouterr().err
+    assert 'forward-unhandled GET /music/api/v1/download/track/detail (#1)' in output
+    assert 'forward-unhandled POST /music/api/v1/search/index/rebuild (#50)' in output
+    # 固定方法白名单之外的方法名不透传（EVIL 非 HTTP 方法），且秘密始终被抹除
+    assert 'EVIL' not in output
+    assert 'SECRET' not in output
 
 
 def test_safe_child_logs_discard_oversized_line_tail(capsys):

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import signal
 import tempfile
 import time
 from pathlib import Path
@@ -25,7 +26,10 @@ logger = logging.getLogger("lxmusic_service.runtime")
 
 SCRIPT_MAX_BYTES = 9_000_000
 MAX_REDIRECTS = 3
-INIT_TIMEOUT_S = 10.0
+# 服务端中转型脚本（如 pdone/lx-music-source 系）init 期间要先联系自家 API 服务器，
+# 实测 1.4~6s、弱网更久；10s 会把"慢而活"的源掐死在激活环节，
+# 30s 对齐桌面版"不设硬超时"的宽裕度，又不至于让激活请求无限挂起
+INIT_TIMEOUT_S = 30.0
 MUSIC_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
 
 _META_LIMITS = {"name": 24, "description": 36, "author": 56, "homepage": 1024, "version": 36}
@@ -50,6 +54,59 @@ class SourceError(Exception):
     def __init__(self, category: str, message: str):
         super().__init__(message)
         self.category = category
+
+
+def reap_orphan_bridges(
+    bridge_path: "str | Path | None" = None, *, proc_root: "str | Path" = "/proc"
+) -> list[int]:
+    """清扫父进程已死亡的残留 bridge 子进程（issue #29「多进程叠加」根因）。
+
+    服务被 SIGKILL/断电等异常终止时，Node 子进程被内核重挂到 PID 1 继续常驻；
+    重启后 SourceManager 只管自己拉起的新进程，孤儿便在 ps 里叠加（#29 实测
+    三个同名进程、etime 各为 26h/12m/4m，即多次异常重启的累计残留）。
+
+    只清理同时满足以下条件的进程，其余一律不动：
+      1. cmdline 恰好引用本服务 bridge.js 的绝对路径（不同部署路径互不影响）；
+      2. 父进程已不存在（或已是 PID 1 托孤）——父进程尚在的不确定归属进程保守跳过；
+      3. 不是本进程自己的孩子（孩子由 UserSource 生命周期管理）。
+    proc_root 参数仅供测试注入伪 /proc 树。
+    """
+    try:
+        target = str(
+            (Path(bridge_path) if bridge_path else Path(__file__).resolve().parent / "js" / "bridge.js")
+            .resolve()
+        )
+    except OSError:
+        return []
+    me = os.getpid()
+    root = Path(proc_root)
+    killed: list[int] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            args = (entry / "cmdline").read_bytes().split(b"\0")
+            if not any(
+                os.path.realpath(a.decode("utf-8", "replace")) == target for a in args if a
+            ):
+                continue
+            stat_text = (entry / "stat").read_text()
+            ppid = int(stat_text[stat_text.rindex(")") + 2:].split()[1])
+            if ppid == me:
+                continue
+            if ppid != 1 and (root / str(ppid)).exists():
+                continue
+            os.kill(int(name), signal.SIGTERM)
+            killed.append(int(name))
+            logger.warning("reaped orphan lx bridge process pid=%s (ppid=%s)", name, ppid)
+        except (OSError, ValueError, IndexError):
+            continue
+    return killed
 
 
 def parse_script_meta(script: str) -> dict:
@@ -477,6 +534,10 @@ class UserSource:
         return url
 
     def describe(self) -> dict:
+        # issue #29：暴露 bridge 进程 pid 与运行时长，便于用户上报"多进程/CPU 占用"时
+        # 直接对照 healthz 与宿主 ps 输出（正常恒为单进程；多进程=容器/服务被外部拉起多次）
+        pid = self._proc.pid if self._proc is not None else None
+        uptime_s = round(time.time() - self.started_at, 1) if self.started_at else None
         return {
             "name": self.meta.get("name") or "",
             "version": self.meta.get("version") or "",
@@ -489,6 +550,8 @@ class UserSource:
             },
             "running": self.running,
             "started_at": self.started_at,
+            "pid": pid,
+            "uptime_s": uptime_s,
         }
 
 
@@ -553,6 +616,12 @@ class SourceManager:
 
     async def load(self) -> None:
         """服务启动时加载：state.json 的 URL 优先，env 为种子；下载失败回退缓存脚本。"""
+        # issue #29：先清扫上次异常退出（SIGKILL/断电）留下的孤儿 bridge，再拉起新进程，
+        # 避免"多个同名 bridge.js 叠加常驻高 CPU"复发。活跃父进程下的进程一律不动。
+        try:
+            reap_orphan_bridges()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("orphan bridge reaper failed (ignored): %s", type(exc).__name__)
         async with self._lock:
             if self._runtime is not None:
                 return

@@ -33,7 +33,7 @@ BASH = shutil.which("bash")
 # 按测试意图用桩覆盖，tar 在需要验证备份内容时用真 tar、需要故障注入时用桩覆盖）
 REAL_TOOLS = ("dirname", "mkdir", "cp", "mv", "rm", "tar", "gzip", "date", "grep",
               "sed", "ls", "tail", "cat", "chmod", "head", "tr", "cut", "tee",
-              "readlink")
+              "readlink", "python3")
 
 INSTALLER_STUB = """#!/bin/bash
 printf '%s\\n' "$*" >> "${STUB_INSTALL_LOG}"
@@ -143,6 +143,8 @@ esac
             "TRIM_TEMP_LOGFILE": str(self.tmp / "trim-log.txt"),
             "STUB_INSTALL_LOG": str(self.install_log),
             "FNMUSIC_DURABLE_LOG": str(self.durable_log),
+            "FNMUSIC_UNIT_FILE": str(self.tmp / "absent-unit.service"),
+            "FNMUSIC_DEPLOYMENT_FILE": str(self.tmp / "absent-deployment"),
             "HOME": str(self.tmp),
         }
         env.update({k: v for k, v in extra.items() if v is not None})
@@ -270,7 +272,9 @@ def test_common_data_items_only_existing(sb, tmp_path):
 
 def _socket_variant(sb: Sandbox, sock: Path) -> None:
     """把 install_init 里硬编码的官方 socket 路径重定向到沙箱（逻辑不变）。"""
-    text = read(sb, "install_init").replace("/var/run/trim_music.socket", str(sock))
+    text = (read(sb, "install_init")
+            .replace("/var/run/trim_music.socket", str(sock))
+            .replace("/var/run/trim_music_upstream.socket", str(sock) + ".upstream"))
     (sb.cmd / "install_init").write_text(text, encoding="utf-8")
     (sb.cmd / "install_init").chmod(0o755)
 
@@ -311,13 +315,21 @@ def test_install_init_passes_with_both_prerequisites(sb, tmp_path, held_socket):
     assert result.returncode == 0, result.stderr
 
 
+def test_install_init_fails_when_docker_daemon_not_running(sb, tmp_path, held_socket):
+    sb.add_docker(rc=1)
+    _socket_variant(sb, held_socket)
+    result = sb.run("install_init")
+    assert result.returncode == 1
+    assert "Docker 服务未运行" in result.stderr
+
+
 # -------------------------------------------------------- install_callback ---
 
 def test_install_callback_defaults_invalid_source_to_musicdl(sb):
     sb.make_repo()
     result = sb.run("install_callback", wizard_sources="bogus", wizard_extend="true")
     assert result.returncode == 0, result.stderr
-    assert sb.install_args() == ["--non-interactive --sources musicdl --webui --extend"]
+    assert sb.install_args() == ["--non-interactive --sources musicdl --webui --adopt --extend"]
 
 
 def test_install_callback_lx_without_url_installs_sourceless(sb):
@@ -325,7 +337,7 @@ def test_install_callback_lx_without_url_installs_sourceless(sb):
     sb.make_repo()
     result = sb.run("install_callback", wizard_sources="lxmusic", wizard_lx_url="")
     assert result.returncode == 0, result.stderr
-    assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --extend"]
+    assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --adopt --extend"]
 
 
 def test_install_callback_lx_url_passthrough_and_extend_off(sb):
@@ -334,7 +346,7 @@ def test_install_callback_lx_url_passthrough_and_extend_off(sb):
                     wizard_lx_url="http://s/y.js", wizard_extend="false")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == [
-        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js"]
+        "--non-interactive --sources lxmusic --webui --adopt --lx-source-url http://s/y.js"]
 
 
 def test_install_callback_legacy_lx_url_still_passthrough(sb):
@@ -344,7 +356,7 @@ def test_install_callback_legacy_lx_url_still_passthrough(sb):
                     wizard_lx_url="http://s/y.js", wizard_lx_skip_verify="true")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == [
-        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js --extend"]
+        "--non-interactive --sources lxmusic --webui --adopt --lx-source-url http://s/y.js --extend"]
 
 
 def test_install_callback_lx_skip_verify_off_by_default(sb):
@@ -353,7 +365,7 @@ def test_install_callback_lx_skip_verify_off_by_default(sb):
                     wizard_lx_url="http://s/y.js", wizard_lx_skip_verify="false")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == [
-        "--non-interactive --sources lxmusic --webui --lx-source-url http://s/y.js --extend"]
+        "--non-interactive --sources lxmusic --webui --adopt --lx-source-url http://s/y.js --extend"]
 
 
 def test_install_callback_install_failure_tails_log(sb):
@@ -430,6 +442,37 @@ def test_install_callback_requires_repo_payload(sb):
     result = sb.run("install_callback", wizard_sources="musicdl")
     assert result.returncode == 1
     assert "应用文件缺失" in result.stderr
+
+
+def test_install_callback_cleans_foreign_unit(sb):
+    """安装时若存在指向其他目录的残留 unit，应主动清理避免冲突。"""
+    repo = sb.make_repo()
+    sb.add_systemctl()
+    stale = sb.tmp / "stale-unit.service"
+    stale.write_text("[Service]\nWorkingDirectory=/vol1/other/repo\n", encoding="utf-8")
+    result = sb.run("install_callback", wizard_sources="musicdl",
+                    FNMUSIC_UNIT_FILE=str(stale))
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+
+
+def test_install_callback_migrates_data_from_old_deployment(sb, tmp_path):
+    """安装时若存在老部署记录且新目录无数据，平滑继承 .env 与数据文件。"""
+    repo = sb.make_repo()
+    old_repo = tmp_path / "old_repo"
+    old_repo.mkdir()
+    (old_repo / ".env").write_text("OLD_KEY=old_value\n", encoding="utf-8")
+    (old_repo / "online_favorites.json").write_text('{"fav": true}\n', encoding="utf-8")
+
+    dep_file = sb.tmp / "deployment"
+    dep_file.parent.mkdir(parents=True, exist_ok=True)
+    dep_file.write_text(f'{{"base": "{old_repo}"}}\n', encoding="utf-8")
+
+    result = sb.run("install_callback", wizard_sources="musicdl",
+                    FNMUSIC_DEPLOYMENT_FILE=str(dep_file))
+    assert result.returncode == 0, result.stderr
+    assert (repo / ".env").read_text(encoding="utf-8") == "OLD_KEY=old_value\n"
+    assert (repo / "online_favorites.json").read_text(encoding="utf-8") == '{"fav": true}\n'
 
 
 # ------------------------------------------------------------ upgrade_init ---
@@ -554,7 +597,7 @@ def test_upgrade_callback_restores_backup_and_reinstalls_lx(sb):
     # 升级跳过洛雪源可用性校验（--lx-skip-verify）：源服务器临时故障不得卡死升级
     assert "FNMUSIC_LX_ENABLED=true" in (repo / ".env").read_text(encoding="utf-8")
     assert sb.install_args() == [
-        "--non-interactive --sources lxmusic --webui --extend --lx-source-url http://s/x.js --lx-skip-verify"]
+        "--non-interactive --sources lxmusic --webui --extend --adopt --lx-source-url http://s/x.js --lx-skip-verify"]
     # 成功后备份目录删除
     assert not (sb.pkgvar / "upgrade-backup").exists()
 
@@ -578,7 +621,7 @@ def test_upgrade_callback_lx_without_url_still_upgrades(sb):
     _make_backup(sb, repo, "FNMUSIC_LX_ENABLED=true\n")  # 备份缺 LX_SOURCE_URL
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
-    assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --extend --lx-skip-verify"]
+    assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --extend --adopt --lx-skip-verify"]
     # 升级成功后备份清理
     assert not (sb.pkgvar / "upgrade-backup" / "data.tar.gz").exists()
 
@@ -587,24 +630,28 @@ def test_upgrade_callback_without_backup_uses_current_env(sb):
     sb.make_repo(env_text="FNMUSIC_NETEASE_ENABLED=true\n")
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
-    assert sb.install_args() == ["--non-interactive --sources musicbox --webui --extend"]
+    assert sb.install_args() == ["--non-interactive --sources musicbox --webui --extend --adopt"]
 
 
 def test_upgrade_callback_install_failure_keeps_backup(sb):
     repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
     sb.add_data(repo)
+    sb.add_docker()
     _make_backup(sb, repo, "FNMUSIC_MUSICDL_ENABLED=true\n")
     result = sb.run("upgrade_callback", STUB_INSTALL_RC="9")
     assert result.returncode == 1
     assert "升级失败" in result.stderr
     assert (sb.pkgvar / "upgrade-backup" / "data.tar.gz").is_file()
+    # 失败后清理音源容器：回滚会原地重建 repo 目录（inode 更换），运行中容器
+    # 绑旧 inode 变空挂载僵尸（占端口/容器名、healthcheck 永久失败），必须移除
+    assert "rm -f fnmusic-sources" in sb.docker_log.read_text(encoding="utf-8")
 
 
 def test_upgrade_callback_defaults_to_musicdl_when_env_silent(sb):
     sb.make_repo(env_text="SOME_OTHER_KEY=1\n")
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
-    assert sb.install_args() == ["--non-interactive --sources musicdl --webui --extend"]
+    assert sb.install_args() == ["--non-interactive --sources musicdl --webui --extend --adopt"]
 
 
 # ---------------------------------------------------------- uninstall_init ---
@@ -656,9 +703,10 @@ def test_uninstall_init_archives_to_volume_root(sb):
     archive = lines[0]
     assert archive.startswith("/vol5/fnmusic-ext-backup-")
     assert archive.endswith(".tar.gz")
-    # tar 参数：归档路径 + 以 repo 为基点的数据项
+    # tar 参数：--ignore-failed-read（数据文件中途消失不中止卸载）+ 归档路径 +
+    # 以 repo 为基点的数据项
     tar_args = sb.tar_log.read_text(encoding="utf-8")
-    assert f"tar -czf {archive} -C {repo}" in tar_args
+    assert f"tar --ignore-failed-read -czf {archive} -C {repo}" in tar_args
     for item in (".env", "sources-data", "play_history"):
         assert item in tar_args
 
@@ -682,6 +730,15 @@ def test_uninstall_callback_never_fails_even_if_all_cleanup_fails(sb):
     result = sb.run("uninstall_callback")
     assert result.returncode == 0, result.stderr
     assert "/etc/systemd/system/fnmusic-ext.service" in rm_log.read_text(encoding="utf-8")
+
+
+def test_uninstall_callback_removes_deployment_file(sb):
+    sb.make_repo()
+    dep_file = sb.tmp / "deployment"
+    dep_file.write_text('{"base": "/some/path"}\n', encoding="utf-8")
+    result = sb.run("uninstall_callback", FNMUSIC_DEPLOYMENT_FILE=str(dep_file))
+    assert result.returncode == 0, result.stderr
+    assert not dep_file.exists()
 
 
 # -------------------------------------------------------------------- main ---

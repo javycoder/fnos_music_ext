@@ -18,7 +18,7 @@ fi
 SOURCES="$(fnmusic_saved_source)"
 [ -n "${SOURCES}" ] || SOURCES="musicdl"
 
-ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend)
+ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend --adopt)
 if [ "${SOURCES}" = "lxmusic" ]; then
     LX_URL="$(fnmusic_saved_lx_url)"
     # 洛雪源 URL 可能为空（v2.2.7+ 支持无源安装、装后在管理页配置）：
@@ -31,6 +31,10 @@ fi
 
 cd "${FNMUSIC_REPO_DIR}"
 if ! fnmusic_run_logged bash ./install.sh "${ARGS[@]}"; then
+    # 升级失败后应用中心回滚 target：repo 目录会被原地重建（inode 更换），运行中
+    # 的容器仍绑着旧 inode（/repo 变空、healthcheck 持续失败且占用端口/容器名）。
+    # 先移除让下次 start/升级重试干净重建，与 install_callback 失败路径对称。
+    fnmusic_cleanup_sources_container
     # 升级失败弹窗要能看到真实错误行（回滚会带走 TRIM_PKGVAR 里的日志）
     fnmusic_fail_from_log "升级失败（数据备份保留在 ${BACKUP_DIR}）"
 fi

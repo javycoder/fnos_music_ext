@@ -92,7 +92,7 @@ function safeParse(line) {
  * 异步 lx.request 回调还没触发进程就没了），必须先等到目标输出。
  */
 class BridgeProc {
-  constructor(scriptBody) {
+  constructor(scriptBody, { env } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lxbridge-test-'));
     const scriptPath = path.join(dir, 'source.js');
     fs.writeFileSync(scriptPath, scriptBody, 'utf8');
@@ -101,7 +101,7 @@ class BridgeProc {
     this.exitCode = null;
     this.exited = false;
     this.child = spawn(NODE, [BRIDGE, scriptPath, JSON.stringify({ name: 't', version: '1.0.0' })],
-      { stdio: ['pipe', 'pipe', 'pipe'] });
+      { stdio: ['pipe', 'pipe', 'pipe'], env: env ? { ...process.env, ...env } : undefined });
     this.exitPromise = new Promise((resolve) => {
       this.child.on('exit', (code) => { this.exited = true; this.exitCode = code; resolve(code); });
     });
@@ -154,8 +154,8 @@ class BridgeProc {
 
 /** 完整跑一个用例：起桥 → 喂 stdin → 等条件 → 收尾 → 断言回调。
  * 断言必须放在 finish 之后（exitCode 才有值；outLines 已冻结）。 */
-async function bridgeCase(scriptBody, { feed = [], waitUntil, timeoutMs = 8000, then } = {}) {
-  const b = new BridgeProc(scriptBody);
+async function bridgeCase(scriptBody, { feed = [], waitUntil, timeoutMs = 8000, then, env } = {}) {
+  const b = new BridgeProc(scriptBody, { env });
   let error;
   try {
     for (const line of feed) b.write(line);
@@ -399,6 +399,54 @@ lx.request(BASE + '/hang', { timeout: 300 }, (err, resp, body) => {
   });
 }
 
+async function test_network_error_carries_errno() {
+  // 连接被拒：undici 只给 "fetch failed"，真实 errno 藏在 cause——桥必须带到
+  // 错误消息里，宿主才能区分"源服务端已失效"与脚本自身错误（pdone 源矩阵实测）。
+  // 端口取自临时监听后关闭的 socket（undici 会拒绝 1 等特权端口，不走 errno 路径）
+  const net = require('node:net');
+  const deadPort = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.request('http://127.0.0.1:${deadPort}/dead', {}).catch((err) => {
+  console.log('ERRMSG=' + err.message);
+});
+`;
+  await bridgeCase(script, {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('ERRMSG=')),
+    timeoutMs: 8000,
+    then: (b) => {
+      const line = b.logs().find((m) => m.includes('ERRMSG='));
+      assert.ok(line, '应收到错误日志');
+      assert.ok(line.includes('ECONNREFUSED'), `错误应携带底层 errno; 实际: ${line}`);
+      assert.ok(line.includes('fetch failed'), `保留原始消息; 实际: ${line}`);
+    },
+  });
+}
+
+async function test_timeout_error_names_target() {
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.request(BASE + '/hang', { timeout: 300 }, (err) => {
+  console.log('TMSG=' + (err ? err.message : 'none'));
+});
+`;
+  await bridgeCase(inject(script), {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('TMSG=')),
+    timeoutMs: 6000,
+    then: (b) => {
+      const line = b.logs().find((m) => m.includes('TMSG='));
+      assert.ok(line, '应收到超时日志');
+      assert.ok(/request timeout after \d+ms/.test(line), `超时错误应说明超时与目标; 实际: ${line}`);
+    },
+  });
+}
+
 async function test_musicurl_protocol_roundtrip() {
   const script = `
 lx.on(lx.EVENT_NAMES.request, ({ action, info }) => {
@@ -575,7 +623,7 @@ let ticks = 0;
 const timer = setInterval(() => {
   ticks += 1;
   if (ticks >= 2) { clearInterval(timer); done(); }
-}, 40);
+}, 600);
 function done() {
   results.push('ticks=' + ticks);
   results.push('atob=' + atob('aGk='));
@@ -649,6 +697,160 @@ setTimeout(() => { throw new Error('boom-after-init'); }, 50);
   });
 }
 
+async function test_interval_period_clamped() {
+  // issue #29：野生脚本的 1ms 定时器在常驻进程里空烧 ~50% CPU。
+  // 周期必须被钳到下限之上：首跳不得早于下限的 80%，且打 WARN。
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+globalThis.__start = Date.now();
+setInterval(() => {
+  console.log('FIRST_TICK_MS=' + (Date.now() - globalThis.__start));
+}, 1);
+`;
+  const started = Date.now();
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('FIRST_TICK_MS=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('FIRST_TICK_MS='));
+      const tickMs = Number((message.match(/FIRST_TICK_MS=(\d+)/) || [])[1]);
+      assert.ok(tickMs >= 400,
+        `1ms interval 必须被钳制到 >=500ms 周期（首跳 ${tickMs}ms 就到了）`);
+      assert.ok(Date.now() - started < 9000, '钳制后用例不得拖满超时');
+      assert.ok(b.logs().some((m) => m.includes('已钳制')), '钳制应打 WARN 便于排查');
+    },
+  });
+}
+
+async function test_interval_active_cap() {
+  // 超过存活上限的 interval 拒绝新增（返回哑定时器），clearInterval 不抛错，进程不崩
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+const timers = [];
+for (let i = 0; i < 40; i += 1) {
+  timers.push(setInterval(() => {}, 100000));
+}
+console.log('REGISTERED=' + timers.length);
+timers.forEach((t) => clearInterval(t));
+console.log('CLEARED_OK');
+`;
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('CLEARED_OK')),
+    then: (b) => {
+      const logs = b.logs();
+      assert.ok(logs.some((m) => m.includes('REGISTERED=40')), '注册调用本身不抛错');
+      assert.ok(logs.some((m) => m.includes('上限')), '超限应打 WARN');
+      assert.equal(b.exitCode, 0, '哑定时器 + clearInterval 不得让进程异常退出');
+      const fatal = b.events().find((e) => e.type === 'event' && e.name === 'fatal');
+      assert.ok(!fatal, `不应有 fatal: ${JSON.stringify(fatal)}`);
+    },
+  });
+}
+
+async function test_settimeout_flood_clamped() {
+  // issue #29 补充：递归 setTimeout 链（自替换句柄，存活数恒为 1）按触发频率治理。
+  // 低阈值环境变量下，1ms 递归链应在触发过频后被钳制到 150ms 周期，且链条不断、不崩。
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+let n = 0;
+let last = Date.now();
+const loop = () => {
+  const now = Date.now();
+  console.log('TICK ' + (++n) + ' ' + (now - last));
+  last = now;
+  if (n < 16) setTimeout(loop, 1);
+};
+setTimeout(loop, 1);
+`;
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    env: {
+      LX_TIMEOUT_FLOOD_WINDOW_MS: '2000',
+      LX_TIMEOUT_FLOOD_MAX_FIRES: '5',
+      LX_TIMEOUT_FLOOD_CLAMP_MS: '150',
+    },
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('TICK 16 ')),
+    then: (b) => {
+      const ticks = b.logs()
+        .filter((m) => m.includes('TICK '))
+        .map((m) => Number((m.match(/TICK \d+ (\d+)/) || [])[1]));
+      assert.ok(ticks.length >= 8, `递归链应继续运行不被杀死（收到 ${ticks.length} 跳）`);
+      assert.ok(Math.max(...ticks) >= 140,
+        `过频后短周期必须被钳制到 >=150ms（实际最大间隔 ${Math.max(...ticks)}ms）`);
+      assert.ok(b.logs().some((m) => m.includes('setTimeout 触发过频')), '钳制应打 WARN 便于排查');
+      const fatal = b.events().find((e) => e.type === 'event' && e.name === 'fatal');
+      assert.ok(!fatal, `不应有 fatal: ${JSON.stringify(fatal)}`);
+    },
+  });
+}
+
+async function test_settimeout_one_off_not_clamped() {
+  // 一次性/低频 setTimeout（含 setTimeout(0) 让步写法）不受洪泛治理影响
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+const t0 = Date.now();
+setTimeout(() => {
+  const wait = Date.now() - t0;
+  setTimeout(() => console.log('ONE_OFF=' + wait + ' STEP_OK'), 0);
+}, 10);
+`;
+  await bridgeCase(script, {
+    timeoutMs: 8000,
+    env: {
+      LX_TIMEOUT_FLOOD_WINDOW_MS: '2000',
+      LX_TIMEOUT_FLOOD_MAX_FIRES: '5',
+      LX_TIMEOUT_FLOOD_CLAMP_MS: '150',
+    },
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('STEP_OK')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('ONE_OFF='));
+      const waitMs = Number((message.match(/ONE_OFF=(\d+)/) || [])[1]);
+      assert.ok(waitMs < 140, `低频 setTimeout 不应被钳制（首跳 ${waitMs}ms）`);
+    },
+  });
+}
+
+async function test_musicurl_musicinfo_contract_passthrough() {
+  // issue #22 对齐审计护栏：musicInfo 的全部平台主键/别名字段必须原样穿透沙箱
+  // （kg hash / kw rid / wy songId / mg copyrightId / tx songmid+strMediaMid /
+  //  albumId / interval 秒字符串 / meta.picUrl / info.type=音质档位）
+  const script = `
+lx.on(lx.EVENT_NAMES.request, ({ action, info }) => {
+  const m = info.musicInfo;
+  console.log('FIELDS=' + [
+    m.hash, m.songmid, m.rid, m.songId, m.copyrightId, m.strMediaMid,
+    m.albumId, m.interval, m.meta && m.meta.picUrl, info.type,
+  ].join('|'));
+  return 'http://media.test/a.flac';
+});
+lx.send(lx.EVENT_NAMES.inited, { openAPI: [], platforms: {} });
+`;
+  await bridgeCase(script, {
+    feed: [JSON.stringify({
+      id: 'r9', type: 'request', source: 'kg', action: 'musicUrl',
+      info: {
+        type: 'flac',
+        musicInfo: {
+          hash: 'KGHASH', songmid: 'KGHASH', rid: '228908', songId: '186016',
+          copyrightId: '600929', strMediaMid: 'MEDIA', albumId: '966846',
+          interval: '269', meta: { picUrl: 'https://img/1.jpg' },
+        },
+      },
+    })],
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('FIELDS=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('FIELDS='));
+      assert.ok(message.includes('KGHASH|KGHASH|228908|186016|600929|MEDIA|966846|269|https://img/1.jpg|flac'),
+        `musicInfo 契约字段必须原样穿透沙箱; 实际: ${message}`);
+    },
+  });
+}
+
 // ------------------------------------------------------------------ 运行 ---
 
 async function main() {
@@ -667,13 +869,20 @@ async function main() {
     ['重定向上限报错', test_too_many_redirects_errors],
     ['form urlencoded', test_form_encoded],
     ['请求超时中断', test_request_timeout_aborts],
+    ['网络错误携带底层 errno', test_network_error_carries_errno],
+    ['超时错误指明目标', test_timeout_error_names_target],
     ['musicUrl 协议往返', test_musicurl_protocol_roundtrip],
+    ['musicInfo 契约字段穿透（issue #22 审计）', test_musicurl_musicinfo_contract_passthrough],
     ['ping/pong', test_ping_pong],
     ['utils 冒烟', test_utils_smoke],
     ['rsaEncrypt NO_PADDING 对齐官方', test_rsa_encrypt_no_padding],
     ['object body 默认 urlencoded', test_object_body_form_encoded_by_default],
     ['object body json 头序列化', test_object_body_json_with_content_type],
     ['沙箱 Web API 可用', test_sandbox_web_api_available],
+    ['interval 周期钳制（issue #29）', test_interval_period_clamped],
+    ['interval 存活上限（issue #29）', test_interval_active_cap],
+    ['setTimeout 递归链洪泛钳制（issue #29）', test_settimeout_flood_clamped],
+    ['setTimeout 一次性调用不钳制', test_settimeout_one_off_not_clamped],
     ['init 前异步崩溃报 fatal', test_async_crash_before_init_is_fatal],
     ['init 后异步崩溃仅记日志', test_async_crash_after_init_only_logs],
     ['沙箱全局白名单', test_sandbox_global_whitelist],

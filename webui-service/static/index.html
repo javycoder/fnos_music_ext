@@ -158,6 +158,20 @@
           </label>
           <p class="hint">缓存数仅在关闭边听边存时生效；restore 还原时会一并清理这些滚动缓存。</p>
         </div>
+        <div class="card">
+          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">收藏或加入歌单的在线歌曲先立即生效，随后在后台自动下载到本地曲库；下载完成后收藏列表或歌单自动绑定已经下载好的本地歌曲而不是绑定在线歌曲。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
+          <label class="field"><span>官方绑定等待（秒） <b id="bind-timeout-label"></b></span>
+            <input class="input" id="bind-timeout" type="number" min="10" max="3600">
+          </label>
+          <p class="hint">下载落库后等待官方曲库收录并完成官方写入的时间上限，超时保留本地映射、打开列表时自动重试。</p>
+          <label class="field"><span>切歌续传并行数</span>
+            <input class="input" id="handoff-max" type="number" min="0" max="20">
+          </label>
+          <label class="field"><span>曲库重扫接口（选填）</span>
+            <input class="input" id="scan-path" placeholder="留空=官方自动扫描入库">
+          </label>
+          <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口无公开文档，可从 FNMUSIC_TRACE_FORWARD=detail 取证日志捕获后填入以加速官方入库。</p>
+        </div>
       </section>
 
       <!-- LLM -->
