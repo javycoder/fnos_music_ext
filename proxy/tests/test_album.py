@@ -265,3 +265,31 @@ def test_search_album_official_error_passthrough(monkeypatch):
     with TestClient(app) as client:
         body = client.get("/music/api/v1/search/album", params={"keyword": "x"}).json()
         assert body["code"] == 401
+
+
+def test_register_fake_album_richer_snapshot_overrides_stub():
+    """issue #28 真机复现的合并 bug：首次解析失败的 stub（仅 id/source）先占位后，
+    更全的后到信息必须能覆盖它，否则专辑合成/命名永远拿到残缺条目。"""
+    from proxy.app import _item_meta_richness
+
+    stub = {"id": "kuwo:228908", "source": "kuwo"}
+    full = {"id": "kuwo:228908", "source": "kuwo", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "duration_s": 269, "ext": "flac"}
+    assert _item_meta_richness(stub) == 0 and _item_meta_richness(full) == 2
+
+    build_online_track({"id": "kuwo:228908", "source": "kuwo", "title": "无专辑歌", "artist": "X"})  # 无关条目隔离
+    # 第一次：stub 先登记（残缺）
+    register = __import__("proxy.app", fromlist=["register_fake_album"]).register_fake_album
+    register("online:kuwo:228908", "", stub)
+    fake = fake_official_guid("online:kuwo:228908:album")
+    entry = resolve_fake_album(fake)
+    assert entry["album"] == ""
+    # 第二次：全量信息应覆盖 stub，专辑名补齐
+    register("online:kuwo:228908", "叶惠美", full)
+    entry = resolve_fake_album(fake)
+    assert entry["album"] == "叶惠美"
+    assert entry["item"].get("title") == "晴天"
+    # 反向：stub 不得降级已全量的条目
+    register("online:kuwo:228908", "", stub)
+    entry = resolve_fake_album(fake)
+    assert entry["album"] == "叶惠美" and entry["item"].get("title") == "晴天"

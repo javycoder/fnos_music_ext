@@ -12,6 +12,7 @@ recommend_cache/
 play_history/
 online_favorites/
 online_favorites.json
+playlist_tracks/
 __pycache__/
 *.pyc
 *.pyo

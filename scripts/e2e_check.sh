@@ -171,6 +171,39 @@ else
   bad "删除临时歌单" "$PLDEL"
 fi
 
+# 8. 专辑搜索与详情测试（WS4 验收）
+ALBUM_SEARCH=$(api "$BASE/search/album?q=%E5%8F%B6%E6%83%A0%E7%BE%8E&page=1&size=5")
+ALBUM_GUID=$(echo "$ALBUM_SEARCH" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    items = d.get("data", {}).get("list") or d.get("data", {}).get("items") or []
+    for it in items:
+        g = it.get("guid") or ""
+        if g:
+            print(g)
+            break
+except Exception:
+    pass
+')
+if [ "$(echo "$ALBUM_SEARCH" | jget code)" = "0" ] && [ -n "$ALBUM_GUID" ]; then
+  ok "专辑搜索 '叶惠美' 返回有效专辑（$ALBUM_GUID）"
+  ALBUM_DET=$(api "$BASE/album/detail?guid=$ALBUM_GUID")
+  if [ "$(echo "$ALBUM_DET" | jget code)" = "0" ] && [ -n "$(echo "$ALBUM_DET" | jget data.name)" ]; then
+    ok "专辑详情返回 code=0 且包含专辑名"
+  else
+    bad "专辑详情" "$ALBUM_DET"
+  fi
+  ALBUM_TRACKS=$(api "$BASE/track/album-detail/list?albumGUID=$ALBUM_GUID&page=1&size=10")
+  if [ "$(echo "$ALBUM_TRACKS" | jget code)" = "0" ]; then
+    ok "专辑曲目列表接口返回 code=0"
+  else
+    bad "专辑曲目列表" "$ALBUM_TRACKS"
+  fi
+else
+  bad "专辑搜索" "code=$(echo "$ALBUM_SEARCH" | jget code) guid=$ALBUM_GUID"
+fi
+
 echo "──────────────────────────────"
 echo "结果：PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || exit 1

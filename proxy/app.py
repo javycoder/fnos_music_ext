@@ -1938,6 +1938,12 @@ def _album_name_from_obj(track_obj: dict) -> str:
     return str(track_obj.get("albumName") or track_obj.get("album") or "").strip()
 
 
+def _item_meta_richness(it: dict) -> int:
+    """条目元数据丰富度：title/album 各 1 分。用于"更全的快照覆盖残缺的"合并。"""
+    it = it if isinstance(it, dict) else {}
+    return int(bool(str(it.get("title") or "").strip())) + int(bool(str(it.get("album") or "").strip()))
+
+
 def register_fake_album(track_guid: str, album_name: str, item: dict | None = None, album_id: str = "") -> None:
     """登记专辑伪装 guid → (source, 专辑名, 所属曲目条目)，供专辑详情拦截反解。
 
@@ -1960,13 +1966,17 @@ def register_fake_album(track_guid: str, album_name: str, item: dict | None = No
             "album_id": str(album_id or ""),
         }
         return
-    # 已登记：首个非空值优先（后到的登记补齐缺失的专辑名/曲目条目）
+    # 已登记：残缺快照可被更全的后到登记覆盖——首次解析失败时 build_metadata_payload
+    # 会用 stub（仅 id/source，issue #28 真机复现）先占位，若"首个非空即终"，
+    # 之后的全量信息永远进不来，专辑合成/封面/命名全部拿到残缺条目。
     if album_name and not entry.get("album"):
         entry["album"] = str(album_name).strip()
-    if isinstance(item, dict) and item and not entry.get("item"):
-        entry["item"] = dict(item)
     if album_id and not entry.get("album_id"):
         entry["album_id"] = str(album_id)
+    if isinstance(item, dict) and item:
+        cur = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+        if _item_meta_richness(item) > _item_meta_richness(cur):
+            entry["item"] = dict(item)
 
 
 def resolve_fake_album(candidate: str) -> dict | None:
@@ -2827,6 +2837,7 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
         os.replace(part, dest)
+    logger.info("tee finalize done for %s: dest=%s", guid, dest)
     lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
     if lyric.strip():
         write_lyric_cache(guid, lyric, title, artist)
@@ -2954,20 +2965,30 @@ def stream_tee_response(
             if fp:
                 fp.close()
                 fp = None
-            info = pre_info
-            if info is None and info_task:
-                try:
-                    info = await asyncio.wait_for(info_task, timeout=8.0)
-                except Exception:
-                    info = None
             if part and eof and written >= 1024 and (expected is None or written == expected):
-                # 落盘转正、mutagen 打标签与滚动清缓全是同步磁盘操作：放线程池执
-                # 行，避免曲目结束的瞬间阻塞事件循环（单 worker 下会拖住切歌、
-                # 心跳等全部并发请求）。
-                await asyncio.to_thread(_tee_finalize, part, guid, ext, info, tee_enabled)
+                # 无论客户端连接此时是否已关闭（curl 接收完直接 EOF 退出，Starlette 会 aclose 生成器），
+                # 完整的音频已全部接收完毕，落盘与标签写入必须受 shield 保护完整执行完毕，
+                # 且立即解绑 part，绝不能被 GeneratorExit / CancelledError 提前打断导致 part 在 finally 中被误删。
+                to_finalize = part
                 part = None
-                if scan_headers_factory is not None:
-                    _schedule_library_scan(scan_headers_factory())
+                with anyio.CancelScope(shield=True):
+                    info = pre_info
+                    if info is None and info_task:
+                        try:
+                            info = await asyncio.wait_for(info_task, timeout=8.0)
+                        except Exception:
+                            info = None
+                    try:
+                        await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled)
+                        if scan_headers_factory is not None:
+                            _schedule_library_scan(scan_headers_factory())
+                    except Exception as exc:
+                        logger.warning("tee finalize execution failed for %s: %s", guid, type(exc).__name__)
+                        if os.path.exists(to_finalize):
+                            try:
+                                os.remove(to_finalize)
+                            except OSError:
+                                pass
         finally:
             if fp:
                 fp.close()
@@ -5403,7 +5424,7 @@ async def search_album(request: Request, subpath: str = ""):
         # 官方错误（含未登录 401 信封）原样透传，不吞官方语义
         return envelope if not isinstance(envelope, dict) else JSONResponse(content=envelope)
 
-    keyword = str(request.query_params.get("keyword") or request.query_params.get("wd") or "").strip()
+    keyword = str(request.query_params.get("q") or request.query_params.get("keyword") or request.query_params.get("wd") or "").strip()
     online: list[dict] = []
     if keyword:
         try:
