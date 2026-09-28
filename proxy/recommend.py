@@ -100,6 +100,15 @@ def verify_playable_enabled() -> bool:
 def verify_timeout_s() -> float:
     return _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", VERIFY_TIMEOUT_S, 2.0, 20.0)
 
+
+def search_concurrency() -> int:
+    # issue #29 反馈者实测的参数：同样放开为运行期读取，.env 热重载立即生效
+    return _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", RECOMMEND_SEARCH_CONCURRENCY, 1, 6)
+
+
+def search_interval_s() -> float:
+    return _env_float("FNMUSIC_REC_SEARCH_INTERVAL", RECOMMEND_SEARCH_INTERVAL, 0.0, 5.0)
+
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HIRA_KATA = re.compile(r"[\u3040-\u30ff]")
 _HANGUL = re.compile(r"[\uac00-\ud7af]")
@@ -1024,7 +1033,7 @@ async def resolve_recommendations(
     out: list[dict] = []
     seen_ids: set[str] = set()
     seen_ta: set[tuple[str, str]] = set()
-    sem = asyncio.Semaphore(RECOMMEND_SEARCH_CONCURRENCY)
+    sem = asyncio.Semaphore(search_concurrency())
 
     def _excluded(guid: str, title: str, artist: str) -> bool:
         if guid and guid in skip_ids:
@@ -1036,17 +1045,18 @@ async def resolve_recommendations(
         title = rec.get("title") or ""
         artist = rec.get("artist") or ""
         keyword = " ".join(x for x in (artist, title) if x).strip() or title
+        interval = search_interval_s()
         async with sem:
-            if RECOMMEND_SEARCH_INTERVAL > 0:
-                await asyncio.sleep(RECOMMEND_SEARCH_INTERVAL)
+            if interval > 0:
+                await asyncio.sleep(interval)
             items = await _search_keyword(
                 keyword, musicdl_client, musicbox_client, netease_enabled,
                 lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             )
         if not items and artist:
             async with sem:
-                if RECOMMEND_SEARCH_INTERVAL > 0:
-                    await asyncio.sleep(RECOMMEND_SEARCH_INTERVAL)
+                if interval > 0:
+                    await asyncio.sleep(interval)
                 items = await _search_keyword(
                     artist, musicdl_client, musicbox_client, netease_enabled,
                     lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,

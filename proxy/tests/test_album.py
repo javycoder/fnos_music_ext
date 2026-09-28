@@ -31,6 +31,10 @@ def clean_album_state(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "recommend_cache"))
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
+    # persist 落盘路径与节流指针指向临时目录：任何 persist 登记都不得写到仓库/用户目录
+    from proxy import app as app_mod
+    monkeypatch.setattr(app_mod, "_ALBUM_REGISTRY_PATH", str(tmp_path / "album_registry.json"))
+    monkeypatch.setattr(app_mod, "_ALBUM_PERSIST_LAST", 0.0)
     app.state.lx_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
         base_url="http://127.0.0.1:8772",
@@ -293,3 +297,57 @@ def test_register_fake_album_richer_snapshot_overrides_stub():
     register("online:kuwo:228908", "", stub)
     entry = resolve_fake_album(fake)
     assert entry["album"] == "叶惠美" and entry["item"].get("title") == "晴天"
+
+
+# ---------------------------------------------------------------- /search/album 登记持久化（重启恢复）
+
+
+def test_search_album_registry_survives_restart(monkeypatch, tmp_path):
+    """/search/album 的在线专辑锚点必须跨重启可反解（原实现只存内存，重启后
+    客户端停留在旧搜索结果点进专辑会回落官方"无此专辑"）。"""
+    import time as _time
+
+    from proxy import app as app_mod
+
+    reg_path = tmp_path / "album_registry.json"
+    monkeypatch.setattr(app_mod, "_ALBUM_REGISTRY_PATH", str(reg_path))
+    monkeypatch.setattr(app_mod, "_ALBUM_PERSIST_LAST", 0.0)
+
+    anchor = "online:netease:album:789"
+    app_mod.register_fake_album(
+        anchor, "叶惠美", {"cover_url": "https://p.music.126.net/yhm.jpg"}, album_id="789", persist=True,
+    )
+    assert reg_path.exists(), "persist=True 的登记必须落盘"
+    fake = app_mod.fake_official_guid(f"{anchor}:album")
+
+    # 模拟重启：清空内存注册表与 reverse 映射，warm 目录全部指向空临时目录
+    app_mod._FAKE_ALBUM_REGISTRY.clear()
+    app_mod._FAKE_GUID_REVERSE.clear()
+    app_mod._REGISTRY_WARMED = False
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setitem(CONF, "fav_dir", str(empty))
+    monkeypatch.setitem(CONF, "plt_dir", str(empty))
+    monkeypatch.setattr(dailyrec, "play_history_dir", lambda: str(empty))
+    monkeypatch.setattr(dailyrec, "recommend_cache_dir", lambda: str(empty))
+    app_mod.ensure_registry_warm()
+
+    entry = app_mod.resolve_fake_album(fake)
+    assert entry is not None, "重启后 warm 必须从落盘登记恢复专辑锚点"
+    assert entry["album"] == "叶惠美"
+    assert entry["album_id"] == "789"
+    # 反向映射也一并恢复（coverId 走 extract_guid → resolve_real_guid 依赖它）
+    assert app_mod.resolve_real_guid(fake) == f"{anchor}:album"
+
+
+def test_persist_flag_not_set_for_track_derived_albums(monkeypatch, tmp_path):
+    """曲目衍生登记（build_online_track 路径）不得落盘——可由收藏/历史快照重建，
+    落盘只会写放大。"""
+    reg_path = tmp_path / "album_registry.json"
+    from proxy import app as app_mod
+
+    monkeypatch.setattr(app_mod, "_ALBUM_REGISTRY_PATH", str(reg_path))
+    monkeypatch.setattr(app_mod, "_ALBUM_PERSIST_LAST", 0.0)
+    build_online_track({"id": "netease:42", "source": "netease", "title": "晴天", "artist": "周杰伦",
+                        "album": "叶惠美", "duration_s": 269, "ext": "flac"})
+    assert not reg_path.exists(), "未标 persist 的登记不应触发写盘"

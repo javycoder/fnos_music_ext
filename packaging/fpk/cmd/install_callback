@@ -19,7 +19,36 @@ case "${EXTEND}" in
     *) EXTEND=0 ;;
 esac
 
-ARGS=(--non-interactive --sources "${SOURCES}" --webui)
+# 1. 宿主机失效代理 unit 预清理（老部署换目录/换卷自愈）
+FNMUSIC_UNIT_FILE="${FNMUSIC_UNIT_FILE:-/etc/systemd/system/fnmusic-ext.service}"
+if [ -f "${FNMUSIC_UNIT_FILE}" ]; then
+    unit_wd="$(sed -n 's/^[[:space:]]*WorkingDirectory=//p' "${FNMUSIC_UNIT_FILE}" | head -n1)"
+    unit_wd_real="$(readlink -f -- "${unit_wd}" 2>/dev/null || true)"
+    repo_real="$(readlink -f -- "${FNMUSIC_REPO_DIR}" 2>/dev/null || true)"
+    if [ -z "${unit_wd_real}" ] || [ "${unit_wd_real}" != "${repo_real}" ]; then
+        systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+        rm -f "${FNMUSIC_UNIT_FILE}"
+        systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
+        echo "[fnmusic-ext] 已清理指向 ${unit_wd:-未知路径} 的历史代理 unit" >> "${FNMUSIC_LOG}" 2>&1
+    fi
+fi
+
+# 2. 存量手动/老目录部署数据平滑继承（.env/登录凭据/收藏/历史）
+DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
+if [ -f "${DEPLOYMENT_FILE}" ]; then
+    OLD_BASE="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${DEPLOYMENT_FILE}" | head -n1)"
+    if [ -n "${OLD_BASE}" ] && [ -d "${OLD_BASE}" ] && [ "$(readlink -f -- "${OLD_BASE}")" != "$(readlink -f -- "${FNMUSIC_REPO_DIR}")" ]; then
+        for item in .env sources-data online_favorites online_favorites.json play_history; do
+            if [ -e "${OLD_BASE}/${item}" ] && [ ! -e "${FNMUSIC_REPO_DIR}/${item}" ]; then
+                cp -a "${OLD_BASE}/${item}" "${FNMUSIC_REPO_DIR}/" 2>/dev/null || true
+                echo "[fnmusic-ext] 已从原部署 (${OLD_BASE}) 平滑继承数据: ${item}" >> "${FNMUSIC_LOG}" 2>&1
+            fi
+        done
+    fi
+fi
+
+# 3. 组装安装参数：应用中心安装天然代表确立整机唯一部署，始终追加 --adopt
+ARGS=(--non-interactive --sources "${SOURCES}" --webui --adopt)
 # 洛雪源脚本（URL/电脑上传/NAS 选择）统一装好后在管理页 WebUI 配置：
 # 安装向导平台没有文件上传组件，URL 也不再向安装者索要，无源安装不阻塞。
 if [ -n "${wizard_lx_url:-}" ]; then

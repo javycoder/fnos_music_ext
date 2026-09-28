@@ -92,7 +92,7 @@ function safeParse(line) {
  * 异步 lx.request 回调还没触发进程就没了），必须先等到目标输出。
  */
 class BridgeProc {
-  constructor(scriptBody) {
+  constructor(scriptBody, { env } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lxbridge-test-'));
     const scriptPath = path.join(dir, 'source.js');
     fs.writeFileSync(scriptPath, scriptBody, 'utf8');
@@ -101,7 +101,7 @@ class BridgeProc {
     this.exitCode = null;
     this.exited = false;
     this.child = spawn(NODE, [BRIDGE, scriptPath, JSON.stringify({ name: 't', version: '1.0.0' })],
-      { stdio: ['pipe', 'pipe', 'pipe'] });
+      { stdio: ['pipe', 'pipe', 'pipe'], env: env ? { ...process.env, ...env } : undefined });
     this.exitPromise = new Promise((resolve) => {
       this.child.on('exit', (code) => { this.exited = true; this.exitCode = code; resolve(code); });
     });
@@ -154,8 +154,8 @@ class BridgeProc {
 
 /** 完整跑一个用例：起桥 → 喂 stdin → 等条件 → 收尾 → 断言回调。
  * 断言必须放在 finish 之后（exitCode 才有值；outLines 已冻结）。 */
-async function bridgeCase(scriptBody, { feed = [], waitUntil, timeoutMs = 8000, then } = {}) {
-  const b = new BridgeProc(scriptBody);
+async function bridgeCase(scriptBody, { feed = [], waitUntil, timeoutMs = 8000, then, env } = {}) {
+  const b = new BridgeProc(scriptBody, { env });
   let error;
   try {
     for (const line of feed) b.write(line);
@@ -702,6 +702,71 @@ console.log('CLEARED_OK');
   });
 }
 
+async function test_settimeout_flood_clamped() {
+  // issue #29 补充：递归 setTimeout 链（自替换句柄，存活数恒为 1）按触发频率治理。
+  // 低阈值环境变量下，1ms 递归链应在触发过频后被钳制到 150ms 周期，且链条不断、不崩。
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+let n = 0;
+let last = Date.now();
+const loop = () => {
+  const now = Date.now();
+  console.log('TICK ' + (++n) + ' ' + (now - last));
+  last = now;
+  if (n < 16) setTimeout(loop, 1);
+};
+setTimeout(loop, 1);
+`;
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    env: {
+      LX_TIMEOUT_FLOOD_WINDOW_MS: '2000',
+      LX_TIMEOUT_FLOOD_MAX_FIRES: '5',
+      LX_TIMEOUT_FLOOD_CLAMP_MS: '150',
+    },
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('TICK 16 ')),
+    then: (b) => {
+      const ticks = b.logs()
+        .filter((m) => m.includes('TICK '))
+        .map((m) => Number((m.match(/TICK \d+ (\d+)/) || [])[1]));
+      assert.ok(ticks.length >= 8, `递归链应继续运行不被杀死（收到 ${ticks.length} 跳）`);
+      assert.ok(Math.max(...ticks) >= 140,
+        `过频后短周期必须被钳制到 >=150ms（实际最大间隔 ${Math.max(...ticks)}ms）`);
+      assert.ok(b.logs().some((m) => m.includes('setTimeout 触发过频')), '钳制应打 WARN 便于排查');
+      const fatal = b.events().find((e) => e.type === 'event' && e.name === 'fatal');
+      assert.ok(!fatal, `不应有 fatal: ${JSON.stringify(fatal)}`);
+    },
+  });
+}
+
+async function test_settimeout_one_off_not_clamped() {
+  // 一次性/低频 setTimeout（含 setTimeout(0) 让步写法）不受洪泛治理影响
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+const t0 = Date.now();
+setTimeout(() => {
+  const wait = Date.now() - t0;
+  setTimeout(() => console.log('ONE_OFF=' + wait + ' STEP_OK'), 0);
+}, 10);
+`;
+  await bridgeCase(script, {
+    timeoutMs: 8000,
+    env: {
+      LX_TIMEOUT_FLOOD_WINDOW_MS: '2000',
+      LX_TIMEOUT_FLOOD_MAX_FIRES: '5',
+      LX_TIMEOUT_FLOOD_CLAMP_MS: '150',
+    },
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('STEP_OK')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('ONE_OFF='));
+      const waitMs = Number((message.match(/ONE_OFF=(\d+)/) || [])[1]);
+      assert.ok(waitMs < 140, `低频 setTimeout 不应被钳制（首跳 ${waitMs}ms）`);
+    },
+  });
+}
+
 async function test_musicurl_musicinfo_contract_passthrough() {
   // issue #22 对齐审计护栏：musicInfo 的全部平台主键/别名字段必须原样穿透沙箱
   // （kg hash / kw rid / wy songId / mg copyrightId / tx songmid+strMediaMid /
@@ -766,6 +831,8 @@ async function main() {
     ['沙箱 Web API 可用', test_sandbox_web_api_available],
     ['interval 周期钳制（issue #29）', test_interval_period_clamped],
     ['interval 存活上限（issue #29）', test_interval_active_cap],
+    ['setTimeout 递归链洪泛钳制（issue #29）', test_settimeout_flood_clamped],
+    ['setTimeout 一次性调用不钳制', test_settimeout_one_off_not_clamped],
     ['init 前异步崩溃报 fatal', test_async_crash_before_init_is_fatal],
     ['init 后异步崩溃仅记日志', test_async_crash_after_init_only_logs],
     ['沙箱全局白名单', test_sandbox_global_whitelist],

@@ -15,12 +15,14 @@ if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/restore.sh" ]; then
         # 尽力恢复；若官方音乐异常，重装本扩展后再卸载一次即可修复。
         # FNMUSIC_UNIT_FILE 仅供测试注入；生产路径固定为 /etc/systemd/system。
         FNMUSIC_UNIT_FILE="${FNMUSIC_UNIT_FILE:-/etc/systemd/system/fnmusic-ext.service}"
+        FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
         echo "[fnmusic-ext] 常规还原失败，降级为强制清理继续卸载" >> "${FNMUSIC_LOG}" 2>&1
         systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
         systemctl disable fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
         rm -f "${FNMUSIC_UNIT_FILE}"
         systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
         docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+        rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
     fi
 fi
 

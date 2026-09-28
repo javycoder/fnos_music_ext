@@ -977,6 +977,29 @@ def test_safe_child_logs_retain_stream_probe_and_abort_lines(capsys):
     assert 'Stream aborted mid-way for online:kuwo:123456: ReadTimeout' in output
 
 
+def test_safe_child_logs_retain_forward_unhandled_lines(capsys):
+    """官方新端点取证日志必须能进 journal（应用中心模式下唯一可见途径）。
+
+    官方 2026-09-25 更新后新增 forward-unhandled 采样日志，若被过滤器丢弃，
+    官方升级引入新端点时用户日志里将无迹可循（review 发现的回归）。
+    """
+    import io
+    lines = (
+        "2026-09-28 15:00:00,001 [INFO] fnmusic_proxy: "
+        "forward-unhandled GET /music/api/v1/download/track/detail (#1) —— 官方端点未被代理拦截，仅透传\n"
+        "2026-09-28 15:00:01,002 [INFO] fnmusic_proxy: "
+        "forward-unhandled POST /music/api/v1/search/index/rebuild (#50) —— 官方端点未被代理拦截，仅透传\n"
+        "forward-unhandled EVIL /x password=SECRET\n"
+    )
+    takeover.drain_diagnostics(io.StringIO(lines), ('SECRET',))
+    output = capsys.readouterr().err
+    assert 'forward-unhandled GET /music/api/v1/download/track/detail (#1)' in output
+    assert 'forward-unhandled POST /music/api/v1/search/index/rebuild (#50)' in output
+    # 固定方法白名单之外的方法名不透传（EVIL 非 HTTP 方法），且秘密始终被抹除
+    assert 'EVIL' not in output
+    assert 'SECRET' not in output
+
+
 def test_safe_child_logs_discard_oversized_line_tail(capsys):
     import io
     oversized = 'x' * 16384 + 'INFO:     Application startup complete.\n'

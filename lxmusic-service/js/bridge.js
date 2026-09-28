@@ -348,9 +348,49 @@ const sandboxClearInterval = (timer) => {
   return clearInterval(timer);
 };
 
+// setTimeout 治理（issue #29 补充）：递归 setTimeout 链是野生脚本空烧 CPU 的另一
+// 常见形态——自替换句柄让"存活数量"恒为 1，数量上限拦不住，只能按"触发频率"治理：
+// 滑动窗口内触发过频（默认 10s 内 ≥200 次，即平均 >20/s）判定为失控，此后短周期
+// （<500ms）的 setTimeout 钳制到 500ms，窗口排空后自动恢复。一次性/低频定时器
+// （含 setTimeout(0) 让步写法）不受影响；最坏情形是每 10s 窗口内一段 ~200ms 的
+// 1ms 连发，CPU 占比可忽略。阈值可用环境变量覆盖（演练/排查用）。
+const TIMEOUT_FLOOD_WINDOW_MS = Math.max(1000, Number(process.env.LX_TIMEOUT_FLOOD_WINDOW_MS) || 10000);
+const TIMEOUT_FLOOD_MAX_FIRES = Math.max(10, Number(process.env.LX_TIMEOUT_FLOOD_MAX_FIRES) || 200);
+const TIMEOUT_FLOOD_CLAMP_MS = Math.max(50, Number(process.env.LX_TIMEOUT_FLOOD_CLAMP_MS) || 500);
+const timeoutFireTimes = [];
+let timeoutFloodWarned = 0;
+
+function timeoutFloodActive() {
+  const cutoff = Date.now() - TIMEOUT_FLOOD_WINDOW_MS;
+  while (timeoutFireTimes.length && timeoutFireTimes[0] <= cutoff) timeoutFireTimes.shift();
+  return timeoutFireTimes.length >= TIMEOUT_FLOOD_MAX_FIRES;
+}
+
+const sandboxSetTimeout = (fn, delay, ...rest) => {
+  const rawDelay = typeof delay === 'number' && Number.isFinite(delay) ? delay : 0;
+  let delayMs = rawDelay;
+  if (delayMs < TIMEOUT_FLOOD_CLAMP_MS && delayMs >= 0 && timeoutFloodActive()) {
+    delayMs = TIMEOUT_FLOOD_CLAMP_MS;
+    if (timeoutFloodWarned < 3) {
+      timeoutFloodWarned += 1;
+      logEvent('warn', [
+        `[bridge] 脚本 setTimeout 触发过频（${TIMEOUT_FLOOD_WINDOW_MS}ms 窗口内 ${timeoutFireTimes.length} 次），` +
+        `短周期定时器已钳制到 ${TIMEOUT_FLOOD_CLAMP_MS}ms（防递归链空烧 CPU，issue #29）`,
+      ]);
+    }
+  }
+  const timer = setTimeout(() => {
+    timeoutFireTimes.push(Date.now());
+    timeoutFloodActive(); // 顺带排空过期窗口，保持判定随时间自愈
+    return fn(...rest);
+  }, Math.min(delayMs, 2147483647));
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  return timer;
+};
+
 const sandbox = {
   lx,
-  setTimeout,
+  setTimeout: sandboxSetTimeout,
   clearTimeout,
   setInterval: sandboxSetInterval,
   clearInterval: sandboxClearInterval,

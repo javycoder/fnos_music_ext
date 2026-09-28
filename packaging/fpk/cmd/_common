@@ -49,7 +49,7 @@ fnmusic_error_brief() {
         | grep -avE '\[ [0-9]+/[0-9]+\] RUN ' \
         | tail -n 5 \
         | tr '\n' ' ' \
-        | cut -c1-400
+        | { python3 -c 'import sys; sys.stdout.write(sys.stdin.read()[:400])' 2>/dev/null || cut -c1-400; }
 }
 
 fnmusic_log_tail_brief() {
@@ -60,7 +60,7 @@ fnmusic_log_tail_brief() {
     sed $'s/\x1b\\[[0-9;]*m//g' "${log}" 2>/dev/null \
         | tail -n 5 \
         | tr '\n' ' ' \
-        | cut -c1-300
+        | { python3 -c 'import sys; sys.stdout.write(sys.stdin.read()[:300])' 2>/dev/null || cut -c1-300; }
 }
 
 fnmusic_run_logged() {

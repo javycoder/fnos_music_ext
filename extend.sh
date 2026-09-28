@@ -19,6 +19,7 @@ MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
 LX_URL="http://127.0.0.1:8772"
 FORCE_RELOAD=0
+ADOPT=0
 
 for arg in "$@"; do
     case "${arg}" in
@@ -32,6 +33,7 @@ for arg in "$@"; do
         --adopt)
             # Explicit deployment migration: skip the cross-checkout registry
             # check so this checkout can become the deployment (install_common.sh).
+            ADOPT=1
             ;;
         -h|--help)
             echo "用法: $0 [--force] [--adopt] [--qr]"
@@ -520,7 +522,11 @@ env_newer_than_container() {
 if [ "${need_start}" -eq 0 ]; then
     # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
     if run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-        reclaim_container "${CONTAINER_NAME}" || exit 1
+        if [ "${ADOPT:-0}" -eq 1 ]; then
+            reclaim_container "${CONTAINER_NAME}" --adopt || exit 1
+        else
+            reclaim_container "${CONTAINER_NAME}" || exit 1
+        fi
         log_info "音源容器 ${CONTAINER_NAME} 已就绪（按需加载：仅所选音源进程驻留内存）。"
         # 升级同步：服务健康也要重建镜像，否则 git pull 后新代码永远不生效
         img_before="$(run_docker inspect -f '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
@@ -536,7 +542,11 @@ if [ "${need_start}" -eq 0 ]; then
     fi
 else
     log_info "音源服务未全部就绪，拉起单容器 ${CONTAINER_NAME}..."
-    reclaim_container "${CONTAINER_NAME}" || exit 1
+    if [ "${ADOPT:-0}" -eq 1 ]; then
+        reclaim_container "${CONTAINER_NAME}" --adopt || exit 1
+    else
+        reclaim_container "${CONTAINER_NAME}" || exit 1
+    fi
     ensure_image_current
     # compose 对配置未变的运行中容器不会重启：手动 restart 让 entrypoint 按最新 .env 重选进程集
     run_docker restart "${CONTAINER_NAME}" || exit 1

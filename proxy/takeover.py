@@ -513,6 +513,7 @@ _SAFE_OUTCOME = re.compile(
     r'cached=(?:True|False) tee_eligible=(?:True|False)|'
     r'tee (?:diag|finalize|metadata) [ -~]{0,400}|'
     r'album detail not synthesizable: source=[!-~]{1,40}|'
+    r'forward-unhandled (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,140}(?: \(\#[0-9]+\))?|'
     r'Upstream auth probe failed|'
     r'(?:musicbox|lxmusic|musicdl)(?: /info| lyric fetch(?: in _online_info)?)? failed|'
     r'lyric sidecar fetch failed|resolve_(?:lx|netease)_url error|'

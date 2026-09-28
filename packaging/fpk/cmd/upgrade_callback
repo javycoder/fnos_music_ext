@@ -18,7 +18,7 @@ fi
 SOURCES="$(fnmusic_saved_source)"
 [ -n "${SOURCES}" ] || SOURCES="musicdl"
 
-ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend)
+ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend --adopt)
 if [ "${SOURCES}" = "lxmusic" ]; then
     LX_URL="$(fnmusic_saved_lx_url)"
     # 洛雪源 URL 可能为空（v2.2.7+ 支持无源安装、装后在管理页配置）：

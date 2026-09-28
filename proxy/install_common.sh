@@ -213,13 +213,21 @@ wait_http() {
 
 reclaim_container() {
     # Compose can reconcile its own containers without destructive rm -f.
-    local name="$1" owner=""
+    # When --adopt is passed (explicit migration), remove the foreign container
+    # so the current checkout's Compose can recreate it cleanly.
+    local name="$1" owner="" adopt=0
+    case " ${*} " in *' --adopt '*) adopt=1 ;; esac
     if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
         return 0
     fi
     owner="$(run_docker container inspect "${name}" \
         --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
     if ! same_dir "${owner}" "${BASE_DIR}"; then
+        if [ "${adopt}" -eq 1 ]; then
+            log_warn "容器 ${name} 属于原目录 ${owner:-未知}，按 --adopt 移除并由当前目录接管。"
+            run_docker rm -f "${name}" >/dev/null 2>&1 || true
+            return 0
+        fi
         log_err "容器 ${name} 不属于当前目录；保留并拒绝接管。请先解决名称/端口冲突。"
         return 1
     fi
@@ -230,7 +238,7 @@ remove_owned_container() {
     if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
         return 0
     fi
-    reclaim_container "${name}" || return 1
+    reclaim_container "$@" || return 1
     run_docker rm -f "${name}"
 }
 
@@ -245,7 +253,15 @@ stop_owned_source_unit() {
     if owned_source_unit "${unit}"; then
         sudo systemctl disable --now "${unit}.service"
     elif systemctl is-active --quiet "${unit}.service"; then
-        log_err "宿主机 unit ${unit} 不属于当前目录；保留。"
-        return 1
+        case " ${*} " in
+            *' --adopt '*)
+                log_warn "宿主机 unit ${unit} 属于其他目录，按 --adopt 停止并禁用。"
+                sudo systemctl disable --now "${unit}.service"
+                ;;
+            *)
+                log_err "宿主机 unit ${unit} 不属于当前目录；保留。"
+                return 1
+                ;;
+        esac
     fi
 }

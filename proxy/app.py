@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -455,6 +456,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_FALLBACK_BUDGET_S": ("", "str"),
     "FNMUSIC_RECOMMEND_VERIFY_PLAYABLE": ("", "str"),
     "FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S": ("", "str"),
+    "FNMUSIC_REC_SEARCH_CONCURRENCY": ("", "str"),
+    "FNMUSIC_REC_SEARCH_INTERVAL": ("", "str"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -1926,8 +1929,18 @@ def fake_official_guid(real_guid: str) -> str:
 
 
 # 专辑伪装 guid 登记表（issue #22）：fake 32-hex → 专辑元信息。
-# 与 _FAKE_GUID_REVERSE 同生命周期（内存 + ensure_registry_warm 磁盘重建）。
+# 与 _FAKE_GUID_REVERSE 同生命周期（内存 + ensure_registry_warm 磁盘重建）；
+# /search/album 的在线专辑锚点额外落盘持久化（这类锚点不存在于任何快照存储，
+# 重启后 warm 重建不到，见 _persist_album_registry/_load_album_registry_persisted）。
 _FAKE_ALBUM_REGISTRY: dict[str, dict] = {}
+_ALBUM_REGISTRY_PATH = (
+    os.environ.get("FNMUSIC_ALBUM_REGISTRY", "").strip()
+    or os.path.join(_HOME, "album_registry.json")
+)
+_ALBUM_REGISTRY_PERSIST_MAX = 256
+_ALBUM_REGISTRY_TTL_S = 14 * 86400
+_ALBUM_PERSIST_MIN_INTERVAL_S = 5.0
+_ALBUM_PERSIST_LAST = 0.0
 
 
 def _album_name_from_obj(track_obj: dict) -> str:
@@ -1944,13 +1957,92 @@ def _item_meta_richness(it: dict) -> int:
     return int(bool(str(it.get("title") or "").strip())) + int(bool(str(it.get("album") or "").strip()))
 
 
-def register_fake_album(track_guid: str, album_name: str, item: dict | None = None, album_id: str = "") -> None:
+def _persist_album_registry(force: bool = False) -> None:
+    """把内存专辑登记表落盘（节流 + 上限 + TTL），供重启后 ensure_registry_warm 恢复。
+
+    只持久化 persist=True 的登记（/search/album 的在线专辑锚点与聚合代表曲目），
+    而非全部曲目衍生登记——后者可从收藏/历史/推荐缓存重建，落盘只会膨胀。
+    """
+    global _ALBUM_PERSIST_LAST
+    now = time.monotonic()
+    if not force and now - _ALBUM_PERSIST_LAST < _ALBUM_PERSIST_MIN_INTERVAL_S:
+        return
+    _ALBUM_PERSIST_LAST = now
+    try:
+        os.makedirs(os.path.dirname(_ALBUM_REGISTRY_PATH) or ".", exist_ok=True)
+        now_ts = int(time.time())
+        entries = []
+        for entry in _FAKE_ALBUM_REGISTRY.values():
+            if not entry.get("persist"):
+                continue
+            entries.append({
+                "track_guid": str(entry.get("track_guid") or ""),
+                "source": str(entry.get("source") or ""),
+                "album": str(entry.get("album") or ""),
+                "album_id": str(entry.get("album_id") or ""),
+                "item": entry.get("item") if isinstance(entry.get("item"), dict) else {},
+                "saved_at": now_ts,
+            })
+        payload = {"version": 1, "savedAt": now_ts, "entries": entries[-_ALBUM_REGISTRY_PERSIST_MAX:]}
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_ALBUM_REGISTRY_PATH) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, _ALBUM_REGISTRY_PATH)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except Exception as e:
+        logger.debug("album registry persist failed: %s", type(e).__name__)
+
+
+def _load_album_registry_persisted() -> int:
+    """重启后从磁盘恢复 /search/album 登记的在线专辑（跨会话可反解，消除
+    "重启后点旧搜索结果进专辑回落官方无此专辑"的窗口）。返回恢复条数。"""
+    try:
+        with open(_ALBUM_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return 0
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return 0
+    cutoff = time.time() - _ALBUM_REGISTRY_TTL_S
+    restored = 0
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        track_guid = str(row.get("track_guid") or "")
+        saved_at = row.get("saved_at")
+        if not track_guid or (isinstance(saved_at, (int, float)) and saved_at < cutoff):
+            continue
+        fake = fake_official_guid(f"{track_guid}:album")
+        if fake in _FAKE_ALBUM_REGISTRY:
+            continue
+        _FAKE_ALBUM_REGISTRY[fake] = {
+            "source": str(row.get("source") or source_from_online_guid(track_guid)),
+            "album": str(row.get("album") or ""),
+            "track_guid": track_guid,
+            "item": row.get("item") if isinstance(row.get("item"), dict) else {},
+            "album_id": str(row.get("album_id") or ""),
+            "persist": True,
+        }
+        restored += 1
+    return restored
+
+
+def register_fake_album(
+    track_guid: str, album_name: str, item: dict | None = None, album_id: str = "", persist: bool = False
+) -> None:
     """登记专辑伪装 guid → (source, 专辑名, 所属曲目条目)，供专辑详情拦截反解。
 
     曲目 VO 构造时同步登记（build_online_track 统一挂接，搜索/推荐/收藏/历史
     全路径覆盖）；假 id 是确定性 md5，重启后由 ensure_registry_warm 从收藏/
     历史/歌单附加/推荐缓存重建时同样登记，保证跨会话可反解。
     album_id：netease 真实专辑 id（/search/album 在线专辑直达详情用，可空）。
+    persist：/search/album 的在线专辑登记传 True——这类锚点不落在任何持久快照里，
+    重启后无法由 warm 重建，必须落盘（其余曲目衍生登记不需要，避免写放大）。
     """
     src = source_from_online_guid(track_guid)
     if not src:
@@ -1964,7 +2056,10 @@ def register_fake_album(track_guid: str, album_name: str, item: dict | None = No
             "track_guid": track_guid,
             "item": dict(item) if isinstance(item, dict) and item else {},
             "album_id": str(album_id or ""),
+            "persist": bool(persist),
         }
+        if persist:
+            _persist_album_registry()
         return
     # 已登记：残缺快照可被更全的后到登记覆盖——首次解析失败时 build_metadata_payload
     # 会用 stub（仅 id/source，issue #28 真机复现）先占位，若"首个非空即终"，
@@ -1977,6 +2072,11 @@ def register_fake_album(track_guid: str, album_name: str, item: dict | None = No
         cur = entry.get("item") if isinstance(entry.get("item"), dict) else {}
         if _item_meta_richness(item) > _item_meta_richness(cur):
             entry["item"] = dict(item)
+    if persist:
+        # 更新路径同样尝试落盘（节流 5s/次；更全的专辑名/album_id/item 需要跟着持久化）
+        if not entry.get("persist"):
+            entry["persist"] = True
+        _persist_album_registry()
 
 
 def resolve_fake_album(candidate: str) -> dict | None:
@@ -2092,6 +2192,11 @@ def ensure_registry_warm() -> None:
             if _register_fakes_from_plt(data):
                 continue
             _register_fakes_from_items(data.get("items") if isinstance(data, dict) else data)
+    # /search/album 的在线专辑锚点（不在任何快照存储里）从落盘登记恢复
+    try:
+        _load_album_registry_persisted()
+    except Exception as e:
+        logger.debug("album registry restore failed: %s", type(e).__name__)
 
 
 def resolve_real_guid(candidate: str) -> str:
@@ -4285,6 +4390,9 @@ async def favorite_track_list(request: Request):
 
 _HISTORY_LOCK = asyncio.Lock()
 _DAILY_TASKS: dict[str, asyncio.Task] = {}  # key: f"{user}:{kind}:{day}"
+# 空结果构建冷却：key 同 _DAILY_TASKS，value=该次空结果的 builtAt（见 _ensure_daily_task）
+_EMPTY_BUILD_COOLDOWN: dict[str, float] = {}
+_EMPTY_BUILD_COOLDOWN_S = 300.0
 
 
 def _prune_stale_daily_tasks(day: str) -> None:
@@ -4293,6 +4401,8 @@ def _prune_stale_daily_tasks(day: str) -> None:
         old = _DAILY_TASKS.pop(k, None)
         if old is not None and not old.done():
             old.cancel()
+    for k in [k for k in _EMPTY_BUILD_COOLDOWN if not str(k).endswith(f":{day}")]:
+        _EMPTY_BUILD_COOLDOWN.pop(k, None)
 
 
 def _recommend_kind_enabled(kind: str) -> bool:
@@ -4345,8 +4455,24 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
                 result = task.result()
                 if isinstance(result, dict) and len(result.get("tracks") or []) >= dailyrec.PLAYLIST_SIZE:
                     return task
+                if isinstance(result, dict) and not result.get("tracks"):
+                    # 空结果冷却：音源全挂/LLM 不可用时构建产出 0 首，缓存为空会让
+                    # 每次打开列表都重新触发一轮构建（反复打搜索与 LLM）。5 分钟内
+                    # 不重建，冷却过后自动重试（缓存非空时本分支不会到达）。
+                    built_at = result.get("builtAt")
+                    last = float(built_at) if isinstance(built_at, (int, float)) else time.time()
+                    if time.time() - last < _EMPTY_BUILD_COOLDOWN_S:
+                        _EMPTY_BUILD_COOLDOWN[key] = last
+                        return task
+                    _EMPTY_BUILD_COOLDOWN[key] = last
         except (asyncio.CancelledError, Exception):
             pass
+    if time.time() - _EMPTY_BUILD_COOLDOWN.get(key, 0.0) < _EMPTY_BUILD_COOLDOWN_S:
+        # 冷却期内：不重复构建（上方已把可返回的 done task 返回；此处是异常/无结果的兜底）
+        done = _DAILY_TASKS.get(key)
+        if done is not None:
+            return done
+    _EMPTY_BUILD_COOLDOWN.pop(key, None)
     async with _FAV_LOCK:
         favs = load_online_favorites(user_guid)
     task = asyncio.create_task(
@@ -5321,7 +5447,7 @@ async def _netease_album_search_rows(request: Request, keyword: str, limit: int)
         # 锚点 guid 仅供专辑伪装登记/反解，不对应任何真实曲目；
         # 形态对齐曲目锚点约定：专辑 guid = 锚点 + ":album"（register 内部拼）
         anchor = f"online:netease:album:{album_id}"
-        register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id)
+        register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id, persist=True)
         out.append(_album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0))
         if len(out) >= limit:
             break
@@ -5385,7 +5511,7 @@ async def _aggregate_album_search_rows(request: Request, keyword: str, limit: in
             rep_guid = online_guid_from_item(rep)
         except Exception:
             continue
-        register_fake_album(rep_guid, album_name, rep)
+        register_fake_album(rep_guid, album_name, rep, persist=True)
         out.append(_album_list_obj(
             f"{rep_guid}:album", album_name,
             str(rep.get("artist") or ""), rep_guid, len(items),
