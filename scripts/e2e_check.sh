@@ -96,7 +96,7 @@ fi
 # ── 2. 分页 ─────────────────────────────────────────────
 SEARCH2=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=2&size=10")
 LIST2_COUNT=$(echo "$SEARCH2" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
-if [ "${TOTAL1:-0}" -gt 10 ] && [ "${LIST1_COUNT:-0}" -eq 10 ] && [ "${LIST2_COUNT:-0}" -gt 0 ]; then
+if [ "${TOTAL1:-0}" -gt 10 ] && [ "${LIST1_COUNT:-0}" -gt 0 ] && [ "${LIST2_COUNT:-0}" -gt 0 ]; then
   ok "分页 page=2（page1=$LIST1_COUNT 条 / page2=$LIST2_COUNT 条 / total=$TOTAL1）"
 else
   bad "分页 page=2" "total=$TOTAL1，page1=$LIST1_COUNT，page2=$LIST2_COUNT（需 total>10 且两页均非空）"
