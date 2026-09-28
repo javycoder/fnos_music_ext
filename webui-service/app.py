@@ -2,7 +2,7 @@
 
 定位：同容器内经 127.0.0.1 访问三源服务，subprocess 调 supervisorctl 切换音源
 进程，直接读写挂载在 /repo 的仓库目录下的 .env（proxy 靠热重载生效）。
-不挂 docker.sock、不做容器级操作；无鉴权——仅限可信内网使用（文档已声明）。
+不挂 docker.sock、不做容器级操作。管理接口要先用密码换取会话。
 
 前端为原生单页（static/，无构建、无 CDN 资产）。
 """
@@ -24,7 +24,20 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
+from auth import (  # noqa: E402
+    COOKIE_NAME,
+    LOCK_AFTER,
+    LOCK_S,
+    SESSION_TTL_S,
+    hash_password,
+    issue_token,
+    new_session_secret,
+    password_ok,
+    token_valid,
+    verify_password,
+)
 from proxy.env_merge import (  # noqa: E402
     parse_env_file,
     preserve_user_comments,
@@ -133,6 +146,7 @@ def write_env(updates: dict[str, str]) -> list[str]:
             trailing=preserve_user_comments(others, header=CONF["env_header"]),
         ),
     )
+    _auth_cache["mtime"] = None
     return changed
 
 
@@ -357,11 +371,167 @@ def _read_version() -> str:
         return SERVICE_VERSION
 
 
+# ------------------------------------------------------------------ 认证 --
+
+_auth_cache: dict = {"mtime": None, "password_hash": "", "session_secret": ""}
+_login_failures: dict[str, dict] = {}
+
+
+def load_auth() -> tuple[str, str]:
+    """按 .env mtime 重读密码哈希和会话密钥。"""
+    try:
+        mtime = ENV_PATH.stat().st_mtime_ns
+    except OSError:
+        _auth_cache.update(mtime=None, password_hash="", session_secret="")
+        return "", ""
+    if _auth_cache["mtime"] == mtime:
+        return _auth_cache["password_hash"], _auth_cache["session_secret"]
+    values = read_env()
+    password_hash = values.get("FNMUSIC_WEBUI_PASSWORD_HASH", "")
+    session_secret = values.get("FNMUSIC_WEBUI_SESSION_SECRET", "")
+    _auth_cache.update(mtime=mtime, password_hash=password_hash, session_secret=session_secret)
+    return password_hash, session_secret
+
+
+def _client_host(scope_or_request) -> str:
+    if isinstance(scope_or_request, Request):
+        client = scope_or_request.client
+        return client.host if client else ""
+    client = scope_or_request.get("client")
+    if client and isinstance(client, (list, tuple)) and client:
+        return str(client[0])
+    return ""
+
+
+def _header_map(scope) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in scope.get("headers") or []:
+        out[key.decode("latin-1").lower()] = value.decode("latin-1")
+    return out
+
+
+def _token_from_headers(headers: dict[str, str]) -> str:
+    authz = headers.get("authorization", "")
+    if authz.lower().startswith("bearer "):
+        return authz[7:].strip()
+    cookie = headers.get("cookie", "")
+    prefix = COOKIE_NAME + "="
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith(prefix):
+            return part[len(prefix):]
+    return ""
+
+
+def login_locked(host: str, now: float | None = None) -> bool:
+    state = _login_failures.get(host)
+    if not state:
+        return False
+    current = time.time() if now is None else now
+    locked_until = float(state.get("locked_until") or 0)
+    if locked_until and current < locked_until:
+        return True
+    if locked_until and current >= locked_until:
+        _login_failures.pop(host, None)
+    return False
+
+
+def note_login_failure(host: str, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    state = _login_failures.setdefault(host, {"count": 0, "locked_until": 0.0})
+    state["count"] = int(state.get("count") or 0) + 1
+    if state["count"] >= LOCK_AFTER:
+        state["locked_until"] = current + LOCK_S
+        state["count"] = 0
+
+
+def note_login_success(host: str) -> None:
+    _login_failures.pop(host, None)
+
+
+def _public_route(method: str, path: str) -> bool:
+    if method == "POST" and path == "/api/auth/login":
+        return True
+    if method == "GET" and path in ("/healthz", "/", "/api/auth/session"):
+        return True
+    if method == "GET" and (path == "/static" or path.startswith("/static/")):
+        return True
+    return False
+
+
+class LoginBody(BaseModel):
+    password: str = ""
+
+
+class PasswordBody(BaseModel):
+    current_password: str = ""
+    new_password: str = ""
+
+
+def _session_cookie(token: str) -> str:
+    return (
+        f"{COOKIE_NAME}={token}; HttpOnly; Path=/; Max-Age={SESSION_TTL_S}; SameSite=Lax"
+    )
+
+
 # ------------------------------------------------------------------ API --
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "service": "fnmusic-webui", "version": SERVICE_VERSION}
+    return {"ok": True}
+
+
+@app.get("/api/auth/session")
+async def api_auth_session(request: Request):
+    _, secret = load_auth()
+    token = _token_from_headers({k.lower(): v for k, v in request.headers.items()})
+    return {"ok": True, "authenticated": bool(token_valid(token, secret))}
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(body: LoginBody, request: Request):
+    host = _client_host(request)
+    if login_locked(host):
+        return JSONResponse(content={"ok": False, "error": "登录失败次数过多，请稍后再试"}, status_code=429)
+    password_hash, secret = load_auth()
+    if not password_hash or not secret or not verify_password(body.password, password_hash):
+        note_login_failure(host)
+        return JSONResponse(content={"ok": False, "error": "密码错误"}, status_code=401)
+    note_login_success(host)
+    token = issue_token(secret)
+    resp = JSONResponse(content={"ok": True})
+    resp.headers.append("set-cookie", _session_cookie(token))
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout():
+    resp = JSONResponse(content={"ok": True})
+    resp.headers.append("set-cookie", f"{COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax")
+    return resp
+
+
+@app.post("/api/auth/password")
+async def api_auth_password(body: PasswordBody, request: Request):
+    password_hash, _secret = load_auth()
+    if not verify_password(body.current_password, password_hash):
+        return JSONResponse(content={"ok": False, "error": "当前密码不正确"}, status_code=400)
+    err = password_ok(body.new_password)
+    if err:
+        return JSONResponse(content={"ok": False, "error": err}, status_code=400)
+    if body.new_password == body.current_password:
+        return JSONResponse(content={"ok": False, "error": "新密码不能与当前密码相同"}, status_code=400)
+    new_hash = hash_password(body.new_password)
+    new_secret = new_session_secret()
+    write_env({
+        "FNMUSIC_WEBUI_PASSWORD_HASH": new_hash,
+        "FNMUSIC_WEBUI_SESSION_SECRET": new_secret,
+    })
+    _auth_cache["mtime"] = None
+    token = issue_token(new_secret)
+    resp = JSONResponse(content={"ok": True})
+    resp.headers.append("set-cookie", _session_cookie(token))
+    return resp
 
 
 @app.get("/api/status")
@@ -662,4 +832,37 @@ class DesktopPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+class AuthMiddleware:
+    """管理接口要求有效会话。桌面前缀由外层中间件先剥掉。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or ""
+        method = (scope.get("method") or "GET").upper()
+        if not path.startswith("/api/") or _public_route(method, path):
+            await self.app(scope, receive, send)
+            return
+        _, secret = load_auth()
+        token = _token_from_headers(_header_map(scope))
+        if token_valid(token, secret):
+            await self.app(scope, receive, send)
+            return
+        body = '{"ok":false,"error":"需要登录"}'.encode()
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                [b"content-type", b"application/json; charset=utf-8"],
+                [b"content-length", str(len(body)).encode()],
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(AuthMiddleware)
 app.add_middleware(DesktopPrefixMiddleware)

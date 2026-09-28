@@ -16,8 +16,8 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 - **三音源单选**（v2.0.0 起互斥，可在 WebUI 秒级切换）：
   - [musicbox](https://github.com/darknessomi/musicbox)：网易云高品质解析，支持扫码登录 VIP/无损曲库与原生每日推荐；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)：酷我/咪咕等 57 个平台聚合，可按平台粒度勾选（编号见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）。部分音乐源歌曲少，或返回的音乐不可播放，请自行测试并使用可靠音乐源；
-  - **lxmusic**：洛雪音乐自定义源运行时——搜索/歌词/榜单走内置平台接口，播放解析由你提供的洛雪自定义源脚本（Node 沙箱隔离运行）完成。源脚本支持三种配置方式：**粘贴 URL**、**上传电脑上的 `.js` 文件**、**从 NAS 选择 `.js`**（飞牛桌面内），搜索结果以及能否播放视源脚本而定，请自行测试并使用可靠来源；
-- **管理 WebUI**（可选，端口 8774）：浏览器里完成音源切换、musicdl 平台勾选、网易扫码、洛雪源配置（URL/上传/NAS 选择）与测试保存、音质偏好、边听边存、推荐开关与 LLM 配置，全部热生效；
+  - **lxmusic**：洛雪音乐自定义源运行时——搜索/歌词/榜单走内置平台接口，播放解析由你提供的洛雪自定义源脚本（在容器内执行）完成。源脚本支持三种配置方式：**粘贴 URL**、**上传电脑上的 `.js` 文件**、**从 NAS 选择 `.js`**（飞牛桌面内）。导入 URL 或 `.js` 前必须自行确认来源安全，不要导入来历不明的脚本；脚本在容器内执行，不受管理密码保护。搜索结果以及能否播放视源脚本而定；
+- **管理 WebUI**（可选，端口 8774，须设置管理密码）：浏览器里完成音源切换、musicdl 平台勾选、网易扫码、洛雪源配置（URL/上传/NAS 选择）与测试保存、音质偏好、边听边存、推荐开关与 LLM 配置，全部热生效；
 - **音质偏好**：`高音质`（从高到低）/ `平衡`（取中间档）/ `流畅`（优先最低）三种模式，覆盖全部音源；
 - **智能边听边存**：在线听歌时后台自动缓存，再次播放本地秒开；可选完整试听后保存进本地曲库；
 - **自动下载封面**：自动保存到本地曲库的歌曲（边听边存 / 收藏自动绑定本地）落库后自动把封面内嵌进音频文件，飞牛音乐 App 里下载的歌即有封面图（可在 WebUI 关闭）；
@@ -41,13 +41,13 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 │   ├─ 边播边存 Tee 落盘                                   │
 │   └─ .env 热重载（2s 检测，白名单键免重启生效）           │
 └───────────────┬─────────────────────────────────────────┘
-                │ 127.0.0.1（仅 musicbox/WebUI 暴露局域网）
+                │ 127.0.0.1（音源仅本机；WebUI 供浏览器）
 ┌───────────────▼─────────────────────────────────────────┐
 │ Docker 单容器 fnmusic-sources（supervisor 按需加载）      │
 │   ├─ musicdl  127.0.0.1:8768 → 容器 8001                 │
-│   ├─ musicbox 0.0.0.0:8770  → 容器 8002（扫码）          │
+│   ├─ musicbox 127.0.0.1:8770 → 容器 8002（扫码走 WebUI） │
 │   ├─ lxmusic  127.0.0.1:8772 → 容器 8003                 │
-│   └─ WebUI    0.0.0.0:8774  → 容器 8004                  │
+│   └─ WebUI    0.0.0.0:8774  → 容器 8004（需管理密码）    │
 │   只启动当前所选音源进程（+可选 WebUI），其余不驻留内存；  │
 │   切换音源 = supervisorctl 秒级 stop/start                │
 └─────────────────────────────────────────────────────────┘
@@ -125,7 +125,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 ./restore.sh --full  # 彻底清理（连配置/登录态/缓存/收藏一并删除）
 ```
 
-网易云扫码（musicbox 源）：终端 `./install.sh --qr`，或浏览器访问 `http://<NAS_IP>:8770/api/v1/auth/login/qr.png`。
+网易云扫码（musicbox 源）：终端 `./install.sh --qr`，或登录管理页后在「音乐源」扫码。
 
 > 部署形态细节、单机多副本约束（`--adopt`）、洛雪源配置与故障排查见 [docs/INSTALL.md](docs/INSTALL.md)。
 
@@ -136,7 +136,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `FNMUSIC_MUSICDL_ENABLED` / `FNMUSIC_NETEASE_ENABLED` / `FNMUSIC_LX_ENABLED` | 单选 | 三音源互斥开关，只能一个为 `true`（热重载） |
-| `FNMUSIC_WEBUI_ENABLED` | `false` | 管理 WebUI 开关（端口 8774，无鉴权） |
+| `FNMUSIC_WEBUI_ENABLED` | `false` | 管理 WebUI 开关（端口 8774，需管理密码） |
 | `LX_SOURCE_URL` | *(空)* | 洛雪自定义源脚本地址：`http(s)://` URL 或 `file:///data/lxmusic/uploads/<名字>.js`（管理页上传/NAS 选择生成）；建议在 WebUI 里「测试并保存」 |
 | `LX_SOURCES` | `kg,wy,mg,kw` | lxmusic 启用的平台（kg/wy/mg/kw/tx） |
 | `FNMUSIC_ONLINE_SOURCES` / `MUSICDL_SOURCES` | 酷我+咪咕 | musicdl 平台白名单（短名/全名均可） |
@@ -173,8 +173,8 @@ git pull
 
 ## 常见问题
 
-- **WebUI 打不开 / 提醒**：WebUI 无鉴权，仅限可信内网使用；确认安装时选择了 WebUI，或设置 `FNMUSIC_WEBUI_ENABLED=true` 后运行 `./extend.sh`。
-- **洛雪源播放失败**：源脚本由第三方提供，在容器内 Node 沙箱中运行——请在 WebUI 中用「测试」按钮验证源可用性，失败时更换源 URL 或重新上传脚本文件。
+- **WebUI 打不开**：确认安装时选择了 WebUI 并设置了管理密码，或 `.env` 中 `FNMUSIC_WEBUI_ENABLED=true` 且已有密码哈希后运行 `./extend.sh`。打开页面后使用该密码登录。
+- **洛雪源播放失败**：源脚本由第三方提供，在容器内执行，不受管理密码保护。导入前必须自行确认来源安全，不要导入来历不明的脚本。可在 WebUI 中用「测试」按钮验证源可用性，失败时更换源 URL 或重新上传脚本文件。
 - **musicdl 某平台搜索为空**：上游接口变化所致，不影响其他平台；可升级 musicdl（`>=2.13.11`）后重建镜像。
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/LLM 等）；路径、端口、平台白名单类改动需执行 `./extend.sh` 重启容器。
@@ -206,7 +206,7 @@ sudo python3 tests/integration/fpk_lifecycle.py --auto-restore
 
 - 本项目基于 **MIT 许可证** 开源（见 [LICENSE](LICENSE)），严格限定于**个人技术研究与非商业用途**；
 - 本项目是协议中继与数据适配层，不托管、不分发任何受版权保护的音频与元数据；音频及元数据版权归属各原始版权方，请支持正版；
-- 洛雪自定义源脚本等第三方代码由使用者自行提供并在隔离子进程中运行，请仅使用可信来源的脚本、仅访问您有权收听的内容；
+- 洛雪自定义源脚本等第三方代码由使用者自行提供并在容器内执行，不受管理密码保护。导入 URL 或 `.js` 前必须自行确认来源安全，不要导入来历不明的脚本，且仅访问您有权收听的内容；
 - 使用者应遵守所在国家/地区法律法规与第三方平台用户协议；因滥用导致的任何责任由使用者自行承担。
 
 上游致谢：[CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)、[darknessomi/musicbox](https://github.com/darknessomi/musicbox)、洛雪音乐（LX Music）社区及其自定义源规范。

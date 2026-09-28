@@ -17,10 +17,20 @@ let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 
+function showLogin() {
+  const overlay = $("#login-overlay");
+  if (overlay) overlay.hidden = false;
+}
+
 async function api(path, options) {
-  const resp = await fetch(APP_BASE + path, options);
+  const opts = Object.assign({ credentials: "same-origin" }, options || {});
+  const resp = await fetch(APP_BASE + path, opts);
   let body = {};
   try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+  if (resp.status === 401 && path !== "/api/auth/login") {
+    showLogin();
+    throw new Error(body.error || "需要登录");
+  }
   if (!resp.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
   return body;
 }
@@ -537,10 +547,82 @@ window.addEventListener("beforeunload", (ev) => {
   if (dirty) ev.preventDefault();
 });
 
-/* -------------------------------------------------------------- 启动 */
-(async function boot() {
+/* -------------------------------------------------------------- 登录与密码 */
+let booted = false;
+
+async function bootApp() {
+  if (booted) return;
+  booted = true;
   await loadConfig();
   await loadStatus();
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   setInterval(loadStatus, 15000);
+}
+
+async function submitLogin(event) {
+  if (event) event.preventDefault();
+  const password = $("#login-password").value;
+  const btn = $("#login-btn");
+  btn.disabled = true;
+  try {
+    const resp = await fetch(APP_BASE + "/api/auth/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok) throw new Error(body.error || `HTTP ${resp.status}`);
+    $("#login-password").value = "";
+    $("#login-overlay").hidden = true;
+    await bootApp();
+  } catch (exc) {
+    toast(exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+  }
+}
+$("#login-form").addEventListener("submit", submitLogin);
+
+$("#pw-save").addEventListener("click", async () => {
+  const current = $("#pw-current").value;
+  const next = $("#pw-new").value;
+  const confirm = $("#pw-confirm").value;
+  if (next !== confirm) {
+    toast("两次输入的新密码不一致", "fail");
+    return;
+  }
+  try {
+    await api("/api/auth/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: current, new_password: next }),
+    });
+    $("#pw-current").value = "";
+    $("#pw-new").value = "";
+    $("#pw-confirm").value = "";
+    toast("密码已修改，其他会话已退出", "ok");
+  } catch (exc) {
+    toast("修改失败：" + exc.message, "fail");
+  }
+});
+
+$("#pw-logout").addEventListener("click", async () => {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } catch (_) { /* 已失效的会话也回到登录层 */ }
+  showLogin();
+});
+
+(async function start() {
+  try {
+    const session = await api("/api/auth/session");
+    if (session.authenticated) {
+      $("#login-overlay").hidden = true;
+      await bootApp();
+      return;
+    }
+  } catch (_) { /* 未登录 */ }
+  showLogin();
 })();

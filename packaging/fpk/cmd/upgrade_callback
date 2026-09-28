@@ -15,6 +15,16 @@ if [ -f "${BACKUP_DIR}/data.tar.gz" ]; then
     fi
 fi
 
+hash_line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?FNMUSIC_WEBUI_PASSWORD_HASH=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null | tail -n1 || true)"
+hash_val="${hash_line#*=}"
+hash_val="${hash_val#\'}"
+hash_val="${hash_val#\"}"
+hash_val="${hash_val%\'}"
+hash_val="${hash_val%\"}"
+if [ -z "${hash_val}" ]; then
+    fnmusic_fail "升级失败：尚未设置管理密码。请重新安装并在向导中设置至少 8 位的管理密码"
+fi
+
 SOURCES="$(fnmusic_saved_source)"
 [ -n "${SOURCES}" ] || SOURCES="musicdl"
 

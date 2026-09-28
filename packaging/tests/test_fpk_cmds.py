@@ -152,6 +152,9 @@ esac
 
     def run(self, script: str, *args: str, env: dict | None = None,
             **extra: str) -> subprocess.CompletedProcess:
+        if script == "install_callback" and env is None:
+            extra.setdefault("wizard_webui_password", "correct-horse")
+            extra.setdefault("wizard_webui_password_confirm", "correct-horse")
         return subprocess.run([str(self.cmd / script), *args],
                               env=env or self.env(**extra),
                               capture_output=True, text=True, timeout=60)
@@ -444,6 +447,44 @@ def test_install_callback_requires_repo_payload(sb):
     assert "应用文件缺失" in result.stderr
 
 
+def test_install_callback_rejects_empty_password(sb):
+    sb.make_repo()
+    result = sb.run(
+        "install_callback",
+        wizard_sources="musicdl",
+        wizard_webui_password="",
+        wizard_webui_password_confirm="",
+    )
+    assert result.returncode == 1
+    assert "必须设置管理密码" in result.stderr
+    assert sb.install_args() == []
+
+
+def test_install_callback_rejects_mismatched_password(sb):
+    sb.make_repo()
+    result = sb.run(
+        "install_callback",
+        wizard_sources="musicdl",
+        wizard_webui_password="correct-horse",
+        wizard_webui_password_confirm="other-horse",
+    )
+    assert result.returncode == 1
+    assert "不一致" in result.stderr
+    assert "correct-horse" not in result.stderr
+    assert "other-horse" not in result.stderr
+    assert sb.install_args() == []
+
+
+def test_install_callback_does_not_log_password(sb):
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="musicdl", wizard_extend="false")
+    assert result.returncode == 0, result.stderr
+    blob = result.stderr + result.stdout + "\n".join(sb.install_args())
+    if sb.durable_log.exists():
+        blob += sb.durable_log.read_text(encoding="utf-8")
+    assert "correct-horse" not in blob
+
+
 def test_install_callback_cleans_foreign_unit(sb):
     """安装时若存在指向其他目录的残留 unit，应主动清理避免冲突。"""
     repo = sb.make_repo()
@@ -579,6 +620,15 @@ def test_upgrade_init_keeps_unit_matching_this_repo(sb):
 
 # -------------------------------------------------------- upgrade_callback ---
 
+_WEBUI_HASH = "FNMUSIC_WEBUI_PASSWORD_HASH=scrypt$00112233445566778899aabbccddeeff$ff\n"
+
+
+def _with_hash(env_text: str) -> str:
+    if "FNMUSIC_WEBUI_PASSWORD_HASH=" in env_text:
+        return env_text
+    return env_text.rstrip("\n") + "\n" + _WEBUI_HASH
+
+
 def _make_backup(sb: Sandbox, repo: Path, env_text: str) -> None:
     (repo / ".env").write_text(env_text, encoding="utf-8")
     backup = sb.pkgvar / "upgrade-backup"
@@ -589,7 +639,7 @@ def _make_backup(sb: Sandbox, repo: Path, env_text: str) -> None:
 
 def test_upgrade_callback_restores_backup_and_reinstalls_lx(sb):
     repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")  # 旧值，应被备份覆盖
-    _make_backup(sb, repo, "FNMUSIC_LX_ENABLED=true\nLX_SOURCE_URL=http://s/x.js\n")
+    _make_backup(sb, repo, _with_hash("FNMUSIC_LX_ENABLED=true\nLX_SOURCE_URL=http://s/x.js\n"))
     sb.add_data(repo)
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
@@ -618,7 +668,7 @@ def test_upgrade_callback_corrupt_backup_fails_and_keeps_it(sb):
 def test_upgrade_callback_lx_without_url_still_upgrades(sb):
     """v2.2.7+ 无源安装（装后管理页配置）：.env 缺 LX_SOURCE_URL 不阻塞升级。"""
     repo = sb.make_repo()
-    _make_backup(sb, repo, "FNMUSIC_LX_ENABLED=true\n")  # 备份缺 LX_SOURCE_URL
+    _make_backup(sb, repo, _with_hash("FNMUSIC_LX_ENABLED=true\n"))  # 备份缺 LX_SOURCE_URL
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == ["--non-interactive --sources lxmusic --webui --extend --adopt --lx-skip-verify"]
@@ -627,7 +677,7 @@ def test_upgrade_callback_lx_without_url_still_upgrades(sb):
 
 
 def test_upgrade_callback_without_backup_uses_current_env(sb):
-    sb.make_repo(env_text="FNMUSIC_NETEASE_ENABLED=true\n")
+    sb.make_repo(env_text=_with_hash("FNMUSIC_NETEASE_ENABLED=true\n"))
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == ["--non-interactive --sources musicbox --webui --extend --adopt"]
@@ -637,7 +687,7 @@ def test_upgrade_callback_install_failure_keeps_backup(sb):
     repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
     sb.add_data(repo)
     sb.add_docker()
-    _make_backup(sb, repo, "FNMUSIC_MUSICDL_ENABLED=true\n")
+    _make_backup(sb, repo, _with_hash("FNMUSIC_MUSICDL_ENABLED=true\n"))
     result = sb.run("upgrade_callback", STUB_INSTALL_RC="9")
     assert result.returncode == 1
     assert "升级失败" in result.stderr
@@ -650,8 +700,9 @@ def test_upgrade_callback_install_failure_keeps_backup(sb):
 def test_upgrade_callback_defaults_to_musicdl_when_env_silent(sb):
     sb.make_repo(env_text="SOME_OTHER_KEY=1\n")
     result = sb.run("upgrade_callback")
-    assert result.returncode == 0, result.stderr
-    assert sb.install_args() == ["--non-interactive --sources musicdl --webui --extend --adopt"]
+    assert result.returncode == 1
+    assert "管理密码" in result.stderr
+    assert sb.install_args() == []
 
 
 # ---------------------------------------------------------- uninstall_init ---

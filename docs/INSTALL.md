@@ -37,9 +37,9 @@ v2.0.0 起部署形态固定为两部分：
 | 端口 | 绑定地址 | 用途 |
 | :--- | :--- | :--- |
 | 8768 | 127.0.0.1 | musicdl 音源（仅代理访问） |
-| 8770 | 0.0.0.0 | musicbox 音源（局域网扫码登录） |
+| 8770 | 127.0.0.1 | musicbox 音源（仅本机；扫码走已登录的管理页） |
 | 8772 | 127.0.0.1 | lxmusic 音源（仅代理访问） |
-| 8774 | 0.0.0.0 | 管理 WebUI（无鉴权，仅限可信内网） |
+| 8774 | 0.0.0.0 | 管理 WebUI（需管理密码） |
 
 数据卷：项目目录 `sources-data/`（网易登录态、洛雪源脚本缓存与状态）；仓库目录挂载到容器 `/repo`（WebUI 读写 `.env` 用）。容器无特权、不挂 docker.sock。
 
@@ -51,7 +51,7 @@ v2.0.0 起部署形态固定为两部分：
 
 从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件：
 
-1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic，选 lxmusic 需填写源脚本 URL）；
+1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic，选 lxmusic 需填写源脚本 URL），并设置至少 8 位的管理密码；
 2. 保持「安装完成后立即启用扩展」开启，安装即自动完成容器构建、代理接管与全链路验收；
 3. 桌面出现「fnMusic 扩展管理」图标，点击在飞牛桌面窗口内打开管理页（`http://<NAS_IP>:8774`）。
 
@@ -83,15 +83,16 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
    - `1` 网易云 musicbox：安装后自动进入扫码登录；
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
    - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
-2. **是否安装管理 WebUI**（端口 8774，默认否；无鉴权，仅限可信内网）；
+2. **是否安装管理 WebUI**（端口 8774，默认否；选择安装后必须设置至少 8 位的管理密码）；
 3. **大模型每日推荐（可选）**：OpenAI 兼容 API，仅在未启用网易音源时作为推荐兜底；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
 
 ### 非交互静默部署（自动化脚本）
 
 ```bash
-# 网易云 + WebUI
-./install.sh --non-interactive --sources musicbox --webui --extend
+# 网易云 + WebUI（密码放环境变量，不要写进命令行参数）
+FNMUSIC_WEBUI_PASSWORD='<至少 8 位>' \
+  ./install.sh --non-interactive --sources musicbox --webui --extend
 
 # musicdl（酷我+咪咕；平台粒度用短名或编号）
 ./install.sh --non-interactive --sources musicdl-kuwo,musicdl-migu --extend
@@ -101,7 +102,8 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --lx-source-url 'https://example.com/your-source.js' --extend
 ./install.sh --non-interactive --sources lxmusic \
   --lx-source-url "$HOME/scripts/my-source.js" --extend   # 本机路径自动复制进数据卷
-./install.sh --non-interactive --sources lxmusic --webui --extend  # 无源安装，装后在管理页配置
+FNMUSIC_WEBUI_PASSWORD='<至少 8 位>' \
+  ./install.sh --non-interactive --sources lxmusic --webui --extend  # 无源安装，装后在管理页配置
 
 # 附带大模型推荐兜底（密钥仅写入本地 .env，权限 600）
 ./install.sh --non-interactive --sources musicdl --enable-recommend \
@@ -167,8 +169,8 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 ./install.sh --qr        # 或 ./netease_login.sh / ./extend.sh --qr
 ```
 
-或局域网浏览器访问 `http://<NAS_IP>:8770/api/v1/auth/login/qr.png` 扫码。
-登录凭证持久化在 `sources-data/`，无需重复扫码；WebUI 内亦可扫码。
+或登录管理页后在「音乐源」扫码。
+登录凭证持久化在 `sources-data/`，无需重复扫码。
 
 ---
 

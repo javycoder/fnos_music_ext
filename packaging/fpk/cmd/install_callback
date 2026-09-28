@@ -47,7 +47,19 @@ if [ -f "${DEPLOYMENT_FILE}" ]; then
     fi
 fi
 
-# 3. 组装安装参数：应用中心安装天然代表确立整机唯一部署，始终追加 --adopt
+# 3. 管理密码：空值或两次不一致时不调用安装脚本，也不把明文写入日志。
+PW="${wizard_webui_password:-}"
+PW2="${wizard_webui_password_confirm:-}"
+if [ -z "${PW}" ] || [ "${#PW}" -lt 8 ]; then
+    fnmusic_fail "必须设置管理密码（至少 8 位）才能继续安装"
+fi
+if [ "${PW}" != "${PW2}" ]; then
+    fnmusic_fail "两次输入的管理密码不一致"
+fi
+export FNMUSIC_WEBUI_PASSWORD="${PW}"
+unset PW PW2
+
+# 4. 组装安装参数：应用中心安装天然代表确立整机唯一部署，始终追加 --adopt
 ARGS=(--non-interactive --sources "${SOURCES}" --webui --adopt)
 # 洛雪源脚本（URL/电脑上传/NAS 选择）统一装好后在管理页 WebUI 配置：
 # 安装向导平台没有文件上传组件，URL 也不再向安装者索要，无源安装不阻塞。

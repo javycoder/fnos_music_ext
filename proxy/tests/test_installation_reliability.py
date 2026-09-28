@@ -587,6 +587,10 @@ def test_lx_url_required_and_webui_choice_wiring():
     assert '是否安装管理 Web UI? [y/N]' in text
     assert 'WEBUI_CHOICE="${WEBUI_CHOICE:-no}"' in text
     assert "echo \"FNMUSIC_WEBUI_ENABLED='${WEBUI_FLAG}'\"" in text
+    assert "必须设置管理密码" in text
+    assert "FNMUSIC_WEBUI_PASSWORD" in text
+    assert "FNMUSIC_WEBUI_PASSWORD_HASH" in text
+    assert 'echo "FNMUSIC_WEBUI_PASSWORD=' not in text
     # 旧 .env 多源并存的升级检测
     assert '检测到旧版 .env 同时启用了多个音源' in text
 
