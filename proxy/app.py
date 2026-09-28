@@ -110,6 +110,11 @@ CONF = {
     "official_bind_timeout_s": float(os.environ.get("FNMUSIC_OFFICIAL_BIND_TIMEOUT_S", "120")),
     # 边听边存切歌续传：允许并行完成的续传任务上限（防快速跳歌时的下载洪泛；0=关闭续传）
     "tee_handoff_max": int(os.environ.get("FNMUSIC_TEE_HANDOFF_MAX", "3")),
+    # 自动下载封面：自动下载的音乐完整落库后，把源站封面内嵌进音频文件。
+    # 飞牛扫描器只认内嵌图（dhowden/tag，无外置 cover.jpg 能力），这是官方
+    # App 显示下载歌曲封面的唯一途径；封面在音乐落库成功后才处理，不存在
+    # 音乐失败、封面先落污染目录的情况
+    "auto_cover": os.environ.get("FNMUSIC_AUTO_COVER", "true").lower() in ("true", "1", "yes"),
     # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
     # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
     "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
@@ -447,6 +452,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_FAV_AUTO_BIND": ("fav_auto_bind", "bool"),
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": ("official_bind_timeout_s", "bind_timeout"),
     "FNMUSIC_TEE_HANDOFF_MAX": ("tee_handoff_max", "tee_handoff_max"),
+    "FNMUSIC_AUTO_COVER": ("auto_cover", "bool"),
     "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
@@ -1042,6 +1048,133 @@ def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -
         audio.save()
     except Exception as e:
         logger.warning("Failed to write audio tags for %s: %s", path, e)
+
+
+_COVER_FETCH_TRANSPORT: "httpx.SyncBaseTransport | None" = None
+_COVER_FETCH_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    """魔数嗅探图片类型；非图片返回空串（Content-Type 会说谎，字节不会）。"""
+    if data.startswith(b"\xFF\xD8\xFF"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return ""
+
+
+def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
+    """下载封面图字节（内嵌用）。非图片/超限/酷我文本假图/网络失败一律返回 None。"""
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    if _KW_TEXT_COVER_HOST in url:
+        return None
+    try:
+        kwargs: dict = {"timeout": 8.0, "follow_redirects": True}
+        if _COVER_FETCH_TRANSPORT is not None:
+            kwargs["transport"] = _COVER_FETCH_TRANSPORT
+        with httpx.Client(**kwargs) as client:
+            r = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return None
+        mime = _sniff_image_mime(data)
+        if not mime:
+            return None
+        return data, mime
+    except Exception as e:
+        logger.debug("cover fetch failed for %s: %s", url, type(e).__name__)
+        return None
+
+
+def _has_embedded_cover(path: str) -> bool:
+    try:
+        from mutagen import File as MutagenFile
+
+        mf = MutagenFile(path)
+        tags = getattr(mf, "tags", None)
+        if tags is None:
+            return False
+        if hasattr(tags, "pictures"):  # FLAC/APE
+            return bool(tags.pictures)
+        if hasattr(tags, "getall"):  # ID3
+            return bool(tags.getall("APIC"))
+        return bool(tags.get("covr") or tags.get("METADATA_BLOCK_PICTURE"))  # MP4/OGG
+    except Exception:
+        return False
+
+
+def embed_audio_cover(path: str, data: bytes, mime: str) -> bool:
+    """把封面字节内嵌进音频文件（MP3 APIC / FLAC Picture / MP4 covr / OGG）。
+
+    飞牛扫描器（dhowden/tag）只认内嵌图，不读外置 cover 图片文件，内嵌是
+    官方 App 显示封面的唯一途径。文件已有内嵌图（源站自带）则跳过；不支持的
+    格式（wav 等）返回 False。
+    """
+    try:
+        import base64
+
+        from mutagen import File as MutagenFile
+        from mutagen.flac import Picture
+        from mutagen.id3 import APIC, ID3
+        from mutagen.mp4 import MP4Cover
+
+        audio = MutagenFile(path)
+        if audio is None or _has_embedded_cover(path):
+            return False
+        cls = audio.__class__.__name__
+        if cls == "MP3":
+            try:
+                id3 = ID3(path)
+            except Exception:
+                id3 = ID3()
+            id3.delall("APIC")
+            id3.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+            id3.save(path, v2_version=3)
+            return True
+        if getattr(audio, "tags", None) is None:
+            try:
+                audio.add_tags()
+            except Exception:
+                return False
+        if cls == "MP4":
+            if mime not in ("image/jpeg", "image/png"):
+                return False
+            fmt = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+            audio["covr"] = [MP4Cover(data, imageformat=fmt)]
+            audio.save()
+            return True
+        if cls == "FLAC":
+            pic = Picture()
+            pic.type = 3
+            pic.mime = mime
+            pic.desc = "Cover"
+            pic.data = data
+            audio.add_picture(pic)
+            audio.save()
+            return True
+        if cls in ("OggVorbis", "OggOpus", "OggSpeex"):
+            pic = Picture()
+            pic.type = 3
+            pic.mime = mime
+            pic.desc = "Cover"
+            pic.data = data
+            audio["METADATA_BLOCK_PICTURE"] = [base64.b64encode(pic.write()).decode("ascii")]
+            audio.save()
+            return True
+        return False
+    except Exception as e:
+        logger.debug("cover embed failed for %s: %s", path, e)
+        return False
+
+
 
 
 def detect_library_dir() -> str:
@@ -2981,6 +3114,16 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         remember_media_path(guid, dest)
         adopt_library_perms(dest)
         write_audio_tags(dest, title, artist, album)
+        # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
+        # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
+        cover_url = str((info or {}).get("cover_url") or "").strip()
+        if cover_url and CONF.get("auto_cover", True):
+            try:
+                fetched = download_cover_bytes(cover_url)
+                if fetched and embed_audio_cover(dest, fetched[0], fetched[1]):
+                    logger.info("cover embedded for %s: %s", guid, dest)
+            except Exception as e:
+                logger.debug("cover embed step skipped for %s: %s", guid, e)
         # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
         promote_shadow_lyric(guid, dest)
     else:
