@@ -25,9 +25,9 @@ services:
     container_name: fnmusic-sources
     ports:
       - "127.0.0.1:8768:8001"  # musicdl（代理访问）
-      - "0.0.0.0:8770:8002"    # musicbox（扫码/调试，内网可访问）
+      - "127.0.0.1:8770:8002"  # musicbox（仅本机；扫码走已登录的 WebUI）
       - "127.0.0.1:8772:8003"  # lxmusic（代理访问）
-      - "0.0.0.0:8774:8004"    # WebUI（无鉴权：仅限可信内网，见 README 安全说明）
+      - "127.0.0.1:8774:8004"  # WebUI（仅本机；浏览器走飞牛网关）
     volumes:
       - ./sources-data:/data
       - .:/repo

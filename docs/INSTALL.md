@@ -37,9 +37,9 @@ v2.0.0 起部署形态固定为两部分：
 | 端口 | 绑定地址 | 用途 |
 | :--- | :--- | :--- |
 | 8768 | 127.0.0.1 | musicdl 音源（仅代理访问） |
-| 8770 | 0.0.0.0 | musicbox 音源（局域网扫码登录） |
+| 8770 | 127.0.0.1 | musicbox 音源（仅本机；扫码走已登录的管理页） |
 | 8772 | 127.0.0.1 | lxmusic 音源（仅代理访问） |
-| 8774 | 0.0.0.0 | 管理 WebUI（无鉴权，仅限可信内网） |
+| 8774 | 127.0.0.1 | 管理 WebUI（仅本机；浏览器走飞牛网关，仅管理员） |
 
 数据卷：项目目录 `sources-data/`（网易登录态、洛雪源脚本缓存与状态）；仓库目录挂载到容器 `/repo`（WebUI 读写 `.env` 用）。容器无特权、不挂 docker.sock。
 
@@ -53,7 +53,7 @@ v2.0.0 起部署形态固定为两部分：
 
 1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic，选 lxmusic 需填写源脚本 URL）；
 2. 保持「安装完成后立即启用扩展」开启，安装即自动完成容器构建、代理接管与全链路验收；
-3. 桌面出现「fnMusic 扩展管理」图标，点击在飞牛桌面窗口内打开管理页（`http://<NAS_IP>:8774`）。
+3. 桌面出现「fnMusic 扩展管理」图标，用飞牛管理员点击打开管理页（`/app/fnmusic-ext`）。
 
 日常启停在应用中心完成：「停止」秒级还原官方直连，「启动」恢复扩展。卸载会先自动备份配置与数据到存储卷根目录（`fnmusic-ext-backup-<时间戳>.tar.gz`）再清理。
 
@@ -83,7 +83,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
    - `1` 网易云 musicbox：安装后自动进入扫码登录；
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
    - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
-2. **是否安装管理 WebUI**（端口 8774，默认否；无鉴权，仅限可信内网）；
+2. **是否安装管理 WebUI**（仅本机 8774，默认否；打开时走飞牛管理员登录）；
 3. **大模型每日推荐（可选）**：OpenAI 兼容 API，仅在未启用网易音源时作为推荐兜底；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
 
@@ -133,7 +133,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 ./restore.sh --full
 ```
 
-**运行期换源/调参**：浏览器打开 `http://<NAS_IP>:8774`（若已装 WebUI），
+**运行期换源/调参**：用飞牛管理员打开桌面「fnMusic 扩展管理」（若已装 WebUI），
 在「音乐源」分区单选切换——写配置与容器内进程切换一步完成，代理侧由热重载
 同步，全程无需命令行。音质偏好、推荐开关、边听边存、LLM 同理。
 
@@ -167,8 +167,8 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 ./install.sh --qr        # 或 ./netease_login.sh / ./extend.sh --qr
 ```
 
-或局域网浏览器访问 `http://<NAS_IP>:8770/api/v1/auth/login/qr.png` 扫码。
-登录凭证持久化在 `sources-data/`，无需重复扫码；WebUI 内亦可扫码。
+或登录管理页后在「音乐源」扫码。
+登录凭证持久化在 `sources-data/`，无需重复扫码。
 
 ---
 

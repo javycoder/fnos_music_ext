@@ -22,6 +22,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setitem(p.CONF, "music_db", str(tmp_path / "missing.db"))
     monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
     monkeypatch.setitem(p.CONF, "tee_save_dir", "")
+    # 本文件专测歌词随迁/影子提升行为，统一在自动下载歌词开启的语境下验证
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
     monkeypatch.setattr(p, "_TEE_SAVE_DIR_WARNED", False)
     os.makedirs(p.CONF["library_dir"], exist_ok=True)
     os.makedirs(p.CONF["cache_dir"], exist_ok=True)

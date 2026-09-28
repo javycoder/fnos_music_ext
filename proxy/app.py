@@ -34,11 +34,13 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
+    from . import nmplaylists as nmpl
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    import nmplaylists as nmpl  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
     from version import get_version  # type: ignore
@@ -110,6 +112,15 @@ CONF = {
     "official_bind_timeout_s": float(os.environ.get("FNMUSIC_OFFICIAL_BIND_TIMEOUT_S", "120")),
     # 边听边存切歌续传：允许并行完成的续传任务上限（防快速跳歌时的下载洪泛；0=关闭续传）
     "tee_handoff_max": int(os.environ.get("FNMUSIC_TEE_HANDOFF_MAX", "3")),
+    # 自动下载封面：自动下载的音乐完整落库后，把源站封面内嵌进音频文件。
+    # 飞牛扫描器只认内嵌图（dhowden/tag，无外置 cover.jpg 能力），这是官方
+    # App 显示下载歌曲封面的唯一途径；封面在音乐落库成功后才处理，不存在
+    # 音乐失败、封面先落污染目录的情况
+    "auto_cover": os.environ.get("FNMUSIC_AUTO_COVER", "true").lower() in ("true", "1", "yes"),
+    # 自动下载歌词（2.6.0）：默认关；仅边听边存开启时生效——音乐完整落库
+    # 成功后才下载同名 .lrc 到歌曲所在目录（飞牛扫描入库即带歌词），音乐
+    # 下载失败不产生任何歌词文件，不存在歌词先落污染目录的情况
+    "lyric_auto_dl": os.environ.get("FNMUSIC_LYRIC_AUTO_DL", "false").lower() in ("true", "1", "yes"),
     # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
     # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
     "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
@@ -139,6 +150,9 @@ CONF = {
     "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
+    # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
+    # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
+    "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
     # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
@@ -447,9 +461,12 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_FAV_AUTO_BIND": ("fav_auto_bind", "bool"),
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": ("official_bind_timeout_s", "bind_timeout"),
     "FNMUSIC_TEE_HANDOFF_MAX": ("tee_handoff_max", "tee_handoff_max"),
+    "FNMUSIC_AUTO_COVER": ("auto_cover", "bool"),
+    "FNMUSIC_LYRIC_AUTO_DL": ("lyric_auto_dl", "bool"),
     "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
+    "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
@@ -1017,9 +1034,13 @@ def unique_library_path(directory: str, basename: str, ext: str) -> str:
     return os.path.join(directory, f"{basename} ({n}).{ext}")
 
 
-def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -> None:
-    """写入 title/artist/album，飞牛扫描后用标签而不是文件名显示。"""
-    title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
+def write_audio_tags(path: str, title: str, artist: str = "", album: Any = "") -> None:
+    """写入 title/artist/album，飞牛扫描后用标签而不是文件名显示。
+
+    album 可能是前端曲目对象 {name, guid, ...}；先归一成纯字符串再写入，
+    避免把整个对象的文本写进专辑标签。
+    """
+    title, artist, album = _tag_fields({"title": title, "artist": artist, "album": album})
     if not title and not artist:
         return
     try:
@@ -1042,6 +1063,131 @@ def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -
         audio.save()
     except Exception as e:
         logger.warning("Failed to write audio tags for %s: %s", path, e)
+
+
+_COVER_FETCH_TRANSPORT: "httpx.SyncBaseTransport | None" = None
+_COVER_FETCH_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    """魔数嗅探图片类型；非图片返回空串（Content-Type 会说谎，字节不会）。"""
+    if data.startswith(b"\xFF\xD8\xFF"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return ""
+
+
+def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
+    """下载封面图字节（内嵌用）。非图片/超限/酷我文本假图/网络失败一律返回 None。"""
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    if _KW_TEXT_COVER_HOST in url:
+        return None
+    try:
+        kwargs: dict = {"timeout": 8.0, "follow_redirects": True}
+        if _COVER_FETCH_TRANSPORT is not None:
+            kwargs["transport"] = _COVER_FETCH_TRANSPORT
+        with httpx.Client(**kwargs) as client:
+            r = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return None
+        mime = _sniff_image_mime(data)
+        if not mime:
+            return None
+        return data, mime
+    except Exception as e:
+        logger.debug("cover fetch failed for %s: %s", url, type(e).__name__)
+        return None
+
+
+def _has_embedded_cover(path: str) -> bool:
+    try:
+        from mutagen import File as MutagenFile
+
+        mf = MutagenFile(path)
+        tags = getattr(mf, "tags", None)
+        if tags is None:
+            return False
+        if hasattr(tags, "pictures"):  # FLAC/APE
+            return bool(tags.pictures)
+        if hasattr(tags, "getall"):  # ID3
+            return bool(tags.getall("APIC"))
+        return bool(tags.get("covr") or tags.get("METADATA_BLOCK_PICTURE"))  # MP4/OGG
+    except Exception:
+        return False
+
+
+def embed_audio_cover(path: str, data: bytes, mime: str) -> bool:
+    """把封面字节内嵌进音频文件（MP3 APIC / FLAC Picture / MP4 covr / OGG）。
+
+    飞牛扫描器（dhowden/tag）只认内嵌图，不读外置 cover 图片文件，内嵌是
+    官方 App 显示封面的唯一途径。文件已有内嵌图（源站自带）则跳过；不支持的
+    格式（wav 等）返回 False。
+    """
+    try:
+        import base64
+
+        from mutagen import File as MutagenFile
+        from mutagen.flac import Picture
+        from mutagen.id3 import APIC, ID3
+        from mutagen.mp4 import MP4Cover
+
+        audio = MutagenFile(path)
+        if audio is None or _has_embedded_cover(path):
+            return False
+        cls = audio.__class__.__name__
+        if cls == "MP3":
+            try:
+                id3 = ID3(path)
+            except Exception:
+                id3 = ID3()
+            id3.delall("APIC")
+            id3.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+            id3.save(path, v2_version=3)
+            return True
+        if getattr(audio, "tags", None) is None:
+            try:
+                audio.add_tags()
+            except Exception:
+                return False
+        if cls == "MP4":
+            if mime not in ("image/jpeg", "image/png"):
+                return False
+            fmt = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+            audio["covr"] = [MP4Cover(data, imageformat=fmt)]
+            audio.save()
+            return True
+        if cls == "FLAC":
+            pic = Picture()
+            pic.type = 3
+            pic.mime = mime
+            pic.desc = "Cover"
+            pic.data = data
+            audio.add_picture(pic)
+            audio.save()
+            return True
+        if cls in ("OggVorbis", "OggOpus", "OggSpeex"):
+            pic = Picture()
+            pic.type = 3
+            pic.mime = mime
+            pic.desc = "Cover"
+            pic.data = data
+            audio["METADATA_BLOCK_PICTURE"] = [base64.b64encode(pic.write()).decode("ascii")]
+            audio.save()
+            return True
+        return False
+    except Exception as e:
+        logger.debug("cover embed failed for %s: %s", path, e)
+        return False
 
 
 def detect_library_dir() -> str:
@@ -1967,6 +2113,41 @@ def _album_name_from_obj(track_obj: dict) -> str:
     return str(track_obj.get("albumName") or track_obj.get("album") or "").strip()
 
 
+def _person_name(value: Any) -> str:
+    """歌手字段：字符串原样，对象取 name，列表取第一个有名字的成员。"""
+    if isinstance(value, dict):
+        return str(value.get("name") or "").strip()
+    if isinstance(value, list):
+        for item in value:
+            name = _person_name(item)
+            if name:
+                return name
+        return ""
+    return str(value or "").strip()
+
+
+def _tag_fields(info: dict | None) -> tuple[str, str, str]:
+    """落盘/历史用的标题、歌手、专辑。恒为纯字符串。
+
+    推荐歌单等前端曲目里 album 是 {name, guid, artists, coverId}，
+    不能 str() 整个对象。对象 name 为空时再看 albumName。
+    """
+    src = info if isinstance(info, dict) else {}
+    title_raw = src.get("title")
+    if isinstance(title_raw, dict) or not str(title_raw or "").strip():
+        title = _person_name(title_raw) or _person_name(src.get("name"))
+    else:
+        title = str(title_raw).strip()
+    artist = _person_name(src.get("artist")) or _person_name(src.get("artists"))
+    album = _album_name_from_obj(src) or str(src.get("albumName") or "").strip()
+    return title, artist, album
+
+
+def _cover_url_of(info: dict | None) -> str:
+    src = info if isinstance(info, dict) else {}
+    return str(src.get("cover_url") or src.get("coverUrl") or src.get("coverURL") or "").strip()
+
+
 def _item_meta_richness(it: dict) -> int:
     """条目元数据丰富度：title/album 各 1 分。用于"更全的快照覆盖残缺的"合并。"""
     it = it if isinstance(it, dict) else {}
@@ -2195,7 +2376,8 @@ def ensure_registry_warm() -> None:
     for directory in (CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites"),
                       CONF.get("plt_dir") or os.path.join(_HOME, "playlist_tracks"),
                       dailyrec.play_history_dir(),
-                      dailyrec.recommend_cache_dir()):
+                      dailyrec.recommend_cache_dir(),
+                      nmpl.cache_dir()):
         for path in _iter_registry_jsons(directory):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -2684,6 +2866,12 @@ async def search_track(request: Request):
     # 清空官方列表，否则官方条目会拼上在线切片在每个后续页重复出现。
     if (page - 1) * size >= original_total and local_list:
         local_list.clear()
+    # 官方搜索忽略 size 全量返回结果集（total=11 时 size=10 的 page=1/2 均返回
+    # 同样 11 条，2026-09-25 官方更新实测）：返回条数超过单页窗口说明拿到的是
+    # 全量列表而非请求页，按请求窗口原地切片，保证本地段全局分页不跨页重复。
+    if len(local_list) > size:
+        win_start = (page - 1) * size
+        local_list[:] = local_list[win_start:win_start + size]
     # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
     # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
@@ -2943,23 +3131,74 @@ def _lookup_online_snapshot(guid: str) -> "dict | None":
     return None
 
 
-def _tee_metadata_fallback(guid: str, title: str, artist: str, album: str) -> tuple[str, str, str]:
-    """issue #28：tee 落盘元数据缺失时的回查兜底，杜绝无元数据以 unknown 进曲库。
+def _track_in_list(tracks: Any, guid: str) -> dict | None:
+    if not isinstance(tracks, list):
+        return None
+    for track in tracks:
+        if not isinstance(track, dict) or str(track.get("guid") or "") != guid:
+            continue
+        title, artist, _album = _tag_fields(track)
+        if title or artist:
+            return track
+    return None
 
-    流式上下文解析失败（info 为空/stub）时此前直接落 "unknown (n).flac"，飞牛
-    扫描后音乐库显示 Unknown 且无元数据。这里先从历史/收藏快照反查补齐；仍缺
-    失才维持 unknown，并打 WARN 便于取证（正常在线曲目在首次播放上报
-    track_play 时已写入历史快照，二播场景必然能反查到）。
+
+def _lookup_playlist_cache_track(guid: str) -> dict | None:
+    """推荐歌单、网易账号歌单的磁盘缓存按 guid 反查下发曲目。
+
+    这两类列表不进搜索缓存。缓存里的曲目是前端形态（album 为对象），
+    调用方必须用 _tag_fields 取标签，不能 str(album)。
     """
-    if title.strip() and artist.strip():
-        return title, artist, album
-    snap = _lookup_online_snapshot(guid)
-    if snap:
-        title = title.strip() or str(snap.get("title") or "")
-        artist = artist.strip() or str(snap.get("artist") or "")
-        album = album.strip() or str(snap.get("album") or "")
-        logger.info("tee metadata fallback hit for %s: %s - %s", guid, artist, title)
-    if not (title.strip() and artist.strip()):
+    if not guid:
+        return None
+    for root in (dailyrec.recommend_cache_dir(), nmpl.cache_dir()):
+        for path in _iter_registry_jsons(root):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            hit = _track_in_list(data.get("tracks"), guid)
+            if hit:
+                return hit
+    return None
+
+
+def _merge_missing_tags(title: str, artist: str, album: str, snap: dict) -> tuple[str, str, str]:
+    """只补空字段。已经是纯字符串的专辑不被缓存里的另一份专辑覆盖。"""
+    snap_title, snap_artist, snap_album = _tag_fields(snap)
+    return title or snap_title, artist or snap_artist, album or snap_album
+
+
+def _tee_metadata_fallback(
+    guid: str, title: str, artist: str, album: str, dest_info: dict | None = None,
+) -> tuple[str, str, str]:
+    """tee 落盘元数据缺失时的回查兜底，避免以 unknown 进曲库。
+
+    顺序：推荐/网易账号歌单缓存（首播时历史往往还没写）→ 播放历史/收藏/自建歌单。
+    缺哪个字段补哪个；已有的纯字符串专辑保持不变。封面 URL 只在调用方还没有时写入 dest_info。
+    """
+    title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
+    need_cover = not _cover_url_of(dest_info)
+    if not (title and artist and album and not need_cover):
+        filled = False
+        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
+            if not snap:
+                continue
+            title, artist, album = _merge_missing_tags(title, artist, album, snap)
+            if need_cover and isinstance(dest_info, dict):
+                cover = _cover_url_of(snap)
+                if cover:
+                    dest_info["cover_url"] = cover
+                    need_cover = False
+            filled = True
+            if title and artist and album and not need_cover:
+                break
+        if filled:
+            logger.info("tee metadata fallback hit for %s: %s - %s", guid, artist, title)
+    if not (title and artist):
         logger.warning(
             "tee finalize missing metadata for %s (title=%r artist=%r)：将以 unknown 命名落盘，"
             "该曲目的元数据解析链路需要排查", guid, title, artist,
@@ -2968,35 +3207,77 @@ def _tee_metadata_fallback(guid: str, title: str, artist: str, album: str) -> tu
 
 
 def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool) -> dict | None:
-    """落盘转正：边听边存开→进曲库（定名/权限/标签/歌词随迁），关→进滚动缓存。
+    """落盘转正：边听边存开→进曲库（定名/权限/标签，歌词仅在 FNMUSIC_LYRIC_AUTO_DL
+    开启时随迁），关→进滚动缓存（不写歌词）。
 
     part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
     返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
     """
-    title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
+    src = dict(info or {})
+    title, artist, album = _tag_fields(src)
     if tee_enabled:
-        title, artist, album = _tee_metadata_fallback(guid, title, artist, album)
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src)
         dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
         os.replace(part, dest)
         remember_media_path(guid, dest)
         adopt_library_perms(dest)
         write_audio_tags(dest, title, artist, album)
-        # 无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-        promote_shadow_lyric(guid, dest)
+        # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
+        # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
+        cover_url = _cover_url_of(src)
+        if cover_url and CONF.get("auto_cover", True):
+            try:
+                fetched = download_cover_bytes(cover_url)
+                if fetched and embed_audio_cover(dest, fetched[0], fetched[1]):
+                    logger.info("cover embedded for %s: %s", guid, dest)
+            except Exception as e:
+                logger.debug("cover embed step skipped for %s: %s", guid, e)
+        # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+        if CONF.get("lyric_auto_dl"):
+            promote_shadow_lyric(guid, dest)
     else:
         # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
         os.replace(part, dest)
     logger.info("tee finalize done for %s: dest=%s", guid, dest)
-    lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
-    if lyric.strip():
-        write_lyric_cache(guid, lyric, title, artist)
+    # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
+    # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
+    if tee_enabled and CONF.get("lyric_auto_dl"):
+        lyric = str(src.get("lyric") or src.get("lrc") or "")
+        if lyric.strip():
+            write_lyric_cache(guid, lyric, title, artist)
     if not tee_enabled:
         try:
             purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
         except Exception as e:
             logger.warning("Rolling cache purge failed: %s", e)
     return {"dest": dest, "title": title, "artist": artist, "album": album}
+
+
+async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | None) -> None:
+    """音乐完整落库成功后补齐歌词（FNMUSIC_LYRIC_AUTO_DL，默认关）。
+
+    仅边听边存转正路径调用，且必须排在 _schedule_library_scan 之前——保证
+    官方扫描入库前 .lrc 已落在音频旁。本地已有歌词（含影子提升产物）零请求；
+    缺失时向源站补拉（酷我上游接口已失效返回空即跳过）。下载失败不会走到
+    这里，不会产生只有歌词没有音频的孤儿文件。
+    """
+    if not CONF.get("lyric_auto_dl"):
+        return
+    dest = str((meta or {}).get("dest") or "")
+    if not dest or _is_rolling_cache_stem(dest, guid):
+        return
+    if find_lyric_file(guid):
+        return
+    try:
+        text = await asyncio.wait_for(resolve_online_lyric(request, guid), timeout=10.0)
+    except Exception as e:
+        logger.info("auto lyric fetch failed for %s: %s", guid, type(e).__name__)
+        return
+    if text:
+        logger.info("auto lyric saved for %s (%d chars)", guid, len(text))
+    else:
+        logger.info("auto lyric unavailable for %s (source returned no lyric)", guid)
 
 
 _SCAN_TTL_S = 90.0
@@ -3055,6 +3336,7 @@ def stream_tee_response(
     chunks: Any = None,
     first_chunk: bytes = b"",
     scan_headers_factory: Callable[[], dict] | None = None,
+    post_finalize: Callable[[dict | None], Coroutine[Any, Any, None]] | None = None,
 ) -> Response:
     headers = {"Accept-Ranges": "bytes"}
     for key in ("content-type", "content-length", "content-range"):
@@ -3135,6 +3417,9 @@ def stream_tee_response(
                             info = None
                     try:
                         meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled)
+                        # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
+                        if post_finalize is not None and meta:
+                            await post_finalize(meta)
                         scan_headers = scan_headers_factory() if scan_headers_factory is not None else None
                         if scan_headers:
                             _schedule_library_scan(scan_headers)
@@ -3267,8 +3552,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.info("online info fast-path missed for %s: %s", guid, type(exc).__name__)
             ext = ext or (info or {}).get("ext")
             # Read timeout must tolerate CDN throttling mid-file: a flat 10s
             # timeout kills long pauses between chunks and surfaces as playback
@@ -3363,6 +3648,37 @@ def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
     _register_background_fetch(request, guid, "fav_auto_bind")
 
 
+async def _info_for_background_save(request: Request, guid: str, info: dict | None) -> dict:
+    """后台整轨/续传落盘前补齐元数据。
+
+    本地推荐歌单、网易账号歌单、历史/收藏里已有标题就用那份，不再打源站。
+    都没有时再拉一次歌曲信息（数秒，不占播放起播的 0.75 秒窗口）。
+    """
+    base = dict(info or {})
+    if _tag_fields(base)[0]:
+        return base
+    local = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
+    if local and _tag_fields(local)[0]:
+        merged = dict(local)
+        if base.get("ext"):
+            merged["ext"] = base["ext"]
+        if base.get("lyric"):
+            merged["lyric"] = base["lyric"]
+        return merged
+    try:
+        fetched = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=4.0)
+    except Exception as exc:
+        logger.info("background online info missed for %s: %s", guid, type(exc).__name__)
+        return base
+    if isinstance(fetched, dict) and _tag_fields(fetched)[0]:
+        if base.get("ext") and not fetched.get("ext"):
+            fetched = dict(fetched)
+            fetched["ext"] = base["ext"]
+        return fetched
+    logger.info("background online info empty for %s", guid)
+    return base
+
+
 async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
     """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。"""
     part = None
@@ -3394,10 +3710,12 @@ async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
                     written += len(chunk)
         if written < 1024 or (expected is not None and written != expected):
             raise RuntimeError(f"size mismatch written={written} expected={expected}")
+        info = await _info_for_background_save(fake_request, guid, info)
         ext = ext or (info or {}).get("ext") or "mp3"
         meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True)
         part = None
         logger.info("Background full fetch saved %s (%d bytes)", guid, written)
+        await _auto_lyric_after_finalize(fake_request, guid, meta)
         _schedule_library_scan(cred_headers)
         _dispatch_official_binding(guid, cred_headers, meta)
     except asyncio.CancelledError:
@@ -3544,9 +3862,11 @@ async def _resume_part_download(guid: str, part: str, written: int, expected: in
         final_size = written + append_written
         if final_size < 1024 or final_size != total:
             raise RuntimeError(f"resume size mismatch final={final_size} total={total}")
+        info = await _info_for_background_save(fake_request, guid, info)
         resolved_ext = ext or stream_ext or (info or {}).get("ext") or "mp3"
         meta = await asyncio.to_thread(_tee_finalize, part, guid, resolved_ext, info or {}, True)
         logger.info("Tee handoff resumed %s (+%d bytes, total %d)", guid, append_written, final_size)
+        await _auto_lyric_after_finalize(fake_request, guid, meta)
         _schedule_library_scan(cred_headers)
         _dispatch_official_binding(guid, cred_headers, meta)
         return True
@@ -4144,9 +4464,11 @@ async def stream_track(request: Request, subpath: str = ""):
                     # 定长窗口客户端：本响应过不了 tee 写盘门，注册后台整轨下载兜底
                     _register_full_fetch(request, candidate)
                 return stream_tee_response(resp, candidate, range_header,
-                    coro_factory=lambda: _online_info(request, candidate), client_to_close=owned,
+                    coro_factory=lambda: _online_info(request, candidate, include_lyric=bool(CONF.get("lyric_auto_dl"))),
+                    client_to_close=owned,
                     resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
-                    scan_headers_factory=lambda: copy_incoming_headers(request))
+                    scan_headers_factory=lambda: copy_incoming_headers(request),
+                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta))
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
             if not await _recover_source(request, candidate, entry):
@@ -4209,16 +4531,16 @@ async def track_transcode(request: Request):
     )
 
 
-async def _online_info(request: Request, guid: str) -> dict | None:
+async def _online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
     retained, entry = _retained_track(request, guid)
     if not _source_enabled(guid):
         return retained
     try:
-        data = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=4.0)
+        data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=4.0)
         if data:
             return data
         if await _recover_source(request, guid, entry):
-            data = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=3.0)
+            data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=3.0)
             if data:
                 return data
     except Exception:
@@ -4226,7 +4548,7 @@ async def _online_info(request: Request, guid: str) -> dict | None:
     return retained
 
 
-async def _fetch_online_info(request: Request, guid: str) -> dict | None:
+async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
     src = source_from_online_guid(guid)
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)
@@ -4262,16 +4584,17 @@ async def _fetch_online_info(request: Request, guid: str) -> dict | None:
                         file_size = int(size_obj.get("size", 0) or 0) if isinstance(size_obj, dict) else 0
 
                         lyric_text = ""
-                        try:
-                            lr = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
-                            if lr.status_code == 200:
-                                l_res = lr.json()
-                                if isinstance(l_res, dict) and l_res.get("ok") is not False:
-                                    l_data = l_res.get("data")
-                                    if isinstance(l_data, dict):
-                                        lyric_text = str(l_data.get("lyric") or "").strip()
-                        except Exception as l_err:
-                            logger.warning("musicbox lyric fetch in _online_info failed for %s: %s", guid, l_err)
+                        if include_lyric:
+                            try:
+                                lr = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
+                                if lr.status_code == 200:
+                                    l_res = lr.json()
+                                    if isinstance(l_res, dict) and l_res.get("ok") is not False:
+                                        l_data = l_res.get("data")
+                                        if isinstance(l_data, dict):
+                                            lyric_text = str(l_data.get("lyric") or "").strip()
+                            except Exception as l_err:
+                                logger.warning("musicbox lyric fetch in _online_info failed for %s: %s", guid, l_err)
 
                         return {
                             "id": f"netease:{song_id}",
@@ -4299,8 +4622,8 @@ async def _fetch_online_info(request: Request, guid: str) -> dict | None:
                 if isinstance(data, dict) and data.get("ok") is not False:
                     inner = data.get("data")
                     if isinstance(inner, dict):
-                        lyric_text = ""
-                        if not inner.get("lyric"):
+                        lyric_text = str(inner.get("lyric") or "").strip()
+                        if not lyric_text and include_lyric:
                             try:
                                 lr = await lx_client.get(
                                     "/api/v1/track/lyric", params={"id": song_id}, timeout=10.0
@@ -4311,8 +4634,6 @@ async def _fetch_online_info(request: Request, guid: str) -> dict | None:
                                         lyric_text = str((l_res.get("data") or {}).get("lyric") or "").strip()
                             except Exception as l_err:
                                 logger.warning("lxmusic lyric fetch failed for %s: %s", guid, l_err)
-                        else:
-                            lyric_text = str(inner.get("lyric") or "").strip()
                         return {
                             "id": song_id,
                             "source": "lx",
@@ -4642,6 +4963,13 @@ async def static_cover(request: Request, subpath: str = ""):
             # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
             return Response(status_code=404)
         guid = picked_guid
+    # 网易账号歌单封面：登记的封面直链直接 302（兼容重启后反查表未重建的裸假 id）
+    nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
+    if nm_pl_id:
+        cover = nmpl.cover_url_for(nm_pl_id)
+        if cover:
+            return RedirectResponse(cover, status_code=302)
+        return Response(status_code=404)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -5422,6 +5750,9 @@ async def playlist_add_track(request: Request):
     if dailyrec.is_recommend_playlist_guid(playlist_guid):
         # 推荐歌单是按天重建的虚拟歌单，保持只读：吸收请求，避免伪装 id 直达官方被拒
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    if nmpl.is_nm_playlist_guid(playlist_guid):
+        # 网易账号歌单只读（不回写网易）：同样吸收请求
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
     if not online:
@@ -5482,6 +5813,8 @@ async def playlist_remove_track(request: Request):
     playlist_guid = resolve_real_guid(playlist_guid)
     if dailyrec.is_recommend_playlist_guid(playlist_guid):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    if nmpl.is_nm_playlist_guid(playlist_guid):
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
     if not online:
@@ -5528,6 +5861,14 @@ async def playlist_remove_track(request: Request):
 async def playlist_delete(request: Request):
     """删除歌单：透传官方；成功后清掉本地为该歌单存的在线附加条目（防孤儿数据）。"""
     upstream_client = get_upstream_client(request.app)
+    try:
+        _body = json.loads((await request.body()).decode("utf-8") or "{}")
+    except Exception:
+        _body = {}
+    _pl_guid = str(_body.get("guid") or "").strip() if isinstance(_body, dict) else ""
+    if nmpl.is_nm_playlist_guid(resolve_real_guid(_pl_guid)):
+        # 网易账号歌单只读：吸收删除（不透传官方必被拒的假 id），下次刷新卡片仍在
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):
         return envelope
@@ -5595,8 +5936,10 @@ async def playlist_list(request: Request):
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
     kinds = _recommend_injectable_kinds(user_guid)
-    if not kinds:
-        # 两个推荐开关全关（或 shared 会话无任何可注入类型）：不注入推荐占位歌单
+    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
+    nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
+    if not kinds and not nm_on:
+        # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
         return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
@@ -5621,19 +5964,44 @@ async def playlist_list(request: Request):
         rec = _playlist_public_fields(bundle.get("playlist") or {}, tracks)
         rec["trackCount"] = len(tracks)
         recs.append(rec)
+    nm_cards: list[dict] = []
+    if nm_on:
+        try:
+            nm_cards = await nmpl.peek_summaries(get_musicbox_client(request.app))
+            for card in nm_cards:
+                g = str(card.get("guid") or "")
+                if is_online_guid(g):
+                    # 登记 guid/封面假 id 反查（coverId 与 guid 同源 md5）
+                    fake_official_guid(g)
+        except Exception as e:
+            logger.warning("netease my-playlists inject failed: %s", e)
+            nm_cards = []
+        if nm_cards:
+            nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
     official = [
         it for it in official
         if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
     ]
-    data["list"] = recs + official
+    data["list"] = recs + nm_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs)
+    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards)
     return JSONResponse(content=envelope, headers=headers)
 
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
+    nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
+    if nm_pl_id:
+        # 网易账号歌单：只读虚拟歌单，卡片从摘要（内存→磁盘）取；trackCount 用
+        # 已缓存曲目数更准（可播过滤后可能少于网易侧计数）
+        card = nmpl.card_for(nm_pl_id)
+        if card is None:
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        tracks = nmpl.cached_tracks(nm_pl_id)
+        if tracks is not None:
+            card = {**card, "trackCount": len(tracks)}
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截修正 trackCount，否则纯透传
@@ -5673,11 +6041,21 @@ async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
     recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
-    if not recommend_ids and not plt_dir_has_data():
+    nm_ids = [
+        pid for pid in (
+            nmpl.nm_playlist_id_from_guid(g) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(g))
+            for g in guids
+        ) if pid
+    ]
+    if not recommend_ids and not nm_ids and not plt_dir_has_data():
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
-    rest = [g for g in guids if not dailyrec.is_recommend_playlist_guid(g)]
+    rest = [
+        g for g in guids
+        if not dailyrec.is_recommend_playlist_guid(g)
+        and not nmpl.is_nm_playlist_guid(resolve_real_guid(g))
+    ]
     official_list: list = []
     if rest:
         headers = copy_incoming_headers(request)
@@ -5718,6 +6096,13 @@ async def playlist_batch_detail(request: Request):
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
         recs.append(rec)
+    for pid in nm_ids:
+        card = nmpl.card_for(pid)
+        if card is not None:
+            tracks = nmpl.cached_tracks(pid)
+            if tracks is not None:
+                card = {**card, "trackCount": len(tracks)}
+            recs.append(card)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
 
 
@@ -5730,6 +6115,37 @@ async def playlist_track_list(request: Request):
         or ""
     ).strip()
     kind = dailyrec.online_playlist_kind(guid)
+    nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
+    if nm_pl_id:
+        # 网易账号歌单曲目：可播过滤后的 VO 分页下发（与推荐歌单同款分页语义）
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        tracks = dailyrec.stamp_playlist_tracks(
+            await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
+        )
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            size = max(len(tracks), 1)
+        if size < 1:
+            size = 50
+        start = (page - 1) * size
+        page_tracks = tracks[start:start + size]
+        return JSONResponse(
+            content=disguise_client_json({
+                "code": 0,
+                "msg": "ok",
+                "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+            })
+        )
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截合并，否则纯透传
         if not plt_dir_has_data():
@@ -6388,10 +6804,18 @@ async def event_report(request: Request):
                     duration_s = None
                     if payload:
                         # 客户端上报若带元数据（App/Web 字段名可能不同）优先采信，
-                        # 避免历史条目只有 guid、标题歌手为空。
-                        title = str(payload.get("title") or payload.get("name") or "").strip() or title
-                        artist = str(payload.get("artist") or payload.get("artistName") or "").strip() or artist
-                        album = str(payload.get("album") or payload.get("albumName") or "").strip()
+                        # 避免历史条目只有 guid、标题歌手为空。专辑可能是对象，先解开。
+                        p_title, p_artist, p_album = _tag_fields({
+                            "title": payload.get("title"),
+                            "name": payload.get("name"),
+                            "artist": payload.get("artist") or payload.get("artistName"),
+                            "artists": payload.get("artists"),
+                            "album": payload.get("album"),
+                            "albumName": payload.get("albumName"),
+                        })
+                        title = p_title or title
+                        artist = p_artist or artist
+                        album = p_album or album
                         raw_dur = payload.get("duration") or payload.get("durationMs") or payload.get("duration_ms")
                         try:
                             dv = float(raw_dur)
@@ -6402,14 +6826,22 @@ async def event_report(request: Request):
                         # 事件不带元数据时从内存搜索会话补齐（播放时会话必在）
                         retained, _entry = _retained_track(request, guid)
                         if retained:
-                            title = title or str(retained.get("title") or "")
-                            artist = artist or str(retained.get("artist") or "")
-                            album = album or str(retained.get("album") or "")
+                            r_title, r_artist, r_album = _tag_fields(retained)
+                            title = title or r_title
+                            artist = artist or r_artist
+                            album = album or r_album
                             if not duration_s:
                                 try:
                                     duration_s = float(retained.get("duration_s") or 0) or None
                                 except (TypeError, ValueError):
                                     duration_s = None
+                        if not title or not artist or not album:
+                            served = _lookup_playlist_cache_track(guid)
+                            if served:
+                                s_title, s_artist, s_album = _tag_fields(served)
+                                title = title or s_title
+                                artist = artist or s_artist
+                                album = album or s_album
                     cached = find_cache_file(guid)
                     if cached and (not title or not artist):
                         base = os.path.splitext(os.path.basename(cached))[0]
@@ -6495,11 +6927,12 @@ async def play_history_list(request: Request):
             # 历史快照可能没带元数据：从内存搜索会话补齐（无网络开销）
             retained, _entry = _retained_track(request, guid)
             if retained:
+                r_title, r_artist, r_album = _tag_fields(retained)
                 info = {
                     **(info or {}),
-                    "title": retained.get("title") or "",
-                    "artist": retained.get("artist") or "",
-                    "album": retained.get("album") or "",
+                    "title": r_title,
+                    "artist": r_artist,
+                    "album": r_album,
                     "duration_s": retained.get("duration_s") or 0,
                     "ext": retained.get("ext") or "",
                 }

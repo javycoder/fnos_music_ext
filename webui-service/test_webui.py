@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -53,6 +54,13 @@ def env_file(tmp_path, monkeypatch):
     return env
 
 
+@contextmanager
+def authed_client():
+    with TestClient(webui.app) as client:
+        client.headers.update({"X-Trim-Isadmin": "true"})
+        yield client
+
+
 @pytest.fixture
 def svctl(monkeypatch):
     calls: list[tuple] = []
@@ -82,7 +90,7 @@ def _mock_http(handler):
 # ------------------------------------------------------------------ 配置视图 ---
 
 def test_config_view_merges_defaults(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/config")
         assert r.status_code == 200
         rj = r.json()
@@ -96,27 +104,27 @@ def test_config_view_merges_defaults(env_file):
 # ------------------------------------------------------------------ PUT 校验 ---
 
 def test_put_rejects_unknown_key(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"NOT_A_KEY": "1"}})
         assert r.status_code == 400
         assert "不支持的配置键" in r.json()["error"]
 
 
 def test_put_rejects_bad_enum(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "ultra"}})
         assert r.status_code == 400
 
 
 def test_put_rejects_multi_provider(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_LX_ENABLED": "true"}})
         assert r.status_code == 400
         assert "三选一" in r.json()["error"]
 
 
 def test_put_rejects_zero_provider(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_ENABLED": "false"}})
         assert r.status_code == 400
         assert "至少" in r.json()["error"]
@@ -125,7 +133,7 @@ def test_put_rejects_zero_provider(env_file):
 # ------------------------------------------------------------------ 写入语义 ---
 
 def test_put_hot_keys_roundtrip_preserves_custom(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_QUALITY_MODE": "balanced",
             "FNMUSIC_RECOMMEND_DAILY": False,
@@ -144,14 +152,14 @@ def test_put_hot_keys_roundtrip_preserves_custom(env_file):
 
 
 def test_put_noop_returns_empty_change(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "high"}})
         assert r.status_code == 200
         assert r.json()["changed"] == []
 
 
 def test_search_timeout_defaults_and_saves(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         view = client.get("/api/config")
         assert view.status_code == 200
         assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
@@ -160,7 +168,7 @@ def test_search_timeout_defaults_and_saves(env_file):
         assert "FNMUSIC_SEARCH_TIMEOUT" in saved.json()["changed"]
     text = env_file.read_text(encoding="utf-8")
     assert "FNMUSIC_SEARCH_TIMEOUT='9'" in text
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         again = client.get("/api/config")
         assert again.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "9"
         clamped = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 99}})
@@ -169,16 +177,32 @@ def test_search_timeout_defaults_and_saves(env_file):
 
 
 def test_put_int_clamps_and_bool_normalizes(env_file):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_TEE_CACHE_MAX": 999}})
         assert r.status_code == 200
     assert "FNMUSIC_TEE_CACHE_MAX='100'" in env_file.read_text(encoding="utf-8")
 
 
+def test_lyric_auto_dl_default_false_and_roundtrip(env_file):
+    """自动下载歌词：默认关闭；开启后写回 .env，热重载键无需重启。"""
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "false"
+        assert view.json()["schema"]["FNMUSIC_LYRIC_AUTO_DL"]["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_LYRIC_AUTO_DL": True}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_LYRIC_AUTO_DL" in saved.json()["changed"]
+    assert "FNMUSIC_LYRIC_AUTO_DL='true'" in env_file.read_text(encoding="utf-8")
+    with authed_client() as client:
+        again = client.get("/api/config")
+        assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
+
+
 # ------------------------------------------------------------------ 切源动作 ---
 
 def test_provider_switch_stops_old_starts_new(env_file, svctl):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
             "FNMUSIC_LX_ENABLED": "true",
@@ -200,7 +224,7 @@ def _preview_http():
 
 def test_preview_endpoint_starts_unenabled_provider(env_file, svctl):
     """点选未启用的音源卡片：临时拉起进程（不写 .env），注册 5 分钟倒计时。"""
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         _preview_http()
         r = client.post("/api/preview", json={"provider": "musicdl"})
         assert r.status_code == 200
@@ -215,7 +239,7 @@ def test_preview_endpoint_starts_unenabled_provider(env_file, svctl):
 
 
 def test_preview_endpoint_rejects_unknown_provider(env_file, svctl):
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.post("/api/preview", json={"provider": "docker"})
         assert r.status_code == 400
     assert not svctl.calls
@@ -263,7 +287,7 @@ def test_preview_reap_stop_failure_keeps_entry_for_retry(env_file, monkeypatch):
 def test_put_config_stops_leftover_preview(env_file, svctl):
     """保存收尾：预览了 musicdl 但最终保存的还是 musicbox → musicdl 立即停止。"""
     webui._preview_until["musicdl"] = time.monotonic() + 300
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "balanced"}})
         assert r.status_code == 200
         preview_stops = [a for a in r.json()["actions"] if a.get("preview")]
@@ -278,7 +302,7 @@ def test_platforms_fetch_renews_preview(env_file, svctl, monkeypatch):
     webui._preview_until["musicdl"] = time.monotonic() + 1
     webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda request: httpx.Response(200, json={"enabled": ["KuwoMusicClient"], "registered": ["KuwoMusicClient"]})))
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/platforms")
         assert r.status_code == 200
     assert webui._preview_until["musicdl"] - time.monotonic() > 250
@@ -286,7 +310,7 @@ def test_platforms_fetch_renews_preview(env_file, svctl, monkeypatch):
 
 def test_musicdl_platform_change_restarts_process(env_file, svctl):
     # 先切到 musicdl
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
             "FNMUSIC_MUSICDL_ENABLED": "true",
@@ -326,7 +350,7 @@ def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, m
     _mock_http(handler)
 
     # 切到 lx 并换 URL：verify → 写 env（含推导 LX_SOURCES）→ 起进程 → 激活
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
             "FNMUSIC_LX_ENABLED": "true",
@@ -352,7 +376,7 @@ def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
 
     _mock_http(handler)
     before = env_file.read_text(encoding="utf-8")
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
             "FNMUSIC_LX_ENABLED": "true",
@@ -371,7 +395,7 @@ def test_lx_verify_endpoint_survives_non_json_upstream(env_file, monkeypatch):
         return httpx.Response(500, text="Internal Server Error")
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.post("/api/lx/verify", json={"values": {"url": "https://s/1.js"}})
         assert r.status_code == 500
         assert r.json()["ok"] is False
@@ -389,7 +413,7 @@ def test_lx_verify_accepts_file_url(env_file, monkeypatch):
         return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.post("/api/lx/verify", json={"values": {"url": "file:///data/lxmusic/uploads/x.js"}})
         assert r.status_code == 200
         assert r.json()["ok"] is True
@@ -419,7 +443,7 @@ def test_lx_upload_proxies_to_lxmusic(env_file, monkeypatch):
         })
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.post("/api/lx/upload",
                         files={"file": ("mine.js", _VALID_SCRIPT.encode(), "text/javascript")})
         assert r.status_code == 200
@@ -445,7 +469,7 @@ def test_lx_upload_accepts_json_from_page(env_file, monkeypatch):
         })
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.post("/api/lx/upload", json={"filename": "mine.js", "script": _VALID_SCRIPT})
         assert r.status_code == 200
         assert r.json()["data"]["url"].startswith("file://")
@@ -457,7 +481,7 @@ def test_lx_upload_accepts_json_from_page(env_file, monkeypatch):
 def test_lx_upload_rejects_bad_requests(env_file, monkeypatch):
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     _mock_http(lambda r: httpx.Response(200, json={"ok": True}))
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         # 非 .js 后缀
         r = client.post("/api/lx/upload", files={"file": ("a.txt", b"hello", "text/plain")})
         assert r.status_code == 400
@@ -482,7 +506,7 @@ def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl,
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
             "FNMUSIC_LX_ENABLED": "true",
@@ -533,7 +557,7 @@ def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
 
     _mock_http(handler)
     # 当前 provider 是 musicbox（BASE_ENV）
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/status")
         assert r.status_code == 200
         rj = r.json()
@@ -551,7 +575,7 @@ def test_platforms_from_musicdl(env_file, monkeypatch):
     _mock_http(lambda r: httpx.Response(200, json={
         "enabled": ["KuwoMusicClient"], "registered": ["BaiduMusicClient", "KuwoMusicClient"],
     }))
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/platforms")
         assert r.status_code == 200
         rj = r.json()
@@ -564,7 +588,7 @@ def test_platforms_unreachable_503(env_file):
         return httpx.Response(502)
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/platforms")
         assert r.status_code == 503
         assert "hint" in r.json()
@@ -597,7 +621,7 @@ def test_netease_auth_proxy_passthrough(env_file, monkeypatch):
         return httpx.Response(404)
 
     _mock_http(handler)
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.post("/api/netease/auth/login")
         assert r.status_code == 200 and r.json()["data"]["unikey"] == "KEY1"
         r2 = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
@@ -614,12 +638,12 @@ def test_netease_auth_proxy_upstream_errors(env_file, monkeypatch):
     monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
     # 上游非 2xx：状态码原样透传（前端轮询把非 2xx 当瞬时失败静默重试）
     _mock_http(lambda r: httpx.Response(500))
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
         assert r.status_code == 500
     # 上游不可达（连接失败）：统一 502 + detail 提示
     _mock_http(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused")))
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
         assert r.status_code == 502
         assert "musicbox" in r.json()["detail"]
@@ -627,7 +651,7 @@ def test_netease_auth_proxy_upstream_errors(env_file, monkeypatch):
 
 def test_netease_qr_svg(env_file):
     qrcode = pytest.importorskip("qrcode")
-    with TestClient(webui.app) as client:
+    with authed_client() as client:
         r = client.get("/api/netease/qr", params={"unikey": "KEY1"})
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("image/svg+xml")
@@ -652,3 +676,39 @@ def test_index_served():
         assert via_desktop.status_code == 200
         assert "/app/fnmusic-ext/static/app.js" in via_desktop.text
         assert client.get("/app/fnmusic-ext/static/icon.png").status_code == 200
+
+
+def test_netease_my_playlists_defaults_and_saves(env_file):
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        # 默认关闭；schema 元数据齐备（hot 热重载）
+        assert view.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "false"
+        meta = view.json()["schema"]["FNMUSIC_NETEASE_MY_PLAYLISTS"]
+        assert meta["kind"] == "bool" and meta["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_MY_PLAYLISTS": True}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_NETEASE_MY_PLAYLISTS" in saved.json()["changed"]
+        assert saved.json()["actions"] == []  # 热键无进程动作
+    assert "FNMUSIC_NETEASE_MY_PLAYLISTS='true'" in env_file.read_text(encoding="utf-8")
+    with authed_client() as client:
+        again = client.get("/api/config")
+        assert again.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "true"
+
+
+# ------------------------------------------------------------------ 网关管理员 ---
+
+def test_api_requires_admin(env_file):
+    with TestClient(webui.app) as client:
+        for path in ("/api/config", "/api/preview", "/api/lx/upload"):
+            denied = client.get(path) if path == "/api/config" else client.post(path, json={})
+            assert denied.status_code == 403, path
+            assert denied.json()["error"] == "需要管理员"
+        guest = client.get("/api/config", headers={"X-Trim-Isadmin": "false"})
+        assert guest.status_code == 403
+        assert client.get("/healthz").json() == {"ok": True}
+        assert client.get("/").status_code == 200
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "smooth"}})
+        assert saved.status_code == 200
+    assert "FNMUSIC_QUALITY_MODE='smooth'" in env_file.read_text(encoding="utf-8")

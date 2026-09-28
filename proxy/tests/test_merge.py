@@ -543,8 +543,10 @@ def test_search_track_deduplication():
         assert items[1]["title"] == "晴天 (Live)"
 
 
-def test_stream_online_guid_range_and_tee_cache():
+def test_stream_online_guid_range_and_tee_cache(monkeypatch):
     """用例 d: stream online guid Range 转发与落盘 (mock musicdl 返回带 Content-Length 的 200 流，断言 cache 文件生成且内容一致)。"""
+    # 自动下载歌词开启场景：落库后同名 .lrc 一并写入（默认关，见 test_tee_cache.py）
+    monkeypatch.setitem(CONF, "lyric_auto_dl", True)
     audio_content = b"RIFF....WAVEfmt....FAKE_MP3_STREAM_CONTENT" * 50
     content_len = str(len(audio_content))
 
@@ -2218,6 +2220,8 @@ def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
         CONF, "fav_dir", str(tmp_path / "online_favorites"),
     )
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "play_history"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "recommend_cache"))
+    monkeypatch.setenv("FNMUSIC_NM_PLAYLISTS_DIR", str(tmp_path / "nm_playlists"))
 
     guid = "online:kuwo:228908"
     # 首播已上报 track_play：历史快照带完整元数据
@@ -2246,3 +2250,260 @@ def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
         f.write(b"RIFF....FAKE_AUDIO2" * 64)
     _tee_finalize(part2, guid2, "mp3", {}, tee_enabled=True)
     assert "周杰伦 - 七里香.mp3" in os.listdir(tee_dir)
+
+
+def _isolate_meta_dirs(tmp_path, monkeypatch):
+    """推荐/网易歌单/历史目录指到临时目录，避免扫到本机缓存。"""
+    rec = tmp_path / "recommend_cache"
+    nm = tmp_path / "nm_playlists"
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(rec))
+    monkeypatch.setenv("FNMUSIC_NM_PLAYLISTS_DIR", str(nm))
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "play_history"))
+    tee_dir = str(tmp_path / "library")
+    os.makedirs(tee_dir, exist_ok=True)
+    os.makedirs(CONF["fav_dir"], exist_ok=True)
+    monkeypatch.setitem(CONF, "tee_save_dir", tee_dir)
+    monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setitem(CONF, "auto_cover", False)
+    return rec, nm, tee_dir
+
+
+def _write_json(path, payload) -> None:
+    import json
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _tiny_mp3(path: str) -> None:
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not available")
+    try:
+        import mutagen  # noqa: F401
+    except ImportError:
+        pytest.skip("mutagen not available")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+            "-t", "0.2", "-q:a", "9", path,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _album_of(path: str) -> str:
+    from mutagen import File as MutagenFile
+
+    tagged = MutagenFile(path, easy=True)
+    assert tagged is not None
+    return tagged["album"][0]
+
+
+def test_tag_fields_unwraps_album_and_keeps_plain_strings():
+    from proxy.app import _tag_fields
+
+    title, artist, album = _tag_fields({
+        "title": "晴天",
+        "artists": [{"name": "周杰伦"}],
+        "album": {"name": "叶惠美", "guid": "online:netease:1:album", "artists": [], "coverId": "x"},
+        "albumName": "不该用这个",
+    })
+    assert (title, artist, album) == ("晴天", "周杰伦", "叶惠美")
+    assert _tag_fields({
+        "name": "七里香",
+        "album": {"name": "", "guid": "g"},
+        "albumName": "七里香",
+    }) == ("七里香", "", "七里香")
+    assert _tag_fields({"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}) == (
+        "晴天", "周杰伦", "叶惠美",
+    )
+
+
+def test_tee_finalize_recommend_vo_names_file_and_plain_album(tmp_path, monkeypatch):
+    """推荐缓存里的前端曲目（album 为对象）落盘：文件名用歌名，专辑标签只写 name。"""
+    from proxy.app import _tee_finalize, _tee_metadata_fallback
+
+    rec, nm, tee_dir = _isolate_meta_dirs(tmp_path, monkeypatch)
+    guid = "online:netease:186016"
+    vo = {
+        "guid": guid,
+        "title": "晴天",
+        "artists": [{"name": "周杰伦", "guid": f"{guid}:artist"}],
+        "album": {
+            "name": "叶惠美",
+            "guid": f"{guid}:album",
+            "artists": [{"name": "周杰伦"}],
+            "coverId": guid,
+        },
+        "albumName": "叶惠美",
+        "cover_url": "https://example.invalid/cover.jpg",
+    }
+    _write_json(os.path.join(rec, "user-1", "daily-20200101.json"), {
+        "day": "20200101", "status": "ready", "tracks": [vo],
+    })
+    holder: dict = {}
+    title, artist, album = _tee_metadata_fallback(guid, "", "", "", holder)
+    assert (title, artist, album) == ("晴天", "周杰伦", "叶惠美")
+    assert holder.get("cover_url") == "https://example.invalid/cover.jpg"
+    assert "{" not in album
+
+    part = os.path.join(tee_dir, "part-rec.mp3")
+    _tiny_mp3(part)
+    _tee_finalize(part, guid, "mp3", None, tee_enabled=True)
+    dest = os.path.join(tee_dir, "周杰伦 - 晴天.mp3")
+    assert os.path.isfile(dest)
+    assert _album_of(dest) == "叶惠美"
+
+    # 网易账号歌单磁盘缓存是同一类 VO，不在搜索缓存里也要能定名
+    guid_nm = "online:netease:42"
+    _write_json(os.path.join(nm, "pl-7.json"), {"tracks": [{
+        "guid": guid_nm,
+        "title": "七里香",
+        "artist": "周杰伦",
+        "album": {"name": "七里香", "guid": f"{guid_nm}:album"},
+    }]})
+    part_nm = os.path.join(tee_dir, "part-nm.mp3")
+    _tiny_mp3(part_nm)
+    _tee_finalize(part_nm, guid_nm, "mp3", {}, tee_enabled=True)
+    dest_nm = os.path.join(tee_dir, "周杰伦 - 七里香.mp3")
+    assert os.path.isfile(dest_nm)
+    assert _album_of(dest_nm) == "七里香"
+
+
+def test_tee_finalize_favorite_album_object_and_keeps_string_album(tmp_path, monkeypatch):
+    """收藏快照的专辑对象写成专辑名；调用方已经给了纯字符串专辑时不被缓存覆盖。"""
+    import json
+
+    from proxy.app import _tee_finalize
+
+    _rec, _nm, tee_dir = _isolate_meta_dirs(tmp_path, monkeypatch)
+    guid = "online:kuwo:9"
+    with open(os.path.join(CONF["fav_dir"], "user-1.json"), "w", encoding="utf-8") as f:
+        json.dump({"items": [{
+            "guid": guid,
+            "track": {
+                "title": "七里香",
+                "artists": [{"name": "周杰伦"}],
+                "album": {"name": "七里香", "guid": f"{guid}:album", "coverId": guid},
+            },
+        }]}, f)
+    part = os.path.join(tee_dir, "part-fav.mp3")
+    _tiny_mp3(part)
+    _tee_finalize(part, guid, "mp3", None, tee_enabled=True)
+    dest = os.path.join(tee_dir, "周杰伦 - 七里香.mp3")
+    assert os.path.isfile(dest)
+    assert _album_of(dest) == "七里香"
+
+    guid2 = "online:kuwo:10"
+    _write_json(os.path.join(_rec, "user-1", "daily-20200101.json"), {"tracks": [{
+        "guid": guid2,
+        "title": "晴天",
+        "artist": "周杰伦",
+        "album": {"name": "不该覆盖", "guid": f"{guid2}:album"},
+    }]})
+    part2 = os.path.join(tee_dir, "part-keep.mp3")
+    _tiny_mp3(part2)
+    _tee_finalize(part2, guid2, "mp3", {
+        "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+    }, tee_enabled=True)
+    kept = os.path.join(tee_dir, "周杰伦 - 晴天.mp3")
+    assert os.path.isfile(kept)
+    assert _album_of(kept) == "叶惠美"
+
+
+def test_write_audio_tags_unwraps_album_object(tmp_path):
+    path = str(tmp_path / "sample.mp3")
+    _tiny_mp3(path)
+    write_audio_tags(path, title="晴天", artist="周杰伦", album={
+        "name": "叶惠美", "guid": "online:netease:1:album", "artists": [], "coverId": "x",
+    })
+    assert _album_of(path) == "叶惠美"
+
+
+def test_search_track_pagination_no_cross_page_duplication():
+    """官方搜索忽略 size 全量返回结果集（2026-09-25 更新实测）时，本地段按请求
+    窗口切片：page1 恰好 size 条、page2 为余量本地+在线切片，跨页零重复。"""
+    local_tracks = [
+        {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": "周杰伦",
+         "album": "专辑", "duration": 200000}
+        for i in range(11)
+    ]
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        # 无论 page/size 如何都返回同样 11 条（官方钳制 + 忽略 size 的真实行为）
+        return httpx.Response(200, json={"code": 0, "data": {"list": local_tracks, "total": 11}})
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"ok": False})
+
+    online_items = [
+        {"id": f"kuwo:{900 + i}", "source": "kuwo", "title": f"在线歌{i}", "artist": "周杰伦",
+         "album": "叶惠美", "duration_s": 250, "ext": "mp3"}
+        for i in range(6)
+    ]
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "items": online_items})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        p1 = client.get("/music/api/v1/search/track?keyword=周杰伦&page=1&size=10").json()
+        p2 = client.get("/music/api/v1/search/track?keyword=周杰伦&page=2&size=10").json()
+        p3 = client.get("/music/api/v1/search/track?keyword=周杰伦&page=3&size=10").json()
+    l1 = [str(i["guid"]) for i in p1["data"]["list"]]
+    l2 = [str(i["guid"]) for i in p2["data"]["list"]]
+    l3 = [str(i["guid"]) for i in p3["data"]["list"]]
+    # page1 = 本地前 10 条；page2 = 第 11 条本地 + 全部 6 条在线（窗口要 9 条只
+    # 有 6 条可给）；page3 本地段越界清空、在线窗口 [9:19) 为空 → 空页
+    assert len(l1) == 10
+    assert len(l2) == 7
+    assert l3 == []
+    assert not (set(l1) & set(l2))
+    assert len(set(l1) | set(l2)) == 17  # 11 本地 + 6 在线，零重复
+    assert p1["data"]["total"] == p2["data"]["total"] == p3["data"]["total"] == 17
+
+
+def test_search_track_pagination_respected_size_untouched():
+    """官方尊重 size 时（返回条数 ≤ size）不切片，既有分页语义不变。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        # 尊重分页：page=2 返回第 11-20 条（这里模拟返回第 2 页内容）
+        data = {"code": 0, "data": {"list": [
+            {"guid": f"local:{i}", "title": f"歌{i}", "artist": "a", "album": "x", "duration": 1}
+            for i in range(10, 20)
+        ], "total": 30}}
+        return httpx.Response(200, json=data)
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"ok": False})
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "items": []})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        p2 = client.get("/music/api/v1/search/track?keyword=x&page=2&size=10").json()
+    # 返回条数(10)不超 size(10)：原样透传第 2 页，不被切片清空
+    assert [str(i["guid"]) for i in p2["data"]["list"]] == [f"local:{i}" for i in range(10, 20)]

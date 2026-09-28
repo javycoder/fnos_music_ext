@@ -587,6 +587,7 @@ def test_lx_url_required_and_webui_choice_wiring():
     assert '是否安装管理 Web UI? [y/N]' in text
     assert 'WEBUI_CHOICE="${WEBUI_CHOICE:-no}"' in text
     assert "echo \"FNMUSIC_WEBUI_ENABLED='${WEBUI_FLAG}'\"" in text
+    assert "FNMUSIC_WEBUI_PASSWORD" not in text
     # 旧 .env 多源并存的升级检测
     assert '检测到旧版 .env 同时启用了多个音源' in text
 
@@ -660,7 +661,7 @@ def test_extend_docker_only_and_single_container_probe():
     assert 'run_docker restart "${CONTAINER_NAME}"' in text
     # WebUI 探测与汇总提示
     assert 'FNMUSIC_WEBUI_ENABLED' in text
-    assert 'http://<NAS_IP>:8774' in text
+    assert '飞牛管理员打开的管理页' in text
     # v1.x 数据目录兜底迁移
     assert 'musicbox-data -> sources-data' in text
 

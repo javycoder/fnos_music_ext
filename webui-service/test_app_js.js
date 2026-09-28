@@ -225,6 +225,34 @@ test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {
   assert.strictEqual(r.ok, true);
 });
 
+test("网易账号歌单开关：loadConfig 回填 + collectConfig 收集", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_NETEASE_MY_PLAYLISTS: "true" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-my-playlists").checked, true);
+  els.get("#netease-my-playlists").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_MY_PLAYLISTS, false);
+  // 回填 false：缺省/关闭都表现为未勾选
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_NETEASE_MY_PLAYLISTS: "false" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-my-playlists").checked, false);
+});
+
+test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LYRIC_AUTO_DL: "true" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lyric-auto-dl").checked, true);
+  els.get("#lyric-auto-dl").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_LYRIC_AUTO_DL, false);
+  // 缺省/关闭都表现为未勾选（默认关）
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

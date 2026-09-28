@@ -15,9 +15,11 @@ from netease_ext import (
     check_is_logged_in,
     filter_playable_song_ids,
     get_song_url,
+    playlist_track_ids,
     reset_api,
     search_web_fallback,
     song_lyric_pair,
+    user_playlists as fetch_user_playlists,
 )
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
@@ -218,6 +220,24 @@ def album(album_id: int = Path(..., ge=1)):
 @app.get("/api/v1/playlist/{playlist_id}")
 def playlist(playlist_id: int = Path(..., ge=1)):
     return exec_musicbox(["playlist", "show", str(playlist_id), "--json"])
+
+
+@app.get("/api/v1/user/playlists")
+def user_playlists(limit: int = Query(100, ge=1, le=100)):
+    """网易账号歌单列表（需扫码登录；自建/收藏的判定字段随行下发，由调用方过滤）。"""
+    res = fetch_user_playlists(limit)
+    if res is None:
+        return {"ok": False, "error": "not_logged_in", "logged_in": False}
+    return {"ok": True, "data": res["playlists"], "account_uid": res["uid"], "logged_in": True}
+
+
+@app.get("/api/v1/user/playlists/{playlist_id}/tracks")
+def user_playlist_tracks(playlist_id: int = Path(..., ge=1)):
+    """网易歌单曲目：trackIds -> 批量详情 + 可播过滤（形状对齐 recommend rows）。"""
+    ids = playlist_track_ids(playlist_id)
+    if ids is None:
+        return {"ok": False, "error": "not_logged_in", "logged_in": False}
+    return {"ok": True, "data": batch_song_details(ids[:1000])}
 
 
 def _cli_error_or_raise(exc: UpstreamException) -> Any:

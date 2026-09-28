@@ -2,7 +2,7 @@
 
 定位：同容器内经 127.0.0.1 访问三源服务，subprocess 调 supervisorctl 切换音源
 进程，直接读写挂载在 /repo 的仓库目录下的 .env（proxy 靠热重载生效）。
-不挂 docker.sock、不做容器级操作；无鉴权——仅限可信内网使用（文档已声明）。
+不挂 docker.sock、不做容器级操作。管理接口只接受飞牛网关注入的管理员身份。
 
 前端为原生单页（static/，无构建、无 CDN 资产）。
 """
@@ -74,6 +74,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
     "FNMUSIC_FAV_AUTO_BIND": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "收藏自动绑定本地"},
+    "FNMUSIC_AUTO_COVER": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "自动下载封面"},
+    "FNMUSIC_LYRIC_AUTO_DL": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "自动下载歌词"},
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": {"kind": "int", "default": "120", "min": 10, "max": 3600, "group": "tee", "reload": "hot", "label": "官方绑定等待（秒）"},
     "FNMUSIC_TEE_HANDOFF_MAX": {"kind": "int", "default": "3", "min": 0, "max": 20, "group": "tee", "reload": "hot", "label": "切歌续传并行数"},
     "FNMUSIC_LIBRARY_SCAN_PATH": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "曲库重扫接口（选填）"},
@@ -81,6 +83,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
+    "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
 }
 
 _PROVIDER_KEYS = set(PROVIDERS.values())
@@ -358,7 +361,18 @@ def _read_version() -> str:
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "service": "fnmusic-webui", "version": SERVICE_VERSION}
+    return {"ok": True}
+
+
+def _header_map(scope) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in scope.get("headers") or []:
+        out[key.decode("latin-1").lower()] = value.decode("latin-1")
+    return out
+
+
+def _is_admin(headers: dict[str, str]) -> bool:
+    return headers.get("x-trim-isadmin", "").lower() == "true"
 
 
 @app.get("/api/status")
@@ -659,4 +673,31 @@ class DesktopPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+class AuthMiddleware:
+    """管理接口要求飞牛网关注入的管理员身份。桌面前缀由外层中间件先剥掉。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or ""
+        if not path.startswith("/api/") or _is_admin(_header_map(scope)):
+            await self.app(scope, receive, send)
+            return
+        body = '{"ok":false,"error":"需要管理员"}'.encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                [b"content-type", b"application/json; charset=utf-8"],
+                [b"content-length", str(len(body)).encode()],
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(AuthMiddleware)
 app.add_middleware(DesktopPrefixMiddleware)

@@ -125,6 +125,11 @@
           </label>
           <p class="hint">单位为秒，默认 15。在线结果一返回就交给播放页，本地歌曲在前；到时还没有就放弃这次在线结果，只返回本地歌曲。保存后立即生效。</p>
         </div>
+
+        <div class="card">
+          <div class="card-title">网易账号歌单</div>
+          <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
+        </div>
       </section>
 
       <!-- 播放与推荐 -->
@@ -150,6 +155,8 @@
         <h2>边听边存</h2>
         <div class="card">
           <label class="switch-row"><span>边听边存<div class="sub">完整试听在线歌后自动保存到本地曲库</div></span><input type="checkbox" id="tee-enabled"></label>
+          <label class="switch-row"><span>自动下载封面<div class="sub">自动保存到本地的歌曲会顺带把封面一起下回来，直接嵌进音频文件里；飞牛音乐认的就是内嵌封面，这样官方 App 里下载的歌就有图。歌曲保存成功后才会去下封面，不会出现只有封面没有歌的垃圾文件。默认开启。</div></span><input type="checkbox" id="auto-cover"></label>
+          <label class="switch-row"><span>自动下载歌词<div class="sub">自动保存到本地的歌曲在完整下载成功后，自动下载同名 .lrc 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放就能显示歌词。歌曲下载成功后才会去下歌词，不会出现只有歌词没有歌的垃圾文件。酷我源的歌词接口已失效，暂无歌词。默认关闭。</div></span><input type="checkbox" id="lyric-auto-dl"></label>
           <label class="field"><span>保存路径</span>
             <input class="input" id="tee-dir" placeholder="留空自动探测共享曲库目录">
           </label>

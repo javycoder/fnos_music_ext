@@ -53,10 +53,9 @@ except Exception:
 " "$1"; }
 
 # ── 1. 搜索 ─────────────────────────────────────────────
-SEARCH1=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=1&size=10")
-TOTAL1=$(echo "$SEARCH1" | jget data.total)
-LIST1_COUNT=$(echo "$SEARCH1" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
-ONLINE_GUID=$(sudo python3 - "$SEARCH1" <<'PY'
+# 从搜索响应 JSON 中提取第一个非官方 guid 的在线条目（本地优先布局下在线条目排在本地条目之后）
+extract_online() {
+  sudo python3 - "$1" <<'PY'
 import json, sqlite3, sys
 try:
     search = json.loads(sys.argv[1])
@@ -71,7 +70,16 @@ try:
 except Exception:
     print('')
 PY
-)
+}
+SEARCH1=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=1&size=10")
+TOTAL1=$(echo "$SEARCH1" | jget data.total)
+LIST1_COUNT=$(echo "$SEARCH1" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+ONLINE_GUID=$(extract_online "$SEARCH1")
+if [ -z "$ONLINE_GUID" ] && [ "${TOTAL1:-0}" -gt 10 ]; then
+  # 第一页全为本地条目时，在线条目在后续页——补查大页提取（判定在线聚合是否真的出结果）
+  SEARCH_WIDE=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=1&size=50")
+  ONLINE_GUID=$(extract_online "$SEARCH_WIDE")
+fi
 if [ -n "$ONLINE_GUID" ] && [ "${TOTAL1:-0}" -gt 0 ]; then
   ok "搜索 \"$KEYWORD\"（total=$TOTAL1，取到在线条目 ${ONLINE_GUID:0:12}…）"
 else
@@ -88,7 +96,7 @@ fi
 # ── 2. 分页 ─────────────────────────────────────────────
 SEARCH2=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=2&size=10")
 LIST2_COUNT=$(echo "$SEARCH2" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
-if [ "${TOTAL1:-0}" -gt 10 ] && [ "${LIST1_COUNT:-0}" -eq 10 ] && [ "${LIST2_COUNT:-0}" -gt 0 ]; then
+if [ "${TOTAL1:-0}" -gt 10 ] && [ "${LIST1_COUNT:-0}" -gt 0 ] && [ "${LIST2_COUNT:-0}" -gt 0 ]; then
   ok "分页 page=2（page1=$LIST1_COUNT 条 / page2=$LIST2_COUNT 条 / total=$TOTAL1）"
 else
   bad "分页 page=2" "total=$TOTAL1，page1=$LIST1_COUNT，page2=$LIST2_COUNT（需 total>10 且两页均非空）"

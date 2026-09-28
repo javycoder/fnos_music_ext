@@ -24,6 +24,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
     monkeypatch.setitem(p.CONF, "tee_save_dir", "")
     monkeypatch.setitem(p.CONF, "tee_cache_max", 2)
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", False)
     monkeypatch.setattr(p, "_TEE_SAVE_DIR_WARNED", False)
     p._full_fetch_tasks.clear()
     p._full_fetch_failed.clear()
@@ -48,14 +49,18 @@ class Audio(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def listen(guid, title="晴天", artist="周杰伦", ext="flac", range_header=None):
+async def listen(guid, title="晴天", artist="周杰伦", ext="flac", range_header=None,
+                 info=None, post_finalize=None, response=None):
     """完整试听一首歌并消费完整个响应体，触发 stream_tee_response 落盘转正。"""
-    info = {"title": title, "artist": artist, "album": "叶惠美", "lyric": "[00:00.00]测试歌词"}
-    response = p.stream_tee_response(
-        httpx.Response(200, stream=Audio()), guid, range_header,
-        pre_info=info, resolved_ext=ext,
+    if info is None:
+        info = {"title": title, "artist": artist, "album": "叶惠美", "lyric": "[00:00.00]测试歌词"}
+    if response is None:
+        response = httpx.Response(200, stream=Audio())
+    tee_response = p.stream_tee_response(
+        response, guid, range_header,
+        pre_info=info, resolved_ext=ext, post_finalize=post_finalize,
     )
-    body = b"".join([chunk async for chunk in response.body_iterator])
+    body = b"".join([chunk async for chunk in tee_response.body_iterator])
     assert body == b"A" * 4096
 
 
@@ -70,7 +75,8 @@ def audio_files(directory):
 
 @pytest.mark.anyio
 async def test_tee_off_only_caches_into_cache_dir(monkeypatch):
-    """开关关：文件以 online_源_id 命名落 cache 目录，不进曲库，回放可命中。"""
+    """开关关：文件以 online_源_id 命名落 cache 目录，不进曲库，回放可命中；
+    滚动缓存不属于"自动下载音乐"，无论歌词开关如何都不写歌词。"""
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
     await listen("online:netease:186016")
     cache_dir, library_dir = p.CONF["cache_dir"], p.CONF["library_dir"]
@@ -78,14 +84,14 @@ async def test_tee_off_only_caches_into_cache_dir(monkeypatch):
     assert os.path.isfile(cached)
     with open(cached, "rb") as f:
         assert f.read() == b"A" * 4096
-    assert os.path.isfile(os.path.join(cache_dir, "online_netease_186016.lrc"))
+    assert not os.path.exists(os.path.join(cache_dir, "online_netease_186016.lrc"))
     assert audio_files(library_dir) == []
     assert p.find_cache_file("online:netease:186016") == cached
 
 
 @pytest.mark.anyio
 async def test_tee_off_keeps_latest_n_rolling(monkeypatch):
-    """开关关：滚动保留最新 tee_cache_max 首，最旧的音频/歌词/ref 一并淘汰。"""
+    """开关关：滚动保留最新 tee_cache_max 首，最旧的音频/ref 一并淘汰。"""
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
     for i, guid in enumerate(["online:kuwo:1", "online:kuwo:2", "online:kuwo:3"]):
         await listen(guid, title=f"歌{i}")
@@ -104,6 +110,7 @@ async def test_tee_off_keeps_latest_n_rolling(monkeypatch):
 async def test_tee_on_ignores_cache_max(monkeypatch):
     """开关开：tee_cache_max 不生效，全部永久保存且不滚动清理。"""
     monkeypatch.setitem(p.CONF, "tee_cache_max", 2)
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
     await listen("online:kuwo:1", title="晴天")
     await listen("online:kuwo:2", title="七里香")
     await listen("online:kuwo:3", title="稻香")
@@ -111,6 +118,11 @@ async def test_tee_on_ignores_cache_max(monkeypatch):
         "周杰伦 - 七里香.flac", "周杰伦 - 晴天.flac", "周杰伦 - 稻香.flac",
     ]
     assert [f for f in os.listdir(p.CONF["cache_dir"]) if f.endswith((".flac", ".mp3"))] == []
+    # 自动下载歌词开启：每首歌旁都有同名 .lrc
+    library_dir = p.CONF["library_dir"]
+    assert sorted(f for f in os.listdir(library_dir) if f.endswith(".lrc")) == [
+        "周杰伦 - 七里香.lrc", "周杰伦 - 晴天.lrc", "周杰伦 - 稻香.lrc",
+    ]
 
 
 @pytest.mark.anyio
@@ -118,6 +130,7 @@ async def test_tee_save_dir_custom_path_used(monkeypatch, tmp_path):
     """配置可用保存路径：文件落配置目录并写标签/歌词，ref 指向该文件。"""
     custom = str(tmp_path / "my-music")
     monkeypatch.setitem(p.CONF, "tee_save_dir", custom)
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
     await listen("online:netease:186016")
     dest = os.path.join(custom, "周杰伦 - 晴天.flac")
     assert os.path.isfile(dest)
@@ -152,6 +165,123 @@ async def test_rolling_ref_does_not_trap_library_promotion(monkeypatch):
     assert os.path.isfile(os.path.join(library_dir, "周杰伦 - 晴天.flac"))
     with open(p.media_ref_path("online:kuwo:1"), encoding="utf-8") as f:
         assert os.path.dirname(f.read().strip()) == library_dir
+
+
+# === 自动下载歌词（FNMUSIC_LYRIC_AUTO_DL，默认关） ===
+
+
+@pytest.mark.anyio
+async def test_lyric_auto_dl_off_no_lrc(monkeypatch):
+    """开关关（默认）：即使源返回了歌词也不落 .lrc，下载即完成、无歌词文件。"""
+    assert p.CONF["lyric_auto_dl"] is False
+    await listen("online:netease:186016")
+    assert os.path.isfile(os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.flac"))
+    assert not os.path.exists(os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc"))
+    assert p.find_lyric_file("online:netease:186016") is None
+
+
+@pytest.mark.anyio
+async def test_lyric_auto_dl_on_writes_sidecar(monkeypatch):
+    """开关开：音乐完整落库成功后，info 里的歌词写到音频旁同名 .lrc。"""
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    await listen("online:netease:186016")
+    library_dir = p.CONF["library_dir"]
+    assert os.path.isfile(os.path.join(library_dir, "周杰伦 - 晴天.flac"))
+    sidecar = os.path.join(library_dir, "周杰伦 - 晴天.lrc")
+    assert os.path.isfile(sidecar)
+    with open(sidecar, encoding="utf-8") as f:
+        assert "测试歌词" in f.read()
+
+
+class Broken(httpx.AsyncByteStream):
+    """上游中途断流的音频流。"""
+
+    async def __aiter__(self):
+        yield b"A" * 2048
+        raise RuntimeError("upstream reset")
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.anyio
+async def test_lyric_auto_dl_on_download_failure_no_pollution(monkeypatch):
+    """开关开但音频下载失败：音频与歌词都不落盘，目录无污染。"""
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    guid = "online:netease:186016"
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=Broken()), guid, None,
+        pre_info={"title": "晴天", "artist": "周杰伦", "album": "叶惠美", "lyric": "[00:00.00]测试歌词"},
+        resolved_ext="flac",
+    )
+    with pytest.raises(RuntimeError):
+        _ = b"".join([chunk async for chunk in response.body_iterator])
+    library_dir = p.CONF["library_dir"]
+    assert audio_files(library_dir) == []
+    assert [f for f in os.listdir(library_dir) if f.endswith(".lrc")] == []
+    if os.path.isdir(p.CONF["cache_dir"]):
+        assert [f for f in os.listdir(p.CONF["cache_dir"])
+                if f.endswith((".flac", ".lrc", ".part"))] == []
+
+
+@pytest.mark.anyio
+async def test_auto_lyric_after_finalize_fetches_when_missing(monkeypatch):
+    """开关开 + info 未带歌词：finalize 后补拉源站歌词并落音频旁。"""
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    calls = []
+
+    async def fake_resolve(request, guid):
+        calls.append(guid)
+        p.write_lyric_cache(guid, "[00:00.00]补拉歌词", title="晴天", artist="周杰伦")
+        return "[00:00.00]补拉歌词"
+
+    monkeypatch.setattr(p, "resolve_online_lyric", fake_resolve)
+    guid = "online:netease:186016"
+
+    async def post(meta):
+        await p._auto_lyric_after_finalize(_fake_request(), guid, meta)
+
+    await listen(guid, info={"title": "晴天", "artist": "周杰伦", "album": "叶惠美"},
+                 post_finalize=post)
+    assert calls == [guid]
+    sidecar = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+    assert os.path.isfile(sidecar)
+    with open(sidecar, encoding="utf-8") as f:
+        assert "补拉歌词" in f.read()
+
+
+@pytest.mark.anyio
+async def test_auto_lyric_after_finalize_guards(monkeypatch):
+    """开关关 / 滚动缓存产物 / 已有歌词：三种情况都不发补拉请求。"""
+    calls = []
+
+    async def fake_resolve(request, guid):
+        calls.append(guid)
+        return ""
+
+    monkeypatch.setattr(p, "resolve_online_lyric", fake_resolve)
+    req = _fake_request()
+
+    # 开关关（默认）：直接返回
+    await p._auto_lyric_after_finalize(req, "online:netease:186016", {"dest": "/x/周杰伦 - 晴天.flac"})
+    assert calls == []
+
+    # 边听边存关：落盘产物是滚动缓存命名，不补歌词
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    rolling_dest = os.path.join(
+        p.CONF["cache_dir"], f"{p.cache_safe_guid('online:netease:186016')}.flac")
+    await p._auto_lyric_after_finalize(req, "online:netease:186016", {"dest": rolling_dest})
+    assert calls == []
+
+    # 已有歌词（音频旁 sidecar 已就位）：零请求
+    audio = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.flac")
+    with open(audio, "wb") as f:
+        f.write(b"audio")
+    p.remember_media_path("online:netease:186016", audio)
+    with open(os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc"), "w", encoding="utf-8") as f:
+        f.write("已有歌词")
+    await p._auto_lyric_after_finalize(req, "online:netease:186016", {"dest": audio})
+    assert calls == []
 
 
 def test_cache_gc_keeps_latest_and_library_refs(tmp_path):
