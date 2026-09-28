@@ -399,6 +399,54 @@ lx.request(BASE + '/hang', { timeout: 300 }, (err, resp, body) => {
   });
 }
 
+async function test_network_error_carries_errno() {
+  // 连接被拒：undici 只给 "fetch failed"，真实 errno 藏在 cause——桥必须带到
+  // 错误消息里，宿主才能区分"源服务端已失效"与脚本自身错误（pdone 源矩阵实测）。
+  // 端口取自临时监听后关闭的 socket（undici 会拒绝 1 等特权端口，不走 errno 路径）
+  const net = require('node:net');
+  const deadPort = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.request('http://127.0.0.1:${deadPort}/dead', {}).catch((err) => {
+  console.log('ERRMSG=' + err.message);
+});
+`;
+  await bridgeCase(script, {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('ERRMSG=')),
+    timeoutMs: 8000,
+    then: (b) => {
+      const line = b.logs().find((m) => m.includes('ERRMSG='));
+      assert.ok(line, '应收到错误日志');
+      assert.ok(line.includes('ECONNREFUSED'), `错误应携带底层 errno; 实际: ${line}`);
+      assert.ok(line.includes('fetch failed'), `保留原始消息; 实际: ${line}`);
+    },
+  });
+}
+
+async function test_timeout_error_names_target() {
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.request(BASE + '/hang', { timeout: 300 }, (err) => {
+  console.log('TMSG=' + (err ? err.message : 'none'));
+});
+`;
+  await bridgeCase(inject(script), {
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('TMSG=')),
+    timeoutMs: 6000,
+    then: (b) => {
+      const line = b.logs().find((m) => m.includes('TMSG='));
+      assert.ok(line, '应收到超时日志');
+      assert.ok(/request timeout after \d+ms/.test(line), `超时错误应说明超时与目标; 实际: ${line}`);
+    },
+  });
+}
+
 async function test_musicurl_protocol_roundtrip() {
   const script = `
 lx.on(lx.EVENT_NAMES.request, ({ action, info }) => {
@@ -821,6 +869,8 @@ async function main() {
     ['重定向上限报错', test_too_many_redirects_errors],
     ['form urlencoded', test_form_encoded],
     ['请求超时中断', test_request_timeout_aborts],
+    ['网络错误携带底层 errno', test_network_error_carries_errno],
+    ['超时错误指明目标', test_timeout_error_names_target],
     ['musicUrl 协议往返', test_musicurl_protocol_roundtrip],
     ['musicInfo 契约字段穿透（issue #22 审计）', test_musicurl_musicinfo_contract_passthrough],
     ['ping/pong', test_ping_pong],

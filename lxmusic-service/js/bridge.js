@@ -154,6 +154,19 @@ async function httpFetch(url, options) {
         redirect: 'manual',
         signal: controller.signal,
       });
+    } catch (e) {
+      // undici 把底层网络失败包装成 "fetch failed"，真实原因（DNS 不存在/IP 不可达/
+      // 连接被拒/超时中断）藏在 e.cause。透传脚本会原样抛出，不带 cause 时
+      // 宿主与用户无法区分"源服务端已失效"与脚本自身逻辑错误
+      const cause = e && e.cause;
+      const causeBits = [];
+      if (cause && cause.code) causeBits.push(cause.code);
+      if (cause && cause.host) causeBits.push(cause.host);
+      const enriched = new Error(
+        String((e && e.message) || e) + (causeBits.length ? ` (${causeBits.join(' ')})` : ''),
+      );
+      if (e && e.name === 'AbortError') enriched.message = `request timeout after ${timeoutMs}ms (${current})`;
+      throw enriched;
     } finally {
       clearTimeout(timer);
     }

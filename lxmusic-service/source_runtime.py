@@ -26,7 +26,10 @@ logger = logging.getLogger("lxmusic_service.runtime")
 
 SCRIPT_MAX_BYTES = 9_000_000
 MAX_REDIRECTS = 3
-INIT_TIMEOUT_S = 10.0
+# 服务端中转型脚本（如 pdone/lx-music-source 系）init 期间要先联系自家 API 服务器，
+# 实测 1.4~6s、弱网更久；10s 会把"慢而活"的源掐死在激活环节，
+# 30s 对齐桌面版"不设硬超时"的宽裕度，又不至于让激活请求无限挂起
+INIT_TIMEOUT_S = 30.0
 MUSIC_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
 
 _META_LIMITS = {"name": 24, "description": 36, "author": 56, "homepage": 1024, "version": 36}

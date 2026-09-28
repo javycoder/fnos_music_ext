@@ -186,6 +186,42 @@ def test_verify_url_music_url_source_error_returns_report(app_alias, isolated, m
     assert shim.stopped is True
 
 
+def test_server_dead_reason_classification():
+    """网络层死亡证据 → 大白话原因；脚本自身错误不误判。"""
+    cases = [
+        ("fetch failed (ENOTFOUND api.ikunshare.com)", "域名已不存在"),
+        ("fetch failed (EHOSTUNREACH)", "IP 从当前网络不可达"),
+        ("fetch failed (ECONNREFUSED 1.2.3.4:443)", "拒绝连接"),
+        ("request timeout after 60000ms (http://x)", "连不上"),
+        ("fetch failed", "连不上"),
+    ]
+    for text, expect in cases:
+        reason = vsr._server_dead_reason(text)
+        assert reason is not None and expect in reason, f"{text} -> {reason}"
+    # 脚本自身逻辑错误：不该归类为服务端死亡
+    assert vsr._server_dead_reason("unknow error") is None
+    assert vsr._server_dead_reason("console.group is not a function") is None
+
+
+def test_verify_url_server_unreachable_report(app_alias, isolated, monkeypatch):
+    """源服务器已死（bridge 透传 errno）→ 报告明确说不是兼容性问题、建议换源。"""
+    async def fake_download(url):
+        return STUB_SCRIPT
+
+    monkeypatch.setattr(vsr, "download_script", fake_download)
+    shim = UserSourceShim(STUB_SCRIPT, {"name": "t"}, resolver=SourceError(
+        "resolve", "fetch failed (EHOSTUNREACH)"
+    ))
+    monkeypatch.setattr(vsr, "UserSource", lambda *a, **kw: shim)
+    lxapp.app.state.http = mock_client(_kw_handler())
+
+    report = asyncio.run(vsr.verify_url("https://src.test/1.js"))
+    assert report["ok"] is False
+    assert report["category"] == "server_unreachable"
+    assert "不可达" in report["message"]
+    assert "不是本扩展的兼容性问题" in report["message"]
+
+
 def test_verify_url_search_empty(app_alias, isolated, monkeypatch):
     async def fake_download(url):
         return STUB_SCRIPT

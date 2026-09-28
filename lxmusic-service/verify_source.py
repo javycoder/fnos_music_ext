@@ -34,6 +34,29 @@ _PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
 _MAX_ATTEMPTS_RECORDED = 12
 
+# 源脚本透传的网络层失败（bridge 已带上底层 errno）——这些说明源自己的 API
+# 服务器已失效/不可达，换哪个客户端都一样，不是本扩展的兼容性问题
+_NET_DEAD_MARKERS = (
+    "ECONNREFUSED", "EHOSTUNREACH", "ENOTFOUND", "ETIMEDOUT",
+    "EAI_AGAIN", "ECONNRESET", "ECONNABORTED", "fetch failed", "request timeout",
+)
+
+
+def _server_dead_reason(text: str) -> "str | None":
+    """解析失败文本中的网络层死亡证据；返回大白话原因，无证据返回 None。"""
+    t = str(text or "")
+    for marker in _NET_DEAD_MARKERS:
+        if marker in t:
+            if "ENOTFOUND" in t or "EAI_AGAIN" in t:
+                return "源服务器的域名已不存在（已停止运营）"
+            if "EHOSTUNREACH" in t:
+                return "源服务器的 IP 从当前网络不可达（服务器下线或搬迁）"
+            if "ECONNREFUSED" in t:
+                return "源服务器拒绝连接（服务进程已关闭）"
+            if marker in ("ETIMEDOUT", "ECONNRESET", "ECONNABORTED", "fetch failed", "request timeout"):
+                return "连不上源脚本的服务器（超时或网络失败）"
+    return None
+
 
 def _looks_like_json_source(script: str) -> bool:
     """musicApi.json 类 API 配置源：JSON 文件而非洛雪桌面版 JS 脚本模块。"""
@@ -210,6 +233,17 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
             report["sampled"] = sampled
             # 抽样全部失败：按证据归类真实原因
             if probe_errors:
+                dead = _server_dead_reason(probe_errors[0])
+                if dead:
+                    report.update(
+                        category="server_unreachable",
+                        message=(
+                            f"源脚本本身能运行，但{dead}: {str(probe_errors[0])[:100]}"
+                            f"（抽样 {sampled} 组全部如此）。这不是本扩展的兼容性问题——"
+                            "该音源的服务端已失效，换用其他源即可"
+                        ),
+                    )
+                    return report
                 report.update(
                     category="resolve",
                     message=f"源脚本解析失败，搜索探活全部未通过: {probe_errors[0]}"
@@ -219,9 +253,14 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
             if saw_resolve_attempt:
                 first = next((a for a in attempts if a["result"] in ("resolve_error", "probe_failed")), None)
                 detail = f"{first['platform']}×{first['keyword']}: {first['error'][:80]}" if first else ""
+                # 直链解析成功但内容不是音频：多为源服务端后端已坏（返回错误页/JSON）
+                dead_hint = (
+                    " 多为该源服务端已失效（返回错误页或空内容），非本扩展兼容性问题。"
+                    if first and first["result"] == "probe_failed" else ""
+                )
                 report.update(
                     category="resolve",
-                    message=f"抽样 {sampled} 组均未通过（例: {detail}）",
+                    message=f"抽样 {sampled} 组均未通过（例: {detail}）。{dead_hint}",
                 )
                 return report
             # 没有任何一组走到"源脚本解析"：全部卡在搜索侧（限流/网络/平台接口波动）。
