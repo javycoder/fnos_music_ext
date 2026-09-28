@@ -122,11 +122,7 @@ class TestWizard:
         fields = {it["field"] for it in items if "field" in it}
         assert "wizard_sources" in fields
         assert "wizard_extend" in fields
-        assert "wizard_webui_password" in fields
-        assert "wizard_webui_password_confirm" in fields
-        password = next(it for it in items if it.get("field") == "wizard_webui_password")
-        assert password["initValue"] == ""
-        assert any(rule.get("required") for rule in password.get("rules", []))
+        assert "wizard_webui_password" not in fields
         radio = next(it for it in items if it["type"] == "radio")
         values = {opt["value"] for opt in radio["options"]}
         assert values == {"musicdl", "musicbox", "lxmusic"}

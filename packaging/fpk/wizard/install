@@ -34,31 +34,7 @@
             },
             {
                 "type": "tips",
-                "helpText": "选择洛雪自定义源时无需在此提供脚本：安装完成后打开管理页（桌面 fnMusic 扩展管理或 http://NAS_IP:8774），在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑上的 .js 文件或从 NAS 选择，测试可用后保存即激活。"
-            },
-            {
-                "type": "password",
-                "field": "wizard_webui_password",
-                "label": "管理密码（至少 8 位，用于登录管理页）",
-                "initValue": "",
-                "rules": [
-                    {
-                        "required": true,
-                        "message": "请设置管理密码"
-                    }
-                ]
-            },
-            {
-                "type": "password",
-                "field": "wizard_webui_password_confirm",
-                "label": "再次输入管理密码",
-                "initValue": "",
-                "rules": [
-                    {
-                        "required": true,
-                        "message": "请再次输入管理密码"
-                    }
-                ]
+                "helpText": "选择洛雪自定义源时无需在此提供脚本：安装完成后用飞牛管理员打开桌面「fnMusic 扩展管理」，在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑上的 .js 文件或从 NAS 选择，测试可用后保存即激活。"
             },
             {
                 "type": "switch",

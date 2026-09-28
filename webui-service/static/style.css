@@ -174,14 +174,6 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 .toast.ok { background: var(--ok); }
 .toast.fail { background: var(--err); }
 
-.login-overlay {
-  position: fixed; inset: 0; z-index: 70;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--bg); padding: 24px;
-}
-.login-overlay[hidden] { display: none; }
-.login-card { width: min(420px, 100%); margin: 0; }
-
 /* -------------------------------------------------- 移动端 */
 .bottom-nav { display: none; }
 

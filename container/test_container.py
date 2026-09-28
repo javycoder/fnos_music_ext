@@ -217,15 +217,16 @@ def test_compose_single_service_layout():
     svc = compose["services"]["fnmusic-sources"]
     assert svc["build"]["dockerfile"] == "container/Dockerfile"
     assert svc["image"] == "fnmusic-sources:latest"
-    # 音源端口只发布在 127.0.0.1；WebUI 给浏览器使用，并要求管理密码
+    # 音源和管理页都只发布在 127.0.0.1；浏览器走飞牛网关
     assert sorted(svc["ports"]) == sorted([
         "127.0.0.1:8768:8001",
         "127.0.0.1:8770:8002",
         "127.0.0.1:8772:8003",
-        "0.0.0.0:8774:8004",
+        "127.0.0.1:8774:8004",
     ])
     raw = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "0.0.0.0:8770" not in raw
+    assert "0.0.0.0:8774" not in raw
     assert "./sources-data:/data" in svc["volumes"]
     assert any(v.startswith(".:/repo") for v in svc["volumes"])
     assert svc["restart"] == "unless-stopped"

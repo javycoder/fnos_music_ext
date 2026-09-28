@@ -595,7 +595,7 @@ else:
             ;;
         *)
             log_warn "尚未配置洛雪用户自定义源（播放解析不可用，搜索/榜单不受影响）。"
-            log_warn "可在 WebUI (http://<NAS_IP>:8774) 配置，或重跑 install.sh 时提供 --lx-source-url。"
+            log_warn "可在飞牛管理员打开的管理页配置，或重跑 install.sh 时提供 --lx-source-url。"
             ;;
     esac
 fi
@@ -693,14 +693,14 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "   若遇到部分网易云 VIP/无损歌曲需登录："
     log_info "   • 命令行扫码登录（推荐）: ./extend.sh --qr 或 ./netease_login.sh"
     log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
-    log_info "   • 管理页内扫码：登录 http://<NAS_IP>:8774 后在「音乐源」扫码"
+    log_info "   • 管理页内扫码：飞牛管理员打开「fnMusic 扩展管理」后在「音乐源」扫码"
     log_info "   • 本机查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"
 if [ "${ENABLE_WEBUI}" -eq 1 ]; then
-    log_info "   • 管理 WebUI: http://<NAS_IP>:8774（需管理密码；音源三选一/音质/推荐/LLM 运行期可调）"
+    log_info "   • 管理 WebUI: 飞牛桌面「fnMusic 扩展管理」（仅管理员；音源三选一/音质/推荐/LLM 运行期可调）"
 fi
 log_info "   • 一键还原: ./restore.sh (一键无损切回官方原生直连)"
 log_info "============================================================"

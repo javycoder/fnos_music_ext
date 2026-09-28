@@ -23,7 +23,6 @@
         <button class="nav-item" data-page="quality">播放与推荐</button>
         <button class="nav-item" data-page="tee">边听边存</button>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
-        <button class="nav-item" data-page="password">密码</button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -192,21 +191,6 @@
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
         </div>
       </section>
-
-      <!-- 密码 -->
-      <section class="page" id="page-password">
-        <h2>密码</h2>
-        <div class="card">
-          <p class="hint">修改管理密码后，其他已登录的浏览器会退出，需要用新密码重新登录。</p>
-          <label class="field"><span>当前密码</span><input class="input" id="pw-current" type="password" autocomplete="current-password"></label>
-          <label class="field"><span>新密码</span><input class="input" id="pw-new" type="password" autocomplete="new-password"></label>
-          <label class="field"><span>确认新密码</span><input class="input" id="pw-confirm" type="password" autocomplete="new-password"></label>
-          <div class="btn-row">
-            <button class="btn primary" id="pw-save" type="button">修改密码</button>
-            <button class="btn" id="pw-logout" type="button">退出登录</button>
-          </div>
-        </div>
-      </section>
     </main>
   </div>
 
@@ -217,22 +201,12 @@
     <button class="nav-item" data-page="quality">播放</button>
     <button class="nav-item" data-page="tee">缓存</button>
     <button class="nav-item" data-page="llm">高级</button>
-    <button class="nav-item" data-page="password">密码</button>
   </nav>
 
   <!-- 保存条 -->
   <div class="save-bar" id="save-bar">
     <span id="save-note" class="muted"></span>
     <button class="btn primary" id="save-btn">保存并生效</button>
-  </div>
-
-  <div class="login-overlay" id="login-overlay">
-    <form class="card login-card" id="login-form">
-      <h2>登录管理页</h2>
-      <p class="hint">使用安装时设置的管理密码。音源服务只在本机提供，不从这里直接打开。</p>
-      <label class="field"><span>管理密码</span><input class="input" id="login-password" type="password" autocomplete="current-password"></label>
-      <button class="btn primary" id="login-btn" type="submit">登录</button>
-    </form>
   </div>
 
   <div class="toast" id="toast" hidden></div>

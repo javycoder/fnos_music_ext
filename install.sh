@@ -11,7 +11,7 @@ set -euo pipefail
 #     3 lxmusic  洛雪音乐自定义源（用户自带源 URL 解析播放）
 #   musicdl 平台粒度: --sources musicdl-kuwo,musicdl-migu 或全局编号 --sources 2,4
 #   （全部平台编号见 musicdl-service/PLATFORMS.md）
-# - 管理 Web UI（可选，端口 8774，须设置管理密码）：
+# - 管理 Web UI（可选，端口 8774，仅本机；经飞牛登录的管理员打开）：
 #   源切换 / 平台选择 / 扫码登录 / 音质模式 / 边听边存 / LLM 配置
 # - 每日推荐默认采信音源原生推荐（网易每日推荐/榜单 + lxmusic 免登录榜单）；
 #   大模型（OpenAI 兼容）仅当网易音源未启用时作为兜底，可选配置
@@ -23,7 +23,6 @@ set -euo pipefail
 #   ./install.sh --sources lxmusic --lx-source-url 'https://example.com/lx.js'
 #   ./install.sh --non-interactive --sources musicdl --webui \
 #       --enable-recommend --llm-base-url https://api.example.com/v1 --llm-api-key '***'
-#   启用 WebUI 时须设置环境变量 FNMUSIC_WEBUI_PASSWORD（至少 8 位，不进入命令行参数）
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,10 +61,6 @@ LX_SOURCE_URL_CLI=""
 LX_SKIP_VERIFY=0
 # WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
 WEBUI_CHOICE=""
-# 管理密码只以哈希写入 .env。1 = 本次明确提供了新密码，覆盖旧哈希并轮换会话密钥。
-WEBUI_PASSWORD_HASH=""
-WEBUI_SESSION_SECRET=""
-WEBUI_PASSWORD_EXPLICIT=0
 CONTAINER_NAME="fnmusic-sources"
 PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
@@ -76,98 +71,6 @@ DOCKER_IMAGE_MIRRORS="${DOCKER_IMAGE_MIRRORS:-docker.1ms.run docker.m.daocloud.i
 log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
 log_warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
 log_err() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
-
-# 从已有 .env 取某个键的值（去掉首尾引号）。文件不存在或没有该键时打印空串。
-webui_env_value() {
-    local key="$1" env_file="${BASE_DIR}/.env" line
-    [ -f "${env_file}" ] || return 0
-    line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "${env_file}" 2>/dev/null | tail -n1 || true)"
-    [ -n "${line}" ] || return 0
-    printf '%s' "${line#*=}" | sed -e "s/^['\"]//" -e "s/['\"]$//"
-}
-
-# 用环境变量里的明文计算哈希与新会话密钥。明文不出现在命令行参数和 stdout。
-compute_webui_secrets() {
-    BASE_DIR="${BASE_DIR}" python3 - <<'PY'
-import os, sys
-sys.path.insert(0, os.path.join(os.environ["BASE_DIR"], "webui-service"))
-from auth import hash_password, new_session_secret, password_ok
-password = os.environ.get("FNMUSIC_WEBUI_PASSWORD", "")
-err = password_ok(password)
-if err:
-    print(err, file=sys.stderr)
-    raise SystemExit(2)
-print(hash_password(password))
-print(new_session_secret())
-PY
-}
-
-# 交互安装：在继续后续步骤前设好密码。已通过环境变量提供时不再询问。
-prompt_webui_password() {
-    if [ -n "${FNMUSIC_WEBUI_PASSWORD:-}" ]; then
-        return 0
-    fi
-    local first second
-    while true; do
-        read -r -s -p "请设置管理密码（至少 8 位，输入不回显）: " first || true
-        echo
-        read -r -s -p "请再次输入管理密码: " second || true
-        echo
-        if [ "${#first}" -lt 8 ]; then
-            log_err "管理密码至少 8 位，请重新输入。"
-            first=""
-            second=""
-            continue
-        fi
-        if [ "${first}" != "${second}" ]; then
-            log_err "两次输入不一致，请重新输入。"
-            first=""
-            second=""
-            continue
-        fi
-        FNMUSIC_WEBUI_PASSWORD="${first}"
-        first=""
-        second=""
-        return 0
-    done
-}
-
-# 启用 WebUI 时必须已有密码：新密码写成哈希；已有哈希则保留。在写 .env 和启动容器之前调用。
-seal_webui_password() {
-    local existing hashed secret_line
-    if [ "${WEBUI_CHOICE}" != "yes" ]; then
-        unset FNMUSIC_WEBUI_PASSWORD
-        return 0
-    fi
-    if [ "${NON_INTERACTIVE}" -eq 0 ]; then
-        prompt_webui_password
-    fi
-    existing="$(webui_env_value FNMUSIC_WEBUI_PASSWORD_HASH)"
-    if [ -n "${FNMUSIC_WEBUI_PASSWORD:-}" ]; then
-        if ! hashed="$(compute_webui_secrets 2>&1)"; then
-            unset FNMUSIC_WEBUI_PASSWORD
-            log_err "管理密码无效：${hashed}"
-            exit 1
-        fi
-        unset FNMUSIC_WEBUI_PASSWORD
-        WEBUI_PASSWORD_HASH="$(printf '%s\n' "${hashed}" | sed -n '1p')"
-        WEBUI_SESSION_SECRET="$(printf '%s\n' "${hashed}" | sed -n '2p')"
-        WEBUI_PASSWORD_EXPLICIT=1
-        log_info "已设置管理密码。"
-        return 0
-    fi
-    unset FNMUSIC_WEBUI_PASSWORD
-    if [ -n "${existing}" ]; then
-        secret_line="$(webui_env_value FNMUSIC_WEBUI_SESSION_SECRET)"
-        if [ -z "${secret_line}" ]; then
-            WEBUI_SESSION_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-        fi
-        log_info "沿用已保存的管理密码。"
-        return 0
-    fi
-    log_err "启用管理 WebUI 必须设置管理密码。交互安装会询问；非交互请设置环境变量 FNMUSIC_WEBUI_PASSWORD（至少 8 位）。"
-    exit 1
-}
 
 usage() {
     cat <<'EOF'
@@ -190,7 +93,7 @@ usage() {
                           留空=无源安装，装好在管理页 WebUI 配置）
   --lx-skip-verify       跳过洛雪源可用性校验（下载→init→搜索→解析→探活）直接激活；
                          源是否可用装好后在管理页 WebUI 查看，适合不想因源故障中断安装的场景
-  --webui                安装管理 Web UI（端口 8774；须设置管理密码）
+  --webui                安装管理 Web UI（仅本机 8774；由已登录的飞牛管理员打开）
   --no-webui             不安装管理 Web UI（非交互默认）
   --non-interactive      无交互，缺省值：音源=musicdl，不装 WebUI，不开启每日推荐
   --enable-recommend     开启大模型兜底推荐（需同时给 base-url 与 api-key；
@@ -854,7 +757,7 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     fi
     if [ -z "${WEBUI_CHOICE}" ]; then
         echo "【管理 Web UI】(端口 8774)：音源切换 / 扫码登录 / 平台选择 / 音质模式 /"
-        echo "  边听边存 / LLM 配置。启用后必须设置管理密码才能继续。"
+        echo "  边听边存 / LLM 配置。只在本机提供，由已登录的飞牛管理员打开。"
         webui_choice="$(prompt "是否安装管理 Web UI? [y/N]" "N")"
         case "${webui_choice}" in
             y|Y|yes|YES) WEBUI_CHOICE="yes" ;;
@@ -912,8 +815,6 @@ else
     fi
 fi
 
-seal_webui_password
-
 ensure_docker_ready
 
 parse_sources "${SOURCES_RAW}"
@@ -946,7 +847,7 @@ if [ "${ENABLE_LX}" -eq 1 ]; then
             ;;
     esac
     if [ -z "${LX_SOURCE_URL_CLI}" ]; then
-        log_info "未提供洛雪源（无源安装）：装好后在管理页 WebUI（桌面「fnMusic 扩展管理」或 http://<NAS_IP>:8774）配置源脚本并激活"
+        log_info "未提供洛雪源（无源安装）：装好后在飞牛管理员打开的管理页配置源脚本并激活"
     fi
     case "${LX_SOURCE_URL_CLI}" in
         ""|http://*|https://*|file://*) : ;;
@@ -1057,12 +958,6 @@ ENV_DESIRED="$(mktemp)"
         echo "LX_SOURCES='$(dotenv_escape "${LX_PLATFORMS}")'"
     fi
     echo "FNMUSIC_WEBUI_ENABLED='${WEBUI_FLAG}'"
-    if [ -n "${WEBUI_PASSWORD_HASH}" ]; then
-        echo "FNMUSIC_WEBUI_PASSWORD_HASH='$(dotenv_escape "${WEBUI_PASSWORD_HASH}")'"
-    fi
-    if [ -n "${WEBUI_SESSION_SECRET}" ]; then
-        echo "FNMUSIC_WEBUI_SESSION_SECRET='$(dotenv_escape "${WEBUI_SESSION_SECRET}")'"
-    fi
     echo "FNMUSIC_DEPLOY_MODE='docker'"
     echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
@@ -1081,9 +976,6 @@ ENV_DESIRED="$(mktemp)"
 
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
-if [ "${WEBUI_PASSWORD_EXPLICIT}" -eq 1 ]; then
-    ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_WEBUI_PASSWORD_HASH,FNMUSIC_WEBUI_SESSION_SECRET"
-fi
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
 # lx 源 URL 种子（校验通过后会再写一次推导出的 LX_SOURCES）
 [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_URL"
@@ -1410,7 +1302,7 @@ log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源${MDL_SUMMARY:+ 平台${MDL_SUMMARY}}   http://127.0.0.1:8768/healthz"
 [ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪自定义源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
 if [ "${WEBUI_FLAG}" = "true" ]; then
-    log_info "  • WebUI     [8774] 管理界面      http://<NAS_IP>:8774（需管理密码）"
+    log_info "  • WebUI     [8774] 管理界面      飞牛桌面「fnMusic 扩展管理」（仅管理员）"
 fi
 log_info "------------------------------------------------------------"
 log_info "【后续验证与使用指引】"
@@ -1425,17 +1317,16 @@ log_info "2. 验证搜索与试听："
 log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌曲（例如“晴天”或“周杰伦”），"
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${WEBUI_FLAG}" = "true" ]; then
-    log_info "3. 管理 Web UI：http://<NAS_IP>:8774"
+    log_info "3. 管理 Web UI：飞牛桌面「fnMusic 扩展管理」，或已登录管理员打开 /app/fnmusic-ext"
     log_info "   • 音源三选一随时切换（秒级）、musicdl 平台多选、网易扫码登录"
-    log_info "   • 音质模式（高音质/平衡/流畅）、边听边存、推荐开关、LLM 配置、修改管理密码"
-    log_info "   • 打开管理页后使用安装时设置的密码登录"
+    log_info "   • 音质模式（高音质/平衡/流畅）、边听边存、推荐开关、LLM 配置"
 fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "4. 网易云扫码登录（可选）："
     log_info "   部分网易云 VIP/无损歌曲需要账号凭证："
     log_info "   • 命令行扫码登录（推荐）: ./install.sh --qr 或 ./netease_login.sh"
     log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
-    log_info "   • 管理页内扫码（安装了 WebUI 时，登录管理页后在「音乐源」扫码）"
+    log_info "   • 管理页内扫码（安装了 WebUI 时，在「音乐源」扫码）"
 fi
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     log_info "5. 大模型每日推荐："
