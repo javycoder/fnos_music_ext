@@ -2761,7 +2761,9 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                 entry["ts"] = time.time()
             return
         entry["partial"] = partial
-        entry["ts"] = time.time()
+        # 全源失败（source busy/熔断/异常）交回的 0 条不是真"无结果"：不落缓存时间戳，
+        # 同词紧跟着重搜会立即重新聚合，而不是吃 10 秒空缓存一直返回空。
+        entry["ts"] = 0 if partial and not entry.get("items") else time.time()
     finally:
         _FETCH_SCOPE.reset(token)
         for task in tasks:

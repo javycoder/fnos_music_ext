@@ -184,6 +184,46 @@ async def test_search_timeout_returns_local_and_drops_late_online(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_all_sources_failed_empty_not_cached_and_retried(monkeypatch):
+    """全源失败（source busy/熔断）交回的 0 条不进缓存：同词重搜立即重新聚合拿到在线结果。"""
+    monkeypatch.setitem(p.CONF, "search_timeout", 1.0)
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+
+    calls = {"n": 0}
+
+    async def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"ok": True, "items": [], "errors": {
+                "KuwoMusicClient": "source busy (previous search still running); retry later",
+                "MiguMusicClient": "circuit breaker open"}}
+        return {"ok": True, "items": [song("kuwo:1")]}
+
+    monkeypatch.setattr(p, "fetch_musicdl_search", flaky)
+    p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"code": 0, "data": {"list": [{"guid": "local:1", "title": "本地"}], "total": 1}})),
+        base_url="http://test")
+
+    import json
+    body = json.loads((await p.search_track(request("q=Song"))).body)
+    assert [item["guid"] for item in body["data"]["list"]] == ["local:1"]
+    entry = next(iter(p._SEARCH_CACHE.values()))
+    await asyncio.wait({entry["task"]})
+    assert entry["items"] == []
+    assert entry["ts"] == 0
+
+    body2 = json.loads((await p.search_track(request("q=Song"))).body)
+    guids = [item["guid"] for item in body2["data"]["list"]]
+    assert fake_official_guid("online:kuwo:1") in guids
+    assert calls["n"] == 2
+    for e in p._SEARCH_CACHE.values():
+        task = e.get("task")
+        if task:
+            await asyncio.wait({task})
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("fast_result", [None, []])
 async def test_empty_or_error_first_completion_still_waits_for_song(monkeypatch, fast_result):
     monkeypatch.setitem(p.CONF, "search_timeout", 1.0)
