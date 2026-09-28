@@ -499,6 +499,8 @@ ensure_image_current() {
             exit 1
         fi
     fi
+    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默）
+    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
     if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "构建/启动 ${CONTAINER_NAME} 失败。"
         exit 1

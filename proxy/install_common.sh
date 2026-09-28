@@ -197,11 +197,18 @@ takeover() {
 wait_http() {
     local url="$1" tries="${2:-60}" delay="${3:-2}"
     # timeout bounds the whole loop, including slow responses, not only sleeps.
+    # 心跳（issue #24）：fpk 安装 55% 阶段长时间无输出让用户以为卡死——等待环
+    # 每 30s 打一行已等秒数（随外层 tee 进 fnmusic-app.log / 安装弹窗日志）
     timeout --foreground "$((tries * delay))s" /bin/bash -c '
+        start=$(date +%s)
         while ! curl --fail --silent --max-time 4 "$1" >/dev/null 2>&1; do
             sleep "$2"
+            now=$(date +%s)
+            if (( now - start >= 30 && (now - start) % 30 < $2 )); then
+                echo "[INFO] 仍在等待服务就绪 ${3}（已等 $((now - start))s，属首次安装拉起慢的正常现象）..."
+            fi
         done
-    ' wait-http "${url}" "${delay}"
+    ' wait-http "${url}" "${delay}" "${url}"
 }
 
 reclaim_container() {

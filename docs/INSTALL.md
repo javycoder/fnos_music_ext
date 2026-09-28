@@ -258,8 +258,32 @@ v1.x 允许多音源并存，v2.0.0 起三音源互斥单选。升级安装时�
 ### 洛雪源测试失败
 
 WebUI 或安装向导的错误分类含义：**下载失败**（URL 不可达/超 9MB）、**格式无效**
-（缺少洛雪源头部注释）、**初始化失败**（脚本运行报错，多为与主流源规范不兼容）、
-**无可用平台**、**解析失败**（源声明平台均无法出直链）。依次检查 URL、换源后重试。
+（缺少洛雪源头部注释）、**格式不支持**（musicApi.json 类 JSON API 源——本项目只支持
+洛雪桌面版自定义源 JS 脚本）、**初始化失败**（脚本运行报错，多为与主流源规范不兼容）、
+**无可用平台**、**解析失败**（源声明平台均无法出直链）、**搜索取不到样本**（源脚本
+初始化正常，但内置搜索接口限流/波动导致无法验证——不代表源不可用，稍后重试即可）。
+报告里的"平台明细"按平台给出 ok/failed/untested 细分结论。依次检查 URL、换源后重试。
+
+### fpk 安装一直卡在 55% 左右（issue #24）
+
+55% 对应 fpk 安装器执行 `install.sh` 的阶段，本身可能要几分钟，卡住几乎都是
+**网络拉取慢**（国内直连境外源受限）。排查步骤：
+
+1. **看真实进度**：安装日志在 `/var/log/apps/fnmusic-ext-install.log`（卸载也不删）。
+   v2.5.0 起拉取镜像/等待服务每 30 秒打一行心跳，能看到"仍在拉取…（已等 Ns）"即代表
+   在正常推进，耐心等完即可。
+2. **自测网络**（任一失败即网络受限）：
+   ```bash
+   curl -s -o /dev/null -m 8 -w '%{http_code}\n' https://mirrors.tencent.com/pypi/simple/
+   curl -s -o /dev/null -m 8 -w '%{http_code}\n' https://docker.m.daocloud.io/v2/
+   ```
+3. **为 Docker 配代理后重试**（社区反馈最有效的解法）：编辑 Docker 的
+   `daemon.json`（fnOS 上通常在 `/usr/local/apps/docker/config/daemon.json` 或
+   fnOS Docker 设置界面）加 `proxies` 段，重启 Docker 后重新安装。
+4. **手动换镜像源**：`FNMUSIC_DOCKER_MIRRORS="docker.m.daocloud.io docker.1ms.run"`
+   或直接 `BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim ./install.sh`。
+5. 反馈问题时运行 `bash scripts/collect_support_info.sh`，把输出整段贴到 issue
+   （只读收集，不含任何密钥）。
 
 ### 构建时报 `failed to resolve source metadata for python:3.13-slim ... 401 Unauthorized` 或拉取超时
 
