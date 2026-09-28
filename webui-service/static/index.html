@@ -100,17 +100,30 @@
           </div>
         </div>
 
-        <!-- lx：源 URL -->
+        <!-- lx：源 URL / 文件上传 -->
         <div class="subpanel" id="panel-lxmusic" hidden>
           <div class="card">
             <div class="card-title">洛雪自定义源</div>
-            <p class="hint">粘贴洛雪音乐自定义源脚本地址（以 http/https 开头）。保存前会自动做端到端校验。</p>
+            <p class="hint">三种方式任选：粘贴源脚本地址（http/https）、上传电脑上的 .js 文件、从 NAS 文件选择（桌面内可用）。保存前会自动做端到端校验。</p>
             <div class="btn-row">
-              <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js">
+              <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js 或 file:///data/lxmusic/uploads/xxx.js">
               <button class="btn" id="lx-test">测试</button>
+            </div>
+            <div class="btn-row">
+              <input type="file" id="lx-file" accept=".js" hidden>
+              <button class="btn" id="lx-upload">上传 .js 文件</button>
+              <button class="btn" id="lx-pick" hidden>从 NAS 选择</button>
+              <span id="lx-upload-note" class="muted"></span>
             </div>
             <div id="lx-report" class="report" hidden></div>
           </div>
+        </div>
+
+        <div class="card">
+          <label class="field"><span>搜索超时时间</span>
+            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
+          </label>
+          <p class="hint">单位为秒，默认 15。在线结果一返回就交给播放页，本地歌曲在前；到时还没有就放弃这次在线结果，只返回本地歌曲。保存后立即生效。</p>
         </div>
       </section>
 
@@ -144,6 +157,9 @@
             <input class="input" id="tee-max" type="number" min="1" max="100">
           </label>
           <p class="hint">缓存数仅在关闭边听边存时生效；restore 还原时会一并清理这些滚动缓存。</p>
+        </div>
+        <div class="card">
+          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">收藏或加入歌单的在线歌曲先立即生效，随后在后台自动下载到本地曲库并绑定下载好的文件；下载完成后更换音乐源也能正常播放这些歌曲（解决换源后收藏无法播放的问题）。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
         </div>
       </section>
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Any
 
 try:
@@ -21,19 +22,59 @@ logger = logging.getLogger("musicbox_service.netease_ext")
 _api_lock = threading.Lock()
 _api_instance = None
 
+# 登录态探测结果缓存：(结果, 探测时刻单调钟)。失败短缓存、成功长缓存，
+# 过期时强制重建实例重读磁盘 cookie 再下结论，避免常驻实例揣着过期 cookie。
+_login_state_lock = threading.Lock()
+_login_state: "tuple[bool, float] | None" = None
+_LOGIN_TTL_OK_S = 300.0
+_LOGIN_TTL_FAIL_S = 60.0
 
-def _get_api():
+# 进程内取链结果缓存：(item, 过期时刻单调钟)。网易直链自带过期时间，只做短缓存。
+_url_cache_lock = threading.Lock()
+_url_cache: "dict[tuple[int, str], tuple[dict, float]]" = {}
+_URL_CACHE_TTL_OK_S = 600.0
+_URL_CACHE_TTL_FAIL_S = 60.0
+_URL_CACHE_MAX = 4096
+
+
+def _get_api_locked():
+    """调用方必须已持有 _api_lock：取实例 + 用实例在同一次持锁内完成。"""
     global _api_instance
     if _api_instance is None:
-        with _api_lock:
-            if _api_instance is None:
-                from runner import ensure_xdg_dirs
+        from runner import ensure_xdg_dirs
 
-                ensure_xdg_dirs()
-                from NEMbox.api import NetEase
+        ensure_xdg_dirs()
+        from NEMbox.api import NetEase
 
-                _api_instance = NetEase()
+        _api_instance = NetEase()
     return _api_instance
+
+
+def _get_api():
+    with _api_lock:
+        return _get_api_locked()
+
+
+def reset_api(reason: str = "") -> None:
+    """丢弃常驻 NetEase 实例与相关缓存，下次 _get_api() 重建并重读磁盘 cookie。
+
+    登录由 CLI 子进程完成并写盘，而 NEMbox 的 NetEase 只在构造时读一次盘；
+    磁盘 cookie 变化（扫码成功等）后不重建实例，服务进程内就永远是旧登录态。
+    """
+    global _api_instance, _login_state
+    with _api_lock:
+        if _api_instance is not None:
+            try:
+                _api_instance.session.close()
+            except Exception:
+                pass
+        _api_instance = None
+    with _login_state_lock:
+        _login_state = None
+    with _url_cache_lock:
+        _url_cache.clear()
+    if reason:
+        logger.info("netease api instance reset: %s", reason)
 
 
 def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
@@ -68,13 +109,27 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def check_is_logged_in() -> bool:
+    global _login_state
+    with _login_state_lock:
+        state = _login_state
+    if state is not None:
+        logged, at = state
+        if time.monotonic() - at < (_LOGIN_TTL_OK_S if logged else _LOGIN_TTL_FAIL_S):
+            return logged
+        # 缓存过期：磁盘 cookie 可能已换（重新扫码/在别处登录），先重建实例再探测
+        with _login_state_lock:
+            _login_state = None
+        reset_api("login-state ttl expired")
     try:
-        api = _get_api()
         with _api_lock:
+            api = _get_api_locked()
             info = api.get_account_info()
-        return bool(info and (info.get("account") or info.get("profile")))
+        logged = bool(info and (info.get("account") or info.get("profile")))
     except Exception:
-        return False
+        logged = False
+    with _login_state_lock:
+        _login_state = (logged, time.monotonic())
+    return logged
 
 
 def filter_playable_song_ids(ids: list[int]) -> set[int]:
@@ -86,9 +141,9 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
     """
     if not ids:
         return set()
-    api = _get_api()
     with _api_lock:
         try:
+            api = _get_api_locked()
             urls_data = api.songs_url(ids)
         except Exception:
             return set()
@@ -128,11 +183,52 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
     return playable_ids
 
 
+def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
+    """进程内解析单曲播放链接（复用常驻实例，免起 CLI 子进程）。
+
+    返回对齐 CLI `song url --json` 的 data 字段（含 url/code/fee 等）；接口
+    异常或返回空时返回 None，由调用方降级 CLI（保留结构化错误语义）。
+    结果短缓存（成功 600s / 失败 60s，键含音质），reset_api 时随实例一并清空。
+    """
+    key = (int(song_id), str(quality))
+    now = time.monotonic()
+    with _url_cache_lock:
+        hit = _url_cache.get(key)
+        if hit and now < hit[1]:
+            return hit[0]
+    try:
+        with _api_lock:
+            api = _get_api_locked()
+            # songs_url 的音质取自全局 Config：临时改写再恢复（CLI cmd_song_url 同款做法）
+            from NEMbox.config import Config
+
+            config = Config()
+            old_quality = config.get("music_quality")
+            config.config.setdefault("music_quality", {})["value"] = quality
+            try:
+                urls = api.songs_url([int(song_id)])
+            finally:
+                config.config["music_quality"]["value"] = old_quality
+    except Exception:
+        return None
+    if not isinstance(urls, list) or not urls or not isinstance(urls[0], dict):
+        return None
+    item = urls[0]
+    ok = item.get("code") == 200 and item.get("url")
+    with _url_cache_lock:
+        if len(_url_cache) >= _URL_CACHE_MAX:
+            expire = time.monotonic()
+            for k in [k for k, v in _url_cache.items() if v[1] <= expire]:
+                del _url_cache[k]
+        _url_cache[key] = (item, time.monotonic() + (_URL_CACHE_TTL_OK_S if ok else _URL_CACHE_TTL_FAIL_S))
+    return item
+
+
 def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:
     if not ids:
         return []
-    api = _get_api()
     with _api_lock:
+        api = _get_api_locked()
         raw_items = api.songs_detail(ids)
     if not raw_items or not isinstance(raw_items, list):
         return []
@@ -149,8 +245,8 @@ def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:
 
 
 def song_lyric_pair(song_id: int) -> dict[str, str]:
-    api = _get_api()
     with _api_lock:
+        api = _get_api_locked()
         raw_lyric = api.song_lyric(song_id)
         raw_tlyric = api.song_tlyric(song_id)
     lyric_str = "\n".join(str(line) for line in raw_lyric) if isinstance(raw_lyric, list) else ""

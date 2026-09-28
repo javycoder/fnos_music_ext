@@ -12,6 +12,7 @@ import base64 as _b64
 import sys
 import time
 import types
+from pathlib import Path
 
 import httpx
 import pytest
@@ -545,9 +546,45 @@ def test_source_verify_endpoint(isolated, monkeypatch):
         assert rj["data"]["platforms"] == ["kw"]
         assert calls["url"] == "https://s/1.js"
 
+        # file:// 上传地址同样允许进入校验链路
+        r1 = client.post("/api/v1/source/verify", json={"url": "file:///data/lxmusic/uploads/x.js"})
+        assert r1.status_code == 200
+        assert calls["url"] == "file:///data/lxmusic/uploads/x.js"
+
         r2 = client.post("/api/v1/source/verify", json={"url": "notaurl"})
         assert r2.status_code == 400
 
+
+_VALID_SCRIPT = (
+    "/*\n * @name 上传源\n * @version 1.0.0\n * @author tester\n */\n"
+    "console.log('boot')\n"
+)
+
+
+def test_source_upload_and_file_url_activate(isolated, tmp_path):
+    """upload 落盘 → file:// URL → 以 file:// 激活（state.json 持久化）。"""
+    isolated.state_dir = tmp_path
+    with TestClient(lxapp.app) as client:
+        # 无效脚本被拒
+        bad = client.post("/api/v1/source/upload", json={"filename": "bad.js", "script": "var x=1"})
+        assert bad.status_code == 400
+        assert bad.json()["category"] == "invalid"
+
+        # 合法脚本落盘
+        r = client.post("/api/v1/source/upload",
+                        json={"filename": "../../我的源.js", "script": _VALID_SCRIPT})
+        assert r.status_code == 200
+        data = r.json()["data"]
+        assert data["url"].startswith(f"file://{tmp_path}/uploads/")
+        assert data["url"].endswith(".js")
+        assert "我的源" in data["url"]
+        assert data["meta"]["name"] == "上传源"
+        assert Path(data["path"]).is_file()
+
+        # 以 file:// URL 激活
+        activated = client.post("/api/v1/source", json={"url": data["url"]})
+        assert activated.status_code == 200
+        assert activated.json()["data"]["url"] == data["url"]
 
 def test_source_verify_endpoint_never_500s_on_verify_exception(isolated, monkeypatch):
     """校验链路任何异常（SourceError 或未预期错误）都必须返回结构化 JSON，
@@ -790,6 +827,72 @@ def test_fresh_probe_tier_and_expiry():
     assert lxapp._fresh_probe(None, "standard") is None
     assert lxapp._fresh_probe({"_probe": dict(base, ts=time.time(), actual_tier="lossless"),
                                "trial": "1"}, "standard") is None
+
+
+def test_same_scope_cancels_search_other_scope_waits(monkeypatch):
+    """同范围的新搜索取消还在跑的平台任务；另一个范围排队，不取消当前搜索。"""
+    import asyncio
+
+    started = []
+    cancelled = []
+    release = {"one": asyncio.Event(), "two": asyncio.Event(), "three": asyncio.Event()}
+
+    async def slow(client, keyword, limit):
+        started.append(keyword)
+        try:
+            await release[keyword].wait()
+        except asyncio.CancelledError:
+            cancelled.append(keyword)
+            raise
+        return []
+
+    monkeypatch.setitem(lxapp._SEARCHERS, "kw", slow)
+    monkeypatch.setattr(lxapp, "source_capabilities", lambda: {"kw": {"playback_available": True, "reason": ""}})
+    monkeypatch.setitem(lxapp.CONF, "sources", ["kw"])
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=lxapp.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://lx") as client:
+            async def hit(keyword, scope):
+                return await client.get(
+                    "/api/v1/search",
+                    params={"keyword": keyword, "sources": "kw"},
+                    headers={"X-Fnmusic-Scope": scope},
+                )
+
+            first = asyncio.create_task(hit("one", "user-a"))
+            for _ in range(50):
+                if "one" in started:
+                    break
+                await asyncio.sleep(0.01)
+            assert started == ["one"]
+            second = asyncio.create_task(hit("two", "user-a"))
+            for _ in range(50):
+                if "two" in started and "one" in cancelled:
+                    break
+                await asyncio.sleep(0.01)
+            assert cancelled == ["one"]
+            assert started == ["one", "two"]
+            third = asyncio.create_task(hit("three", "user-b"))
+            await asyncio.sleep(0.05)
+            assert started == ["one", "two"]
+            release["two"].set()
+            second_resp = await second
+            for _ in range(50):
+                if "three" in started:
+                    break
+                await asyncio.sleep(0.01)
+            assert "three" not in cancelled
+            assert started == ["one", "two", "three"]
+            release["three"].set()
+            third_resp = await third
+            first_resp = await first
+            assert first_resp.json()["superseded"] is True
+            assert second_resp.status_code == 200
+            assert third_resp.status_code == 200
+            assert third_resp.json().get("superseded") is not True
+
+    asyncio.run(scenario())
 
 
 def test_title_relevance_ranking():

@@ -39,7 +39,7 @@ for arg in "$@"; do
             echo "         （仅清理在线试听滚动缓存 cache/online_*，不影响已存入曲库的歌曲）"
             echo "  --full: 额外删除 .env（含备份）、网易云登录、缓存、在线收藏、播放历史、"
             echo "          推荐缓存与虚拟环境（保留代码），用于彻底重置"
-            echo "  --adopt: 允许在部署登记指向其他目录时强制还原（迁移部署到当前目录的流程之一）"
+            echo "  --adopt: 允许在部署登记或代理 unit 属于其他目录时强制还原（迁移部署到当前目录的流程之一）"
             exit 0
             ;;
         *)
@@ -91,7 +91,7 @@ purge_local_state() {
     log_info "已保留：代码、git 仓库与 Docker 镜像（重装时可直接复用缓存）。"
 }
 
-check_proxy_unit_owner || exit 1
+check_proxy_unit_owner "$@" || exit 1
 # Refuse to restore from a second checkout while the machine-wide deployment
 # registry names another live directory (skip with the explicit --adopt flag).
 check_deployment_owner "$@" || exit 1

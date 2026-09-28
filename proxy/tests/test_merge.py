@@ -54,6 +54,7 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 604800.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
 
     def default_musicbox_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"ok": False, "data": []})
@@ -998,9 +999,9 @@ def test_ext_healthz():
 
 
 def test_search_track_late_wait_first_source_completed(monkeypatch):
-    """3s 内无任何源返回，进入超时外等待 5s：一旦首个源返回，立刻采用本地+首个结果返回。"""
-    monkeypatch.setitem(CONF, "netease_wait_s", 0.05)  # 模拟阶段一极短超时
-    monkeypatch.setitem(CONF, "late_page_wait_s", 2.0)  # 模拟阶段二等待
+    """等到各音源结束（上限 search_timeout）再回复，慢源的空结果不会丢掉先返回的歌曲。"""
+    monkeypatch.setitem(CONF, "search_timeout", 2.0)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
     monkeypatch.setitem(CONF, "lx_enabled", True)
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
@@ -1208,6 +1209,123 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
         assert items[4]["artist"] == "洛雪翻唱歌手"
         assert len(items) == 5
 
+
+
+def test_search_track_strict_local_first_pagination():
+    """多页严格本地优先：本地 60 条(size=20)占据前 3 页，第 4 页起为在线段。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        size = int(request.url.params.get("size", "20"))
+        start = (page - 1) * size
+        chunk = [
+            {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": f"歌手{i % 7}"}
+            for i in range(start, min(start + size, 60))
+        ]
+        return httpx.Response(200, json={"code": 0, "data": {"list": chunk, "total": 60}})
+
+    async def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": [
+                    {"song_id": f"mb_{i}", "song_name": f"在线歌{i}", "artist": f"在线歌手{i}", "duration": 200}
+                    for i in range(50)
+                ],
+            },
+        )
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True, "items": []})),
+        base_url="http://127.0.0.1:8768",
+    )
+
+    with TestClient(app) as client:
+        seen = []
+        for page in range(1, 7):
+            resp = client.get(f"/music/api/v1/search/track?q=歌&page={page}&size=20")
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert data["total"] == 60 + 50
+            items = data["list"]
+            seen.extend(it["guid"] for it in items)
+            if page <= 3:
+                # 纯本地页：全部是本地 guid
+                assert items and all(str(it["guid"]).startswith("local:") for it in items)
+            elif page == 4:
+                # 边界页：本地尾部 0 条（60 恰为 size 整数倍）+ 在线头部 20 条
+                assert all(not str(it["guid"]).startswith("local:") for it in items)
+        # 走完 6 页：60 本地 + 50 在线 = 110 条，无重复
+        locals_seen = [g for g in seen if str(g).startswith("local:")]
+        onlines_seen = [g for g in seen if not str(g).startswith("local:")]
+        assert len(locals_seen) == 60 and len(onlines_seen) == 50
+        assert len(set(seen)) == 110
+        # 本地全部出现在线之前
+        first_online_idx = seen.index(onlines_seen[0])
+        assert all(str(g).startswith("local:") for g in seen[:first_online_idx])
+        assert all(not str(g).startswith("local:") for g in seen[first_online_idx:])
+
+
+def test_search_track_official_clamp_out_of_range_page():
+    """官方搜索越界页钳制回第 1 页（total=4 时 page≥2 仍返回同样 4 条，
+    收藏/歌单条目接口无此行为）。合并层必须丢弃该回声，否则官方条目
+    拼上在线切片在每个后续页重复出现。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        chunk = [
+            {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": f"歌手{i}"}
+            for i in range(4)
+        ]
+        return httpx.Response(200, json={"code": 0, "data": {"list": chunk, "total": 4}})
+
+    async def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": [
+                    {"song_id": f"mb_{i}", "song_name": f"在线歌{i}", "artist": f"在线歌手{i}", "duration": 200}
+                    for i in range(10)
+                ],
+            },
+        )
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True, "items": []})),
+        base_url="http://127.0.0.1:8768",
+    )
+
+    with TestClient(app) as client:
+        seen = []
+        for page in (1, 2, 3):
+            resp = client.get(f"/music/api/v1/search/track?q=歌&page={page}&size=10")
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert data["total"] == 4 + 10
+            items = data["list"]
+            if page == 1:
+                # 边界页：4 官方 + 6 在线
+                assert len(items) == 10
+            if page == 3:
+                # 在线段走完：纯空页（total 不变，客户端据此停页）
+                assert items == []
+            seen.extend(str(it["guid"]) for it in items)
+        locals_seen = [g for g in seen if g.startswith("local:")]
+        onlines_seen = [g for g in seen if not g.startswith("local:")]
+        assert locals_seen == [f"local:{i}" for i in range(4)]
+        assert len(onlines_seen) == 10
+        assert len(set(seen)) == 14
 
 
 def test_general_passthrough():
@@ -2050,3 +2168,81 @@ def test_merge_online_tracks_filters_unplayable_defense():
 
 
 
+
+
+def test_forward_to_upstream_keeps_content_length():
+    """identity 响应透传精确 Content-Length（对齐官方直连行为）；204 不带。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/echo":
+            return httpx.Response(200, content=b"hello", headers={"content-type": "text/plain"})
+        if request.url.path == "/music/api/v1/nocontent":
+            return httpx.Response(204)
+        if request.url.path == "/music/api/v1/range":
+            return httpx.Response(
+                206, content=b"ab",
+                headers={"content-range": "bytes 0-1/10"},
+            )
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    with TestClient(app) as client:
+        r = client.get("/music/api/v1/echo")
+        assert r.status_code == 200
+        assert r.headers.get("content-length") == "5"
+        assert r.content == b"hello"
+
+        r204 = client.get("/music/api/v1/nocontent")
+        assert r204.status_code == 204
+        assert "content-length" not in r204.headers
+
+        # Range 分段：Content-Length 与 Content-Range 同时到达客户端
+        r206 = client.get("/music/api/v1/range")
+        assert r206.headers.get("content-length") == "2"
+        assert r206.headers.get("content-range") == "bytes 0-1/10"
+        assert r206.content == b"ab"
+
+
+def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
+    """issue #28：流式上下文元数据缺失时，从在线历史/收藏快照回查命名，
+    绝不以 unknown (n) 形态进曲库。"""
+    import json
+
+    from proxy import recommend as dailyrec
+    from proxy.app import _tee_finalize, _lookup_online_snapshot
+
+    tee_dir = str(tmp_path / "library")
+    os.makedirs(tee_dir, exist_ok=True)
+    monkeypatch.setitem(CONF, "tee_save_dir", tee_dir)
+    monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setitem(
+        CONF, "fav_dir", str(tmp_path / "online_favorites"),
+    )
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "play_history"))
+
+    guid = "online:kuwo:228908"
+    # 首播已上报 track_play：历史快照带完整元数据
+    dailyrec.record_online_play("user-1", guid, {
+        "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+    })
+    assert _lookup_online_snapshot(guid)["title"] == "晴天"
+
+    # tee 落盘时 info 解析失败（空 dict）——文件名仍应来自历史快照
+    part = os.path.join(tee_dir, "cache_safe_guid.abc.part")
+    with open(part, "wb") as f:
+        f.write(b"RIFF....FAKE_AUDIO" * 64)
+    _tee_finalize(part, guid, "mp3", None, tee_enabled=True)
+    files = os.listdir(tee_dir)
+    assert files == ["周杰伦 - 晴天.mp3"], f"应以快照元数据命名，实际: {files}"
+
+    # 收藏快照同样可兜底：无历史但收藏里有元数据
+    guid2 = "online:migu:9"
+    with open(os.path.join(CONF["fav_dir"], "user-1.json"), "w", encoding="utf-8") as f:
+        json.dump({"items": [{
+            "guid": guid2, "addedAt": 1,
+            "track": {"title": "七里香", "artist": "周杰伦", "album": "七里香"},
+        }]}, f)
+    part2 = os.path.join(tee_dir, "cache_safe_guid2.abc.part")
+    with open(part2, "wb") as f:
+        f.write(b"RIFF....FAKE_AUDIO2" * 64)
+    _tee_finalize(part2, guid2, "mp3", {}, tee_enabled=True)
+    assert "周杰伦 - 七里香.mp3" in os.listdir(tee_dir)

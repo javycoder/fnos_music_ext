@@ -8,6 +8,22 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
 
+# 迁卷/换目录自愈：unit 的 WorkingDirectory 与本次安装目录不一致时（应用迁到
+# 其他卷、或此前从别的副本部署），升级回调里 install.sh 的归属检查会拒绝继续，
+# 造成升级循环失败。升级流程必然重建 unit，这里直接清掉失效的旧 unit 文件。
+# FNMUSIC_UNIT_FILE 仅供测试注入；生产路径固定为 /etc/systemd/system 下本服务 unit。
+FNMUSIC_UNIT_FILE="${FNMUSIC_UNIT_FILE:-/etc/systemd/system/fnmusic-ext.service}"
+if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_UNIT_FILE}" ]; then
+    unit_wd="$(sed -n 's/^[[:space:]]*WorkingDirectory=//p' "${FNMUSIC_UNIT_FILE}" | head -n1)"
+    unit_wd_real="$(readlink -f -- "${unit_wd}" 2>/dev/null || true)"
+    repo_real="$(readlink -f -- "${FNMUSIC_REPO_DIR}" 2>/dev/null || true)"
+    if [ -z "${unit_wd_real}" ] || [ "${unit_wd_real}" != "${repo_real}" ]; then
+        rm -f "${FNMUSIC_UNIT_FILE}"
+        systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
+        echo "[fnmusic-ext] 已清理指向 ${unit_wd:-未知路径} 的失效代理 unit（升级流程会重建）" >> "${FNMUSIC_LOG}" 2>&1
+    fi
+fi
+
 if [ -z "${FNMUSIC_REPO_DIR}" ]; then
     exit 0
 fi

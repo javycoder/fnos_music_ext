@@ -62,7 +62,7 @@ LX_SKIP_VERIFY=0
 # WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
 WEBUI_CHOICE=""
 CONTAINER_NAME="fnmusic-sources"
-PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
 BASE_IMAGE="${BASE_IMAGE:-}"
@@ -81,12 +81,16 @@ usage() {
                          2) musicdl   聚合音源，可精确到平台：
                              --sources musicdl[-<平台短名>,...]
                              或全局编号 --sources 2,4（编号见 musicdl-service/PLATFORMS.md）
-                         3) lxmusic   洛雪音乐自定义源（需 --lx-source-url 或交互输入）
+                         3) lxmusic   洛雪音乐自定义源（源脚本装后在管理页配置：
+                             URL / 上传 .js / NAS 选择；--lx-source-url 仍可选）
                          示例: --sources musicbox
                                --sources musicdl-kuwo,musicdl-migu
                                --sources lxmusic --lx-source-url https://example.com/lx.js
+                               --sources lxmusic（无源安装，装后在管理页配置）
                          非交互缺省: musicdl
-  --lx-source-url URL    洛雪自定义源脚本地址（--sources lxmusic 时必填；交互模式可向导输入）
+  --lx-source-url SRC    洛雪自定义源脚本地址：http(s) URL、file:// URL 或本机 .js 文件路径
+                         （本机路径会复制进 sources-data/lxmusic/uploads/ 并转为 file://；
+                          留空=无源安装，装好在管理页 WebUI 配置）
   --lx-skip-verify       跳过洛雪源可用性校验（下载→init→搜索→解析→探活）直接激活；
                          源是否可用装好后在管理页 WebUI 查看，适合不想因源故障中断安装的场景
   --webui                安装管理 Web UI（端口 8774；无鉴权，仅限可信内网使用）
@@ -99,8 +103,8 @@ usage() {
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
   --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
-  --adopt                把本机部署迁移到当前目录（部署登记指向其他目录时使用；
-                        会跳过跨目录部署检查并重新登记）
+  --adopt                把本机部署迁移到当前目录（部署登记或代理 unit 属于其他
+                        目录时使用；会跳过跨目录检查并重新登记）
   --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
@@ -576,7 +580,11 @@ ensure_docker_ready() {
     fi
 }
 
-check_proxy_unit_owner || exit 1
+if [ "${ADOPT}" -eq 1 ]; then
+    check_proxy_unit_owner --adopt || exit 1
+else
+    check_proxy_unit_owner || exit 1
+fi
 # Refuse to install from a second checkout while the machine-wide deployment
 # registry names another live directory. NOTE: argument parsing above has
 # already consumed "$@", so the parsed ADOPT flag drives the bypass here.
@@ -724,13 +732,13 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}（Docker 单容器·按需加载）"
     echo " 音源: ${MUSICBOX_REPO}"
     echo "       ${MUSICDL_REPO}"
-    echo "       lxmusic — 洛雪音乐自定义源（用户自带源 URL）"
+    echo "       lxmusic — 洛雪音乐自定义源（装后在管理页配置源脚本）"
     echo "============================================================"
     if [ -z "${SOURCES_RAW}" ]; then
         echo "【音源三选一】（互斥单选；安装后可在 WebUI 里随时切换，秒级生效）"
         echo "  1) musicbox — 网易云音乐盒子（高品质/无损/歌词封面；推荐安装后扫码登录）"
         echo "  2) musicdl  — 聚合音源（多平台可选：酷我/咪咕/酷狗/QQ/B站等）"
-        echo "  3) lxmusic  — 洛雪音乐自定义源（需提供源脚本 URL，解析播放只走该源）"
+        echo "  3) lxmusic  — 洛雪音乐自定义源（解析播放只走用户源；源脚本装后在管理页配置：URL / 上传 .js / NAS 选择）"
         local_choice="$(prompt "请选择音源 (输入 1/2/3)" "2")"
         case "${local_choice}" in
             1) SOURCES_RAW="musicbox" ;;
@@ -811,20 +819,40 @@ ensure_docker_ready
 
 parse_sources "${SOURCES_RAW}"
 
-# 洛雪自定义源：必须拿到脚本 URL（非交互 --lx-source-url 必填；交互循环输入）
+# 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置）；
+# 传入主机上存在的 .js 文件路径时自动复制进 sources-data/lxmusic/uploads/ 并转 file:// URL
 if [ "${ENABLE_LX}" -eq 1 ]; then
-    if [ -z "${LX_SOURCE_URL_CLI}" ] && [ "${NON_INTERACTIVE}" -eq 1 ]; then
-        log_err "非交互选择 lxmusic 必须提供 --lx-source-url（洛雪自定义源脚本地址）"
-        exit 1
-    fi
-    while [ -z "${LX_SOURCE_URL_CLI}" ]; do
-        LX_SOURCE_URL_CLI="$(prompt "请输入洛雪自定义源脚本 URL（https://.../*.js，可改选其他音源后重跑安装）")"
-        [ -n "${LX_SOURCE_URL_CLI}" ] || log_warn "选择 lxmusic 必须提供源脚本 URL"
-    done
     case "${LX_SOURCE_URL_CLI}" in
-        http://*|https://*) : ;;
+        ""|http://*|https://*|file://*) ;;
         *)
-            log_err "洛雪源 URL 必须是 http(s) 地址: ${LX_SOURCE_URL_CLI}"
+            # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
+            LX_HOST_FILE="${LX_SOURCE_URL_CLI}"
+            if [ ! -f "${LX_HOST_FILE}" ]; then
+                log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
+                exit 1
+            fi
+            case "${LX_HOST_FILE}" in
+                *.js|*.JS) : ;;
+                *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
+            esac
+            LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
+            mkdir -p "${LX_UPLOAD_DIR}"
+            LX_BASENAME="$(basename "${LX_HOST_FILE}")"
+            if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
+                LX_BASENAME="$(date +%s)-${LX_BASENAME}"
+            fi
+            cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
+            LX_SOURCE_URL_CLI="file:///data/lxmusic/uploads/${LX_BASENAME}"
+            log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
+            ;;
+    esac
+    if [ -z "${LX_SOURCE_URL_CLI}" ]; then
+        log_info "未提供洛雪源（无源安装）：装好后在管理页 WebUI（桌面「fnMusic 扩展管理」或 http://<NAS_IP>:8774）配置源脚本并激活"
+    fi
+    case "${LX_SOURCE_URL_CLI}" in
+        ""|http://*|https://*|file://*) : ;;
+        *)
+            log_err "洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径: ${LX_SOURCE_URL_CLI}"
             exit 1
             ;;
     esac
@@ -867,7 +895,7 @@ if [ -d "${BASE_DIR}/musicbox-data" ] && [ ! -d "${SOURCES_DATA_DIR}" ]; then
     log_info "迁移数据目录: musicbox-data -> sources-data（网易登录态/缓存原样保留）"
     mv "${BASE_DIR}/musicbox-data" "${SOURCES_DATA_DIR}"
 fi
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlist_tracks" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
     "${SOURCES_DATA_DIR}/cache/netease-musicbox" \
     "${SOURCES_DATA_DIR}/config/netease-musicbox" \
     "${SOURCES_DATA_DIR}/netease-musicbox" \
@@ -903,6 +931,7 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
     echo "FNMUSIC_CACHE_DIR='$(dotenv_escape "${BASE_DIR}/cache")'"
     echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${BASE_DIR}/online_favorites")'"
+    echo "FNMUSIC_PLT_DIR='$(dotenv_escape "${BASE_DIR}/playlist_tracks")'"
     echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${BASE_DIR}/play_history")'"
     echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"
     echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"
@@ -992,6 +1021,23 @@ else
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
     log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
 fi
+
+# 存量迁移：历史安装会把当时的默认源写进 .env；env_merge 对该键保留旧值，
+# 老机器升级后仍会拿故障源构建。仅当值恰好等于历史默认值时替换为腾讯云新
+# 默认（apt/pip 走 HTTP/1.1，阿里云镜像 CDN 对 H1.1 限速 ~350KB/s，腾讯云实测
+# 20MB/s 不限）；用户自定义的源地址（无论哪家）一律保留不动。
+migrate_default_mirror() {
+    local key="$1" old="$2" current
+    current="$(sed -n "s/^${key}=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
+    if [ "${current}" = "${old}" ]; then
+        sed -i "s|^${key}=.*|${key}='${3}'|" "${ENV_PATH}"
+        log_info "已将 ${key} 的历史默认源迁移为腾讯云（${3}）。"
+    fi
+}
+migrate_default_mirror FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple" "https://mirrors.tencent.com/pypi/simple/"
+migrate_default_mirror FNMUSIC_PIP_INDEX "https://mirrors.aliyun.com/pypi/simple/" "https://mirrors.tencent.com/pypi/simple/"
+migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.tencent.com"
+migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.aliyun.com" "https://mirrors.tencent.com"
 rm -f "${ENV_DESIRED}"
 chmod 600 "${ENV_PATH}"
 
@@ -1001,7 +1047,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 log_info "安装代理依赖..."
-# venv 创建 + 多源回退（清华→阿里→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
+# venv 创建 + 多源回退（阿里→清华→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
 PIP_INDEX="${PIP_INDEX}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
 
 install_unit() {
@@ -1037,8 +1083,12 @@ install_sources_container() {
     log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
     reclaim_container "${CONTAINER_NAME}" || return 1
+    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
+    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
     if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
+        log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
+        log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
         return 1
     fi
     # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）

@@ -11,3 +11,4 @@ install_dep_apps      = trim.music
 desktop_uidir         = ui
 desktop_applaunchname = fnmusic-ext.main
 checkport             = false
+micro_app             = true

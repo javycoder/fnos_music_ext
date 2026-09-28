@@ -14,6 +14,8 @@ from netease_ext import (
     batch_song_details,
     check_is_logged_in,
     filter_playable_song_ids,
+    get_song_url,
+    reset_api,
     search_web_fallback,
     song_lyric_pair,
 )
@@ -173,6 +175,11 @@ def search(
 def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh")):
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
+    # 进程内复用常驻实例解析（毫秒级，免 CLI 子进程冷启动）；失败再降级 CLI
+    # 兜底，保留 not_logged_in 等结构化错误语义
+    item = get_song_url(song_id, quality)
+    if item is not None:
+        return {"ok": True, "data": item}
     return exec_musicbox(["song", "url", str(song_id), "--quality", quality, "--json"])
 
 
@@ -291,7 +298,13 @@ def auth_login():
 def auth_login_check(unikey: str = Query(...)):
     if not unikey.strip():
         raise HTTPException(status_code=400, detail="unikey cannot be empty")
-    return exec_musicbox(["auth", "login", "--check", unikey, "--json"])
+    data = exec_musicbox(["auth", "login", "--check", unikey, "--json"])
+    # 扫码成功（803）时 CLI 子进程已把新 cookie 写盘，而常驻实例只在构造时
+    # 读过盘：立即丢弃实例，让后续查询重建并读到新登录态
+    payload = data.get("data") if isinstance(data, dict) else None
+    if isinstance(payload, dict) and payload.get("code") == 803:
+        reset_api("qr login success")
+    return data
 
 
 @app.get("/api/v1/auth/login/qr.png")
