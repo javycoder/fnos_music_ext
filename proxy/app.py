@@ -791,6 +791,8 @@ def build_online_track(item: dict) -> dict:
         "artists": artists_list,
         "coverId": guid,
     }
+    # 专辑伪装 guid 同步登记（issue #22）：客户端点击专辑时按 fake 反解分源适配详情
+    register_fake_album(guid, album, item)
     audio_spec = {
         "path": spec_path,
         "format": play_format,
@@ -1891,12 +1893,84 @@ def fake_official_guid(real_guid: str) -> str:
     return fake
 
 
+# 专辑伪装 guid 登记表（issue #22）：fake 32-hex → 专辑元信息。
+# 与 _FAKE_GUID_REVERSE 同生命周期（内存 + ensure_registry_warm 磁盘重建）。
+_FAKE_ALBUM_REGISTRY: dict[str, dict] = {}
+
+
+def _album_name_from_obj(track_obj: dict) -> str:
+    """从曲目对象（VO 快照或 info 形状）提取专辑名。"""
+    album = track_obj.get("album")
+    if isinstance(album, dict):
+        return str(album.get("name") or "").strip()
+    return str(track_obj.get("albumName") or track_obj.get("album") or "").strip()
+
+
+def register_fake_album(track_guid: str, album_name: str, item: dict | None = None) -> None:
+    """登记专辑伪装 guid → (source, 专辑名, 所属曲目条目)，供专辑详情拦截反解。
+
+    曲目 VO 构造时同步登记（build_online_track 统一挂接，搜索/推荐/收藏/历史
+    全路径覆盖）；假 id 是确定性 md5，重启后由 ensure_registry_warm 从收藏/
+    历史/歌单附加/推荐缓存重建时同样登记，保证跨会话可反解。
+    """
+    src = source_from_online_guid(track_guid)
+    if not src:
+        return
+    fake = fake_official_guid(f"{track_guid}:album")
+    entry = _FAKE_ALBUM_REGISTRY.get(fake)
+    if entry is None:
+        _FAKE_ALBUM_REGISTRY[fake] = {
+            "source": src,
+            "album": str(album_name or "").strip(),
+            "track_guid": track_guid,
+            "item": dict(item) if isinstance(item, dict) and item else {},
+        }
+        return
+    # 已登记：首个非空值优先（后到的登记补齐缺失的专辑名/曲目条目）
+    if album_name and not entry.get("album"):
+        entry["album"] = str(album_name).strip()
+    if isinstance(item, dict) and item and not entry.get("item"):
+        entry["item"] = dict(item)
+
+
+def resolve_fake_album(candidate: str) -> dict | None:
+    """客户端回传的专辑伪装 guid → 登记条目；非伪装专辑（含官方 guid）返回 None。"""
+    if not candidate:
+        return None
+    fake = candidate[6:] if candidate.startswith("track_") else candidate
+    if not re.fullmatch(r"[0-9a-f]{32}", fake or ""):
+        return None
+    ensure_registry_warm()
+    entry = _FAKE_ALBUM_REGISTRY.get(fake)
+    if entry is None:
+        # 专辑登记丢失（如旧会话仅命中曲目反查表）：按确定性映射重建最小条目
+        real = _FAKE_GUID_REVERSE.get(fake) or ""
+        if real.endswith(":album") and is_online_guid(real):
+            track_guid = real[: -len(":album")]
+            entry = {
+                "source": source_from_online_guid(track_guid),
+                "album": "",
+                "track_guid": track_guid,
+                "item": {},
+            }
+            _FAKE_ALBUM_REGISTRY[fake] = entry
+    return entry or None
+
+
 def _register_fakes_from_items(items) -> None:
     for it in items or []:
-        if isinstance(it, dict):
-            g = str(it.get("guid") or "")
-            if is_online_guid(g):
-                fake_official_guid(g)
+        if not isinstance(it, dict):
+            continue
+        g = str(it.get("guid") or "")
+        nested = it.get("track") if isinstance(it.get("track"), dict) else None
+        if is_online_guid(g):
+            fake_official_guid(g)
+            # 专辑假 id 一并登记（issue #22）：收藏/历史/歌单附加/推荐缓存里的
+            # 快照带专辑名，重建时保住专辑详情的反解依据
+            src_obj = nested if nested is not None else it
+            register_fake_album(g, _album_name_from_obj(src_obj), _snapshot_to_info(src_obj))
+        elif nested is not None:
+            _register_fakes_from_items([nested])
 
 
 def _iter_registry_jsons(directory: str):
@@ -4082,6 +4156,32 @@ def _recommend_kinds_enabled() -> list[str]:
     return [k for k in ("daily", "hot") if _recommend_kind_enabled(k)]
 
 
+def _is_shared_user_guid(user_guid: str) -> bool:
+    """身份探测未解析到真实用户 guid（保守回落 shared）的会话。"""
+    return str(user_guid or "").strip() == "shared"
+
+
+def _recommend_injectable_kinds(user_guid: str) -> list[str]:
+    """按用户身份返回可注入（可构建）的推荐歌单类型，注入/生成侧统一判定。
+
+    issue #25 多用户隔离：_probe_upstream_auth 失败/解析异常/guid 缺失时所有用户
+    都回落 user_guid="shared"。数据来源结论（recommend.py）：
+      - daily 是个性化歌单——种子取个人 play_history（本地+在线）与个人收藏，
+        网易日推也是已登录账号的个性化内容；shared 会话注入会让身份探测失败的
+        所有用户共享同一份"每日推荐"，混合历史生成的歌单跨用户泄露，必须跳过。
+      - hot 是公共榜单——构建链（网易热歌榜/lx 免登录榜单）不读任何个人历史与
+        收藏、不做按用户排除，内容与用户身份无关（缓存仅按用户分目录存放，
+        不含任何用户数据），shared 注入无隔离风险。
+    生成侧同样收口：seeds 只按各自 user_guid 文件读取，shared 历史
+    （play_history/shared.json）不会进入任何真实用户的 daily 种子；shared 的
+    daily 经本判定在 _peek/_load 处直接短路，绝不触发构建。
+    """
+    kinds = _recommend_kinds_enabled()
+    if _is_shared_user_guid(user_guid):
+        return [k for k in kinds if k == "hot"]
+    return kinds
+
+
 async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "daily") -> asyncio.Task:
     day = dailyrec.today_key()
     _prune_stale_daily_tasks(day)
@@ -4122,7 +4222,8 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
 
 async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
     """歌单列表用：有缓存立刻返回；否则后台生成，最多等 2s，超时仍返回占位歌单。"""
-    if not _recommend_kind_enabled(kind):
+    if kind not in _recommend_injectable_kinds(user_guid):
+        # 开关关闭或身份探测失败（shared）的个性化 daily：注入与生成一并跳过
         return dailyrec.empty_daily_bundle(user_guid, kind)
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
@@ -4143,7 +4244,8 @@ async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "dail
 
 
 async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
-    if not _recommend_kind_enabled(kind):
+    if kind not in _recommend_injectable_kinds(user_guid):
+        # 同 _peek_daily_bundle：shared 会话不构建/不下发个性化 daily（issue #25）
         return dailyrec.empty_daily_bundle(user_guid, kind)
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
@@ -4435,9 +4537,9 @@ async def playlist_list(request: Request):
     if not is_authed:
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
-    kinds = _recommend_kinds_enabled()
+    kinds = _recommend_injectable_kinds(user_guid)
     if not kinds:
-        # 两个推荐开关全关：不注入任何推荐占位歌单
+        # 两个推荐开关全关（或 shared 会话无任何可注入类型）：不注入推荐占位歌单
         return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
@@ -4666,6 +4768,233 @@ async def playlist_track_list(request: Request):
             "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
         })
     )
+
+
+# === album detail（在线曲目伪装专辑详情，issue #22）===
+# 曲目 VO 的 album.guid 形如 "online:<src>:<id>:album"，disguise 后客户端拿到
+# 官方 32-hex 形态；点击专辑时客户端请求官方专辑详情端点，原样转发官方必返回
+# "无此专辑"。此处拦截分源适配：netease 经 musicbox 调真实专辑接口；musicdl/lx
+# 从保留的搜索缓存/收藏/历史聚合同专辑名曲目合成；无法合成返回业务错误，
+# 绝不透传官方"无此专辑"。官方专辑（guid 非 fake）原样转发不受影响。
+#
+# 取证说明：仓库内（proxy/static、webui-service/static、docs、tests）未找到客户端
+# 专辑跳调端点的直接证据；官方 API 命名风格为 /music/api/v1/<资源>/detail?guid=
+# （playlist/detail 同款），故按 /music/api/v1/album 前缀 + 携带 guid 参数保守
+# 拦截——反解不到已登记伪装专辑的请求一律原样转发官方，行为与官方直连一致。
+
+
+def _artist_names_joined(row: dict) -> str:
+    """原生 netease 行的 ar/artists 列表 → "A / B" 拼接。"""
+    ar = row.get("ar") or row.get("artists") or []
+    if not isinstance(ar, list):
+        return ""
+    return " / ".join(str(a.get("name") or "") for a in ar if isinstance(a, dict) and a.get("name"))
+
+
+def _album_detail_payload(album_guid: str, album_name: str, artist: str, tracks: list[dict]) -> dict:
+    """官方专辑详情 VO：字段结构对齐 track VO 的 artists/album 对象风格。"""
+    ts = int(time.time())
+    artist_name = str(artist or "").strip() or "未知艺术家"
+    artists_list = [{
+        "guid": f"{album_guid}:artist",
+        "name": artist_name,
+        "coverId": None,
+        "createdAt": ts,
+        "updatedAt": ts,
+    }]
+    # 封面取第一首曲目 guid（/static/cover 按曲目封面解析），无曲目回落专辑自身
+    cover_id = str((tracks[0] or {}).get("guid") or album_guid) if tracks else album_guid
+    album_obj = {
+        "guid": album_guid,
+        "name": str(album_name or "").strip() or "未知专辑",
+        "artists": artists_list,
+        "coverId": cover_id,
+        "releaseDate": None,
+        "barcode": None,
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": len(tracks),
+        "tracks": dailyrec.stamp_playlist_tracks(tracks),
+    }
+    return {"code": 0, "msg": "ok", "data": album_obj}
+
+
+async def _netease_album_detail_payload(request: Request, entry: dict) -> dict | None:
+    """netease 专辑：曲目详情解析真实专辑 ID，经 musicbox /api/v1/album/{id} 拉曲目列表。"""
+    if not CONF.get("netease_enabled"):
+        return None
+    musicbox_client = get_musicbox_client(request.app)
+    track_guid = str(entry.get("track_guid") or "")
+    song_id = song_id_from_online_guid(track_guid).rsplit(":", 1)[-1]
+    album_id = ""
+    album_name = str(entry.get("album") or "")
+    cover_url = ""
+    try:
+        r = await musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
+        if r.status_code == 200:
+            body = r.json()
+            if isinstance(body, dict) and body.get("ok") is not False:
+                data = body.get("data")
+                if isinstance(data, dict):
+                    al = data.get("al") if isinstance(data.get("al"), dict) else {}
+                    album_id = str(al.get("id") or "")
+                    album_name = album_name or str(al.get("name") or "")
+                    cover_url = str(al.get("picUrl") or "")
+    except Exception as e:
+        logger.warning("musicbox song info for album detail failed (%s): %s", track_guid, e)
+    if not album_id:
+        return None
+
+    rows: list = []
+    try:
+        r = await musicbox_client.get(f"/api/v1/album/{album_id}", timeout=25.0)
+        if r.status_code == 200:
+            body = r.json()
+            if isinstance(body, dict):
+                rows = body.get("data") if isinstance(body.get("data"), list) else []
+            elif isinstance(body, list):
+                rows = body
+    except Exception as e:
+        logger.warning("musicbox album detail failed for %s: %s", album_id, e)
+
+    # 行归一化：兼容 dig_info 形状（song_name/artist/duration 秒）与原生形状（name/ar/dt 毫秒）
+    items: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("song_id") or row.get("id") or "")
+        if not sid:
+            continue
+        title = str(row.get("song_name") or row.get("name") or "")
+        artist = str(row.get("artist") or "") or _artist_names_joined(row)
+        try:
+            dur_f = float(row.get("duration") or row.get("dt") or 0)
+        except (TypeError, ValueError):
+            dur_f = 0.0
+        items.append({
+            "id": f"netease:{sid}",
+            "source": "netease",
+            "title": title,
+            "artist": artist,
+            "album": album_name,
+            "duration_s": dur_f / 1000.0 if dur_f > 10000 else dur_f,
+            "ext": "flac" if (row.get("has_sq") or row.get("sq") or row.get("has_hr")) else "mp3",
+            "cover_url": cover_url,
+        })
+    if not items:
+        return None
+    tracks = [build_online_track(it) for it in items]
+    return _album_detail_payload(f"{track_guid}:album", album_name, str(tracks[0].get("artist") or ""), tracks)
+
+
+def _user_album_snapshots(user_guid: str) -> list[dict]:
+    """当前用户的收藏/播放历史/歌单附加曲目快照（仅本用户，绝不扫其他用户数据）。"""
+    out: list[dict] = []
+    for loader in (load_online_favorites, dailyrec.load_online_play_history):
+        try:
+            for it in loader(user_guid) or []:
+                snapshot = it.get("track") if isinstance(it, dict) and isinstance(it.get("track"), dict) else None
+                if snapshot:
+                    out.append(snapshot)
+        except Exception:
+            continue
+    try:
+        for bucket in load_playlist_tracks(user_guid).values():
+            for it in bucket:
+                snapshot = it.get("track") if isinstance(it, dict) and isinstance(it.get("track"), dict) else None
+                if snapshot:
+                    out.append(snapshot)
+    except Exception:
+        pass
+    return out
+
+
+def _normalize_album_candidate(it: dict) -> dict:
+    """聚合候选归一为 info 形状：VO 快照还原，搜索条目原样。"""
+    if isinstance(it.get("artists"), list) or isinstance(it.get("audioSpec"), dict):
+        return _snapshot_to_info(it)
+    return dict(it)
+
+
+async def _aggregate_album_detail_payload(request: Request, entry: dict) -> dict | None:
+    """musicdl/lx 专辑：无真实专辑接口，从内存搜索缓存 + 当前用户收藏/历史聚合同名曲目合成。"""
+    album_name = str(entry.get("album") or "").strip()
+    src = str(entry.get("source") or "")
+    track_guid = str(entry.get("track_guid") or "")
+    if not album_name:
+        # 无专辑名无法按专辑聚合（搜索结果常缺专辑字段），走业务错误
+        return None
+
+    anchor = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+    candidates: list[dict] = [anchor] if anchor else []
+    # ① 内存搜索缓存：音源目录数据，与用户身份无关
+    _clean_search_cache()
+    for cache_entry in _SEARCH_CACHE.values():
+        for it in cache_entry.get("items") or []:
+            if isinstance(it, dict):
+                candidates.append(it)
+    # ② 当前用户的收藏/历史/歌单附加快照（探测失败则跳过磁盘源，只用缓存）
+    upstream_client = get_upstream_client(request.app)
+    try:
+        is_authed, user_guid, _resp = await _probe_upstream_auth(request, upstream_client)
+    except Exception:
+        is_authed, user_guid = False, ""
+    if is_authed and user_guid:
+        candidates.extend(_user_album_snapshots(user_guid))
+
+    infos: list[dict] = []
+    seen_guids: set[str] = set()
+    for it in candidates:
+        if not isinstance(it, dict) or not it:
+            continue
+        try:
+            g = online_guid_from_item(it)
+        except Exception:
+            continue
+        if not g or not is_online_guid(g) or g in seen_guids:
+            continue
+        if source_from_online_guid(g) != src:
+            continue
+        info = _normalize_album_candidate(it)
+        if str(info.get("album") or "").strip() != album_name:
+            continue
+        seen_guids.add(g)
+        infos.append(info)
+    if not infos:
+        return None
+    tracks = [build_online_track(info) for info in infos]
+    return _album_detail_payload(f"{track_guid}:album", album_name, str(tracks[0].get("artist") or ""), tracks)
+
+
+@app.api_route("/music/api/v1/album", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/album/{subpath:path}", methods=["GET", "HEAD"])
+async def album_detail(request: Request, subpath: str = ""):
+    raw_guid = str(
+        request.query_params.get("guid")
+        or request.query_params.get("albumGUID")
+        or request.query_params.get("albumGuid")
+        or request.query_params.get("id")
+        or request.query_params.get("albumId")
+        or ""
+    ).strip()
+    entry = resolve_fake_album(raw_guid)
+    if entry is None:
+        # 官方专辑或未知 guid：原样转发官方，官方专辑请求不受影响
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    src = str(entry.get("source") or "")
+    payload = None
+    try:
+        if src == "netease":
+            payload = await _netease_album_detail_payload(request, entry)
+        else:
+            payload = await _aggregate_album_detail_payload(request, entry)
+    except Exception as e:
+        logger.warning("album detail adapt failed for %s: %s", raw_guid, e)
+    if payload is not None:
+        return JSONResponse(content=disguise_client_json(payload))
+    logger.info("album detail not synthesizable: source=%s album=%r guid=%s", src, entry.get("album"), raw_guid)
+    return JSONResponse(content={"code": -1, "msg": "该音源暂不支持专辑详情", "data": None})
 
 
 @app.post("/music/api/v1/event/report")

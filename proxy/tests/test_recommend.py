@@ -907,3 +907,139 @@ async def test_resolve_recommendations_concurrency_and_throttle(monkeypatch):
     assert len(search_timestamps) >= 6
     assert time.monotonic() - t0 >= 0.12
 
+
+# -------------------------------- 多用户推荐隔离（issue #25）
+
+def _seed_recommend_cache(user: str, kind: str, titles: list[str]) -> str:
+    """直接落一份今日推荐缓存并返回歌单 guid（绕开构建链，聚焦注入隔离）。"""
+    day = dailyrec.today_key()
+    guid = dailyrec.recommend_playlist_guid(kind, day, user)
+    safe = dailyrec._safe_user_name(user)
+    tracks = [
+        {
+            "guid": f"online:migu:{safe}-{i}",
+            "title": t,
+            "artist": "歌手甲",
+            "album": f"专辑{kind}",
+        }
+        for i, t in enumerate(titles)
+    ]
+    payload = {
+        "day": day,
+        "kind": kind,
+        "guid": guid,
+        "status": "ready",
+        "playlist": dailyrec.build_playlist_record(
+            guid, dailyrec.playlist_display_name(kind, day), guid, len(tracks)
+        ),
+        "tracks": dailyrec.stamp_playlist_tracks(tracks),
+        "tiers": ["netease-daily"],
+        "seedCount": 1,
+        "favoriteCount": 0,
+        "builtAt": 1,
+    }
+    dailyrec.save_daily_cache(user, day, payload, kind)
+    return guid
+
+
+def _switchable_auth(current: dict) -> httpx.MockTransport:
+    """可切换当前用户 guid 的上游 mock（/user/me 缺 guid 时回落 shared）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/user/me"):
+            data = {"guid": current["guid"]} if current.get("guid") else {}
+            return httpx.Response(200, json={"code": 0, "data": data})
+        if path.endswith("/playlist/list"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"list": [{"guid": "localpl", "name": "牛一", "coverId": "c1", "createdAt": 1, "updatedAt": 1}], "total": 1}},
+            )
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    return httpx.MockTransport(handler)
+
+
+def test_playlist_list_daily_isolated_between_users(tmp_path, monkeypatch):
+    """a) 两个真实 guid 用户各自注入各自的 daily（不同缓存不同歌单）。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setitem(CONF, "recommend_daily", True)
+    monkeypatch.setitem(CONF, "recommend_hot", False)
+    guid_a = _seed_recommend_cache("user-a", "daily", ["甲歌1", "甲歌2"])
+    guid_b = _seed_recommend_cache("user-b", "daily", ["乙歌1", "乙歌2"])
+    assert guid_a != guid_b
+
+    current = {"guid": "user-a"}
+    app.state.upstream_client = httpx.AsyncClient(transport=_switchable_auth(current), base_url="http://unix")
+    with TestClient(app) as client:
+        resp_a = client.get("/music/api/v1/playlist/list").json()
+        recs_a = [it for it in resp_a["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
+        assert [it["guid"] for it in recs_a] == [guid_a]
+        assert recs_a[0]["trackCount"] == 2
+
+        tracks_a = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid_a, "page": 1, "size": 50}).json()
+        assert {t["title"] for t in tracks_a["data"]["list"]} == {"甲歌1", "甲歌2"}
+
+        current["guid"] = "user-b"
+        resp_b = client.get("/music/api/v1/playlist/list").json()
+        recs_b = [it for it in resp_b["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
+        assert [it["guid"] for it in recs_b] == [guid_b]
+
+        tracks_b = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid_b, "page": 1, "size": 50}).json()
+        assert {t["title"] for t in tracks_b["data"]["list"]} == {"乙歌1", "乙歌2"}
+
+
+def test_playlist_list_shared_user_skips_daily_keeps_hot(tmp_path, monkeypatch):
+    """b/c) 身份探测失败（shared）不注入个性化 daily；hot 为公共榜单允许注入。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setitem(CONF, "recommend_daily", True)
+    monkeypatch.setitem(CONF, "recommend_hot", True)
+    _seed_recommend_cache("user-a", "daily", ["甲歌1", "甲歌2"])  # 真实用户缓存存在也不得挂给 shared
+    hot_guid = _seed_recommend_cache("shared", "hot", ["热歌1", "热歌2"])
+
+    current = {"guid": ""}  # user/me 缺 data.guid → _probe_upstream_auth 回落 shared
+    app.state.upstream_client = httpx.AsyncClient(transport=_switchable_auth(current), base_url="http://unix")
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/playlist/list")
+        assert resp.status_code == 200
+        recs = [it for it in resp.json()["data"]["list"] if dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))]
+        kinds = {dailyrec.online_playlist_kind(str(it["guid"])): it for it in recs}
+        assert "daily" not in kinds  # shared 跳过个性化 daily
+        assert kinds["hot"]["guid"] == hot_guid  # hot 公共榜单照常注入
+        assert kinds["hot"]["trackCount"] == 2
+        names = [it.get("name") for it in resp.json()["data"]["list"]]
+        assert "牛一" in names  # 官方歌单不受影响
+
+
+def test_shared_session_never_returns_others_daily_nor_builds_shared_daily(tmp_path, monkeypatch):
+    """d) shared 场景绝不返回其他用户的 daily bundle，且不为 shared 构建个性化 daily。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setitem(CONF, "recommend_daily", True)
+    monkeypatch.setitem(CONF, "recommend_hot", False)
+    user_a_guid = _seed_recommend_cache("user-a", "daily", ["甲歌1", "甲歌2"])
+
+    current = {"guid": ""}
+    app.state.upstream_client = httpx.AsyncClient(transport=_switchable_auth(current), base_url="http://unix")
+    with TestClient(app) as client:
+        detail = client.get("/music/api/v1/playlist/detail", params={"guid": user_a_guid}).json()
+        assert detail["code"] == 0
+        assert detail["data"]["trackCount"] == 0
+        assert detail["data"]["guid"] != user_a_guid
+
+        tracks = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": user_a_guid, "page": 1, "size": 50}).json()
+        assert tracks["data"]["total"] == 0
+        assert tracks["data"]["list"] == []
+
+        batch = client.get("/music/api/v1/playlist/batch-detail", params={"guids": user_a_guid}).json()
+        rec = batch["data"]["list"][0]
+        assert dailyrec.online_playlist_kind(str(rec["guid"])) != "daily" or rec["trackCount"] == 0
+
+    # 生成侧同样收口：shared 会话不触发 daily 构建（无 shared/daily-*.json 落盘）
+    shared_folder = os.path.join(dailyrec.recommend_cache_dir(), dailyrec._safe_user_name("shared"))
+    assert not os.path.exists(os.path.join(shared_folder, f"daily-{dailyrec.today_key()}.json"))
+
+    # shared 播放历史只落在 shared 自己的文件里，绝不进入真实用户的 daily 种子
+    dailyrec.record_online_play("shared", "online:migu:shared-song", {"title": "共享歌", "artist": "某歌手"})
+    assert dailyrec.load_online_play_history("user-a") == []
+    assert all(s.get("guid") != "online:migu:shared-song" for s in dailyrec.seeds_from_online_history("user-a"))
+
