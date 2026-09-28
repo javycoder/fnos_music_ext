@@ -3,6 +3,14 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [2.6.0a] - 2026-09-28
+
+### 变更：musicdl 跟随上游升级 2.13.11 → 2.14.0
+
+- **音源依赖升级**：musicdl 服务内置的 [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl) 从 2.13.11 升至 2.14.0（2026-09-23 发布），升级后镜像重新构建即生效。对本项目用户可感知的修复主要是：**酷狗音源歌词获取修复**（上游修复歌词拉取报错并更新第三方解析接口）与 QQ 音乐第三方接口更新；海外平台侧 Apple Music 解析修复（上游 issue #86/#87/#99）与 Qobuz/Deezer/TIDAL 解析重构一并带入。
+- **平台编号表无变化**：上游此版本区间无平台增删，实测 2.14.0 注册的 57 个平台与 `musicdl-service/PLATFORMS.md` 编号总表完全一致；默认白名单（酷我/咪咕）冒烟实测搜索、取链、真实音频流验证全部通过。
+- **网易云音乐盒子（NetEase-MusicBox）核查确认为最新**：上游 [darknessomi/musicbox](https://github.com/darknessomi/musicbox) 当前最新即 0.5.3（2026-08-27 发布，本项目自 v1.0.0 起已使用），镜像内版本实测一致，无需变更。
+
 ## [2.5.0] - 2026-09-28
 
 自 2.3.0 以来的全部变更收拢为本次正式版发布（期间的 2.4.x / 2.5.x 迭代版本仅作为测试构建分发，未正式发版）。
