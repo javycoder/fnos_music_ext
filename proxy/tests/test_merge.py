@@ -2220,6 +2220,8 @@ def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
         CONF, "fav_dir", str(tmp_path / "online_favorites"),
     )
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "play_history"))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "recommend_cache"))
+    monkeypatch.setenv("FNMUSIC_NM_PLAYLISTS_DIR", str(tmp_path / "nm_playlists"))
 
     guid = "online:kuwo:228908"
     # 首播已上报 track_play：历史快照带完整元数据
@@ -2248,6 +2250,179 @@ def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
         f.write(b"RIFF....FAKE_AUDIO2" * 64)
     _tee_finalize(part2, guid2, "mp3", {}, tee_enabled=True)
     assert "周杰伦 - 七里香.mp3" in os.listdir(tee_dir)
+
+
+def _isolate_meta_dirs(tmp_path, monkeypatch):
+    """推荐/网易歌单/历史目录指到临时目录，避免扫到本机缓存。"""
+    rec = tmp_path / "recommend_cache"
+    nm = tmp_path / "nm_playlists"
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(rec))
+    monkeypatch.setenv("FNMUSIC_NM_PLAYLISTS_DIR", str(nm))
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "play_history"))
+    tee_dir = str(tmp_path / "library")
+    os.makedirs(tee_dir, exist_ok=True)
+    os.makedirs(CONF["fav_dir"], exist_ok=True)
+    monkeypatch.setitem(CONF, "tee_save_dir", tee_dir)
+    monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
+    monkeypatch.setitem(CONF, "auto_cover", False)
+    return rec, nm, tee_dir
+
+
+def _write_json(path, payload) -> None:
+    import json
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _tiny_mp3(path: str) -> None:
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not available")
+    try:
+        import mutagen  # noqa: F401
+    except ImportError:
+        pytest.skip("mutagen not available")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+            "-t", "0.2", "-q:a", "9", path,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _album_of(path: str) -> str:
+    from mutagen import File as MutagenFile
+
+    tagged = MutagenFile(path, easy=True)
+    assert tagged is not None
+    return tagged["album"][0]
+
+
+def test_tag_fields_unwraps_album_and_keeps_plain_strings():
+    from proxy.app import _tag_fields
+
+    title, artist, album = _tag_fields({
+        "title": "晴天",
+        "artists": [{"name": "周杰伦"}],
+        "album": {"name": "叶惠美", "guid": "online:netease:1:album", "artists": [], "coverId": "x"},
+        "albumName": "不该用这个",
+    })
+    assert (title, artist, album) == ("晴天", "周杰伦", "叶惠美")
+    assert _tag_fields({
+        "name": "七里香",
+        "album": {"name": "", "guid": "g"},
+        "albumName": "七里香",
+    }) == ("七里香", "", "七里香")
+    assert _tag_fields({"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}) == (
+        "晴天", "周杰伦", "叶惠美",
+    )
+
+
+def test_tee_finalize_recommend_vo_names_file_and_plain_album(tmp_path, monkeypatch):
+    """推荐缓存里的前端曲目（album 为对象）落盘：文件名用歌名，专辑标签只写 name。"""
+    from proxy.app import _tee_finalize, _tee_metadata_fallback
+
+    rec, nm, tee_dir = _isolate_meta_dirs(tmp_path, monkeypatch)
+    guid = "online:netease:186016"
+    vo = {
+        "guid": guid,
+        "title": "晴天",
+        "artists": [{"name": "周杰伦", "guid": f"{guid}:artist"}],
+        "album": {
+            "name": "叶惠美",
+            "guid": f"{guid}:album",
+            "artists": [{"name": "周杰伦"}],
+            "coverId": guid,
+        },
+        "albumName": "叶惠美",
+        "cover_url": "https://example.invalid/cover.jpg",
+    }
+    _write_json(os.path.join(rec, "user-1", "daily-20200101.json"), {
+        "day": "20200101", "status": "ready", "tracks": [vo],
+    })
+    holder: dict = {}
+    title, artist, album = _tee_metadata_fallback(guid, "", "", "", holder)
+    assert (title, artist, album) == ("晴天", "周杰伦", "叶惠美")
+    assert holder.get("cover_url") == "https://example.invalid/cover.jpg"
+    assert "{" not in album
+
+    part = os.path.join(tee_dir, "part-rec.mp3")
+    _tiny_mp3(part)
+    _tee_finalize(part, guid, "mp3", None, tee_enabled=True)
+    dest = os.path.join(tee_dir, "周杰伦 - 晴天.mp3")
+    assert os.path.isfile(dest)
+    assert _album_of(dest) == "叶惠美"
+
+    # 网易账号歌单磁盘缓存是同一类 VO，不在搜索缓存里也要能定名
+    guid_nm = "online:netease:42"
+    _write_json(os.path.join(nm, "pl-7.json"), {"tracks": [{
+        "guid": guid_nm,
+        "title": "七里香",
+        "artist": "周杰伦",
+        "album": {"name": "七里香", "guid": f"{guid_nm}:album"},
+    }]})
+    part_nm = os.path.join(tee_dir, "part-nm.mp3")
+    _tiny_mp3(part_nm)
+    _tee_finalize(part_nm, guid_nm, "mp3", {}, tee_enabled=True)
+    dest_nm = os.path.join(tee_dir, "周杰伦 - 七里香.mp3")
+    assert os.path.isfile(dest_nm)
+    assert _album_of(dest_nm) == "七里香"
+
+
+def test_tee_finalize_favorite_album_object_and_keeps_string_album(tmp_path, monkeypatch):
+    """收藏快照的专辑对象写成专辑名；调用方已经给了纯字符串专辑时不被缓存覆盖。"""
+    import json
+
+    from proxy.app import _tee_finalize
+
+    _rec, _nm, tee_dir = _isolate_meta_dirs(tmp_path, monkeypatch)
+    guid = "online:kuwo:9"
+    with open(os.path.join(CONF["fav_dir"], "user-1.json"), "w", encoding="utf-8") as f:
+        json.dump({"items": [{
+            "guid": guid,
+            "track": {
+                "title": "七里香",
+                "artists": [{"name": "周杰伦"}],
+                "album": {"name": "七里香", "guid": f"{guid}:album", "coverId": guid},
+            },
+        }]}, f)
+    part = os.path.join(tee_dir, "part-fav.mp3")
+    _tiny_mp3(part)
+    _tee_finalize(part, guid, "mp3", None, tee_enabled=True)
+    dest = os.path.join(tee_dir, "周杰伦 - 七里香.mp3")
+    assert os.path.isfile(dest)
+    assert _album_of(dest) == "七里香"
+
+    guid2 = "online:kuwo:10"
+    _write_json(os.path.join(_rec, "user-1", "daily-20200101.json"), {"tracks": [{
+        "guid": guid2,
+        "title": "晴天",
+        "artist": "周杰伦",
+        "album": {"name": "不该覆盖", "guid": f"{guid2}:album"},
+    }]})
+    part2 = os.path.join(tee_dir, "part-keep.mp3")
+    _tiny_mp3(part2)
+    _tee_finalize(part2, guid2, "mp3", {
+        "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+    }, tee_enabled=True)
+    kept = os.path.join(tee_dir, "周杰伦 - 晴天.mp3")
+    assert os.path.isfile(kept)
+    assert _album_of(kept) == "叶惠美"
+
+
+def test_write_audio_tags_unwraps_album_object(tmp_path):
+    path = str(tmp_path / "sample.mp3")
+    _tiny_mp3(path)
+    write_audio_tags(path, title="晴天", artist="周杰伦", album={
+        "name": "叶惠美", "guid": "online:netease:1:album", "artists": [], "coverId": "x",
+    })
+    assert _album_of(path) == "叶惠美"
 
 
 def test_search_track_pagination_no_cross_page_duplication():

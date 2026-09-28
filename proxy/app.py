@@ -1034,9 +1034,13 @@ def unique_library_path(directory: str, basename: str, ext: str) -> str:
     return os.path.join(directory, f"{basename} ({n}).{ext}")
 
 
-def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -> None:
-    """写入 title/artist/album，飞牛扫描后用标签而不是文件名显示。"""
-    title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
+def write_audio_tags(path: str, title: str, artist: str = "", album: Any = "") -> None:
+    """写入 title/artist/album，飞牛扫描后用标签而不是文件名显示。
+
+    album 可能是前端曲目对象 {name, guid, ...}；先归一成纯字符串再写入，
+    避免把整个对象的文本写进专辑标签。
+    """
+    title, artist, album = _tag_fields({"title": title, "artist": artist, "album": album})
     if not title and not artist:
         return
     try:
@@ -2109,6 +2113,41 @@ def _album_name_from_obj(track_obj: dict) -> str:
     return str(track_obj.get("albumName") or track_obj.get("album") or "").strip()
 
 
+def _person_name(value: Any) -> str:
+    """歌手字段：字符串原样，对象取 name，列表取第一个有名字的成员。"""
+    if isinstance(value, dict):
+        return str(value.get("name") or "").strip()
+    if isinstance(value, list):
+        for item in value:
+            name = _person_name(item)
+            if name:
+                return name
+        return ""
+    return str(value or "").strip()
+
+
+def _tag_fields(info: dict | None) -> tuple[str, str, str]:
+    """落盘/历史用的标题、歌手、专辑。恒为纯字符串。
+
+    推荐歌单等前端曲目里 album 是 {name, guid, artists, coverId}，
+    不能 str() 整个对象。对象 name 为空时再看 albumName。
+    """
+    src = info if isinstance(info, dict) else {}
+    title_raw = src.get("title")
+    if isinstance(title_raw, dict) or not str(title_raw or "").strip():
+        title = _person_name(title_raw) or _person_name(src.get("name"))
+    else:
+        title = str(title_raw).strip()
+    artist = _person_name(src.get("artist")) or _person_name(src.get("artists"))
+    album = _album_name_from_obj(src) or str(src.get("albumName") or "").strip()
+    return title, artist, album
+
+
+def _cover_url_of(info: dict | None) -> str:
+    src = info if isinstance(info, dict) else {}
+    return str(src.get("cover_url") or src.get("coverUrl") or src.get("coverURL") or "").strip()
+
+
 def _item_meta_richness(it: dict) -> int:
     """条目元数据丰富度：title/album 各 1 分。用于"更全的快照覆盖残缺的"合并。"""
     it = it if isinstance(it, dict) else {}
@@ -3092,23 +3131,74 @@ def _lookup_online_snapshot(guid: str) -> "dict | None":
     return None
 
 
-def _tee_metadata_fallback(guid: str, title: str, artist: str, album: str) -> tuple[str, str, str]:
-    """issue #28：tee 落盘元数据缺失时的回查兜底，杜绝无元数据以 unknown 进曲库。
+def _track_in_list(tracks: Any, guid: str) -> dict | None:
+    if not isinstance(tracks, list):
+        return None
+    for track in tracks:
+        if not isinstance(track, dict) or str(track.get("guid") or "") != guid:
+            continue
+        title, artist, _album = _tag_fields(track)
+        if title or artist:
+            return track
+    return None
 
-    流式上下文解析失败（info 为空/stub）时此前直接落 "unknown (n).flac"，飞牛
-    扫描后音乐库显示 Unknown 且无元数据。这里先从历史/收藏快照反查补齐；仍缺
-    失才维持 unknown，并打 WARN 便于取证（正常在线曲目在首次播放上报
-    track_play 时已写入历史快照，二播场景必然能反查到）。
+
+def _lookup_playlist_cache_track(guid: str) -> dict | None:
+    """推荐歌单、网易账号歌单的磁盘缓存按 guid 反查下发曲目。
+
+    这两类列表不进搜索缓存。缓存里的曲目是前端形态（album 为对象），
+    调用方必须用 _tag_fields 取标签，不能 str(album)。
     """
-    if title.strip() and artist.strip():
-        return title, artist, album
-    snap = _lookup_online_snapshot(guid)
-    if snap:
-        title = title.strip() or str(snap.get("title") or "")
-        artist = artist.strip() or str(snap.get("artist") or "")
-        album = album.strip() or str(snap.get("album") or "")
-        logger.info("tee metadata fallback hit for %s: %s - %s", guid, artist, title)
-    if not (title.strip() and artist.strip()):
+    if not guid:
+        return None
+    for root in (dailyrec.recommend_cache_dir(), nmpl.cache_dir()):
+        for path in _iter_registry_jsons(root):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            hit = _track_in_list(data.get("tracks"), guid)
+            if hit:
+                return hit
+    return None
+
+
+def _merge_missing_tags(title: str, artist: str, album: str, snap: dict) -> tuple[str, str, str]:
+    """只补空字段。已经是纯字符串的专辑不被缓存里的另一份专辑覆盖。"""
+    snap_title, snap_artist, snap_album = _tag_fields(snap)
+    return title or snap_title, artist or snap_artist, album or snap_album
+
+
+def _tee_metadata_fallback(
+    guid: str, title: str, artist: str, album: str, dest_info: dict | None = None,
+) -> tuple[str, str, str]:
+    """tee 落盘元数据缺失时的回查兜底，避免以 unknown 进曲库。
+
+    顺序：推荐/网易账号歌单缓存（首播时历史往往还没写）→ 播放历史/收藏/自建歌单。
+    缺哪个字段补哪个；已有的纯字符串专辑保持不变。封面 URL 只在调用方还没有时写入 dest_info。
+    """
+    title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
+    need_cover = not _cover_url_of(dest_info)
+    if not (title and artist and album and not need_cover):
+        filled = False
+        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
+            if not snap:
+                continue
+            title, artist, album = _merge_missing_tags(title, artist, album, snap)
+            if need_cover and isinstance(dest_info, dict):
+                cover = _cover_url_of(snap)
+                if cover:
+                    dest_info["cover_url"] = cover
+                    need_cover = False
+            filled = True
+            if title and artist and album and not need_cover:
+                break
+        if filled:
+            logger.info("tee metadata fallback hit for %s: %s - %s", guid, artist, title)
+    if not (title and artist):
         logger.warning(
             "tee finalize missing metadata for %s (title=%r artist=%r)：将以 unknown 命名落盘，"
             "该曲目的元数据解析链路需要排查", guid, title, artist,
@@ -3123,9 +3213,10 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
     返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
     """
-    title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
+    src = dict(info or {})
+    title, artist, album = _tag_fields(src)
     if tee_enabled:
-        title, artist, album = _tee_metadata_fallback(guid, title, artist, album)
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src)
         dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
         os.replace(part, dest)
         remember_media_path(guid, dest)
@@ -3133,7 +3224,7 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         write_audio_tags(dest, title, artist, album)
         # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
         # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
-        cover_url = str((info or {}).get("cover_url") or "").strip()
+        cover_url = _cover_url_of(src)
         if cover_url and CONF.get("auto_cover", True):
             try:
                 fetched = download_cover_bytes(cover_url)
@@ -3152,7 +3243,7 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
     # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
     if tee_enabled and CONF.get("lyric_auto_dl"):
-        lyric = str((info or {}).get("lyric") or (info or {}).get("lrc") or "")
+        lyric = str(src.get("lyric") or src.get("lrc") or "")
         if lyric.strip():
             write_lyric_cache(guid, lyric, title, artist)
     if not tee_enabled:
@@ -3461,8 +3552,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.info("online info fast-path missed for %s: %s", guid, type(exc).__name__)
             ext = ext or (info or {}).get("ext")
             # Read timeout must tolerate CDN throttling mid-file: a flat 10s
             # timeout kills long pauses between chunks and surfaces as playback
@@ -3557,6 +3648,37 @@ def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
     _register_background_fetch(request, guid, "fav_auto_bind")
 
 
+async def _info_for_background_save(request: Request, guid: str, info: dict | None) -> dict:
+    """后台整轨/续传落盘前补齐元数据。
+
+    本地推荐歌单、网易账号歌单、历史/收藏里已有标题就用那份，不再打源站。
+    都没有时再拉一次歌曲信息（数秒，不占播放起播的 0.75 秒窗口）。
+    """
+    base = dict(info or {})
+    if _tag_fields(base)[0]:
+        return base
+    local = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
+    if local and _tag_fields(local)[0]:
+        merged = dict(local)
+        if base.get("ext"):
+            merged["ext"] = base["ext"]
+        if base.get("lyric"):
+            merged["lyric"] = base["lyric"]
+        return merged
+    try:
+        fetched = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=4.0)
+    except Exception as exc:
+        logger.info("background online info missed for %s: %s", guid, type(exc).__name__)
+        return base
+    if isinstance(fetched, dict) and _tag_fields(fetched)[0]:
+        if base.get("ext") and not fetched.get("ext"):
+            fetched = dict(fetched)
+            fetched["ext"] = base["ext"]
+        return fetched
+    logger.info("background online info empty for %s", guid)
+    return base
+
+
 async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
     """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。"""
     part = None
@@ -3588,6 +3710,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
                     written += len(chunk)
         if written < 1024 or (expected is not None and written != expected):
             raise RuntimeError(f"size mismatch written={written} expected={expected}")
+        info = await _info_for_background_save(fake_request, guid, info)
         ext = ext or (info or {}).get("ext") or "mp3"
         meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True)
         part = None
@@ -3739,6 +3862,7 @@ async def _resume_part_download(guid: str, part: str, written: int, expected: in
         final_size = written + append_written
         if final_size < 1024 or final_size != total:
             raise RuntimeError(f"resume size mismatch final={final_size} total={total}")
+        info = await _info_for_background_save(fake_request, guid, info)
         resolved_ext = ext or stream_ext or (info or {}).get("ext") or "mp3"
         meta = await asyncio.to_thread(_tee_finalize, part, guid, resolved_ext, info or {}, True)
         logger.info("Tee handoff resumed %s (+%d bytes, total %d)", guid, append_written, final_size)
@@ -6678,10 +6802,18 @@ async def event_report(request: Request):
                     duration_s = None
                     if payload:
                         # 客户端上报若带元数据（App/Web 字段名可能不同）优先采信，
-                        # 避免历史条目只有 guid、标题歌手为空。
-                        title = str(payload.get("title") or payload.get("name") or "").strip() or title
-                        artist = str(payload.get("artist") or payload.get("artistName") or "").strip() or artist
-                        album = str(payload.get("album") or payload.get("albumName") or "").strip()
+                        # 避免历史条目只有 guid、标题歌手为空。专辑可能是对象，先解开。
+                        p_title, p_artist, p_album = _tag_fields({
+                            "title": payload.get("title"),
+                            "name": payload.get("name"),
+                            "artist": payload.get("artist") or payload.get("artistName"),
+                            "artists": payload.get("artists"),
+                            "album": payload.get("album"),
+                            "albumName": payload.get("albumName"),
+                        })
+                        title = p_title or title
+                        artist = p_artist or artist
+                        album = p_album or album
                         raw_dur = payload.get("duration") or payload.get("durationMs") or payload.get("duration_ms")
                         try:
                             dv = float(raw_dur)
@@ -6692,14 +6824,22 @@ async def event_report(request: Request):
                         # 事件不带元数据时从内存搜索会话补齐（播放时会话必在）
                         retained, _entry = _retained_track(request, guid)
                         if retained:
-                            title = title or str(retained.get("title") or "")
-                            artist = artist or str(retained.get("artist") or "")
-                            album = album or str(retained.get("album") or "")
+                            r_title, r_artist, r_album = _tag_fields(retained)
+                            title = title or r_title
+                            artist = artist or r_artist
+                            album = album or r_album
                             if not duration_s:
                                 try:
                                     duration_s = float(retained.get("duration_s") or 0) or None
                                 except (TypeError, ValueError):
                                     duration_s = None
+                        if not title or not artist or not album:
+                            served = _lookup_playlist_cache_track(guid)
+                            if served:
+                                s_title, s_artist, s_album = _tag_fields(served)
+                                title = title or s_title
+                                artist = artist or s_artist
+                                album = album or s_album
                     cached = find_cache_file(guid)
                     if cached and (not title or not artist):
                         base = os.path.splitext(os.path.basename(cached))[0]
@@ -6785,11 +6925,12 @@ async def play_history_list(request: Request):
             # 历史快照可能没带元数据：从内存搜索会话补齐（无网络开销）
             retained, _entry = _retained_track(request, guid)
             if retained:
+                r_title, r_artist, r_album = _tag_fields(retained)
                 info = {
                     **(info or {}),
-                    "title": retained.get("title") or "",
-                    "artist": retained.get("artist") or "",
-                    "album": retained.get("album") or "",
+                    "title": r_title,
+                    "artist": r_artist,
+                    "album": r_album,
                     "duration_s": retained.get("duration_s") or 0,
                     "ext": retained.get("ext") or "",
                 }
