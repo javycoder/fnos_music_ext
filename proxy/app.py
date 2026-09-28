@@ -135,6 +135,10 @@ CONF = {
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
+    # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
+    # =detail 时逐条记录。官方 App 更新引入新端点时（如 2.5.0 前的 download/*），
+    # 日志可直接看到客户端在调什么，避免"Unknown 元数据"类问题无迹可循
+    "trace_forward": os.environ.get("FNMUSIC_TRACE_FORWARD", "").strip().lower() in ("detail", "1", "true", "yes"),
 }
 
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
@@ -439,10 +443,18 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
+    "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
     "FNMUSIC_LLM_API_KEY": ("", "str"),
     "FNMUSIC_LLM_MODEL": ("llm_model", "str"),
     "FNMUSIC_SEARCH_TIMEOUT": ("search_timeout", "seconds"),
+    # issue #29：推荐构建预算/候选数/逐首校验运行期可调（recommend.py 动态读 os.environ）
+    "FNMUSIC_RECOMMEND_BUDGET_S": ("", "str"),
+    "FNMUSIC_RECOMMEND_CANDIDATES": ("", "str"),
+    "FNMUSIC_LLM_TIMEOUT_S": ("", "str"),
+    "FNMUSIC_RECOMMEND_FALLBACK_BUDGET_S": ("", "str"),
+    "FNMUSIC_RECOMMEND_VERIFY_PLAYABLE": ("", "str"),
+    "FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S": ("", "str"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -516,6 +528,17 @@ def _env_watch_stat(path: "str | None" = None):
         return None
 
 
+# 音源集合相关的 CONF 键：任一变化意味着推荐缓存里的旧源曲目可能不可播（issue #22）
+_SOURCE_CONF_KEYS = {"musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources"}
+
+
+def _cancel_daily_tasks() -> None:
+    for key in list(_DAILY_TASKS):
+        old = _DAILY_TASKS.pop(key, None)
+        if old is not None and not old.done():
+            old.cancel()
+
+
 async def _env_watch_loop() -> None:
     last = _env_watch_stat()
     while True:
@@ -533,6 +556,15 @@ async def _env_watch_loop() -> None:
             changed = apply_env_hot_reload()
             if changed:
                 _reset_search_cache()
+                if _SOURCE_CONF_KEYS & set(changed):
+                    # issue #22：切换音源后当日推荐立即失效，切回歌单按新音源重建，
+                    # 旧源曲目不再残留到当日结束
+                    removed = dailyrec.invalidate_today_cache_all_users()
+                    _cancel_daily_tasks()
+                    logger.info(
+                        "音源配置变化(%s)：已失效当日推荐缓存 %d 个，推荐歌单将按新音源重建",
+                        ",".join(sorted(_SOURCE_CONF_KEYS & set(changed))), removed,
+                    )
                 logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
         except asyncio.CancelledError:
             raise
@@ -1906,12 +1938,13 @@ def _album_name_from_obj(track_obj: dict) -> str:
     return str(track_obj.get("albumName") or track_obj.get("album") or "").strip()
 
 
-def register_fake_album(track_guid: str, album_name: str, item: dict | None = None) -> None:
+def register_fake_album(track_guid: str, album_name: str, item: dict | None = None, album_id: str = "") -> None:
     """登记专辑伪装 guid → (source, 专辑名, 所属曲目条目)，供专辑详情拦截反解。
 
     曲目 VO 构造时同步登记（build_online_track 统一挂接，搜索/推荐/收藏/历史
     全路径覆盖）；假 id 是确定性 md5，重启后由 ensure_registry_warm 从收藏/
     历史/歌单附加/推荐缓存重建时同样登记，保证跨会话可反解。
+    album_id：netease 真实专辑 id（/search/album 在线专辑直达详情用，可空）。
     """
     src = source_from_online_guid(track_guid)
     if not src:
@@ -1924,6 +1957,7 @@ def register_fake_album(track_guid: str, album_name: str, item: dict | None = No
             "album": str(album_name or "").strip(),
             "track_guid": track_guid,
             "item": dict(item) if isinstance(item, dict) and item else {},
+            "album_id": str(album_id or ""),
         }
         return
     # 已登记：首个非空值优先（后到的登记补齐缺失的专辑名/曲目条目）
@@ -1931,6 +1965,8 @@ def register_fake_album(track_guid: str, album_name: str, item: dict | None = No
         entry["album"] = str(album_name).strip()
     if isinstance(item, dict) and item and not entry.get("item"):
         entry["item"] = dict(item)
+    if album_id and not entry.get("album_id"):
+        entry["album_id"] = str(album_id)
 
 
 def resolve_fake_album(candidate: str) -> dict | None:
@@ -1955,6 +1991,15 @@ def resolve_fake_album(candidate: str) -> dict | None:
             }
             _FAKE_ALBUM_REGISTRY[fake] = entry
     return entry or None
+
+
+def album_entry_from_real_guid(real_guid: str) -> "dict | None":
+    """真实形态专辑 guid（"online:...:album"）→ 登记条目；封面拦截按 cover_url 直出用。"""
+    raw = str(real_guid or "")
+    if not raw.endswith(":album"):
+        return None
+    fake = fake_official_guid(raw)
+    return _FAKE_ALBUM_REGISTRY.get(fake)
 
 
 def _register_fakes_from_items(items) -> None:
@@ -3683,6 +3728,14 @@ async def static_cover(request: Request, subpath: str = ""):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
+    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
+    album_entry = album_entry_from_real_guid(guid)
+    if album_entry is not None:
+        cover = str((album_entry.get("item") or {}).get("cover_url") or "")
+        if cover and _KW_TEXT_COVER_HOST not in cover:
+            return RedirectResponse(cover, status_code=302)
+        return _placeholder_cover_response(guid)
+
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
     # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
@@ -4220,8 +4273,42 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
     return task
 
 
+async def _wait_progressive_bundle(
+    request: Request, user_guid: str, kind: str, timeout_s: float,
+) -> dict:
+    """issue #23 渐进上架：后台构建期间轮询磁盘 checkpoint，出现任意一首即返回。
+
+    recommend 构建已改为逐首 checkpoint（2s 节流落盘），这里 0.5s 轮询一次：
+    歌单/曲目列表首屏必有歌（构建仍在继续，用户重进列表可见增长），不再
+    空等整链构建完成。task 完成则返回最终结果；超时仍无任何曲目回占位歌单。
+    """
+    day = dailyrec.today_key()
+    task = await _ensure_daily_task(request, user_guid, kind)
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=min(remaining, 0.5))
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            logger.warning("daily recommend build failed: %s", e)
+            break
+        cached = dailyrec.load_daily_cache(user_guid, day, kind)
+        if cached and cached.get("tracks"):
+            return cached
+        if task.done():
+            break
+    cached = dailyrec.load_daily_cache(user_guid, day, kind)
+    if cached and cached.get("tracks"):
+        return cached
+    return dailyrec.empty_daily_bundle(user_guid, kind)
+
+
 async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
-    """歌单列表用：有缓存立刻返回；否则后台生成，最多等 2s，超时仍返回占位歌单。"""
+    """歌单列表用：有缓存立刻返回；否则等渐进 checkpoint，最多 2s，超时仍返回占位歌单。"""
     if kind not in _recommend_injectable_kinds(user_guid):
         # 开关关闭或身份探测失败（shared）的个性化 daily：注入与生成一并跳过
         return dailyrec.empty_daily_bundle(user_guid, kind)
@@ -4230,17 +4317,7 @@ async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "dail
     cached = dailyrec.load_daily_cache(user_guid, day, kind)
     if cached and cached.get("tracks"):
         return cached
-    task = await _ensure_daily_task(request, user_guid, kind)
-    try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-    except asyncio.TimeoutError:
-        cached = dailyrec.load_daily_cache(user_guid, day, kind)
-        if cached and cached.get("tracks"):
-            return cached
-        return dailyrec.empty_daily_bundle(user_guid, kind)
-    except Exception as e:
-        logger.warning("daily recommend peek failed: %s", e)
-        return dailyrec.empty_daily_bundle(user_guid, kind)
+    return await _wait_progressive_bundle(request, user_guid, kind, timeout_s=2.0)
 
 
 async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
@@ -4252,15 +4329,7 @@ async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "dail
     cached = dailyrec.load_daily_cache(user_guid, day, kind)
     if cached and cached.get("tracks"):
         return cached
-
-    task = await _ensure_daily_task(request, user_guid, kind)
-    try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=20.0)
-    except asyncio.TimeoutError:
-        cached = dailyrec.load_daily_cache(user_guid, day, kind)
-        if cached and cached.get("tracks"):
-            return cached
-        return dailyrec.empty_daily_bundle(user_guid, kind)
+    return await _wait_progressive_bundle(request, user_guid, kind, timeout_s=20.0)
 
 
 # === playlist tracks（官方歌单内的在线附加条目）===
@@ -4820,28 +4889,32 @@ def _album_detail_payload(album_guid: str, album_name: str, artist: str, tracks:
 
 
 async def _netease_album_detail_payload(request: Request, entry: dict) -> dict | None:
-    """netease 专辑：曲目详情解析真实专辑 ID，经 musicbox /api/v1/album/{id} 拉曲目列表。"""
+    """netease 专辑：曲目详情解析真实专辑 ID，经 musicbox /api/v1/album/{id} 拉曲目列表。
+
+    entry 带 album_id（/search/album 在线专辑登记）时跳过 song/info 二跳直达。
+    """
     if not CONF.get("netease_enabled"):
         return None
     musicbox_client = get_musicbox_client(request.app)
     track_guid = str(entry.get("track_guid") or "")
-    song_id = song_id_from_online_guid(track_guid).rsplit(":", 1)[-1]
-    album_id = ""
+    album_id = str(entry.get("album_id") or "")
     album_name = str(entry.get("album") or "")
     cover_url = ""
-    try:
-        r = await musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
-        if r.status_code == 200:
-            body = r.json()
-            if isinstance(body, dict) and body.get("ok") is not False:
-                data = body.get("data")
-                if isinstance(data, dict):
-                    al = data.get("al") if isinstance(data.get("al"), dict) else {}
-                    album_id = str(al.get("id") or "")
-                    album_name = album_name or str(al.get("name") or "")
-                    cover_url = str(al.get("picUrl") or "")
-    except Exception as e:
-        logger.warning("musicbox song info for album detail failed (%s): %s", track_guid, e)
+    if not album_id:
+        song_id = song_id_from_online_guid(track_guid).rsplit(":", 1)[-1]
+        try:
+            r = await musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict) and body.get("ok") is not False:
+                    data = body.get("data")
+                    if isinstance(data, dict):
+                        al = data.get("al") if isinstance(data.get("al"), dict) else {}
+                        album_id = str(al.get("id") or "")
+                        album_name = album_name or str(al.get("name") or "")
+                        cover_url = str(al.get("picUrl") or "")
+        except Exception as e:
+            logger.warning("musicbox song info for album detail failed (%s): %s", track_guid, e)
     if not album_id:
         return None
 
@@ -4966,6 +5039,60 @@ async def _aggregate_album_detail_payload(request: Request, entry: dict) -> dict
     return _album_detail_payload(f"{track_guid}:album", album_name, str(tracks[0].get("artist") or ""), tracks)
 
 
+# 专辑详情合成缓存（fake guid → (过期时间, payload)）：客户端进专辑页会先调
+# /album/detail 再调 /track/album-detail/list，避免同专辑合成两次；TTL 短，仅省重复请求
+_ALBUM_PAYLOAD_CACHE: dict[str, tuple[float, dict]] = {}
+_ALBUM_PAYLOAD_TTL_S = 120.0
+
+
+async def _synthesize_album_payload(request: Request, entry: dict, raw_guid: str) -> "dict | None":
+    """按源合成专辑详情 payload（带 120s TTL 缓存）；合成失败返回 None。"""
+    now = time.monotonic()
+    cached = _ALBUM_PAYLOAD_CACHE.get(raw_guid)
+    if cached and cached[0] > now:
+        return cached[1]
+    src = str(entry.get("source") or "")
+    payload = None
+    try:
+        if src == "netease":
+            payload = await _netease_album_detail_payload(request, entry)
+        else:
+            payload = await _aggregate_album_detail_payload(request, entry)
+    except Exception as e:
+        logger.warning("album detail adapt failed for %s: %s", raw_guid, e)
+    if payload is not None:
+        if len(_ALBUM_PAYLOAD_CACHE) > 256:
+            _ALBUM_PAYLOAD_CACHE.clear()
+        _ALBUM_PAYLOAD_CACHE[raw_guid] = (now + _ALBUM_PAYLOAD_TTL_S, payload)
+    return payload
+
+
+def _album_list_envelope(request: Request, tracks: list[dict]) -> dict:
+    """官方专辑曲目列表信封：与 /track/playlist-detail/list 同款 {list,total,sort}。"""
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 50)
+    except (TypeError, ValueError):
+        size = 50
+    if size == -1:
+        size = max(len(tracks), 1)
+    if size < 1:
+        size = 50
+    start = (page - 1) * size
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": {
+            "list": tracks[start:start + size],
+            "total": len(tracks),
+            "sort": request.query_params.get("sort") or "",
+        },
+    }
+
+
 @app.api_route("/music/api/v1/album", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/album/{subpath:path}", methods=["GET", "HEAD"])
 async def album_detail(request: Request, subpath: str = ""):
@@ -4982,19 +5109,255 @@ async def album_detail(request: Request, subpath: str = ""):
         # 官方专辑或未知 guid：原样转发官方，官方专辑请求不受影响
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
-    src = str(entry.get("source") or "")
-    payload = None
-    try:
-        if src == "netease":
-            payload = await _netease_album_detail_payload(request, entry)
-        else:
-            payload = await _aggregate_album_detail_payload(request, entry)
-    except Exception as e:
-        logger.warning("album detail adapt failed for %s: %s", raw_guid, e)
+    payload = await _synthesize_album_payload(request, entry, raw_guid)
     if payload is not None:
         return JSONResponse(content=disguise_client_json(payload))
-    logger.info("album detail not synthesizable: source=%s album=%r guid=%s", src, entry.get("album"), raw_guid)
+    logger.info("album detail not synthesizable: source=%s album=%r guid=%s", entry.get("source"), entry.get("album"), raw_guid)
     return JSONResponse(content={"code": -1, "msg": "该音源暂不支持专辑详情", "data": None})
+
+
+@app.api_route("/music/api/v1/track/album-detail/list", methods=["GET", "HEAD"])
+async def track_album_detail_list(request: Request):
+    """专辑页曲目列表（官方 2.5 版客户端在 /album/detail 之后调用）。
+
+    官方专辑原样透传；在线伪装专辑复用专辑详情合成结果分页下发，
+    合成失败返回业务错误空列表，绝不透传官方"无此专辑"。
+    """
+    raw_guid = str(
+        request.query_params.get("albumGUID")
+        or request.query_params.get("albumGuid")
+        or request.query_params.get("guid")
+        or request.query_params.get("id")
+        or ""
+    ).strip()
+    entry = resolve_fake_album(raw_guid)
+    if entry is None:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    payload = await _synthesize_album_payload(request, entry, raw_guid)
+    if payload is None:
+        return JSONResponse(content={"code": -1, "msg": "该音源暂不支持专辑详情", "data": None})
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    tracks = list(data.get("tracks") or [])
+    return JSONResponse(content=disguise_client_json(_album_list_envelope(request, tracks)))
+
+
+# === /search/album 在线专辑合并（issue #22，官方 2.5 版客户端专辑搜索 Tab）===
+# 官方端点搜的是本地曲库专辑；这里透传官方结果后合并在线专辑：
+#   - netease：musicbox type=album 真实专辑搜索，登记真实 album_id 直达详情
+#   - musicdl/lx：无专辑接口，按关键词搜曲目后按"专辑名+源"聚合合成，
+#     代表曲目 guid 注册伪装专辑（详情走聚合适配）
+# 官方专辑永远排在前面；同名专辑（与官方结果撞名）不重复注入。
+
+_ALBUM_SEARCH_LIMIT = 10
+
+
+def _album_list_obj(album_guid: str, album_name: str, artist: str, cover_ref: str, track_count: int) -> dict:
+    """专辑列表/搜索结果 VO（与 _album_detail_payload 同字段风格，无 tracks）。"""
+    ts = int(time.time())
+    artist_name = str(artist or "").strip() or "未知艺术家"
+    return {
+        "guid": album_guid,
+        "name": str(album_name or "").strip() or "未知专辑",
+        "artists": [{
+            "guid": f"{album_guid}:artist",
+            "name": artist_name,
+            "coverId": None,
+            "createdAt": ts,
+            "updatedAt": ts,
+        }],
+        "coverId": cover_ref or album_guid,
+        "releaseDate": None,
+        "barcode": None,
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": int(track_count or 0),
+    }
+
+
+def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str] | None":
+    """网易专辑搜索行（CLI 与 web 兜底两种形状）→ (album_id, 名称, 歌手, 封面)。"""
+    album_id = str(row.get("album_id") or row.get("albumId") or row.get("id") or "")
+    name = str(row.get("album_name") or row.get("name") or row.get("title") or "").strip()
+    if not album_id or album_id in ("0", "None") or not name:
+        return None
+    ar = row.get("artists") or row.get("artist") or []
+    if isinstance(ar, list):
+        artist = " / ".join(str(a.get("name") or "") for a in ar if isinstance(a, dict) and a.get("name"))
+    else:
+        artist = str(ar or "")
+    cover = str(row.get("pic_url") or row.get("picUrl") or row.get("coverImgUrl") or row.get("cover") or "")
+    return album_id, name, artist, cover
+
+
+async def _netease_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
+    if not CONF.get("netease_enabled"):
+        return []
+    client = get_musicbox_client(request.app)
+    try:
+        r = await client.get(
+            "/api/v1/search",
+            params={"keyword": keyword, "type": "album", "limit": max(limit, 5)},
+            timeout=8.0,
+        )
+    except Exception as e:
+        logger.debug("netease album search failed: %s", e)
+        return []
+    if r.status_code != 200:
+        return []
+    body = r.json() if r.headers.get("content-type", "").startswith(("application/json", "text/json")) else {}
+    rows = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        norm = _normalize_netease_album_row(row)
+        if norm is None:
+            continue
+        album_id, name, artist, cover = norm
+        if album_id in seen:
+            continue
+        seen.add(album_id)
+        # 锚点 guid 仅供专辑伪装登记/反解，不对应任何真实曲目；
+        # 形态对齐曲目锚点约定：专辑 guid = 锚点 + ":album"（register 内部拼）
+        anchor = f"online:netease:album:{album_id}"
+        register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id)
+        out.append(_album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _aggregate_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
+    """musicdl/lx：关键词搜曲目后按"专辑名+源"聚合合成专辑卡片。"""
+    jobs: list = []
+    if CONF.get("musicdl_enabled"):
+        jobs.append(("musicdl", get_musicdl_client(request.app).get(
+            "/search", params={"keyword": keyword, "limit": 20}, timeout=6.0,
+        )))
+    if CONF.get("lx_enabled"):
+        params: dict = {"keyword": keyword, "limit": 20}
+        lx_sources = CONF.get("lx_sources") or None
+        if lx_sources:
+            params["sources"] = ",".join(lx_sources)
+        jobs.append(("lx", get_lx_client(request.app).get("/api/v1/search", params=params, timeout=6.0)))
+
+    async def _run(coro):
+        try:
+            return await coro
+        except Exception as e:
+            logger.debug("album aggregate source search failed: %s", e)
+            return None
+
+    groups: "dict[tuple[str, str], list[dict]]" = {}
+    for fut in asyncio.as_completed([_run(coro) for _name, coro in jobs]):
+        r = await fut
+        if r is None or r.status_code != 200:
+            continue
+        try:
+            rows = r.json().get("items")
+        except Exception:
+            continue
+        if not isinstance(rows, list):
+            continue
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            # lx 行的 id 是裸平台 id（如 kg:xxx），补 online: 前缀统一 guid 形态
+            raw_id = str(it.get("id") or "")
+            if raw_id and not raw_id.startswith(("online:", "lx:")):
+                it = dict(it, id=f"lx:{raw_id}" if str(it.get("source") or "") == "lx" else raw_id)
+            try:
+                guid = online_guid_from_item(it)
+            except Exception:
+                continue
+            src = source_from_online_guid(guid)
+            album_name = str(it.get("album") or "").strip()
+            if not guid or not is_online_guid(guid) or not album_name:
+                continue
+            groups.setdefault((src, album_name), []).append(it)
+
+    out: list[dict] = []
+    # 每组取曲目数最多的前 N 个专辑；代表曲目注册伪装专辑（详情走聚合适配）
+    for (src, album_name), items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        rep = items[0]
+        try:
+            rep_guid = online_guid_from_item(rep)
+        except Exception:
+            continue
+        register_fake_album(rep_guid, album_name, rep)
+        out.append(_album_list_obj(
+            f"{rep_guid}:album", album_name,
+            str(rep.get("artist") or ""), rep_guid, len(items),
+        ))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _online_album_search(request: Request, keyword: str, limit: int) -> list[dict]:
+    """在线专辑搜索：netease 真实接口优先，musicdl/lx 聚合补充（并行）。"""
+    netease_coro = _netease_album_search_rows(request, keyword, limit)
+    agg_coro = _aggregate_album_search_rows(request, keyword, max(limit // 2, 3))
+    results = await asyncio.gather(netease_coro, agg_coro, return_exceptions=True)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for part in results:
+        if isinstance(part, Exception):
+            logger.debug("online album search branch failed: %s", part)
+            continue
+        for obj in part or []:
+            name_key = str(obj.get("name") or "").strip().lower()
+            if name_key and name_key in seen:
+                continue
+            seen.add(name_key)
+            out.append(obj)
+    return out[:limit]
+
+
+@app.api_route("/music/api/v1/search/album", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/search/album/{subpath:path}", methods=["GET", "HEAD"])
+async def search_album(request: Request, subpath: str = ""):
+    upstream_client = get_upstream_client(request.app)
+    envelope = await fetch_upstream_envelope(request, upstream_client)
+    if not isinstance(envelope, dict) or envelope.get("code") != 0:
+        # 官方错误（含未登录 401 信封）原样透传，不吞官方语义
+        return envelope if not isinstance(envelope, dict) else JSONResponse(content=envelope)
+
+    keyword = str(request.query_params.get("keyword") or request.query_params.get("wd") or "").strip()
+    online: list[dict] = []
+    if keyword:
+        try:
+            online = await asyncio.wait_for(
+                _online_album_search(request, keyword, _ALBUM_SEARCH_LIMIT), timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("online album search timed out for %r", keyword)
+        except Exception as e:
+            logger.warning("online album search failed: %s", e)
+
+    if online:
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            data = {}
+            envelope["data"] = data
+        lst = data.get("list") if isinstance(data.get("list"), list) else None
+        if lst is None:
+            data["list"] = lst = []
+        official_names = {
+            str(x.get("name") or "").strip().lower()
+            for x in lst if isinstance(x, dict)
+        }
+        add = [o for o in online if str(o.get("name") or "").strip().lower() not in official_names]
+        data["list"] = lst + add
+        if isinstance(data.get("total"), int):
+            data["total"] = data["total"] + len(add)
+        elif "total" not in data:
+            data["total"] = len(data["list"])
+    return JSONResponse(content=disguise_client_json(envelope))
 
 
 @app.post("/music/api/v1/event/report")
@@ -5200,6 +5563,31 @@ async def play_history_delete(request: Request):
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
+# 官方端点取证：未拦截路径 -> 转发次数（仅内存，重启清零；用于首见告警与采样）
+_FORWARDED_PATH_STATS: dict[str, int] = {}
+
+
+def _trace_forwarded_endpoint(request: Request) -> None:
+    """catch_all 透传前的官方端点取证日志。
+
+    未拦截的 /music/api 请求：同一路径首见打 INFO（官方 App 更新引入新端点时
+    日志立刻可见），之后每 50 次采样一条；FNMUSIC_TRACE_FORWARD=detail 逐条记录。
+    """
+    path = request.url.path
+    if not path.startswith("/music/api/"):
+        return
+    count = _FORWARDED_PATH_STATS.get(path, 0) + 1
+    _FORWARDED_PATH_STATS[path] = count
+    if CONF.get("trace_forward") or count == 1 or count % 50 == 0:
+        logger.info(
+            "forward-unhandled %s %s (#%d) —— 官方端点未被代理拦截，仅透传",
+            request.method,
+            path,
+            count,
+        )
+
+
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, full_path: str):
+    _trace_forwarded_endpoint(request)
     return await forward_to_upstream(request, get_upstream_client(request.app))

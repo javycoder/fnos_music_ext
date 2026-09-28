@@ -496,8 +496,9 @@ def test_cover_enrich_disabled_falls_to_placeholder(monkeypatch):
     assert box_calls["n"] == 0  # 补全关闭不打 musicbox
 
 
-def test_cover_placeholder_never_404_and_deterministic():
-    CONF["musicdl_enabled"] = True
+def test_cover_placeholder_never_404_and_deterministic(monkeypatch):
+    # monkeypatch 而非裸赋值：裸写 CONF 会泄漏到后续用例（曾让顺序依赖被掩盖）
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "ok": True, "id": "migu:9", "source": "migu", "title": "t", "artist": "a", "cover_url": "",
@@ -624,6 +625,8 @@ def _cover_env(tmp_path, monkeypatch, user_guid="user-cover", musicdl_handler=No
 
 def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
     """歌单封面请求：第一首无封面 → 跳到第二首（musicdl 只收到第二首的 info）。"""
+    # musicdl 封面直链需要音源开启（自给自足，不依赖前置用例的 CONF 泄漏）
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/info"
         assert request.url.params.get("id") == "migu:2"
@@ -662,6 +665,11 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
 
     from proxy.app import _FAKE_GUID_REVERSE, _REGISTRY_WARMED
 
+    # _online_info 按 CONF 门禁调用 musicdl：本用例走 musicdl 封面直链，
+    # 必须自给自足开启（此前隐式依赖前置用例泄漏的 musicdl_enabled=True，
+    # 单跑/换文件顺序即挂）
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
+
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params.get("id") == "migu:2"
         return httpx.Response(200, json={"ok": True, "id": "migu:2", "title": "歌", "artist": "手",
@@ -675,10 +683,13 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
     pl_guid = _write_recommend_bundle(rec_dir, "user-cover", tracks)
     fake_cover = "track_" + hashlib.md5(f"fnmusic-ext::{pl_guid}".encode()).hexdigest()
 
+    # 模拟重启：内存反查表清空、warm 标记复位。必须改模块属性——
+    # from import 后直接赋值只重绑本地名，模块级 _REGISTRY_WARMED 原样保留
+    # （此前单跑碰巧为 False 才通过；任何前置用例触发过 warm 即挂）。
     backup = dict(_FAKE_GUID_REVERSE)
     warmed = _REGISTRY_WARMED
     _FAKE_GUID_REVERSE.clear()
-    _REGISTRY_WARMED = False
+    monkeypatch.setattr("proxy.app._REGISTRY_WARMED", False)
     try:
         with TestClient(app) as client:
             resp = client.get(f"/music/api/v1/static/cover?coverId={fake_cover}&size=120", follow_redirects=False)
@@ -687,4 +698,5 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
     finally:
         _FAKE_GUID_REVERSE.clear()
         _FAKE_GUID_REVERSE.update(backup)
-        _REGISTRY_WARMED = warmed
+        import proxy.app as _appmod
+    _appmod._REGISTRY_WARMED = warmed

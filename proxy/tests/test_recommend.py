@@ -97,6 +97,9 @@ def test_playlist_list_injects_fallback_when_llm_disabled(tmp_path, monkeypatch)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            # 可播校验探针（issue #23）：Range 头部探测需 200/206 音频响应
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         if request.url.path == "/search":
             return httpx.Response(
                 200,
@@ -160,6 +163,8 @@ def test_playlist_list_drops_yesterday_daily(tmp_path, monkeypatch):
         return httpx.Response(200, json={"code": 0, "data": None})
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         if request.url.path == "/search":
             return httpx.Response(
                 200,
@@ -202,6 +207,8 @@ def test_playlist_list_injects_daily_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         if request.url.path == "/search":
             return httpx.Response(
                 200,
@@ -438,6 +445,8 @@ async def test_daily_fills_twenty_online_and_skips_favorites(tmp_path, monkeypat
         )
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         if request.url.path != "/search":
             return httpx.Response(404)
         kw = request.url.params.get("keyword") or ""
@@ -548,6 +557,8 @@ async def test_get_or_build_daily_uses_llm_when_netease_disabled(monkeypatch):
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
         kw = request.url.params.get("keyword") or ""
         title = kw.split()[-1] if kw else "x"
         return httpx.Response(
@@ -1043,3 +1054,211 @@ def test_shared_session_never_returns_others_daily_nor_builds_shared_daily(tmp_p
     assert dailyrec.load_online_play_history("user-a") == []
     assert all(s.get("guid") != "online:migu:shared-song" for s in dailyrec.seeds_from_online_history("user-a"))
 
+
+
+# ====================================================================
+# issue #23 / #29：逐首可播校验、渐进上架、tier 渐进 checkpoint、预算可配置
+# ====================================================================
+
+
+class _SlowTransport(httpx.AsyncBaseTransport):
+    """延迟 N 秒后才响应的异步传输，用于模拟慢 LLM / 慢音源。"""
+
+    def __init__(self, delay_s: float, response: httpx.Response):
+        self.delay_s = delay_s
+        self.response = response
+        self.hits = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.hits += 1
+        await asyncio.sleep(self.delay_s)
+        return self.response
+
+
+def _playable_musicdl_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/stream":
+        return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
+    if request.url.path == "/search":
+        return httpx.Response(200, json={"ok": True, "items": [{
+            "id": "migu:9", "source": "migu", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "duration_s": 269, "ext": "mp3",
+        }]})
+    return httpx.Response(404)
+
+
+def _dead_stream_musicdl_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/stream":
+        return httpx.Response(404)
+    if request.url.path == "/search":
+        return httpx.Response(200, json={"ok": True, "items": [{
+            "id": "migu:9", "source": "migu", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "duration_s": 269, "ext": "mp3",
+        }]})
+    return httpx.Response(404)
+
+
+@pytest.mark.anyio
+async def test_resolve_recommendations_drops_unplayable_track(monkeypatch):
+    """issue #23：候选命中但可播校验失败（/stream 404）必须被丢弃。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", "/nonexistent.db")
+    from proxy.app import build_online_track
+
+    recs = [{"title": "晴天", "artist": "周杰伦", "dimension": "artist"}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_dead_stream_musicdl_handler), base_url="http://127.0.0.1:8768",
+    ) as mdl, httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770",
+    ) as mb:
+        out = await dailyrec.resolve_recommendations(
+            recs, mdl, mb, False, build_online_track,
+        )
+    assert out == []
+
+
+@pytest.mark.anyio
+async def test_resolve_recommendations_emits_progressively(monkeypatch):
+    """issue #29：on_track 每入列一首即回调（渐进 checkpoint 的数据来源）。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", "/nonexistent.db")
+    from proxy.app import build_online_track
+
+    recs = [
+        {"title": "晴天", "artist": "周杰伦", "dimension": "artist"},
+        {"title": "七里香", "artist": "周杰伦", "dimension": "genre"},
+    ]
+    emitted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stream":
+            return httpx.Response(200, headers={"content-type": "audio/mpeg"}, content=b"ID3")
+        kw = request.url.params.get("keyword") or "歌"
+        return httpx.Response(200, json={"ok": True, "items": [{
+            "id": f"migu:{abs(hash(kw)) % 9999}", "source": "migu",
+            "title": kw.split()[-1], "artist": "A", "duration_s": 200, "ext": "mp3",
+        }]})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8768",
+    ) as mdl, httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770",
+    ) as mb:
+        out = await dailyrec.resolve_recommendations(
+            recs, mdl, mb, False, build_online_track, on_track=emitted.append,
+        )
+    assert len(out) == 2
+    assert emitted == out  # 回调与最终列表一一对应
+
+
+@pytest.mark.anyio
+async def test_llm_timeout_records_failure_and_fallback_protected_budget(monkeypatch):
+    """issue #29：LLM 层超时不再静默——失败原因落盘 tierFailures，
+    fallback 层保护预算保证兜底仍有执行机会，歌单不再为空。"""
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", "/nonexistent.db")
+    monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
+    monkeypatch.setattr(dailyrec, "build_budget_s", lambda: 3.0)
+    monkeypatch.setattr(dailyrec, "fallback_protected_budget_s", lambda: 5.0)
+    from proxy.app import build_online_track
+
+    slow_llm = _SlowTransport(30.0, httpx.Response(200, json={"choices": [{"message": {"content": "[]"}}]}))
+    async with httpx.AsyncClient(transport=slow_llm, base_url="http://127.0.0.1:9") as llm_client, \
+            httpx.AsyncClient(
+                transport=httpx.MockTransport(_playable_musicdl_handler), base_url="http://127.0.0.1:8768",
+            ) as mdl, httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda r: httpx.Response(404)), base_url="http://127.0.0.1:8770",
+            ) as mb:
+        payload = await dailyrec.get_or_build_daily(
+            user_guid="u-timeout",
+            musicdl_client=mdl,
+            musicbox_client=mb,
+            llm_http=llm_client,
+            build_track=build_online_track,
+            netease_enabled=False,
+        )
+    assert any(f.startswith("llm:") for f in payload.get("tierFailures") or [])
+    assert "fallback" in payload["tiers"]
+    assert len(payload["tracks"]) >= 1
+    # healthz 摘要同样带上失败原因
+    info = dailyrec.last_recommend_summary().get("u-timeout:daily") or {}
+    assert info.get("tierFailures")
+
+
+def test_invalidate_today_cache_all_users(tmp_path):
+    """issue #22：音源集合变化清掉所有用户当日缓存，隔日缓存不受影响。"""
+    day = dailyrec.today_key()
+    for user in ("u1", "u2"):
+        folder = os.path.join(dailyrec.recommend_cache_dir(), dailyrec._safe_user_name(user))
+        os.makedirs(folder, exist_ok=True)
+        for name in (f"daily-{day}.json", f"hot-{day}.json", "daily-20200101.json"):
+            with open(os.path.join(folder, name), "w") as f:
+                f.write('{"tracks": [1]}')
+
+    removed = dailyrec.invalidate_today_cache_all_users()
+    assert removed == 4
+    for user in ("u1", "u2"):
+        folder = os.path.join(dailyrec.recommend_cache_dir(), dailyrec._safe_user_name(user))
+        assert sorted(os.listdir(folder)) == ["daily-20200101.json"]
+
+
+def test_playlist_list_serves_partial_checkpoint_progressively(tmp_path, monkeypatch):
+    """issue #23：构建任务尚未完成但已有 1 首 checkpoint 时，歌单列表立即以
+    当前进度上架（trackCount>=1），不再空等整链构建。"""
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "recommend_hot", False)
+    monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
+
+    from proxy.app import build_online_track
+
+    day = dailyrec.today_key()
+    full_bundle = {"hits": 0}
+
+    async def fake_build(**kwargs):
+        # 0.6s 后先落 1 首 checkpoint，再拖到 1.5s 才完整结束——peek 的 2s 窗口
+        # 应在 ~0.6-1.0s 之间看到 checkpoint 并立即返回，而不是等 full bundle
+        full_bundle["hits"] += 1
+        user_guid = kwargs.get("user_guid")
+        kind = kwargs.get("kind") or "daily"
+        track = build_online_track({
+            "id": "migu:1", "source": "migu", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "duration_s": 269, "ext": "mp3",
+        })
+        first_cp = {
+            "day": day, "kind": kind, "guid": dailyrec.daily_playlist_guid(day, user_guid),
+            "status": "partial",
+            "playlist": dailyrec.build_playlist_record(
+                dailyrec.daily_playlist_guid(day, user_guid), "每日推荐", track.get("guid"), 1,
+            ),
+            "tracks": [track], "tiers": ["llm"], "seedCount": 0, "favoriteCount": 0,
+            "builtAt": int(time.time()),
+        }
+        await asyncio.sleep(0.6)
+        dailyrec.save_daily_cache(user_guid, day, first_cp, kind)
+        await asyncio.sleep(1.5)
+        full = dict(first_cp)
+        full["tracks"] = [track] * 5
+        return full
+
+    monkeypatch.setattr(dailyrec, "get_or_build_daily", fake_build)
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_auth_user()), base_url="http://unix")
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_playable_musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
+        base_url="http://127.0.0.1:8770",
+    )
+    app.state.llm_client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"choices": [{"message": {"content": "[]"}}]})
+    ), base_url="http://127.0.0.1:9")
+
+    with TestClient(app) as client:
+        started = time.monotonic()
+        resp = client.get("/music/api/v1/playlist/list")
+        elapsed = time.monotonic() - started
+        body = resp.json()
+        first = body["data"]["list"][0]
+        assert first["isDaily"] is True
+        assert first["trackCount"] >= 1
+        # 未等完整构建（完整结束需 ~2.1s，peek 窗口 2s；命中 checkpoint 应明显更早）
+        assert elapsed < 1.8, f"应命中渐进 checkpoint 提前返回，实际等了 {elapsed:.2f}s"
