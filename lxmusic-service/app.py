@@ -247,7 +247,9 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             continue
         sq = str(it.get("sqhash") or "")
         hq = str(it.get("hqhash") or "")
-        duration_ms = int(it.get("duration") or 0)  # v3 接口 duration 为毫秒
+        # v3 搜索接口 duration 单位为秒（2026-09 实测：晴天=269，4:29）；
+        # 按毫秒除以 1000 会把时长变成 0:00（下游按秒渲染）
+        duration_s = int(it.get("duration") or 0)
         cover = str(it.get("origin_cover") or it.get("img") or "").replace("{size}", "480")
         item = {
             "id": f"lx:kg:{fhash}",
@@ -255,7 +257,7 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "title": title,
             "artist": singer,
             "album": str(it.get("album_name") or ""),
-            "duration_s": duration_ms / 1000.0,
+            "duration_s": duration_s,
             "ext": "flac" if sq else "mp3",
             "cover_url": cover,
             "file_size": int(sq and it.get("sq_size") or it.get("filesize") or 0) or 0,
