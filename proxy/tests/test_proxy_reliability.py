@@ -413,7 +413,7 @@ async def test_metadata_recovers_backend_after_restart_once(monkeypatch):
     session(req, [song("kuwo:1")])
     calls = []
     restored = False
-    async def fetch(req, guid):
+    async def fetch(req, guid, include_lyric=True):
         calls.append("info")
         return song("kuwo:1", album="restored") if restored else None
     async def search(*args):

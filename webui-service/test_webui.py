@@ -175,6 +175,22 @@ def test_put_int_clamps_and_bool_normalizes(env_file):
     assert "FNMUSIC_TEE_CACHE_MAX='100'" in env_file.read_text(encoding="utf-8")
 
 
+def test_lyric_auto_dl_default_false_and_roundtrip(env_file):
+    """自动下载歌词：默认关闭；开启后写回 .env，热重载键无需重启。"""
+    with TestClient(webui.app) as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "false"
+        assert view.json()["schema"]["FNMUSIC_LYRIC_AUTO_DL"]["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_LYRIC_AUTO_DL": True}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_LYRIC_AUTO_DL" in saved.json()["changed"]
+    assert "FNMUSIC_LYRIC_AUTO_DL='true'" in env_file.read_text(encoding="utf-8")
+    with TestClient(webui.app) as client:
+        again = client.get("/api/config")
+        assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
+
+
 # ------------------------------------------------------------------ 切源动作 ---
 
 def test_provider_switch_stops_old_starts_new(env_file, svctl):
@@ -652,3 +668,21 @@ def test_index_served():
         assert via_desktop.status_code == 200
         assert "/app/fnmusic-ext/static/app.js" in via_desktop.text
         assert client.get("/app/fnmusic-ext/static/icon.png").status_code == 200
+
+
+def test_netease_my_playlists_defaults_and_saves(env_file):
+    with TestClient(webui.app) as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        # 默认关闭；schema 元数据齐备（hot 热重载）
+        assert view.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "false"
+        meta = view.json()["schema"]["FNMUSIC_NETEASE_MY_PLAYLISTS"]
+        assert meta["kind"] == "bool" and meta["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_MY_PLAYLISTS": True}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_NETEASE_MY_PLAYLISTS" in saved.json()["changed"]
+        assert saved.json()["actions"] == []  # 热键无进程动作
+    assert "FNMUSIC_NETEASE_MY_PLAYLISTS='true'" in env_file.read_text(encoding="utf-8")
+    with TestClient(webui.app) as client:
+        again = client.get("/api/config")
+        assert again.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "true"

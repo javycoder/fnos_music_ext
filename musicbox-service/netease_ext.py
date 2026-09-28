@@ -352,3 +352,86 @@ def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20) -> l
             "quality": "lossless",
         })
     return out
+
+
+def _int_or_zero(val: Any) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ms_to_epoch_s(val: Any) -> int:
+    """网易接口的毫秒时间戳 -> 秒；异常回落当前时间。"""
+    n = _int_or_zero(val)
+    if n > 0:
+        return n // 1000
+    return int(time.time())
+
+
+def _map_playlist_summary(item: dict) -> dict:
+    pid = _int_or_zero(item.get("id") or item.get("playlist_id"))
+    return {
+        "playlist_id": pid,
+        "name": str(item.get("name") or ""),
+        "cover_url": str(item.get("coverImgUrl") or item.get("cover_img_url") or ""),
+        "track_count": _int_or_zero(item.get("trackCount") or item.get("track_count")),
+        "created_at": _ms_to_epoch_s(item.get("createTime")),
+        "updated_at": _ms_to_epoch_s(item.get("updateTime")),
+        "user_id": _int_or_zero(item.get("userId") or item.get("user_id")),
+        "special_type": _int_or_zero(item.get("specialType") or item.get("special_type")),
+    }
+
+
+def user_playlists(limit: int = 100) -> "dict[str, Any] | None":
+    """当前登录账号的歌单列表（含自建与收藏，自建判定交给调用方按 user_id 过滤）。
+
+    返回 {"uid": 账号id, "playlists": [摘要行]}；未登录/接口失败返回 None。
+    """
+    if not check_is_logged_in():
+        return None
+    try:
+        with _api_lock:
+            api = _get_api_locked()
+            info = api.get_account_info()
+            uid = 0
+            for src in (info.get("account"), info.get("profile")):
+                if isinstance(src, dict):
+                    uid = _int_or_zero(src.get("id") or src.get("userId"))
+                    if uid:
+                        break
+            if not uid:
+                return None
+            rows = api.user_playlist(uid, offset=0, limit=limit)
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    playlists = []
+    for it in rows:
+        if isinstance(it, dict):
+            mapped = _map_playlist_summary(it)
+            if mapped["playlist_id"] > 0:
+                playlists.append(mapped)
+    return {"uid": uid, "playlists": playlists}
+
+
+def playlist_track_ids(playlist_id: int) -> "list[int] | None":
+    """歌单曲目 ID 列表（保持网易歌单内顺序）；未登录返回 None，空歌单返回 []。"""
+    if not check_is_logged_in():
+        return None
+    try:
+        with _api_lock:
+            api = _get_api_locked()
+            raw = api.playlist_songlist(int(playlist_id))
+    except Exception:
+        return None
+    if not isinstance(raw, list):
+        return []
+    ids: list[int] = []
+    for it in raw:
+        sid = it if isinstance(it, int) else (it.get("id") if isinstance(it, dict) else None)
+        sid = _int_or_zero(sid)
+        if sid > 0:
+            ids.append(sid)
+    return ids

@@ -797,3 +797,84 @@ def test_song_url_prefers_inproc_falls_back_to_cli(monkeypatch):
     with TestClient(app) as client:
         r2 = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
         assert r2.json() == {"ok": True, "data": {"url": "http://inproc/1.flac", "code": 200}}
+
+
+def test_user_playlists_endpoint_maps_rows(monkeypatch):
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 200, "account": {"id": 365}, "profile": {"nickname": "u"}}
+
+        def user_playlist(self, uid, offset=0, limit=100):
+            assert uid == 365
+            return [
+                {"id": 111, "name": "我喜欢的音乐", "coverImgUrl": "http://img/111.jpg", "trackCount": 9,
+                 "createTime": 1700000000000, "updateTime": 1700000100000, "userId": 365, "specialType": 5},
+                {"id": 222, "name": "别人的歌单", "coverImgUrl": "", "trackCount": 3,
+                 "createTime": 1700000000000, "updateTime": 1700000000000, "userId": 999},
+            ]
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/user/playlists")
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["ok"] is True and data["logged_in"] is True
+    assert data["account_uid"] == 365
+    assert len(data["data"]) == 2
+    row = data["data"][0]
+    assert row["playlist_id"] == 111
+    assert row["name"] == "我喜欢的音乐"
+    assert row["cover_url"] == "http://img/111.jpg"
+    assert row["track_count"] == 9
+    assert row["user_id"] == 365
+    assert row["created_at"] == 1700000000  # 毫秒 -> 秒
+    assert data["data"][1]["user_id"] == 999  # 自建/收藏判定字段随行下发
+
+
+def test_user_playlists_endpoint_not_logged_in(monkeypatch):
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 301, "account": None, "profile": None}
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/user/playlists")
+        data = resp.json()
+    assert data["ok"] is False
+    assert data["error"] == "not_logged_in"
+    assert data["logged_in"] is False
+
+
+def test_user_playlist_tracks_endpoint(monkeypatch):
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 200, "account": {"id": 1}}
+
+        def playlist_songlist(self, playlist_id):
+            assert playlist_id == 111
+            return [{"id": 101, "v": 3}, {"id": 102}, 103]
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    monkeypatch.setattr(musicbox_app, "batch_song_details", lambda ids: [
+        {"song_id": i, "name": f"s{i}", "artist": "a", "album_name": "al", "album_pic_url": "", "duration_ms": 1000}
+        for i in ids
+    ])
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/user/playlists/111/tracks")
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["ok"] is True
+    # trackIds 的 dict / 裸 int 两种形态都提取，且保持歌单内顺序
+    assert [r["song_id"] for r in data["data"]] == [101, 102, 103]
+
+
+def test_user_playlist_tracks_endpoint_not_logged_in(monkeypatch):
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 301, "account": None, "profile": None}
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/user/playlists/111/tracks")
+        data = resp.json()
+    assert data["ok"] is False and data["error"] == "not_logged_in"

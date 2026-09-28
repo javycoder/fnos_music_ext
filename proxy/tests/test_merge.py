@@ -543,8 +543,10 @@ def test_search_track_deduplication():
         assert items[1]["title"] == "晴天 (Live)"
 
 
-def test_stream_online_guid_range_and_tee_cache():
+def test_stream_online_guid_range_and_tee_cache(monkeypatch):
     """用例 d: stream online guid Range 转发与落盘 (mock musicdl 返回带 Content-Length 的 200 流，断言 cache 文件生成且内容一致)。"""
+    # 自动下载歌词开启场景：落库后同名 .lrc 一并写入（默认关，见 test_tee_cache.py）
+    monkeypatch.setitem(CONF, "lyric_auto_dl", True)
     audio_content = b"RIFF....WAVEfmt....FAKE_MP3_STREAM_CONTENT" * 50
     content_len = str(len(audio_content))
 
@@ -2246,3 +2248,87 @@ def test_tee_finalize_metadata_fallback_avoids_unknown(tmp_path, monkeypatch):
         f.write(b"RIFF....FAKE_AUDIO2" * 64)
     _tee_finalize(part2, guid2, "mp3", {}, tee_enabled=True)
     assert "周杰伦 - 七里香.mp3" in os.listdir(tee_dir)
+
+
+def test_search_track_pagination_no_cross_page_duplication():
+    """官方搜索忽略 size 全量返回结果集（2026-09-25 更新实测）时，本地段按请求
+    窗口切片：page1 恰好 size 条、page2 为余量本地+在线切片，跨页零重复。"""
+    local_tracks = [
+        {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": "周杰伦",
+         "album": "专辑", "duration": 200000}
+        for i in range(11)
+    ]
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        # 无论 page/size 如何都返回同样 11 条（官方钳制 + 忽略 size 的真实行为）
+        return httpx.Response(200, json={"code": 0, "data": {"list": local_tracks, "total": 11}})
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"ok": False})
+
+    online_items = [
+        {"id": f"kuwo:{900 + i}", "source": "kuwo", "title": f"在线歌{i}", "artist": "周杰伦",
+         "album": "叶惠美", "duration_s": 250, "ext": "mp3"}
+        for i in range(6)
+    ]
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "items": online_items})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        p1 = client.get("/music/api/v1/search/track?keyword=周杰伦&page=1&size=10").json()
+        p2 = client.get("/music/api/v1/search/track?keyword=周杰伦&page=2&size=10").json()
+        p3 = client.get("/music/api/v1/search/track?keyword=周杰伦&page=3&size=10").json()
+    l1 = [str(i["guid"]) for i in p1["data"]["list"]]
+    l2 = [str(i["guid"]) for i in p2["data"]["list"]]
+    l3 = [str(i["guid"]) for i in p3["data"]["list"]]
+    # page1 = 本地前 10 条；page2 = 第 11 条本地 + 全部 6 条在线（窗口要 9 条只
+    # 有 6 条可给）；page3 本地段越界清空、在线窗口 [9:19) 为空 → 空页
+    assert len(l1) == 10
+    assert len(l2) == 7
+    assert l3 == []
+    assert not (set(l1) & set(l2))
+    assert len(set(l1) | set(l2)) == 17  # 11 本地 + 6 在线，零重复
+    assert p1["data"]["total"] == p2["data"]["total"] == p3["data"]["total"] == 17
+
+
+def test_search_track_pagination_respected_size_untouched():
+    """官方尊重 size 时（返回条数 ≤ size）不切片，既有分页语义不变。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        # 尊重分页：page=2 返回第 11-20 条（这里模拟返回第 2 页内容）
+        data = {"code": 0, "data": {"list": [
+            {"guid": f"local:{i}", "title": f"歌{i}", "artist": "a", "album": "x", "duration": 1}
+            for i in range(10, 20)
+        ], "total": 30}}
+        return httpx.Response(200, json=data)
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"ok": False})
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "items": []})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        p2 = client.get("/music/api/v1/search/track?keyword=x&page=2&size=10").json()
+    # 返回条数(10)不超 size(10)：原样透传第 2 页，不被切片清空
+    assert [str(i["guid"]) for i in p2["data"]["list"]] == [f"local:{i}" for i in range(10, 20)]
