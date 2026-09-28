@@ -242,6 +242,29 @@ remove_owned_container() {
     run_docker rm -f "${name}"
 }
 
+env_newer_than_container() {
+    # .env 比容器启动新（安装/切源/升级恢复改了开关）且镜像未变时，compose 不会
+    # 重建容器：需要显式重启让 entrypoint 重读 .env 重选进程集。
+    local started epoch_start epoch_env
+    started="$(run_docker inspect -f '{{.State.StartedAt}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
+    epoch_start="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
+    epoch_env="$(stat -c %Y "${BASE_DIR}/.env" 2>/dev/null)" || return 1
+    [ "${epoch_env}" -gt "${epoch_start}" ]
+}
+
+diagnose_sources_container() {
+    # healthz 超时取证：supervisor 进程状态 + 容器日志尾部随安装日志落盘，
+    # 让「进程集与 .env 不一致 / 程序启动失败」一眼可辨（issue 反馈可直接贴）。
+    local name="$1" line
+    log_warn "采集 ${name} 诊断信息（supervisorctl status / 容器日志尾部）..."
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "  [supervisor] ${line}"
+    done < <(run_docker exec "${name}" supervisorctl -c /etc/supervisor/supervisord.conf status 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "  [container-log] ${line}"
+    done < <(run_docker logs --tail 40 "${name}" 2>&1 || true)
+}
+
 owned_source_unit() {
     local unit="$1" file="/etc/systemd/system/${1}.service"
     [ -f "${file}" ] || return 1

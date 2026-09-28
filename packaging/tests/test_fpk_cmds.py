@@ -636,11 +636,15 @@ def test_upgrade_callback_without_backup_uses_current_env(sb):
 def test_upgrade_callback_install_failure_keeps_backup(sb):
     repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
     sb.add_data(repo)
+    sb.add_docker()
     _make_backup(sb, repo, "FNMUSIC_MUSICDL_ENABLED=true\n")
     result = sb.run("upgrade_callback", STUB_INSTALL_RC="9")
     assert result.returncode == 1
     assert "升级失败" in result.stderr
     assert (sb.pkgvar / "upgrade-backup" / "data.tar.gz").is_file()
+    # 失败后清理音源容器：回滚会原地重建 repo 目录（inode 更换），运行中容器
+    # 绑旧 inode 变空挂载僵尸（占端口/容器名、healthcheck 永久失败），必须移除
+    assert "rm -f fnmusic-sources" in sb.docker_log.read_text(encoding="utf-8")
 
 
 def test_upgrade_callback_defaults_to_musicdl_when_env_silent(sb):
@@ -699,9 +703,10 @@ def test_uninstall_init_archives_to_volume_root(sb):
     archive = lines[0]
     assert archive.startswith("/vol5/fnmusic-ext-backup-")
     assert archive.endswith(".tar.gz")
-    # tar 参数：归档路径 + 以 repo 为基点的数据项
+    # tar 参数：--ignore-failed-read（数据文件中途消失不中止卸载）+ 归档路径 +
+    # 以 repo 为基点的数据项
     tar_args = sb.tar_log.read_text(encoding="utf-8")
-    assert f"tar -czf {archive} -C {repo}" in tar_args
+    assert f"tar --ignore-failed-read -czf {archive} -C {repo}" in tar_args
     for item in (".env", "sources-data", "play_history"):
         assert item in tar_args
 

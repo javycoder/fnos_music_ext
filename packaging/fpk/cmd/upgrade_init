@@ -45,8 +45,10 @@ mkdir -p "${BACKUP_DIR}"
 
 ITEMS="$(fnmusic_data_items)"
 if [ -n "${ITEMS}" ]; then
+    # --ignore-failed-read：播放历史/缓存文件在打包读取中途消失（服务仍在写）时
+    # 不再让整个升级中止，缺失项仅记录 warning。
     # shellcheck disable=SC2086
-    if ! tar -czf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
+    if ! tar --ignore-failed-read -czf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
         rm -rf "${BACKUP_DIR}"
         fnmusic_fail "升级前备份数据失败，已中止（未改动任何数据）"
     fi

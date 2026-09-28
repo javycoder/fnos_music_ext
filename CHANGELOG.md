@@ -18,6 +18,10 @@
 
 ### 修复
 
+- **FPK 升级/切源后 `等待 musicdl healthz 超时`（根因修复）**：容器 entrypoint 只在启动时读一次 `.env` 选择音源进程，而 `docker compose up -d --build` 对镜像与配置均未变的运行中容器不会重启——升级回调按备份 `.env` 换源重装时容器仍跑旧进程集，新选音源端口永远无人监听，healthz 必然等满超时失败。现 `install.sh` 在等待 healthz 前对齐进程集：`.env` 比容器新且所选音源未运行时显式 `docker restart`（同参数幂等重跑已就绪则跳过，保持快速路径）；重启亦会重新解析 bind mount，顺带治愈升级失败回滚重建 repo 目录后容器挂旧 inode（`/repo` 变空、healthcheck 永久失败）的现场。
+- **升级失败不再遗留僵尸容器**：`upgrade_callback` 失败路径补齐与 `install_callback` 对称的 `fnmusic_cleanup_sources_container`——应用中心回滚原地重建 repo（换 inode）后，运行中容器立即变空挂载孤儿（占端口/容器名），先移除让下次 start/重试干净重建。
+- **healthz 超时取证**：`install.sh` 四个等待分支与 `extend.sh` 的 `wait_source` 超时后自动采集容器内 `supervisorctl status` 与容器日志尾部随安装日志落盘，「进程集与 .env 不一致 / 程序启动失败」一眼可辨；`env_newer_than_container` 移入共享库 `proxy/install_common.sh`。
+- **卸载/备份幂等加固**：卸载归档与升级备份的 tar 增加 `--ignore-failed-read`（播放历史等文件读取中途消失不再中止流程）；卸载归档卷根解析失败时先从 repo 路径推导 `/vol{n}/`，仍失败才落到 `/vol1/`。
 - **`_lookup_online_snapshot` 补扫歌单附加条目**：只加过歌单、从未收藏/播放的在线歌曲此前反查不到元数据（官方绑定与 tee 兜底会跳过或落 unknown），现 `playlist_tracks/` 一并纳入快照反查。
 
 ### 变更：每日推荐按账户隔离

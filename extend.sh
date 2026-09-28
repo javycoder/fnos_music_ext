@@ -509,15 +509,8 @@ ensure_image_current() {
     fi
 }
 
-# .env 比容器启动新（安装/切源改了开关）且镜像未变时，compose 不会重建容器：
-# 需显式重启让 entrypoint 重读 .env 重选进程集。
-env_newer_than_container() {
-    local started epoch_start epoch_env
-    started="$(run_docker inspect -f '{{.State.StartedAt}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
-    epoch_start="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
-    epoch_env="$(stat -c %Y "${BASE_DIR}/.env" 2>/dev/null)" || return 1
-    [ "${epoch_env}" -gt "${epoch_start}" ]
-}
+# .env 比容器新时需重启让 entrypoint 重读开关：env_newer_than_container 已移入
+# proxy/install_common.sh（install.sh 的等待点同样依赖，见 install_sources_container）。
 
 if [ "${need_start}" -eq 0 ]; then
     # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
@@ -559,6 +552,7 @@ wait_source() {
         return 0
     fi
     log_err "等待 ${name} healthz 超时 (${url}/healthz)"
+    diagnose_sources_container "${CONTAINER_NAME}"
     return 1
 }
 
