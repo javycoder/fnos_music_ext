@@ -98,6 +98,11 @@ def test_build_music_info_platform_keys():
     assert kw["rid"] == "228908"
     wy = sr.build_music_info({"_identifier": "186016", "song_id": "186016"}, "wy")
     assert wy["songId"] == "186016"
+    mg = sr.build_music_info(
+        {"_identifier": "600929", "copyright_id": "600929", "album_id": "11094"}, "mg",
+    )
+    assert mg["copyrightId"] == "600929"  # 主流洛雪源 mg 解构 copyrightId
+    assert mg["albumId"] == "11094"
     tx = sr.build_music_info(
         {"_identifier": "MID", "songmid": "MID", "str_media_mid": "MEDIA", "album_id": "8220"},
         "tx",

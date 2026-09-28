@@ -702,6 +702,42 @@ console.log('CLEARED_OK');
   });
 }
 
+async function test_musicurl_musicinfo_contract_passthrough() {
+  // issue #22 对齐审计护栏：musicInfo 的全部平台主键/别名字段必须原样穿透沙箱
+  // （kg hash / kw rid / wy songId / mg copyrightId / tx songmid+strMediaMid /
+  //  albumId / interval 秒字符串 / meta.picUrl / info.type=音质档位）
+  const script = `
+lx.on(lx.EVENT_NAMES.request, ({ action, info }) => {
+  const m = info.musicInfo;
+  console.log('FIELDS=' + [
+    m.hash, m.songmid, m.rid, m.songId, m.copyrightId, m.strMediaMid,
+    m.albumId, m.interval, m.meta && m.meta.picUrl, info.type,
+  ].join('|'));
+  return 'http://media.test/a.flac';
+});
+lx.send(lx.EVENT_NAMES.inited, { openAPI: [], platforms: {} });
+`;
+  await bridgeCase(script, {
+    feed: [JSON.stringify({
+      id: 'r9', type: 'request', source: 'kg', action: 'musicUrl',
+      info: {
+        type: 'flac',
+        musicInfo: {
+          hash: 'KGHASH', songmid: 'KGHASH', rid: '228908', songId: '186016',
+          copyrightId: '600929', strMediaMid: 'MEDIA', albumId: '966846',
+          interval: '269', meta: { picUrl: 'https://img/1.jpg' },
+        },
+      },
+    })],
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('FIELDS=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('FIELDS='));
+      assert.ok(message.includes('KGHASH|KGHASH|228908|186016|600929|MEDIA|966846|269|https://img/1.jpg|flac'),
+        `musicInfo 契约字段必须原样穿透沙箱; 实际: ${message}`);
+    },
+  });
+}
+
 // ------------------------------------------------------------------ 运行 ---
 
 async function main() {
@@ -721,6 +757,7 @@ async function main() {
     ['form urlencoded', test_form_encoded],
     ['请求超时中断', test_request_timeout_aborts],
     ['musicUrl 协议往返', test_musicurl_protocol_roundtrip],
+    ['musicInfo 契约字段穿透（issue #22 审计）', test_musicurl_musicinfo_contract_passthrough],
     ['ping/pong', test_ping_pong],
     ['utils 冒烟', test_utils_smoke],
     ['rsaEncrypt NO_PADDING 对齐官方', test_rsa_encrypt_no_padding],
