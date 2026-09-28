@@ -28,6 +28,14 @@ def setup_fav_autobind_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
     appmod._full_fetch_tasks.clear()
     appmod._full_fetch_failed.clear()
+    appmod._bind_pending.clear()
+    appmod._bind_tasks.clear()
+    appmod._bind_retry_last.clear()
+    appmod._tee_active.clear()
+    appmod._tee_handoff_active.clear()
+    appmod._bind_registry.clear()
+    # 阻止读取真实磁盘上的绑定登记文件
+    monkeypatch.setattr(appmod, "_bind_registry_loaded", True)
 
     plt_dir = str(tmp_path / "playlist_tracks")
     fav_dir = str(tmp_path / "online_favorites")
@@ -82,10 +90,21 @@ def setup_fav_autobind_env(tmp_path, monkeypatch):
         base_url="http://127.0.0.1:8772",
     )
 
+    # 本文件聚焦下载注册门禁：官方绑定任务以 no-op 隔离（真实闭环见 test_official_bind.py）
+    async def _noop_bind_task(guid, user_guid, meta=None):
+        return None
+
+    monkeypatch.setattr(appmod, "_bind_official_task", _noop_bind_task)
+
     yield
 
     appmod._full_fetch_tasks.clear()
     appmod._full_fetch_failed.clear()
+    appmod._bind_pending.clear()
+    appmod._bind_tasks.clear()
+    appmod._bind_retry_last.clear()
+    appmod._tee_active.clear()
+    appmod._tee_handoff_active.clear()
 
 
 def test_scenario1_fav_autobind_disabled_no_task(monkeypatch):
@@ -207,6 +226,9 @@ def test_scenario5_conf_default_and_env_watch_keys():
     assert "FNMUSIC_FAV_AUTO_BIND" in _ENV_WATCH_KEYS
     assert _ENV_WATCH_KEYS["FNMUSIC_FAV_AUTO_BIND"] == ("fav_auto_bind", "bool")
     assert CONF.get("fav_auto_bind") is False or CONF["fav_auto_bind"] is False
+    # 2.5.2a：官方绑定等待与切歌续传并行数纳入热重载
+    assert _ENV_WATCH_KEYS["FNMUSIC_OFFICIAL_BIND_TIMEOUT_S"] == ("official_bind_timeout_s", "bind_timeout")
+    assert _ENV_WATCH_KEYS["FNMUSIC_TEE_HANDOFF_MAX"] == ("tee_handoff_max", "tee_handoff_max")
 
 
 def test_fav_autobind_cooldown_and_dedup(monkeypatch):

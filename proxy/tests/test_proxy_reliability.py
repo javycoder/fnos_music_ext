@@ -26,6 +26,9 @@ def isolated(tmp_path, monkeypatch):
         monkeypatch.setitem(p.CONF, key, str(tmp_path / key))
     monkeypatch.setitem(p.CONF, "music_db", str(tmp_path / "missing.db"))
     monkeypatch.setitem(p.CONF, "search_debounce_s", 0.0)
+    # 本文件验证"续传关闭（旧契约）"下的行为：无分离下载器、中断不留 part。
+    # 切歌续传（handoff）的新行为由 test_official_bind.py 覆盖。
+    monkeypatch.setitem(p.CONF, "tee_handoff_max", 0)
     for key in ("musicdl_enabled", "netease_enabled", "lx_enabled"):
         monkeypatch.setitem(p.CONF, key, True)
     for attr in ("upstream_client", "musicdl_client", "musicbox_client", "lx_client"):
