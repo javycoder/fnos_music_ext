@@ -53,11 +53,24 @@ image_exists_local() {
     timeout 10 ${DOCKER_CMD} image inspect "${ref}" >/dev/null 2>&1
 }
 
-# 用真实 docker pull 验证（与 BuildKit 构建走同一条 daemon 链路，顺带预取镜像层）
+# 用真实 docker pull 验证（与 BuildKit 构建走同一条 daemon 链路，顺带预取镜像层）。
+# 心跳（issue #24）：--quiet 拉取大镜像长时间无输出，在 fpk 安装器里表现为
+# "卡在 55%"——后台拉取 + 每 30s 打一行已耗时，让用户知道仍在推进。
 pull_ok() {
-    local ref="$1"
+    local ref="$1" rc=0 pull_pid waited
     # shellcheck disable=SC2086
-    timeout "${PULL_TIMEOUT}" ${DOCKER_CMD} pull --quiet "${ref}"
+    timeout "${PULL_TIMEOUT}" ${DOCKER_CMD} pull --quiet "${ref}" &
+    pull_pid=$!
+    waited=0
+    while kill -0 "${pull_pid}" 2>/dev/null; do
+        sleep 5
+        waited=$((waited + 5))
+        if (( waited % 30 == 0 )) && kill -0 "${pull_pid}" 2>/dev/null; then
+            log_info "仍在拉取 ${ref}（已等 ${waited}s / 上限 ${PULL_TIMEOUT}s）..."
+        fi
+    done
+    wait "${pull_pid}" || rc=$?
+    return "${rc}"
 }
 
 # 安全增量写入 FNMUSIC_BASE_IMAGE（沿用 install.sh 的 env_merge 备份惯例）
@@ -118,6 +131,43 @@ else
     add_candidate "${BASE_TAG}"
 fi
 
+# ---- 测速择优（issue #24：安装卡 55%）---------------------------------------
+# 固定顺序会把当前最慢的镜像排前面，弱网下逐个拉满 240s 超时表现为"安装卡住"。
+# 拉取前对未命中本地的镜像源做 /v2/ 探活测速（单源 ≤4s，任意状态码即可，
+# 只比响应速度），按耗时升序重排候选；本地已存在的引用（前缀 0）保持最优先，
+# 官方短引用不测速沉底兜底。
+speed_rank_candidates() {
+    local ranked=() plain=()
+    local ref host t
+    for ref in "${CANDIDATES[@]}"; do
+        if image_exists_local "${ref}"; then
+            ranked+=("0 ${ref}")
+            continue
+        fi
+        # 无斜杠 = 无 registry 前缀（官方短引用，如 python:3.13-slim）：不测速沉底。
+        # 不能用 host 是否含冒号判断——官方短引用自身就带 tag 冒号。
+        case "${ref}" in
+            */*) ;;
+            *) plain+=("${ref}"); continue ;;
+        esac
+        host="${ref%%/*}"
+        t="$(curl -s -o /dev/null -m 4 -w '%{time_total}' "https://${host}/v2/" 2>/dev/null || echo 9999)"
+        case "${t}" in ''|*[!0-9.]*) t="9999" ;; esac
+        ranked+=("${t} ${ref}")
+    done
+    # 数值排序（-s 稳定）：本地命中(0) > 测速快的镜像源 > 测速失败(9999)
+    mapfile -t CANDIDATES < <(
+        printf '%s\n' "${ranked[@]}" | sort -k1,1g -s | while read -r _t _ref; do
+            [ -n "${_ref}" ] && printf '%s\n' "${_ref}"
+        done
+        printf '%s\n' "${plain[@]}"
+    )
+}
+if [ -z "${MANUAL}" ] && command -v curl >/dev/null 2>&1 && [ "${#CANDIDATES[@]}" -gt 1 ]; then
+    speed_rank_candidates
+    log_info "镜像候选已按测速重排: ${CANDIDATES[*]}"
+fi
+
 CHOSEN=""
 total="${#CANDIDATES[@]}"
 idx=0
@@ -140,9 +190,11 @@ done
 
 if [ -z "${CHOSEN}" ]; then
     log_err "所有基础镜像候选均拉取失败: ${CANDIDATES[*]}"
-    log_err "可尝试：1) 设置 BASE_IMAGE 环境变量手动指定可用镜像引用（如 docker.m.daocloud.io/library/python:3.13-slim）；"
-    log_err "        2) 通过 FNMUSIC_DOCKER_MIRRORS 自定义国内镜像候选列表；"
-    log_err "        3) 检查 fnOS Docker 镜像加速器（如 docker.fnnas.com）是否可用，或改用 ./install.sh --mode host。"
+    log_err "国内网络直连 docker.io 不稳定是安装卡住的最常见原因（issue #24），可尝试："
+    log_err "  1) 为 Docker 配置可用代理后重试（daemon.json 的 proxies 段，改完重启 Docker）；"
+    log_err "  2) 设置 BASE_IMAGE 环境变量手动指定可用镜像引用（如 docker.m.daocloud.io/library/python:3.13-slim）；"
+    log_err "  3) 通过 FNMUSIC_DOCKER_MIRRORS 自定义国内镜像候选列表；"
+    log_err "  4) 检查 fnOS Docker 镜像加速器（如 docker.fnnas.com）是否可用，或改用 ./install.sh --mode host。"
     exit 1
 fi
 

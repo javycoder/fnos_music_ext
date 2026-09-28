@@ -82,7 +82,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 1. **音源三选一**（v2.0.0 起互斥单选）：
    - `1` 网易云 musicbox：安装后自动进入扫码登录；
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
-   - `3` 洛雪 lxmusic：输入自定义源脚本 URL，安装时进行「下载→初始化→搜索→解析→探活」全链路校验，失败可循环重输；
+   - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
 2. **是否安装管理 WebUI**（端口 8774，默认否；无鉴权，仅限可信内网）；
 3. **大模型每日推荐（可选）**：OpenAI 兼容 API，仅在未启用网易音源时作为推荐兜底；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
@@ -96,9 +96,12 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 # musicdl（酷我+咪咕；平台粒度用短名或编号）
 ./install.sh --non-interactive --sources musicdl-kuwo,musicdl-migu --extend
 
-# 洛雪自定义源（--lx-source-url 非交互必填）
+# 洛雪自定义源（--lx-source-url 可选：http(s) URL / 本机 .js 路径 / 留空无源安装）
 ./install.sh --non-interactive --sources lxmusic \
   --lx-source-url 'https://example.com/your-source.js' --extend
+./install.sh --non-interactive --sources lxmusic \
+  --lx-source-url "$HOME/scripts/my-source.js" --extend   # 本机路径自动复制进数据卷
+./install.sh --non-interactive --sources lxmusic --webui --extend  # 无源安装，装后在管理页配置
 
 # 附带大模型推荐兜底（密钥仅写入本地 .env，权限 600）
 ./install.sh --non-interactive --sources musicdl --enable-recommend \
@@ -106,7 +109,8 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --llm-api-key '<KEY>' --llm-model 'gpt-4o-mini' --extend
 ```
 
-常用参数：`--sources`（音源三选一）、`--lx-source-url`、`--lx-skip-verify`
+常用参数：`--sources`（音源三选一）、`--lx-source-url`（可选：http(s) URL 或
+宿主机 `.js` 路径，路径会自动复制进数据卷）、`--lx-skip-verify`
 （跳过洛雪源可用性校验直接激活，源是否可用装好后在管理页 WebUI 查看）、
 `--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--adopt`（迁移部署登记）、
 `--qr`（仅扫码登录）。`--mode` 参数已随 host 模式移除。
@@ -145,8 +149,10 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   ```bash
   ./install.sh --non-interactive --sources musicbox --webui --adopt --extend
   ```
-  接管成功后登记自动指向当前目录。`extend.sh` / `restore.sh` 同样支持 `--adopt`；
-- 原登记目录已被删除时不拦截，任意目录可直接重新安装；
+  接管成功后登记自动指向当前目录。`--adopt` 同时作用于部署登记与代理 unit 的
+  跨目录检查；`extend.sh` / `restore.sh` 同样支持 `--adopt`；
+- 原登记目录或代理 unit 指向的目录已被删除时不拦截，任意目录可直接重新安装
+  （无法保护的废弃部署会被自动接管）；
 - 安装锁若被**本副本**挂起的旧进程占用（如向导停在扫码登录），新命令会自动
   终止旧进程并接管；锁若属于另一份副本或无关进程则绝不终止，仅报告后退出。
 
@@ -170,10 +176,20 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 播放解析依赖你提供的洛雪自定义源脚本（社区格式，`@name/@version` 头部注释的 JS）：
 
-- **安装时配置**：向导选 `3` 后输入 URL，或非交互 `--lx-source-url '<URL>'`；
-  安装器在容器内运行 `verify_source.py` 做全链路校验（下载→初始化→内置搜索→
-  128k 解析→Range 探活），失败按分类提示循环重输；
-- **运行期更换**：WebUI「音乐源 → 洛雪」输入 URL 点「测试」，通过后保存即热切换；
+- **管理页配置（推荐）**：WebUI「音乐源 → 洛雪自定义源」提供三种方式——
+  1. **粘贴 URL**：`http(s)://.../*.js`（原有方式）；
+  2. **上传 .js 文件**：从电脑选择脚本上传，落盘到数据卷
+     `sources-data/lxmusic/uploads/`，以 `file:///data/lxmusic/uploads/<名字>.js`
+     形态参与后续流程（随数据卷持久化，重启/升级不丢）；
+  3. **从 NAS 选择**：飞牛桌面内打开管理页时可用（走 fnOS 开放 API
+     `pickUserFile` 文件选择器；直连 8774 的浏览器环境自动隐藏该按钮），
+     选中 NAS 上的 `.js` 后由宿主侧网关代读内容，等效于上传。
+  任一方式选定后点「测试」（下载→初始化→内置搜索→128k 解析→Range 探活），
+  通过后保存即热切换；
+- **安装时配置（可选）**：非交互 `--lx-source-url` 接受 `http(s)` URL 或宿主机
+  `.js` 文件路径（自动复制进数据卷并转 `file://`）；安装器在容器内运行
+  `verify_source.py` 做全链路校验，失败按分类提示。不提供则无源安装，
+  装好后在管理页配置；fpk 安装向导不再出现任何洛雪源输入项；
 - **生效范围**：源脚本只在容器内 Node 沙箱中运行、仅可发起 HTTP 请求；
   搜索/歌词/热门榜单始终走内置平台接口，不依赖源脚本；
 - 未配置源时 lxmusic 的播放解析不可用（搜索/榜单不受影响），`/healthz` 的
@@ -242,8 +258,32 @@ v1.x 允许多音源并存，v2.0.0 起三音源互斥单选。升级安装时�
 ### 洛雪源测试失败
 
 WebUI 或安装向导的错误分类含义：**下载失败**（URL 不可达/超 9MB）、**格式无效**
-（缺少洛雪源头部注释）、**初始化失败**（脚本运行报错，多为与主流源规范不兼容）、
-**无可用平台**、**解析失败**（源声明平台均无法出直链）。依次检查 URL、换源后重试。
+（缺少洛雪源头部注释）、**格式不支持**（musicApi.json 类 JSON API 源——本项目只支持
+洛雪桌面版自定义源 JS 脚本）、**初始化失败**（脚本运行报错，多为与主流源规范不兼容）、
+**无可用平台**、**解析失败**（源声明平台均无法出直链）、**搜索取不到样本**（源脚本
+初始化正常，但内置搜索接口限流/波动导致无法验证——不代表源不可用，稍后重试即可）。
+报告里的"平台明细"按平台给出 ok/failed/untested 细分结论。依次检查 URL、换源后重试。
+
+### fpk 安装一直卡在 55% 左右（issue #24）
+
+55% 对应 fpk 安装器执行 `install.sh` 的阶段，本身可能要几分钟，卡住几乎都是
+**网络拉取慢**（国内直连境外源受限）。排查步骤：
+
+1. **看真实进度**：安装日志在 `/var/log/apps/fnmusic-ext-install.log`（卸载也不删）。
+   v2.5.0 起拉取镜像/等待服务每 30 秒打一行心跳，能看到"仍在拉取…（已等 Ns）"即代表
+   在正常推进，耐心等完即可。
+2. **自测网络**（任一失败即网络受限）：
+   ```bash
+   curl -s -o /dev/null -m 8 -w '%{http_code}\n' https://mirrors.tencent.com/pypi/simple/
+   curl -s -o /dev/null -m 8 -w '%{http_code}\n' https://docker.m.daocloud.io/v2/
+   ```
+3. **为 Docker 配代理后重试**（社区反馈最有效的解法）：编辑 Docker 的
+   `daemon.json`（fnOS 上通常在 `/usr/local/apps/docker/config/daemon.json` 或
+   fnOS Docker 设置界面）加 `proxies` 段，重启 Docker 后重新安装。
+4. **手动换镜像源**：`FNMUSIC_DOCKER_MIRRORS="docker.m.daocloud.io docker.1ms.run"`
+   或直接 `BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim ./install.sh`。
+5. 反馈问题时运行 `bash scripts/collect_support_info.sh`，把输出整段贴到 issue
+   （只读收集，不含任何密钥）。
 
 ### 构建时报 `failed to resolve source metadata for python:3.13-slim ... 401 Unauthorized` 或拉取超时
 

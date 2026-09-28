@@ -196,7 +196,11 @@ def test_verify_url_search_empty(app_alias, isolated, monkeypatch):
 
     report = asyncio.run(vsr.verify_url("https://src.test/1.js"))
     assert report["ok"] is False
-    assert report["category"] == "resolve"
+    # issue #22：纯搜索空（源脚本从未被调用）不再误判源不可用，
+    # 与"解析失败"分开归类，提示稍后重试；并携带按平台细分结论
+    assert report["category"] == "search_unavailable"
+    assert report["platform_results"]
+    assert set(report["platform_results"].values()) <= {"no_items", "search_error", "untested"}
 
 
 def test_verify_url_samples_multiple_artists(app_alias, isolated, monkeypatch):
@@ -251,3 +255,55 @@ def test_format_report_renders():
     fail = {"ok": False, "meta": None, "platforms": [], "category": "download", "message": "boom"}
     fail_text = vsr.format_report(fail)
     assert "不可用 ✗" in fail_text and "download" in fail_text
+
+
+def test_verify_url_json_api_source_friendly_error(app_alias, isolated, monkeypatch):
+    """issue #22：musicApi.json 类 JSON API 源给专属友好错误，而非"脚本头缺失"误导。"""
+    async def fake_download(url):
+        return '{"name":"测试API源","api":"https://api.example.com","type":"musicApi"}'
+
+    monkeypatch.setattr(vsr, "download_script", fake_download)
+    monkeypatch.setattr(vsr, "UserSource", UserSourceShim)
+    lxapp.app.state.http = mock_client(lambda r: httpx.Response(404))
+
+    report = asyncio.run(vsr.verify_url("https://src.test/musicApi.json"))
+    assert report["ok"] is False
+    assert report["category"] == "format"
+    assert "JSON" in report["message"] or "musicApi" in report["message"]
+    assert "洛雪桌面版" in report["message"]
+
+
+def test_verify_url_platform_results_breakdown(app_alias, isolated, monkeypatch):
+    """issue #22：平台细分结论——kg 免费曲不经搜索探活，解析失败的平台记 failed。"""
+    async def fake_download(url):
+        return STUB_SCRIPT
+
+    monkeypatch.setattr(vsr, "download_script", fake_download)
+
+    async def failing_resolver(music_info, quality, platform=None, timeout=10.0):
+        raise SourceError("resolve", "脚本解析失败：测试用例模拟")
+
+    # kg 搜索免费曲直接收录（与 test_verify_url_probe_failure 同款响应），
+    # 失败留在 musicUrl 解析阶段，platform_results 应记 failed 而非 search 侧状态
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mobilecdn.kugou.com" in str(request.url):
+            return httpx.Response(
+                200,
+                json={"data": {"info": [{"hash": "H1", "songname": "晴天",
+                                         "singername": "周杰伦", "duration": 269000,
+                                         "pay_type": 0}]}},
+            )
+        return httpx.Response(404)
+
+    shim = UserSourceShim(
+        STUB_SCRIPT, {"name": "t"},
+        platforms={"kg": ["128k", "320k"]}, resolver=failing_resolver,
+    )
+    monkeypatch.setattr(vsr, "UserSource", lambda *a, **kw: shim)
+
+    lxapp.app.state.http = mock_client(handler)
+    report = asyncio.run(vsr.verify_url("https://src.test/1.js"))
+    assert report["ok"] is False
+    # 拿到样本并真实尝试过解析失败 → 仍是源问题（resolve）
+    assert report["category"] == "resolve"
+    assert report["platform_results"]["kg"] == "failed"

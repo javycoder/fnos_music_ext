@@ -142,6 +142,7 @@ _HOT_ENV_KEYS = [
     "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
     "quality_mode", "tee_save_enabled", "tee_save_dir", "tee_cache_max",
     "recommend_hot", "recommend_daily", "cover_enrich", "llm_base_url", "llm_model",
+    "search_timeout",
 ]
 
 
@@ -159,6 +160,7 @@ def conf_guard():
         "FNMUSIC_TEE_SAVE_ENABLED", "FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_TEE_CACHE_MAX",
         "FNMUSIC_RECOMMEND_HOT", "FNMUSIC_RECOMMEND_DAILY", "FNMUSIC_COVER_ENRICH",
         "FNMUSIC_LLM_BASE_URL", "FNMUSIC_LLM_API_KEY", "FNMUSIC_LLM_MODEL",
+        "FNMUSIC_SEARCH_TIMEOUT",
     ]
     env_snapshot = {k: os.environ.get(k) for k in env_keys}
     yield
@@ -185,6 +187,7 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
         "LX_SOURCES=kw,kg\n"
         "FNMUSIC_LLM_API_KEY='sk-test'\n"
         "FNMUSIC_LLM_BASE_URL=https://llm.example.com/v1/\n"
+        "FNMUSIC_SEARCH_TIMEOUT=20\n"
         "FNMUSIC_MUSIC_DB=/should/not/apply.db\n",
         encoding="utf-8",
     )
@@ -199,6 +202,7 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
     # LLM 密钥只进环境变量（recommend 直接读 env，绝不进 CONF）
     assert os.environ.get("FNMUSIC_LLM_API_KEY") == "sk-test"
     assert CONF["llm_base_url"] == "https://llm.example.com/v1"
+    assert CONF["search_timeout"] == 20.0
     # 非白名单键不动
     assert CONF["music_db"] != "/should/not/apply.db"
     # 幂等：再跑一次无变化
@@ -492,8 +496,9 @@ def test_cover_enrich_disabled_falls_to_placeholder(monkeypatch):
     assert box_calls["n"] == 0  # 补全关闭不打 musicbox
 
 
-def test_cover_placeholder_never_404_and_deterministic():
-    CONF["musicdl_enabled"] = True
+def test_cover_placeholder_never_404_and_deterministic(monkeypatch):
+    # monkeypatch 而非裸赋值：裸写 CONF 会泄漏到后续用例（曾让顺序依赖被掩盖）
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "ok": True, "id": "migu:9", "source": "migu", "title": "t", "artist": "a", "cover_url": "",
@@ -557,11 +562,12 @@ async def test_aggregate_search_dispatches_single_provider(monkeypatch, enabled,
     monkeypatch.setattr("proxy.app.fetch_lx_search", fake_lx)
     for key, value in enabled.items():
         monkeypatch.setitem(CONF, key, value)
+    monkeypatch.setitem(CONF, "search_debounce_s", 0)
 
     class _Req:
         app = app
 
-    entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0}
+    entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0, "credentials": "test"}
     await _aggregate_search(_Req(), "晴天", entry)
     assert called == expect
 
@@ -619,6 +625,8 @@ def _cover_env(tmp_path, monkeypatch, user_guid="user-cover", musicdl_handler=No
 
 def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
     """歌单封面请求：第一首无封面 → 跳到第二首（musicdl 只收到第二首的 info）。"""
+    # musicdl 封面直链需要音源开启（自给自足，不依赖前置用例的 CONF 泄漏）
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/info"
         assert request.url.params.get("id") == "migu:2"
@@ -657,6 +665,11 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
 
     from proxy.app import _FAKE_GUID_REVERSE, _REGISTRY_WARMED
 
+    # _online_info 按 CONF 门禁调用 musicdl：本用例走 musicdl 封面直链，
+    # 必须自给自足开启（此前隐式依赖前置用例泄漏的 musicdl_enabled=True，
+    # 单跑/换文件顺序即挂）
+    monkeypatch.setitem(CONF, "musicdl_enabled", True)
+
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params.get("id") == "migu:2"
         return httpx.Response(200, json={"ok": True, "id": "migu:2", "title": "歌", "artist": "手",
@@ -670,10 +683,13 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
     pl_guid = _write_recommend_bundle(rec_dir, "user-cover", tracks)
     fake_cover = "track_" + hashlib.md5(f"fnmusic-ext::{pl_guid}".encode()).hexdigest()
 
+    # 模拟重启：内存反查表清空、warm 标记复位。必须改模块属性——
+    # from import 后直接赋值只重绑本地名，模块级 _REGISTRY_WARMED 原样保留
+    # （此前单跑碰巧为 False 才通过；任何前置用例触发过 warm 即挂）。
     backup = dict(_FAKE_GUID_REVERSE)
     warmed = _REGISTRY_WARMED
     _FAKE_GUID_REVERSE.clear()
-    _REGISTRY_WARMED = False
+    monkeypatch.setattr("proxy.app._REGISTRY_WARMED", False)
     try:
         with TestClient(app) as client:
             resp = client.get(f"/music/api/v1/static/cover?coverId={fake_cover}&size=120", follow_redirects=False)
@@ -682,4 +698,5 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
     finally:
         _FAKE_GUID_REVERSE.clear()
         _FAKE_GUID_REVERSE.update(backup)
-        _REGISTRY_WARMED = warmed
+        import proxy.app as _appmod
+    _appmod._REGISTRY_WARMED = warmed
