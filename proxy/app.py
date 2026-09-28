@@ -2733,6 +2733,81 @@ async def search_suggest(request: Request):
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
+def _lookup_online_snapshot(guid: str) -> "dict | None":
+    """按 guid 在在线播放历史/在线收藏的用户快照里反查曲目元数据（issue #28）。
+
+    两个存储都按用户分文件且量小（历史 ≤500 条/用户），tee 转正是低频路径，
+    顺序扫描可接受；命中即返回含 title/artist/album 的快照 dict。
+    """
+    # ① 在线播放历史（play_history/<user>.json，条目最新的在末尾，倒序找）
+    try:
+        root = dailyrec.play_history_dir()
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            items = data.get("items") if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                continue
+            for it in reversed(items):
+                if isinstance(it, dict) and it.get("guid") == guid:
+                    snap = it.get("track") if isinstance(it.get("track"), dict) else None
+                    if snap and (snap.get("title") or snap.get("artist")):
+                        return snap
+    except OSError:
+        pass
+    # ② 在线收藏（online_favorites/<user>.json，形状同收藏下发条目）
+    try:
+        fav_root = CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites")
+        for name in sorted(os.listdir(fav_root)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(fav_root, name), encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            items = data.get("items") if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                continue
+            for it in reversed(items):
+                if isinstance(it, dict) and it.get("guid") == guid:
+                    snap = it.get("track") if isinstance(it.get("track"), dict) else None
+                    if snap and (snap.get("title") or snap.get("artist")):
+                        return snap
+    except OSError:
+        pass
+    return None
+
+
+def _tee_metadata_fallback(guid: str, title: str, artist: str, album: str) -> tuple[str, str, str]:
+    """issue #28：tee 落盘元数据缺失时的回查兜底，杜绝无元数据以 unknown 进曲库。
+
+    流式上下文解析失败（info 为空/stub）时此前直接落 "unknown (n).flac"，飞牛
+    扫描后音乐库显示 Unknown 且无元数据。这里先从历史/收藏快照反查补齐；仍缺
+    失才维持 unknown，并打 WARN 便于取证（正常在线曲目在首次播放上报
+    track_play 时已写入历史快照，二播场景必然能反查到）。
+    """
+    if title.strip() and artist.strip():
+        return title, artist, album
+    snap = _lookup_online_snapshot(guid)
+    if snap:
+        title = title.strip() or str(snap.get("title") or "")
+        artist = artist.strip() or str(snap.get("artist") or "")
+        album = album.strip() or str(snap.get("album") or "")
+        logger.info("tee metadata fallback hit for %s: %s - %s", guid, artist, title)
+    if not (title.strip() and artist.strip()):
+        logger.warning(
+            "tee finalize missing metadata for %s (title=%r artist=%r)：将以 unknown 命名落盘，"
+            "该曲目的元数据解析链路需要排查", guid, title, artist,
+        )
+    return title, artist, album
+
+
 def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool) -> None:
     """落盘转正：边听边存开→进曲库（定名/权限/标签/歌词随迁），关→进滚动缓存。
 
@@ -2740,6 +2815,7 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     """
     title, artist, album = (str((info or {}).get(k) or "") for k in ("title", "artist", "album"))
     if tee_enabled:
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album)
         dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
         os.replace(part, dest)
         remember_media_path(guid, dest)
