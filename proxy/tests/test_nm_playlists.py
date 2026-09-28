@@ -118,7 +118,7 @@ def test_playlist_list_injects_own_playlists_before_official():
     assert guids == ["online:playlist:nm:111", "online:playlist:nm:333", "localpl"]
     card = lst[0]
     assert card["name"] == "我喜欢的音乐"
-    assert card["isDaily"] is False
+    assert card["isDaily"] is True
     assert card["trackCount"] == 9
     assert card["createdAt"] == 1700000000
     # coverId 伪装为官方 track_+32hex 形态，且假 id 可反解回 nm guid
@@ -206,6 +206,8 @@ def test_detail_batch_and_track_list_flow():
         assert len(data["list"]) == 1
         assert not str(data["list"][0]["guid"]).startswith("online:")
         assert data["list"][0]["title"] == "晴天"
+        assert isinstance(data["list"][0]["createdAt"], int)
+        assert isinstance(data["list"][0]["album"]["createdAt"], int)
         # size=-1 全量
         resp = client.get("/music/api/v1/track/playlist-detail/list",
                           params={"playlistGUID": "online:playlist:nm:111", "page": 1, "size": -1})

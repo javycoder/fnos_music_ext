@@ -255,7 +255,9 @@ def _card_from_row(row: dict) -> "dict | None":
         "createdAt": created or int(time.time()),
         "updatedAt": updated or int(time.time()),
         "trackCount": count,
-        "isDaily": False,
+        # 与热门/每日推荐相同：客户端只对 isDaily 的 online: 歌单拉曲目列表。
+        # 歌单名仍用网易原名，多个虚拟歌单可以并存。
+        "isDaily": True,
     }
     cover_url = str(row.get("cover_url") or "")
     if cover_url:

@@ -6122,7 +6122,9 @@ async def playlist_track_list(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        tracks = await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
+        tracks = dailyrec.stamp_playlist_tracks(
+            await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
+        )
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
