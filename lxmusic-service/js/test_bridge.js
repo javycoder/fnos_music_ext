@@ -575,7 +575,7 @@ let ticks = 0;
 const timer = setInterval(() => {
   ticks += 1;
   if (ticks >= 2) { clearInterval(timer); done(); }
-}, 40);
+}, 600);
 function done() {
   results.push('ticks=' + ticks);
   results.push('atob=' + atob('aGk='));
@@ -649,6 +649,59 @@ setTimeout(() => { throw new Error('boom-after-init'); }, 50);
   });
 }
 
+async function test_interval_period_clamped() {
+  // issue #29：野生脚本的 1ms 定时器在常驻进程里空烧 ~50% CPU。
+  // 周期必须被钳到下限之上：首跳不得早于下限的 80%，且打 WARN。
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+globalThis.__start = Date.now();
+setInterval(() => {
+  console.log('FIRST_TICK_MS=' + (Date.now() - globalThis.__start));
+}, 1);
+`;
+  const started = Date.now();
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('FIRST_TICK_MS=')),
+    then: (b) => {
+      const message = b.logs().find((m) => m.includes('FIRST_TICK_MS='));
+      const tickMs = Number((message.match(/FIRST_TICK_MS=(\d+)/) || [])[1]);
+      assert.ok(tickMs >= 400,
+        `1ms interval 必须被钳制到 >=500ms 周期（首跳 ${tickMs}ms 就到了）`);
+      assert.ok(Date.now() - started < 9000, '钳制后用例不得拖满超时');
+      assert.ok(b.logs().some((m) => m.includes('已钳制')), '钳制应打 WARN 便于排查');
+    },
+  });
+}
+
+async function test_interval_active_cap() {
+  // 超过存活上限的 interval 拒绝新增（返回哑定时器），clearInterval 不抛错，进程不崩
+  const script = `
+lx.on(lx.EVENT_NAMES.request, () => {});
+lx.send(lx.EVENT_NAMES.inited, {});
+const timers = [];
+for (let i = 0; i < 40; i += 1) {
+  timers.push(setInterval(() => {}, 100000));
+}
+console.log('REGISTERED=' + timers.length);
+timers.forEach((t) => clearInterval(t));
+console.log('CLEARED_OK');
+`;
+  await bridgeCase(script, {
+    timeoutMs: 10000,
+    waitUntil: (evs) => evs.some((e) => String(e.message || '').includes('CLEARED_OK')),
+    then: (b) => {
+      const logs = b.logs();
+      assert.ok(logs.some((m) => m.includes('REGISTERED=40')), '注册调用本身不抛错');
+      assert.ok(logs.some((m) => m.includes('上限')), '超限应打 WARN');
+      assert.equal(b.exitCode, 0, '哑定时器 + clearInterval 不得让进程异常退出');
+      const fatal = b.events().find((e) => e.type === 'event' && e.name === 'fatal');
+      assert.ok(!fatal, `不应有 fatal: ${JSON.stringify(fatal)}`);
+    },
+  });
+}
+
 // ------------------------------------------------------------------ 运行 ---
 
 async function main() {
@@ -674,6 +727,8 @@ async function main() {
     ['object body 默认 urlencoded', test_object_body_form_encoded_by_default],
     ['object body json 头序列化', test_object_body_json_with_content_type],
     ['沙箱 Web API 可用', test_sandbox_web_api_available],
+    ['interval 周期钳制（issue #29）', test_interval_period_clamped],
+    ['interval 存活上限（issue #29）', test_interval_active_cap],
     ['init 前异步崩溃报 fatal', test_async_crash_before_init_is_fatal],
     ['init 后异步崩溃仅记日志', test_async_crash_after_init_only_logs],
     ['沙箱全局白名单', test_sandbox_global_whitelist],

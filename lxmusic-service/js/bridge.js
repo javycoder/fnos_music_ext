@@ -313,11 +313,39 @@ lx.currentScriptInfo = {
   rawScript,
 };
 
-// 脚本注册的 interval 不能阻止宿主进程退出（rl close 时统一 process.exit）
-const sandboxSetInterval = (...args) => {
-  const timer = setInterval(...args);
+// 脚本注册的 interval 不能阻止宿主进程退出（rl close 时统一 process.exit）。
+// 常驻 Node 进程里野生脚本的短周期定时器会持续空烧 CPU（issue #29 实测空闲 ~50%），
+// 故对脚本侧 interval 做治理：周期下限钳制 + 活跃数量上限，过频/超限打 WARN。
+const INTERVAL_MIN_MS = 500;      // 脚本 interval 周期下限（低于则提到该值）
+const INTERVAL_MAX_ACTIVE = 32;   // 同时存活的脚本 interval 数量上限
+const liveIntervals = new Set();
+let intervalClampWarned = 0;
+
+const sandboxSetInterval = (fn, delay, ...rest) => {
+  const rawDelay = typeof delay === 'number' && Number.isFinite(delay) ? delay : 1;
+  if (rawDelay < INTERVAL_MIN_MS && intervalClampWarned < 3) {
+    intervalClampWarned += 1;
+    logEvent('warn', [
+      `[bridge] 脚本 interval 周期 ${rawDelay}ms 低于 ${INTERVAL_MIN_MS}ms，已钳制（防常驻进程空烧 CPU，issue #29）`,
+    ]);
+  }
+  const delayMs = Math.max(INTERVAL_MIN_MS, Math.min(rawDelay, 2147483647));
+  if (liveIntervals.size >= INTERVAL_MAX_ACTIVE) {
+    logEvent('warn', [`[bridge] 脚本存活 interval 已达上限 ${INTERVAL_MAX_ACTIVE}，拒绝新增（疑似失控脚本）`]);
+    // 返回哑定时器（unref + 永不触发回调），保证脚本 clearInterval(句柄) 不抛错
+    const dummy = setInterval(() => {}, 3600000);
+    if (dummy && typeof dummy.unref === 'function') dummy.unref();
+    return dummy;
+  }
+  const timer = setInterval(fn, delayMs, ...rest);
+  liveIntervals.add(timer);
   if (timer && typeof timer.unref === 'function') timer.unref();
   return timer;
+};
+
+const sandboxClearInterval = (timer) => {
+  if (timer) liveIntervals.delete(timer);
+  return clearInterval(timer);
 };
 
 const sandbox = {
@@ -325,7 +353,7 @@ const sandbox = {
   setTimeout,
   clearTimeout,
   setInterval: sandboxSetInterval,
-  clearInterval,
+  clearInterval: sandboxClearInterval,
   console: sandboxConsole,
   URL,
   URLSearchParams,

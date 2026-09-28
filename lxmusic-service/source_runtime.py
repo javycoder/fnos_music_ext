@@ -477,6 +477,10 @@ class UserSource:
         return url
 
     def describe(self) -> dict:
+        # issue #29：暴露 bridge 进程 pid 与运行时长，便于用户上报"多进程/CPU 占用"时
+        # 直接对照 healthz 与宿主 ps 输出（正常恒为单进程；多进程=容器/服务被外部拉起多次）
+        pid = self._proc.pid if self._proc is not None else None
+        uptime_s = round(time.time() - self.started_at, 1) if self.started_at else None
         return {
             "name": self.meta.get("name") or "",
             "version": self.meta.get("version") or "",
@@ -489,6 +493,8 @@ class UserSource:
             },
             "running": self.running,
             "started_at": self.started_at,
+            "pid": pid,
+            "uptime_s": uptime_s,
         }
 
 
