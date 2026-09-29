@@ -316,7 +316,8 @@ def test_play_history_merges_online(tmp_path, monkeypatch):
 
 
 def test_play_history_delete_online_and_official(tmp_path, monkeypatch):
-    """删除闭环：online 条目（客户端持有伪装假 id）删本地存储；官方条目原样转发。"""
+    """删除闭环：官方契约 trackGUIDs 数组，online 条目（客户端持有伪装假 id）删本地
+    存储；官方条目原样转发。"""
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
     dailyrec.record_online_play("user-rec-1", "online:migu:99", {"title": "在线歌", "artist": "歌手"})
     forwarded = []
@@ -329,21 +330,75 @@ def test_play_history_delete_online_and_official(tmp_path, monkeypatch):
 
     app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
     with TestClient(app) as client:
+        # 官方真实契约：trackGUIDs 数组（前端单条移除/"编辑"多选移除共用）
         fake = fake_official_guid("online:migu:99")
-        resp = client.post("/music/api/v1/play-history/delete", json={"trackGUID": fake})
+        resp = client.post("/music/api/v1/play-history/delete", json={"trackGUIDs": [fake]})
         assert resp.json()["code"] == 0
         assert all(it["guid"] != "online:migu:99" for it in dailyrec.load_online_play_history("user-rec-1"))
 
-        # DELETE 方法与 guid 字段名同样受理（TestClient.delete 不收 json，用 request）
+        # 兼容单数 trackGUID（TestClient.delete 不收 json，DELETE 用 request 发）
         dailyrec.record_online_play("user-rec-1", "online:migu:99", {"title": "在线歌"})
-        resp2 = client.request("DELETE", "/music/api/v1/play-history/delete", json={"guid": fake})
+        resp2 = client.post("/music/api/v1/play-history/delete", json={"trackGUID": fake})
         assert resp2.json()["code"] == 0
+        assert all(it["guid"] != "online:migu:99" for it in dailyrec.load_online_play_history("user-rec-1"))
+
+        dailyrec.record_online_play("user-rec-1", "online:migu:99", {"title": "在线歌"})
+        resp3 = client.request("DELETE", "/music/api/v1/play-history/delete", json={"guid": fake})
+        assert resp3.json()["code"] == 0
         assert dailyrec.load_online_play_history("user-rec-1") == []
 
-        # 官方条目：改写后转发上游，不打官方之外的接口
-        resp3 = client.post("/music/api/v1/play-history/delete", json={"trackGUID": "official-guid-1"})
-        assert resp3.json()["code"] == 0
+        # 官方条目：原样转发上游，不打官方之外的接口
+        resp4 = client.post("/music/api/v1/play-history/delete", json={"trackGUIDs": ["official-guid-1"]})
+        assert resp4.json()["code"] == 0
     assert forwarded == [("POST", "/music/api/v1/play-history/delete")]
+
+
+def test_play_history_delete_mixed_batch_forwards_official_first(tmp_path, monkeypatch):
+    """混合批次（在线+官方同批）：官方部分改写为 trackGUIDs 先行转发，成功后本地删除。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    dailyrec.record_online_play("user-rec-1", "online:migu:7", {"title": "在线歌"})
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-rec-1"}})
+        body = json.loads(request.content)
+        seen.append((body, len(dailyrec.load_online_play_history("user-rec-1"))))
+        return httpx.Response(200, json={"code": 0, "msg": "", "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    fake = fake_official_guid("online:migu:7")
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/play-history/delete",
+            json={"trackGUIDs": [fake, "official-guid-1", "official-guid-2"]},
+        )
+        assert resp.json()["code"] == 0
+        assert dailyrec.load_online_play_history("user-rec-1") == []
+
+    # 官方部分整体改写转发，且转发时本地在线条目尚未删除（官方先行）
+    assert seen == [({"trackGUIDs": ["official-guid-1", "official-guid-2"]}, 1)]
+
+
+def test_play_history_delete_official_failure_keeps_local(tmp_path, monkeypatch):
+    """混合批次官方部分失败：透传官方错误，本地在线条目不动。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    dailyrec.record_online_play("user-rec-1", "online:migu:7", {"title": "在线歌"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-rec-1"}})
+        return httpx.Response(200, json={"code": 100005, "msg": "not found", "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+    fake = fake_official_guid("online:migu:7")
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/play-history/delete",
+            json={"trackGUIDs": [fake, "official-guid-1"]},
+        )
+        assert resp.json()["code"] == 100005
+        assert [it["guid"] for it in dailyrec.load_online_play_history("user-rec-1")] == ["online:migu:7"]
 
 
 def test_playlist_detail_size_minus_one_returns_all(tmp_path, monkeypatch):

@@ -6963,13 +6963,43 @@ async def play_history_list(request: Request):
     return JSONResponse(content=envelope, headers=headers)
 
 
+async def _forward_official_play_history_delete(
+    request: Request, client: httpx.AsyncClient, official: list[str],
+) -> Response | None:
+    """混合批次中官方部分先行。返回 None=官方成功，否则返回官方错误响应（本地不动）。"""
+    req = client.build_request(
+        "POST",
+        "/music/api/v1/play-history/delete",
+        headers=copy_incoming_headers(request),
+        json={"trackGUIDs": official},
+    )
+    resp = await client.send(req)
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    if resp.status_code != 200:
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if not (isinstance(payload, dict) and payload.get("code") == 0):
+        return JSONResponse(content=payload or {"code": -1, "msg": "upstream error", "data": None})
+    return None
+
+
 @app.api_route("/music/api/v1/play-history/delete", methods=["POST", "DELETE"])
 async def play_history_delete(request: Request):
-    """删除播放历史：online 条目删本地存储，官方条目原样转发官方后端。
+    """删除播放历史：online 条目删本地存储，官方条目转发官方后端。
 
     列表是代理拼的（list 合并本地在线历史），删除闭环也必须在代理完成，否则
-    带（伪装成官方 32-hex 的）在线 id 的删除请求直达官方被拒。方法双注册、
-    字段兼容 trackGUID/guid（含 query 透传），与 favorite-track/delete 同款分工。
+    带（伪装成官方 32-hex 的）在线 id 的删除请求直达官方被拒。官方契约是批量
+    字段 trackGUIDs（前端单条移除与"编辑"多选移除共用，官方后端 binding:"required"），
+    兼容单数 trackGUID/guid（含 query 透传）；混合批次官方部分先行，官方失败
+    本地不动，与 playlist/remove-track 同款分工。
     """
     upstream_client = get_upstream_client(request.app)
     try:
@@ -6977,25 +7007,38 @@ async def play_history_delete(request: Request):
     except Exception:
         body = {}
 
-    guid = ""
-    if isinstance(body, dict):
-        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
-    if not guid:
-        guid = str(request.query_params.get("trackGUID") or request.query_params.get("guid") or "").strip()
-    guid = resolve_real_guid(guid)
+    raw = body.get("trackGUIDs") if isinstance(body, dict) else None
+    if isinstance(raw, list) and raw:
+        candidates = [str(g or "").strip() for g in raw]
+    else:
+        single = ""
+        if isinstance(body, dict):
+            single = str(body.get("trackGUID") or body.get("guid") or "").strip()
+        if not single:
+            single = str(request.query_params.get("trackGUID") or request.query_params.get("guid") or "").strip()
+        candidates = [single] if single else []
 
-    if not is_online_guid(guid):
+    resolved = [resolve_real_guid(g) for g in candidates if g]
+    online = [g for g in resolved if is_online_guid(g)]
+    if not online:
         return await forward_to_upstream(request, upstream_client)
 
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
 
+    official = [g for g in resolved if not is_online_guid(g)]
+    if official:
+        err = await _forward_official_play_history_delete(request, upstream_client, official)
+        if err is not None:
+            return err
+
     async with _HISTORY_LOCK:
-        try:
-            dailyrec.remove_online_play(user_guid, guid)
-        except Exception as e:
-            logger.warning("Error deleting from online play history for user %s: %s", user_guid, e)
+        for guid in online:
+            try:
+                dailyrec.remove_online_play(user_guid, guid)
+            except Exception as e:
+                logger.warning("Error deleting from online play history for user %s: %s", user_guid, e)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 

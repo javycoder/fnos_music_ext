@@ -144,6 +144,15 @@ else
   bad "播放历史包含刚播放的在线曲目" "report=$(echo "$REPORT" | jget code)"
 fi
 
+# ── 6b. 移除最近播放（官方批量契约 trackGUIDs）→ 列表更新 ─
+HIST_DEL=$(api -X POST -H "Content-Type: application/json" -d "{\"trackGUIDs\":[\"$ONLINE_GUID\"]}" "$BASE/play-history/delete")
+HIST2=$(api "$BASE/play-history/list?page=1&size=50")
+if [ "$(echo "$HIST_DEL" | jget code)" = "0" ] && ! echo "$HIST2" | grep -q "$ONLINE_GUID"; then
+  ok "移除最近播放在线条目后列表已更新"
+else
+  bad "移除最近播放在线条目" "delete code=$(echo "$HIST_DEL" | jget code)"
+fi
+
 # ── 7. 歌单：建 → 加在线歌 → 列表 → 移出 → 删 ───────────
 PL_GUID=$(api -X POST -H "Content-Type: application/json" -d '{"name":"e2e-冒烟-可删"}' "$BASE/playlist/create" | jget data.guid)
 if [ -n "$PL_GUID" ]; then
