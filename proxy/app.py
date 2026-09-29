@@ -1706,19 +1706,12 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
         return None
     scope = _FETCH_SCOPE.get()
 
-    async def _query():
-        params: dict[str, Any] = {"keyword": keyword, "limit": limit}
-        selected_sources = CONF["online_sources"] if sources is None else sources
-        if selected_sources:
-            params["sources"] = selected_sources
-        timeout = max(1.0, float(CONF.get("search_timeout") or 15))
+    async def _fetch_once(params: dict[str, Any], timeout: float) -> dict | None:
         try:
             r = await client.get("/search", params=params, timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, dict):
-                    if data.get("errors"):
-                        logger.warning("musicdl search partial errors: %s", data.get("errors"))
                     raw_items = data.get("items")
                     if isinstance(raw_items, list):
                         data["items"] = [it for it in raw_items if is_playable_online_track(it)]
@@ -1726,6 +1719,26 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
         except Exception as e:
             logger.warning("Failed to fetch online search from musicdl: %s", e)
         return None
+
+    async def _query():
+        params: dict[str, Any] = {"keyword": keyword, "limit": limit}
+        selected_sources = CONF["online_sources"] if sources is None else sources
+        if selected_sources:
+            params["sources"] = selected_sources
+        timeout = max(1.0, float(CONF.get("search_timeout") or 15))
+        started = time.monotonic()
+        data = await _fetch_once(params, timeout)
+        # musicdl 快速交回 0 条且带错误（全源 busy/熔断/瞬时失败）时不是
+        # 终态：稍等片刻重试一次，避免把偶发空结果当成真"无结果"。
+        if (isinstance(data, dict) and not data.get("items") and data.get("errors")
+                and time.monotonic() - started < 5.0):
+            await asyncio.sleep(1.5)
+            retry = await _fetch_once(params, timeout)
+            if isinstance(retry, dict) and retry.get("items"):
+                data = retry
+        if isinstance(data, dict) and data.get("errors"):
+            logger.warning("musicdl search partial errors: %s", data.get("errors"))
+        return data
 
     return await _MUSICDL_SEARCH_GATE.run(scope, keyword, _query)
 
