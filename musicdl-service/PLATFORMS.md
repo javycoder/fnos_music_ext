@@ -14,7 +14,7 @@
 | 命令行 `--sources` 用编号 | `--sources 1,2,62` |
 | 命令行 `--sources` 用短名 | `--sources netease,lx-kw,musicdl-kuwo` |
 | 命令行整源（默认平台，**不是数字**） | `--sources musicbox,musicdl,lxmusic` |
-| `.env` 手动调整（重装生效） | `FNMUSIC_ONLINE_SOURCES=kuwo,gequhai` 与 `MUSICDL_SOURCES=KuwoMusicClient,GequhaiMusicClient` |
+| `.env` 手动调整（重启 musicdl 进程即生效，WebUI 保存自动生效） | `FNMUSIC_ONLINE_SOURCES=kuwo,gequhai` 与 `MUSICDL_SOURCES=KuwoMusicClient,GequhaiMusicClient` |
 
 说明：
 

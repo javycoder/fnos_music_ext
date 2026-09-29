@@ -117,7 +117,8 @@ def write_env(updates: dict[str, str]) -> list[str]:
     if not changed:
         return []
     if ENV_PATH.exists():
-        backup = ENV_PATH.with_suffix(".env.webui.bak")
+        # with_suffix 会把 ".env" 当后缀替换，产出 ".env.env.webui.bak" 畸形名；拼名字才是 /repo/.env.webui.bak
+        backup = ENV_PATH.with_name(ENV_PATH.name + ".webui.bak")
         try:
             backup.write_bytes(ENV_PATH.read_bytes())
         except OSError as exc:  # 备份失败不阻断写入，但要有迹可循

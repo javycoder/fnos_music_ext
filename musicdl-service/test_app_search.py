@@ -566,3 +566,67 @@ def test_probe_playable_sync_unit(monkeypatch):
     assert app_module._probe_playable_sync("http://test.com/html_error", {}) is False
     assert app_module._probe_playable_sync("http://test.com/notfound", {}) is False
 
+
+
+# ------------------------------------------------------------------ 启动白名单来源 --
+
+def test_startup_sources_env_file_overrides_stale_process_env(monkeypatch, tmp_path):
+    """.env 有白名单时优先于进程环境变量（supervisord restart 继承的是容器启动时刻的陈旧值）。"""
+    envf = tmp_path / ".env"
+    envf.write_text("MUSICDL_SOURCES='kugou,netease'\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ENV_FILE", str(envf))
+    monkeypatch.setenv("MUSICDL_SOURCES", "KuwoMusicClient,MiguMusicClient")
+    sources, origin = app_module._startup_sources()
+    assert sources == ["kugou", "netease"]
+    assert origin.startswith("env file")
+
+
+def test_startup_sources_falls_back_to_env_var(monkeypatch, tmp_path):
+    """.env 缺键、值留空或文件不存在时回退进程环境变量。"""
+    envf = tmp_path / ".env"
+    envf.write_text("MUSICDL_SOURCES=''\nOTHER=1\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ENV_FILE", str(envf))
+    monkeypatch.setenv("MUSICDL_SOURCES", "KuwoMusicClient")
+    sources, origin = app_module._startup_sources()
+    assert sources == ["KuwoMusicClient"]
+    assert origin == "process env"
+
+    monkeypatch.setenv("FNMUSIC_ENV_FILE", str(tmp_path / "absent.env"))
+    sources, origin = app_module._startup_sources()
+    assert sources == ["KuwoMusicClient"]
+    assert origin == "process env"
+
+
+def test_startup_sources_builtin_default(monkeypatch, tmp_path):
+    """.env 不存在且环境变量未设时用内置默认（酷我 + 咪咕）。"""
+    monkeypatch.setenv("FNMUSIC_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.delenv("MUSICDL_SOURCES", raising=False)
+    sources, origin = app_module._startup_sources()
+    assert sources == ["KuwoMusicClient", "MiguMusicClient"]
+    assert origin == "builtin default"
+
+
+def test_module_conf_sources_from_env_file_normalized(monkeypatch, tmp_path):
+    """导入期端到端：CONF['sources'] 取 .env 白名单并完成短名归一（issue #31 回归）。"""
+    builder = types.SimpleNamespace(REGISTERED_MODULES={
+        "KuwoMusicClient": object, "MiguMusicClient": object,
+        "KugouMusicClient": object, "NeteaseMusicClient": object,
+    })
+    src_mod = types.ModuleType("musicdl.modules.sources")
+    src_mod.MusicClientBuilder = builder
+    pkg_mod = types.ModuleType("musicdl.modules")
+    pkg_mod.sources = src_mod
+    _musicdl_stub.modules = pkg_mod
+    sys.modules.setdefault("musicdl.modules", pkg_mod)
+    sys.modules.setdefault("musicdl.modules.sources", src_mod)
+
+    envf = tmp_path / ".env"
+    envf.write_text("MUSICDL_SOURCES='kugou,netease'\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_ENV_FILE", str(envf))
+    monkeypatch.setenv("MUSICDL_SOURCES", "KuwoMusicClient,MiguMusicClient")
+
+    spec = importlib.util.spec_from_file_location("musicdl_service_app_envfile", _HERE / "app.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.CONF["sources"] == ["KugouMusicClient", "NeteaseMusicClient"]
+    assert mod._SOURCES_ORIGIN.startswith("env file")
