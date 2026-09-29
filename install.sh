@@ -900,7 +900,12 @@ mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlis
     "${SOURCES_DATA_DIR}/config/netease-musicbox" \
     "${SOURCES_DATA_DIR}/netease-musicbox" \
     "${SOURCES_DATA_DIR}/lxmusic"
-chmod -R 0755 "${SOURCES_DATA_DIR}" 2>/dev/null || true
+# 数据卷权限收紧：属主对齐容器 appuser（uid 1000，Dockerfile 固定），group/other 全收——
+# 网易 cookie/state.json 等凭据不可被本机其他用户读取；chown 需 root（fpk 安装即 root），
+# 交互安装时调用者本身即属主（fnOS 默认 admin=1000）兜底
+chown -R 1000:1000 "${SOURCES_DATA_DIR}" 2>/dev/null || true
+find "${SOURCES_DATA_DIR}" -type d -exec chmod 0700 {} + 2>/dev/null || true
+find "${SOURCES_DATA_DIR}" -type f -exec chmod 0600 {} + 2>/dev/null || true
 
 # 归一化服务源码权限：umask 077 环境检出的文件为 600，会导致镜像内 appuser 读不到 app.py
 chmod 0644 \

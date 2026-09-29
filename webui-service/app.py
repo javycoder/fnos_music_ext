@@ -121,6 +121,7 @@ def write_env(updates: dict[str, str]) -> list[str]:
         backup = ENV_PATH.with_name(ENV_PATH.name + ".webui.bak")
         try:
             backup.write_bytes(ENV_PATH.read_bytes())
+            os.chmod(backup, 0o600)  # write_bytes 按 umask 落盘（0644），密钥备份必须收紧
         except OSError as exc:  # 备份失败不阻断写入，但要有迹可循
             logger.warning("webui env backup failed: %s", exc)
     merged = [(k, updates.get(k, v)) if k in updates else (k, v) for k, v in existing_kv]
