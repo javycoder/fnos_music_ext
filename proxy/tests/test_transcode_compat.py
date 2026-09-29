@@ -121,6 +121,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "transcode_max_sessions", 2)
     monkeypatch.setitem(CONF, "transcode_ttl_s", 90.0)
     monkeypatch.setitem(CONF, "transcode_cache_max_mb", 512)
+    monkeypatch.setitem(CONF, "transcode_dl_bitrate", "320k")
     monkeypatch.setitem(CONF, "fav_auto_bind", False)
     monkeypatch.setitem(CONF, "trace_forward", False)
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", dirs["play_history"])
@@ -177,9 +178,9 @@ def env(tmp_path, monkeypatch):
     appmod._TAGS_LOOKUP_MISS.clear()
 
 
-def seed_cached_audio(guid: str, data: bytes = b"MP3DATA" * 200) -> str:
+def seed_cached_audio(guid: str, data: bytes = b"MP3DATA" * 200, ext: str = "mp3") -> str:
     """往测试曲库放一个已落库文件并记 .ref，模拟已下载完成的在线曲。"""
-    path = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
+    path = os.path.join(CONF["library_dir"], f"周杰伦 - 晴天.{ext}")
     with open(path, "wb") as f:
         f.write(data)
     appmod.remember_media_path(guid, path)
@@ -415,83 +416,104 @@ def test_hls_stub_fallback_without_ffmpeg(env):
         assert resp.json()["status"] == "success"
 
 
-# === App 下载侧：prepare → status → file → delete ===
+# === App 下载侧：prepare → status → file → delete（协议形状对齐官方实测） ===
 
 def test_download_standard_transcode_flow(env, fake_ffmpeg):
     fake_ffmpeg("ok")
-    seed_cached_audio(FAKE_KUWO)
+    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 500, ext="flac")
     with TestClient(app) as client:
         prep = client.post("/music/api/v1/download/track/transcode/prepare",
-                           json={"guid": FAKE_KUWO, "quality": "standard"})
+                           json={"trackGUID": FAKE_KUWO, "quality": "standard"})
         assert prep.status_code == 200
-        task_guid = prep.json()["data"]["taskGuid"]
-        assert task_guid
+        data = prep.json()["data"]
+        assert data["status"] == "success" and data["downloadId"]  # 官方形状：downloadId
 
-        def _done():
-            st = client.post("/music/api/v1/download/track/transcode/status",
-                             json={"taskGuid": task_guid}).json()["data"]
-            return st if st["state"] == "completed" else None
-        data = wait_for(_done)
-        assert data is not None
-        assert data["progress"] == 100 and data["size"] > 0
-        assert data["bitrate"] == "128k"
+        did = data["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None
+        assert st["percent"] == 100 and st["downloadId"] == did
 
         file_resp = client.get("/music/api/v1/download/track/transcode/file",
-                               params={"taskGuid": task_guid})
+                               params={"downloadId": did})
         assert file_resp.status_code == 200
-        assert file_resp.content.startswith(b"M4ADATA")
+        assert file_resp.content.startswith(b"M4ADATA")          # 假 ffmpeg 的产物
+        assert file_resp.headers["content-type"].startswith("audio/mpeg")
 
         head = client.head("/music/api/v1/download/track/transcode/file",
-                           params={"taskGuid": task_guid})
+                           params={"downloadId": did})
         assert head.status_code == 200
 
         rng = client.get("/music/api/v1/download/track/transcode/file",
-                         params={"taskGuid": task_guid}, headers={"Range": "bytes=0-6"})
+                         params={"downloadId": did}, headers={"Range": "bytes=0-6"})
         assert rng.status_code == 206
         assert len(rng.content) == 7
 
         dele = client.post("/music/api/v1/download/track/transcode/delete",
-                           json={"taskGuid": task_guid})
-        assert dele.json()["code"] == 0
-        # 任务已删：同 taskGuid 再问 → 透传官方（sentinel）
-        st2 = client.post("/music/api/v1/download/track/transcode/status",
-                          json={"taskGuid": task_guid})
+                           json={"downloadId": did})
+        assert dele.json()["data"] == {"downloadId": did, "deleted": True}
+        # 任务已删：同 downloadId 再问 → 透传官方（sentinel）
+        st2 = client.get("/music/api/v1/download/track/transcode/status",
+                         params={"downloadId": did})
         assert st2.json() == SENTINEL
+
+
+def test_download_standard_mp3_source_served_as_is(env, fake_ffmpeg):
+    """源已是 mp3：标准档不做无意义重编码，直接供原文件（内容零损失）。"""
+    fake_ffmpeg("fail")   # 假 ffmpeg fail——一旦被调用测试即失败
+    payload = b"ID3MP3SRC" * 200
+    seed_cached_audio(FAKE_KUWO, payload, ext="mp3")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "standard"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready)
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+        assert file_resp.headers["content-type"].startswith("audio/mpeg")
 
 
 def test_download_original_serves_cached_file(env, fake_ffmpeg):
     fake_ffmpeg("ok")
     payload = b"ORIGINALBYTES" * 100
-    seed_cached_audio(FAKE_KUWO, payload)
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
     with TestClient(app) as client:
-        prep = client.post("/music/api/v1/download/track/transcode/prepare",
-                           json={"guid": FAKE_KUWO, "quality": "original"})
-        task_guid = prep.json()["data"]["taskGuid"]
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "original"}).json()["data"]["downloadId"]
 
-        def _done():
-            st = client.post("/music/api/v1/download/track/transcode/status",
-                             json={"taskGuid": task_guid}).json()["data"]
-            return st if st["state"] == "completed" else None
-        assert wait_for(_done)
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready)
         file_resp = client.get("/music/api/v1/download/track/transcode/file",
-                               params={"taskGuid": task_guid})
+                               params={"downloadId": did})
         assert file_resp.content == payload      # 原始档：不转码，直接供原文件
 
 
 def test_download_standard_fails_without_ffmpeg(env):
-    seed_cached_audio(FAKE_KUWO)
+    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 100, ext="flac")
     with TestClient(app) as client:
-        prep = client.post("/music/api/v1/download/track/transcode/prepare",
-                           json={"guid": FAKE_KUWO})
-        task_guid = prep.json()["data"]["taskGuid"]
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO}).json()["data"]["downloadId"]
 
         def _failed():
-            st = client.post("/music/api/v1/download/track/transcode/status",
-                             json={"taskGuid": task_guid}).json()["data"]
-            return st if st["state"] == "failed" else None
-        assert wait_for(_failed)
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "failed" else None
+        st = wait_for(_failed)
+        assert st is not None and st["errmsg"]
         file_resp = client.get("/music/api/v1/download/track/transcode/file",
-                               params={"taskGuid": task_guid})
+                               params={"downloadId": did})
         assert file_resp.status_code == 404
 
 
@@ -499,14 +521,13 @@ def test_download_fails_when_source_dead_and_no_cache(env, fake_ffmpeg):
     fake_ffmpeg("ok")
     guid = "online:migu:600902000006889366"   # musicdl mock 只答 /info，流 404
     with TestClient(app) as client:
-        prep = client.post("/music/api/v1/download/track/transcode/prepare",
-                           json={"guid": guid})
-        task_guid = prep.json()["data"]["taskGuid"]
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": guid}).json()["data"]["downloadId"]
 
         def _failed():
-            st = client.post("/music/api/v1/download/track/transcode/status",
-                             json={"taskGuid": task_guid}).json()["data"]
-            return st if st["state"] == "failed" else None
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "failed" else None
         assert wait_for(_failed, timeout=15)
 
 

@@ -134,6 +134,8 @@ CONF = {
     "transcode_max_sessions": int(os.environ.get("FNMUSIC_TRANSCODE_MAX_SESSIONS", "2")),
     "transcode_ttl_s": float(os.environ.get("FNMUSIC_TRANSCODE_TTL_S", "90")),
     "transcode_cache_max_mb": int(os.environ.get("FNMUSIC_TRANSCODE_CACHE_MAX_MB", "512")),
+    # 下载"标准"档目标码率：官方实测 MP3 320k（prepare quality=standard, FLAC 源 → 320067bps）
+    "transcode_dl_bitrate": os.environ.get("FNMUSIC_TRANSCODE_DL_BITRATE", "320k"),
     # 落盘进曲库后通知官方重扫的接口路径（POST）；空=禁用。官方无公开文档，
     # 真机在官方 App 手动点一次扫描、从代理请求日志捕获真实路径后填入启用
     "library_scan_path": (os.environ.get("FNMUSIC_LIBRARY_SCAN_PATH", "") or "").strip(),
@@ -485,6 +487,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_TRANSCODE_MAX_SESSIONS": ("transcode_max_sessions", "tee_cache_max"),
     "FNMUSIC_TRANSCODE_TTL_S": ("transcode_ttl_s", "ttl_seconds"),
     "FNMUSIC_TRANSCODE_CACHE_MAX_MB": ("transcode_cache_max_mb", "mb_int"),
+    "FNMUSIC_TRANSCODE_DL_BITRATE": ("transcode_dl_bitrate", "str"),
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
     "FNMUSIC_LLM_API_KEY": ("", "str"),
     "FNMUSIC_LLM_MODEL": ("llm_model", "str"),
@@ -4766,17 +4769,22 @@ async def track_transcode(request: Request):
 
 
 # === App 下载（音质偏好=标准 → 转码下载）仿真 ===
-# 取证（APK）：官方协议为 download/track/transcode/prepare → status 轮询
-# （waiting/transcoding/completed/failed）→ file 取文件（支持断点）→ delete 清理。
-# 官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当 taskGuid/guid 命中
-# 本代理会话才接管，本地曲目与未知 taskGuid 一律透传官方。
+# 协议按官方实测对齐（本地歌曲透传抓包，2026-09-29）：
+#   prepare POST {trackGUID, quality}  → data{status:"success", errno, errmsg, downloadId}
+#   status  GET ?downloadId=           → data{status:"waiting|transcoding|ready|failed",
+#                                             errno, errmsg, downloadId, percent}
+#   file    GET ?downloadId=           → 音频字节（audio/mpeg，支持断点）
+#   delete  POST {downloadId}          → data{downloadId, deleted:true}
+# 官方"标准"档 = MP3 320kbps（FLAC 源实测 320067bps）；源已是 mp3 时直接供原文件
+# 不做无意义重编码。官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当
+# guid 是在线曲目才接管，本地曲目与未知 downloadId 一律透传官方。
 _DL_TASKS: dict[str, dict] = {}
 _DL_TASK_TTL_S = 3600.0
 _DL_TRANSCODE_SUBDIR = "dltrans"
 
 
 def _dl_transcode_path(guid: str) -> str:
-    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.m4a")
+    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.mp3")
 
 
 def _dl_sweep() -> None:
@@ -4798,7 +4806,7 @@ async def _dl_body_json(request: Request) -> dict:
 
 
 def _dl_find_task(request: Request, body: dict) -> "dict | None":
-    for key in ("taskGuid", "taskId", "downloadId", "id", "guid", "trackGUID"):
+    for key in ("downloadId", "taskGuid", "taskId", "id", "guid", "trackGUID"):
         value = request.query_params.get(key) or body.get(key)
         if value:
             hit = _DL_TASKS.get(str(value))
@@ -4811,13 +4819,19 @@ def _dl_find_task(request: Request, body: dict) -> "dict | None":
 def _task_guid_of(task: dict) -> str:
     for key, value in _DL_TASKS.items():
         if value is task:
-            task["taskGuid"] = key
+            task["downloadId"] = key
             return key
-    return str(task.get("taskGuid") or "")
+    return str(task.get("downloadId") or "")
+
+
+def _dl_state_word(task: dict) -> str:
+    """内部状态 → 官方 status 字段用词（completed=ready）。"""
+    state = str(task.get("state") or "waiting")
+    return {"completed": "ready"}.get(state, state)
 
 
 async def _dl_produce(task: dict, cred_headers: dict) -> None:
-    """后台产文件：标准档转 AAC m4a；原始档直接供整轨下载的原文件。"""
+    """后台产文件：标准档按官方规格 MP3 320k（源已是 mp3 直接供原文件）；原始档供原文件。"""
     guid = task["guid"]
     try:
         src = find_cache_file(guid)
@@ -4827,28 +4841,30 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
             src = find_cache_file(guid)
         if not src:
             task["state"] = "failed"
+            task["errmsg"] = "online source unavailable"
             return
-        if task.get("quality") == "original":
+        if task.get("quality") == "original" or os.path.splitext(src)[1].lower() == ".mp3":
             task["path"] = src
         else:
             target = _dl_transcode_path(guid)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             if not os.path.isfile(target):
                 task["state"] = "transcoding"
-                task["progress"] = 5
+                task["percent"] = 0
                 proc = await asyncio.create_subprocess_exec(
                     tc.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                     "-i", src, "-vn", "-map_metadata", "-1",
-                    "-c:a", "aac", "-b:a", str(CONF.get("transcode_bitrate") or "128k"),
-                    "-movflags", "+faststart", target,
+                    "-c:a", "libmp3lame", "-b:a", str(CONF.get("transcode_dl_bitrate") or "320k"),
+                    "-f", "mp3", target,
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 )
                 if await proc.wait() != 0:
                     task["state"] = "failed"
+                    task["errmsg"] = "transcode failed"
                     return
             task["path"] = target
         task["state"] = "completed"
-        task["progress"] = 100
+        task["percent"] = 100
         try:
             task["size"] = os.path.getsize(task["path"])
         except OSError:
@@ -4856,6 +4872,7 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("download transcode produce failed for %s: %s", guid, e)
         task["state"] = "failed"
+        task["errmsg"] = "internal error"
 
 
 async def _dl_forward(request: Request):
@@ -4903,15 +4920,14 @@ async def dl_transcode_prepare(request: Request):
     if body.get("isOriginal") is True:
         quality = "original"
     _dl_sweep()
-    task_guid = uuid4().hex
-    task = {"guid": guid, "quality": quality, "state": "waiting", "progress": 0,
-            "taskGuid": task_guid, "touched": time.monotonic(), "started": time.time()}
-    _DL_TASKS[task_guid] = task
+    download_id = uuid4().hex
+    task = {"guid": guid, "quality": quality, "state": "waiting", "percent": 0,
+            "downloadId": download_id, "touched": time.monotonic(), "started": time.time()}
+    _DL_TASKS[download_id] = task
     asyncio.create_task(_dl_produce(task, copy_incoming_headers(request)))
     return JSONResponse(content={
-        "code": 0, "msg": "ok", "status": "success",
-        "data": {"taskGuid": task_guid, "guid": raw_guid or guid, "quality": quality,
-                 "state": "waiting", "progress": 0},
+        "code": 0, "msg": "",
+        "data": {"status": "success", "errno": "", "errmsg": "", "downloadId": download_id},
     })
 
 
@@ -4921,12 +4937,12 @@ async def dl_transcode_status(request: Request):
     task = _dl_find_task(request, body)
     if task is None:
         return await _dl_forward(request)
-    data = {"taskGuid": _task_guid_of(task), "guid": task["guid"],
-            "state": task["state"], "progress": int(task.get("progress", 0))}
-    if task["state"] == "completed":
-        data.update({"size": task.get("size", 0), "progress": 100,
-                     "bitrate": str(CONF.get("transcode_bitrate") or "128k")})
-    return JSONResponse(content={"code": 0, "msg": "ok", "status": "success", "data": data})
+    return JSONResponse(content={
+        "code": 0, "msg": "",
+        "data": {"status": _dl_state_word(task), "errno": "",
+                 "errmsg": str(task.get("errmsg") or ""), "downloadId": _task_guid_of(task),
+                 "percent": int(task.get("percent", 0))},
+    })
 
 
 @app.api_route("/music/api/v1/download/track/transcode/file", methods=["GET", "HEAD"])
@@ -4938,7 +4954,8 @@ async def dl_transcode_file(request: Request):
     path = task.get("path")
     if task["state"] != "completed" or not path or not os.path.isfile(path):
         return JSONResponse(content={"code": 404, "msg": "not ready", "data": None}, status_code=404)
-    return serve_file_with_range(path, request.headers.get("range"), "audio/mp4")
+    media = "audio/mpeg" if os.path.splitext(path)[1].lower() == ".mp3" else "audio/mp4"
+    return serve_file_with_range(path, request.headers.get("range"), media)
 
 
 @app.api_route("/music/api/v1/download/track/transcode/delete", methods=["GET", "POST", "DELETE"])
@@ -4947,10 +4964,15 @@ async def dl_transcode_delete(request: Request):
     task = _dl_find_task(request, body)
     if task is None:
         return await _dl_forward(request)
+    download_id = ""
     for key, value in list(_DL_TASKS.items()):
         if value is task:
             _DL_TASKS.pop(key, None)
-    return JSONResponse(content={"code": 0, "msg": "ok", "status": "success", "data": None})
+            download_id = key
+    return JSONResponse(content={
+        "code": 0, "msg": "",
+        "data": {"downloadId": download_id, "deleted": True},
+    })
 
 
 async def _online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
