@@ -80,12 +80,26 @@ class SourceBulkhead:
         return future
 
     async def run(self, source, fn, *args, timeout):
-        future = asyncio.wrap_future(self.submit(source, fn, *args))
+        # A busy source means the previous keyword's worker still holds the
+        # slot. Rejecting instantly hands the caller an empty result while the
+        # real results are still being produced, so wait for admission within
+        # the caller's own timeout budget instead.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                future = asyncio.wrap_future(self.submit(source, fn, *args))
+                break
+            except SourceBusy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.2, max(0.02, remaining)))
         # Never cancel the executor future, even before its worker starts:
         # cancelled queue entries would otherwise release admission too early.
         # Retrieve late failures even when their original waiter has gone away.
         future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        remaining = max(0.05, deadline - time.monotonic())
+        return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
 
     def shutdown(self, wait=True):
         with self._lock:

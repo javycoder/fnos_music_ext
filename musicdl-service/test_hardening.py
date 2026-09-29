@@ -96,6 +96,93 @@ class TestSourceBulkhead:
         finally:
             pool.shutdown()
 
+    def test_run_waits_for_busy_source_within_budget(self):
+        """busy 的源在 timeout 预算内等坑释放后执行，而不是立即交白卷。"""
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+
+        def slow():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        async def main():
+            first = asyncio.create_task(pool.run("source", slow, timeout=5))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            # 上一个关键词的 worker 还占着坑：第二次调用在预算内排队
+            second = asyncio.create_task(pool.run("source", lambda: "second", timeout=5))
+            await asyncio.sleep(0.3)
+            assert not second.done(), "second call should still wait for admission"
+            release.set()
+            assert await first == "first"
+            assert await second == "second"
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+    def test_run_busy_budget_exhausted_stays_busy(self):
+        """预算耗尽仍抢不到坑：保持 SourceBusy 语义，让调用方拿到明确失败。"""
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+
+        def slow():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        async def main():
+            first = asyncio.create_task(pool.run("source", slow, timeout=5))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            with pytest.raises(SourceBusy):
+                await pool.run("source", lambda: "second", timeout=0.4)
+            release.set()
+            assert await first == "first"
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+    def test_run_queue_wait_counts_against_budget(self):
+        """排队耗时计入总预算：等坑用掉的时间会压缩实际执行的超时。"""
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+
+        def slow():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        def would_be_slow():
+            time.sleep(0.6)
+            return "second"
+
+        async def main():
+            first = asyncio.create_task(pool.run("source", slow, timeout=5))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            second = asyncio.create_task(pool.run("source", would_be_slow, timeout=1.0))
+            await asyncio.sleep(0.8)  # 让排队吃掉大部分预算
+            release.set()
+            assert await first == "first"
+            with pytest.raises(asyncio.TimeoutError):
+                await second
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
 
 class TestSearchCache:
     def test_cache_put_and_get_hit(self):
