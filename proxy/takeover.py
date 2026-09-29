@@ -505,7 +505,8 @@ def diagnostic(text):
 # dictionaries, config values or URLs appended to them. This deliberately small
 # allowlist covers source/search/stream/auth/recommend failures in the current app.
 _SAFE_OUTCOME = re.compile(
-    r'(?:Failed to fetch online search from (?:musicdl|lxmusic)|'
+    r'(?:\[dl-capture\] [ -~]{0,600}|'
+    r'Failed to fetch online search from (?:musicdl|lxmusic)|'
     r'Failed to fetch musicbox search|musicdl search partial errors|'
     r'Suggest musicdl error|Stream startup failed|'
     r'Stream aborted mid-way for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'

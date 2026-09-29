@@ -300,6 +300,14 @@ def test_safe_child_log_allows_request_log_and_degrade():
     )
     assert safe_child_log(degrade_line) is not None
 
+    # trace_forward 抓包日志（download/* 协议对齐取证）需放行到 journal，其余仍丢弃
+    capture_line = (
+        "2026-09-18 10:00:00,123 [INFO] fnmusic_proxy: "
+        '[dl-capture] PREPARE req q={} body={\'trackGUID\': \'abc\', \'quality\': \'standard\'}'
+    )
+    out = safe_child_log(capture_line)
+    assert out is not None and "[dl-capture] PREPARE" in out and "secret" not in out
+
     assert safe_child_log("2026-09-18 10:00:00,123 [INFO] fnmusic_proxy: secret token abc123") is None
 
 
