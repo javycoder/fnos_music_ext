@@ -308,6 +308,19 @@ def test_safe_child_log_allows_request_log_and_degrade():
     out = safe_child_log(capture_line)
     assert out is not None and "[dl-capture] PREPARE" in out and "secret" not in out
 
+    # 损坏流防护/后台下载失败日志（2026-09-29 kuwo 坏流事件）需可观测
+    for line in (
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "audio decode check failed for online:kuwo:9 (ext=flac bytes=52159151)",
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "retrying online:kuwo:9 with mp3 tier after corrupt lossless stream",
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "tee finalize rejected corrupt lossless for online:kuwo:9",
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "Background full fetch failed for online:kuwo:9: RuntimeError",
+    ):
+        assert safe_child_log(line) is not None
+
     assert safe_child_log("2026-09-18 10:00:00,123 [INFO] fnmusic_proxy: secret token abc123") is None
 
 

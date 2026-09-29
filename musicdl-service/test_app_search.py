@@ -4,6 +4,8 @@
 并通过 monkeypatch 替换单源搜索函数来模拟快源/慢源/熔断源。
 """
 import asyncio
+import shutil
+import subprocess
 import sys
 import time
 import types
@@ -717,3 +719,95 @@ def test_module_conf_sources_from_env_file_normalized(monkeypatch, tmp_path):
     spec.loader.exec_module(mod)
     assert mod.CONF["sources"] == ["KugouMusicClient", "NeteaseMusicClient"]
     assert mod._SOURCES_ORIGIN.startswith("env file")
+
+
+# === 损坏流防护：无损头探针 + kuwo mp3 降级（2026-09-29 kuwo CDN 实测） ===
+
+ffmpeg_path = shutil.which("ffmpeg")
+
+
+@pytest.mark.skipif(ffmpeg_path is None, reason="宿主机无 ffmpeg")
+def test_decode_probe_ok_judges_by_decoded_duration(tmp_path):
+    """截断的完好样本解出数秒=好；开头就坏的样本 time≈0=坏。"""
+    good = tmp_path / "good.flac"
+    subprocess.run(
+        [ffmpeg_path, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+         "-c:a", "flac", str(good)], check=True, timeout=60)
+    # 截断到头部若干字节：仍是可解出前几秒的完好流
+    data = good.read_bytes()
+    trunc = tmp_path / "trunc.flac"
+    trunc.write_bytes(data[: min(len(data) - 100, 160 * 1024)])
+    assert app_module._decode_probe_ok(str(trunc)) is True
+    # 头部完好、正文损坏（对齐 kuwo 坏流形态：合法 fLaC 头 + 垃圾正文）
+    corrupt = tmp_path / "corrupt.flac"
+    corrupt.write_bytes(data[:200] + b"\x00" * 100_000)
+    assert app_module._decode_probe_ok(str(corrupt)) is False
+
+
+@pytest.mark.anyio
+async def test_maybe_downgrade_swaps_corrupt_lossless_to_mp3(clean_state, monkeypatch):
+    entry = {"item": {"ext": "flac", "download_url": "http://src/flac"},
+             "download_headers": {"User-Agent": "x"}}
+    async def _probe_bad(url, headers, song_id):
+        return False
+    monkeypatch.setattr(app_module, "_head_probe", _probe_bad)
+    monkeypatch.setattr(app_module, "_kuwo_force_mp3_url_sync",
+                        lambda sid: ("http://src/mp3", {"User-Agent": "okhttp/3.10.0"}))
+    url, headers = await app_module._maybe_downgrade(
+        "kuwo:123", entry, "http://src/flac", "", None)
+    assert url == "http://src/mp3"
+    assert headers["User-Agent"] == "okhttp/3.10.0"
+
+
+@pytest.mark.anyio
+async def test_maybe_downgrade_keeps_clean_lossless(clean_state, monkeypatch):
+    entry = {"item": {"ext": "flac"}, "download_headers": {"Referer": "r"}}
+    async def _probe_ok(url, headers, song_id):
+        return True
+    monkeypatch.setattr(app_module, "_head_probe", _probe_ok)
+    url, headers = await app_module._maybe_downgrade(
+        "kuwo:123", entry, "http://src/flac", "", "bytes=0-99")
+    assert url == "http://src/flac" and headers["Range"] == "bytes=0-99"
+
+
+@pytest.mark.anyio
+async def test_maybe_downgrade_quality_param_forces_mp3_without_probe(clean_state, monkeypatch):
+    entry = {"item": {"ext": "flac"}, "download_headers": {}}
+    async def _fail_probe(url, headers, song_id):
+        raise AssertionError("quality=mp3 不应再探测无损档")
+    monkeypatch.setattr(app_module, "_head_probe", _fail_probe)
+    monkeypatch.setattr(app_module, "_kuwo_force_mp3_url_sync",
+                        lambda sid: ("http://src/mp3", {"User-Agent": "okhttp/3.10.0"}))
+    url, _ = await app_module._maybe_downgrade(
+        "kuwo:123", entry, "http://src/flac", "mp3", None)
+    assert url == "http://src/mp3"
+
+
+def test_kuwo_force_mp3_url_extracts_from_official_api(monkeypatch):
+    """convert_url2 应答文本中提取直链（stub 掉库的加密工具与 HTTP）。"""
+    kuwo_stub = types.ModuleType("musicdl.modules.sources.kuwo")
+    class _U:
+        @staticmethod
+        def encryptquery(q):
+            return "ENCRYPTED"
+    kuwo_stub.KuwoMusicClientUtils = _U
+    monkeypatch.setitem(sys.modules, "musicdl.modules.sources.kuwo", kuwo_stub)
+    monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
+
+    class _Resp:
+        text = 'xxx\r\nhttp://kw-er.kuwo.cn/abc/mp3_320.mp3?sign=1\r\n000'
+    class _Client:
+        def __init__(self, timeout=None):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def get(self, url, headers=None):
+            assert "q=ENCRYPTED" in url
+            return _Resp()
+    monkeypatch.setattr(app_module.httpx, "Client", _Client)
+    result = app_module._kuwo_force_mp3_url_sync("kuwo:456")
+    assert result is not None
+    assert result[0].startswith("http://kw-er.kuwo.cn/") and "mp3" in result[0]
+    assert result[1]["User-Agent"] == "okhttp/3.10.0"

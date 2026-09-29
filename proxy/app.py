@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -3305,8 +3306,17 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     开启时随迁），关→进滚动缓存（不写歌词）。
 
     part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
+    无损档解码校验不过直接丢弃（上游损坏流绝不入库）并拉黑该 guid。
     返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
     """
+    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
+        _lossless_blacklist(guid)
+        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return None
     src = dict(info or {})
     title, artist, album = _tag_fields(src)
     if tee_enabled:
@@ -3618,13 +3628,15 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
-async def _open_online_stream(request: Request, guid: str, range_header: str | None):
+async def _open_online_stream(request: Request, guid: str, range_header: str | None,
+                              force_mp3: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client."""
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
     headers = {"Accept-Encoding": "identity"}
     if range_header:
         headers["Range"] = range_header
+    via_musicdl = False
     owned = None
     resp = None
     ext = None
@@ -3660,7 +3672,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             req = client.build_request("GET", url, headers=headers)
         else:
             client = get_musicdl_client(request.app)
-            req = client.build_request("GET", "/stream", params={"id": song_id_from_online_guid(guid), "proxy": "true"}, headers=headers)
+            via_musicdl = True
+            params = {"id": song_id_from_online_guid(guid), "proxy": "true"}
+            # 无损档已被判定损坏的曲目（或上层明确要求）直接取 mp3 档；
+            # 带断点续传的请求不切档——前后字节必须来自同一条流
+            if (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
+                params["quality"] = "mp3"
+            req = client.build_request("GET", "/stream", params=params, headers=headers)
         resp = await client.send(req, stream=True)
         content_type = resp.headers.get("content-type", "").lower()
         if (resp.status_code not in (200, 206)
@@ -3673,6 +3691,11 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
         first = await anext(chunks, b"")
         if not first:
             return None
+        # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
+        # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
+        # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
+        if via_musicdl and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
+            ext = "mp3"
         result = (resp, owned, ext, info, chunks, first)
         resp = owned = None  # transfer ownership to response iterator
         return result
@@ -3686,6 +3709,49 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
 _FULL_FETCH_COOLDOWN_S = 1800.0
 _full_fetch_tasks: "dict[str, asyncio.Task]" = {}
 _full_fetch_failed: "dict[str, float]" = {}
+
+# --- 损坏流防护（2026-09-29 实测）-----------------------------------------
+# kuwo 官方 CDN 的无损档交付不可解码字节（fLaC 头与 Content-Length 都正常，
+# musicdl 库探活只验 URL/扩展名），坏文件一旦入库，官方转码器编到坏点即报
+# "transcoding error"、App 端表现为转码下载失败。对策：入库前全量解码校验，
+# 坏流丢弃并按 guid 拉黑无损档——此后该曲目取流自动降级 mp3 档（musicdl
+# 服务 /stream?quality=mp3）。
+_LOSSLESS_EXTS = {"flac", "wav", "ape", "m4a", "alac", "ogg", "opus"}
+_LOSSLESS_BAD: "dict[str, float]" = {}
+_LOSSLESS_BAD_TTL_S = 6 * 3600.0
+
+
+def _lossless_blacklist(guid: str) -> None:
+    _LOSSLESS_BAD[guid] = time.monotonic()
+
+
+def _lossless_is_blacklisted(guid: str) -> bool:
+    ts = _LOSSLESS_BAD.get(guid)
+    if ts is None:
+        return False
+    if time.monotonic() - ts > _LOSSLESS_BAD_TTL_S:
+        _LOSSLESS_BAD.pop(guid, None)
+        return False
+    return True
+
+
+def _audio_file_ok(path: str) -> bool:
+    """完整音频文件的解码校验：ffmpeg 无任何错误输出才算通过。
+
+    只对已通过长度校验的完整文件调用——截断的完好文件同样会报解码错误，
+    报错文本无法区分二者，完整性必须由字节数校验先行保证。
+    ffmpeg 不可用（测试守卫/宿主机缺件）时无从校验，只能放行。
+    """
+    if not tc.FFMPEG_BIN:
+        return True
+    try:
+        r = subprocess.run(
+            [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-f", "null", "-"],
+            capture_output=True, text=True, timeout=300,
+        )
+        return r.returncode == 0 and not (r.stderr or "").strip()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _prune_full_fetch_state(now: float) -> None:
@@ -3773,8 +3839,12 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
     return base
 
 
-async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
-    """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。"""
+async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False) -> None:
+    """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。
+
+    无损档解码校验失败时按 guid 拉黑并自动以 mp3 档重试一次（服务端
+    quality=mp3），两次都坏才宣告失败——坏字节绝不入库。
+    """
     part = None
     resp = None
     owned = None
@@ -3782,7 +3852,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
         # 合成最小 Request scope（触发请求的凭证头 + app 实例），完整复用在线取
         # 流的解析/元数据/首字节校验逻辑；Range 传 None 保证拿到完整资源。
         fake_request = _synth_request(cred_headers)
-        opened = await _open_online_stream(fake_request, guid, None)
+        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3)
         if not opened:
             raise RuntimeError("open failed")
         resp, owned, ext, info, chunks, first = opened
@@ -3806,6 +3876,21 @@ async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
             raise RuntimeError(f"size mismatch written={written} expected={expected}")
         info = await _info_for_background_save(fake_request, guid, info)
         ext = ext or (info or {}).get("ext") or "mp3"
+        if ext in _LOSSLESS_EXTS and not await asyncio.to_thread(_audio_file_ok, part):
+            _lossless_blacklist(guid)
+            logger.warning("audio decode check failed for %s (ext=%s bytes=%d)", guid, ext, written)
+            # 坏流不落库：关掉当前连接后改要 mp3 档重来一次
+            with anyio.CancelScope(shield=True):
+                if resp:
+                    await resp.aclose()
+                if owned:
+                    await owned.aclose()
+                resp = owned = None
+            if not force_mp3:
+                logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
+                await _full_fetch_download(guid, cred_headers, force_mp3=True)
+                return
+            raise RuntimeError("corrupt stream even at mp3 tier")
         meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True)
         part = None
         logger.info("Background full fetch saved %s (%d bytes)", guid, written)
@@ -4643,6 +4728,8 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
                        if k.lower() in ("referer", "user-agent")}
             return str(resolved["url"]), headers or None
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
+        if _lossless_is_blacklisted(guid):
+            url += "&quality=mp3"
         return url, None
     except Exception as e:  # noqa: BLE001
         logger.warning("transcode source resolve failed for %s: %s", guid, e)

@@ -506,6 +506,10 @@ def diagnostic(text):
 # allowlist covers source/search/stream/auth/recommend failures in the current app.
 _SAFE_OUTCOME = re.compile(
     r'(?:\[dl-capture\] [ -~]{0,600}|'
+    r'audio decode check failed for [!-~]{1,120} \(ext=[a-z0-9]{1,8} bytes=[0-9]{1,12}\)|'
+    r'retrying [!-~]{1,120} with mp3 tier after corrupt lossless stream|'
+    r'tee finalize rejected corrupt lossless for [!-~]{1,120}|'
+    r'Background full fetch failed for [!-~]{1,120}: [A-Za-z_]{1,40}|'
     r'Failed to fetch online search from (?:musicdl|lxmusic)|'
     r'Failed to fetch musicbox search|musicdl search partial errors|'
     r'Suggest musicdl error|Stream startup failed|'

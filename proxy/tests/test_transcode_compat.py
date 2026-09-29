@@ -33,6 +33,12 @@ if mode == "hang":
     sys.exit(0)
 if mode == "ok_delay":
     time.sleep(0.5)
+# 解码校验调用（-f null -）：FAKE_FFMPEG_DECODE 控制成败；不落任何文件
+if "-f" in args and "null" in args:
+    if os.environ.get("FAKE_FFMPEG_DECODE") == "bad":
+        sys.stderr.write("[flac] invalid sync code\\n")
+        sys.exit(1)
+    sys.exit(0)
 if "-hls_segment_filename" in args:
     pattern = args[args.index("-hls_segment_filename") + 1]
     segdir = os.path.dirname(os.path.abspath(pattern))
@@ -700,3 +706,145 @@ def test_remember_media_path_roundtrip(env):
     appmod.remember_media_path(FAKE_KUWO, audio)
     stem = appmod.recalled_media_stem(FAKE_KUWO)
     assert stem == audio[:-len(".flac")]       # 记词干不记扩展名
+
+
+# === 损坏流防护：无损入库前解码校验 + mp3 档自动降级（2026-09-29 kuwo 实测） ===
+
+class _Whole(httpx.AsyncByteStream):
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aiter__(self):
+        yield self.payload
+
+    async def aclose(self):
+        pass
+
+
+class _Done(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        if False:
+            yield b""
+
+    async def aclose(self):
+        pass
+
+
+def _mk_part(path, size):
+    with open(path, "wb") as f:
+        f.write(b"fLaC" + b"X" * (size - 4))
+    return str(path)
+
+
+@pytest.mark.anyio
+async def test_full_fetch_corrupt_lossless_retries_mp3(env, fake_ffmpeg, monkeypatch):
+    """无损流解码不过：拒入曲库、拉黑 guid、自动改要 mp3 档重试成功。"""
+    fake_ffmpeg("ok")
+    monkeypatch.setenv("FAKE_FFMPEG_DECODE", "bad")
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    guid = "online:kuwo:99001"
+    flac, mp3 = b"fLaC" + b"F" * 9000, b"ID3" + b"M" * 8000
+    opens = []
+
+    async def fake_open(request, g, range_header, force_mp3=False):
+        opens.append(force_mp3)
+        data = mp3 if force_mp3 else flac
+        info = {"title": "测试曲", "artist": "测试人",
+                "ext": "mp3" if force_mp3 else "flac"}
+        resp = httpx.Response(200, stream=_Whole(data),
+                              headers={"content-length": str(len(data))})
+        return (resp, None, info["ext"], info, _Done(), data)
+
+    monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
+    appmod._LOSSLESS_BAD.clear()
+    await appmod._full_fetch_download(guid, {"cookie": "sid=t"})
+    assert opens == [False, True]                       # 先无损后 mp3
+    assert appmod._lossless_is_blacklisted(guid)        # 无损档已拉黑
+    dest = os.path.join(env["dirs"]["library"], "测试人 - 测试曲.mp3")
+    assert os.path.isfile(dest)                         # mp3 档入库
+    assert not any(n.endswith(".flac") for n in os.listdir(env["dirs"]["library"]))
+    assert guid not in appmod._full_fetch_failed
+
+
+@pytest.mark.anyio
+async def test_full_fetch_corrupt_even_at_mp3_fails_clean(env, fake_ffmpeg, monkeypatch):
+    """mp3 档同样声称无损且解码不过：两次失败后放弃，曲库零写入。"""
+    fake_ffmpeg("ok")
+    monkeypatch.setenv("FAKE_FFMPEG_DECODE", "bad")
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    guid = "online:kuwo:99002"
+    opens = []
+
+    async def fake_open(request, g, range_header, force_mp3=False):
+        opens.append(force_mp3)
+        data = b"fLaC" + b"F" * 9000
+        resp = httpx.Response(200, stream=_Whole(data),
+                              headers={"content-length": str(len(data))})
+        return (resp, None, "flac", {"title": "测试曲2", "artist": "测试人"}, _Done(), data)
+
+    monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
+    appmod._LOSSLESS_BAD.clear()
+    await appmod._full_fetch_download(guid, {"cookie": "sid=t"})
+    assert opens == [False, True]
+    assert guid in appmod._full_fetch_failed             # 明确失败
+    assert os.listdir(env["dirs"]["library"]) == []      # 曲库零写入
+
+
+def test_tee_finalize_rejects_corrupt_lossless(env, fake_ffmpeg, monkeypatch, tmp_path):
+    fake_ffmpeg("ok")
+    monkeypatch.setenv("FAKE_FFMPEG_DECODE", "bad")
+    guid = "online:kuwo:99003"
+    appmod._LOSSLESS_BAD.clear()
+    part = _mk_part(tmp_path / "a.part", 2048)
+    meta = appmod._tee_finalize(part, guid, "flac", {"title": "t", "artist": "a"}, True)
+    assert meta is None                                  # 拒绝转正
+    assert not os.path.exists(part)                      # 临时件已清
+    assert appmod._lossless_is_blacklisted(guid)
+
+
+def test_tee_finalize_accepts_lossless_when_decode_ok(env, fake_ffmpeg, monkeypatch, tmp_path):
+    fake_ffmpeg("ok")                                    # FAKE_FFMPEG_DECODE 未设 → 解码通过
+    appmod._LOSSLESS_BAD.clear()
+    part = _mk_part(tmp_path / "b.part", 2048)
+    meta = appmod._tee_finalize(part, "online:kuwo:99004", "flac",
+                                {"title": "好曲", "artist": "好人"}, True)
+    assert meta is not None and os.path.isfile(meta["dest"])
+
+
+def test_open_stream_blacklisted_guid_requests_mp3(env):
+    """拉黑曲目的取流请求带 quality=mp3（且续传请求不切档）。"""
+    appmod._LOSSLESS_BAD.clear()
+    captured = {}
+
+    class _FakeClient:
+        def build_request(self, method, url, params=None, headers=None):
+            captured["params"] = params
+            resp = httpx.Response(200, stream=_Whole(b"ID3xyz"),
+                                  headers={"content-length": "6",
+                                           "content-type": "audio/mpeg"})
+            return resp
+
+        async def send(self, req, stream=False):
+            import io
+            return httpx.Response(200, stream=_Whole(b"ID3xyz"),
+                                  headers={"content-length": "6",
+                                           "content-type": "audio/mpeg"})
+
+    class _FakeApp:
+        state = type("S", (), {"musicdl_client": _FakeClient()})()
+
+    def _fake_get(app):
+        return _FakeClient()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(appmod, "get_musicdl_client", _fake_get)
+    appmod._lossless_blacklist("online:kuwo:99005")
+
+    async def _run():
+        req = appmod.Request({"type": "http", "headers": [], "app": _FakeApp()})
+        return await appmod._open_online_stream(req, "online:kuwo:99005", None)
+
+    opened = asyncio.run(_run())
+    assert captured["params"].get("quality") == "mp3"
+    assert opened is not None and opened[2] == "mp3"     # content-type 修正扩展名
+    monkeypatch.undo()
