@@ -788,9 +788,50 @@ def play_format_from_ext(ext: str | None) -> str:
     return _FORMAT_ALIASES.get(raw, raw or "mp3")
 
 
+def _sanitize_content_disposition(value: str) -> str:
+    """把 Content-Disposition 里的非 latin-1 文件名规范化为 RFC 6266/5987 格式。
+
+    上游（官方 trim-music）在交付转码/下载文件时会在 filename="..." 填入原始中文歌名，
+    同时在 filename*=UTF-8''... 填入 URL 编码的歌名。Starlette 要求所有响应头
+    必须能被 latin-1 编码，否则抛出 UnicodeEncodeError 导致 500 报错。
+    本函数将 filename="..." 中的非 ASCII 字符替换为安全字符，并确保 filename*= 存在。
+    """
+    m_star = re.search(r"filename\*=([^;]+)", value, re.IGNORECASE)
+    m_plain = re.search(r'filename="([^"]+)"', value, re.IGNORECASE)
+    if not m_plain:
+        m_plain = re.search(r'filename=([^; ]+)', value, re.IGNORECASE)
+
+    raw_fn = m_plain.group(1) if m_plain else "track"
+    ext = "." + raw_fn.rsplit(".", 1)[-1] if "." in raw_fn else ""
+    ascii_fn = re.sub(r'[^\x20-\x7e]', '_', raw_fn)
+    if not ascii_fn.strip() or ascii_fn == ext:
+        ascii_fn = f"track{ext}"
+
+    if m_star:
+        star_part = f"filename*={m_star.group(1).strip()}"
+    else:
+        quoted = quote(raw_fn, encoding="utf-8")
+        star_part = f"filename*=UTF-8''{quoted}"
+
+    disposition = value.split(";")[0].strip() or "attachment"
+    return f'{disposition}; filename="{ascii_fn}"; {star_part}'
+
+
 def filter_headers(headers: Any, exclude_keys: set | None = None) -> dict:
     exclude = HOP_BY_HOP | {k.lower() for k in (exclude_keys or set())}
-    return {k: v for k, v in headers.items() if k.lower() not in exclude}
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in exclude:
+            continue
+        try:
+            str(v).encode("latin-1")
+            out[k] = v
+        except UnicodeEncodeError:
+            if k.lower() == "content-disposition":
+                out[k] = _sanitize_content_disposition(str(v))
+            else:
+                out[k] = str(v).encode("latin-1", errors="replace").decode("latin-1")
+    return out
 
 
 def copy_incoming_headers(request: Request) -> dict:
@@ -1602,7 +1643,8 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
     return start, end
 
 
-def serve_file_with_range(path: str, range_header: str | None, media_type: str) -> Response:
+def serve_file_with_range(path: str, range_header: str | None, media_type: str,
+                          extra_headers: dict | None = None) -> Response:
     file_size = os.path.getsize(path)
     rng = parse_http_range(range_header, file_size)
 
@@ -1620,28 +1662,33 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str) 
 
         return gen()
 
+    extra = extra_headers or {}
     if rng is None:
+        headers = {
+            "Content-Type": media_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        }
+        headers.update(extra)
         return StreamingResponse(
             iter_file(0, file_size),
             status_code=200,
-            headers={
-                "Content-Type": media_type,
-                "Content-Length": str(file_size),
-                "Accept-Ranges": "bytes",
-            },
+            headers=headers,
         )
 
     start, end = rng
     length = end - start + 1
+    headers = {
+        "Content-Type": media_type,
+        "Content-Length": str(length),
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+    }
+    headers.update(extra)
     return StreamingResponse(
         iter_file(start, length),
         status_code=206,
-        headers={
-            "Content-Type": media_type,
-            "Content-Length": str(length),
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Accept-Ranges": "bytes",
-        },
+        headers=headers,
     )
 
 
@@ -4981,7 +5028,7 @@ async def _dl_forward(request: Request):
                         request.method, request.url.path, resp.status_code, b"".join(captured)[:2000])
 
     return StreamingResponse(_tee(), status_code=resp.status_code,
-                             headers=dict(resp.headers), media_type=resp.media_type)
+                             headers=filter_headers(resp.headers), media_type=resp.media_type)
 
 
 @app.api_route("/music/api/v1/download/track/transcode/prepare", methods=["GET", "POST"])
@@ -5042,7 +5089,15 @@ async def dl_transcode_file(request: Request):
     if task["state"] != "completed" or not path or not os.path.isfile(path):
         return JSONResponse(content={"code": 404, "msg": "not ready", "data": None}, status_code=404)
     media = "audio/mpeg" if os.path.splitext(path)[1].lower() == ".mp3" else "audio/mp4"
-    return serve_file_with_range(path, request.headers.get("range"), media)
+    fname = os.path.basename(path)
+    fn_ext = os.path.splitext(fname)[1]
+    quoted = quote(fname, encoding="utf-8")
+    ascii_fn = re.sub(r'[^\x20-\x7e]', '_', fname)
+    if not ascii_fn.strip() or ascii_fn == fn_ext:
+        ascii_fn = f"track{fn_ext}"
+    disposition = f'attachment; filename="{ascii_fn}"; filename*=UTF-8\'\'{quoted}'
+    return serve_file_with_range(path, request.headers.get("range"), media,
+                                 extra_headers={"Content-Disposition": disposition})
 
 
 @app.api_route("/music/api/v1/download/track/transcode/delete", methods=["GET", "POST", "DELETE"])

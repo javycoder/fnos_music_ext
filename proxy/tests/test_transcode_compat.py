@@ -848,3 +848,21 @@ def test_open_stream_blacklisted_guid_requests_mp3(env):
     assert captured["params"].get("quality") == "mp3"
     assert opened is not None and opened[2] == "mp3"     # content-type 修正扩展名
     monkeypatch.undo()
+
+
+def test_filter_headers_sanitizes_unicode_content_disposition():
+    """上游返回中文文件名时 filter_headers 规范化为 RFC 6266/5987，防止 Starlette latin-1 抛 500。"""
+    raw_headers = {
+        "content-type": "audio/mpeg",
+        "content-disposition": 'attachment; filename="马頔 - 南山南.mp3"; filename*=UTF-8\'\'%E9%A9%AC%E9%A0%94%20-%20%E5%8D%97%E5%B1%B1%E5%8D%97.mp3',
+        "x-custom-utf8": "中文说明",
+    }
+    filtered = appmod.filter_headers(raw_headers)
+    # 所有 value 必须能被 latin-1 正常编码
+    for k, v in filtered.items():
+        v.encode("latin-1")
+    assert "filename*=" in filtered["content-disposition"]
+    assert "%E9%A9%AC%E9%A0%94" in filtered["content-disposition"]
+    # 纯中文 filename 替换或 URL 编码，不保留裸中文
+    assert "马頔" not in filtered["content-disposition"]
+
