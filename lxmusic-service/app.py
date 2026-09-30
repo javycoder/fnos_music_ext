@@ -94,6 +94,9 @@ CONF = {
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
     # 搜索期 VIP/第三方直链曲目的探活结果有效期（秒）：过期后 track/url 重新解析
     "probe_fresh_s": int(os.environ.get("LX_PROBE_FRESH_S", "900")),
+    # 逐曲探活开关（beta）：默认关。开启时在搜索阶段逐曲调用用户源解析+Range探活；
+    # 慢速用户源或多平台并发容易引发搜索超时，建议保持关闭（播放时实时解析直链）
+    "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
 }
 
 # 当前激活的用户自定义源（启动时从 state.json / LX_SOURCE_URL 恢复）
@@ -114,6 +117,14 @@ def _record_failure(exc: Exception) -> None:
 
 
 _SEARCH_PARTIAL: ContextVar[list | None] = ContextVar("lx_search_partial", default=None)
+_SEARCH_PROBE_ENABLED: ContextVar[bool | None] = ContextVar("lx_search_probe_enabled", default=None)
+
+
+def is_probe_enabled() -> bool:
+    v = _SEARCH_PROBE_ENABLED.get()
+    if v is not None:
+        return v
+    return bool(CONF.get("search_probe", False))
 
 
 def _publish(item: dict) -> None:
@@ -276,10 +287,17 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             _cache_put(item)
             items.append(item)
             _publish(item)
-    # VIP 候选批量探活，通过（verified）才补进结果
+    # VIP 候选：开启逐曲探活时探活后补进；未开启时直接作为未验证候选补齐结果
     if vip_candidates and len(items) < limit:
         want = min(len(vip_candidates), limit - len(items) + limit // 2)
-        items.extend(await _probe_candidates(client, "kg", vip_candidates[:want], limit - len(items)))
+        if is_probe_enabled():
+            items.extend(await _probe_candidates(client, "kg", vip_candidates[:want], limit - len(items)))
+        else:
+            for it in vip_candidates[:want]:
+                it.update(verified=False, validation_status="unverified", completeness="unknown")
+                _cache_put(it)
+                items.append(it)
+                _publish(it)
     return items[: limit + limit // 2]
 
 
@@ -396,10 +414,17 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             _cache_put(item)
             items.append(item)
             _publish(item)
-    # VIP 候选批量探活，通过（verified）才补进结果
+    # VIP 候选：开启逐曲探活时探活后补进；未开启时直接作为未验证候选补齐结果
     if vip_candidates and len(items) < limit:
         want = min(len(vip_candidates), limit - len(items) + limit // 2)
-        items.extend(await _probe_candidates(client, "wy", vip_candidates[:want], limit - len(items)))
+        if is_probe_enabled():
+            items.extend(await _probe_candidates(client, "wy", vip_candidates[:want], limit - len(items)))
+        else:
+            for it in vip_candidates[:want]:
+                it.update(verified=False, validation_status="unverified", completeness="unknown")
+                _cache_put(it)
+                items.append(it)
+                _publish(it)
     return items[: limit + limit // 2]
 
 
@@ -460,7 +485,15 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         return item
 
     candidates = [item for it in raw[:fetch_size] if (item := _map_one(it))]
-    return await _probe_candidates(client, "mg", candidates, limit)
+    if is_probe_enabled():
+        return await _probe_candidates(client, "mg", candidates, limit)
+    items = []
+    for it in candidates[:limit]:
+        it.update(verified=False, validation_status="unverified", completeness="unknown")
+        _cache_put(it)
+        items.append(it)
+        _publish(it)
+    return items
 
 
 async def mg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
@@ -961,8 +994,16 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
                 "pay_type": int(pay.get("pay_play") or 0),
             }
         )
-    # 直链由用户自定义源解析+探活；用户源未声明 tx 平台时探活全败返回空
-    return await _probe_candidates(client, "tx", candidates, limit)
+    # 直链由用户自定义源解析+探活；未开启逐曲探活时直接作为未验证条目返回
+    if is_probe_enabled():
+        return await _probe_candidates(client, "tx", candidates, limit)
+    items = []
+    for it in candidates[:limit]:
+        it.update(verified=False, validation_status="unverified", completeness="unknown")
+        _cache_put(it)
+        items.append(it)
+        _publish(it)
+    return items
 
 
 async def tx_resolve_lyric(client: httpx.AsyncClient, identifier: str) -> str:
@@ -1088,7 +1129,15 @@ async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         )
     # 标题相关度排序：原版（title≈keyword）优先于伴奏/DJ/翻唱版本
     candidates.sort(key=lambda c: _title_relevance(c["title"], keyword))
-    return await _probe_candidates(client, "kw", candidates, limit)
+    if is_probe_enabled():
+        return await _probe_candidates(client, "kw", candidates, limit)
+    items = []
+    for it in candidates[:limit]:
+        it.update(verified=False, validation_status="unverified", completeness="unknown")
+        _cache_put(it)
+        items.append(it)
+        _publish(it)
+    return items
 
 
 async def kw_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
@@ -1166,7 +1215,14 @@ async def kg_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
             items.append(item)
             _publish(item)
     if vip_candidates and len(items) < limit:
-        items.extend(await _probe_candidates(client, "kg", vip_candidates, limit - len(items)))
+        if is_probe_enabled():
+            items.extend(await _probe_candidates(client, "kg", vip_candidates, limit - len(items)))
+        else:
+            for it in vip_candidates[:limit - len(items)]:
+                it.update(verified=False, validation_status="unverified", completeness="unknown")
+                _cache_put(it)
+                items.append(it)
+                _publish(it)
     return items[:limit]
 
 
@@ -1227,7 +1283,14 @@ async def kw_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
                 "pay_type": 1 if str(fee_type.get("song") or "0") != "0" else 0,
             }
         )
-    return await _probe_candidates(client, "kw", candidates, limit)
+    if is_probe_enabled():
+        return await _probe_candidates(client, "kw", candidates, limit)
+    items = []
+    for it in candidates[:limit]:
+        it.update(verified=False, validation_status="unverified", completeness="unknown")
+        _cache_put(it)
+        items.append(it)
+    return items
 
 
 async def wy_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
@@ -1286,7 +1349,14 @@ async def wy_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
             items.append(item)
             _publish(item)
     if vip_candidates and len(items) < limit:
-        items.extend(await _probe_candidates(client, "wy", vip_candidates, limit - len(items)))
+        if is_probe_enabled():
+            items.extend(await _probe_candidates(client, "wy", vip_candidates, limit - len(items)))
+        else:
+            for it in vip_candidates[:limit - len(items)]:
+                it.update(verified=False, validation_status="unverified", completeness="unknown")
+                _cache_put(it)
+                items.append(it)
+                _publish(it)
     return items[:limit]
 
 
@@ -1461,6 +1531,7 @@ async def search(
     q: str = Query("", alias="q"),
     limit: int = Query(0),
     sources: str = Query(""),
+    probe: int | None = Query(None, alias="probe"),
     x_fnmusic_scope: str = Header(default=""),
 ):
     kw = (keyword or q or "").strip()
@@ -1475,7 +1546,7 @@ async def search(
     scope = (x_fnmusic_scope or "").strip()
 
     async def _run():
-        return await _search_platforms(kw, limit, wanted)
+        return await _search_platforms(kw, limit, wanted, probe=probe)
 
     result = await LX_SEARCH_GATE.run(scope, kw, _run)
     if result is _LX_SUPERSEDED:
@@ -1483,58 +1554,63 @@ async def search(
     return result
 
 
-async def _search_platforms(kw: str, limit: int, wanted: list[str]) -> dict:
-    client = get_http(app)
-    tasks = {}
-    partials = {}
-    errors: dict[str, str] = {}
-    capabilities = source_capabilities()
-
-    async def run_source(src):
-        token = _SEARCH_PARTIAL.set(partials[src])
-        try:
-            return await _SEARCHERS[src](client, kw, limit)
-        finally:
-            _SEARCH_PARTIAL.reset(token)
-
-    for src in dict.fromkeys(wanted):
-        if src not in _SEARCHERS:
-            continue
-        if not capabilities[src]["playback_available"]:
-            errors[src] = capabilities[src]["reason"]
-            continue
-        partials[src] = []
-        tasks[src] = asyncio.create_task(run_source(src))
-    items: list[dict] = []
+async def _search_platforms(kw: str, limit: int, wanted: list[str], *, probe: int | None = None) -> dict:
+    probe_val = bool(probe) if probe is not None else None
+    probe_token = _SEARCH_PROBE_ENABLED.set(probe_val)
     try:
-        if tasks:
-            # One shared budget, below the proxy's default 15s timeout. Never
-            # multiply the timeout by source count or wait in insertion order.
-            await asyncio.wait(tasks.values(), timeout=max(0.001, min(CONF["search_timeout"], 13.0)))
+        client = get_http(app)
+        tasks = {}
+        partials = {}
+        errors: dict[str, str] = {}
+        capabilities = source_capabilities()
+
+        async def run_source(src):
+            token = _SEARCH_PARTIAL.set(partials[src])
+            try:
+                return await _SEARCHERS[src](client, kw, limit)
+            finally:
+                _SEARCH_PARTIAL.reset(token)
+
+        for src in dict.fromkeys(wanted):
+            if src not in _SEARCHERS:
+                continue
+            if not capabilities[src]["playback_available"]:
+                errors[src] = capabilities[src]["reason"]
+                continue
+            partials[src] = []
+            tasks[src] = asyncio.create_task(run_source(src))
+        items: list[dict] = []
+        try:
+            if tasks:
+                # One shared budget, below the proxy's default 15s timeout. Never
+                # multiply the timeout by source count or wait in insertion order.
+                await asyncio.wait(tasks.values(), timeout=max(0.001, min(CONF["search_timeout"], 13.0)))
+        finally:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for src, task in tasks.items():
+            if task.cancelled():
+                errors[src] = "search deadline exceeded"
+                results = partials[src]
+            elif task.exception() is not None:
+                errors[src] = str(task.exception()) or type(task.exception()).__name__
+                results = partials[src]
+            else:
+                results = task.result()
+            seen = set()
+            for item in results:
+                if item.get("id") not in seen:
+                    items.append(item)
+                    seen.add(item.get("id"))
+                    if len(seen) >= limit:
+                        break
+        _STATS["errors"] += len(errors)
+        return {"ok": True, "items": items, "errors": errors, "stats": dict(_STATS),
+                "capabilities": capabilities}
     finally:
-        for task in tasks.values():
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks.values(), return_exceptions=True)
-    for src, task in tasks.items():
-        if task.cancelled():
-            errors[src] = "search deadline exceeded"
-            results = partials[src]
-        elif task.exception() is not None:
-            errors[src] = str(task.exception()) or type(task.exception()).__name__
-            results = partials[src]
-        else:
-            results = task.result()
-        seen = set()
-        for item in results:
-            if item.get("id") not in seen:
-                items.append(item)
-                seen.add(item.get("id"))
-                if len(seen) >= limit:
-                    break
-    _STATS["errors"] += len(errors)
-    return {"ok": True, "items": items, "errors": errors, "stats": dict(_STATS),
-            "capabilities": capabilities}
+        _SEARCH_PROBE_ENABLED.reset(probe_token)
 
 
 @app.get("/api/v1/recommend")

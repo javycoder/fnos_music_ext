@@ -135,6 +135,7 @@ def isolated(monkeypatch) -> FakeManager:
     lxapp._STATS.update(searches=0, url_resolutions=0, errors=0)
     lxapp.LX_SEARCH_GATE.reset()
     lxapp.app.state.http = None
+    monkeypatch.setitem(lxapp.CONF, "search_probe", True)
     manager = FakeManager()
     monkeypatch.setattr(lxapp, "SOURCE_MANAGER", manager)
     return manager

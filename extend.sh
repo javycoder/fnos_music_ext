@@ -470,7 +470,10 @@ mkdir -p "${BASE_DIR}/sources-data/cache/netease-musicbox" \
     "${BASE_DIR}/sources-data/config/netease-musicbox" \
     "${BASE_DIR}/sources-data/netease-musicbox" \
     "${BASE_DIR}/sources-data/lxmusic"
-chmod -R 0755 "${BASE_DIR}/sources-data" 2>/dev/null || true
+# 数据卷权限收紧：属主对齐容器 appuser（uid 1000），group/other 全收（凭据防本机其他用户读取）
+chown -R 1000:1000 "${BASE_DIR}/sources-data" 2>/dev/null || true
+find "${BASE_DIR}/sources-data" -type d -exec chmod 0700 {} + 2>/dev/null || true
+find "${BASE_DIR}/sources-data" -type f -exec chmod 0600 {} + 2>/dev/null || true
 
 # 旧 v1.x 部署形态清理：宿主机三 unit + 三容器（释放端口 8768/8770/8772 给单容器）
 for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do

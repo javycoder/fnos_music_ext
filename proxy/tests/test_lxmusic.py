@@ -152,8 +152,9 @@ async def test_fetch_lx_search_mapping():
 
 
 @pytest.mark.anyio
-async def test_fetch_lx_search_verified_vip_passes():
-    """verified 条目（服务端已探活实证）绕过收费元数据拦截。"""
+async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
+    """verified 条目（服务端已探活实证）绕过收费元数据拦截（逐曲探活开启时）。"""
+    monkeypatch.setitem(CONF, "search_probe", True)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -195,6 +196,43 @@ async def test_fetch_lx_search_verified_vip_passes():
     items = await fetch_lx_search(client, "晴天", 20)
     assert [it["id"] for it in items] == ["lx:kw:228908"]
     assert items[0]["verified"] is True  # 字段透传
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_fetch_lx_search_probe_disabled_allows_unverified_vip(monkeypatch):
+    """逐曲探活未开启时，lx 候选曲目跳过收费拦截直出（由客户端播放时按需解析）。"""
+    monkeypatch.setitem(CONF, "search_probe", False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "items": [
+                    {
+                        "id": "lx:kw:228908",
+                        "lx_source": "kw",
+                        "title": "晴天",
+                        "artist": "周杰伦",
+                        "album": "叶惠美",
+                        "duration_s": 269.0,
+                        "ext": "flac",
+                        "cover_url": "",
+                        "file_size": 38210000,
+                        "pay_type": 1,
+                        "verified": False,
+                    },
+                ],
+                "errors": {},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    items = await fetch_lx_search(client, "晴天", 20)
+    assert len(items) == 1
+    assert items[0]["id"] == "lx:kw:228908"
+    assert items[0]["verified"] is False
     await client.aclose()
 
 

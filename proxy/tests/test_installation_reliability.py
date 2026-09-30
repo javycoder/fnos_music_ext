@@ -601,10 +601,10 @@ def test_env_flags_written_before_container_up():
 
 
 def test_data_migration_musicbox_to_sources_data(tmp_path):
-    """v1.x musicbox-data → v2.0.0 sources-data：登录态原样保留。"""
+    """v1.x musicbox-data → v2.0.0 sources-data：登录态原样保留 + 权限收紧到位。"""
     text = (BASE/'install.sh').read_text(encoding='utf-8')
     start = text.index('# 数据卷迁移')
-    end = text.index('chmod -R 0755 "${SOURCES_DATA_DIR}"', start)
+    end = text.index('find "${SOURCES_DATA_DIR}" -type f', start)
     end = text.index('|| true', end) + len('|| true')
     block = text[start:end]
     login = tmp_path/'musicbox-data/netease-musicbox/login.json'
@@ -617,6 +617,20 @@ def test_data_migration_musicbox_to_sources_data(tmp_path):
     assert (tmp_path/'sources-data/lxmusic').is_dir()
     assert (tmp_path/'sources-data/cache/netease-musicbox').is_dir()
     assert (tmp_path/'sources-data/config/netease-musicbox').is_dir()
+    # 权限收紧：目录 0700 / 文件 0600（沙箱非 root，chown 静默失败属预期，只断权限位）
+    assert (tmp_path/'sources-data').stat().st_mode & 0o777 == 0o700
+    assert (tmp_path/'sources-data/netease-musicbox').stat().st_mode & 0o777 == 0o700
+    assert (tmp_path/'sources-data/netease-musicbox/login.json').stat().st_mode & 0o777 == 0o600
+
+
+def test_sources_data_permissions_hardened():
+    """回归守卫：sources-data 不许回退到 chmod -R 0755（凭据全局可读）的旧语义。"""
+    install = (BASE/'install.sh').read_text(encoding='utf-8')
+    extend = (BASE/'extend.sh').read_text(encoding='utf-8')
+    assert 'chmod -R 0755 "${SOURCES_DATA_DIR}"' not in install
+    assert 'chmod -R 0755 "${BASE_DIR}/sources-data"' not in extend
+    assert 'chown -R 1000:1000 "${SOURCES_DATA_DIR}"' in install
+    assert 'chown -R 1000:1000 "${BASE_DIR}/sources-data"' in extend
 
 
 def test_extend_lx_user_source_probe_states():

@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -35,12 +36,14 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 try:
     from . import recommend as dailyrec
     from . import nmplaylists as nmpl
+    from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import nmplaylists as nmpl  # type: ignore
+    import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
     from version import get_version  # type: ignore
@@ -124,6 +127,16 @@ CONF = {
     # 在线取流 Range 探针：记录每条在线 /track/stream 的 Range 形态与落盘资格，
     # 用于真机确认手机播放器是否按定长窗口取流（那样边听边存永不触发）
     "stream_probe": os.environ.get("FNMUSIC_STREAM_PROBE", "true").lower() in ("true", "1", "yes"),
+    # 标准音质转码（App 音质偏好=标准时走 HLS 转码而非直拉原文件）：
+    # ffmpeg 输出 AAC fMP4 分片；宿主机无 ffmpeg 自动回落单分片桩
+    "transcode_enabled": os.environ.get("FNMUSIC_TRANSCODE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "transcode_bitrate": os.environ.get("FNMUSIC_TRANSCODE_BITRATE", "128k"),
+    "transcode_hls_time": float(os.environ.get("FNMUSIC_TRANSCODE_HLS_TIME", "10")),
+    "transcode_max_sessions": int(os.environ.get("FNMUSIC_TRANSCODE_MAX_SESSIONS", "2")),
+    "transcode_ttl_s": float(os.environ.get("FNMUSIC_TRANSCODE_TTL_S", "90")),
+    "transcode_cache_max_mb": int(os.environ.get("FNMUSIC_TRANSCODE_CACHE_MAX_MB", "512")),
+    # 下载"标准"档目标码率：官方实测 MP3 320k（prepare quality=standard, FLAC 源 → 320067bps）
+    "transcode_dl_bitrate": os.environ.get("FNMUSIC_TRANSCODE_DL_BITRATE", "320k"),
     # 落盘进曲库后通知官方重扫的接口路径（POST）；空=禁用。官方无公开文档，
     # 真机在官方 App 手动点一次扫描、从代理请求日志捕获真实路径后填入启用
     "library_scan_path": (os.environ.get("FNMUSIC_LIBRARY_SCAN_PATH", "") or "").strip(),
@@ -134,6 +147,7 @@ CONF = {
     "lx_sources": _normalize_lx_sources(os.environ.get("LX_SOURCES", "")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5.0")),
     "fav_dir": os.environ.get(
@@ -454,6 +468,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
+    "FNMUSIC_SEARCH_PROBE": ("search_probe", "bool"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
@@ -469,6 +484,13 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
+    "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
+    "FNMUSIC_TRANSCODE_BITRATE": ("transcode_bitrate", "str"),
+    "FNMUSIC_TRANSCODE_HLS_TIME": ("transcode_hls_time", "seconds"),
+    "FNMUSIC_TRANSCODE_MAX_SESSIONS": ("transcode_max_sessions", "tee_cache_max"),
+    "FNMUSIC_TRANSCODE_TTL_S": ("transcode_ttl_s", "ttl_seconds"),
+    "FNMUSIC_TRANSCODE_CACHE_MAX_MB": ("transcode_cache_max_mb", "mb_int"),
+    "FNMUSIC_TRANSCODE_DL_BITRATE": ("transcode_dl_bitrate", "str"),
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
     "FNMUSIC_LLM_API_KEY": ("", "str"),
     "FNMUSIC_LLM_MODEL": ("llm_model", "str"),
@@ -515,6 +537,16 @@ def _env_watch_parse(raw: str, kind: str):
     if kind == "bind_timeout":
         try:
             return max(10.0, min(3600.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "ttl_seconds":
+        try:
+            return max(10.0, min(3600.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "mb_int":
+        try:
+            return max(1, min(102400, int(raw)))
         except (TypeError, ValueError):
             return None
     if kind == "tee_handoff_max":
@@ -649,7 +681,7 @@ ONLINE_TRIAL_MARKERS = (
 )
 
 
-def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
+def is_playable_online_track(item: dict, require_id: bool = False, allow_paywall: bool = False) -> bool:
     """最终防线校验：过滤无音频流或试听标记的不可播曲目。"""
     if not isinstance(item, dict):
         return False
@@ -673,8 +705,9 @@ def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
     if int(item.get("is_free_part") or 0) != 0 or int(item.get("fail_process") or 0) == 4:
         return False
 
-    # 3. 收费/VIP 拦截（verified 条目已由服务端完成"直链解析+Range探活"验证，可播性有实证，跳过收费元数据拦截）
-    if item.get("verified") is not True:
+    # 3. 收费/VIP 拦截（verified 条目已由服务端完成"直链解析+Range探活"验证，可播性有实证，跳过收费元数据拦截；
+    #    当 allow_paywall=True 时同样跳过收费拦截，用于逐曲探活关闭时放行第三方源候选歌曲）
+    if not allow_paywall and item.get("verified") is not True:
         if int(item.get("pay_type") or 0) != 0:
             return False
         if int(item.get("pkg_price") or 0) != 0 or int(item.get("price") or 0) != 0:
@@ -758,9 +791,50 @@ def play_format_from_ext(ext: str | None) -> str:
     return _FORMAT_ALIASES.get(raw, raw or "mp3")
 
 
+def _sanitize_content_disposition(value: str) -> str:
+    """把 Content-Disposition 里的非 latin-1 文件名规范化为 RFC 6266/5987 格式。
+
+    上游（官方 trim-music）在交付转码/下载文件时会在 filename="..." 填入原始中文歌名，
+    同时在 filename*=UTF-8''... 填入 URL 编码的歌名。Starlette 要求所有响应头
+    必须能被 latin-1 编码，否则抛出 UnicodeEncodeError 导致 500 报错。
+    本函数将 filename="..." 中的非 ASCII 字符替换为安全字符，并确保 filename*= 存在。
+    """
+    m_star = re.search(r"filename\*=([^;]+)", value, re.IGNORECASE)
+    m_plain = re.search(r'filename="([^"]+)"', value, re.IGNORECASE)
+    if not m_plain:
+        m_plain = re.search(r'filename=([^; ]+)', value, re.IGNORECASE)
+
+    raw_fn = m_plain.group(1) if m_plain else "track"
+    ext = "." + raw_fn.rsplit(".", 1)[-1] if "." in raw_fn else ""
+    ascii_fn = re.sub(r'[^\x20-\x7e]', '_', raw_fn)
+    if not ascii_fn.strip() or ascii_fn == ext:
+        ascii_fn = f"track{ext}"
+
+    if m_star:
+        star_part = f"filename*={m_star.group(1).strip()}"
+    else:
+        quoted = quote(raw_fn, encoding="utf-8")
+        star_part = f"filename*=UTF-8''{quoted}"
+
+    disposition = value.split(";")[0].strip() or "attachment"
+    return f'{disposition}; filename="{ascii_fn}"; {star_part}'
+
+
 def filter_headers(headers: Any, exclude_keys: set | None = None) -> dict:
     exclude = HOP_BY_HOP | {k.lower() for k in (exclude_keys or set())}
-    return {k: v for k, v in headers.items() if k.lower() not in exclude}
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in exclude:
+            continue
+        try:
+            str(v).encode("latin-1")
+            out[k] = v
+        except UnicodeEncodeError:
+            if k.lower() == "content-disposition":
+                out[k] = _sanitize_content_disposition(str(v))
+            else:
+                out[k] = str(v).encode("latin-1", errors="replace").decode("latin-1")
+    return out
 
 
 def copy_incoming_headers(request: Request) -> dict:
@@ -991,10 +1065,15 @@ def _path_stem(path: str) -> str:
 
 def remember_media_path(guid: str, media_path: str) -> None:
     """记住曲库里的文件词干（不含扩展名），音频和 .lrc 共用。"""
+    stem = _path_stem(media_path)
     try:
         os.makedirs(CONF["cache_dir"], exist_ok=True)
         with open(media_ref_path(guid), "w", encoding="utf-8") as f:
-            f.write(_path_stem(media_path))
+            f.write(stem)
+        # .ref 静默写丢会让已落库的歌重新出网、曲库出现重复文件，写后读回校验
+        with open(media_ref_path(guid), encoding="utf-8") as f:
+            if f.read().strip() != stem:
+                raise OSError("read-back mismatch")
     except Exception as e:
         logger.warning("Failed to remember media path for %s: %s", guid, e)
 
@@ -1268,7 +1347,38 @@ def find_cache_file(guid: str) -> str | None:
             exact = os.path.join(d, f"{safe}.{ext}")
             if os.path.exists(exact) and os.path.getsize(exact) > 0:
                 return exact
-    return None
+    return _find_file_by_snapshot_tags(guid)
+
+
+# 标签兜底查库的阴性缓存：确认不在曲库的 guid 短期内不再反复扫快照/查库
+_TAGS_LOOKUP_MISS: dict[str, float] = {}
+_TAGS_MISS_TTL_S = 300.0
+
+
+def _find_file_by_snapshot_tags(guid: str) -> "str | None":
+    """.ref 与精确名都 miss 时的自愈兜底：按快照标签在官方曲库反查文件。
+
+    命中说明歌已落库只是 .ref 丢了（或本就有同名同曲的本地文件），
+    remember_media_path 自愈后下次直接走 recall。必须 title+artist 双条件
+    才可能命中（album 有则再收紧），查库只在 miss 时发生。
+    """
+    now = time.monotonic()
+    miss_at = _TAGS_LOOKUP_MISS.get(guid)
+    if miss_at is not None and now - miss_at < _TAGS_MISS_TTL_S:
+        return None
+    snap = _lookup_online_snapshot(guid)
+    title = artist = album = ""
+    if snap:
+        title, artist, album = _tag_fields(snap)
+    path = library_file_by_tags(title, artist, album) if title and artist else None
+    if not path:
+        if len(_TAGS_LOOKUP_MISS) > 1024:
+            _TAGS_LOOKUP_MISS.clear()
+        _TAGS_LOOKUP_MISS[guid] = now
+        return None
+    remember_media_path(guid, path)
+    logger.info("Recalled library file for %s via tags: %s", guid, path)
+    return path
 
 
 def promote_cache_hit(guid: str, audio_path: str) -> str:
@@ -1536,7 +1646,8 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
     return start, end
 
 
-def serve_file_with_range(path: str, range_header: str | None, media_type: str) -> Response:
+def serve_file_with_range(path: str, range_header: str | None, media_type: str,
+                          extra_headers: dict | None = None) -> Response:
     file_size = os.path.getsize(path)
     rng = parse_http_range(range_header, file_size)
 
@@ -1554,28 +1665,33 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str) 
 
         return gen()
 
+    extra = extra_headers or {}
     if rng is None:
+        headers = {
+            "Content-Type": media_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        }
+        headers.update(extra)
         return StreamingResponse(
             iter_file(0, file_size),
             status_code=200,
-            headers={
-                "Content-Type": media_type,
-                "Content-Length": str(file_size),
-                "Accept-Ranges": "bytes",
-            },
+            headers=headers,
         )
 
     start, end = rng
     length = end - start + 1
+    headers = {
+        "Content-Type": media_type,
+        "Content-Length": str(length),
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+    }
+    headers.update(extra)
     return StreamingResponse(
         iter_file(start, length),
         status_code=206,
-        headers={
-            "Content-Type": media_type,
-            "Content-Length": str(length),
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Accept-Ranges": "bytes",
-        },
+        headers=headers,
     )
 
 
@@ -1634,7 +1750,19 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
         headers=headers,
         content=body if body else None,
     )
-    resp = await client.send(req, stream=True)
+    # 幂等方法在"连接还没换来任何响应"的失败（官方服务重启窗口的陈旧连接 /
+    # uds 瞬断）上重试一次：响应已开始流式传输后的失败不重试（无法安全回放）。
+    resp = None
+    attempts = 2 if request.method.upper() in ("GET", "HEAD") else 1
+    for attempt in range(attempts):
+        try:
+            resp = await client.send(req, stream=True)
+            break
+        except (httpx.TransportError, httpx.RemoteProtocolError):
+            if attempt + 1 >= attempts:
+                raise
+            logger.info("upstream forward retry (%s %s): connection-level failure",
+                        request.method, request.url.path)
     resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
     # 上游请求强制 accept-encoding: identity，其 Content-Length 即精确字节数；原样
     # 透传可让依赖总长度的播放内核走定长帧（对齐官方直连行为）。无 body 的状态
@@ -1862,7 +1990,11 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, s
 
 
 async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str) -> list[dict]:
-    params: dict[str, Any] = {"keyword": keyword, "limit": limit}
+    params: dict[str, Any] = {
+        "keyword": keyword,
+        "limit": limit,
+        "probe": 1 if CONF.get("search_probe") else 0,
+    }
     selected = CONF.get("lx_sources") if sources is None else sources
     if isinstance(selected, str):
         selected = [s.strip() for s in selected.split(",") if s.strip()]
@@ -1886,10 +2018,11 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
         if not isinstance(raw_list, list):
             return None
         items = []
+        allow_paywall = not bool(CONF.get("search_probe"))
         for it in raw_list:
             if not isinstance(it, dict):
                 continue
-            if not is_playable_online_track(it):
+            if not is_playable_online_track(it, allow_paywall=allow_paywall):
                 continue
             tid = str(it.get("id") or "")
             if not tid:
@@ -1918,7 +2051,7 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
                 "lyric": "",
                 "verified": it.get("verified") is True,
             })
-        return _SearchItems([it for it in items if is_playable_online_track(it)], partial=bool(data.get("errors")))
+        return _SearchItems([it for it in items if is_playable_online_track(it, allow_paywall=allow_paywall)], partial=bool(data.get("errors")))
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
         return None
@@ -2681,6 +2814,10 @@ async def lifespan(fastapi_app: FastAPI):
         if env_task:
             env_task.cancel()
             await asyncio.gather(env_task, return_exceptions=True)
+        try:
+            await tc.shutdown_all()
+        except Exception:  # noqa: BLE001
+            pass
         if created_upstream and getattr(fastapi_app.state, "upstream_client", None):
             await fastapi_app.state.upstream_client.aclose()
             fastapi_app.state.upstream_client = None
@@ -3224,8 +3361,17 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     开启时随迁），关→进滚动缓存（不写歌词）。
 
     part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
+    无损档解码校验不过直接丢弃（上游损坏流绝不入库）并拉黑该 guid。
     返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
     """
+    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
+        _lossless_blacklist(guid)
+        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return None
     src = dict(info or {})
     title, artist, album = _tag_fields(src)
     if tee_enabled:
@@ -3537,13 +3683,15 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
-async def _open_online_stream(request: Request, guid: str, range_header: str | None):
+async def _open_online_stream(request: Request, guid: str, range_header: str | None,
+                              force_mp3: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client."""
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
     headers = {"Accept-Encoding": "identity"}
     if range_header:
         headers["Range"] = range_header
+    via_musicdl = False
     owned = None
     resp = None
     ext = None
@@ -3579,7 +3727,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             req = client.build_request("GET", url, headers=headers)
         else:
             client = get_musicdl_client(request.app)
-            req = client.build_request("GET", "/stream", params={"id": song_id_from_online_guid(guid), "proxy": "true"}, headers=headers)
+            via_musicdl = True
+            params = {"id": song_id_from_online_guid(guid), "proxy": "true"}
+            # 无损档已被判定损坏的曲目（或上层明确要求）直接取 mp3 档；
+            # 带断点续传的请求不切档——前后字节必须来自同一条流
+            if (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
+                params["quality"] = "mp3"
+            req = client.build_request("GET", "/stream", params=params, headers=headers)
         resp = await client.send(req, stream=True)
         content_type = resp.headers.get("content-type", "").lower()
         if (resp.status_code not in (200, 206)
@@ -3592,6 +3746,11 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
         first = await anext(chunks, b"")
         if not first:
             return None
+        # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
+        # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
+        # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
+        if via_musicdl and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
+            ext = "mp3"
         result = (resp, owned, ext, info, chunks, first)
         resp = owned = None  # transfer ownership to response iterator
         return result
@@ -3605,6 +3764,49 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
 _FULL_FETCH_COOLDOWN_S = 1800.0
 _full_fetch_tasks: "dict[str, asyncio.Task]" = {}
 _full_fetch_failed: "dict[str, float]" = {}
+
+# --- 损坏流防护（2026-09-29 实测）-----------------------------------------
+# kuwo 官方 CDN 的无损档交付不可解码字节（fLaC 头与 Content-Length 都正常，
+# musicdl 库探活只验 URL/扩展名），坏文件一旦入库，官方转码器编到坏点即报
+# "transcoding error"、App 端表现为转码下载失败。对策：入库前全量解码校验，
+# 坏流丢弃并按 guid 拉黑无损档——此后该曲目取流自动降级 mp3 档（musicdl
+# 服务 /stream?quality=mp3）。
+_LOSSLESS_EXTS = {"flac", "wav", "ape", "m4a", "alac", "ogg", "opus"}
+_LOSSLESS_BAD: "dict[str, float]" = {}
+_LOSSLESS_BAD_TTL_S = 6 * 3600.0
+
+
+def _lossless_blacklist(guid: str) -> None:
+    _LOSSLESS_BAD[guid] = time.monotonic()
+
+
+def _lossless_is_blacklisted(guid: str) -> bool:
+    ts = _LOSSLESS_BAD.get(guid)
+    if ts is None:
+        return False
+    if time.monotonic() - ts > _LOSSLESS_BAD_TTL_S:
+        _LOSSLESS_BAD.pop(guid, None)
+        return False
+    return True
+
+
+def _audio_file_ok(path: str) -> bool:
+    """完整音频文件的解码校验：ffmpeg 无任何错误输出才算通过。
+
+    只对已通过长度校验的完整文件调用——截断的完好文件同样会报解码错误，
+    报错文本无法区分二者，完整性必须由字节数校验先行保证。
+    ffmpeg 不可用（测试守卫/宿主机缺件）时无从校验，只能放行。
+    """
+    if not tc.FFMPEG_BIN:
+        return True
+    try:
+        r = subprocess.run(
+            [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-f", "null", "-"],
+            capture_output=True, text=True, timeout=300,
+        )
+        return r.returncode == 0 and not (r.stderr or "").strip()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _prune_full_fetch_state(now: float) -> None:
@@ -3692,8 +3894,12 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
     return base
 
 
-async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
-    """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。"""
+async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False) -> None:
+    """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。
+
+    无损档解码校验失败时按 guid 拉黑并自动以 mp3 档重试一次（服务端
+    quality=mp3），两次都坏才宣告失败——坏字节绝不入库。
+    """
     part = None
     resp = None
     owned = None
@@ -3701,7 +3907,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
         # 合成最小 Request scope（触发请求的凭证头 + app 实例），完整复用在线取
         # 流的解析/元数据/首字节校验逻辑；Range 传 None 保证拿到完整资源。
         fake_request = _synth_request(cred_headers)
-        opened = await _open_online_stream(fake_request, guid, None)
+        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3)
         if not opened:
             raise RuntimeError("open failed")
         resp, owned, ext, info, chunks, first = opened
@@ -3725,6 +3931,21 @@ async def _full_fetch_download(guid: str, cred_headers: dict) -> None:
             raise RuntimeError(f"size mismatch written={written} expected={expected}")
         info = await _info_for_background_save(fake_request, guid, info)
         ext = ext or (info or {}).get("ext") or "mp3"
+        if ext in _LOSSLESS_EXTS and not await asyncio.to_thread(_audio_file_ok, part):
+            _lossless_blacklist(guid)
+            logger.warning("audio decode check failed for %s (ext=%s bytes=%d)", guid, ext, written)
+            # 坏流不落库：关掉当前连接后改要 mp3 档重来一次
+            with anyio.CancelScope(shield=True):
+                if resp:
+                    await resp.aclose()
+                if owned:
+                    await owned.aclose()
+                resp = owned = None
+            if not force_mp3:
+                logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
+                await _full_fetch_download(guid, cred_headers, force_mp3=True)
+                return
+            raise RuntimeError("corrupt stream even at mp3 tier")
         meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True)
         part = None
         logger.info("Background full fetch saved %s (%d bytes)", guid, written)
@@ -3966,6 +4187,58 @@ def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "st
                 return None
             if row and row[0]:
                 return str(row[0])
+        return None
+    finally:
+        con.close()
+
+
+def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | None":
+    """按标签在官方 music.db 反查曲库文件路径（audio_file.path，最新优先）。
+
+    find_cache_file 的兜底数据源：与 official_track_guid_by_tags 同款两遍
+    精确/NOCASE 查询，但取 a.path 且逐行校验文件确实存在（官方库里的
+    悬空记录不算命中）。
+    """
+    title_s = (title or "").strip()
+    artist_s = (artist or "").strip()
+    album_s = (album or "").strip()
+    if not title_s or not artist_s:
+        return None
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except Exception as e:
+        logger.warning("Library tags lookup db open failed: %s", e)
+        return None
+    try:
+        for nocase in (False, True):
+            collate = " COLLATE NOCASE" if nocase else ""
+            sql = (
+                "SELECT a.path FROM track t "
+                "JOIN audio_file a ON a.id = t.audio_file_id "
+                "JOIN track_artist ta ON ta.track_id = t.id "
+                "JOIN artist ar ON ar.id = ta.artist_id "
+                f"WHERE t.title = ?{collate} AND ar.name = ?{collate}"
+            )
+            params: list = [title_s, artist_s]
+            if album_s:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM album al"
+                    f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+                )
+                params.append(album_s)
+            sql += " ORDER BY t.id DESC"
+            try:
+                rows = con.execute(sql, params).fetchall()
+            except Exception as e:
+                logger.warning("Library tags lookup query failed: %s", e)
+                return None
+            for row in rows:
+                path = str(row[0] or "").strip()
+                if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                    return path
         return None
     finally:
         con.close()
@@ -4489,23 +4762,70 @@ async def stream_track(request: Request, subpath: str = ""):
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
-@app.api_route("/music/api/v1/track/hls/{guid}/preset.m3u8", methods=["GET", "HEAD"])
-@app.api_route("/music/api/v1/track/hls/{guid}/{filename}", methods=["GET", "HEAD"])
-async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
-    guid = resolve_real_guid(guid)
-    if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, dict | None]":
+    """转码输入源：已落库/已缓存文件优先（源关了也能转），其次在线直链。"""
+    cached = find_cache_file(guid)
+    if cached:
+        return cached, None
+    if not _source_enabled(guid):
+        return None, None
+    source = source_from_online_guid(guid)
+    try:
+        if source == "netease":
+            url = await resolve_netease_url(
+                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+            return (url or None, None)
+        if source == "lx":
+            resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+            if not resolved or not resolved.get("url"):
+                return None, None
+            headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()
+                       if k.lower() in ("referer", "user-agent")}
+            return str(resolved["url"]), headers or None
+        url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
+        if _lossless_is_blacklisted(guid):
+            url += "&quality=mp3"
+        return url, None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("transcode source resolve failed for %s: %s", guid, e)
+        return None, None
 
-    info = await _online_info(request, guid)
-    duration_s = 0
-    if info:
-        try:
-            duration_s = int(float(info.get("duration_s") or 0))
-        except (TypeError, ValueError):
-            duration_s = 0
+
+async def _start_transcode_session(request: Request, guid: str) -> "tc.Session | None":
+    """启动/复用标准音质转码会话；不可用返回 None（调用方回落单分片桩）。"""
+    try:
+        info = await _online_info(request, guid) or {}
+        duration_s = float(info.get("duration_s") or 0)
+        src, headers = await _transcode_source(request, guid)
+        if not src:
+            return None
+        return await tc.ensure_session(
+            guid, src, duration_s,
+            root=CONF["cache_dir"],
+            bitrate=str(CONF.get("transcode_bitrate") or "128k"),
+            hls_time=float(CONF.get("transcode_hls_time") or 10),
+            max_active=max(1, int(CONF.get("transcode_max_sessions") or 2)),
+            max_cache_bytes=max(16, int(CONF.get("transcode_cache_max_mb") or 512)) * 1024 * 1024,
+            headers=headers,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("transcode session start failed for %s: %s", guid, e)
+        return None
+
+
+def _transcode_live(guid: str) -> "tc.Session | None":
+    """取在跑或磁盘已完整的转码会话（不解析在线源）。"""
+    return tc.get_session(guid) or tc.peek_cached(guid, CONF["cache_dir"])
+
+
+def _legacy_hls_stub(guid: str, info: "dict | None") -> Response:
+    """无 ffmpeg / 源不可用时的兜底：单分片=原始文件（历史行为）。"""
+    try:
+        duration_s = int(float((info or {}).get("duration_s") or 0))
+    except (TypeError, ValueError):
+        duration_s = 0
     if duration_s <= 0:
         duration_s = 240
-
     stream_url = f"/music/api/v1/track/stream?guid={quote(guid, safe='')}"
     playlist = (
         "#EXTM3U\n"
@@ -4520,12 +4840,51 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
     return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
 
 
+@app.api_route("/music/api/v1/track/hls/{guid}/preset.m3u8", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/track/hls/{guid}/{filename}", methods=["GET", "HEAD"])
+async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
+    guid = resolve_real_guid(guid)
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    if filename != "preset.m3u8" and not tc.valid_segment_name(filename):
+        return JSONResponse(content={"code": 404, "msg": "not found", "data": None}, status_code=404)
+
+    sess = _transcode_live(guid)
+    if sess is None and CONF.get("transcode_enabled") and tc.FFMPEG_BIN:
+        # App 有时不先 POST /track/transcode 直接拉 playlist（实测），此处惰性补启
+        sess = await _start_transcode_session(request, guid)
+
+    if sess is not None:
+        if filename == "preset.m3u8":
+            return Response(content=tc.playlist_text(sess), media_type="application/vnd.apple.mpegurl")
+        path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
+        if path:
+            media = "audio/mp4" if filename == tc.INIT_NAME else "video/iso.segment"
+            return serve_file_with_range(path, request.headers.get("range"), media)
+        return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
+
+    if filename != "preset.m3u8":
+        return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
+    info = await _online_info(request, guid)
+    return _legacy_hls_stub(guid, info)
+
+
 @app.api_route("/music/api/v1/track/transcode/heartbeat", methods=["GET", "POST"])
 @app.api_route("/music/api/v1/track/transcode/quit", methods=["GET", "POST"])
 async def track_transcode_session(request: Request):
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
+    if request.url.path.endswith("/heartbeat"):
+        tc.heartbeat(guid)
+        try:
+            await tc.maintain(CONF["cache_dir"], float(CONF.get("transcode_ttl_s") or 90),
+                              max(16, int(CONF.get("transcode_cache_max_mb") or 512)) * 1024 * 1024)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        await tc.quit_session(guid)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid}})
 
 
@@ -4534,6 +4893,13 @@ async def track_transcode(request: Request):
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
+    if CONF.get("transcode_enabled") and tc.FFMPEG_BIN:
+        sess = _transcode_live(guid)
+        if sess is None:
+            sess = await _start_transcode_session(request, guid)
+        if sess is not None and sess.status in ("starting", "running") and not find_cache_file(guid):
+            # 标准音质播放不经过 /track/stream，tee 永不触发；挂后台整轨下载保住边听边存
+            _register_full_fetch(request, guid)
     return JSONResponse(
         content={
             "code": 0,
@@ -4542,6 +4908,221 @@ async def track_transcode(request: Request):
             "data": {"guid": guid, "status": "ready"},
         }
     )
+
+
+# === App 下载（音质偏好=标准 → 转码下载）仿真 ===
+# 协议按官方实测对齐（本地歌曲透传抓包，2026-09-29）：
+#   prepare POST {trackGUID, quality}  → data{status:"success", errno, errmsg, downloadId}
+#   status  GET ?downloadId=           → data{status:"waiting|transcoding|ready|failed",
+#                                             errno, errmsg, downloadId, percent}
+#   file    GET ?downloadId=           → 音频字节（audio/mpeg，支持断点）
+#   delete  POST {downloadId}          → data{downloadId, deleted:true}
+# 官方"标准"档 = MP3 320kbps（FLAC 源实测 320067bps）；源已是 mp3 时直接供原文件
+# 不做无意义重编码。官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当
+# guid 是在线曲目才接管，本地曲目与未知 downloadId 一律透传官方。
+_DL_TASKS: dict[str, dict] = {}
+_DL_TASK_TTL_S = 3600.0
+_DL_TRANSCODE_SUBDIR = "dltrans"
+
+
+def _dl_transcode_path(guid: str) -> str:
+    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.mp3")
+
+
+def _dl_sweep() -> None:
+    now = time.monotonic()
+    for key, task in list(_DL_TASKS.items()):
+        if now - float(task.get("touched", 0)) > _DL_TASK_TTL_S:
+            _DL_TASKS.pop(key, None)
+
+
+async def _dl_body_json(request: Request) -> dict:
+    try:
+        raw = await request.body()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _dl_find_task(request: Request, body: dict) -> "dict | None":
+    for key in ("downloadId", "taskGuid", "taskId", "id", "guid", "trackGUID"):
+        value = request.query_params.get(key) or body.get(key)
+        if value:
+            hit = _DL_TASKS.get(str(value))
+            if hit:
+                hit["touched"] = time.monotonic()
+                return hit
+    return None
+
+
+def _task_guid_of(task: dict) -> str:
+    for key, value in _DL_TASKS.items():
+        if value is task:
+            task["downloadId"] = key
+            return key
+    return str(task.get("downloadId") or "")
+
+
+def _dl_state_word(task: dict) -> str:
+    """内部状态 → 官方 status 字段用词（completed=ready）。"""
+    state = str(task.get("state") or "waiting")
+    return {"completed": "ready"}.get(state, state)
+
+
+async def _dl_produce(task: dict, cred_headers: dict) -> None:
+    """后台产文件：标准档按官方规格 MP3 320k（源已是 mp3 直接供原文件）；原始档供原文件。"""
+    guid = task["guid"]
+    try:
+        src = find_cache_file(guid)
+        if not src and _source_enabled(guid):
+            # 无本地文件：先走整轨下载管线（带元数据命名/落库，与边听边存同款）
+            await _full_fetch_download(guid, cred_headers)
+            src = find_cache_file(guid)
+        if not src:
+            task["state"] = "failed"
+            task["errmsg"] = "online source unavailable"
+            return
+        if task.get("quality") == "original" or os.path.splitext(src)[1].lower() == ".mp3":
+            task["path"] = src
+        else:
+            target = _dl_transcode_path(guid)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if not os.path.isfile(target):
+                task["state"] = "transcoding"
+                task["percent"] = 0
+                proc = await asyncio.create_subprocess_exec(
+                    tc.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                    "-i", src, "-vn", "-map_metadata", "-1",
+                    "-c:a", "libmp3lame", "-b:a", str(CONF.get("transcode_dl_bitrate") or "320k"),
+                    "-f", "mp3", target,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                if await proc.wait() != 0:
+                    task["state"] = "failed"
+                    task["errmsg"] = "transcode failed"
+                    return
+            task["path"] = target
+        task["state"] = "completed"
+        task["percent"] = 100
+        try:
+            task["size"] = os.path.getsize(task["path"])
+        except OSError:
+            task["size"] = 0
+    except Exception as e:  # noqa: BLE001
+        logger.warning("download transcode produce failed for %s: %s", guid, e)
+        task["state"] = "failed"
+        task["errmsg"] = "internal error"
+
+
+async def _dl_forward(request: Request):
+    """download/* 透传官方；trace_forward=detail 时抓双向往返报文（协议对齐取证）。"""
+    if not CONF.get("trace_forward"):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    body = await request.body()
+    if body:
+        logger.info("[dl-capture] REQ %s %s body=%s", request.method, request.url.path, body[:2000])
+    resp = await forward_to_upstream(request, get_upstream_client(request.app))
+    captured: list[bytes] = []
+
+    async def _tee():
+        async for chunk in resp.body_iterator:
+            captured.append(chunk)
+            yield chunk
+        if captured:
+            logger.info("[dl-capture] RESP %s %s status=%s body=%s",
+                        request.method, request.url.path, resp.status_code, b"".join(captured)[:2000])
+
+    return StreamingResponse(_tee(), status_code=resp.status_code,
+                             headers=filter_headers(resp.headers), media_type=resp.media_type)
+
+
+@app.api_route("/music/api/v1/download/track/transcode/prepare", methods=["GET", "POST"])
+async def dl_transcode_prepare(request: Request):
+    body = await _dl_body_json(request)
+    if CONF.get("trace_forward"):
+        logger.info("[dl-capture] PREPARE req q=%s body=%s", dict(request.query_params), body)
+    raw_guid = ""
+    for key in ("guid", "trackGUID", "trackGuid"):
+        value = request.query_params.get(key) or body.get(key)
+        if value:
+            raw_guid = str(value)
+            break
+    guid = resolve_real_guid(raw_guid)
+    if not is_online_guid(guid):
+        return await _dl_forward(request)
+    quality = "standard"
+    for key in ("quality", "qualityType"):
+        value = str(body.get(key) or request.query_params.get(key) or "").lower()
+        if value in ("original", "standard"):
+            quality = value
+            break
+    if body.get("isOriginal") is True:
+        quality = "original"
+    _dl_sweep()
+    download_id = uuid4().hex
+    task = {"guid": guid, "quality": quality, "state": "waiting", "percent": 0,
+            "downloadId": download_id, "touched": time.monotonic(), "started": time.time()}
+    _DL_TASKS[download_id] = task
+    asyncio.create_task(_dl_produce(task, copy_incoming_headers(request)))
+    return JSONResponse(content={
+        "code": 0, "msg": "",
+        "data": {"status": "success", "errno": "", "errmsg": "", "downloadId": download_id},
+    })
+
+
+@app.api_route("/music/api/v1/download/track/transcode/status", methods=["GET", "POST"])
+async def dl_transcode_status(request: Request):
+    body = await _dl_body_json(request)
+    task = _dl_find_task(request, body)
+    if task is None:
+        return await _dl_forward(request)
+    return JSONResponse(content={
+        "code": 0, "msg": "",
+        "data": {"status": _dl_state_word(task), "errno": "",
+                 "errmsg": str(task.get("errmsg") or ""), "downloadId": _task_guid_of(task),
+                 "percent": int(task.get("percent", 0))},
+    })
+
+
+@app.api_route("/music/api/v1/download/track/transcode/file", methods=["GET", "HEAD"])
+async def dl_transcode_file(request: Request):
+    body = await _dl_body_json(request)
+    task = _dl_find_task(request, body)
+    if task is None:
+        return await _dl_forward(request)
+    path = task.get("path")
+    if task["state"] != "completed" or not path or not os.path.isfile(path):
+        return JSONResponse(content={"code": 404, "msg": "not ready", "data": None}, status_code=404)
+    media = "audio/mpeg" if os.path.splitext(path)[1].lower() == ".mp3" else "audio/mp4"
+    fname = os.path.basename(path)
+    fn_ext = os.path.splitext(fname)[1]
+    quoted = quote(fname, encoding="utf-8")
+    ascii_fn = re.sub(r'[^\x20-\x7e]', '_', fname)
+    if not ascii_fn.strip() or ascii_fn == fn_ext:
+        ascii_fn = f"track{fn_ext}"
+    disposition = f'attachment; filename="{ascii_fn}"; filename*=UTF-8\'\'{quoted}'
+    return serve_file_with_range(path, request.headers.get("range"), media,
+                                 extra_headers={"Content-Disposition": disposition})
+
+
+@app.api_route("/music/api/v1/download/track/transcode/delete", methods=["GET", "POST", "DELETE"])
+async def dl_transcode_delete(request: Request):
+    body = await _dl_body_json(request)
+    task = _dl_find_task(request, body)
+    if task is None:
+        return await _dl_forward(request)
+    download_id = ""
+    for key, value in list(_DL_TASKS.items()):
+        if value is task:
+            _DL_TASKS.pop(key, None)
+            download_id = key
+    return JSONResponse(content={
+        "code": 0, "msg": "",
+        "data": {"downloadId": download_id, "deleted": True},
+    })
 
 
 async def _online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
@@ -6963,13 +7544,43 @@ async def play_history_list(request: Request):
     return JSONResponse(content=envelope, headers=headers)
 
 
+async def _forward_official_play_history_delete(
+    request: Request, client: httpx.AsyncClient, official: list[str],
+) -> Response | None:
+    """混合批次中官方部分先行。返回 None=官方成功，否则返回官方错误响应（本地不动）。"""
+    req = client.build_request(
+        "POST",
+        "/music/api/v1/play-history/delete",
+        headers=copy_incoming_headers(request),
+        json={"trackGUIDs": official},
+    )
+    resp = await client.send(req)
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    if resp.status_code != 200:
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if not (isinstance(payload, dict) and payload.get("code") == 0):
+        return JSONResponse(content=payload or {"code": -1, "msg": "upstream error", "data": None})
+    return None
+
+
 @app.api_route("/music/api/v1/play-history/delete", methods=["POST", "DELETE"])
 async def play_history_delete(request: Request):
-    """删除播放历史：online 条目删本地存储，官方条目原样转发官方后端。
+    """删除播放历史：online 条目删本地存储，官方条目转发官方后端。
 
     列表是代理拼的（list 合并本地在线历史），删除闭环也必须在代理完成，否则
-    带（伪装成官方 32-hex 的）在线 id 的删除请求直达官方被拒。方法双注册、
-    字段兼容 trackGUID/guid（含 query 透传），与 favorite-track/delete 同款分工。
+    带（伪装成官方 32-hex 的）在线 id 的删除请求直达官方被拒。官方契约是批量
+    字段 trackGUIDs（前端单条移除与"编辑"多选移除共用，官方后端 binding:"required"），
+    兼容单数 trackGUID/guid（含 query 透传）；混合批次官方部分先行，官方失败
+    本地不动，与 playlist/remove-track 同款分工。
     """
     upstream_client = get_upstream_client(request.app)
     try:
@@ -6977,25 +7588,38 @@ async def play_history_delete(request: Request):
     except Exception:
         body = {}
 
-    guid = ""
-    if isinstance(body, dict):
-        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
-    if not guid:
-        guid = str(request.query_params.get("trackGUID") or request.query_params.get("guid") or "").strip()
-    guid = resolve_real_guid(guid)
+    raw = body.get("trackGUIDs") if isinstance(body, dict) else None
+    if isinstance(raw, list) and raw:
+        candidates = [str(g or "").strip() for g in raw]
+    else:
+        single = ""
+        if isinstance(body, dict):
+            single = str(body.get("trackGUID") or body.get("guid") or "").strip()
+        if not single:
+            single = str(request.query_params.get("trackGUID") or request.query_params.get("guid") or "").strip()
+        candidates = [single] if single else []
 
-    if not is_online_guid(guid):
+    resolved = [resolve_real_guid(g) for g in candidates if g]
+    online = [g for g in resolved if is_online_guid(g)]
+    if not online:
         return await forward_to_upstream(request, upstream_client)
 
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
 
+    official = [g for g in resolved if not is_online_guid(g)]
+    if official:
+        err = await _forward_official_play_history_delete(request, upstream_client, official)
+        if err is not None:
+            return err
+
     async with _HISTORY_LOCK:
-        try:
-            dailyrec.remove_online_play(user_guid, guid)
-        except Exception as e:
-            logger.warning("Error deleting from online play history for user %s: %s", user_guid, e)
+        for guid in online:
+            try:
+                dailyrec.remove_online_play(user_guid, guid)
+            except Exception as e:
+                logger.warning("Error deleting from online play history for user %s: %s", user_guid, e)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 

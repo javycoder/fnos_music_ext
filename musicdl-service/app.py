@@ -7,11 +7,13 @@ import asyncio
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
@@ -397,6 +399,142 @@ async def _refresh_by_keyword(song_id: str) -> dict | None:
     return None
 
 
+# --- 损坏流防护（2026-09-29 实测）-----------------------------------------
+# kuwo 官方 CDN 的无损档开始交付不可解码字节（文件头仍是合法 fLaC、大小与
+# Content-Length 一致，musicdl 库只验 URL/扩展名发现不了），代理侧会把这种
+# 流原样落进曲库，官方转码器编到坏点即报"transcoding error"。取流前对无损
+# 档做头部解码探针：坏流自动降级到 kuwo 官方 convert_url2 的 mp3 档（实测
+# 干净、无需登录）；上层也可以用 quality=mp3 主动要求有损档。
+_PROBE_EXTS = {"flac", "wav", "ape", "m4a", "alac", "ogg", "opus"}
+_PROBE_BYTES = 3 * 1024 * 1024
+_PROBE_MIN_DECODED_S = 1.0
+_PROBE_CACHE: dict[str, tuple[float, bool]] = {}
+_PROBE_CACHE_LOCK = threading.Lock()
+_PROBE_TTL = int(os.environ.get("MUSICDL_PROBE_TTL", "600"))
+
+
+def _decode_probe_ok(path: str) -> bool:
+    """ffmpeg 解码探针样本文件，以实际解出的时长判断好坏。
+
+    截断的完好样本也能解出数十秒（探针只取头部字节）；从头就坏的样本
+    time≈0。报错文本不可用作判据——截断与损坏的报错完全相同。
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-i", path, "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
+        if not times:
+            return False
+        h, mnt, s = times[-1]
+        return int(h) * 3600 + int(mnt) * 60 + float(s) >= _PROBE_MIN_DECODED_S
+    except Exception:
+        return False
+
+
+def _head_probe_sync(url: str, headers: dict) -> bool:
+    probe_headers = {k: v for k, v in headers.items() if k.lower() != "range"}
+    probe_headers["Range"] = f"bytes=0-{_PROBE_BYTES - 1}"
+    tmp_path = ""
+    try:
+        if HAS_CURL_CFFI:
+            resp = curl_requests.get(url, headers=probe_headers, impersonate="chrome",
+                                     stream=True, timeout=(10, 60))
+        else:
+            client = httpx.Client(follow_redirects=True, timeout=30)
+            resp = client.build_request("GET", url, headers=probe_headers)
+            resp = client.send(resp, stream=True)
+        buf = b""
+        for chunk in resp.iter_content(256 * 1024):
+            buf += chunk
+            if len(buf) >= _PROBE_BYTES:
+                break
+        if hasattr(resp, "close"):
+            resp.close()
+        if not buf:
+            return False
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".probe", delete=False) as f:
+            f.write(buf)
+            tmp_path = f.name
+        return _decode_probe_ok(tmp_path)
+    except Exception:
+        return False
+    finally:
+        if tmp_path:
+            with suppress(Exception):
+                os.unlink(tmp_path)
+
+
+async def _head_probe(url: str, headers: dict, song_id: str) -> bool:
+    with _PROBE_CACHE_LOCK:
+        cached = _PROBE_CACHE.get(song_id)
+    if cached and (time.time() - cached[0]) < _PROBE_TTL:
+        return cached[1]
+    ok = await asyncio.to_thread(_head_probe_sync, url, headers)
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE[song_id] = (time.time(), ok)
+    if not ok:
+        logger.warning("stream head probe FAILED for %s (%s) — likely corrupt upstream bytes", song_id, url[:120])
+    return ok
+
+
+def _kuwo_force_mp3_url_sync(song_id: str) -> "tuple[str, dict] | None":
+    """kuwo 官方 convert_url2 直取 320k mp3 档（无需登录，实测干净）。"""
+    try:
+        from musicdl.modules.sources.kuwo import KuwoMusicClientUtils
+    except Exception:
+        return None
+    rid = song_id.split(":", 1)[1] if ":" in song_id else song_id
+    query = (f"user=0&corp=kuwo&source=kwplayer_ar_5.1.0.0_B_jiakong_vh.apk"
+             f"&p2p=1&type=convert_url2&sig=0&format=mp3&rid={rid}")
+    try:
+        enc = KuwoMusicClientUtils.encryptquery(query)
+        if HAS_CURL_CFFI:
+            resp = curl_requests.get(f"http://mobi.kuwo.cn/mobi.s?f=kuwo&q={enc}",
+                                     headers={"User-Agent": "okhttp/3.10.0"}, timeout=10)
+        else:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(f"http://mobi.kuwo.cn/mobi.s?f=kuwo&q={enc}",
+                                  headers={"User-Agent": "okhttp/3.10.0"})
+        m = re.search(r'http[^\s$\"]+', resp.text or "")
+        if not m:
+            return None
+        return m.group(0), {"User-Agent": "okhttp/3.10.0"}
+    except Exception as e:
+        logger.warning("kuwo force-mp3 resolve failed for %s: %s", song_id, type(e).__name__)
+        return None
+
+
+async def _maybe_downgrade(id: str, entry: dict, url: str, quality: str,
+                           range_header: "str | None") -> "tuple[str, dict]":
+    """无损档坏流探测与 mp3 降级；返回最终 (url, 源站请求头)。"""
+    ext = str(entry["item"].get("ext") or "").lower()
+    want_mp3 = str(quality or "").strip().lower() == "mp3"
+    if not want_mp3 and ext in _PROBE_EXTS:
+        probe_headers = dict(entry.get("download_headers") or {})
+        if not await _head_probe(url, probe_headers, id):
+            logger.warning("lossless stream corrupt for %s (ext=%s), downgrading to mp3", id, ext)
+            want_mp3 = True
+    if not want_mp3:
+        src_headers = dict(entry.get("download_headers") or {})
+    else:
+        forced = None
+        if str(id).startswith("kuwo:"):
+            forced = await asyncio.to_thread(_kuwo_force_mp3_url_sync, id)
+            if forced:
+                logger.warning("stream for %s downgraded to official mp3 tier", id)
+        if forced:
+            url, base_headers = forced
+        else:
+            base_headers = dict(entry.get("download_headers") or {})
+        src_headers = base_headers
+    if range_header:
+        src_headers["Range"] = range_header
+    return url, src_headers
+
+
 async def _resolve_entry(song_id: str, auto_refresh: bool = True):
     entry = _cache_get(song_id)
     if entry is None:
@@ -721,18 +859,16 @@ async def info(id: str = Query(..., min_length=1)):
 async def stream(
     id: str = Query(...),
     proxy: bool = Query(False, description="true=字节流透传而非302"),
+    quality: str = Query("", description="mp3=跳过无损档直接取有损直链（上游无损流损坏时上层降级用）"),
     range_header: str | None = Header(None, alias="Range", description="客户端请求头中的 Range"),
 ):
     entry = await _resolve_entry(id)
     url = entry["item"].get("download_url")
     if not url:
         raise HTTPException(502, f"no playable url for {id}")
+    url, src_headers = await _maybe_downgrade(id, entry, url, quality, range_header)
     if not proxy:
         return RedirectResponse(url, status_code=302)
-
-    src_headers = dict(entry.get("download_headers") or {})
-    if range_header:
-        src_headers["Range"] = range_header
 
     try:
         resp = await _fetch_upstream_stream(url, src_headers)
@@ -744,9 +880,7 @@ async def stream(
         if refreshed_entry and refreshed_entry["item"].get("download_url"):
             entry = refreshed_entry
             url = entry["item"]["download_url"]
-            src_headers = dict(entry.get("download_headers") or {})
-            if range_header:
-                src_headers["Range"] = range_header
+            url, src_headers = await _maybe_downgrade(id, entry, url, quality, range_header)
             resp = await _fetch_upstream_stream(url, src_headers)
         else:
             raise HTTPException(502, f"failed to fetch stream from source for {id}: {e}")
@@ -760,9 +894,7 @@ async def stream(
         if refreshed_entry and refreshed_entry["item"].get("download_url") and refreshed_entry["item"]["download_url"] != url:
             entry = refreshed_entry
             url = entry["item"]["download_url"]
-            src_headers = dict(entry.get("download_headers") or {})
-            if range_header:
-                src_headers["Range"] = range_header
+            url, src_headers = await _maybe_downgrade(id, entry, url, quality, range_header)
             resp = await _fetch_upstream_stream(url, src_headers)
             if resp.status_code >= 400:
                 status = resp.status_code

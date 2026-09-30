@@ -143,6 +143,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | `FNMUSIC_QUALITY_MODE` | `high` | 音质偏好：`high` / `balanced` / `smooth`（热重载） |
 | `FNMUSIC_TEE_SAVE_ENABLED` | `true` | 边听边存开关；`FNMUSIC_TEE_SAVE_DIR` 留空自动探测飞牛共享曲库 |
 | `FNMUSIC_TEE_CACHE_MAX` | `2` | 关闭边听边存时滚动保留的试听缓存条数（仅关闭时生效） |
+| `FNMUSIC_TRANSCODE_ENABLED` | `true` | App 音质偏好为"标准"时在线歌曲由 ffmpeg 实时转码 AAC 分片流播放（热重载）；配套 `FNMUSIC_TRANSCODE_BITRATE`（128k）、`_HLS_TIME`（10 秒/片）、`_MAX_SESSIONS`（并发 2）、`_TTL_S`（停止心跳 90 秒后回收）、`_CACHE_MAX_MB`（转码缓存 512MB，最久未用先清）、`_DL_BITRATE`（转码下载标准档 320k，与官方一致） |
 | `FNMUSIC_AUTO_COVER` | `true` | 自动下载封面：落库歌曲自动内嵌源站封面，官方 App 显示封面图（热重载） |
 | `FNMUSIC_LYRIC_AUTO_DL` | `false` | 自动下载歌词：歌曲完整落库成功后自动下载同名 `.lrc` 到歌曲所在目录（热重载） |
 | `FNMUSIC_RECOMMEND_HOT` / `FNMUSIC_RECOMMEND_DAILY` | `true` | 「热门推荐」/「每日推荐」两个独立歌单的开关（热重载） |

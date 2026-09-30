@@ -83,6 +83,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
+    "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
 }
 
@@ -121,6 +122,7 @@ def write_env(updates: dict[str, str]) -> list[str]:
         backup = ENV_PATH.with_name(ENV_PATH.name + ".webui.bak")
         try:
             backup.write_bytes(ENV_PATH.read_bytes())
+            os.chmod(backup, 0o600)  # write_bytes 按 umask 落盘（0644），密钥备份必须收紧
         except OSError as exc:  # 备份失败不阻断写入，但要有迹可循
             logger.warning("webui env backup failed: %s", exc)
     merged = [(k, updates.get(k, v)) if k in updates else (k, v) for k, v in existing_kv]
