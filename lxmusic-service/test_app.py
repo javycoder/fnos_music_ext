@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64 as _b64
 import sys
 import time
@@ -916,3 +917,38 @@ def test_lenient_pydict_parses_python_literal():
 
     parsed = lxapp._lenient_pydict(_FakeResp(), "kw")
     assert parsed == {"abslist": [{"MUSICRID": "MUSIC_1", "SONGNAME": "A"}]}
+
+
+def test_search_probe_disabled_returns_unverified_without_probing(isolated, monkeypatch):
+    """当 search_probe 为 False 时，kw/tx 等搜索跳过 _probe_candidates，直接返回未验证候选。"""
+    monkeypatch.setitem(lxapp.CONF, "search_probe", False)
+    kw_raw = {
+        "abslist": [
+            {"MUSICRID": "MUSIC_123", "SONGNAME": "晴天", "ARTIST": "周杰伦", "ALBUM": "叶惠美", "DURATION": "269", "web_albumpic_short": "c.jpg"}
+        ]
+    }
+    called_probe = []
+
+    async def fake_probe(*args, **kwargs):
+        called_probe.append(True)
+        return []
+
+    monkeypatch.setattr(lxapp, "_probe_candidates", fake_probe)
+
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=kw_raw)
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            items = await lxapp.kw_search(client, "晴天", 10)
+            assert len(items) == 1
+            assert items[0]["id"] == "lx:kw:123"
+            assert items[0]["verified"] is False
+            assert items[0]["validation_status"] == "unverified"
+            assert not called_probe, "不应触发逐曲探活"
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+

@@ -83,6 +83,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
+    "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
 }
 

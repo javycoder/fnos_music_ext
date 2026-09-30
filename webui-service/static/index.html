@@ -21,6 +21,7 @@
         <button class="nav-item active" data-page="overview">概览</button>
         <button class="nav-item" data-page="source">音乐源</button>
         <button class="nav-item" data-page="quality">播放与推荐</button>
+        <button class="nav-item" data-page="search">搜索</button>
         <button class="nav-item" data-page="tee">边听边存</button>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
       </nav>
@@ -52,7 +53,6 @@
       <!-- 音乐源 -->
       <section class="page" id="page-source">
         <h2>音乐源（三选一）</h2>
-        <p class="hint">切换即时生效：旧音源进程停止、新音源进程启动，代理配置热重载。点选未启用的音源会临时拉起其进程供预览（选平台/测试源/扫码立即可用），保存后转正式启用，5 分钟内未保存自动停止。</p>
         <div class="provider-grid">
           <label class="provider-card" data-provider="musicbox">
             <input type="radio" name="provider" value="musicbox">
@@ -120,13 +120,6 @@
         </div>
 
         <div class="card">
-          <label class="field"><span>搜索超时时间</span>
-            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
-          </label>
-          <p class="hint">单位为秒，默认 15。在线结果一返回就交给播放页，本地歌曲在前；到时还没有就放弃这次在线结果，只返回本地歌曲。保存后立即生效。</p>
-        </div>
-
-        <div class="card">
           <div class="card-title">网易账号歌单</div>
           <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
         </div>
@@ -147,6 +140,20 @@
           <div class="card-title">推荐</div>
           <label class="switch-row"><span>热门榜单推荐<div class="sub">独立「热门推荐」歌单：热歌榜/飙升榜原味</div></span><input type="checkbox" id="recommend-hot"></label>
           <label class="switch-row"><span>每日推荐<div class="sub">独立「每日推荐」歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
+        </div>
+      </section>
+
+      <!-- 搜索 -->
+      <section class="page" id="page-search">
+        <h2>搜索</h2>
+        <div class="card">
+          <label class="switch-row"><span>逐曲探活(beta)<div class="sub">搜索时预先对候选歌曲进行直链解析与网络探活，确保“搜得到必能播”；但由于第三方音源解析较慢，开启后容易造成搜索超时甚至无法搜出结果，建议保持关闭。</div></span><input type="checkbox" id="search-probe"></label>
+        </div>
+        <div class="card">
+          <label class="field"><span>搜索超时时间</span>
+            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
+          </label>
+          <p class="hint">单位为秒，默认 15。在线结果一返回就交给播放页，本地歌曲在前；到时还没有就放弃这次在线结果，只返回本地歌曲。保存后立即生效。</p>
         </div>
       </section>
 
@@ -199,6 +206,7 @@
     <button class="nav-item active" data-page="overview">概览</button>
     <button class="nav-item" data-page="source">音源</button>
     <button class="nav-item" data-page="quality">播放</button>
+    <button class="nav-item" data-page="search">搜索</button>
     <button class="nav-item" data-page="tee">缓存</button>
     <button class="nav-item" data-page="llm">高级</button>
   </nav>

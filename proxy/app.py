@@ -147,6 +147,7 @@ CONF = {
     "lx_sources": _normalize_lx_sources(os.environ.get("LX_SOURCES", "")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5.0")),
     "fav_dir": os.environ.get(
@@ -467,6 +468,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
+    "FNMUSIC_SEARCH_PROBE": ("search_probe", "bool"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
@@ -679,7 +681,7 @@ ONLINE_TRIAL_MARKERS = (
 )
 
 
-def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
+def is_playable_online_track(item: dict, require_id: bool = False, allow_paywall: bool = False) -> bool:
     """最终防线校验：过滤无音频流或试听标记的不可播曲目。"""
     if not isinstance(item, dict):
         return False
@@ -703,8 +705,9 @@ def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
     if int(item.get("is_free_part") or 0) != 0 or int(item.get("fail_process") or 0) == 4:
         return False
 
-    # 3. 收费/VIP 拦截（verified 条目已由服务端完成"直链解析+Range探活"验证，可播性有实证，跳过收费元数据拦截）
-    if item.get("verified") is not True:
+    # 3. 收费/VIP 拦截（verified 条目已由服务端完成"直链解析+Range探活"验证，可播性有实证，跳过收费元数据拦截；
+    #    当 allow_paywall=True 时同样跳过收费拦截，用于逐曲探活关闭时放行第三方源候选歌曲）
+    if not allow_paywall and item.get("verified") is not True:
         if int(item.get("pay_type") or 0) != 0:
             return False
         if int(item.get("pkg_price") or 0) != 0 or int(item.get("price") or 0) != 0:
@@ -1987,7 +1990,11 @@ async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, s
 
 
 async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str) -> list[dict]:
-    params: dict[str, Any] = {"keyword": keyword, "limit": limit}
+    params: dict[str, Any] = {
+        "keyword": keyword,
+        "limit": limit,
+        "probe": 1 if CONF.get("search_probe") else 0,
+    }
     selected = CONF.get("lx_sources") if sources is None else sources
     if isinstance(selected, str):
         selected = [s.strip() for s in selected.split(",") if s.strip()]
@@ -2011,10 +2018,11 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
         if not isinstance(raw_list, list):
             return None
         items = []
+        allow_paywall = not bool(CONF.get("search_probe"))
         for it in raw_list:
             if not isinstance(it, dict):
                 continue
-            if not is_playable_online_track(it):
+            if not is_playable_online_track(it, allow_paywall=allow_paywall):
                 continue
             tid = str(it.get("id") or "")
             if not tid:
@@ -2043,7 +2051,7 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
                 "lyric": "",
                 "verified": it.get("verified") is True,
             })
-        return _SearchItems([it for it in items if is_playable_online_track(it)], partial=bool(data.get("errors")))
+        return _SearchItems([it for it in items if is_playable_online_track(it, allow_paywall=allow_paywall)], partial=bool(data.get("errors")))
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
         return None

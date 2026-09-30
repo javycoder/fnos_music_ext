@@ -130,6 +130,7 @@ function applyConfigToForm() {
   $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
+  $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
   $("#lx-url").value = v.LX_SOURCE_URL || "";
   lxVerifiedUrl = v.LX_SOURCE_URL || null;
@@ -158,6 +159,7 @@ function collectConfig() {
     FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
+    FNMUSIC_SEARCH_PROBE: $("#search-probe").checked,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
   };
   if (provider === "musicdl") {
@@ -518,7 +520,7 @@ $("#lx-pick").addEventListener("click", lxPickFromNas);
 ["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {

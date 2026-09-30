@@ -164,14 +164,18 @@ def test_search_timeout_defaults_and_saves(env_file):
         view = client.get("/api/config")
         assert view.status_code == 200
         assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
-        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})
+        assert view.json()["values"]["FNMUSIC_SEARCH_PROBE"] == "false"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9, "FNMUSIC_SEARCH_PROBE": True}})
         assert saved.status_code == 200
         assert "FNMUSIC_SEARCH_TIMEOUT" in saved.json()["changed"]
+        assert "FNMUSIC_SEARCH_PROBE" in saved.json()["changed"]
     text = env_file.read_text(encoding="utf-8")
     assert "FNMUSIC_SEARCH_TIMEOUT='9'" in text
+    assert "FNMUSIC_SEARCH_PROBE='true'" in text
     with authed_client() as client:
         again = client.get("/api/config")
         assert again.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "9"
+        assert again.json()["values"]["FNMUSIC_SEARCH_PROBE"] == "true"
         clamped = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 99}})
         assert clamped.status_code == 200
     assert "FNMUSIC_SEARCH_TIMEOUT='60'" in env_file.read_text(encoding="utf-8")
