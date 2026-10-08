@@ -276,10 +276,15 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         return report
 
     finally:
-        # 清理临时源（复用的既有源不动）
+        # 清理：自建的临时源直接删除；复用的既有源还原启用态
         if temp_source_id:
             try:
                 await temp_client.delete_custom_source(temp_source_id)
+            except Exception:
+                pass
+        elif reused_source is not None and reused_was_enabled is False:
+            try:
+                await temp_client.toggle_custom_source(str(reused_source.get("id")), False)
             except Exception:
                 pass
         await temp_client.close()

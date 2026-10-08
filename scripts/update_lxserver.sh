@@ -46,12 +46,22 @@ fi
 
 echo "[INFO] 准备拉取 lxserver ${TARGET_TAG} 预编译包至构建缓存..."
 
-MIRRORS=(
-    "https://ghfast.top"
-    "https://gh-proxy.com"
-    "https://github.moeyy.xyz"
-    ""
-)
+if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    # CI 环境（海外网络）：优先官方直连，国内镜像兜底
+    MIRRORS=(
+        ""
+        "https://ghfast.top"
+        "https://gh-proxy.com"
+    )
+else
+    # 国内普通构建环境：优先镜像加速，官方直连兜底
+    MIRRORS=(
+        "https://ghfast.top"
+        "https://gh-proxy.com"
+        "https://github.moeyy.xyz"
+        ""
+    )
+fi
 
 BASE_RELEASE="https://github.com/XCQ0607/lxserver/releases/download/${TARGET_TAG}/${ZIP_NAME}"
 DOWNLOAD_OK=0

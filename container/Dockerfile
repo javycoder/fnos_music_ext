@@ -97,11 +97,16 @@ RUN set -eu; \
     if [ ! -s "${TARGET_ZIP}" ]; then \
         echo "[INFO] 预置包不存在或为空，通过镜像下载 ${LXSERVER_ZIP_NAME}..."; \
         DOWNLOAD_OK=0; \
-        for mirror in "${LXSERVER_MIRROR}" "https://gh-proxy.com" "https://github.moeyy.xyz" ""; do \
-            if [ -n "${mirror}" ]; then \
-                URL="${mirror}/https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
-            else \
+        if [ -z "${APT_MIRROR:-}" ]; then \
+            _chain="\"\" ${LXSERVER_MIRROR} https://gh-proxy.com"; \
+        else \
+            _chain="${LXSERVER_MIRROR} https://gh-proxy.com https://github.moeyy.xyz \"\""; \
+        fi; \
+        for mirror in ${_chain}; do \
+            if [ "${mirror}" = "\"\"" ] || [ -z "${mirror}" ]; then \
                 URL="https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+            else \
+                URL="${mirror}/https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
             fi; \
             echo "[INFO] 尝试从 ${URL} 下载..."; \
             if curl -fSL --connect-timeout 10 --max-time 180 "${URL}" -o "${TARGET_ZIP}"; then \

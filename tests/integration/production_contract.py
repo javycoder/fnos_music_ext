@@ -71,12 +71,14 @@ def main():
             assert callable(musicdl.MusicClient)
             assert curl_cffi.requests.Session
         else:
-            from source_runtime import MUSIC_PLATFORMS, parse_script_meta
-            assert "kw" in MUSIC_PLATFORMS
-            parse_script_meta(
+            from lxserver_client import SUPPORTED_PLATFORMS
+            from verify_source import parse_script_meta
+            assert "kw" in SUPPORTED_PLATFORMS
+            meta = parse_script_meta(
                 "/*\n * @name ci-src\n * @version 1.0.0\n * @author ci\n"
                 " * @description contract\n */\n"
             )
+            assert meta["name"] == "ci-src"
         print(json.dumps({"service": args.service, "production_import": "pass", "offline_contract": "pass"}))
 
 

@@ -47,7 +47,7 @@ jobs:
       - name: Python compile check
         run: >
           python -m py_compile proxy/app.py proxy/recommend.py proxy/env_merge.py proxy/version.py
-          lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py
+          lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py
           musicdl-service/app.py musicdl-service/hardening.py
           musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py
           webui-service/app.py
