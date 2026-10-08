@@ -96,7 +96,10 @@ async def download_script(url: str, timeout: float = 20.0) -> str:
 
 def parse_script_meta(script: str) -> dict:
     meta = {"name": "", "description": "", "version": "1.0.0", "author": ""}
-    for line in script.splitlines()[:50]:
+    # 与 lxserver extractMetadata 同契约：优先解析 /*! 或 /** 块注释
+    block = re.search(r"/\*[*!]([\s\S]*?)\*/", script)
+    lines = block.group(1).splitlines() if block else script.splitlines()[:50]
+    for line in lines:
         line = line.strip()
         m = re.search(r"@(\w+)\s+(.+)", line)
         if m:

@@ -826,6 +826,23 @@ class UploadBody(BaseModel):
     script: str
 
 
+_META_BLOCK_RE = re.compile(r"/\*[*!]([\s\S]*?)\*/")
+
+
+def _parse_script_head_meta(script: str) -> dict:
+    """按 lxserver extractMetadata 契约解析头部块注释（/*! 或 /**）里的 @name/@version。"""
+    meta: dict[str, str] = {}
+    m = _META_BLOCK_RE.search(script)
+    if not m:
+        return meta
+    block = m.group(1)
+    for key in ("name", "version"):
+        km = re.search(rf"@{key}\s+(.+)", block)
+        if km:
+            meta[key] = km.group(1).strip()
+    return meta
+
+
 def _lx_source_fs_path(source_id: str) -> str:
     """lxserver _open 用户源的容器内存储路径（与 lxserver getSourceDir/_open 约定一致）。"""
     return f"/data/lxserver/users/source/_open/{source_id}"
@@ -857,8 +874,7 @@ async def source_upload(body: UploadBody):
     lxserver 报"已存在"，此时复用已有源（多源列表场景下再次添加同名脚本是正常操作）。
     """
     # 提取脚本头部元数据（lxserver 返回的 metadata 为准，此处作兜底与匹配用）
-    match = re.search(r"@name\s+([^\r\n]+)", body.script)
-    name = match.group(1).strip() if match else body.filename
+    name = _parse_script_head_meta(body.script).get("name") or body.filename
 
     try:
         res = await LXSERVER.upload_custom_source(body.filename, body.script)

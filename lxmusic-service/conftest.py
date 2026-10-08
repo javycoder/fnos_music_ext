@@ -65,8 +65,15 @@ class FakeLxServerClient:
 
     @staticmethod
     def _derive_source_id(filename: str, script: str) -> str:
-        m = re.search(r"@name\s+([^\r\n]+)", script)
-        name = (m.group(1).strip() if m else filename) or "source"
+        # 与 lxserver extractMetadata/generateId 同契约：仅解析 /*! 或 /** 块注释
+        block = re.search(r"/\*[*!]([\s\S]*?)\*/", script)
+        name = ""
+        if block:
+            m = re.search(r"@name\s+(.+)", block.group(1))
+            if m:
+                name = m.group(1).strip()
+        if not name:
+            name = filename or "source"
         if name.lower().endswith(".js"):
             name = name[:-3]
         return re.sub(r'[\\/:*?"<>|]', "_", name) + ".js"
@@ -124,7 +131,8 @@ class FakeLxServerClient:
         existing = next((s for s in self.sources if s["id"] == source_id), None)
         if existing:
             raise RuntimeError(f'源 "{existing["name"]}" 已存在于 [open]')
-        m = re.search(r"@name\s+([^\r\n]+)", script_content)
+        block = re.search(r"/\*[*!]([\s\S]*?)\*/", script_content)
+        m = re.search(r"@name\s+(.+)", block.group(1)) if block else None
         name = (m.group(1).strip() if m else filename) or filename
         entry = {"id": source_id, "name": name, "enabled": False, "version": "1.0.0",
                  "supportedSources": ["kw", "wy"]}

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -192,29 +193,118 @@ def test_track_lyric_endpoint(test_app_client):
     assert "[00:00.00]" in data["data"]["lyric"]
 
 
-def test_source_management_endpoints(test_app_client):
+def test_source_management_endpoints(test_app_client, fake_lx):
     # GET /api/v1/source
     res = test_app_client.get("/api/v1/source")
     assert res.status_code == 200
     assert res.json()["ok"] is True
 
-    # POST /api/v1/source/upload
+    # POST /api/v1/source/upload —— 返回 lxserver 真实存储路径（id 由 @name 派生）
     res = test_app_client.post(
         "/api/v1/source/upload",
-        json={"filename": "my_src.js", "script": "/* @name MyTest */ console.log(1);"},
+        json={"filename": "my_src.js", "script": "/*!\n * @name MyTest\n */\nconsole.log(1);"},
     )
     assert res.status_code == 200
     assert res.json()["ok"] is True
+    data = res.json()["data"]
+    assert data["url"] == "file:///data/lxserver/users/source/_open/MyTest.js"
+    assert data["meta"]["name"] == "MyTest"
 
-    # POST /api/v1/source (激活)
-    res = test_app_client.post("/api/v1/source", json={"url": "my_src.js"})
+    # 同一脚本重复上传：复用既有源，不报错（多源列表的常规操作）
+    res = test_app_client.post(
+        "/api/v1/source/upload",
+        json={"filename": "my_src.js", "script": "/*!\n * @name MyTest\n */\nconsole.log(1);"},
+    )
+    assert res.status_code == 200
+    assert res.json()["data"]["url"] == data["url"]
+
+    # POST /api/v1/source（激活上传返回的 file:// URL）
+    res = test_app_client.post("/api/v1/source", json={"url": data["url"]})
     assert res.status_code == 200
     assert res.json()["ok"] is True
+    # 单源语义：目标启用、其余禁用
+    states = {s["id"]: s["enabled"] for s in fake_lx.sources}
+    assert states.get("MyTest.js") is True
+    assert states.get("source1") is False
 
     # DELETE /api/v1/source (清除)
     res = test_app_client.delete("/api/v1/source")
     assert res.status_code == 200
     assert res.json()["ok"] is True
+
+
+def test_source_set_activates_unknown_local_file_by_import(test_app_client, fake_lx, tmp_path):
+    """旧数据卷路径（如 /data/lxmusic/uploads）不在 lxserver 列表时自动补导入再激活。"""
+    script_path = tmp_path / "legacy_src.js"
+    script_path.write_text("/*!\n * @name LegacySrc\n */\nconsole.log(1);", encoding="utf-8")
+    res = test_app_client.post("/api/v1/source", json={"url": f"file://{script_path}"})
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    # 已按派生 id 导入并激活
+    states = {s["id"]: s["enabled"] for s in fake_lx.sources}
+    assert states.get("LegacySrc.js") is True
+
+
+def test_source_set_rejects_missing_source(test_app_client):
+    res = test_app_client.post("/api/v1/source", json={"url": "file:///nonexistent/nope.js"})
+    assert res.status_code == 500
+    assert "未找到要激活的源" in res.json()["error"]
+
+
+def test_lxserver_upload_sends_json_contract():
+    """上传必须发 JSON {filename, content}（lxserver 端点 JSON.parse，multipart 会被拒）。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content_type"] = request.headers.get("content-type", "")
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"success": True, "id": "x.js", "metadata": {"name": "x"}})
+
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test", admin_password="pw")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    res = asyncio.run(client.upload_custom_source("x.js", "console.log(1)"))
+    assert captured["content_type"].startswith("application/json")
+    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)"}
+    assert res["id"] == "x.js"
+
+
+def test_lxserver_admin_resp_semantics():
+    """管理端点失败语义：success=false / HTTP 500 抛 RuntimeError 带服务端文案。"""
+    from lxserver_client import LxServerClient
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": False, "error": '源 "x" 已存在于 [open]'})
+
+    client = LxServerClient(base_url="http://test", admin_password="pw")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(fail_handler), base_url="http://test")
+    with pytest.raises(RuntimeError, match="已存在"):
+        asyncio.run(client.upload_custom_source("x.js", "s"))
+
+    def server_error_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"success": False, "error": "boom"})
+
+    client2 = LxServerClient(base_url="http://test", admin_password="pw")
+    client2._client = httpx.AsyncClient(transport=httpx.MockTransport(server_error_handler), base_url="http://test")
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(client2.toggle_custom_source("x.js", True))
+
+
+def test_lxserver_toggle_sends_enabled_key():
+    """toggle 必须用 enabled 键（lxserver 端点不认识 enable，会退化成布尔翻转）。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"success": True, "enabled": True})
+
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test", admin_password="pw")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    assert asyncio.run(client.toggle_custom_source("MyTest.js", True)) is True
+    assert captured["body"] == {"id": "MyTest.js", "enabled": True}
 
 
 def test_track_url_resolution(test_app_client):
