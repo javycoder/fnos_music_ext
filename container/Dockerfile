@@ -130,6 +130,9 @@ RUN set -eu; \
     else \
         cp -a /srv/lxserver-tmp/. /srv/lxserver/; \
     fi; \
+    if [ -f /srv/lxserver/server/server.js ]; then \
+        sed -i 's/const result = await musicSdk\[source\]\.getLyric(songInfo);/const _res = musicSdk[source].getLyric(songInfo); const result = await (_res \&\& _res.promise ? _res.promise : _res);/g' /srv/lxserver/server/server.js; \
+    fi; \
     rm -rf /srv/lxserver-tmp /srv/lxserver-artifact; \
     chown -R appuser:appuser /srv/lxserver
 

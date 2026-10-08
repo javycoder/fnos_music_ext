@@ -23,10 +23,10 @@ def supervisord_conf():
     return cp
 
 
-def test_supervisord_four_programs_all_autostart_false(supervisord_conf):
+def test_supervisord_programs_all_autostart_false(supervisord_conf):
     programs = sorted(s for s in supervisord_conf.sections() if s.startswith("program:"))
     assert programs == [
-        "program:lxmusic", "program:musicbox", "program:musicdl", "program:webui",
+        "program:lxmusic", "program:lxserver", "program:musicbox", "program:musicdl", "program:webui",
     ]
     for section in programs:
         assert supervisord_conf.get(section, "autostart") == "false"
@@ -51,6 +51,12 @@ def test_supervisord_ports_and_directories(supervisord_conf):
         command = supervisord_conf.get(section, "command")
         assert f"--port {port}" in command
         assert supervisord_conf.get(section, "directory") == directory
+
+    # lxserver 独立 node 进程，通过环境变量注入端口与路径
+    lxserver_sec = "program:lxserver"
+    assert supervisord_conf.get(lxserver_sec, "directory") == "/srv/lxserver"
+    assert "node index.js" in supervisord_conf.get(lxserver_sec, "command")
+    assert 'PORT="8005"' in supervisord_conf.get(lxserver_sec, "environment")
 
 
 def test_supervisord_daemon_section(supervisord_conf):
@@ -156,17 +162,22 @@ class FakeSupervisor:
         daemon.chmod(0o755)
 
 
-def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path) -> list[str]:
+def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path, tmp_path: Path | None = None) -> list[str]:
     """跑真实 entrypoint.sh，返回 supervisorctl 的调用序列（去掉 supervisord 行）。"""
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "ENV_FLAG_LIB": str(CONTAINER_DIR / "env_flag.sh"),
+        "SUPERVISOR_CONF": "/nonexistent/supervisord.conf",
+        "FNMUSIC_ENV_FILE": str(env_file),
+    }
+    if tmp_path is not None:
+        data_dir = tmp_path / "data"
+        env["DATA_PATH"] = str(data_dir / "lxserver")
+        env["LX_DATA_DIR"] = str(data_dir / "lxmusic")
     proc = subprocess.run(
         ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
         capture_output=True, text=True, timeout=30,
-        env={
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "ENV_FLAG_LIB": str(CONTAINER_DIR / "env_flag.sh"),
-            "SUPERVISOR_CONF": "/nonexistent/supervisord.conf",
-            "FNMUSIC_ENV_FILE": str(env_file),
-        },
+        env=env,
     )
     assert proc.returncode == 0, proc.stderr
     calls = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln and not ln.startswith("supervisord ")]
@@ -186,7 +197,7 @@ def entrypoint_env(tmp_path):
     def run(env_text: str) -> list[str]:
         env_file.write_text(env_text, encoding="utf-8")
         log.write_text("", encoding="utf-8")
-        return _run_entrypoint(fake_bin, env_file, log)
+        return _run_entrypoint(fake_bin, env_file, log, tmp_path)
 
     return run
 
@@ -195,9 +206,9 @@ def entrypoint_env(tmp_path):
     # 单源：只启动所选音源
     ("FNMUSIC_MUSICDL_ENABLED=true\n", ["start musicdl"]),
     ("FNMUSIC_NETEASE_ENABLED=true\n", ["start musicbox"]),
-    ("FNMUSIC_LX_ENABLED=true\n", ["start lxmusic"]),
+    ("FNMUSIC_LX_ENABLED=true\n", ["start lxserver", "start lxmusic"]),
     # WebUI 独立开关
-    ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\n", ["start lxmusic", "start webui"]),
+    ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\n", ["start lxserver", "start lxmusic", "start webui"]),
     ("FNMUSIC_WEBUI_ENABLED=true\n", ["start webui"]),
     # 旧多源并存：只取第一个命中（musicdl 优先），不重复拉起
     ("FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\n",
@@ -250,7 +261,9 @@ def test_dockerfile_assembly():
     for req in ("musicdl-service/requirements.txt", "musicbox-service/requirements.txt",
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
-    assert "lxmusic-service/js/bridge.js" in text
+    assert "container/lxserver.version" in text
+    assert "lxmusic-service/lxserver_client.py" in text
+    assert "lxmusic-service/js/bridge.js" not in text
     assert text.count("HEALTHCHECK") >= 1
     assert 'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' in text
     assert "EXPOSE 8001 8002 8003 8004" in text

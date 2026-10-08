@@ -974,6 +974,8 @@ def strip_source_tag(title: str) -> str:
         name = str(entry.get("name") or "").strip()
         if name:
             candidates.append(f"[{name}] ")
+    # 优先匹配最长标记，避免前缀部分命中短备注名
+    candidates.sort(key=len, reverse=True)
     for tag in candidates:
         if t.startswith(tag):
             return t[len(tag):]
@@ -3081,6 +3083,15 @@ async def search_track(request: Request):
     entry["accessed"] = time.time()
     task = entry.get("task")
     if (not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry):
+        # TTL 到期重新聚合：清理深分页遗留状态，避免继承旧轮次与取尽标记
+        entry.pop("exhausted", None)
+        entry.pop("deep_round", None)
+        entry.pop("deep_cursors", None)
+        entry.pop("source_seen_ids", None)
+        ext_task = entry.get("extend_task")
+        if ext_task and not ext_task.done():
+            ext_task.cancel()
+        entry.pop("extend_task", None)
         task = asyncio.create_task(_aggregate_search(request, keyword, entry))
         entry["task"] = task
     # 在线搜索只有一个超时。有在线条目就立刻回复（本地在前、在线在后）；
@@ -3271,13 +3282,18 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
     try:
         fetches: list[tuple[str, Any]] = []
         exhausted = entry.setdefault("exhausted", set())
+        cursors = entry.setdefault("deep_cursors", {})
+        seen_ids = entry.setdefault("source_seen_ids", {})
+
         if CONF.get("netease_enabled") and "netease" not in exhausted:
             limit = int(CONF["netease_search_limit"])
+            n_cursor = cursors.get("netease", 1)
             fetches.append(("netease", _musicbox_search_request(
-                get_musicbox_client(request.app), keyword, limit, offset=round_no * limit)))
+                get_musicbox_client(request.app), keyword, limit, offset=n_cursor * limit)))
         if CONF.get("lx_enabled") and "lx" not in exhausted:
+            lx_cursor = cursors.get("lx", 1)
             fetches.append(("lx", _lx_search_request(
-                get_lx_client(request.app), keyword, CONF["lx_search_limit"], None, scope, page=round_no + 1)))
+                get_lx_client(request.app), keyword, CONF["lx_search_limit"], None, scope, page=lx_cursor + 1)))
         if not fetches:
             return
         results = await asyncio.gather(*[coro for _, coro in fetches], return_exceptions=True)
@@ -3285,19 +3301,28 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
             return
         merged = list(entry["items"])
         for (name, _), result in zip(fetches, results):
-            if isinstance(result, BaseException):
-                # 瞬时失败不判取尽，下一轮重试
+            if isinstance(result, BaseException) or result is None:
+                # 瞬时失败不判取尽，下一轮重试当前游标
                 logger.warning("deep page fetch %s failed: %s", name, result)
                 continue
             items = result if isinstance(result, list) else []
             if not items:
                 exhausted.add(name)
                 continue
-            prev = len(merged)
-            merged = deduplicate_online_items(merged + items)[:2000]
-            if len(merged) == prev:
-                # 本轮 0 新增：上游开始重复自身，视为取尽
+
+            prev_seen = seen_ids.setdefault(name, set())
+            item_ids = {it.get("id") or (title_from_track(it), artist_from_track(it)) for it in items}
+            if item_ids and item_ids.issubset(prev_seen):
+                # 该源自身已开始重复，判定该源已到末尾取尽
                 exhausted.add(name)
+                continue
+            prev_seen.update(item_ids)
+
+            # 该源成功获取新数据，推进该源的独立游标
+            cursors[name] = cursors.get(name, 1) + 1
+
+            merged = deduplicate_online_items(merged + items)[:2000]
+
         if len(merged) >= 2000:
             exhausted.update({"netease", "lx"})
         entry["items"] = merged

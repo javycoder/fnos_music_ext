@@ -329,10 +329,16 @@ class LxSearchGate:
             if not w.done():
                 w.set_result(value)
 
-    async def run(self, scope: str, keyword: str, factory):
+    async def run(self, scope: str, keyword: str, factory, subkey: str = ""):
         fut = asyncio.get_running_loop().create_future()
         running = self._running
-        if running and running["scope"] == scope and running["keyword"] == keyword and not running.get("superseded"):
+        if (
+            running
+            and running["scope"] == scope
+            and running["keyword"] == keyword
+            and running.get("subkey") == subkey
+            and not running.get("superseded")
+        ):
             running["waiters"].append(fut)
         elif running and running["scope"] == scope and running["keyword"] != keyword:
             running["superseded"] = True
@@ -340,28 +346,37 @@ class LxSearchGate:
             task = running.get("task")
             if task and not task.done():
                 task.cancel()
-            self._upsert(scope, keyword, factory, fut, front=True)
+            self._upsert(scope, keyword, subkey, factory, fut, front=True)
         else:
-            self._upsert(scope, keyword, factory, fut, front=False)
+            self._upsert(scope, keyword, subkey, factory, fut, front=False)
         self._pump()
         return await asyncio.shield(fut)
 
-    def _upsert(self, scope, keyword, factory, fut, front: bool) -> None:
+    def _upsert(self, scope, keyword, subkey, factory, fut, front: bool) -> None:
         for slot in self._queue:
             if slot["scope"] != scope:
                 continue
             if slot["keyword"] != keyword:
                 self._resolve(slot, _LX_SUPERSEDED)
                 slot["keyword"] = keyword
+                slot["subkey"] = subkey
                 slot["factory"] = factory
                 slot["waiters"] = [fut]
-            else:
+            elif slot.get("subkey") == subkey:
                 slot["waiters"].append(fut)
+            else:
+                continue
             if front:
                 self._queue.remove(slot)
                 self._queue.insert(0, slot)
             return
-        slot = {"scope": scope, "keyword": keyword, "factory": factory, "waiters": [fut]}
+        slot = {
+            "scope": scope,
+            "keyword": keyword,
+            "subkey": subkey,
+            "factory": factory,
+            "waiters": [fut],
+        }
         self._queue.insert(0, slot) if front else self._queue.append(slot)
 
     def _pump(self) -> None:
@@ -371,6 +386,7 @@ class LxSearchGate:
         job = {
             "scope": slot["scope"],
             "keyword": slot["keyword"],
+            "subkey": slot.get("subkey", ""),
             "factory": slot["factory"],
             "waiters": slot["waiters"],
             "superseded": False,
@@ -421,14 +437,18 @@ async def resolve_and_probe(
     if not song_info:
         song_info = LXSERVER.synthesize_song_info(track_id, item)
 
+    deadline = time.monotonic() + budget
     tiers = _quality_tiers(quality)
     attempted_tiers: list[str] = []
 
     for tier in tiers:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         lx_q = _tier_to_lx_quality(tier)
         attempted_tiers.append(tier)
         try:
-            async with asyncio.timeout(min(budget, CONF["resolver_timeout"])):
+            async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
                 res = await LXSERVER.get_music_url(song_info, lx_q)
         except Exception as exc:
             logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
@@ -445,8 +465,16 @@ async def resolve_and_probe(
         elif src == "tx":
             headers["Referer"] = "https://y.qq.com/"
 
-        # 媒体魔数探活
-        ok, final_url, ct, size = await probe_url(client, raw_url, headers)
+        # 媒体魔数探活（共用同一总预算）
+        remaining_probe = deadline - time.monotonic()
+        if remaining_probe <= 0:
+            break
+        try:
+            async with asyncio.timeout(remaining_probe):
+                ok, final_url, ct, size = await probe_url(client, raw_url, headers)
+        except Exception:
+            ok = False
+
         if ok:
             _chain_record_success("user_source")
             ext = "flac" if "flac" in ct else ("mp3" if "mp3" in ct else "mp3")
@@ -479,14 +507,28 @@ async def source_capabilities() -> dict[str, dict]:
             active_source = s
             break
 
+    supported = []
+    source_status = (active_source or {}).get("status", "ok") if active_source else ""
+    if active_source and source_status != "failed":
+        raw_supp = active_source.get("supportedSources") or active_source.get("sources") or []
+        if isinstance(raw_supp, dict):
+            raw_supp = list(raw_supp.keys())
+        supported = [normalize_source(str(p)) for p in raw_supp if normalize_source(str(p))]
+        if not supported:
+            supported = list(SUPPORTED_PLATFORMS)
+
     caps: dict[str, dict] = {}
     for src in SUPPORTED_PLATFORMS:
-        has_playback = bool(lx_alive and active_source)
+        has_playback = bool(lx_alive and active_source and (src in supported))
         reason = ""
         if not lx_alive:
             reason = "lxserver unready"
         elif not active_source:
             reason = "no active custom source"
+        elif source_status == "failed":
+            reason = f"active source failed: {active_source.get('error', 'init error')}"
+        elif src not in supported:
+            reason = f"platform {src} not supported by active source"
 
         qualitys = ["128k", "320k", "flac"] if has_playback else []
         caps[src] = {
@@ -520,21 +562,30 @@ async def describe_user_source() -> dict:
             "source": None,
         }
 
-    platforms_desc = {}
-    for p in SUPPORTED_PLATFORMS:
-        platforms_desc[p] = {"qualitys": ["128k", "320k", "flac"]}
+    status = str(active.get("status") or "ok")
+    err = str(active.get("error") or "")
+    initialized = status != "failed"
+
+    raw_supp = active.get("supportedSources") or active.get("sources") or []
+    if isinstance(raw_supp, dict):
+        raw_supp = list(raw_supp.keys())
+    supported = [normalize_source(str(p)) for p in raw_supp if normalize_source(str(p))]
+    if not supported:
+        supported = list(SUPPORTED_PLATFORMS)
+
+    platforms_desc = {p: {"qualitys": ["128k", "320k", "flac"]} for p in supported}
 
     return {
         "configured": True,
         "url": active.get("name") or active.get("id") or "",
-        "initialized": True,
-        "last_error": "",
+        "initialized": initialized,
+        "last_error": err,
         "source": {
             "name": active.get("name", "lx-source"),
             "version": active.get("version", "1.0.0"),
             "author": active.get("author", ""),
             "platforms": platforms_desc,
-            "running": True,
+            "running": initialized,
             "pid": 0,
             "uptime_s": 3600,
         },
@@ -543,11 +594,59 @@ async def describe_user_source() -> dict:
 
 # ------------------------------------------------------------- FastAPI 生命周期 --
 
+async def _bootstrap_migration():
+    for _ in range(20):
+        try:
+            if await LXSERVER.health():
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    try:
+        old_dir = Path(os.environ.get("LX_DATA_DIR", "/data/lxmusic"))
+        uploads = old_dir / "uploads"
+        if uploads.is_dir():
+            existing = await LXSERVER.list_custom_sources()
+            existing_names = {s.get("name") for s in existing} | {s.get("id") for s in existing}
+            for js_file in uploads.glob("*.js"):
+                if js_file.name not in existing_names:
+                    try:
+                        content = js_file.read_text(encoding="utf-8", errors="replace")
+                        await LXSERVER.upload_custom_source(js_file.name, content)
+                        logger.info("已自动迁移并加载历史自定义源脚本: %s", js_file.name)
+                    except Exception as e:
+                        logger.warning("迁移脚本 %s 失败: %s", js_file.name, e)
+
+        active = await describe_user_source()
+        if not active.get("configured"):
+            source_url = ""
+            state_file = old_dir / "state.json"
+            if state_file.is_file():
+                try:
+                    data = json.loads(state_file.read_text(encoding="utf-8"))
+                    source_url = str(data.get("source_url") or "")
+                except Exception:
+                    pass
+            if not source_url:
+                source_url = os.environ.get("LX_SOURCE_URL", "").strip()
+            if source_url:
+                try:
+                    await source_set(SourceBody(url=source_url))
+                    logger.info("已自动激活历史音源: %s", source_url)
+                except Exception as e:
+                    logger.warning("自动激活历史音源失败: %s", e)
+    except Exception as exc:
+        logger.warning("历史数据检查与迁移异常: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 共享一个全局 AsyncClient 用于探活和下载
     app.state.client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+    migration_task = asyncio.create_task(_bootstrap_migration())
     yield
+    migration_task.cancel()
     await app.state.client.aclose()
     await LXSERVER.close()
 
@@ -666,7 +765,8 @@ async def search_tracks(
         }
 
     try:
-        gate_res = await _SEARCH_GATE.run(scope, kw, _do_search)
+        subkey = f"{page}:{limit}:{','.join(sorted(wanted))}:{probe_enabled}"
+        gate_res = await _SEARCH_GATE.run(scope, kw, _do_search, subkey=subkey)
         if gate_res is _LX_SUPERSEDED:
             return {"ok": True, "items": [], "superseded": True}
         if isinstance(gate_res, Exception):
@@ -941,6 +1041,18 @@ async def source_set(body: SourceBody):
                     raise
                 existing = await _find_lxserver_source(by_url=url)
                 source_id = str((existing or {}).get("id") or "")
+            if not source_id:
+                existing = await _find_lxserver_source(by_url=url)
+                source_id = str((existing or {}).get("id") or "")
+            if not source_id or not await LXSERVER.activate_single_source(source_id):
+                return JSONResponse(
+                    content={
+                        "ok": False,
+                        "error": f"导入成功但未找到要激活的源: {source_id or url}",
+                        "category": "runtime",
+                    },
+                    status_code=500,
+                )
         else:
             # file:// URL 或裸 id/名称：取最后一段作为 lxserver 源 id（与上传时返回的 id 一致）
             parsed = urllib.parse.urlparse(url)
@@ -996,6 +1108,7 @@ async def source_clear():
                 await LXSERVER.toggle_custom_source(sid, False)
     except Exception as exc:
         logger.warning("source_clear error: %s", exc)
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=500)
 
     _CHAIN_HEALTH.pop("user_source", None)
     return {"ok": True, "data": None}

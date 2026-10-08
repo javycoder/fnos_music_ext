@@ -61,6 +61,7 @@ class FakeLxServerClient:
         self._song_info_cache = {}
         self.toggle_calls: list[tuple[str, bool]] = []
         self.upload_calls: list[tuple[str, str]] = []
+        self.import_calls: list[str] = []
         self.deleted_ids: list[str] = []
 
     @staticmethod
@@ -139,6 +140,31 @@ class FakeLxServerClient:
         self.sources.append(entry)
         return {"success": True, "id": source_id,
                 "metadata": {"name": name, "version": "1.0.0"}, "supportedSources": ["kw", "wy"]}
+
+    async def import_custom_source(self, url: str) -> dict:
+        self.import_calls.append(url)
+        source_id = url.split("?")[0].rstrip("/").split("/")[-1] or "imported_source.js"
+        if not source_id.endswith(".js"):
+            source_id += ".js"
+        existing = next((s for s in self.sources if s.get("sourceUrl") == url or s["id"] == source_id), None)
+        if existing:
+            raise RuntimeError(f'源 "{existing["name"]}" 已存在于 [open]')
+        name = source_id.removesuffix(".js")
+        entry = {
+            "id": source_id,
+            "name": name,
+            "enabled": False,
+            "version": "1.0.0",
+            "sourceUrl": url,
+            "supportedSources": ["kw", "wy"],
+        }
+        self.sources.append(entry)
+        return {
+            "success": True,
+            "id": source_id,
+            "metadata": {"name": name, "version": "1.0.0"},
+            "supportedSources": ["kw", "wy"],
+        }
 
     async def activate_single_source(self, target_id_or_name: str) -> bool:
         target = self._find(target_id_or_name)

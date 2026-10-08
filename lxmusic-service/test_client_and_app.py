@@ -339,3 +339,74 @@ def test_verify_source_json_format_guard():
     assert _looks_like_json_source('[{"api": 1}]') is True
     assert _looks_like_json_source("/* @name test */ console.log(1);") is False
 
+
+def test_source_set_http_url_activates_target(test_app_client, fake_lx):
+    """测试通过 HTTP URL 设置源，能够正确导入并激活该源（单源生效）。"""
+    res = test_app_client.post("/api/v1/source", json={"url": "https://example.com/remote_source.js"})
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert "https://example.com/remote_source.js" in fake_lx.import_calls
+    # 验证目标源已被激活，旧源已被禁用
+    states = {s["id"]: s["enabled"] for s in fake_lx.sources}
+    assert states.get("remote_source.js") is True
+    assert states.get("source1") is False
+
+
+def test_activate_nonexistent_source_does_not_disable_existing():
+    """激活不存在的目标源时，不应当误将当前运行中的源全部禁用。"""
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test")
+    # 模拟已有激活源
+    sources = [
+        {"id": "source1", "name": "source1", "enabled": True},
+        {"id": "source2", "name": "source2", "enabled": False},
+    ]
+    toggled = []
+
+    async def fake_list():
+        return list(sources)
+
+    async def fake_toggle(sid, enable):
+        toggled.append((sid, enable))
+        return True
+
+    client.list_custom_sources = fake_list
+    client.toggle_custom_source = fake_toggle
+
+    ok = asyncio.run(client.activate_single_source("non_existent_source"))
+    assert ok is False
+    # 没有任何 toggle 被执行，旧源保持原样
+    assert toggled == []
+
+
+def test_source_capabilities_reflects_failed_status():
+    """当激活源状态为 failed 时，playback_available 应为 False 并给出错误原因。"""
+    from app import source_capabilities
+    import app as lxapp
+
+    orig_lx = lxapp.LXSERVER
+    try:
+        class FailedClient:
+            async def is_alive(self):
+                return True
+
+            async def list_custom_sources(self):
+                return [{
+                    "id": "bad.js",
+                    "name": "bad",
+                    "enabled": True,
+                    "status": "failed",
+                    "error": "script crashed",
+                    "supportedSources": ["kw"],
+                }]
+
+        lxapp.LXSERVER = FailedClient()
+        caps = asyncio.run(source_capabilities())
+        for plat, info in caps.items():
+            assert info["playback_available"] is False
+            assert "failed" in info["reason"]
+    finally:
+        lxapp.LXSERVER = orig_lx
+
+

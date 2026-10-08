@@ -781,3 +781,58 @@ def test_api_requires_admin(env_file):
         saved = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "smooth"}})
         assert saved.status_code == 200
     assert "FNMUSIC_QUALITY_MODE='smooth'" in env_file.read_text(encoding="utf-8")
+
+
+def test_preview_endpoint_cleans_up_on_partial_start_failure(env_file, monkeypatch):
+    """多进程音源（如 lxmusic 的 lxserver + lxmusic）如果后一进程启动失败，应回滚停止已启动的前置进程。"""
+    calls: list[tuple[str, str]] = []
+
+    def fake_supervisorctl(cmd, prog, timeout=20.0):
+        calls.append((cmd, prog))
+        if cmd == "start" and prog == "lxmusic":
+            return 1, "failed to start lxmusic"
+        return 0, "ok"
+
+    monkeypatch.setattr(webui, "supervisorctl", fake_supervisorctl)
+    with authed_client() as client:
+        r = client.post("/api/preview", json={"provider": "lxmusic"})
+        assert r.status_code == 500
+        assert "lxmusic" not in webui._preview_until
+    # 验证 lxserver 被拉起后又被停止回滚
+    assert ("start", "lxserver") in calls
+    assert ("start", "lxmusic") in calls
+    assert ("stop", "lxserver") in calls
+
+
+def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
+    """当 .env 已经写入 LX_SOURCE_URL，重新保存相同 URL 时即使 .env 无 diff，也必须触发 lx_activate 支持重试。"""
+    import json
+    env_content = (
+        "FNMUSIC_NETEASE_ENABLED='false'\n"
+        "FNMUSIC_MUSICDL_ENABLED='false'\n"
+        "FNMUSIC_LX_ENABLED='true'\n"
+        "LX_SOURCE_URL='http://lx.test/source.js'\n"
+    )
+    env_file.write_text(env_content, encoding="utf-8")
+    activate_calls: list[dict] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/source":
+            activate_calls.append(json.loads(request.content.decode()))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False})
+
+    webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"LX_SOURCE_URL": "http://lx.test/source.js"}})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        # 即使 changed 为空，actions 也包含 lx_activate
+        lx_actions = [a for a in data["actions"] if a["kind"] == "lx_activate"]
+        assert len(lx_actions) == 1
+        assert lx_actions[0]["ok"] is True, f"lx_activate failed with error: {lx_actions[0].get('error')}"
+    assert len(activate_calls) == 1
+    assert activate_calls[0]["url"] == "http://lx.test/source.js"
+

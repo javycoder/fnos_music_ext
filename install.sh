@@ -879,17 +879,24 @@ KEEP_DATA_DIR="${FNMUSIC_KEEP_DIR:-${VOL}fnmusic-ext-data}"
 RESTORED_FROM_KEEP_DIR=""
 if [ -d "${KEEP_DATA_DIR}" ] && [ ! -f "${BASE_DIR}/.env" ]; then
     log_info "检测到历史保留的音乐源与配置文件 (${KEEP_DATA_DIR})，正在恢复..."
+    RESTORE_OK=1
     (
         shopt -s dotglob nullglob
         for _k_item in "${KEEP_DATA_DIR}"/*; do
             [ -e "${_k_item}" ] || continue
             _k_name="$(basename "${_k_item}")"
             [ "${_k_name}" = "." ] || [ "${_k_name}" = ".." ] || [ "${_k_name}" = "README.txt" ] && continue
-            cp -a "${_k_item}" "${BASE_DIR}/" 2>/dev/null || true
+            if ! cp -a "${_k_item}" "${BASE_DIR}/"; then
+                exit 1
+            fi
         done
-    )
-    RESTORED_FROM_KEEP_DIR="${KEEP_DATA_DIR}"
-    log_info "历史音乐源数据已恢复至 ${BASE_DIR}"
+    ) || RESTORE_OK=0
+    if [ "${RESTORE_OK}" -eq 1 ] && [ -f "${BASE_DIR}/.env" ]; then
+        RESTORED_FROM_KEEP_DIR="${KEEP_DATA_DIR}"
+        log_info "历史音乐源数据已恢复至 ${BASE_DIR}"
+    else
+        log_warn "历史数据未完全成功恢复，将保留备份目录以防止数据丢失: ${KEEP_DATA_DIR}"
+    fi
 fi
 
 # v2.0.0 升级检测：旧 .env 三源并存（多 true）时强制重新三选一
@@ -1372,7 +1379,7 @@ if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     bash "${BASE_DIR}/netease_login.sh" || true
 fi
 
-if [ -n "${RESTORED_FROM_KEEP_DIR}" ] && [ -d "${RESTORED_FROM_KEEP_DIR}" ]; then
+if [ -n "${RESTORED_FROM_KEEP_DIR}" ] && [ -d "${RESTORED_FROM_KEEP_DIR}" ] && [ -f "${BASE_DIR}/.env" ]; then
     rm -rf "${RESTORED_FROM_KEEP_DIR}" 2>/dev/null || true
     log_info "已清理安装过渡目录: ${RESTORED_FROM_KEEP_DIR}"
 fi

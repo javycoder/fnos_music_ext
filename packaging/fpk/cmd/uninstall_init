@@ -66,7 +66,9 @@ if [ -d "${KEEP_DIR}" ]; then
     for item in ${ITEMS}; do
         src="${FNMUSIC_REPO_DIR}/${item}"
         [ -e "${src}" ] || continue
-        cp -a "${src}" "${KEEP_DIR}/" 2>> "${FNMUSIC_LOG}" || true
+        if ! cp -a "${src}" "${KEEP_DIR}/" 2>> "${FNMUSIC_LOG}"; then
+            echo "[fnmusic-ext] WARN: 保留项 ${item} 复制到 ${KEEP_DIR} 失败" >> "${FNMUSIC_LOG}"
+        fi
     done
     cat > "${KEEP_DIR}/README.txt" << 'EOF' 2>/dev/null || true
 此目录为 fnmusic-ext 卸载时保留的音乐源与配置数据。

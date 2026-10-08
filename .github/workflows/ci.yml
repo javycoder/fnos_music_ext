@@ -36,7 +36,7 @@ jobs:
         run: >
           python -m pip install -r proxy/requirements.txt
           -r webui-service/requirements.txt
-          pytest mutagen qrcode pillow PyYAML pytest-cov
+          pytest pytest-asyncio mutagen qrcode pillow PyYAML pytest-cov
 
       - name: Shell script syntax check
         run: |

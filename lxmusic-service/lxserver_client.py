@@ -186,9 +186,16 @@ class LxServerClient:
         self.admin_password = admin_password
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        self._mgmt_lock: asyncio.Lock | None = None
         # songInfo 反查缓存: track_id -> songInfo dict
         self._song_info_cache: dict[str, dict] = {}
         self._cache_max = 2000
+
+    @property
+    def mgmt_lock(self) -> asyncio.Lock:
+        if self._mgmt_lock is None:
+            self._mgmt_lock = asyncio.Lock()
+        return self._mgmt_lock
 
     async def get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -318,10 +325,17 @@ class LxServerClient:
             # 记录完整原始 songInfo 供后续反查解析
             self.cache_song_info(track_id, raw)
             results.append(item)
+            if len(results) >= limit:
+                break
         return results
 
     # ------------------------------------------------------------- 播放链接解析 --
-    async def get_music_url(self, song_info: dict, quality: str = "128k") -> dict | None:
+    async def get_music_url(
+        self,
+        song_info: dict,
+        quality: str = "128k",
+        exclude_api_sources: list[str] | None = None,
+    ) -> dict | None:
         """调用 lxserver /api/music/url 解析直链。
 
         返回格式:
@@ -334,6 +348,8 @@ class LxServerClient:
             "quality": quality,
             "enableAutoSwitchApiSource": True,
         }
+        if exclude_api_sources:
+            body["excludeApiSources"] = exclude_api_sources
         resp = await client.post("/api/music/url", json=body, timeout=self.timeout)
         if resp.status_code != 200:
             logger.warning("lxserver get_music_url error %s: %.150s", resp.status_code, resp.text)
@@ -347,12 +363,35 @@ class LxServerClient:
     async def get_lyric(self, song_info: dict) -> dict | None:
         """调用 lxserver /api/music/lyric 获取歌词。"""
         client = await self.get_client()
+        source = song_info.get("source") or ""
+        songmid = song_info.get("songmid") or song_info.get("id") or ""
+        params = {
+            "source": source,
+            "songmid": songmid,
+            "name": song_info.get("name") or "",
+            "singer": song_info.get("singer") or "",
+            "hash": song_info.get("hash") or "",
+            "interval": song_info.get("interval") or "",
+            "copyrightId": song_info.get("copyrightId") or "",
+        }
+        try:
+            resp = await client.get("/api/music/lyric", params=params, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and (data.get("lyric") or data.get("lrc")):
+                    return data
+        except Exception:
+            pass
+
+        # 降级尝试 POST 接口
         body = {"songInfo": song_info}
         resp = await client.post("/api/music/lyric", json=body, timeout=self.timeout)
         if resp.status_code != 200:
             return None
         data = resp.json()
         if isinstance(data, dict):
+            if "promise" in data and isinstance(data["promise"], dict):
+                return data["promise"]
             return data
         return None
 
@@ -458,16 +497,28 @@ class LxServerClient:
         raise RuntimeError(message)
 
     async def activate_single_source(self, target_id_or_name: str) -> bool:
-        """单源激活语义：只启用 target，禁用其余所有源。"""
-        sources = await self.list_custom_sources()
-        found = False
-        for s in sources:
-            sid = str(s.get("id") or "")
-            sname = str(s.get("name") or "")
-            is_target = (sid == target_id_or_name) or (sname == target_id_or_name)
-            if is_target:
-                found = True
-                await self.toggle_custom_source(sid, True)
-            else:
-                await self.toggle_custom_source(sid, False)
-        return found
+        """单源激活语义：只启用 target，禁用其余所有源。若 target 不存在则直接返回 False，不触碰任何源。"""
+        async with self.mgmt_lock:
+            sources = await self.list_custom_sources()
+            target = next(
+                (
+                    s
+                    for s in sources
+                    if str(s.get("id") or "") == target_id_or_name
+                    or str(s.get("name") or "") == target_id_or_name
+                ),
+                None,
+            )
+            if not target:
+                return False
+
+            target_id = str(target.get("id") or "")
+            for s in sources:
+                sid = str(s.get("id") or "")
+                if not sid:
+                    continue
+                if sid == target_id:
+                    await self.toggle_custom_source(sid, True)
+                else:
+                    await self.toggle_custom_source(sid, False)
+            return True
