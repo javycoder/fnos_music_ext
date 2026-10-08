@@ -1,15 +1,14 @@
-"""lxmusic-service 测试公共设施：单实例加载 app + 用户源替身。
-
-app.py 以 "lxmusic_service_app" 名字加载一次，各测试文件共享同一实例，
-与线上进程内模块状态（缓存/熔断器/SOURCE_MANAGER）完全对应。
+"""lxmusic-service 测试公共设施。
+单实例加载 app + lxserver 桩客户端。
 """
+
 from __future__ import annotations
 
-import asyncio  # noqa: F401  (供替身解析器使用协程)
+import asyncio
 import importlib.util
-import sys
-import tempfile
 from pathlib import Path
+import sys
+from typing import Any
 
 import httpx
 import pytest
@@ -17,8 +16,6 @@ import pytest
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
-
-from source_runtime import SourceError  # noqa: E402
 
 
 def _load_app():
@@ -31,115 +28,104 @@ def _load_app():
 
 lxapp = _load_app()
 
-# 通过 parse_script_meta 校验的桩脚本（SourceManager/UserSource 替身测试用）
-STUB_SCRIPT = (
-    "/*\n * @name test-src\n * @version 1.0.0\n * @author tester\n"
-    " * @description stub source\n */\nconsole.log('boot')\n"
-)
 
+class FakeLxServerClient:
+    """替身 LxServerClient，供离线单元测试使用。"""
 
-class FakeRuntime:
-    """替身 UserSource：按声明暴露平台/档位，解析行为可注入。
+    def __init__(self):
+        self.alive = True
+        self.sources = [
+            {"id": "source1", "name": "test-src", "enable": True, "sources": {"kw": {}, "kg": {}, "wy": {}}}
+        ]
+        self.search_results = [
+            {
+                "name": "海阔天空",
+                "singer": "Beyond",
+                "source": "kw",
+                "songmid": "5886682",
+                "albumName": "乐与怒",
+                "interval": "05:24",
+                "img": "https://img.test/cover.jpg",
+                "types": [{"type": "128k"}, {"type": "320k"}, {"type": "flac"}],
+            }
+        ]
+        self.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
+        self.lyric_result = {"lyric": "[00:00.00] 歌词内容\n[00:05.00] 第二句"}
+        self._song_info_cache = {}
 
-    resolver 约定：None → 返回默认 FLAC 直链；Exception 实例 → 每次抛出；
-    可调用对象 → (music_info, quality, platform) → 直链字符串。
-    """
+    async def is_alive(self) -> bool:
+        return self.alive
 
-    def __init__(self, platforms=None, resolver=None):
-        platforms = platforms if platforms is not None else {"kw": ["128k", "320k", "flac"]}
-        self.platforms = {
-            code: {"name": code, "actions": ["musicUrl"], "qualitys": list(qualitys)}
-            for code, qualitys in platforms.items()
-        }
-        self._resolver = resolver
-        self.calls: list[dict] = []
-        self.running = True
+    async def list_custom_sources(self) -> list[dict]:
+        return self.sources
 
-    def qualitys(self, platform: str) -> list:
-        return list(self.platforms.get(platform, {}).get("qualitys") or [])
+    async def search(self, keyword: str, source: str = "kw", page: int = 1, pages: int = 1, limit: int = 20) -> list[dict]:
+        from lxserver_client import map_lxserver_song
 
-    def music_platforms(self) -> list:
-        return [p for p in ("kw", "kg", "tx", "wy", "mg") if p in self.platforms]
+        res = []
+        for raw in self.search_results:
+            item = map_lxserver_song(raw, fallback_source=source)
+            self._song_info_cache[item["id"]] = raw
+            res.append(item)
+        return res
 
-    async def music_url(self, music_info, quality, *, platform, timeout=10.0):
-        self.calls.append({"platform": platform, "quality": quality, "info": music_info})
-        resolver = self._resolver
-        if resolver is None:
-            return "https://media.test/a.flac"
-        if isinstance(resolver, Exception):
-            raise resolver
-        if asyncio.iscoroutinefunction(resolver):
-            return await resolver(music_info, quality, platform)
-        return resolver(music_info, quality, platform)
-
-    def describe(self) -> dict:
-        return {
-            "name": "fake-src",
-            "platforms": {
-                code: {"name": code, "qualitys": info["qualitys"]}
-                for code, info in sorted(self.platforms.items())
-            },
-            "running": self.running,
-        }
-
-
-class FakeManager:
-    """替身 SourceManager：满足 app.py 的读取面 + 生命周期端点。"""
-
-    def __init__(self, runtime=None, url="", seed="", last_error=""):
-        self._runtime = runtime
-        self.active_url = url
-        self.seed_url = seed
-        self.last_error = last_error
-        tmp = Path(tempfile.gettempdir())
-        self.state_path = tmp / "lx-state-test.json"
-        self.script_cache = tmp / "lx-source-test.js"
-        self.activated: list[str] = []
-        self.shut_down = 0
-
-    def get(self):
-        runtime = self._runtime
-        if runtime is not None and getattr(runtime, "running", True):
-            return runtime
+    async def get_music_url(self, song_info: dict, quality: str = "128k") -> dict | None:
+        if self.url_result:
+            return dict(self.url_result)
         return None
 
-    def describe(self) -> dict:
-        runtime = self.get()
+    async def get_lyric(self, song_info: dict) -> dict | None:
+        return self.lyric_result
+
+    async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1) -> list[dict]:
+        return await self.search("榜单", source=source)
+
+    def get_cached_song_info(self, track_id: str) -> dict | None:
+        return self._song_info_cache.get(track_id)
+
+    def synthesize_song_info(self, track_id: str, fallback_meta: dict | None = None) -> dict:
         return {
-            "configured": bool(self.active_url or self.seed_url),
-            "url": self.active_url or self.seed_url,
-            "initialized": runtime is not None,
-            "last_error": self.last_error,
-            "source": runtime.describe() if runtime is not None else None,
+            "name": "测试曲目",
+            "singer": "测试歌手",
+            "source": "kw",
+            "songmid": "5886682",
+            "albumName": "测试专辑",
+            "interval": 200,
+            "img": "",
         }
 
-    async def load(self) -> None:
-        return None
+    async def upload_custom_source(self, filename: str, script_content: str) -> dict:
+        return {"ok": True, "id": filename, "name": filename}
 
-    async def shutdown(self) -> None:
-        self.shut_down += 1
-        self._runtime = None
+    async def activate_single_source(self, target_id_or_name: str) -> bool:
+        return True
 
-    async def activate(self, url: str):
-        if "bad-source" in url:
-            raise SourceError("download", "下载失败: boom")
-        self.activated.append(url)
-        self.active_url = url
+    async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
+        return True
 
+    async def delete_custom_source(self, source_id: str) -> bool:
+        return True
 
-@pytest.fixture(autouse=True)
-def isolated(monkeypatch) -> FakeManager:
-    """每个测试拿到干净的缓存/熔断器/替身管理器与关闭的 HTTP 客户端。"""
-    lxapp._SONG_CACHE.clear()
-    lxapp._CHAIN_HEALTH.clear()
-    lxapp._STATS.update(searches=0, url_resolutions=0, errors=0)
-    lxapp.LX_SEARCH_GATE.reset()
-    lxapp.app.state.http = None
-    monkeypatch.setitem(lxapp.CONF, "search_probe", True)
-    manager = FakeManager()
-    monkeypatch.setattr(lxapp, "SOURCE_MANAGER", manager)
-    return manager
+    async def close(self) -> None:
+        pass
 
 
 def mock_client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=5.0)
+
+
+@pytest.fixture
+def fake_lx():
+    fake = FakeLxServerClient()
+    orig = lxapp.LXSERVER
+    lxapp.LXSERVER = fake
+    yield fake
+    lxapp.LXSERVER = orig
+
+
+@pytest.fixture
+def test_app_client(fake_lx):
+    # 模拟外部调用 app 的客户端
+    from starlette.testclient import TestClient
+
+    return TestClient(lxapp.app)

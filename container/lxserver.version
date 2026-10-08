@@ -1,0 +1,5 @@
+# lxserver 版本锁定与完整性校验文件
+# 由 scripts/update_lxserver.sh 维护；Dockerfile 构建与 CI 打包时自动校验
+LXSERVER_TAG=v2.1.2
+LXSERVER_ZIP_NAME=lx-music-sync-server-v2.1.2-server.zip
+LXSERVER_SHA256=1f89639366a7d0f968bfb0e56d88701a60d500a555afd52ae2cc7e5ff4742a63

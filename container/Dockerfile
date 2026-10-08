@@ -57,7 +57,7 @@ RUN set -eu; \
         echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
         exit 1; \
     fi; \
-    apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates; \
+    apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates unzip curl; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
 
@@ -84,20 +84,59 @@ RUN set -eu; \
     && rm -f /srv/req.*
 
 RUN useradd -m -u 1000 appuser \
-    && mkdir -p /data/cache /data/config /data/lxmusic \
+    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
     && chown -R appuser:appuser /data
+
+# lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
+ARG LXSERVER_MIRROR="https://ghfast.top"
+COPY container/lxserver.version /srv/lxserver.version
+COPY container/lxserver-artifact/ /srv/lxserver-artifact/
+RUN set -eu; \
+    . /srv/lxserver.version; \
+    TARGET_ZIP="/srv/lxserver-artifact/${LXSERVER_ZIP_NAME}"; \
+    if [ ! -s "${TARGET_ZIP}" ]; then \
+        echo "[INFO] 预置包不存在或为空，通过镜像下载 ${LXSERVER_ZIP_NAME}..."; \
+        DOWNLOAD_OK=0; \
+        for mirror in "${LXSERVER_MIRROR}" "https://gh-proxy.com" "https://github.moeyy.xyz" ""; do \
+            if [ -n "${mirror}" ]; then \
+                URL="${mirror}/https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+            else \
+                URL="https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+            fi; \
+            echo "[INFO] 尝试从 ${URL} 下载..."; \
+            if curl -fSL --connect-timeout 10 --max-time 180 "${URL}" -o "${TARGET_ZIP}"; then \
+                if [ -s "${TARGET_ZIP}" ]; then DOWNLOAD_OK=1; break; fi; \
+            fi; \
+        done; \
+        if [ "${DOWNLOAD_OK}" -ne 1 ]; then \
+            echo "ERROR: lxserver release zip 下载失败，请预先放置于 container/lxserver-artifact/" >&2; \
+            exit 1; \
+        fi; \
+    fi; \
+    ACTUAL_SHA="$(sha256sum "${TARGET_ZIP}" | awk '{print $1}')"; \
+    if [ -n "${LXSERVER_SHA256:-}" ] && [ "${ACTUAL_SHA}" != "${LXSERVER_SHA256}" ]; then \
+        echo "ERROR: lxserver zip 校验和不符 (${ACTUAL_SHA} != ${LXSERVER_SHA256})" >&2; \
+        exit 1; \
+    fi; \
+    mkdir -p /srv/lxserver; \
+    unzip -q -o "${TARGET_ZIP}" -d /srv/lxserver-tmp; \
+    if [ -d "/srv/lxserver-tmp/lx-music-sync-server" ]; then \
+        cp -a /srv/lxserver-tmp/lx-music-sync-server/. /srv/lxserver/; \
+    else \
+        cp -a /srv/lxserver-tmp/. /srv/lxserver/; \
+    fi; \
+    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact; \
+    chown -R appuser:appuser /srv/lxserver
 
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
 COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py /srv/musicdl-service/
 COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py /srv/musicbox-service/
-COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py /srv/lxmusic-service/
-COPY --chown=appuser:appuser lxmusic-service/js/bridge.js /srv/lxmusic-service/js/bridge.js
+COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
 COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/
 RUN find /srv -name "*.py" -exec chmod 0644 {} + \
-    && chmod 0755 /srv/lxmusic-service/js/bridge.js \
     && mkdir -p /repo \
     && chmod 0755 /repo /data
 

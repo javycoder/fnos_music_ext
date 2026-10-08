@@ -172,17 +172,32 @@ def supervisor_status() -> dict[str, dict]:
     return result
 
 
+PROVIDER_PROGRAMS = {
+    "musicdl": ["musicdl"],
+    "musicbox": ["musicbox"],
+    "lxmusic": ["lxserver", "lxmusic"],
+}
+PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}  # 兼容单名引用
+PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
+
+
 def switch_provider_process(old: str, new: str) -> list[dict]:
     """切源进程：先停旧再起新；失败逐项记录，不抛出。"""
     actions: list[dict] = []
     if old and old != new:
-        code, out = supervisorctl("stop", old)
-        actions.append({"kind": "process", "program": old, "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        # 停旧：按逆序停止（例如先停 lxmusic 再停 lxserver）
+        old_progs = reversed(PROVIDER_PROGRAMS.get(old, [old]))
+        for prog in old_progs:
+            code, out = supervisorctl("stop", prog)
+            actions.append({"kind": "process", "program": prog, "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out})
     if new:
-        code, out = supervisorctl("start", new)
-        actions.append({"kind": "process", "program": new, "op": "start",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        # 起新：按顺序启动（例如先起 lxserver 再起 lxmusic）
+        new_progs = PROVIDER_PROGRAMS.get(new, [new])
+        for prog in new_progs:
+            code, out = supervisorctl("start", prog)
+            actions.append({"kind": "process", "program": prog, "op": "start",
+                            "ok": code == 0, "error": "" if code == 0 else out})
     return actions
 
 
@@ -193,9 +208,6 @@ def switch_provider_process(old: str, new: str) -> list[dict]:
 # - 只点选未保存的，PREVIEW_TTL 秒无访问后自动停止（选平台/测试源/扫码会续期）。
 PREVIEW_TTL = 300.0
 _preview_until: dict[str, float] = {}
-
-PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}
-PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
 
 
 def preview_seconds_left(provider: str) -> float:
@@ -220,13 +232,16 @@ def preview_reap() -> list[str]:
         if provider == enabled:
             _preview_until.pop(provider, None)
         elif deadline <= time.monotonic():
-            code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
-            if code == 0:
+            all_ok = True
+            for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
+                code, out = supervisorctl("stop", prog)
+                if code != 0:
+                    all_ok = False
+                    logger.warning("预览到期但停止失败（下轮重试）%s(%s): %s", provider, prog, out)
+            if all_ok:
                 _preview_until.pop(provider, None)
                 logger.info("预览到期，停止音源进程 %s", provider)
                 stopped.append(provider)
-            else:
-                logger.warning("预览到期但停止失败（下轮重试）%s: %s", provider, out)
     return stopped
 
 
@@ -239,9 +254,10 @@ def preview_reconcile_after_save() -> list[dict]:
             _preview_until.pop(provider, None)
             continue
         _preview_until.pop(provider, None)
-        code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
-        actions.append({"kind": "process", "program": PROVIDER_PROGRAM[provider], "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
+        for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
+            code, out = supervisorctl("stop", prog)
+            actions.append({"kind": "process", "program": prog, "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
     return actions
 
 
@@ -486,9 +502,10 @@ async def api_preview(body: PreviewBody, request: Request):
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
-    code, out = supervisorctl("start", PROVIDER_PROGRAM[provider])
-    if code != 0:
-        return JSONResponse(content={"ok": False, "error": out or "supervisorctl start 失败"}, status_code=500)
+    for prog in PROVIDER_PROGRAMS.get(provider, [provider]):
+        code, out = supervisorctl("start", prog)
+        if code != 0:
+            return JSONResponse(content={"ok": False, "error": f"supervisorctl start {prog} 失败: {out}"}, status_code=500)
     client = get_http(request)
     for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
         try:

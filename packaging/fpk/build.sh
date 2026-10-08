@@ -63,6 +63,12 @@ command -v rsync >/dev/null 2>&1 || {
     exit 1
 }
 
+# 确保 lxserver 预编译包已就绪（内嵌到 fpk 中实现 NAS 用户离线安装）
+if [ -x "${REPO_ROOT}/scripts/update_lxserver.sh" ]; then
+    echo "[fpk] 检查并确保 lxserver 预编译包存在..."
+    "${REPO_ROOT}/scripts/update_lxserver.sh" || echo "[WARN] update_lxserver 检查失败，将使用现有本地缓存"
+fi
+
 # ------------------------------------------------------------------------------
 # 1. 组装打包目录
 # ------------------------------------------------------------------------------

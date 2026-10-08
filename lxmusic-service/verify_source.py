@@ -1,49 +1,55 @@
-"""洛雪自定义源可用性校验（安装向导 / WebUI / 运维共用）。
+"""lxmusic-service/verify_source.py
+洛雪自定义源可用性端到端校验 (基于 lxserver 后端)。
 
-用法（服务环境内）:
-    python3 verify_source.py <源URL>          # 人类可读输出，退出码 0=可用 1=不可用
-    python3 verify_source.py <源URL> --json   # 仅输出 JSON 报告
-
-校验链路：下载 → 头部/元数据校验 → Node 沙箱初始化 → 平台交集推导 →
-多首歌（不同歌手，纯歌名关键词）× 平台抽样「搜索 → musicUrl 解析 → Range 媒体探活」，
-任一首成功即判可用（第一首成功就不再继续）；全部失败时按尝试明细给出真实原因。
+校验链路：
+1. 下载 / 读取脚本文本并校验头部元数据；
+2. 作为临时源导入 lxserver 沙箱；
+3. 读取声明的平台与音质；
+4. 抽取标准关键词 (晴天、江南等) 发起搜索并调用解析 + Range 媒体探活；
+5. 清理临时源并输出结构化校验报告。
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
-import sys
+import os
 from pathlib import Path
+import re
+import sys
 from typing import Sequence
+import urllib.parse
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from source_runtime import (  # noqa: E402
-    MUSIC_PLATFORMS,
-    SourceError,
-    UserSource,
-    build_music_info,
-    download_script,
-    parse_script_meta,
+from lxserver_client import (
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_LXSERVER_URL,
+    LxServerClient,
+    SUPPORTED_PLATFORMS,
+    normalize_source,
 )
 
-# 至少 4 首不同歌手的歌（关键词用纯歌名，越简单越好）：单首热门曲可能有缓存/特判，
-# 只测一首会把"偶合可用"误判为源可用；任一首成功即判可用（第一首成功就不再继续）
 VERIFY_KEYWORDS = ("晴天", "江南", "十年", "倔强")
 _PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
-_MAX_ATTEMPTS_RECORDED = 12
 
-# 源脚本透传的网络层失败（bridge 已带上底层 errno）——这些说明源自己的 API
-# 服务器已失效/不可达，换哪个客户端都一样，不是本扩展的兼容性问题
 _NET_DEAD_MARKERS = (
-    "ECONNREFUSED", "EHOSTUNREACH", "ENOTFOUND", "ETIMEDOUT",
-    "EAI_AGAIN", "ECONNRESET", "ECONNABORTED", "fetch failed", "request timeout",
+    "ECONNREFUSED",
+    "EHOSTUNREACH",
+    "ENOTFOUND",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "ECONNRESET",
+    "ECONNABORTED",
+    "fetch failed",
+    "request timeout",
 )
 
 
-def _server_dead_reason(text: str) -> "str | None":
-    """解析失败文本中的网络层死亡证据；返回大白话原因，无证据返回 None。"""
+def _server_dead_reason(text: str) -> str | None:
     t = str(text or "")
     for marker in _NET_DEAD_MARKERS:
         if marker in t:
@@ -59,288 +65,190 @@ def _server_dead_reason(text: str) -> "str | None":
 
 
 def _looks_like_json_source(script: str) -> bool:
-    """musicApi.json 类 API 配置源：JSON 文件而非洛雪桌面版 JS 脚本模块。"""
     raw = (script or "").lstrip()
     if not raw or raw[0] not in "{[":
         return False
     try:
         json.loads(script)
+        return True
     except Exception:
         return False
-    return True
+
+
+async def download_script(url: str, timeout: float = 20.0) -> str:
+    """下载或读取脚本内容。支持 http(s):// 与 file://"""
+    url = url.strip()
+    if url.startswith("file://"):
+        parsed = urllib.parse.urlparse(url)
+        path = urllib.parse.unquote(parsed.path)
+        if not os.path.isfile(path):
+            raise ValueError(f"本地文件不存在: {path}")
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            raise ValueError(f"下载失败 (HTTP {resp.status_code})")
+        return resp.text
+
+
+def parse_script_meta(script: str) -> dict:
+    meta = {"name": "", "description": "", "version": "1.0.0", "author": ""}
+    for line in script.splitlines()[:50]:
+        line = line.strip()
+        m = re.search(r"@(\w+)\s+(.+)", line)
+        if m:
+            key = m.group(1).lower()
+            val = m.group(2).strip()
+            if key in meta:
+                meta[key] = val
+    if not meta["name"]:
+        # 从内容猜测
+        meta["name"] = "custom_source"
+    return meta
 
 
 async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict:
-    """端到端校验一个源 URL；返回结构化报告（不改变当前激活源）。
-
-    issue #22 体验改进：
-    - musicApi.json 等 JSON API 源给专属友好错误（而非"脚本头缺失"这种误导信息）
-    - platform_results 按平台细分 tested(ok/failed)/untested/search_error/no_items，
-      弱网/平台限流导致的"搜索取不到样本"与"源脚本解析失败"分开归类
-      （后者才是源真的不可用；前者源可能仍可用）
-    """
-    import app as lx_app  # 延迟导入：app 反向依赖本模块的时机只在端点内
+    """端到端校验一个源 URL 并返回结构化报告。"""
+    import app as lx_app  # 延迟导入
 
     keywords = list(keywords) if keywords else list(VERIFY_KEYWORDS)
     report: dict = {
-        "ok": False, "url": url, "category": "", "message": "",
-        "meta": None, "declared_platforms": [], "platforms": [], "qualitys": {},
-        "platform_results": {}, "probe": None, "keywords": keywords, "attempts": [],
+        "ok": False,
+        "url": url,
+        "category": "",
+        "message": "",
+        "meta": None,
+        "declared_platforms": [],
+        "platforms": [],
+        "qualitys": {},
+        "platform_results": {},
+        "probe": None,
+        "keywords": keywords,
+        "attempts": [],
     }
+
     try:
         script = await download_script(url)
-    except SourceError as exc:
-        report.update(category=exc.category, message=str(exc))
+    except Exception as exc:
+        report.update(category="download", message=str(exc))
         return report
+
     if _looks_like_json_source(script):
         report.update(
             category="format",
             message=(
                 "不支持的音源格式：检测到 JSON 配置（musicApi.json 类 API 源）。"
-                "本扩展只支持洛雪桌面版自定义音源 JS 脚本（以 /* @name ... */ 头部注释开头、"
-                "通过 globalThis.lx 与宿主交互的 .js 文件），请提供脚本文件本体或其 URL。"
+                "本扩展只支持洛雪自定义音源 JS 脚本，请提供脚本文件本体或其 URL。"
             ),
         )
         return report
+
     meta = parse_script_meta(script)
     report["meta"] = meta
 
-    runtime = UserSource(script, meta, script_dir=str(Path(__file__).resolve().parent))
-    try:
-        try:
-            await runtime.start()
-        except SourceError as exc:
-            report.update(category=exc.category, message=str(exc))
-            return report
+    temp_client = LxServerClient(
+        base_url=os.environ.get("LXSERVER_URL", DEFAULT_LXSERVER_URL),
+        admin_password=os.environ.get("LXSERVER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
+        timeout=15.0,
+    )
 
-        declared = runtime.music_platforms()
+    temp_filename = f"verify_tmp_{int(time.time())}.js"
+    try:
+        # 上传为临时源
+        upload_res = await temp_client.upload_custom_source(temp_filename, script)
+        # 等待源在沙箱初始化并查询平台
+        await asyncio.sleep(1.0)
+        sources = await temp_client.list_custom_sources()
+        target_src = None
+        for s in sources:
+            if s.get("id") == temp_filename or s.get("name") == meta["name"]:
+                target_src = s
+                break
+
+        declared = []
+        if target_src and isinstance(target_src.get("sources"), dict):
+            declared = [normalize_source(k) for k in target_src["sources"].keys()]
+        if not declared:
+            declared = list(SUPPORTED_PLATFORMS)
+
+        declared = [p for p in declared if p in SUPPORTED_PLATFORMS]
         report["declared_platforms"] = declared
-        report["qualitys"] = {p: runtime.qualitys(p) for p in declared}
-        usable = [p for p in MUSIC_PLATFORMS if p in declared and p in lx_app._SEARCHERS]
+        report["qualitys"] = {p: ["128k", "320k", "flac"] for p in declared}
+        usable = declared
         report["platforms"] = usable
         report["platform_results"] = {p: "untested" for p in usable}
+
         if not usable:
-            report.update(
-                category="no_platform",
-                message="源声明的平台与内置搜索平台无交集"
-                        f"（源: {','.join(declared) or '无'}；内置: {','.join(sorted(lx_app._SEARCHERS))}）",
-            )
+            report.update(category="no_platform", message="源未声明任何支持的音乐平台")
             return report
 
-        # 仅覆盖本任务的解析运行时：搜索期 VIP 探活走用户源，但不替换进程级 SOURCE_MANAGER
-        override_token = lx_app._RUNTIME_OVERRIDE.set(runtime)
-        # 搜索探活失败的异常被 _probe_candidates 静默吞掉；记录首个源解析错误，
-        # 用于区分"真没搜到"和"源脚本解析全挂"（后者报搜索空会误导排查方向）
-        probe_errors: list[str] = []
-        original_music_url = runtime.music_url
-
-        async def recording_music_url(music_info, quality, *, platform, timeout=10.0):
-            try:
-                return await original_music_url(music_info, quality, platform=platform, timeout=timeout)
-            except SourceError as exc:
-                if not probe_errors:
-                    probe_errors.append(str(exc))
-                raise
-
-        runtime.music_url = recording_music_url
+        # 抽样测试
         client = lx_app.get_http(lx_app.app)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _SAMPLE_BUDGET_S
-        attempts: list[dict] = report["attempts"]
-        platform_results: dict[str, str] = report["platform_results"]
-        sampled = 0
-        saw_items = False
-        saw_resolve_attempt = False
+        for kw in keywords:
+            for platform in usable:
+                attempt = {"keyword": kw, "platform": platform, "result": "", "error": ""}
+                try:
+                    search_res = await temp_client.search(kw, source=platform, page=1, limit=3)
+                except Exception as exc:
+                    attempt.update(result="search_error", error=str(exc))
+                    report["attempts"].append(attempt)
+                    continue
 
-        def _mark_platform(platform: str, result: str) -> None:
-            # ok 与 failed（真实解析/探活失败）是终态；搜索侧状态可被后续关键词覆盖
-            current = platform_results.get(platform, "untested")
-            if current in ("ok", "failed"):
-                return
-            platform_results[platform] = result
+                if not search_res:
+                    attempt.update(result="no_items")
+                    report["attempts"].append(attempt)
+                    continue
 
-        try:
-            for keyword in keywords:
-                for platform in usable:
-                    if loop.time() > deadline:
-                        break
-                    sampled += 1
-                    attempt = {"keyword": keyword, "platform": platform, "result": "", "error": ""}
-                    try:
-                        items = await asyncio.wait_for(
-                            lx_app._SEARCHERS[platform](client, keyword, 3),
-                            timeout=_PROBE_TIMEOUT,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        attempt.update(result="search_error", error=str(exc)[:200])
-                        report.setdefault("search_warnings", {})[platform] = str(exc)
-                        _mark_platform(platform, "search_error")
-                    else:
-                        if not items:
-                            attempt.update(result="no_items", error="搜索无结果")
-                            _mark_platform(platform, "no_items")
-                        else:
-                            saw_items = True
-                            item = dict(items[0])
-                            platform, identifier = lx_app.parse_track_id(str(item.get("id") or ""))
-                            item["_identifier"] = identifier
-                            quality = "128k"
-                            if quality not in runtime.qualitys(platform):
-                                declared_q = runtime.qualitys(platform)
-                                quality = declared_q[0] if declared_q else "128k"
-                            saw_resolve_attempt = True
-                            try:
-                                url_resolved = await asyncio.wait_for(
-                                    runtime.music_url(
-                                        build_music_info(item, platform), quality, platform=platform
-                                    ),
-                                    timeout=_PROBE_TIMEOUT,
-                                )
-                            except SourceError as exc:
-                                # 脚本解析失败（含沙箱桥 API 缺失等运行时错误）记录后继续抽样，
-                                # 不能向上抛穿端点变裸 500
-                                attempt.update(result="resolve_error", error=str(exc)[:200])
-                                _mark_platform(platform, "failed")
-                            else:
-                                ok, final_url, content_type, size = await lx_app.probe_url(client, url_resolved)
-                                if not ok:
-                                    attempt.update(
-                                        result="probe_failed",
-                                        error=f"直链未通过媒体探活（HTTP 内容非音频）: {final_url[:80]}",
-                                    )
-                                    _mark_platform(platform, "failed")
-                                else:
-                                    attempt.update(result="ok")
-                                    _mark_platform(platform, "ok")
-                                    if report["probe"] is None:  # 首个成功作为代表实测
-                                        report["probe"] = {
-                                            "platform": platform,
-                                            "quality": quality,
-                                            "title": str(item.get("title") or ""),
-                                            "artist": str(item.get("artist") or ""),
-                                            "content_type": content_type,
-                                            "file_size": size,
-                                            "keyword": keyword,
-                                        }
-                                        report["search_platform"] = platform
-                    if len(attempts) < _MAX_ATTEMPTS_RECORDED:
-                        attempts.append(attempt)
-                    if attempt["result"] == "ok":
-                        # 第一首成功即判可用，不再继续测后面的歌
-                        report["ok"] = True
-                        report["sampled"] = sampled
-                        return report
-            report["sampled"] = sampled
-            # 抽样全部失败：按证据归类真实原因
-            if probe_errors:
-                dead = _server_dead_reason(probe_errors[0])
-                if dead:
-                    report.update(
-                        category="server_unreachable",
-                        message=(
-                            f"源脚本本身能运行，但{dead}: {str(probe_errors[0])[:100]}"
-                            f"（抽样 {sampled} 组全部如此）。这不是本扩展的兼容性问题——"
-                            "该音源的服务端已失效，换用其他源即可"
-                        ),
-                    )
+                # 尝试解析第一首歌
+                first_song = search_res[0]
+                sinfo = temp_client.get_cached_song_info(first_song["id"]) or temp_client.synthesize_song_info(
+                    first_song["id"], first_song
+                )
+                try:
+                    url_res = await temp_client.get_music_url(sinfo, "128k")
+                except Exception as exc:
+                    attempt.update(result="resolve_failed", error=str(exc))
+                    report["attempts"].append(attempt)
+                    continue
+
+                if not url_res or not url_res.get("url"):
+                    attempt.update(result="resolve_empty")
+                    report["attempts"].append(attempt)
+                    continue
+
+                # 探活
+                probe_ok, final_url, ct, size = await lx_app.probe_url(client, url_res["url"])
+                if probe_ok:
+                    attempt.update(result="ok")
+                    report["platform_results"][platform] = "ok"
+                    report["attempts"].append(attempt)
+                    report["ok"] = True
+                    report["probe"] = {
+                        "platform": platform,
+                        "song": first_song.get("title", ""),
+                        "url": final_url,
+                        "ct": ct,
+                        "size": size,
+                    }
                     return report
-                report.update(
-                    category="resolve",
-                    message=f"源脚本解析失败，搜索探活全部未通过: {probe_errors[0]}"
-                            f"（抽样 {sampled} 组）",
-                )
-                return report
-            if saw_resolve_attempt:
-                first = next((a for a in attempts if a["result"] in ("resolve_error", "probe_failed")), None)
-                detail = f"{first['platform']}×{first['keyword']}: {first['error'][:80]}" if first else ""
-                # 直链解析成功但内容不是音频：多为源服务端后端已坏（返回错误页/JSON）
-                dead_hint = (
-                    " 多为该源服务端已失效（返回错误页或空内容），非本扩展兼容性问题。"
-                    if first and first["result"] == "probe_failed" else ""
-                )
-                report.update(
-                    category="resolve",
-                    message=f"抽样 {sampled} 组均未通过（例: {detail}）。{dead_hint}",
-                )
-                return report
-            # 没有任何一组走到"源脚本解析"：全部卡在搜索侧（限流/网络/平台接口波动）。
-            # 源脚本已成功初始化，"不可用"的结论证据不足——与解析失败分开归类，
-            # 提示稍后重试（issue #22：洛雪App内可用的源在这里被误判不可用）
-            failed_platforms = [p for p, r in platform_results.items() if r != "untested"]
-            if report.get("search_warnings"):
-                first_plat, first_err = next(iter(report["search_warnings"].items()))
-                report.update(
-                    category="search_unavailable",
-                    message=(
-                        f"源脚本初始化正常，但内置搜索未取得可测样本（{first_plat}: {first_err}）。"
-                        f"这是搜索接口波动/限流，不代表源不可用——请稍后重试，或直接在实际播放中验证"
-                        f"（已试平台: {','.join(failed_platforms) or '无'}）"
-                    ),
-                )
-                return report
-            report.update(
-                category="search_unavailable",
-                message=(
-                    "源脚本初始化正常，但内置搜索未在任何交集平台返回曲目"
-                    f"（关键词: {'、'.join(keywords)}）。不代表源不可用——"
-                    "请稍后重试或更换网络环境再测"
-                ),
-            )
-            return report
-        finally:
-            lx_app._RUNTIME_OVERRIDE.reset(override_token)
+                else:
+                    attempt.update(result="probe_failed")
+                    report["platform_results"][platform] = "failed"
+                    report["attempts"].append(attempt)
+
+        # 全部失败
+        report.update(
+            category="resolve",
+            message="源脚本解析尝试均未成功，可能接口已被上游限制或凭据失效",
+        )
+        return report
+
     finally:
-        await runtime.stop()
-
-
-def format_report(report: dict) -> str:
-    meta = report.get("meta") or {}
-    attempts = report.get("attempts") or []
-    lines = [
-        f"源名称   : {meta.get('name') or '-'}" + (f"  v{meta.get('version')}" if meta.get("version") else ""),
-        f"作者     : {meta.get('author') or '-'}",
-        f"可用平台 : {','.join(report.get('platforms') or []) or '-'}",
-        f"抽样     : {report.get('sampled', len(attempts))} 组（关键词: {'、'.join(report.get('keywords') or []) or '-'}）",
-    ]
-    platform_results = report.get("platform_results") or {}
-    if platform_results:
-        # 按平台细分结论：ok=实测通过 / failed=解析或探活失败 / search_error|no_items=搜索侧
-        # 取不到样本 / untested=未测到（首平台成功后提前结束是正常情况）
-        detail = "  ".join(f"{p}:{r}" for p, r in platform_results.items())
-        lines.append(f"平台明细 : {detail}")
-    if report.get("probe"):
-        probe = report["probe"]
-        lines.append(
-            f"实测解析 : {probe['title']} - {probe['artist']} [{probe['platform']}/{probe['quality']}] "
-            f"{probe.get('content_type') or ''} {probe.get('file_size') or 0} bytes"
-        )
-    if not report.get("ok") and attempts:
-        detail = "; ".join(
-            f"{a.get('platform')}×{a.get('keyword')}: {a.get('result')}"
-            + (f" {str(a.get('error'))[:50]}" if a.get("error") else "")
-            for a in attempts[:4]
-        )
-        lines.append(f"失败明细 : {detail}")
-    if report.get("ok"):
-        lines.append("结论     : 可用 ✓")
-    else:
-        lines.append(f"结论     : 不可用 ✗（{report.get('category') or 'unknown'}）{report.get('message') or ''}")
-    return "\n".join(lines)
-
-
-async def _main(argv: list[str]) -> int:
-    args = [a for a in argv[1:] if a != "--json"]
-    as_json = "--json" in argv[1:]
-    if len(args) != 1:
-        print("用法: python3 verify_source.py <源URL> [--json]", file=sys.stderr)
-        return 2
-    report = await verify_url(args[0].strip())
-    if as_json:
-        print(json.dumps(report, ensure_ascii=False))
-    else:
-        print(format_report(report))
-    return 0 if report["ok"] else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(asyncio.run(_main(sys.argv)))
+        # 清理临时源
+        try:
+            await temp_client.delete_custom_source(temp_filename)
+        except Exception:
+            pass
+        await temp_client.close()

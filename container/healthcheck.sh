@@ -24,7 +24,17 @@ check() {
 
 check musicdl FNMUSIC_MUSICDL_ENABLED
 check musicbox FNMUSIC_NETEASE_ENABLED
-check lxmusic FNMUSIC_LX_ENABLED
+if [ "$(env_flag FNMUSIC_LX_ENABLED)" = "true" ]; then
+    checked=$((checked + 1))
+    if ! running lxserver; then
+        echo "[healthcheck] lxserver 应运行但状态异常" >&2
+        fail=1
+    fi
+    if ! running lxmusic; then
+        echo "[healthcheck] lxmusic 应运行但状态异常" >&2
+        fail=1
+    fi
+fi
 check webui FNMUSIC_WEBUI_ENABLED
 
 if [ "$checked" -eq 0 ]; then
