@@ -100,8 +100,8 @@ async def test_health_one_source_suffices_but_reports_degradation(monkeypatch):
     assert result["details"]["musicbox"]["dependency"]["reason"] == "offline"
 
 
-@pytest.mark.parametrize("initial", [1, 3])
-def test_online_window_local_first_layout_and_local_duplicates(initial, monkeypatch):
+@pytest.mark.parametrize("initial, second_prefix", [(1, "[music box] "), (3, "[dl] ")])
+def test_online_window_local_first_layout_and_local_duplicates(initial, second_prefix, monkeypatch):
     """本地优先全局布局：在线条目在 items 上连续分页、不重不漏；本地重复由 merge 过滤。"""
     monkeypatch.setitem(p.CONF, "online_limit", 3)
     raw = [song(f"kuwo:{i}", str(i)) for i in range(initial)] + [song(f"netease:{i}", str(i)) for i in range(5)]
@@ -118,11 +118,12 @@ def test_online_window_local_first_layout_and_local_duplicates(initial, monkeypa
         page += 1
         assert page < 20
     assert walked == items
-    # 本地重复过滤不影响窗口本身（过滤发生在 merge_online_tracks）
+    # 本地重复过滤不影响窗口本身（过滤发生在 merge_online_tracks）；
+    # 追加的在线条目带来源标记（首条与本地重复被过滤，第二带对应源前缀）
     envelope = {"data": {"list": [{"title": walked[0], "artist": "Artist"}], "total": 1}}
     window = p._online_window(entry, 1, 2, local_total=0)
     merged = p.merge_online_tracks(envelope, window, selected=True)
-    assert [x["title"] for x in merged["data"]["list"]] == walked[0:2]
+    assert [x["title"] for x in merged["data"]["list"]] == [walked[0], second_prefix + walked[1]]
 
 
 def test_online_window_local_pages_have_no_online_items():
@@ -538,7 +539,8 @@ async def test_gzip_audio_rejected_before_first_byte(tmp_path):
 def _titles(resp):
     import json
     body = json.loads(resp.body)
-    return [item.get("title") for item in body["data"]["list"]]
+    # 在线条目歌名带来源标记（仅显示）；本组用例关注门控/分页语义，统一剥标记比较
+    return [p.strip_source_tag(item.get("title") or "") for item in body["data"]["list"]]
 
 
 def _cached(keyword):

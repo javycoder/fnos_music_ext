@@ -152,6 +152,9 @@ CONF = {
     # lx 平台白名单（同 .env 的 LX_SOURCES；install.sh --sources lx-<平台> 写入）；
     # 空 = 不限制。GUID 第 3 段携带平台（online:lx:kg:xxx），据此过滤与透传 ?sources=
     "lx_sources": _normalize_lx_sources(os.environ.get("LX_SOURCES", "")),
+    # 洛雪多源管理（WebUI 维护）：当前激活源地址与源列表 JSON，搜索结果来源标记用
+    "lx_source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
+    "lx_source_list": os.environ.get("LX_SOURCE_LIST", "[]"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
@@ -478,6 +481,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
+    "LX_SOURCE_URL": ("lx_source_url", "str"),
+    "LX_SOURCE_LIST": ("lx_source_list", "str"),
     "FNMUSIC_SEARCH_PROBE": ("search_probe", "bool"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
@@ -921,11 +926,73 @@ def source_from_online_guid(guid: str) -> str:
     return parts[1] if len(parts) >= 3 else ""
 
 
-def build_online_track(item: dict) -> dict:
-    """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
+# 搜索结果在线条目的来源标记（仅显示，不入库不影响业务逻辑）：
+# 网易盒子→[music box]，musicdl→[dl]，洛雪→激活源备注名（无备注则 [lx]）
+_SOURCE_TAG_NETEASE = "[music box] "
+_SOURCE_TAG_MUSICDL = "[dl] "
+_SOURCE_TAG_LX_FALLBACK = "[lx] "
+
+
+def _lx_source_entries() -> list[dict]:
+    try:
+        entries = json.loads(CONF.get("lx_source_list") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+
+
+def _lx_source_remark() -> str:
+    """当前激活洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。"""
+    url = str(CONF.get("lx_source_url") or "").strip()
+    if not url:
+        return ""
+    for entry in _lx_source_entries():
+        if str(entry.get("url") or "").strip() == url:
+            return str(entry.get("name") or "").strip()
+    return ""
+
+
+def source_display_prefix(src: str) -> str:
+    """在线条目来源标记前缀：netease→[music box]，lx→备注名或 [lx]，其余(musicdl 平台)→[dl]。"""
+    s = str(src or "").strip()
+    if s == "netease":
+        return _SOURCE_TAG_NETEASE
+    if s == "lx":
+        remark = _lx_source_remark()
+        return f"[{remark}] " if remark else _SOURCE_TAG_LX_FALLBACK
+    if s:
+        return _SOURCE_TAG_MUSICDL
+    return ""
+
+
+def strip_source_tag(title: str) -> str:
+    """剥离来源标记前缀。仅精确匹配已知标记（含列表里全部洛雪备注名），
+    不用泛化正则，避免误伤本身以方括号开头的歌名。"""
+    t = str(title or "")
+    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK]
+    for entry in _lx_source_entries():
+        name = str(entry.get("name") or "").strip()
+        if name:
+            candidates.append(f"[{name}] ")
+    for tag in candidates:
+        if t.startswith(tag):
+            return t[len(tag):]
+    return t
+
+
+def build_online_track(item: dict, mark_source: bool = False) -> dict:
+    """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。
+
+    mark_source=True 时在 title/name 前加来源标记（仅搜索结果列表用）；
+    收藏/历史/元数据等其余出口保持干净标题，业务逻辑一律不受标记影响。
+    """
     guid = online_guid_from_item(item)
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
+    if mark_source and title:
+        prefix = source_display_prefix(src)
+        if prefix:
+            title = prefix + title
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
     duration_s = item.get("duration_s") or 0
@@ -2228,7 +2295,8 @@ def merge_online_tracks(
     page_online = filtered_online
 
     for it in page_online:
-        target_list.append(build_online_track(it))
+        # 搜索结果在线条目带来源标记；merge_online_tracks 仅被 search_track 调用
+        target_list.append(build_online_track(it, mark_source=True))
 
     parts = CONF["search_list_path"].split(".")
     parent = upstream_json
@@ -7637,6 +7705,8 @@ async def event_report(request: Request):
                             "album": payload.get("album"),
                             "albumName": payload.get("albumName"),
                         })
+                        # 客户端上报的是搜索列表里带来源标记的显示名，入库前剥离
+                        p_title = strip_source_tag(p_title)
                         title = p_title or title
                         artist = p_artist or artist
                         album = p_album or album

@@ -188,7 +188,9 @@ def test_search_track_merge_success():
         assert items[0]["title"] == "夜曲"
         # 在线条目合并追加且格式正确
         assert items[1]["guid"] == fake_official_guid("online:netease:228908")
-        assert items[1]["title"] == "晴天"
+        # 在线条目歌名带来源标记（仅显示），其余字段干净
+        assert items[1]["title"] == "[music box] 晴天"
+        assert items[1]["name"] == "[music box] 晴天"
         assert items[1]["artist"] == "周杰伦"
         assert items[1]["albumName"] == "叶惠美" and items[1]["album"]["name"] == "叶惠美"
         assert items[1]["duration_ms"] == 269000
@@ -542,7 +544,7 @@ def test_search_track_deduplication():
         assert len(items) == 2
         assert items[0]["guid"] == "local:101"
         assert items[1]["guid"] == fake_official_guid("online:netease:228909")
-        assert items[1]["title"] == "晴天 (Live)"
+        assert items[1]["title"] == "[music box] 晴天 (Live)"
 
 
 def test_stream_online_guid_range_and_tee_cache(monkeypatch):
@@ -1081,7 +1083,7 @@ def test_search_track_late_wait_first_source_completed(monkeypatch):
         assert items[0]["title"] == "晴天"
         # 率先返回的 musicdl 被并入
         assert items[1]["guid"] == fake_official_guid("online:kuwo:first_win")
-        assert items[1]["title"] == "晴天 (Live)"
+        assert items[1]["title"] == "[dl] 晴天 (Live)"
         assert items[1]["artist"] == "刘瑞琦"
 
 
@@ -2167,7 +2169,7 @@ def test_merge_online_tracks_filters_unplayable_defense():
     # 只有有效且可播的退后 (id=3) 会被合并
     assert len(items) == 1
     assert items[0]["guid"] == "online:kuwo:3"
-    assert items[0]["title"] == "退后"
+    assert items[0]["title"] == "[dl] 退后"
 
 
 
