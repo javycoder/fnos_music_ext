@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -30,12 +31,18 @@ lxapp = _load_app()
 
 
 class FakeLxServerClient:
-    """替身 LxServerClient，供离线单元测试使用。"""
+    """替身 LxServerClient，供离线单元测试使用。
+
+    自定义源管理方法按 lxserver 真实契约模拟：上传以脚本 @name 派生唯一 id、
+    重复上传报"已存在"、toggle 以 enabled 键生效、activate 单源互斥。
+    """
 
     def __init__(self):
         self.alive = True
+        # 模拟 lxserver users/source/_open/sources.json 的列表项字段
         self.sources = [
-            {"id": "source1", "name": "test-src", "enable": True, "sources": {"kw": {}, "kg": {}, "wy": {}}}
+            {"id": "source1", "name": "test-src", "enabled": True, "version": "1.0.0",
+             "supportedSources": ["kw", "kg", "wy"]}
         ]
         self.search_results = [
             {
@@ -52,6 +59,23 @@ class FakeLxServerClient:
         self.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
         self.lyric_result = {"lyric": "[00:00.00] 歌词内容\n[00:05.00] 第二句"}
         self._song_info_cache = {}
+        self.toggle_calls: list[tuple[str, bool]] = []
+        self.upload_calls: list[tuple[str, str]] = []
+        self.deleted_ids: list[str] = []
+
+    @staticmethod
+    def _derive_source_id(filename: str, script: str) -> str:
+        m = re.search(r"@name\s+([^\r\n]+)", script)
+        name = (m.group(1).strip() if m else filename) or "source"
+        if name.lower().endswith(".js"):
+            name = name[:-3]
+        return re.sub(r'[\\/:*?"<>|]', "_", name) + ".js"
+
+    def _find(self, target: str):
+        for s in self.sources:
+            if s["id"] == target or s["name"] == target:
+                return s
+        return None
 
     async def is_alive(self) -> bool:
         return self.alive
@@ -95,15 +119,42 @@ class FakeLxServerClient:
         }
 
     async def upload_custom_source(self, filename: str, script_content: str) -> dict:
-        return {"ok": True, "id": filename, "name": filename}
+        self.upload_calls.append((filename, script_content))
+        source_id = self._derive_source_id(filename, script_content)
+        existing = next((s for s in self.sources if s["id"] == source_id), None)
+        if existing:
+            raise RuntimeError(f'源 "{existing["name"]}" 已存在于 [open]')
+        m = re.search(r"@name\s+([^\r\n]+)", script_content)
+        name = (m.group(1).strip() if m else filename) or filename
+        entry = {"id": source_id, "name": name, "enabled": False, "version": "1.0.0",
+                 "supportedSources": ["kw", "wy"]}
+        self.sources.append(entry)
+        return {"success": True, "id": source_id,
+                "metadata": {"name": name, "version": "1.0.0"}, "supportedSources": ["kw", "wy"]}
 
     async def activate_single_source(self, target_id_or_name: str) -> bool:
+        target = self._find(target_id_or_name)
+        if not target:
+            return False
+        for s in self.sources:
+            enable = s is target
+            s["enabled"] = enable
+            self.toggle_calls.append((s["id"], enable))
         return True
 
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
+        target = self._find(source_id)
+        if not target:
+            raise RuntimeError("源不存在")
+        target["enabled"] = bool(enable)
+        self.toggle_calls.append((source_id, bool(enable)))
         return True
 
     async def delete_custom_source(self, source_id: str) -> bool:
+        target = self._find(source_id)
+        if target:
+            self.sources.remove(target)
+            self.deleted_ids.append(source_id)
         return True
 
     async def close(self) -> None:
