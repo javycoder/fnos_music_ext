@@ -502,19 +502,29 @@ async def api_preview(body: PreviewBody, request: Request):
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
+    started: list[str] = []
     for prog in PROVIDER_PROGRAMS.get(provider, [provider]):
         code, out = supervisorctl("start", prog)
         if code != 0:
+            for p in reversed(started):
+                supervisorctl("stop", p)
             return JSONResponse(content={"ok": False, "error": f"supervisorctl start {prog} 失败: {out}"}, status_code=500)
+        started.append(prog)
     client = get_http(request)
+    healthy = False
     for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
         try:
             r = await client.get(f"{PROVIDER_HEALTH[provider]}/healthz", timeout=2.0)
             if r.status_code == 200:
+                healthy = True
                 break
         except httpx.HTTPError:
             pass
         await asyncio.sleep(0.5)
+    if not healthy:
+        for p in reversed(started):
+            supervisorctl("stop", p)
+        return JSONResponse(content={"ok": False, "error": f"{provider} 启动后未能通过健康检查"}, status_code=504)
     _preview_until[provider] = time.monotonic() + PREVIEW_TTL
     return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
 
@@ -551,18 +561,25 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     old_provider = current_provider(before)
     changed = write_env(updates)
-    if not changed:
-        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化"}
-
     after = read_env()
     new_provider = current_provider(after)
     actions: list[dict] = []
 
+    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL 且当前是 lxmusic，仍应重试激活
+    force_lx_activate = (
+        new_provider == "lxmusic"
+        and "LX_SOURCE_URL" in updates
+        and bool(after.get("LX_SOURCE_URL"))
+    )
+
+    if not changed and not force_lx_activate and not _preview_until:
+        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化"}
+
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, new_provider))
-    # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，必须显式激活）
-    if new_provider == "lxmusic" and lx_url_changed:
+    # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，或用户重试激活）
+    if new_provider == "lxmusic" and (lx_url_changed or force_lx_activate):
         client = get_http(request)
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",

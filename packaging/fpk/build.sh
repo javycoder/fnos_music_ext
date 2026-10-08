@@ -66,9 +66,9 @@ command -v rsync >/dev/null 2>&1 || {
 # 确保 lxserver 预编译包已在构建缓存就绪（内嵌到 fpk 中实现 NAS 用户离线安装）
 BUILD_CACHE="${FPK_DIR}/.build/cache"
 mkdir -p "${BUILD_CACHE}"
-if [ -x "${REPO_ROOT}/scripts/update_lxserver.sh" ]; then
+if [ -f "${REPO_ROOT}/scripts/update_lxserver.sh" ]; then
     echo "[fpk] 检查构建缓存中的 lxserver 预编译包..."
-    "${REPO_ROOT}/scripts/update_lxserver.sh" "" "${BUILD_CACHE}" || echo "[WARN] 缓存预编译包检查失败"
+    bash "${REPO_ROOT}/scripts/update_lxserver.sh" "" "${BUILD_CACHE}" || echo "[WARN] 缓存预编译包检查失败"
 fi
 
 # ------------------------------------------------------------------------------

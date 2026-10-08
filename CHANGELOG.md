@@ -11,6 +11,13 @@
 
 ### 修复
 
+- **洛雪多音源架构、深分页稳定性与 WebUI 管理健壮性增强（2.7.0c）**：
+  1. **Supervisord 全生命周期与 CI 稳定性**：将容器 5 个受管服务（musicdl/musicbox/lxserver/lxmusic/webui）纳入统一进程断言，补齐 CI 自动化构建与测试依赖，强化测试执行目录沙箱隔离；
+  2. **卸载/重装数据持久化防护**：修复 `install.sh` 与 `uninstall_init` 中数据恢复错误处理逻辑，当备份还原校验未完成时严禁删除保留数据目录，杜绝覆盖失败导致的历史数据丢失；
+  3. **洛雪单源原子切换与并发互斥**：为 lxserver 客户端管理操作引入 `asyncio.Lock` 互斥保护，激活目标源前增加存在性探针以防误关现有音源，并在校验探活时通过 `excludeApiSources` 彻底隔离其他激活源干扰；
+  4. **lxserver 上游契约与歌词解析增强**：修正容器启动脚本平铺点分隔配置项（`frontend.password`、`subsonic.enable` 等），修补上游 Dockerfile 解包歌词 Promise 未等待缺陷并增加 GET/POST 双重退避回退；
+  5. **深分页游标隔离与客户端驱动**：为网易与洛雪深分页维护独立请求游标与源维度查重集合，打破跨源重歌误判取尽与循环死锁，TTL 重查时安全重置深分页状态；
+  6. **WebUI 保存重试与预览清理**：支持在 `.env` 无差异时重新触发音源激活（满足用户重试诉求），并对预览启动失败时已拉起的多进程组件提供严格逆序回滚清理。
 - **洛雪自定义多音乐源保存与校验修复**：
   1. 修复在线 JS URL 校验时缺少 `time` 模块导入导致的 `name 'time' is not defined` 异常；
   2. 修复本地 JS 上传至 lxserver 端点的数据格式（由 multipart 表单修正为 JSON `{filename, content}`），并按真实解析生成的源 ID 绑定持久路径，彻底解决上传后报 `本地文件不存在: /data/lxserver/users/source/_open/latest.js` 的问题；

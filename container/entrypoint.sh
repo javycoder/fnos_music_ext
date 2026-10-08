@@ -16,32 +16,23 @@ init_lxserver_config() {
     _lx_data="${DATA_PATH:-/data/lxserver}"
     mkdir -p "${_lx_data}/backups" "${_lx_data}/users/source/_open"
     _cfg_file="${_lx_data}/config.js"
-    if [ ! -f "${_cfg_file}" ]; then
+    if [ ! -f "${_cfg_file}" ] || (grep -q "frontend:" "${_cfg_file}" 2>/dev/null && ! grep -q "frontend.password" "${_cfg_file}" 2>/dev/null); then
         # 默认密码从环境变量获取，或缺省为 123456
         _admin_pw="${LXSERVER_ADMIN_PASSWORD:-123456}"
+        _escaped_pw="$(printf '%s' "${_admin_pw}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
         cat <<EOF > "${_cfg_file}"
 module.exports = {
   serverName: "fnmusic-lxserver",
   bindIP: "127.0.0.1",
   port: 8005,
-  frontend: {
-    password: "${_admin_pw}"
-  },
-  player: {
-    enableAuth: false
-  },
-  subsonic: {
-    enable: false
-  },
-  webdav: {
-    enable: false
-  },
-  system: {
-    allowUnsafeVM: true
-  }
+  "frontend.password": "${_escaped_pw}",
+  "player.enableAuth": false,
+  "subsonic.enable": false,
+  "webdav.enable": false,
+  "system.allowUnsafeVM": true
 };
 EOF
-        log "已初始化 lxserver 配置: ${_cfg_file}"
+        log "已初始化/对齐 lxserver 配置: ${_cfg_file}"
     fi
 
     # 历史数据无损迁移：从旧 /data/lxmusic 迁移用户自定义源脚本到 lxserver

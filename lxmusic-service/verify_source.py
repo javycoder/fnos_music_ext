@@ -219,6 +219,12 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
 
         # 抽样测试
         client = lx_app.get_http(lx_app.app)
+        target_id = str(target_src.get("id") or temp_source_id or "")
+        other_sources = [
+            str(s.get("id"))
+            for s in sources
+            if str(s.get("id") or "") and str(s.get("id") or "") != target_id
+        ]
         for kw in keywords:
             for platform in usable:
                 attempt = {"keyword": kw, "platform": platform, "result": "", "error": ""}
@@ -240,7 +246,9 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
                     first_song["id"], first_song
                 )
                 try:
-                    url_res = await temp_client.get_music_url(sinfo, "128k")
+                    url_res = await temp_client.get_music_url(
+                        sinfo, "128k", exclude_api_sources=other_sources
+                    )
                 except Exception as exc:
                     attempt.update(result="resolve_failed", error=str(exc))
                     report["attempts"].append(attempt)
@@ -248,6 +256,16 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
 
                 if not url_res or not url_res.get("url"):
                     attempt.update(result="resolve_empty")
+                    report["attempts"].append(attempt)
+                    continue
+
+                # 校验解析归属：必须由待测源解析，防止被并发其他源代劳
+                resolved_id = str(url_res.get("sourceId") or "")
+                resolved_name = str(url_res.get("sourceName") or "")
+                if (target_id and resolved_id and resolved_id != target_id) and (
+                    resolved_name and resolved_name != meta["name"]
+                ):
+                    attempt.update(result="resolved_by_other_source")
                     report["attempts"].append(attempt)
                     continue
 
