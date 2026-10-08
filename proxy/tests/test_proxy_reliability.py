@@ -640,7 +640,9 @@ async def test_lx_new_keyword_cancels_previous_request(monkeypatch):
     new = asyncio.create_task(p.search_track(request("q=new", token="user")))
     await old
     await new
-    assert seen == ["old", "new"]
+    # 深分页预取可能对新词多发一次第 2 页请求；旧词必须被取消且不再被打
+    assert seen[0] == "old" and "new" in seen
+    assert "old" not in seen[1:]
     assert cancelled == ["old"]
     assert _titles(old.result()) == []
     assert _titles(new.result()) == ["new"]

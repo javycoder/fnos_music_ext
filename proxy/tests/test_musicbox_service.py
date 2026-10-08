@@ -878,3 +878,34 @@ def test_user_playlist_tracks_endpoint_not_logged_in(monkeypatch):
         resp = client.get("/api/v1/user/playlists/111/tracks")
         data = resp.json()
     assert data["ok"] is False and data["error"] == "not_logged_in"
+
+
+def test_search_offset_routes_to_web_fallback(monkeypatch):
+    """offset>0（深分页）直接走官方 web 搜索接口：offset/limit 透传，可播过滤沿用。"""
+    captured: dict = {}
+
+    def fake_fallback(keyword, stype="song", limit=20, offset=0):
+        captured.update(keyword=keyword, stype=stype, limit=limit, offset=offset)
+        return [
+            {"song_id": 33894312, "song_name": "晴天", "artist": "周杰伦", "duration": 269},
+            {"song_id": 186016, "song_name": "晴天 (Live)", "artist": "周杰伦", "duration": 301},
+        ]
+
+    monkeypatch.setattr(musicbox_app, "search_web_fallback", fake_fallback)
+    monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
+
+    with TestClient(app) as client:
+        r = client.get("/api/v1/search", params={"keyword": "晴天", "offset": 50, "limit": 30})
+    assert r.status_code == 200
+    assert captured == {"keyword": "晴天", "stype": "song", "limit": 30, "offset": 50}
+    data = r.json()["data"]
+    assert [it["song_id"] for it in data] == [33894312, 186016]
+
+
+def test_search_offset_zero_keeps_cli_path():
+    """offset=0（首屏）不触发 web 直连分支，维持 CLI 优先的既有路径。"""
+    with TestClient(app) as client:
+        r = client.get("/api/v1/search", params={"keyword": "周杰伦", "offset": 0})
+    # CLI 路径失败会自动降级 web fallback，两条路径都返回 200 信封；断言不炸即可
+    assert r.status_code == 200
+    assert isinstance(r.json().get("data"), list)

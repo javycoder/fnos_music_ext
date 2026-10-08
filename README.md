@@ -12,7 +12,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ## 功能特性
 
-- **在线聚合搜播**：在官方搜索框输入歌名，聚合三大音源之一的曲库（见下），在线歌曲即点即播，自动补齐滚动歌词与高清封面。搜索结果严格**本地优先**：本地曲库条目始终排在前面，在线音源结果（网易 > musicdl > 洛雪）紧随其后；
+- **在线聚合搜播**：在官方搜索框输入歌名，聚合三大音源之一的曲库（见下），在线歌曲即点即播，自动补齐滚动歌词与高清封面。搜索结果严格**本地优先**：本地曲库条目始终排在前面，在线音源结果（网易 > musicdl > 洛雪）紧随其后；翻页时若在线结果不够填满一页，自动向音源继续取下一页补齐（**深分页**，可关；musicdl 仅参与首屏），详见 [docs/SEARCH_PAGINATION.md](docs/SEARCH_PAGINATION.md)；
 - **三音源单选**（v2.0.0 起互斥，可在 WebUI 秒级切换）：
   - [musicbox](https://github.com/darknessomi/musicbox)：网易云高品质解析，支持扫码登录 VIP/无损曲库与原生每日推荐；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)：酷我/咪咕等 57 个平台聚合，可按平台粒度勾选（编号见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）。部分音乐源歌曲少，或返回的音乐不可播放，请自行测试并使用可靠音乐源；

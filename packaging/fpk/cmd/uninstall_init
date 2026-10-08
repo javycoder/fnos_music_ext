@@ -57,6 +57,25 @@ if ! tar --ignore-failed-read -czf "${ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" ${ITEMS
     fnmusic_fail "备份数据到 ${ARCHIVE} 失败，已中止卸载（可重试或手动备份）"
 fi
 echo "[fnmusic-ext] 卸载前已备份配置与数据到 ${ARCHIVE}" >> "${FNMUSIC_LOG}"
+
+# 默认保留音乐源与配置数据至持久目录（重装时自动检测并恢复）
+KEEP_DIR="${FNMUSIC_KEEP_DIR:-${VOL}fnmusic-ext-data}"
+mkdir -p "${KEEP_DIR}" 2>/dev/null || true
+if [ -d "${KEEP_DIR}" ]; then
+    # shellcheck disable=SC2086
+    for item in ${ITEMS}; do
+        src="${FNMUSIC_REPO_DIR}/${item}"
+        [ -e "${src}" ] || continue
+        cp -a "${src}" "${KEEP_DIR}/" 2>> "${FNMUSIC_LOG}" || true
+    done
+    cat > "${KEEP_DIR}/README.txt" << 'EOF' 2>/dev/null || true
+此目录为 fnmusic-ext 卸载时保留的音乐源与配置数据。
+重新安装 fnmusic-ext 时将自动检测并恢复此目录下的配置与音乐源。
+如需彻底清除所有历史数据，可手动删除此目录。
+EOF
+    echo "[fnmusic-ext] 音乐源数据已保留至 ${KEEP_DIR}" >> "${FNMUSIC_LOG}"
+fi
+
 echo "${ARCHIVE}"
 
 exit 0

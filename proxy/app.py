@@ -92,6 +92,11 @@ CONF = {
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     # 输入停满这么久才向音源发起搜索。窗口内的新词会替换旧词并重新计时。
     "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "1.0")),
+    # 搜索深分页：本地优先布局不变，翻页越过在线首屏池时向音源增量取下一页
+    # 把本页在线段填满（直到上游取尽或 deep_max_pages 封顶）。musicdl 库无
+    # 分页参数，深分页只作用于网易/洛雪。
+    "search_deep_page": os.environ.get("FNMUSIC_SEARCH_DEEP_PAGE", "true").lower() in ("true", "1", "yes"),
+    "search_deep_max_pages": max(1, int(os.environ.get("FNMUSIC_SEARCH_DEEP_MAX_PAGES", "10"))),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -451,6 +456,9 @@ def _clean_search_cache() -> None:
         task = entry.get("task")
         if task and not task.done():
             task.cancel()
+        ext = entry.get("extend_task")
+        if ext and not ext.done():
+            ext.cancel()
 
 
 def _set_search_cache(keyword: str, entry: dict) -> None:
@@ -469,6 +477,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
     "FNMUSIC_SEARCH_PROBE": ("search_probe", "bool"),
+    "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
+    "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
@@ -554,6 +564,11 @@ def _env_watch_parse(raw: str, kind: str):
             return max(0, min(20, int(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "deep_pages":
+        try:
+            return max(1, min(50, int(raw)))
+        except (TypeError, ValueError):
+            return None
     return raw
 
 
@@ -580,8 +595,9 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
 
 def _reset_search_cache() -> None:
     tasks = [
-        entry.get("task") for entry in _SEARCH_CACHE.values()
-        if entry.get("task") and not entry["task"].done()
+        t for entry in _SEARCH_CACHE.values()
+        for t in (entry.get("task"), entry.get("extend_task"))
+        if t and not t.done()
     ]
     for task in tasks:
         task.cancel()
@@ -1871,22 +1887,25 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
     return await _MUSICDL_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
+async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
     if not keyword:
         return None
     scope = _FETCH_SCOPE.get()
 
     async def _query():
-        return await _musicbox_search_request(client, keyword, limit)
+        return await _musicbox_search_request(client, keyword, limit, offset)
 
     return await _MUSICBOX_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
+async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+    params: dict[str, Any] = {"keyword": keyword, "limit": limit, "type": "song"}
+    if offset > 0:
+        params["offset"] = offset
     try:
         r = await client.get(
             "/api/v1/search",
-            params={"keyword": keyword, "limit": limit, "type": "song"},
+            params=params,
             timeout=20.0,
         )
         if r.status_code != 200:
@@ -1974,27 +1993,30 @@ class _SearchItems(list):
         self.partial = partial
 
 
-async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: "list[str] | str | None" = None) -> list[dict]:
+async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: "list[str] | str | None" = None, page: int = 1) -> list[dict]:
     """洛雪音乐源搜索：返回统一 item（id = "lx:<source>:<identifier>"）。
 
     sources：平台白名单（列表或逗号串），None = 用 CONF["lx_sources"]；空 = 跟随 lx 服务配置。
+    page：深分页页号（1 = 首屏），透传给 lx 服务的各平台上游分页参数。
     """
     if not keyword:
         return None  # type: ignore[return-value]
     scope = _FETCH_SCOPE.get()
 
     async def _query():
-        return await _lx_search_request(client, keyword, limit, sources, scope)
+        return await _lx_search_request(client, keyword, limit, sources, scope, page)
 
     return await _LX_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str) -> list[dict]:
+async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str, page: int = 1) -> list[dict]:
     params: dict[str, Any] = {
         "keyword": keyword,
         "limit": limit,
         "probe": 1 if CONF.get("search_probe") else 0,
     }
+    if page > 1:
+        params["page"] = page
     selected = CONF.get("lx_sources") if sources is None else sources
     if isinstance(selected, str):
         selected = [s.strip() for s in selected.split(",") if s.strip()]
@@ -2978,7 +3000,10 @@ async def search_track(request: Request):
     entry = _SEARCH_CACHE.get(key)
     if entry is None:
         entry = {"items": [], "ts": 0, "keyword": keyword,
-                 "scope": _search_scope(request), "credentials": scope, "config": _source_config(), "task": None}
+                 "scope": _search_scope(request), "credentials": scope, "config": _source_config(), "task": None,
+                 # 深分页游标：deep_round=已取到的源页轮次（首轮聚合即第 1 页）；
+                 # exhausted=已取尽的源；extend_task=进行中的增量取页任务
+                 "deep_round": 1, "exhausted": set(), "extend_task": None}
         _set_search_cache(key, entry)
     entry["gen"] = _USER_SEARCH_GEN.get(scope, 0)
     entry["superseded"] = False
@@ -3022,12 +3047,22 @@ async def search_track(request: Request):
     if len(local_list) > size:
         win_start = (page - 1) * size
         local_list[:] = local_list[win_start:win_start + size]
+    # 深分页：本页在线段末尾越过在线池时，向未取尽的源增量取下一页填满本页
+    # （本地优先布局不变）。池增长后 total_online 需按新池重算。
+    if CONF.get("search_deep_page"):
+        need_end = max(0, page * size - original_total)
+        if need_end > len(entry["items"]):
+            await _wait_deep_pages(request, keyword, entry, need_end)
+            total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
     # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
     # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
     selected = _online_window(entry, page, size, original_total)
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     merged["data"]["total"] = original_total + total_online
+    # 预取下一页的在线段：源未取尽且池未填满时后台先取一轮，连续翻页零等待
+    if CONF.get("search_deep_page"):
+        _schedule_deep_prefetch(request, keyword, entry, max(0, (page + 1) * size - original_total))
     fav_set = await _online_favorite_set(request)
     if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
@@ -3133,6 +3168,113 @@ def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[
         return []
     window = [item for item in entry["items"][start:end] if _source_enabled(online_guid_from_item(item))]
     return window
+
+
+def _deep_sources_available(entry: dict) -> bool:
+    """深分页是否还有可取的源：启用且未取尽，且未达 max_pages 封顶。"""
+    if int(entry.get("deep_round") or 1) >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
+        return False
+    exhausted = entry.get("exhausted") or set()
+    for name in ("netease", "lx"):
+        if CONF.get(f"{name}_enabled") and name not in exhausted:
+            return True
+    return False
+
+
+async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
+    """深分页增量取页：向未取尽的在线源取下一页并追加进在线池。
+
+    只追加不重排（_online_window 的前缀稳定承诺）。取尽判定：某源本轮
+    返回空列表，或去重后对池 0 新增（上游开始重复自身）。musicdl 库无
+    分页参数，不参与深分页。绕过代理侧取消门——翻页是用户主动行为；
+    lx 请求仍带 scope 头，lx 服务端的同词取消门自然生效。
+    """
+    scope = entry.get("credentials") or _credential_scope(request)
+    round_no = int(entry.get("deep_round") or 1)
+    if _user_search_stale(entry, scope):
+        return
+    if round_no >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
+        entry.setdefault("exhausted", set()).update({"netease", "lx"})
+        return
+    token = _FETCH_SCOPE.set(scope)
+    try:
+        fetches: list[tuple[str, Any]] = []
+        exhausted = entry.setdefault("exhausted", set())
+        if CONF.get("netease_enabled") and "netease" not in exhausted:
+            limit = int(CONF["netease_search_limit"])
+            fetches.append(("netease", _musicbox_search_request(
+                get_musicbox_client(request.app), keyword, limit, offset=round_no * limit)))
+        if CONF.get("lx_enabled") and "lx" not in exhausted:
+            fetches.append(("lx", _lx_search_request(
+                get_lx_client(request.app), keyword, CONF["lx_search_limit"], None, scope, page=round_no + 1)))
+        if not fetches:
+            return
+        results = await asyncio.gather(*[coro for _, coro in fetches], return_exceptions=True)
+        if _user_search_stale(entry, scope):
+            return
+        merged = list(entry["items"])
+        for (name, _), result in zip(fetches, results):
+            if isinstance(result, BaseException):
+                # 瞬时失败不判取尽，下一轮重试
+                logger.warning("deep page fetch %s failed: %s", name, result)
+                continue
+            items = result if isinstance(result, list) else []
+            if not items:
+                exhausted.add(name)
+                continue
+            prev = len(merged)
+            merged = deduplicate_online_items(merged + items)[:2000]
+            if len(merged) == prev:
+                # 本轮 0 新增：上游开始重复自身，视为取尽
+                exhausted.add(name)
+        if len(merged) >= 2000:
+            exhausted.update({"netease", "lx"})
+        entry["items"] = merged
+        entry["deep_round"] = round_no + 1
+        entry["accessed"] = time.time()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("deep page extend failed for %r: %s", keyword, e)
+    finally:
+        _FETCH_SCOPE.reset(token)
+
+
+async def _wait_deep_pages(request: Request, keyword: str, entry: dict, need_end: int) -> None:
+    """确保在线池覆盖到 need_end：创建/加入增量任务并在预算内等待填满。
+
+    到点没填满就交现有切片（短页自愈：total 仍大于客户端已见条数，下次
+    翻页会再次触发）。首屏聚合仍在跑时先等它交卷，避免增量页与首屏页
+    乱序（聚合的最后写回会覆盖增量结果）。
+    """
+    if not entry.get("items"):
+        # 首屏池还空（聚合被放弃/超时）：深取第 2 页会留下永久空洞，不做
+        return
+    agg = entry.get("task")
+    if agg and not agg.done():
+        await asyncio.wait({agg}, timeout=min(10.0, max(0.05, float(CONF["search_timeout"]))))
+    deadline = asyncio.get_running_loop().time() + min(10.0, max(0.05, float(CONF["search_timeout"])))
+    while len(entry["items"]) < need_end and _deep_sources_available(entry):
+        task = entry.get("extend_task")
+        if not task or task.done():
+            task = asyncio.create_task(_extend_search(request, keyword, entry))
+            entry["extend_task"] = task
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        await asyncio.wait({task}, timeout=min(0.05, remaining))
+
+
+def _schedule_deep_prefetch(request: Request, keyword: str, entry: dict, next_need: int) -> None:
+    """预取：下一页的在线段未填满且源未取尽时后台先取一轮，连续翻页零等待。"""
+    if not entry.get("items") or next_need <= len(entry["items"]):
+        return
+    if not _deep_sources_available(entry):
+        return
+    task = entry.get("extend_task")
+    if task and not task.done():
+        return
+    entry["extend_task"] = asyncio.create_task(_extend_search(request, keyword, entry))
 
 
 @app.get("/music/api/v1/search/suggest")

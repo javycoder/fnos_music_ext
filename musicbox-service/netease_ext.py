@@ -254,10 +254,11 @@ def song_lyric_pair(song_id: int) -> dict[str, str]:
     return {"lyric": lyric_str, "tlyric": tlyric_str}
 
 
-def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20) -> list[dict[str, Any]]:
+def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
     """网易官方 Web 搜索接口降级容错（https://music.163.com/api/search/get/web）。
 
     当主接口被风控（如 405 操作频繁）或失败时，调用官方备用接口获取歌曲列表。
+    offset 为官方接口原生分页参数（0 起始）；CLI search 无 offset 参数，深分页也走这里。
     """
     if not keyword or not keyword.strip():
         return []
@@ -277,7 +278,7 @@ def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20) -> l
         "s": keyword.strip(),
         "type": str(type_map.get(stype, 1)),
         "limit": str(limit),
-        "offset": "0",
+        "offset": str(max(0, int(offset or 0))),
     }
     res = None
     try:

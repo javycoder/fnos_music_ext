@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -66,6 +68,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_ONLINE_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 启用平台"},
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
     "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
+    "LX_SOURCE_LIST": {"kind": "str", "default": "[]", "group": "lx", "reload": "hot", "label": "洛雪源列表（JSON 数组）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
@@ -84,6 +87,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
+    "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
+    "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
 }
 
@@ -242,7 +247,50 @@ def preview_reconcile_after_save() -> list[dict]:
 
 # ------------------------------------------------------------------ 校验 --
 
+def _normalize_lx_source_list(raw) -> str:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return "[]"
+        try:
+            items = json.loads(text)
+        except Exception as exc:
+            raise ValueError(f"LX_SOURCE_LIST: 不是合法的 JSON 数组: {exc}") from exc
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ValueError(f"LX_SOURCE_LIST: 期望 JSON 数组，收到 {type(raw).__name__}")
+
+    if not isinstance(items, list):
+        raise ValueError("LX_SOURCE_LIST: 期望 JSON 数组，收到 JSON 对象或其他类型")
+
+    normalized: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in items[:50]:  # 上限 50 条
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        url_lower = url.lower()
+        if not (url_lower.startswith("http://") or url_lower.startswith("https://") or url_lower.startswith("file://")):
+            continue
+        if len(url) > 2000:
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        name = str(item.get("name") or "").strip()
+        name = re.sub(r"[\r\n\t]+", " ", name).strip()[:80]
+        normalized.append({"name": name, "url": url})
+
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalize_value(key: str, raw) -> str:
+    if key == "LX_SOURCE_LIST":
+        return _normalize_lx_source_list(raw)
     spec = SCHEMA[key]
     kind = spec["kind"]
     if kind == "bool":

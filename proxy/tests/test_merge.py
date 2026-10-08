@@ -55,6 +55,8 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "search_cache_ttl", 604800.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
     monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
+    monkeypatch.setitem(CONF, "search_deep_page", True)
+    monkeypatch.setitem(CONF, "search_deep_max_pages", 10)
 
     def default_musicbox_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"ok": False, "data": []})
@@ -2507,3 +2509,139 @@ def test_search_track_pagination_respected_size_untouched():
         p2 = client.get("/music/api/v1/search/track?keyword=x&page=2&size=10").json()
     # 返回条数(10)不超 size(10)：原样透传第 2 页，不被切片清空
     assert [str(i["guid"]) for i in p2["data"]["list"]] == [f"local:{i}" for i in range(10, 20)]
+
+
+def _deep_page_handlers(pool_size: int, offsets_seen: list):
+    """深分页测试公共 mock：官方本地 30 条；网易按 offset/limit 切池返回。"""
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        chunk = [
+            {"guid": f"local:{i}", "title": f"本地歌{i}", "artist": f"歌手{i % 7}"}
+            for i in range(30)
+        ]
+        return httpx.Response(200, json={"code": 0, "data": {"list": chunk, "total": 30}})
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        pool = [
+            {"song_id": f"mb_{i}", "song_name": f"在线歌{i}", "artist": f"在线歌手{i}", "duration": 200}
+            for i in range(pool_size)
+        ]
+        if request.url.path == "/api/v1/songs/detail":
+            # 详情（补封面）请求：返回同池数据，不计入 offset 统计
+            return httpx.Response(200, json={"ok": True, "data": pool})
+        offset = int(request.url.params.get("offset") or 0)
+        limit = int(request.url.params.get("limit") or 50)
+        offsets_seen.append(offset)
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": pool[offset:offset + limit]},
+        )
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "items": []})
+
+    return upstream_handler, musicbox_handler, musicdl_handler
+
+
+def test_search_track_deep_pagination_user_scenario():
+    """深分页用户场景：本地 30 + size 50 —— 第 1 页 30 本地 + 20 在线，第 2 页起
+    每页 50 在线；在线池越过首屏时按 offset=50/100/150 向网易增量取页，上游
+    取尽后末页短页、total 稳定、后续页为空且不再打上游。"""
+    offsets_seen: list[int] = []
+    upstream_handler, musicbox_handler, musicdl_handler = _deep_page_handlers(200, offsets_seen)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        seen = []
+        for page in range(1, 7):
+            resp = client.get(f"/music/api/v1/search/track?q=歌&page={page}&size=50")
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            items = data["list"]
+            guids = [str(it["guid"]) for it in items]
+            seen.extend(guids)
+            if page == 1:
+                # 边界页：30 本地 + 20 在线填满整页；total 反映首屏池
+                assert len(items) == 50
+                assert sum(1 for g in guids if g.startswith("local:")) == 30
+                assert data["total"] == 30 + 50
+            elif page in (2, 3, 4):
+                # 纯在线页：深分页增量取页填满 50 条
+                assert len(items) == 50
+                assert all(not g.startswith("local:") for g in guids)
+            elif page == 5:
+                # 上游取尽（池 200 = 30 本地 + 170 在线后不够）：短页 30 条
+                assert len(items) == 30
+                assert all(not g.startswith("local:") for g in guids)
+                assert data["total"] == 30 + 200
+            else:
+                assert items == []
+                assert data["total"] == 30 + 200
+        # 跨页零重复：本地 30 + 在线 200 全量出现、本地全在前
+        locals_seen = [g for g in seen if g.startswith("local:")]
+        onlines_seen = [g for g in seen if not g.startswith("local:")]
+        assert len(locals_seen) == 30 and len(onlines_seen) == 200
+        assert len(set(seen)) == 230
+        assert seen.index(onlines_seen[0]) == 30
+        # 深取页严格按 50 递增、每轮恰好一次（含首屏 offset=0）
+        assert offsets_seen == [0, 50, 100, 150, 200]
+
+
+def test_search_track_deep_pagination_disabled(monkeypatch):
+    """深分页关闭：越过首屏池不再打上游（offset 恒 0），在线段只余首屏尾段。"""
+    monkeypatch.setitem(CONF, "search_deep_page", False)
+    offsets_seen: list[int] = []
+    upstream_handler, musicbox_handler, musicdl_handler = _deep_page_handlers(200, offsets_seen)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        p1 = client.get("/music/api/v1/search/track?q=歌&page=1&size=50").json()["data"]
+        p2 = client.get("/music/api/v1/search/track?q=歌&page=2&size=50").json()["data"]
+        p3 = client.get("/music/api/v1/search/track?q=歌&page=3&size=50").json()["data"]
+    assert len(p1["list"]) == 50
+    assert len(p2["list"]) == 30  # 首屏池余量 mb_20..mb_49，不再增量取页
+    assert p3["list"] == []
+    assert p1["total"] == p2["total"] == p3["total"] == 30 + 50
+    assert offsets_seen == [0]
+
+
+def test_search_track_single_page_under_size():
+    """总量 ≤ 一页（30 本地 + 20 在线 = 50）时不分页：第 1 页装下全部，第 2 页空。"""
+    offsets_seen: list[int] = []
+    upstream_handler, musicbox_handler, musicdl_handler = _deep_page_handlers(20, offsets_seen)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        p1 = client.get("/music/api/v1/search/track?q=歌&page=1&size=50").json()["data"]
+        p2 = client.get("/music/api/v1/search/track?q=歌&page=2&size=50").json()["data"]
+    assert len(p1["list"]) == 50
+    assert p1["total"] == 50
+    assert p2["list"] == []
+    assert p2["total"] == 50

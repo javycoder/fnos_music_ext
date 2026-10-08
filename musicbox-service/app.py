@@ -108,11 +108,28 @@ def search(
     keyword: str = Query(...),
     type: str = Query("song"),
     limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     if not keyword.strip():
         raise HTTPException(status_code=400, detail="keyword cannot be empty")
     if type not in SEARCH_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type {type!r}")
+
+    if offset > 0:
+        # CLI search 无 offset 参数；深分页直接走官方 web 搜索接口（原生分页）。
+        try:
+            page_items = search_web_fallback(keyword, stype=type, limit=limit, offset=offset)
+        except Exception as exc:
+            logger.warning("offset search failed: %s", exc)
+            page_items = []
+        if page_items and type == "song":
+            song_ids = [it["song_id"] for it in page_items if it.get("song_id")]
+            if song_ids:
+                playable = filter_playable_song_ids(song_ids)
+                filtered = [it for it in page_items if it.get("song_id") in playable]
+                if filtered:
+                    page_items = filtered
+        return {"ok": True, "code": 200, "data": page_items}
 
     res = None
     fallback_needed = False

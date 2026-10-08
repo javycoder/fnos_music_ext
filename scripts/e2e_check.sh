@@ -102,6 +102,33 @@ else
   bad "分页 page=2" "total=$TOTAL1，page1=$LIST1_COUNT，page2=$LIST2_COUNT（需 total>10 且两页均非空）"
 fi
 
+# ── 2b. 深分页：page=3 继续出结果且三页 guid 零重复 ────────
+SEARCH3=$(api "$BASE/search/track?q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$KEYWORD")&page=3&size=10")
+LIST3_COUNT=$(echo "$SEARCH3" | jget data.list | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+if [ "${TOTAL1:-0}" -le 30 ]; then
+  ok "深分页 page=3（total=$TOTAL1 ≤ 30，无第三页属正确分页行为，跳过）"
+elif [ "${LIST3_COUNT:-0}" -gt 0 ]; then
+  CROSS_DUP=$(python3 - "$SEARCH1" "$SEARCH2" "$SEARCH3" << 'PY'
+import json, sys
+guids = []
+for raw in sys.argv[1:4]:
+    try:
+        data = json.loads(raw)
+        guids += [str(it.get("guid") or "") for it in data.get("data", {}).get("list", [])]
+    except Exception:
+        pass
+print(len(guids) - len(set(guids)))
+PY
+)
+  if [ "${CROSS_DUP:-1}" = "0" ]; then
+    ok "深分页 page=3（page3=$LIST3_COUNT 条，三页零重复 / total=$TOTAL1）"
+  else
+    bad "深分页 page=3" "跨页重复 ${CROSS_DUP} 条（page1=$LIST1_COUNT，page2=$LIST2_COUNT，page3=$LIST3_COUNT）"
+  fi
+else
+  bad "深分页 page=3" "total=$TOTAL1，page3=$LIST3_COUNT（total>30 时第三页不应为空）"
+fi
+
 # ── 3. 播放（在线曲目拉 64KB 音频） ─────────────────────
 BYTES=$(api -o /tmp/e2e_stream.bin -w "%{http_code}:%{size_download}" -H "Range: bytes=0-65535" "$BASE/track/stream/$ONLINE_GUID" 2>/dev/null)
 CODE=${BYTES%%:*}; SIZE=${BYTES##*:}

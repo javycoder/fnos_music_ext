@@ -718,6 +718,31 @@ def test_uninstall_init_without_repo_exits_cleanly(sb):
     assert not sb.tar_log.exists()
 
 
+def test_uninstall_init_preserves_data_to_keep_dir(sb):
+    repo = sb.make_repo(env_text="SAVED_VAR=test_val\n", with_restore=True)
+    sb.add_data(repo)
+    sb.add_tar()
+    keep_dir = sb.tmp / "vol" / "fnmusic-ext-data"
+    result = sb.run("uninstall_init", FNMUSIC_KEEP_DIR=str(keep_dir))
+    assert result.returncode == 0, result.stderr
+    assert keep_dir.is_dir()
+    assert (keep_dir / ".env").is_file()
+    assert "SAVED_VAR=test_val" in (keep_dir / ".env").read_text(encoding="utf-8")
+    assert (keep_dir / "sources-data").is_dir()
+    assert (keep_dir / "README.txt").is_file()
+    assert "重新安装 fnmusic-ext 时将自动检测并恢复" in (keep_dir / "README.txt").read_text(encoding="utf-8")
+
+
+def test_uninstall_init_keep_data_false_skips_keep_dir(sb):
+    repo = sb.make_repo(with_restore=True)
+    sb.add_data(repo)
+    sb.add_tar()
+    keep_dir = sb.tmp / "vol" / "fnmusic-ext-data"
+    result = sb.run("uninstall_init", wizard_keep_data="false", FNMUSIC_KEEP_DIR=str(keep_dir))
+    assert result.returncode == 0, result.stderr
+    assert not keep_dir.exists()
+
+
 # ------------------------------------------------------ uninstall_callback ---
 
 def test_uninstall_callback_never_fails_even_if_all_cleanup_fails(sb):

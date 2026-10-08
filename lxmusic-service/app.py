@@ -217,7 +217,7 @@ def _quality_tiers(quality: str) -> list[str]:
 
 # ------------------------------------------------------------------ 酷狗 kg ---
 
-async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int, page: int = 1) -> list[dict]:
     # 检索更多条目以便剔除收费/VIP曲目后仍能满足 limit 数量
     fetch_size = max(limit * 3, 20)
     r = await client.get(
@@ -225,7 +225,7 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         params={
             "keyword": keyword,
             "format": "json",
-            "page": 1,
+            "page": page,
             "pagesize": fetch_size,
             "showtype": 1,
         },
@@ -342,11 +342,11 @@ async def kg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
 
 # ------------------------------------------------------------------ 网易 wy ---
 
-async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int, page: int = 1) -> list[dict]:
     fetch_limit = max(limit * 2, 20)
     r = await client.post(
         "https://music.163.com/api/search/get/web",
-        data={"s": keyword, "type": 1, "offset": 0, "limit": fetch_limit, "total": "true"},
+        data={"s": keyword, "type": 1, "offset": (page - 1) * fetch_limit, "limit": fetch_limit, "total": "true"},
         headers={
             "User-Agent": UA_PC,
             "Referer": "https://music.163.com/",
@@ -440,11 +440,11 @@ async def wy_resolve_lyric(client: httpx.AsyncClient, identifier: str) -> str:
 
 # ------------------------------------------------------------------ 咪咕 mg ---
 
-async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int, page: int = 1) -> list[dict]:
     fetch_size = max(limit * 2, 10)
     r = await client.get(
         "https://c.music.migu.cn/MIGUM2.0/v1.0/content/search_all.do",
-        params={"text": keyword, "pageNo": 1, "pageSize": fetch_size, "resource": 1},
+        params={"text": keyword, "pageNo": page, "pageSize": fetch_size, "resource": 1},
         headers={"User-Agent": UA_MOBILE, "Referer": "https://m.music.migu.cn/"},
     )
     r.raise_for_status()
@@ -944,10 +944,10 @@ TX_SEARCH_BODY = {
 }
 
 
-async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int, page: int = 1) -> list[dict]:
     """QQ 音乐官方免登录搜索（musicu.fcg）。直链由用户自定义源解析后探活。"""
     fetch_size = max(limit * 2, 20)
-    body = {"req_1": {**TX_SEARCH_BODY["req_1"], "param": {**TX_SEARCH_BODY["req_1"]["param"], "query": keyword, "num_per_page": fetch_size}}}
+    body = {"req_1": {**TX_SEARCH_BODY["req_1"], "param": {**TX_SEARCH_BODY["req_1"]["param"], "query": keyword, "page_num": page, "num_per_page": fetch_size}}}
     try:
         r = await client.post(
             "https://u.y.qq.com/cgi-bin/musicu.fcg",
@@ -1074,7 +1074,7 @@ def _title_relevance(title: str, keyword: str) -> int:
     return 3
 
 
-async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict]:
+async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int, page: int = 1) -> list[dict]:
     """酷我官方免登录搜索（r.s 老接口）。直链由用户自定义源解析后探活。"""
     import html as _html
 
@@ -1087,7 +1087,7 @@ async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "ft": "music",
             "itemset": "web_2013",
             "client": "kt",
-            "pn": 0,
+            "pn": page - 1,
             "rn": fetch_size,
             "rformat": "json",
             "encoding": "utf8",
@@ -1532,6 +1532,7 @@ async def search(
     limit: int = Query(0),
     sources: str = Query(""),
     probe: int | None = Query(None, alias="probe"),
+    page: int = Query(1, ge=1),
     x_fnmusic_scope: str = Header(default=""),
 ):
     kw = (keyword or q or "").strip()
@@ -1546,7 +1547,7 @@ async def search(
     scope = (x_fnmusic_scope or "").strip()
 
     async def _run():
-        return await _search_platforms(kw, limit, wanted, probe=probe)
+        return await _search_platforms(kw, limit, wanted, probe=probe, page=page)
 
     result = await LX_SEARCH_GATE.run(scope, kw, _run)
     if result is _LX_SUPERSEDED:
@@ -1554,7 +1555,7 @@ async def search(
     return result
 
 
-async def _search_platforms(kw: str, limit: int, wanted: list[str], *, probe: int | None = None) -> dict:
+async def _search_platforms(kw: str, limit: int, wanted: list[str], *, probe: int | None = None, page: int = 1) -> dict:
     probe_val = bool(probe) if probe is not None else None
     probe_token = _SEARCH_PROBE_ENABLED.set(probe_val)
     try:
@@ -1567,7 +1568,7 @@ async def _search_platforms(kw: str, limit: int, wanted: list[str], *, probe: in
         async def run_source(src):
             token = _SEARCH_PARTIAL.set(partials[src])
             try:
-                return await _SEARCHERS[src](client, kw, limit)
+                return await _SEARCHERS[src](client, kw, limit, page)
             finally:
                 _SEARCH_PARTIAL.reset(token)
 

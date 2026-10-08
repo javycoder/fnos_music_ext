@@ -43,6 +43,8 @@ def setup_lx_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
     monkeypatch.setitem(CONF, "late_page_wait_s", 5.0)
     monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
+    monkeypatch.setitem(CONF, "search_deep_page", True)
+    monkeypatch.setitem(CONF, "search_deep_max_pages", 10)
     yield
     # 恢复全局 app.state，避免 mock 客户端泄漏到其它测试文件
     for attr in ("upstream_client", "musicdl_client", "musicbox_client", "lx_client"):
@@ -531,3 +533,63 @@ def test_search_without_netease_merges_lx_and_musicdl(monkeypatch):
         assert "local-1" in guids
         assert any(resolve_real_guid(g).startswith("online:lx:") for g in guids)
         assert any("migu" in resolve_real_guid(g) for g in guids)
+
+
+def test_search_track_deep_pagination_lx_page_passthrough():
+    """深分页对洛雪源透传 page 页号：翻页越过首屏池时按 page=2、3 增量取页。"""
+    pages_seen: list[int] = []
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
+
+    def lx_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/api/v1/search":
+            return httpx.Response(404, json={"ok": False})
+        page = int(request.url.params.get("page") or 1)
+        pages_seen.append(page)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "items": [
+                    {
+                        "id": f"lx:kg:{page:02d}{i:03d}",
+                        "lx_source": "kg",
+                        "title": f"晴天{page}-{i}",
+                        "artist": "周杰伦",
+                        "album": "叶惠美",
+                        "duration_s": 269.0,
+                        "ext": "flac",
+                        "cover_url": "",
+                        "file_size": 1000,
+                    }
+                    for i in range(20)
+                ],
+                "errors": {},
+            },
+        )
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772"
+    )
+
+    with TestClient(app) as client:
+        p1 = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()["data"]
+        p2 = client.get("/music/api/v1/search/track?q=晴天&page=2&size=20").json()["data"]
+        p3 = client.get("/music/api/v1/search/track?q=晴天&page=3&size=20").json()["data"]
+    # 每页都拿满 20 条在线；page=2/3 由深分页增量触发（首屏聚合不发 page 参数）；
+    # 末页响应后的预取可能多取一轮更深的页，属预期行为
+    assert len(p1["list"]) == 20 and p1["total"] == 20
+    assert len(p2["list"]) == 20 and p2["total"] == 40
+    assert len(p3["list"]) == 20 and p3["total"] == 60
+    assert pages_seen[0] == 1
+    assert pages_seen == sorted(pages_seen)
+    assert {2, 3}.issubset(set(pages_seen))
+    # 跨页零重复
+    g1 = {str(i["guid"]) for i in p1["list"]}
+    g2 = {str(i["guid"]) for i in p2["list"]}
+    g3 = {str(i["guid"]) for i in p3["list"]}
+    assert not (g1 & g2) and not (g1 & g3) and not (g2 & g3)

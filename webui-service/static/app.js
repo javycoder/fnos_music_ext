@@ -16,6 +16,7 @@ let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
+let lxSourceList = [];    // 洛雪源列表 [{ name, url }]
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
@@ -131,9 +132,31 @@ function applyConfigToForm() {
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
   $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
+  $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
+  $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
   $("#lx-url").value = v.LX_SOURCE_URL || "";
   lxVerifiedUrl = v.LX_SOURCE_URL || null;
+  try {
+    const rawList = v.LX_SOURCE_LIST;
+    lxSourceList = rawList ? JSON.parse(rawList) : [];
+    if (!Array.isArray(lxSourceList)) lxSourceList = [];
+  } catch (_) {
+    lxSourceList = [];
+  }
+  const currentUrl = (v.LX_SOURCE_URL || "").trim();
+  if (currentUrl && !lxSourceList.some((item) => item.url === currentUrl)) {
+    lxSourceList.unshift({
+      name: lxDefaultName(currentUrl),
+      url: currentUrl,
+    });
+  }
+  if ($("#lx-name")) {
+    const matched = lxSourceList.find((item) => item.url === currentUrl);
+    $("#lx-name").value = (matched && matched.name) || "";
+  }
+  renderLxSourceList();
+  syncLxAddButton();
   renderPlatformChips();
 }
 
@@ -160,7 +183,10 @@ function collectConfig() {
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
     FNMUSIC_SEARCH_PROBE: $("#search-probe").checked,
+    FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
+    FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
+    LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
@@ -373,6 +399,103 @@ function stopQrPolling() {
 $("#qr-btn").addEventListener("click", startQrLogin);
 
 /* -------------------------------------------------------------- lx 源测试 */
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function lxDefaultName(url) {
+  if (!url) return "自定义源";
+  try {
+    const raw = url.split("?")[0].split("#")[0];
+    const segment = raw.split("/").filter(Boolean).pop() || "lx-source";
+    return decodeURIComponent(segment);
+  } catch (_) {
+    return "自定义源";
+  }
+}
+
+function syncLxAddButton() {
+  const url = ($("#lx-url")?.value || "").trim();
+  const addBtn = $("#lx-add");
+  if (addBtn) addBtn.disabled = !url;
+}
+
+function renderLxSourceList() {
+  const container = $("#lx-source-list");
+  if (!container) return;
+  const currentUrl = ($("#lx-url")?.value || "").trim();
+
+  if (!lxSourceList.length) {
+    container.innerHTML = `<span class="muted pad">暂无洛雪音乐源，上传 .js 或填写脚本地址后点击「添加」加入列表</span>`;
+    return;
+  }
+
+  container.innerHTML = lxSourceList.map((item, idx) => {
+    const isActive = item.url === currentUrl;
+    const displayName = escapeHtml(item.name || lxDefaultName(item.url));
+    const safeUrl = escapeHtml(item.url);
+    if (isActive) {
+      return `
+        <div class="lx-item on">
+          <div class="lx-item-main">
+            <div class="lx-item-header">
+              <span class="lx-item-name">${displayName}</span>
+              <span class="lx-badge">已激活</span>
+            </div>
+            <div class="lx-item-url" title="${safeUrl}">${safeUrl}</div>
+          </div>
+        </div>`;
+    }
+    return `
+      <div class="lx-item">
+        <div class="lx-item-main">
+          <div class="lx-item-header">
+            <span class="lx-item-name">${displayName}</span>
+          </div>
+          <div class="lx-item-url" title="${safeUrl}">${safeUrl}</div>
+        </div>
+        <div class="lx-item-btns">
+          <button class="btn small lx-btn-activate" data-idx="${idx}">激活</button>
+          <button class="btn small danger lx-btn-del" data-idx="${idx}">删除</button>
+        </div>
+      </div>`;
+  }).join("");
+
+  container.querySelectorAll(".lx-btn-activate").forEach((btn) => {
+    btn.addEventListener("click", () => activateLxSource(parseInt(btn.dataset.idx, 10)));
+  });
+  container.querySelectorAll(".lx-btn-del").forEach((btn) => {
+    btn.addEventListener("click", () => deleteLxSource(parseInt(btn.dataset.idx, 10)));
+  });
+}
+
+function activateLxSource(idx) {
+  const item = lxSourceList[idx];
+  if (!item) return;
+  $("#lx-url").value = item.url;
+  if ($("#lx-name")) $("#lx-name").value = item.name || "";
+  lxVerifiedUrl = null;
+  renderLxSourceList();
+  syncLxAddButton();
+  markDirty("已切换激活源，需点击下方「保存并生效」");
+  toast(`已激活「${item.name || lxDefaultName(item.url)}」，请点击下方「保存并生效」`, "ok");
+}
+
+function deleteLxSource(idx) {
+  const item = lxSourceList[idx];
+  if (!item) return;
+  const name = item.name || lxDefaultName(item.url);
+  lxSourceList.splice(idx, 1);
+  renderLxSourceList();
+  markDirty("洛雪源列表已修改，需保存后生效");
+  toast(`已删除「${name}」`, "ok");
+}
+
 $("#lx-test").addEventListener("click", async () => {
   const url = $("#lx-url").value.trim();
   const box = $("#lx-report");
@@ -399,6 +522,9 @@ $("#lx-test").addEventListener("click", async () => {
       const meta = d.meta || {};
       const probe = d.probe || {};
       lxVerifiedUrl = url;
+      if (meta.name && $("#lx-name") && !$("#lx-name").value.trim()) {
+        $("#lx-name").value = meta.name;
+      }
       box.className = "report ok";
       box.innerHTML =
         `<div class="kv"><b>源名称</b>${meta.name || "-"} ${meta.version ? "v" + meta.version : ""}（${meta.author || "未知作者"}）</div>` +
@@ -436,9 +562,15 @@ async function lxAfterUpload(r) {
   const d = r.data || {};
   $("#lx-url").value = d.url || "";
   lxVerifiedUrl = null; // 上传地址仍需走一次"测试"
-  $("#lx-upload-note").textContent = d.meta && d.meta.name ? `已上传：${d.meta.name}` : "已上传";
+  const scriptName = (d.meta && d.meta.name) || "";
+  if (scriptName && $("#lx-name") && !$("#lx-name").value.trim()) {
+    $("#lx-name").value = scriptName;
+  }
+  $("#lx-upload-note").textContent = scriptName ? `已上传：${scriptName}` : "已上传";
+  syncLxAddButton();
+  renderLxSourceList();
   markDirty("洛雪源已更新为上传脚本，测试后保存生效");
-  toast("脚本已上传，请点「测试」验证后保存", "ok");
+  toast("脚本已上传，请点「测试」验证或点击「添加」加入列表", "ok");
 }
 
 $("#lx-upload").addEventListener("click", () => $("#lx-file").click());
@@ -507,6 +639,28 @@ async function lxPickFromNas() {
 }
 $("#lx-pick").addEventListener("click", lxPickFromNas);
 
+$("#lx-add").addEventListener("click", () => {
+  const url = ($("#lx-url")?.value || "").trim();
+  if (!url) {
+    toast("请先填写脚本地址或上传 .js 文件", "fail");
+    return;
+  }
+  const nameInput = ($("#lx-name")?.value || "").trim();
+  const name = nameInput || lxDefaultName(url);
+
+  const existingIdx = lxSourceList.findIndex((item) => item.url === url);
+  if (existingIdx >= 0) {
+    lxSourceList[existingIdx].name = name;
+    toast(`已更新列表中该源的名称为「${name}」`, "ok");
+  } else {
+    lxSourceList.push({ name, url });
+    toast(`已添加「${name}」至洛雪源列表`, "ok");
+  }
+  if ($("#lx-name")) $("#lx-name").value = "";
+  renderLxSourceList();
+  markDirty("洛雪源列表已修改，需保存后生效");
+});
+
 (async function detectNasPicker() {
   // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
   const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
@@ -517,10 +671,18 @@ $("#lx-pick").addEventListener("click", lxPickFromNas);
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
+["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
+$("#lx-url").addEventListener("input", () => {
+  syncLxAddButton();
+  renderLxSourceList();
+  markDirty();
+});
+if ($("#lx-name")) {
+  $("#lx-name").addEventListener("input", () => markDirty());
+}
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {

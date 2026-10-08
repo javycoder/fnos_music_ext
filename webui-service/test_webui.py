@@ -701,6 +701,70 @@ def test_netease_my_playlists_defaults_and_saves(env_file):
         assert again.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "true"
 
 
+def test_lx_source_list_schema_and_roundtrip(env_file):
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["LX_SOURCE_LIST"] == "[]"
+        meta = view.json()["schema"]["LX_SOURCE_LIST"]
+        assert meta["kind"] == "str" and meta["reload"] == "hot"
+
+        sources = [
+            {"name": "小蜜蜂源", "url": "https://example.com/bee.js"},
+            {"name": "本地上传'测试'", "url": "file:///data/lxmusic/uploads/local_123.js"},
+        ]
+        import json
+        saved = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps(sources, ensure_ascii=False)}})
+        assert saved.status_code == 200
+        assert "LX_SOURCE_LIST" in saved.json()["changed"]
+        assert saved.json()["actions"] == []
+
+    # 验证 .env 转义与读回一致性
+    content = env_file.read_text(encoding="utf-8")
+    assert "LX_SOURCE_LIST=" in content
+    with authed_client() as client:
+        again = client.get("/api/config")
+        val = again.json()["values"]["LX_SOURCE_LIST"]
+        loaded = json.loads(val)
+        assert len(loaded) == 2
+        assert loaded[0]["name"] == "小蜜蜂源"
+        assert loaded[0]["url"] == "https://example.com/bee.js"
+        assert loaded[1]["name"] == "本地上传'测试'"
+        assert loaded[1]["url"] == "file:///data/lxmusic/uploads/local_123.js"
+
+
+def test_lx_source_list_validation_rejects_bad_json(env_file):
+    with authed_client() as client:
+        bad1 = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": "{not-valid-json"}})
+        assert bad1.status_code == 400
+        assert "不是合法的 JSON" in bad1.json()["error"]
+
+        bad2 = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": '{"not": "a list"}'}})
+        assert bad2.status_code == 400
+        assert "期望 JSON 数组" in bad2.json()["error"]
+
+
+def test_lx_source_list_normalizes_items_and_dedupes(env_file):
+    import json
+    with authed_client() as client:
+        items = [
+            {"name": "源 1\n换行\t制表", "url": "https://a.com/source.js"},
+            {"name": "源 1 重复 URL", "url": "https://a.com/source.js"},  # 同 url 去重
+            {"name": "非法协议", "url": "ftp://bad.com/a.js"},            # 非法协议过滤
+            {"name": "", "url": ""},                                      # 空 url 过滤
+            {"name": "源 2", "url": "https://b.com/source.js"},
+        ]
+        res = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps(items, ensure_ascii=False)}})
+        assert res.status_code == 200
+        again = client.get("/api/config")
+        loaded = json.loads(again.json()["values"]["LX_SOURCE_LIST"])
+        assert len(loaded) == 2
+        assert loaded[0]["name"] == "源 1 换行 制表"
+        assert loaded[0]["url"] == "https://a.com/source.js"
+        assert loaded[1]["name"] == "源 2"
+        assert loaded[1]["url"] == "https://b.com/source.js"
+
+
 # ------------------------------------------------------------------ 网关管理员 ---
 
 def test_api_requires_admin(env_file):
