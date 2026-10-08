@@ -19,6 +19,7 @@ import os
 import re
 import time
 from typing import Any
+import urllib.parse
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -825,28 +826,71 @@ class UploadBody(BaseModel):
     script: str
 
 
+def _lx_source_fs_path(source_id: str) -> str:
+    """lxserver _open 用户源的容器内存储路径（与 lxserver getSourceDir/_open 约定一致）。"""
+    return f"/data/lxserver/users/source/_open/{source_id}"
+
+
+async def _find_lxserver_source(*, by_id: str = "", by_name: str = "", by_url: str = "") -> dict | None:
+    """在 lxserver 已有源列表中查找（按 id / 名称 / 导入 URL 任一命中）。"""
+    try:
+        sources = await LXSERVER.list_custom_sources()
+    except Exception:
+        return None
+    for s in sources:
+        if by_id and str(s.get("id") or "") == by_id:
+            return s
+    for s in sources:
+        name = str(s.get("name") or "")
+        if by_name and (name == by_name or str(s.get("id") or "") == by_name):
+            return s
+        if by_url and str(s.get("sourceUrl") or "") == by_url:
+            return s
+    return None
+
+
 @app.post("/api/v1/source/upload")
 async def source_upload(body: UploadBody):
-    """落盘并导入上传的自定义源脚本。"""
-    # 提取脚本头部元数据
+    """落盘并导入上传的自定义源脚本。
+
+    lxserver 以脚本 @name 生成唯一 id 并落盘到 _open 目录；同一脚本重复上传时
+    lxserver 报"已存在"，此时复用已有源（多源列表场景下再次添加同名脚本是正常操作）。
+    """
+    # 提取脚本头部元数据（lxserver 返回的 metadata 为准，此处作兜底与匹配用）
     match = re.search(r"@name\s+([^\r\n]+)", body.script)
     name = match.group(1).strip() if match else body.filename
 
-    # 上传至 lxserver
     try:
         res = await LXSERVER.upload_custom_source(body.filename, body.script)
     except Exception as exc:
-        return JSONResponse(
-            content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
-            status_code=500,
-        )
+        if "已存在" not in str(exc):
+            return JSONResponse(
+                content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
+                status_code=500,
+            )
+        existing = await _find_lxserver_source(by_name=name)
+        if not existing:
+            return JSONResponse(
+                content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
+                status_code=500,
+            )
+        res = {"id": existing.get("id"), "metadata": {
+            "name": existing.get("name") or name,
+            "version": existing.get("version") or "1.0.0",
+        }}
 
+    source_id = str(res.get("id") or "") or name
+    meta = res.get("metadata") or {}
+    path = _lx_source_fs_path(source_id)
     return {
         "ok": True,
         "data": {
-            "path": f"/data/lxserver/users/source/_open/{body.filename}",
-            "url": f"file:///data/lxserver/users/source/_open/{body.filename}",
-            "meta": {"name": name, "version": "1.0.0"},
+            "path": path,
+            "url": f"file://{path}",
+            "meta": {
+                "name": meta.get("name") or name,
+                "version": meta.get("version") or "1.0.0",
+            },
         },
     }
 
@@ -856,19 +900,64 @@ async def source_set(body: SourceBody):
     """切换激活自定义源。第一期保持单源语义：激活目标源，其余禁用。"""
     url = (body.url or "").strip()
     if not url and body.script:
-        # 直接传入脚本内容：先上传
-        res = await LXSERVER.upload_custom_source("custom_source.js", body.script)
-        url = "custom_source.js"
+        # 直接传入脚本内容：先上传再激活
+        try:
+            res = await LXSERVER.upload_custom_source("custom_source.js", body.script)
+            url = f"file://{_lx_source_fs_path(str(res.get('id') or 'custom_source.js'))}"
+        except Exception as exc:
+            return JSONResponse(
+                content={"ok": False, "error": f"上传脚本失败: {exc}", "category": "download"},
+                status_code=500,
+            )
 
     if not url:
         return _err("url 不能为空", 400)
 
     try:
-        # 如果是 http(s) URL，尝试 import
+        source_id = ""
         if url.startswith(("http://", "https://")):
-            await LXSERVER.import_custom_source(url)
-        # 单源激活：激活此源并禁用其余
-        await LXSERVER.activate_single_source(url)
+            # http(s) URL：交给 lxserver 下载导入；同脚本已导入过则直接复用
+            try:
+                res = await LXSERVER.import_custom_source(url)
+                source_id = str(res.get("id") or "")
+            except Exception as exc:
+                if "已存在" not in str(exc):
+                    raise
+                existing = await _find_lxserver_source(by_url=url)
+                source_id = str((existing or {}).get("id") or "")
+        else:
+            # file:// URL 或裸 id/名称：取最后一段作为 lxserver 源 id（与上传时返回的 id 一致）
+            parsed = urllib.parse.urlparse(url)
+            path_part = urllib.parse.unquote(parsed.path) if parsed.scheme else url
+            source_id = path_part.rsplit("/", 1)[-1]
+            if not await LXSERVER.activate_single_source(source_id):
+                # 列表中无此 id：若本地确有脚本文件（如旧数据卷 /data/lxmusic/uploads），
+                # 自动补导入 lxserver 后激活，保证历史配置可继续使用
+                imported = False
+                if path_part.startswith("/") and os.path.isfile(path_part):
+                    with open(path_part, "r", encoding="utf-8", errors="replace") as f:
+                        script = f.read()
+                    try:
+                        res = await LXSERVER.upload_custom_source(source_id, script)
+                        source_id = str(res.get("id") or "") or source_id
+                        imported = True
+                    except Exception as exc:
+                        if "已存在" not in str(exc):
+                            raise
+                        existing = (
+                            await _find_lxserver_source(by_id=source_id)
+                            or await _find_lxserver_source(by_name=source_id.removesuffix(".js"))
+                        )
+                        if existing:
+                            source_id = str(existing.get("id") or source_id)
+                            imported = True
+                if not imported or not await LXSERVER.activate_single_source(source_id):
+                    return JSONResponse(
+                        content={"ok": False,
+                                 "error": f"未找到要激活的源: {source_id}，请先上传或用测试校验源可用性",
+                                 "category": "runtime"},
+                        status_code=500,
+                    )
     except Exception as exc:
         return JSONResponse(
             content={"ok": False, "error": f"激活源失败: {exc}", "category": "runtime"},

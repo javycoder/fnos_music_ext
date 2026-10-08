@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Sequence
 import urllib.parse
 
@@ -155,21 +156,50 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
     )
 
     temp_filename = f"verify_tmp_{int(time.time())}.js"
+    # lxserver 上传后以脚本 @name 生成唯一 id；已存在同 id 源时复用既有源（测毕还原其启用态）
+    temp_source_id: str | None = None
+    reused_source: dict | None = None
+    reused_was_enabled: bool | None = None
     try:
         # 上传为临时源
-        upload_res = await temp_client.upload_custom_source(temp_filename, script)
+        try:
+            upload_res = await temp_client.upload_custom_source(temp_filename, script)
+            temp_source_id = str(upload_res.get("id") or "") or None
+        except Exception as upload_exc:
+            if "已存在" not in str(upload_exc):
+                report.update(category="internal", message=f"临时源上传失败: {upload_exc}")
+                return report
         # 等待源在沙箱初始化并查询平台
         await asyncio.sleep(1.0)
         sources = await temp_client.list_custom_sources()
         target_src = None
         for s in sources:
-            if s.get("id") == temp_filename or s.get("name") == meta["name"]:
+            if (temp_source_id and s.get("id") == temp_source_id) or s.get("name") == meta["name"]:
                 target_src = s
                 break
+        if target_src is None:
+            report.update(category="internal", message="临时源上传后未在 lxserver 列表中找到")
+            return report
+
+        # lxserver 解析只走 enabled 的源（isSourceSupported 跳过禁用源）：
+        # 新上传的临时源默认禁用，须临时启用；复用既有源时记住原状态，测毕还原
+        if temp_source_id is None:
+            reused_source = target_src
+            reused_was_enabled = bool(target_src.get("enabled"))
+            if not reused_was_enabled:
+                await temp_client.toggle_custom_source(str(target_src.get("id")), True)
+        else:
+            await temp_client.toggle_custom_source(temp_source_id, True)
 
         declared = []
-        if target_src and isinstance(target_src.get("sources"), dict):
-            declared = [normalize_source(k) for k in target_src["sources"].keys()]
+        # lxserver 列表项的平台字段是 supportedSources（数组）
+        raw_platforms = target_src.get("supportedSources") or target_src.get("sources") or []
+        if isinstance(raw_platforms, dict):
+            raw_platforms = list(raw_platforms.keys())
+        for p in raw_platforms:
+            code = normalize_source(str(p))
+            if code and code not in declared:
+                declared.append(code)
         if not declared:
             declared = list(SUPPORTED_PLATFORMS)
 
@@ -246,9 +276,10 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         return report
 
     finally:
-        # 清理临时源
-        try:
-            await temp_client.delete_custom_source(temp_filename)
-        except Exception:
-            pass
+        # 清理临时源（复用的既有源不动）
+        if temp_source_id:
+            try:
+                await temp_client.delete_custom_source(temp_source_id)
+            except Exception:
+                pass
         await temp_client.close()

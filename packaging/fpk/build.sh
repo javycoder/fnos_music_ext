@@ -63,10 +63,12 @@ command -v rsync >/dev/null 2>&1 || {
     exit 1
 }
 
-# 确保 lxserver 预编译包已就绪（内嵌到 fpk 中实现 NAS 用户离线安装）
+# 确保 lxserver 预编译包已在构建缓存就绪（内嵌到 fpk 中实现 NAS 用户离线安装）
+BUILD_CACHE="${FPK_DIR}/.build/cache"
+mkdir -p "${BUILD_CACHE}"
 if [ -x "${REPO_ROOT}/scripts/update_lxserver.sh" ]; then
-    echo "[fpk] 检查并确保 lxserver 预编译包存在..."
-    "${REPO_ROOT}/scripts/update_lxserver.sh" || echo "[WARN] update_lxserver 检查失败，将使用现有本地缓存"
+    echo "[fpk] 检查构建缓存中的 lxserver 预编译包..."
+    "${REPO_ROOT}/scripts/update_lxserver.sh" "" "${BUILD_CACHE}" || echo "[WARN] 缓存预编译包检查失败"
 fi
 
 # ------------------------------------------------------------------------------
@@ -93,6 +95,18 @@ rsync -a --delete \
     --exclude='online_favorites/' --exclude='online_favorites.json' \
     --exclude='*.fpk' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
+
+# 注入预编译包至打包 staging 目录，实现 fpk 离线内嵌而不污染源码树
+if [ -f "${REPO_ROOT}/container/lxserver.version" ]; then
+    # shellcheck disable=SC1090
+    source "${REPO_ROOT}/container/lxserver.version"
+    CACHED_ZIP="${BUILD_CACHE}/${LXSERVER_ZIP_NAME:-}"
+    if [ -f "${CACHED_ZIP}" ]; then
+        mkdir -p "${STAGE}/app/repo/container/lxserver-artifact"
+        cp -p "${CACHED_ZIP}" "${STAGE}/app/repo/container/lxserver-artifact/"
+        echo "[fpk] 已将离线预编译包注入至打包目标目录: ${LXSERVER_ZIP_NAME}"
+    fi
+fi
 
 # 应用骨架。fnpack 要求 manifest 版本为 x.y.z[-r]（r 为整数修订号）；自动
 # 迭代测试构建在 VERSION/文件名上带字母后缀（如 2.2.9a），manifest 只落基础

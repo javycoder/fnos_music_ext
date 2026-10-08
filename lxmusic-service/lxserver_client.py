@@ -410,39 +410,52 @@ class LxServerClient:
         return []
 
     async def import_custom_source(self, url: str) -> dict:
-        """从 URL 导入自定义源。"""
+        """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。"""
         client = await self.get_client()
         resp = await client.post("/api/custom-source/import", json={"url": url}, timeout=self.timeout)
-        if resp.status_code == 200:
-            return resp.json()
-        return {"ok": False, "error": resp.text}
+        data = self._parse_admin_resp(resp, "导入自定义源")
+        return data
 
     async def upload_custom_source(self, filename: str, script_content: str) -> dict:
-        """上传自定义源脚本文本。"""
+        """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。"""
         client = await self.get_client()
-        # lxserver 的 upload 支持 multipart 或 json
-        # 优先使用 json 接口或构造 multipart
-        files = {"file": (filename, script_content.encode("utf-8"), "application/javascript")}
-        resp = await client.post("/api/custom-source/upload", files=files, timeout=self.timeout)
-        if resp.status_code == 200:
-            return resp.json()
-        return {"ok": False, "error": resp.text}
+        resp = await client.post(
+            "/api/custom-source/upload",
+            json={"filename": filename, "content": script_content},
+            timeout=self.timeout,
+        )
+        return self._parse_admin_resp(resp, "上传自定义源")
 
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
-        """启用或禁用某音源。"""
+        """启用或禁用某音源（lxserver 端点键名为 enabled）。"""
         client = await self.get_client()
         resp = await client.post(
             "/api/custom-source/toggle",
-            json={"id": source_id, "enable": enable},
+            json={"id": source_id, "enabled": bool(enable)},
             timeout=self.timeout,
         )
-        return resp.status_code == 200
+        data = self._parse_admin_resp(resp, f"切换自定义源 {source_id}")
+        return bool(data.get("success", True))
 
     async def delete_custom_source(self, source_id: str) -> bool:
         """删除某音源。"""
         client = await self.get_client()
         resp = await client.post("/api/custom-source/delete", json={"id": source_id}, timeout=self.timeout)
-        return resp.status_code == 200
+        data = self._parse_admin_resp(resp, f"删除自定义源 {source_id}")
+        return bool(data.get("success", True))
+
+    @staticmethod
+    def _parse_admin_resp(resp: httpx.Response, action: str) -> dict:
+        """lxserver 管理端点约定：HTTP 200 + {success: true} 才算成功，
+        失败时（HTTP 500/403 或 success=false）抛 RuntimeError 带服务端错误文案。"""
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if resp.status_code == 200 and data.get("success") is not False:
+            return data
+        message = data.get("error") or data.get("message") or f"{action}失败 (HTTP {resp.status_code})"
+        raise RuntimeError(message)
 
     async def activate_single_source(self, target_id_or_name: str) -> bool:
         """单源激活语义：只启用 target，禁用其余所有源。"""
