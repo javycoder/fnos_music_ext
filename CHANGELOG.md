@@ -19,6 +19,10 @@
   5. **配置与 WebUI**：新增「搜索」页开关 **搜索深分页**（`FNMUSIC_SEARCH_DEEP_PAGE`，默认开）与 **深分页页数上限**（1-50），均热生效；总开关关闭后行为与旧版完全一致（在线只显示首屏部分）。
   6. **测试**：新增用户场景逐页构成（30 本地 + size 50）、开关关闭、单页不分页、lx page 透传、musicbox offset 透传等用例，`proxy/tests` 548 项全绿；`scripts/e2e_check.sh` 增加 page=3 三页零重复实机校验。
 
+### 修复
+
+- **本地歌曲封面直读官方封面目录（解决本地歌曲封面显示为占位图问题）**：官方列表接口下发的 `coverId` 为封面资源的唯一 guid（`track.cover_guid`，形如 `track_<32hex>`），而非曲目自身的 `guid`。在静态封面端点（`/music/api/v1/static/cover`）新增本地封面直读快速路径：自动探测飞牛系统官方封面根目录（`/vol*/@appmeta/trim.music/cover/{track,album,artist,playlist}/`，支持 `FNMUSIC_COVER_DIR` 自定义配置），命中即直接按魔数嗅探（JPEG/PNG/WebP）返回 `FileResponse`，并支持客户端 `size` 参数优先返回官方缩略图；未命中时平滑落回官方上游 UDS 透传，避开 UDS 请求与鉴权开销，彻底解决接管后本地歌曲封面异常回退占位图的问题。
+
 ## [2.6.3] - 2026-09-30
 
 ### 修复

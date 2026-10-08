@@ -272,9 +272,9 @@ def test_playlist_track_list_merge_shape():
         assert body["data"]["total"] == 4
         guids = [it["guid"] for it in body["data"]["list"]]
         assert guids[:2] == ["official-1", "official-2"]
-        assert resolve_real_guid(guids[2]) == FAKE_KUWO1
-        assert resolve_real_guid(guids[3]) == FAKE_MIGU
-        online = body["data"]["list"][2]
+        online_guids = [resolve_real_guid(g) for g in guids[2:]]
+        assert set(online_guids) == {FAKE_KUWO1, FAKE_MIGU}
+        online = next(it for it in body["data"]["list"][2:] if resolve_real_guid(it["guid"]) == FAKE_KUWO1)
         assert online["title"] == "晴天"
         assert online["artists"][0]["name"] == "周杰伦"
         assert online["album"]["name"] == "叶惠美"

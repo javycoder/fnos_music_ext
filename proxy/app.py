@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import hashlib
 import math
 import json
@@ -31,7 +32,7 @@ from uuid import uuid4
 import httpx
 import anyio
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
@@ -105,6 +106,7 @@ CONF = {
     "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
+    "cover_dir": os.environ.get("FNMUSIC_COVER_DIR", ""),
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
@@ -492,6 +494,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
+    "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
@@ -5654,12 +5657,91 @@ def _placeholder_cover_response(guid: str) -> Response:
     )
 
 
+_OFFICIAL_COVER_ROOT_CACHE: str | None = None
+_OFFICIAL_COVER_MIME_CACHE: dict[str, str] = {}
+
+
+def _official_cover_root() -> str | None:
+    """获取飞牛官方封面根目录。优先读取配置/环境变量，否则自动探测 /vol*/@appmeta 目录。"""
+    configured = (os.environ.get("FNMUSIC_COVER_DIR") or CONF.get("cover_dir") or "").strip()
+    if configured:
+        if os.path.isdir(configured):
+            return configured
+        return None
+    global _OFFICIAL_COVER_ROOT_CACHE
+    if _OFFICIAL_COVER_ROOT_CACHE and os.path.isdir(_OFFICIAL_COVER_ROOT_CACHE):
+        return _OFFICIAL_COVER_ROOT_CACHE
+    candidates = sorted(glob.glob("/vol*/@appmeta/trim.music/cover"))
+    candidates.extend([
+        "/usr/local/apps/@appmeta/trim.music/cover",
+        "/usr/local/apps/@appdata/trim.music/cover",
+    ])
+    for cand in candidates:
+        if os.path.isdir(cand):
+            _OFFICIAL_COVER_ROOT_CACHE = cand
+            return cand
+    return None
+
+
+def _official_cover_file_response(cover_id: str, size: str | None = None) -> Response | None:
+    """按官方封面资源 guid 直读官方封面文件。
+    官方 coverId 格式多为 track_<32hex> 或裸 <32hex>（资源 guid 即 track.cover_guid）。
+    若存在对应文件直接返回 FileResponse，支持根据 size 参数优先返回缩略图。
+    """
+    raw_id = str(cover_id or "").strip()
+    for prefix in ("track_", "album_", "artist_", "playlist_"):
+        if raw_id.startswith(prefix):
+            raw_id = raw_id[len(prefix):]
+            break
+    if not re.fullmatch(r"[0-9a-f]{32}", raw_id, re.IGNORECASE):
+        return None
+    gid = raw_id.lower()
+    root = _official_cover_root()
+    if not root:
+        return None
+
+    size_str = str(size or "").strip()
+    candidate_names: list[str] = []
+    if size_str.isdigit():
+        candidate_names.append(f"{gid}_w{size_str}.jpg")
+    candidate_names.append(gid)
+
+    for sub in ("track", "album", "artist", "playlist"):
+        for fname in candidate_names:
+            fpath = os.path.join(root, sub, gid[:2], fname)
+            if os.path.isfile(fpath):
+                mime = _OFFICIAL_COVER_MIME_CACHE.get(fname)
+                if not mime:
+                    try:
+                        with open(fpath, "rb") as f:
+                            head = f.read(16)
+                        mime = _sniff_image_mime(head) or "image/jpeg"
+                        if len(_OFFICIAL_COVER_MIME_CACHE) > 4096:
+                            _OFFICIAL_COVER_MIME_CACHE.clear()
+                        _OFFICIAL_COVER_MIME_CACHE[fname] = mime
+                    except OSError:
+                        mime = "image/jpeg"
+                return FileResponse(
+                    fpath,
+                    media_type=mime,
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        "ETag": f'"{gid}"',
+                    },
+                )
+    return None
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
+    if not guid and subpath:
+        cand = subpath.strip("/").split("/")[-1]
+        if cand:
+            guid = resolve_real_guid(cand)
     playlist_kind = dailyrec.online_playlist_kind(guid)
     if playlist_kind:
         upstream_client = get_upstream_client(request.app)
@@ -5673,6 +5755,9 @@ async def static_cover(request: Request, subpath: str = ""):
         if not is_online_guid(picked_guid):
             cover_id = str((picked or {}).get("coverId") or "")
             if picked and cover_id and not is_online_guid(cover_id):
+                local_resp = _official_cover_file_response(cover_id, size=request.query_params.get("size"))
+                if local_resp is not None:
+                    return local_resp
                 # 本地曲目封面：coverId 是真实官方封面 guid，透传官方静态封面端点
                 upstream_client = get_upstream_client(request.app)
                 headers = copy_incoming_headers(request)
@@ -5707,6 +5792,9 @@ async def static_cover(request: Request, subpath: str = ""):
             return RedirectResponse(cover, status_code=302)
         return Response(status_code=404)
     if not is_online_guid(guid):
+        local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
+        if local_resp is not None:
+            return local_resp
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
