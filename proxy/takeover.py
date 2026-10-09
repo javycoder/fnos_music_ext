@@ -772,10 +772,13 @@ def lock_holders(path='/run/fnmusic-ext-install/operation.lock'):
 DEPLOYMENT_FILE = Path('/var/lib/fnmusic-ext/deployment')
 
 
-def deployment_remember(base):
+def deployment_remember(base, deploy_mode=None):
     """Record this checkout as the active deployment (requires root)."""
     record = {'base': str(Path(base).resolve()),
               'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    if deploy_mode:
+        # docker | native（v2.8.0a+ 原生形态）；旧记录无此字段，按 docker 理解
+        record['deploy_mode'] = deploy_mode
     DEPLOYMENT_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     # Explicit chmod: the install chain may run under `umask 077` (install.sh
     # protects .env writes), which would silently tighten a fresh mkdir to
@@ -838,6 +841,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=30)
     parser.add_argument('--lock-file', default='/run/fnmusic-ext-install/operation.lock',
                         help='lock path for lock-holders (testing)')
+    parser.add_argument('--deploy-mode', choices=['docker', 'native'], default=None,
+                        help='deployment form recorded by deployment-remember')
     args = parser.parse_args()
     state = State(args.target, args.upstream, args.state_dir)
     try:
@@ -846,7 +851,7 @@ def main():
         elif args.command == 'lock-holders':
             lock_holders(args.lock_file)
         elif args.command == 'deployment-remember':
-            deployment_remember(args.base)
+            deployment_remember(args.base, args.deploy_mode)
         elif args.command == 'deployment-check':
             conflict = deployment_conflict(args.base)
             if conflict:

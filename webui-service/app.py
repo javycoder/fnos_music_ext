@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -149,7 +150,9 @@ def write_env(updates: dict[str, str]) -> list[str]:
 # ------------------------------------------------------------------ supervisor --
 
 def supervisorctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
-    cmd = [CONF["supervisorctl"], *args]
+    # WEBUI_SUPERVISORCTL 可携带参数（如 "supervisorctl -c /path/supervisord.conf"），
+    # 按 shell 词法拆分；默认裸 "supervisorctl" 拆分后行为不变。
+    cmd = shlex.split(CONF["supervisorctl"]) + list(args)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:

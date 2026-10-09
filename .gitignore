@@ -3,6 +3,9 @@
 .venv-research/
 .venv-musicdl/
 .venv-musicbox/
+.venv-sources/
+.lxserver/
+sources-native/
 musicbox-data/
 sources-data/
 cache/

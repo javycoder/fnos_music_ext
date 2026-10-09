@@ -155,6 +155,15 @@ is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
 is_enabled "${FNMUSIC_NETEASE_ENABLED:-true}" && ENABLE_MUSICBOX=1
 is_enabled "${FNMUSIC_LX_ENABLED:-false}" && ENABLE_LX=1
 is_enabled "${FNMUSIC_WEBUI_ENABLED:-false}" && ENABLE_WEBUI=1
+# 部署形态（v2.8.0a+）：docker（默认，单容器）| native（宿主机 systemd + supervisord）
+DEPLOY_MODE="${FNMUSIC_DEPLOY_MODE:-docker}"
+case "${DEPLOY_MODE}" in
+    docker|native) : ;;
+    *)
+        log_err ".env 的 FNMUSIC_DEPLOY_MODE 仅支持 docker 或 native: ${DEPLOY_MODE}"
+        exit 1
+        ;;
+esac
 if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_LX}" -eq 0 ]; then
     log_err "至少需要启用一个音源（FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED）。"
     exit 1
@@ -453,12 +462,14 @@ if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
     exit 1
 fi
 
-# 1.4 检查 / 自动拉起单容器 fnmusic-sources（v2.0.0 仅 Docker 部署，entrypoint 按需加载）
+# 1.4 检查 / 自动拉起音源服务（形态分派：docker=单容器 fnmusic-sources；native=宿主机 unit）
 CONTAINER_NAME="fnmusic-sources"
-if ! command -v docker >/dev/null 2>&1 || ! run_docker info >/dev/null 2>&1; then
-    log_err "【缺少组件】v2.0.0 仅支持 Docker 部署，但当前 Docker 不可用。"
-    log_err "请先在 fnOS 应用中心安装 Docker 后重试。"
-    exit 1
+if [ "${DEPLOY_MODE}" = "docker" ]; then
+    if ! command -v docker >/dev/null 2>&1 || ! run_docker info >/dev/null 2>&1; then
+        log_err "【缺少组件】Docker 不可用（.env 指定 Docker 部署）。"
+        log_err "如本机无 Docker，请改用原生模式：./install.sh --deploy native --adopt"
+        exit 1
+    fi
 fi
 
 # v1.x 直接 git pull 后运行本脚本的兜底：迁移旧数据目录 musicbox-data -> sources-data
@@ -471,7 +482,10 @@ mkdir -p "${BASE_DIR}/sources-data/cache/netease-musicbox" \
     "${BASE_DIR}/sources-data/netease-musicbox" \
     "${BASE_DIR}/sources-data/lxmusic"
 # 数据卷权限收紧：属主对齐容器 appuser（uid 1000），group/other 全收（凭据防本机其他用户读取）
-chown -R 1000:1000 "${BASE_DIR}/sources-data" 2>/dev/null || true
+# 原生模式以 root 运行音源，不做 uid 对齐（目录布局两形态共用，切换时由 install 重新对齐）
+if [ "${DEPLOY_MODE}" = "docker" ]; then
+    chown -R 1000:1000 "${BASE_DIR}/sources-data" 2>/dev/null || true
+fi
 find "${BASE_DIR}/sources-data" -type d -exec chmod 0700 {} + 2>/dev/null || true
 find "${BASE_DIR}/sources-data" -type f -exec chmod 0600 {} + 2>/dev/null || true
 
@@ -491,6 +505,41 @@ if [ "${ENABLE_MUSICDL}" -eq 1 ] && ! source_healthy "${MUSICDL_URL}"; then need
 if [ "${ENABLE_MUSICBOX}" -eq 1 ] && ! source_healthy "${MUSICBOX_URL}"; then need_start=1; fi
 if [ "${ENABLE_LX}" -eq 1 ] && ! source_healthy "${LX_URL}"; then need_start=1; fi
 if [ "${ENABLE_WEBUI}" -eq 1 ] && ! source_healthy "http://127.0.0.1:8774"; then need_start=1; fi
+
+# --- 原生形态：确保 unit 已安装、运行时依赖齐备，并按需重启对齐代码/.env ---
+ensure_native_sources() {
+    local unit_file="/etc/systemd/system/${NATIVE_UNIT_NAME}.service"
+    if ! native_unit_installed_owned; then
+        if [ -f "${unit_file}" ]; then
+            log_err "原生音源 unit 属于其他目录 $(unit_working_dir "${unit_file}")，拒绝接管。"
+            log_err "如需迁移请加 --adopt 重跑: ./install.sh --deploy native"
+        else
+            log_err "原生音源 unit 未安装（native 部署形态要求先完成安装）。"
+            log_err "请执行: ./install.sh --deploy native"
+        fi
+        exit 1
+    fi
+    # 升级自愈：依赖补齐（requirements 演进）与 lxserver 版本推进均幂等
+    PIP_INDEX="${FNMUSIC_PIP_INDEX:-${PIP_INDEX:-}}" FNMUSIC_APT_MIRROR="${FNMUSIC_APT_MIRROR:-}" \
+        bash "${BASE_DIR}/ensure_sources_native.sh"
+    render_native_supervisor_conf
+    if [ "${need_start}" -eq 0 ] && systemctl is-active --quiet "${NATIVE_UNIT_NAME}.service" 2>/dev/null; then
+        if env_newer_than_native_unit || native_code_or_env_newer; then
+            log_info "检测到 .env 或服务代码更新，重启原生音源服务..."
+            sudo systemctl restart "${NATIVE_UNIT_NAME}.service"
+        else
+            log_info "原生音源服务已就绪（按需加载：仅所选音源进程驻留内存）。"
+        fi
+    else
+        log_info "音源服务未全部就绪，重启原生音源服务 ${NATIVE_UNIT_NAME}.service..."
+        sudo systemctl restart "${NATIVE_UNIT_NAME}.service"
+    fi
+}
+
+# 部署形态分派：native 走宿主机 unit；docker 分支与 v2.7.0 行为一致
+if [ "${DEPLOY_MODE}" = "native" ]; then
+    ensure_native_sources
+else
 
 # 构建并确保容器与当前代码同步。compose up -d --build 幂等：镜像与配置均未变时
 # 不动运行中的容器（仅秒级缓存校验）；镜像有变（git pull 升级后）则自动换新容器。
@@ -547,6 +596,7 @@ else
     # compose 对配置未变的运行中容器不会重启：手动 restart 让 entrypoint 按最新 .env 重选进程集
     run_docker restart "${CONTAINER_NAME}" || exit 1
 fi
+fi
 
 wait_source() {
     local name="$1" url="$2" tries="${3:-60}"
@@ -555,7 +605,11 @@ wait_source() {
         return 0
     fi
     log_err "等待 ${name} healthz 超时 (${url}/healthz)"
-    diagnose_sources_container "${CONTAINER_NAME}"
+    if [ "${DEPLOY_MODE}" = "native" ]; then
+        diagnose_native
+    else
+        diagnose_sources_container "${CONTAINER_NAME}"
+    fi
     return 1
 }
 
@@ -627,7 +681,7 @@ elif takeover ready --timeout 5; then
     if verify_acceptance; then
         # This checkout is the live deployment; refresh the machine-wide
         # registry so a second checkout cannot silently take over later.
-        takeover deployment-remember --base "${BASE_DIR}" || true
+        takeover deployment-remember --base "${BASE_DIR}" --deploy-mode "${DEPLOY_MODE:-docker}" || true
         log_info "============================================================"
         log_info "fnmusic-ext 当前已处于扩展态且运行正常，无需重复操作！"
         log_info "============================================================"
@@ -682,7 +736,7 @@ log_info "============================================================"
 trap - ERR INT TERM
 # Deployment registry: mark this checkout as the machine-wide deployment so
 # a second checkout cannot silently steal the unit/containers/lock later.
-takeover deployment-remember --base "${BASE_DIR}" || true
+takeover deployment-remember --base "${BASE_DIR}" --deploy-mode "${DEPLOY_MODE:-docker}" || true
 log_info "fnmusic-ext v${FNMUSIC_VERSION} 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
 log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"
