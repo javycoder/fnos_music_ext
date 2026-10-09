@@ -169,9 +169,12 @@ CONF = {
     ),
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
-    # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order）；
+    # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order，只影响在线取源）；
     # 推荐双开关 / 封面补全 / .env 热重载默认开，均可被 .env 覆盖
     "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
+    # App 下载档（2.8.0）：app=跟随 App 显式请求，未知/缺省一律原文件（不擅自有损
+    # 转码）；original=强制原文件；standard=强制 MP3 320k（官方"标准"档语义）
+    "dl_quality": (os.environ.get("FNMUSIC_DL_QUALITY") or "app").strip().lower(),
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
@@ -487,6 +490,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
+    "FNMUSIC_DL_QUALITY": ("dl_quality", "dl_quality"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
@@ -543,6 +547,8 @@ def _env_watch_parse(raw: str, kind: str):
             return None
     if kind == "quality_mode":
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
+    if kind == "dl_quality":
+        return raw.lower() if raw.lower() in ("app", "original", "standard") else None
     if kind == "lx_sources":
         return _normalize_lx_sources(raw)
     if kind == "llm_url":
@@ -5153,11 +5159,13 @@ async def track_transcode(request: Request):
 #   prepare POST {trackGUID, quality}  → data{status:"success", errno, errmsg, downloadId}
 #   status  GET ?downloadId=           → data{status:"waiting|transcoding|ready|failed",
 #                                             errno, errmsg, downloadId, percent}
-#   file    GET ?downloadId=           → 音频字节（audio/mpeg，支持断点）
+#   file    GET ?downloadId=           → 音频字节（支持断点，Content-Type 按扩展名）
 #   delete  POST {downloadId}          → data{downloadId, deleted:true}
-# 官方"标准"档 = MP3 320kbps（FLAC 源实测 320067bps）；源已是 mp3 时直接供原文件
-# 不做无意义重编码。官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当
-# guid 是在线曲目才接管，本地曲目与未知 downloadId 一律透传官方。
+# 档位（2.8.0 修复"FLAC 下载变 MP3"）：只有 App 显式请求"标准"档（standard 词表）
+# 才交 MP3 320k；未知档位词与缺省一律交付原文件——2.6.3-2.7.0 缺省=standard，
+# App 无损偏好下发的 quality 值落到缺省被擅自转码。dl_quality 可整体强制覆盖。
+# 官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当 guid 是在线曲目才接管，
+# 本地曲目与未知 downloadId 一律透传官方。
 _DL_TASKS: dict[str, dict] = {}
 _DL_TASK_TTL_S = 3600.0
 _DL_TRANSCODE_SUBDIR = "dltrans"
@@ -5165,6 +5173,28 @@ _DL_TRANSCODE_SUBDIR = "dltrans"
 
 def _dl_transcode_path(guid: str) -> str:
     return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.mp3")
+
+
+# App 请求词命中才算显式要"标准"档（MP3 320k）；其余一律按原始档交付
+_DL_STANDARD_WORDS = ("standard", "std", "mp3", "标准")
+
+
+def _dl_effective_quality(raw_quality: str, is_original: bool) -> str:
+    """下载交付档位：original=原文件，standard=MP3 320k。
+
+    2.6.3-2.7.0 的词表只认 ("original","standard") 且缺省=standard，App 无损
+    偏好下发的 quality 值落到缺省，FLAC 被擅自转成 MP3（用户反馈的下载变
+    MP3）。现缺省跟随 App：standard 词表命中才转码，未知/缺省一律原文件；
+    dl_quality=original|standard 可整体强制覆盖（热重载）。
+    """
+    mode = str(CONF.get("dl_quality") or "app").strip().lower()
+    if mode in ("original", "standard"):
+        return mode
+    if is_original:
+        return "original"
+    if str(raw_quality or "").strip().lower() in _DL_STANDARD_WORDS:
+        return "standard"
+    return "original"
 
 
 def _dl_sweep() -> None:
@@ -5291,14 +5321,16 @@ async def dl_transcode_prepare(request: Request):
     guid = resolve_real_guid(raw_guid)
     if not is_online_guid(guid):
         return await _dl_forward(request)
-    quality = "standard"
+    quality = ""
     for key in ("quality", "qualityType"):
-        value = str(body.get(key) or request.query_params.get(key) or "").lower()
-        if value in ("original", "standard"):
+        value = str(body.get(key) or request.query_params.get(key) or "").strip()
+        if value:
             quality = value
             break
-    if body.get("isOriginal") is True:
-        quality = "original"
+    is_original = str(body.get("isOriginal") or "").strip().lower() in ("true", "1")
+    effective = _dl_effective_quality(quality, is_original)
+    logger.info("[dl] prepare guid=%s q=%s -> %s", raw_guid or guid, quality or "-", effective)
+    quality = effective
     _dl_sweep()
     download_id = uuid4().hex
     task = {"guid": guid, "quality": quality, "state": "waiting", "percent": 0,
@@ -5334,7 +5366,8 @@ async def dl_transcode_file(request: Request):
     path = task.get("path")
     if task["state"] != "completed" or not path or not os.path.isfile(path):
         return JSONResponse(content={"code": 404, "msg": "not ready", "data": None}, status_code=404)
-    media = "audio/mpeg" if os.path.splitext(path)[1].lower() == ".mp3" else "audio/mp4"
+    # 转码产物固定 .mp3；原始档按真实扩展名交付（flac 不再错标 audio/mp4）
+    media = media_type_for_ext(os.path.splitext(path)[1].lstrip("."))
     fname = os.path.basename(path)
     fn_ext = os.path.splitext(fname)[1]
     quoted = quote(fname, encoding="utf-8")

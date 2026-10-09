@@ -114,6 +114,8 @@ function applyConfigToForm() {
   if (provider === "musicbox") syncNeteaseAccount();
   const quality = v.FNMUSIC_QUALITY_MODE || "high";
   $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
+  const dlQuality = v.FNMUSIC_DL_QUALITY || "app";
+  $$("input[name=dl-quality]").forEach((el) => { el.checked = el.value === dlQuality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
@@ -167,6 +169,7 @@ function collectConfig() {
     FNMUSIC_NETEASE_ENABLED: provider === "musicbox",
     FNMUSIC_LX_ENABLED: provider === "lxmusic",
     FNMUSIC_QUALITY_MODE: ($$("input[name=quality]").find((el) => el.checked) || {}).value || "high",
+    FNMUSIC_DL_QUALITY: ($$("input[name=dl-quality]").find((el) => el.checked) || {}).value || "app",
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
@@ -682,6 +685,7 @@ if ($("#lx-name")) {
   $("#lx-name").addEventListener("input", () => markDirty());
 }
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
+$$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("下载音质需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 

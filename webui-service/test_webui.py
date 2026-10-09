@@ -99,6 +99,8 @@ def test_config_view_merges_defaults(env_file):
         assert rj["values"]["FNMUSIC_LLM_MODEL"] == "gpt-4o-mini"  # 缺省补齐
         assert "CUSTOM_KEY" not in rj["values"]  # 非管理键不进视图
         assert rj["schema"]["FNMUSIC_QUALITY_MODE"]["values"] == ["high", "balanced", "smooth"]
+        assert rj["schema"]["FNMUSIC_DL_QUALITY"]["values"] == ["app", "original", "standard"]
+        assert rj["schema"]["FNMUSIC_DL_QUALITY"]["default"] == "app"
 
 
 # ------------------------------------------------------------------ PUT 校验 ---
@@ -113,6 +115,8 @@ def test_put_rejects_unknown_key(env_file):
 def test_put_rejects_bad_enum(env_file):
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "ultra"}})
+        assert r.status_code == 400
+        r = client.put("/api/config", json={"values": {"FNMUSIC_DL_QUALITY": "lossless"}})
         assert r.status_code == 400
 
 
