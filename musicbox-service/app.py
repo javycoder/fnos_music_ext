@@ -18,6 +18,7 @@ from netease_ext import (
     playlist_track_ids,
     reset_api,
     search_web_fallback,
+    song_detail_raw,
     song_lyric_pair,
     user_playlists as fetch_user_playlists,
 )
@@ -204,6 +205,11 @@ def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh")):
 
 @app.get("/api/v1/song/{song_id}/info")
 def song_info(song_id: int = Path(..., ge=1)):
+    # 进程内直取优先（毫秒级）：CLI 子进程冷启动常超代理侧 4s 预算，导致
+    # 封面/时长主路径超时回落。异常或空结果再降级 CLI 兜底。
+    raw = song_detail_raw(song_id)
+    if raw is not None:
+        return {"ok": True, "data": raw}
     return exec_musicbox(["song", "info", str(song_id), "--json"])
 
 
@@ -269,7 +275,11 @@ def _cli_error_or_raise(exc: UpstreamException) -> Any:
 
 
 def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
-    """CLI 推荐输出 -> 批量详情 + 可播过滤（未登录剔除 VIP/试听片段）。"""
+    """CLI 推荐输出 -> 批量详情 + 可播过滤（未登录剔除 VIP/试听片段）。
+
+    2.8.0 起批量详情不再内联可播过滤（封面与可播性解耦），推荐行的可播
+    过滤在此显式执行——推荐是可播列表用途，与纯展示封面不同。
+    """
     ids: list[int] = []
     if isinstance(rows, list):
         for it in rows:
@@ -281,7 +291,9 @@ def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
                 sid = 0
             if sid > 0:
                 ids.append(sid)
-    return batch_song_details(ids[:100])[:limit]
+    hydrated = batch_song_details(ids[:100])
+    playable = filter_playable_song_ids([int(row["song_id"]) for row in hydrated])
+    return [row for row in hydrated if int(row["song_id"]) in playable][:limit]
 
 
 @app.get("/api/v1/recommend/songs")

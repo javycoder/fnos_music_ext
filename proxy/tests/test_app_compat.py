@@ -318,6 +318,9 @@ def test_safe_child_log_allows_request_log_and_degrade():
         "tee finalize rejected corrupt lossless for online:kuwo:9",
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "Background full fetch failed for online:kuwo:9: RuntimeError",
+        # 2.8.0 边听边存写盘失败（弃件不停流）需可观测，与上游断流可区分
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "tee disk write failed for online:kuwo:9: OSError",
     ):
         assert safe_child_log(line) is not None
 

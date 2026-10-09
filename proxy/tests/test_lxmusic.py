@@ -327,7 +327,7 @@ def test_stream_track_lx_retry_passes_fresh_url(monkeypatch):
 
     opened_fresh: "list[bool]" = []
 
-    async def fake_open(request, guid, range_header, force_mp3=False, fresh_url=False):
+    async def fake_open(request, guid, range_header, force_mp3=False, fresh_url=False, refresh=False):
         opened_fresh.append(fresh_url)
         return None
 
