@@ -1232,8 +1232,8 @@ migrate_lx_url_between_modes() {
     else
         case "${current}" in
             file://${BASE_DIR}/sources-data/lxmusic/uploads/*)
-                fs_target="file:///data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
-                target="${fs_target}"
+                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
+                target="file:///data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
                 ;;
             *) return 0 ;;
         esac

@@ -776,3 +776,39 @@ async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cach
 
 
 
+
+@pytest.mark.asyncio
+async def test_url_inflight_cancelled_leader_does_not_cancel_follower(monkeypatch, fresh_url_cache):
+    started = asyncio.Event()
+    async def resolve(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(lxapp, "resolve_and_probe", resolve)
+    item = {"id": "lx:kw:cancel", "lx_source": "kw"}
+    leader = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item, "lossless", 20))
+    await started.wait()
+    follower = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item, "lossless", 20))
+    await asyncio.sleep(0)
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    with pytest.raises(RuntimeError, match="leader cancelled"):
+        await follower
+    assert not follower.cancelled()
+    assert not lxapp._URL_INFLIGHT
+
+
+def test_source_deactivate_filename_differs_from_name(test_app_client, fake_lx, tmp_path, monkeypatch):
+    script = tmp_path / "local.js"
+    script.write_text("/**\n * @name Real Source\n */")
+    calls = []
+    async def enabled(source_id, value):
+        calls.append((source_id, value))
+        return source_id == "real-id"
+    async def find(**kwargs):
+        return {"id": "real-id"} if kwargs.get("by_name") == "Real Source" else None
+    monkeypatch.setattr(lxapp.LXSERVER, "set_source_enabled", enabled)
+    monkeypatch.setattr(lxapp, "_find_lxserver_source", find)
+    r = test_app_client.post("/api/v1/source", json={"url": script.as_uri(), "enabled": False})
+    assert r.status_code == 200, r.text
+    assert ("real-id", False) in calls

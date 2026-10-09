@@ -192,12 +192,13 @@ def search(
 
 
 @app.get("/api/v1/song/{song_id}/url")
-def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh")):
+def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0)):
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
     # 进程内复用常驻实例解析（毫秒级，免 CLI 子进程冷启动）；失败再降级 CLI
-    # 兜底，保留 not_logged_in 等结构化错误语义
-    item = get_song_url(song_id, quality)
+    # 兜底，保留 not_logged_in 等结构化错误语义。fresh=1 旁路进程内取链缓存：
+    # 代理确认钉链失效后的强制重解析必须拿到新链，不能命中同一条死链
+    item = get_song_url(song_id, quality, fresh=bool(fresh))
     if item is not None:
         return {"ok": True, "data": item}
     return exec_musicbox(["song", "url", str(song_id), "--quality", quality, "--json"])

@@ -348,6 +348,7 @@ async def test_resolve_netease_url_pin_reuse_refresh_drop():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
+        assert request.url.params.get("fresh") == "1"
         return httpx.Response(200, json={"ok": True, "data": {
             "code": 200, "url": f"http://audio.test/{calls['n']}.flac", "expi": 1200,
         }})
@@ -1306,3 +1307,17 @@ def test_search_musicbox_only_skips_musicdl(monkeypatch):
         assert len(items) == 1
         assert items[0]["guid"] == fake_official_guid("online:netease:228908")
         assert called["musicdl"] == 0
+
+
+def test_netease_pin_hard_capacity(monkeypatch):
+    import importlib
+    proxy_app = importlib.import_module("proxy.app")
+    monkeypatch.setattr(proxy_app, "_NETEASE_URL_PIN_MAX", 2)
+    proxy_app._NETEASE_URL_PIN.clear()
+    try:
+        for i in range(5):
+            proxy_app._netease_url_pin_store(str(i), "https://media.test/song", 300)
+        assert len(proxy_app._NETEASE_URL_PIN) == 2
+        assert "4" in proxy_app._NETEASE_URL_PIN
+    finally:
+        proxy_app._NETEASE_URL_PIN.clear()

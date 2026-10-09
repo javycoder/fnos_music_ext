@@ -134,7 +134,7 @@ fi
 # shellcheck disable=SC1090
 . "${LXSERVER_VERSION_FILE}"
 LXSERVER_STAMP="${LXSERVER_DIR}/.provisioned-version"
-if [ -f "${LXSERVER_DIR}/server/server.js" ] \
+if [ -f "${LXSERVER_DIR}/index.js" ] \
     && [ "$(cat "${LXSERVER_STAMP}" 2>/dev/null || true)" = "${LXSERVER_TAG}" ]; then
     log_info "lxserver ${LXSERVER_TAG} 已就位（${LXSERVER_DIR}），跳过。"
 else

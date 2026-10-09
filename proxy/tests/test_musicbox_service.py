@@ -449,7 +449,7 @@ def test_song_url_passes_quality_to_cli(monkeypatch):
         return 0, '{"ok": true, "data": {"code": 200, "url": "http://m.test/a.flac"}}', ""
 
     # 本测试校验 CLI 参数透传：进程内路径置为失败，强制走 CLI 兜底
-    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q: None)
+    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q, fresh=False: None)
     monkeypatch.setattr(runner, "run_musicbox", mock_run)
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/123/url", params={"quality": "lossless"})
@@ -844,6 +844,11 @@ def test_get_song_url_inproc_with_quality_and_cache(monkeypatch):
     # 不同音质：另查
     netease_ext.get_song_url(186016, "exhigh")
     assert calls["n"] == 2
+    netease_ext.get_song_url(186016, "lossless", fresh=True)
+    assert calls["n"] == 3
+    monkeypatch.setattr(netease_ext, "_URL_CACHE_MAX", 2)
+    netease_ext.get_song_url(999, "lossless")
+    assert len(netease_ext._url_cache) == 2
 
 
 def test_song_url_prefers_inproc_falls_back_to_cli(monkeypatch):
@@ -854,7 +859,7 @@ def test_song_url_prefers_inproc_falls_back_to_cli(monkeypatch):
         cli_calls.append(args)
         return 0, json.dumps({"ok": True, "data": {"url": "http://cli/1.mp3", "code": 200}}), ""
 
-    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q: None)
+    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q, fresh=False: None)
     monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
     with TestClient(app) as client:
         r = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
@@ -865,7 +870,7 @@ def test_song_url_prefers_inproc_falls_back_to_cli(monkeypatch):
     def boom(args, timeout=30.0):
         raise AssertionError("CLI 不应被调用")
 
-    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q: {"url": "http://inproc/1.flac", "code": 200})
+    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q, fresh=False: {"url": "http://inproc/1.flac", "code": 200})
     monkeypatch.setattr(runner, "run_musicbox", boom)
     with TestClient(app) as client:
         r2 = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})

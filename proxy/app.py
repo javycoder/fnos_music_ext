@@ -2278,10 +2278,25 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
 # 字节布局不同，带偏移的续拉会 416/错位断流，表象即"播到一半跳歌"。同一首歌
 # 在直链有效期内钉住同一条 CDN URL，全部调用点自动一致。
 _NETEASE_URL_PIN: "dict[str, tuple[str, float]]" = {}
+# 钉链表容量上限：过期是惰性清理（同 key 再查才剔），必须配硬顶防进程
+# 生命周期内无限增长（与洛雪取链缓存同思路）
+_NETEASE_URL_PIN_MAX = 1024
 
 
 def _netease_url_pin_drop(song_id: str) -> None:
     _NETEASE_URL_PIN.pop(str(song_id), None)
+
+
+def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
+    """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
+    now = time.monotonic()
+    if len(_NETEASE_URL_PIN) >= _NETEASE_URL_PIN_MAX:
+        for k in [k for k, v in _NETEASE_URL_PIN.items() if v[1] <= now]:
+            _NETEASE_URL_PIN.pop(k, None)
+        if len(_NETEASE_URL_PIN) >= _NETEASE_URL_PIN_MAX:
+            oldest = min(_NETEASE_URL_PIN, key=lambda k: _NETEASE_URL_PIN[k][1])
+            _NETEASE_URL_PIN.pop(oldest, None)
+    _NETEASE_URL_PIN[str(song_id)] = (url, now + ttl)
 
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: bool = False) -> str | None:
@@ -2300,7 +2315,13 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: 
 
     for q in qualities:
         try:
-            r = await client.get(f"/api/v1/song/{song_id}/url", params={"quality": q}, timeout=10.0)
+            params = {"quality": q}
+            if refresh or key not in _NETEASE_URL_PIN:
+                # 无有效钉链时也旁路：后台失败重试不一定传 refresh。
+                # 旁路 musicbox 的取链短缓存：钉链确认失效后的强制重解析必须
+                # 拿到新链，否则会缓存命中同一条死链再钉回去（假修复）
+                params["fresh"] = "1"
+            r = await client.get(f"/api/v1/song/{song_id}/url", params=params, timeout=10.0)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, dict) and data.get("ok") is not False:
@@ -2317,7 +2338,7 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: 
                             except (TypeError, ValueError):
                                 expi = 0.0
                             ttl = min(max(expi - 60.0, 60.0), 1800.0) if expi > 60.0 else 300.0
-                            _NETEASE_URL_PIN[key] = (url, time.monotonic() + ttl)
+                            _netease_url_pin_store(key, url, ttl)
                             return url
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s", song_id, q, e)
@@ -4102,20 +4123,29 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             if (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
                 params["quality"] = "mp3"
             req = client.build_request("GET", "/stream", params=params, headers=headers)
-        resp = await client.send(req, stream=True)
-        content_type = resp.headers.get("content-type", "").lower()
-        if (resp.status_code not in (200, 206)
-                or any(x in content_type for x in ("text/", "json"))
-                or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
-            # Reject servers ignoring identity: decoded bytes cannot use encoded
-            # Content-Length/Range offsets, and must not enter the audio cache.
+        try:
+            resp = await client.send(req, stream=True)
+            content_type = resp.headers.get("content-type", "").lower()
+            if (resp.status_code not in (200, 206)
+                    or any(x in content_type for x in ("text/", "json"))
+                    or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
+                # Reject servers ignoring identity: decoded bytes cannot use encoded
+                # Content-Length/Range offsets, and must not enter the audio cache.
+                if source == "netease":
+                    # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
+                    _netease_url_pin_drop(song_id)
+                return None
+            chunks = resp.aiter_bytes()
+            first = await anext(chunks, b"")
+        except Exception:
+            # 网易钉链在连接/首字节阶段就失败（超时/重置）：同样弃钉——后台取流
+            # 路径不携带 refresh=True，否则会在 TTL 内反复撞同一条死链
             if source == "netease":
-                # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
                 _netease_url_pin_drop(song_id)
-            return None
-        chunks = resp.aiter_bytes()
-        first = await anext(chunks, b"")
+            raise
         if not first:
+            if source == "netease":
+                _netease_url_pin_drop(song_id)
             return None
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
@@ -5471,7 +5501,7 @@ async def dl_transcode_prepare(request: Request):
             break
     is_original = str(body.get("isOriginal") or "").strip().lower() in ("true", "1")
     effective = _dl_effective_quality(quality, is_original)
-    logger.info("[dl] prepare guid=%s q=%s -> %s", raw_guid or guid, quality or "-", effective)
+    logger.info("[dl] prepare guid=%s q=%s -> %s", raw_guid or guid, (quality or "-")[:40], effective)
     quality = effective
     _dl_sweep()
     download_id = uuid4().hex

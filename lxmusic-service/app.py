@@ -178,7 +178,8 @@ async def _resolve_url_cached(
     if not fresh:
         entry = _URL_CACHE.get(key)
         if entry is not None:
-            age = time.time() - float(entry.get("ts") or 0.0)
+            # ts 用单调钟：NTP 回拨会把墙钟缓存任意拉长，续发过期直链
+            age = time.monotonic() - float(entry.get("ts") or 0.0)
             data = entry.get("data")
             if data is None:
                 if age <= CONF["url_cache_neg_ttl"]:
@@ -191,7 +192,7 @@ async def _resolve_url_cached(
                 if refreshed is not None:
                     if _URL_CACHE_GEN == gen:
                         entry["data"] = refreshed
-                        entry["ts"] = time.time()
+                        entry["ts"] = time.monotonic()
                     _STATS["url_cache_hits"] += 1
                     return refreshed
 
@@ -219,7 +220,15 @@ async def _resolve_url_inflight(
         result = await resolve_and_probe(client, src, item, quality, budget=budget)
     except BaseException as exc:
         if not fut.done():
-            fut.set_exception(exc)
+            # 领队被取消时不能把 CancelledError 设给跟随者：跟随者的任务并未被
+            # 取消，收到 CancelledError 会被 asyncio 标记为 cancelled 而无辜死掉，
+            # 换成普通错误让它们走各自的重试路径
+            fut.set_exception(
+                exc if not isinstance(exc, asyncio.CancelledError)
+                else RuntimeError("inflight leader cancelled")
+            )
+            # Mark observed even without followers; awaiting followers still receive it.
+            fut.exception()
         raise
     finally:
         _URL_INFLIGHT.pop(key, None)
@@ -229,7 +238,7 @@ async def _resolve_url_inflight(
             # 容量超限清理最早的一半（与 _cache_put 同策略）
             for old in sorted(_URL_CACHE, key=lambda k: _URL_CACHE[k]["ts"])[: len(_URL_CACHE) // 2]:
                 _URL_CACHE.pop(old, None)
-        _URL_CACHE[key] = {"data": result, "ts": time.time()}
+        _URL_CACHE[key] = {"data": result, "ts": time.monotonic()}
     if not fut.done():
         fut.set_result(result)
     return result
@@ -779,6 +788,8 @@ async def _bootstrap_migration():
                 for url in multi_urls:
                     try:
                         res = await source_set(SourceBody(url=_normalize_legacy_file_url(url)))
+                        if isinstance(res, JSONResponse):
+                            res = json.loads(res.body)
                         if res.get("ok"):
                             logger.info("已自动激活洛雪源: %s", url)
                         else:
@@ -1276,15 +1287,31 @@ async def source_set(body: SourceBody):
             source_id = path_part.rsplit("/", 1)[-1]
             if not await LXSERVER.set_source_enabled(source_id, body.enabled):
                 # 列表中无此 id：激活语义下，若本地确有脚本文件（如旧数据卷 /data/lxmusic/uploads），
-                # 自动补导入 lxserver 后激活，保证历史配置可继续使用；停用语义不做补导入
-                imported = False
+                # 自动补导入 lxserver 后激活，保证历史配置可继续使用；停用语义不做补导入，
+                # 但 file:// 的 basename（用户自己的文件名）不是 lxserver 按 @name 派生的
+                # id——先按名称反查，再读本地脚本按 @name 反查真实 id 后停用
+                resolved = False
+                if not body.enabled:
+                    existing = await _find_lxserver_source(by_name=source_id.removesuffix(".js"))
+                    if not existing and path_part.startswith("/") and os.path.isfile(path_part):
+                        try:
+                            with open(path_part, "r", encoding="utf-8", errors="replace") as f:
+                                script = f.read()
+                        except OSError:
+                            script = ""
+                        name = _parse_script_head_meta(script).get("name") or ""
+                        if name:
+                            existing = await _find_lxserver_source(by_name=name)
+                    if existing:
+                        source_id = str(existing.get("id") or source_id)
+                        resolved = True
                 if body.enabled and path_part.startswith("/") and os.path.isfile(path_part):
                     with open(path_part, "r", encoding="utf-8", errors="replace") as f:
                         script = f.read()
                     try:
                         res = await LXSERVER.upload_custom_source(source_id, script)
                         source_id = str(res.get("id") or "") or source_id
-                        imported = True
+                        resolved = True
                     except Exception as exc:
                         if "已存在" not in str(exc):
                             raise
@@ -1294,8 +1321,8 @@ async def source_set(body: SourceBody):
                         )
                         if existing:
                             source_id = str(existing.get("id") or source_id)
-                            imported = True
-                if not imported or not await LXSERVER.set_source_enabled(source_id, body.enabled):
+                            resolved = True
+                if not resolved or not await LXSERVER.set_source_enabled(source_id, body.enabled):
                     action = "激活" if body.enabled else "停用"
                     return JSONResponse(
                         content={"ok": False,

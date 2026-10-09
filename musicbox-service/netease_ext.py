@@ -183,18 +183,19 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
     return playable_ids
 
 
-def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
+def get_song_url(song_id: int, quality: str, fresh: bool = False) -> "dict[str, Any] | None":
     """进程内解析单曲播放链接（复用常驻实例，免起 CLI 子进程）。
 
     返回对齐 CLI `song url --json` 的 data 字段（含 url/code/fee 等）；接口
     异常或返回空时返回 None，由调用方降级 CLI（保留结构化错误语义）。
-    结果短缓存（成功 600s / 失败 60s，键含音质），reset_api 时随实例一并清空。
+    结果短缓存（成功 600s / 失败 60s，键含音质），reset_api 时随实例一并清空；
+    fresh=True 旁路缓存读（仍回写结果），供代理确认旧直链失效后强制重解析。
     """
     key = (int(song_id), str(quality))
     now = time.monotonic()
     with _url_cache_lock:
         hit = _url_cache.get(key)
-        if hit and now < hit[1]:
+        if hit and now < hit[1] and not fresh:
             return hit[0]
     try:
         with _api_lock:
@@ -220,6 +221,8 @@ def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
             expire = time.monotonic()
             for k in [k for k, v in _url_cache.items() if v[1] <= expire]:
                 del _url_cache[k]
+            if key not in _url_cache and len(_url_cache) >= _URL_CACHE_MAX:
+                del _url_cache[min(_url_cache, key=lambda k: _url_cache[k][1])]
         _url_cache[key] = (item, time.monotonic() + (_URL_CACHE_TTL_OK_S if ok else _URL_CACHE_TTL_FAIL_S))
     return item
 
