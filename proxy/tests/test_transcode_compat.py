@@ -834,8 +834,8 @@ async def test_full_fetch_corrupt_lossless_retries_mp3(env, fake_ffmpeg, monkeyp
     flac, mp3 = b"fLaC" + b"F" * 9000, b"ID3" + b"M" * 8000
     opens = []
 
-    async def fake_open(request, g, range_header, force_mp3=False):
-        opens.append(force_mp3)
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
+        opens.append((force_mp3, fresh_url))
         data = mp3 if force_mp3 else flac
         info = {"title": "测试曲", "artist": "测试人",
                 "ext": "mp3" if force_mp3 else "flac"}
@@ -846,7 +846,7 @@ async def test_full_fetch_corrupt_lossless_retries_mp3(env, fake_ffmpeg, monkeyp
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
     appmod._LOSSLESS_BAD.clear()
     await appmod._full_fetch_download(guid, {"cookie": "sid=t"})
-    assert opens == [False, True]                       # 先无损后 mp3
+    assert opens == [(False, False), (True, True)]      # 先无损后 mp3；坏流重试旁路 lx 直链缓存
     assert appmod._lossless_is_blacklisted(guid)        # 无损档已拉黑
     dest = os.path.join(env["dirs"]["library"], "测试人 - 测试曲.mp3")
     assert os.path.isfile(dest)                         # mp3 档入库
@@ -863,8 +863,8 @@ async def test_full_fetch_corrupt_even_at_mp3_fails_clean(env, fake_ffmpeg, monk
     guid = "online:kuwo:99002"
     opens = []
 
-    async def fake_open(request, g, range_header, force_mp3=False):
-        opens.append(force_mp3)
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
+        opens.append((force_mp3, fresh_url))
         data = b"fLaC" + b"F" * 9000
         resp = httpx.Response(200, stream=_Whole(data),
                               headers={"content-length": str(len(data))})
@@ -873,7 +873,7 @@ async def test_full_fetch_corrupt_even_at_mp3_fails_clean(env, fake_ffmpeg, monk
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
     appmod._LOSSLESS_BAD.clear()
     await appmod._full_fetch_download(guid, {"cookie": "sid=t"})
-    assert opens == [False, True]
+    assert opens == [(False, False), (True, True)]      # 两次尝试均记录；重试旁路 lx 直链缓存
     assert guid in appmod._full_fetch_failed             # 明确失败
     assert os.listdir(env["dirs"]["library"]) == []      # 曲库零写入
 

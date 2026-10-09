@@ -371,18 +371,18 @@ async def test_handoff_falls_back_to_full_download_on_no_range(tmp_path, monkeyp
         async def aclose(self):
             pass
 
-    async def fake_open(request, guid, range_header, force_mp3=False):
+    async def fake_open(request, guid, range_header, force_mp3=False, fresh_url=False):
         return (FakeResp(), None, "mp3", {}, None, b"")
 
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
 
-    async def fake_full(guid, headers):
-        calls["full"] = guid
+    async def fake_full(guid, headers, force_mp3=False, fresh_url=False):
+        calls["full"] = (guid, fresh_url)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_full)
 
     await appmod._tee_handoff_download(FAKE_KUWO1, str(part), 10, 20, "mp3", {})
-    assert calls["full"] == FAKE_KUWO1
+    assert calls["full"] == (FAKE_KUWO1, True)  # 续传失败回退整轨重下时旁路 lx 直链缓存
     assert not os.path.exists(part)
 
 

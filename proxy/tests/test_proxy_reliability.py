@@ -311,7 +311,7 @@ async def test_prebyte_fallback_and_no_splicing(monkeypatch):
     session(req, items)
     attempts = []
     streams = []
-    async def opened(req, guid, rang):
+    async def opened(req, guid, rang, force_mp3=False, fresh_url=False):
         attempts.append(guid)
         if guid == "online:kuwo:1":
             raise httpx.ReadError("before first byte")
@@ -358,7 +358,7 @@ async def test_fallback_redirect_survives_relayed_https_client(monkeypatch):
     items = p.deduplicate_online_items([song("kuwo:1"), song("netease:2")])
     session(req, items)
 
-    async def opened(req, guid, rang):
+    async def opened(req, guid, rang, force_mp3=False, fresh_url=False):
         if guid == "online:kuwo:1":
             raise httpx.ReadError("before first byte")
         audio = Audio()
@@ -390,7 +390,7 @@ async def test_disabled_alternative_and_seek_never_cross_sources(monkeypatch):
     session(req, p.deduplicate_online_items([song("kuwo:1"), song("netease:2")]))
     monkeypatch.setitem(p.CONF, "netease_enabled", False)
     attempts = []
-    async def failed(req, guid, rang):
+    async def failed(req, guid, rang, force_mp3=False, fresh_url=False):
         attempts.append(guid)
         return None
     async def no_recovery(*args):

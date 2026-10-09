@@ -51,8 +51,10 @@ CONF: dict[str, Any] = {
     "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "12.0")),
     "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
     "cache_ttl": float(os.environ.get("LX_CACHE_TTL", "604800.0")),
+    "url_cache_ttl": float(os.environ.get("LX_URL_CACHE_TTL", "600.0")),
+    "url_cache_neg_ttl": float(os.environ.get("LX_URL_CACHE_NEG_TTL", "60.0")),
+    "url_cache_max": int(os.environ.get("LX_URL_CACHE_MAX", "512")),
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
-    "probe_fresh_s": float(os.environ.get("LX_PROBE_FRESH_S", "900.0")),
     "search_probe": bool(os.environ.get("FNMUSIC_SEARCH_PROBE", "").lower() in ("1", "true", "yes", "on")),
     "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
@@ -66,7 +68,13 @@ LXSERVER = LxServerClient(
 
 # 内存曲目缓存: id -> {"item": dict, "ts": float}
 _SONG_CACHE: dict[str, dict] = {}
-_STATS = {"searches": 0, "url_resolutions": 0, "errors": 0}
+# 播放直链缓存: (canonical_id, tier) -> {"data": dict | None, "ts": float}；data=None 为失败负缓存
+_URL_CACHE: dict[tuple[str, str], dict] = {}
+# 同键在途解析合并：key -> Future（与 musicdl SingleFlight 同型的 shielded-future 去重）
+_URL_INFLIGHT: dict[tuple[str, str], asyncio.Future] = {}
+# 源代计数：切源/重导入脚本时自增，代间在途解析的回写据此丢弃，防止串源
+_URL_CACHE_GEN = 0
+_STATS = {"searches": 0, "url_resolutions": 0, "url_cache_hits": 0, "errors": 0}
 
 # 探活前缀字节数
 _PROBE_BYTES = 4096
@@ -114,6 +122,116 @@ def _cache_get(track_id: str) -> dict | None:
         _SONG_CACHE.pop(track_id, None)
         return None
     return entry["item"]
+
+
+def _url_cache_reset() -> None:
+    """清空播放直链缓存并推进源代计数：切源/重导入脚本后旧直链一律作废，防止串源。"""
+    _URL_CACHE.clear()
+    global _URL_CACHE_GEN
+    _URL_CACHE_GEN += 1
+
+
+async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | None:
+    """对过期的缓存直链做 Range 前缀探活续期。
+
+    仅请求 CDN 少量前缀字节、不消耗按次计量的音源解析额度；仍可用则返回
+    缓存条目（上游重定向时更新最终 URL 与总大小），失效返回 None。"""
+    url = data.get("url")
+    if not url:
+        return None
+    try:
+        ok, final_url, _ct, size = await probe_url(client, url, data.get("headers") or {})
+    except Exception:
+        return None
+    if not ok:
+        return None
+    refreshed = dict(data)
+    if final_url and final_url != url:
+        refreshed["url"] = final_url
+    if size:
+        refreshed["file_size"] = size
+    return refreshed
+
+
+async def _resolve_url_cached(
+    client: httpx.AsyncClient,
+    src: str,
+    item: dict,
+    quality: str = "lossless",
+    budget: float = 20.0,
+    fresh: bool = False,
+) -> dict | None:
+    """带成功缓存/失败负缓存/同键在途合并的播放直链解析。
+
+    - 成功结果按「曲目 + 音质档」缓存 url_cache_ttl 秒，有效期内零额度复用；
+    - TTL 到期先探活旧链续期（不耗音源额度），失效才重新解析；
+    - 失败负缓存 url_cache_neg_ttl 秒，短时间内同键重复请求直接快速失败；
+    - fresh=True 显式旁路缓存强制重新解析（代理重试路径确认旧链失效后使用）；
+    - 同键并发共享一次实际解析；源代计数变化后代间结果不回写。"""
+    canonical_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
+    tiers = _quality_tiers(quality)
+    key = (canonical_id, tiers[0] if tiers else "standard")
+    gen = _URL_CACHE_GEN
+    deadline = time.monotonic() + max(float(budget), 1.0)
+
+    if not fresh:
+        entry = _URL_CACHE.get(key)
+        if entry is not None:
+            age = time.time() - float(entry.get("ts") or 0.0)
+            data = entry.get("data")
+            if data is None:
+                if age <= CONF["url_cache_neg_ttl"]:
+                    return None
+            elif age <= CONF["url_cache_ttl"]:
+                _STATS["url_cache_hits"] += 1
+                return data
+            else:
+                refreshed = await _refresh_cached_url(client, data)
+                if refreshed is not None:
+                    if _URL_CACHE_GEN == gen:
+                        entry["data"] = refreshed
+                        entry["ts"] = time.time()
+                    _STATS["url_cache_hits"] += 1
+                    return refreshed
+
+    remaining = deadline - time.monotonic()
+    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen)
+
+
+async def _resolve_url_inflight(
+    client: httpx.AsyncClient,
+    src: str,
+    item: dict,
+    quality: str,
+    budget: float,
+    key: tuple[str, str],
+    gen: int,
+) -> dict | None:
+    """实际解析执行段：同键在途合并，失败/取消正确清理在途状态供后续重试。"""
+    existing = _URL_INFLIGHT.get(key)
+    if existing is not None:
+        return await asyncio.shield(existing)
+
+    fut = asyncio.get_running_loop().create_future()
+    _URL_INFLIGHT[key] = fut
+    try:
+        result = await resolve_and_probe(client, src, item, quality, budget=budget)
+    except BaseException as exc:
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
+    finally:
+        _URL_INFLIGHT.pop(key, None)
+
+    if _URL_CACHE_GEN == gen:
+        if len(_URL_CACHE) >= CONF["url_cache_max"]:
+            # 容量超限清理最早的一半（与 _cache_put 同策略）
+            for old in sorted(_URL_CACHE, key=lambda k: _URL_CACHE[k]["ts"])[: len(_URL_CACHE) // 2]:
+                _URL_CACHE.pop(old, None)
+        _URL_CACHE[key] = {"data": result, "ts": time.time()}
+    if not fut.done():
+        fut.set_result(result)
+    return result
 
 
 def _quality_tiers(quality: str) -> list[str]:
@@ -815,8 +933,11 @@ async def track_url(
     id: str = Query("", alias="id"),
     guid: str = Query("", alias="guid"),
     quality: str = Query("lossless"),
+    fresh: int = Query(0),
 ):
-    """解析单曲播放直链。支持音质阶梯降级与媒体魔数探活。"""
+    """解析单曲播放直链。支持音质阶梯降级、媒体魔数探活与成功结果缓存/同键并发合并。
+
+    fresh=1 旁路缓存强制重新解析：代理重试路径确认缓存直链失效后的有界刷新入口。"""
     track_id = (id or guid or "").strip()
     src, identifier = parse_track_id(track_id)
     if not src or not identifier:
@@ -828,7 +949,9 @@ async def track_url(
     client = get_http(app)
 
     try:
-        result = await resolve_and_probe(client, src, cached, quality, budget=CONF["url_timeout"])
+        result = await _resolve_url_cached(
+            client, src, cached, quality, budget=CONF["url_timeout"], fresh=bool(fresh)
+        )
     except Exception as e:
         _STATS["errors"] += 1
         logger.warning("lx url resolve %s failed: %s", track_id, e)
@@ -998,6 +1121,8 @@ async def source_upload(body: UploadBody):
     source_id = str(res.get("id") or "") or name
     meta = res.get("metadata") or {}
     path = _lx_source_fs_path(source_id)
+    # 同名脚本重新上传可能被 lxserver 覆盖（换接口/密钥），已缓存直链不再可信
+    _url_cache_reset()
     return {
         "ok": True,
         "data": {
@@ -1093,6 +1218,7 @@ async def source_set(body: SourceBody):
         )
 
     _CHAIN_HEALTH.pop("user_source", None)
+    _url_cache_reset()
     user_src = await describe_user_source()
     return {"ok": True, "data": user_src}
 
@@ -1111,4 +1237,5 @@ async def source_clear():
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=500)
 
     _CHAIN_HEALTH.pop("user_source", None)
+    _url_cache_reset()
     return {"ok": True, "data": None}

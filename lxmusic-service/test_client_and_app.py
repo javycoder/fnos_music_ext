@@ -410,3 +410,195 @@ def test_source_capabilities_reflects_failed_status():
         lxapp.LXSERVER = orig_lx
 
 
+# ------------------------------------------------- 播放直链缓存与并发合并 --
+# issue #45：同曲同音质重复解析治理——成功缓存、失败负缓存、探活续期、
+# 同键在途合并、fresh 旁路与切源失效。
+
+def _flac_probe_handler(request: httpx.Request) -> httpx.Response:
+    """探活 mock：dead 链接模拟直链过期后 CDN 拒绝，其余返回合法 flac 前缀。"""
+    if "dead" in str(request.url):
+        return httpx.Response(200, headers={"Content-Type": "text/html"}, content=b"<html>gone</html>")
+    return httpx.Response(
+        206,
+        headers={"Content-Type": "audio/flac", "Content-Range": "bytes 0-4095/30000000"},
+        content=b"fLaC" + b"\x00" * 4092,
+    )
+
+
+@pytest.fixture
+def fresh_url_cache():
+    """隔离模块级直链缓存/在途/熔断状态。"""
+    lxapp._URL_CACHE.clear()
+    lxapp._URL_INFLIGHT.clear()
+    lxapp._CHAIN_HEALTH.pop("user_source", None)
+    yield
+    lxapp._URL_CACHE.clear()
+    lxapp._URL_INFLIGHT.clear()
+
+
+def test_track_url_success_cache_reuses_resolution(test_app_client, fresh_url_cache, fake_lx):
+    """同曲同音质连续请求：第二次命中缓存，音源仅解析一次（issue #45 主诉求）。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        r1 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+        r2 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    finally:
+        lxapp.app.state.client = orig_client
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(fake_lx.url_calls) == 1
+    assert r1.json()["data"]["url"] == r2.json()["data"]["url"] == "https://media.test/song.flac"
+
+
+@pytest.mark.asyncio
+async def test_track_url_concurrent_requests_merge_inflight(fake_lx, fresh_url_cache):
+    """同键并发请求共享一次实际解析（在途 Future 合并），不放大音源调用量。"""
+    gate = asyncio.Event()
+    fake_lx.url_gate = gate
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    leader = asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+    while not fake_lx.url_calls:
+        await asyncio.sleep(0.01)
+    followers = [
+        asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+        for _ in range(2)
+    ]
+    await asyncio.sleep(0.05)
+    assert len(fake_lx.url_calls) == 1  # 等待期间未新增解析
+    gate.set()
+    results = await asyncio.gather(leader, *followers)
+    assert len(fake_lx.url_calls) == 1
+    assert all(r["url"] == results[0]["url"] for r in results)
+    assert lxapp._URL_INFLIGHT == {}
+    await probe_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_track_url_ttl_expiry_renews_via_probe(fake_lx, fresh_url_cache):
+    """TTL 到期先探活旧链续期（零额度消耗），不重新解析；续期后缓存刷新继续命中。"""
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    key = ("lx:kw:5886682", "lossless")
+    r1 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1
+    lxapp._URL_CACHE[key]["ts"] -= lxapp.CONF["url_cache_ttl"] + 1.0
+    r2 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1  # 旧链探活通过 → 续期，不消耗解析额度
+    assert r2["url"] == r1["url"]
+    r3 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1
+    assert r3["url"] == r1["url"]
+    await probe_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_track_url_ttl_expiry_dead_url_reresolves(fake_lx, fresh_url_cache):
+    """TTL 到期且旧链探活失败：重新解析并覆盖缓存。"""
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    key = ("lx:kw:5886682", "lossless")
+    r1 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1
+    entry = lxapp._URL_CACHE[key]
+    entry["data"] = {**entry["data"], "url": "https://media.test/dead.flac"}
+    entry["ts"] -= lxapp.CONF["url_cache_ttl"] + 1.0
+    r2 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 2
+    assert r2["url"] == "https://media.test/song.flac"
+    await probe_client.aclose()
+
+
+def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_cache, fake_lx):
+    """解析失败写负缓存：短时间内重复请求不再打音源；fresh=1 旁路强制重新解析。
+
+    一次失败解析会走完整音质阶梯（flac→320k→128k 共 3 次调低档调用）。"""
+    fake_lx.url_result = None
+    r1 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    r2 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    assert r1.status_code == 404 and r2.status_code == 404
+    assert len(fake_lx.url_calls) == 3  # 第二次请求负缓存命中，未再走阶梯
+
+    r3 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless&fresh=1")
+    assert r3.status_code == 404
+    assert len(fake_lx.url_calls) == 6  # fresh 旁路负缓存，重新走一遍阶梯
+
+    # 音源恢复后 fresh 重取成功并覆盖负缓存，后续请求恢复命中
+    fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        r4 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless&fresh=1")
+        assert r4.status_code == 200
+        r5 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+        assert r5.status_code == 200
+    finally:
+        lxapp.app.state.client = orig_client
+    assert len(fake_lx.url_calls) == 7  # 成功解析在首档即命中，仅 +1
+
+
+def test_track_url_quality_isolation(test_app_client, fresh_url_cache, fake_lx):
+    """不同音质档各自解析与缓存，同音质命中缓存（音质变化不串缓存）。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=high").status_code == 200
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=high").status_code == 200
+    finally:
+        lxapp.app.state.client = orig_client
+    assert [q for _, q in fake_lx.url_calls] == ["flac", "320k"]
+
+
+def test_track_url_cache_cleared_on_source_change(test_app_client, fresh_url_cache, fake_lx):
+    """切换音源后直链缓存清空：后续请求重新解析，杜绝串源。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert len(fake_lx.url_calls) == 1
+        res = test_app_client.post("/api/v1/source", json={"url": "file:///data/lxserver/users/source/_open/source1"})
+        assert res.status_code == 200 and res.json()["ok"] is True
+        assert lxapp._URL_CACHE == {}
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert len(fake_lx.url_calls) == 2
+    finally:
+        lxapp.app.state.client = orig_client
+
+
+@pytest.mark.asyncio
+async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cache):
+    """领头解析异常传播给等待者，在途状态清理且不写缓存（含负缓存），随后可重试。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def flaky_resolve(client, src, item, quality="lossless", budget=20.0):
+        started.set()
+        await release.wait()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(lxapp, "resolve_and_probe", flaky_resolve)
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    leader = asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+    await started.wait()
+    follower = asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+    await asyncio.sleep(0.05)
+    release.set()
+    with pytest.raises(RuntimeError, match="boom"):
+        await leader
+    with pytest.raises(RuntimeError, match="boom"):
+        await follower
+    assert lxapp._URL_INFLIGHT == {}
+    assert lxapp._URL_CACHE == {}
+
+    async def ok_resolve(client, src, item, quality="lossless", budget=20.0):
+        return {"id": item.get("id"), "url": "https://media.test/song.flac"}
+
+    monkeypatch.setattr(lxapp, "resolve_and_probe", ok_resolve)
+    r = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert r["url"] == "https://media.test/song.flac"
+    await probe_client.aclose()
+
+

@@ -63,6 +63,10 @@ class FakeLxServerClient:
         self.upload_calls: list[tuple[str, str]] = []
         self.import_calls: list[str] = []
         self.deleted_ids: list[str] = []
+        # get_music_url 调用记录 (songmid, quality)：缓存/在途合并测试统计实际解析次数用
+        self.url_calls: list[tuple[str, str]] = []
+        # 非空时 get_music_url 等待该事件（同测试循环内使用）：并发时序控制
+        self.url_gate: asyncio.Event | None = None
 
     @staticmethod
     def _derive_source_id(filename: str, script: str) -> str:
@@ -102,6 +106,9 @@ class FakeLxServerClient:
         return res
 
     async def get_music_url(self, song_info: dict, quality: str = "128k") -> dict | None:
+        self.url_calls.append((str(song_info.get("songmid") or ""), quality))
+        if self.url_gate is not None:
+            await self.url_gate.wait()
         if self.url_result:
             return dict(self.url_result)
         return None

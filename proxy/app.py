@@ -2186,8 +2186,11 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
-    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False) -> "dict | None":
+    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
+
+    fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
+    重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。"""
     primary = str(CONF.get("lx_quality") or "lossless").strip()
     qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2195,9 +2198,12 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
 
     for q in qualities:
         try:
+            params = {"id": song_id, "quality": q}
+            if fresh:
+                params["fresh"] = "1"
             r = await client.get(
                 "/api/v1/track/url",
-                params={"id": song_id, "quality": q},
+                params=params,
                 # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 20s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
                 timeout=22.0,
@@ -3928,8 +3934,10 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
 
 
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
-                              force_mp3: bool = False):
-    """Resolve and read first bytes before committing HTTP headers to the client."""
+                              force_mp3: bool = False, fresh_url: bool = False):
+    """Resolve and read first bytes before committing HTTP headers to the client.
+
+    fresh_url：lx 直链解析旁路 lxmusic 成功缓存强制刷新（仅重试路径使用）。"""
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
     headers = {"Accept-Encoding": "identity"}
@@ -3946,7 +3954,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not url:
                     return None
             else:
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid), fresh=fresh_url)
                 if not resolved:
                     return None
                 url = resolved["url"]
@@ -4138,12 +4146,14 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
     return base
 
 
-async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False) -> None:
+async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False,
+                               fresh_url: bool = False) -> None:
     """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。
 
     无损档解码校验失败时按 guid 拉黑并自动以 mp3 档重试一次（服务端
     quality=mp3），两次都坏才宣告失败——坏字节绝不入库。
-    """
+    fresh_url：解析直链时旁路 lxmusic 成功缓存（续传回退/坏流重试等确认旧链
+    不可信的路径使用，force_mp3 重试同样强制刷新）。"""
     part = None
     resp = None
     owned = None
@@ -4151,7 +4161,8 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         # 合成最小 Request scope（触发请求的凭证头 + app 实例），完整复用在线取
         # 流的解析/元数据/首字节校验逻辑；Range 传 None 保证拿到完整资源。
         fake_request = _synth_request(cred_headers)
-        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3)
+        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3,
+                                           fresh_url=fresh_url or force_mp3)
         if not opened:
             raise RuntimeError("open failed")
         resp, owned, ext, info, chunks, first = opened
@@ -4305,7 +4316,9 @@ async def _tee_handoff_download(guid: str, part: str, written: int, expected: in
     if resumed:
         return
     _remove_quiet(part)
-    await _full_fetch_download(guid, cred_headers)
+    # 续传失败（打开失败/非 206/长度不符）大概率是解析直链已失效：整轨重下时
+    # 旁路 lxmusic 成功缓存强制刷新，避免拿同一条死链再失败一轮
+    await _full_fetch_download(guid, cred_headers, fresh_url=True)
 
 
 async def _resume_part_download(guid: str, part: str, written: int, expected: int | None,
@@ -4965,8 +4978,12 @@ async def stream_track(request: Request, subpath: str = ""):
             if remaining <= 0:
                 break
             try:
-                # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(6.0, remaining))
+                # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐；
+                # 重试（首次打开失败后）旁路 lxmusic 成功缓存，避免反复取到同一条失效直链
+                opened = await asyncio.wait_for(
+                    _open_online_stream(request, candidate, range_header, fresh_url=attempt > 0),
+                    timeout=min(6.0, remaining),
+                )
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None
