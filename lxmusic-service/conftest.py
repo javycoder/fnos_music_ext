@@ -34,15 +34,17 @@ class FakeLxServerClient:
     """替身 LxServerClient，供离线单元测试使用。
 
     自定义源管理方法按 lxserver 真实契约模拟：上传以脚本 @name 派生唯一 id、
-    重复上传报"已存在"、toggle 以 enabled 键生效、activate 单源互斥。
+    重复上传报"已存在"、toggle 以 enabled 键生效、启用态可多源并存（set_source_enabled 只动目标）。
     """
 
     def __init__(self):
         self.alive = True
-        # 模拟 lxserver users/source/_open/sources.json 的列表项字段
+        # 模拟 lxserver users/source/_open/sources.json 的列表项字段（默认两个源、其一启用）
         self.sources = [
             {"id": "source1", "name": "test-src", "enabled": True, "version": "1.0.0",
-             "supportedSources": ["kw", "kg", "wy"]}
+             "supportedSources": ["kw", "kg", "wy"]},
+            {"id": "source2", "name": "test-src-2", "enabled": False, "version": "1.0.0",
+             "supportedSources": ["kw", "wy"]},
         ]
         self.search_results = [
             {
@@ -173,14 +175,13 @@ class FakeLxServerClient:
             "supportedSources": ["kw", "wy"],
         }
 
-    async def activate_single_source(self, target_id_or_name: str) -> bool:
+    async def set_source_enabled(self, target_id_or_name: str, enabled: bool) -> bool:
+        """多源叠加语义：只改目标源启用态，不动其他源。目标不存在返回 False。"""
         target = self._find(target_id_or_name)
         if not target:
             return False
-        for s in self.sources:
-            enable = s is target
-            s["enabled"] = enable
-            self.toggle_calls.append((s["id"], enable))
+        target["enabled"] = bool(enabled)
+        self.toggle_calls.append((target["id"], bool(enabled)))
         return True
 
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:

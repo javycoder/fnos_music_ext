@@ -496,8 +496,8 @@ class LxServerClient:
         message = data.get("error") or data.get("message") or f"{action}失败 (HTTP {resp.status_code})"
         raise RuntimeError(message)
 
-    async def activate_single_source(self, target_id_or_name: str) -> bool:
-        """单源激活语义：只启用 target，禁用其余所有源。若 target 不存在则直接返回 False，不触碰任何源。"""
+    async def set_source_enabled(self, target_id_or_name: str, enabled: bool) -> bool:
+        """设置单个源的启用状态（多源可同时启用）。若 target 不存在则直接返回 False，不触碰任何源。"""
         async with self.mgmt_lock:
             sources = await self.list_custom_sources()
             target = next(
@@ -513,12 +513,7 @@ class LxServerClient:
                 return False
 
             target_id = str(target.get("id") or "")
-            for s in sources:
-                sid = str(s.get("id") or "")
-                if not sid:
-                    continue
-                if sid == target_id:
-                    await self.toggle_custom_source(sid, True)
-                else:
-                    await self.toggle_custom_source(sid, False)
+            if not target_id:
+                return False
+            await self.toggle_custom_source(target_id, enabled)
             return True

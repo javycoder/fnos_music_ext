@@ -80,6 +80,27 @@ def test_source_display_prefix_mapping(monkeypatch):
     assert source_display_prefix("lx") == "[lx] "
 
 
+def test_source_display_prefix_multi_active(monkeypatch):
+    """多源同时激活：列表 active 标记决定备注；≥2 个激活时无法归属单曲，回退 [lx]。"""
+    # 恰好 1 个 active → 备注名
+    _set_lx_source(monkeypatch, "", [
+        {"name": "星海源", "url": "http://s1/one.js", "active": True},
+        {"name": "云海源", "url": "http://s2/two.js", "active": False},
+    ])
+    assert source_display_prefix("lx") == "[星海源] "
+    # 2 个 active → [lx]
+    _set_lx_source(monkeypatch, "", [
+        {"name": "星海源", "url": "http://s1/one.js", "active": True},
+        {"name": "云海源", "url": "http://s2/two.js", "active": True},
+    ])
+    assert source_display_prefix("lx") == "[lx] "
+    # active 项无备注 → [lx]
+    _set_lx_source(monkeypatch, "", [
+        {"name": "", "url": "http://s1/one.js", "active": True},
+    ])
+    assert source_display_prefix("lx") == "[lx] "
+
+
 def test_strip_source_tag_precise(monkeypatch):
     _set_lx_source(monkeypatch, "http://s1/one.js", [{"name": "星海源", "url": "http://s1/one.js"}])
     assert strip_source_tag("[music box] 晴天") == "晴天"

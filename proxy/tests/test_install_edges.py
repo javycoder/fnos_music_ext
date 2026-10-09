@@ -267,18 +267,18 @@ LX_STUBS = """
 log_info() { printf 'info %s\\n' "$*"; }
 log_warn() { printf 'warn %s\\n' "$*"; }
 log_err() { printf 'err %s\\n' "$*" >&2; }
-run_docker() {
-  if [ "$1" = "exec" ]; then
-    n="$(cat "${STUB_STATE_DIR}/n" 2>/dev/null || echo 0)"
-    n=$((n + 1)); echo "$n" > "${STUB_STATE_DIR}/n"
-    if [ "$n" -eq 1 ]; then printf '%s' "${VERIFY_REPORT_1}"; else printf '%s' "${VERIFY_REPORT_2:-${VERIFY_REPORT_1}}"; fi
-    return 0
-  fi
-  return 0
-}
 prompt() { printf '%s' "${PROMPT_ANSWER:-${2:-}}"; }
 curl() {
   printf 'curl %s\\n' "$*" >> "${STUB_STATE_DIR}/curl.log"
+  case "$*" in
+    *"/api/v1/source/verify"*)
+      # 校验请求：按轮次返回 VERIFY_REPORT_1 / VERIFY_REPORT_2
+      n="$(cat "${STUB_STATE_DIR}/n" 2>/dev/null || echo 0)"
+      n=$((n + 1)); echo "$n" > "${STUB_STATE_DIR}/n"
+      if [ "$n" -eq 1 ]; then printf '%s' "${VERIFY_REPORT_1}"; else printf '%s' "${VERIFY_REPORT_2:-${VERIFY_REPORT_1}}"; fi
+      return 0
+      ;;
+  esac
   return "${ACTIVATE_RC:-0}"
 }
 """
@@ -290,6 +290,12 @@ def lx_activation_script(tmp_path: Path, env_url: str, env_path: Path) -> str:
     state.mkdir()
     return ("set -uo pipefail\n" + LX_STUBS
             + function(install, "dotenv_escape")
+            + function(install, "lx_source_list_json")
+            + function(install, "lx_verify_request")
+            + function(install, "lx_report_ok")
+            + function(install, "lx_report_platforms")
+            + function(install, "lx_report_field")
+            + function(install, "lx_merge_csv")
             + f'NON_INTERACTIVE=1\nCONTAINER_NAME=fnmusic-sources\n'
             f'BASE_DIR="{BASE}"\nENV_PATH="{env_path}"\n'
             f'STUB_STATE_DIR="{state}"\nLX_SOURCE_URL_CLI="{env_url}"\n'
@@ -301,21 +307,51 @@ def test_lx_activation_success_writes_platforms_to_env(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("LX_SOURCE_URL='http://s/x.js'\nFNMUSIC_LX_ENABLED=true\n",
                         encoding="utf-8")
-    report = json.dumps({"ok": True, "platforms": ["kg", "wy"]})
+    report = json.dumps({"ok": True, "data": {"platforms": ["kg", "wy"]}})
     result = run_bash(lx_activation_script(tmp_path, "http://s/x.js", env_file),
                       env={**os.environ,
                            "VERIFY_REPORT_1": report,
                            "STUB_STATE_DIR": str(tmp_path / "lxstate"),
                            "PATH": os.environ["PATH"]})
     assert result.returncode == 0, result.stderr
-    # 激活 POST 携带正确 URL
+    # 校验与激活都走 HTTP（lxmusic 8772）
     curl_log = (tmp_path / "lxstate" / "curl.log").read_text(encoding="utf-8")
-    assert "-X POST http://127.0.0.1:8772/api/v1/source" in curl_log
+    assert "/api/v1/source/verify" in curl_log
+    assert "-X POST http://127.0.0.1:8772/api/v1/source " in curl_log
     assert "http://s/x.js" in curl_log
-    # 平台交集写回 .env（真实 env_merge 增量合并）
+    # 平台并集与多源激活种子写回 .env（真实 env_merge 增量合并）
     content = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCES='kg,wy'" in content
+    assert "LX_SOURCE_URL='http://s/x.js'" in content
+    assert json.loads(content.split("LX_SOURCE_LIST='")[1].split("'")[0]) == [
+        {"name": "x.js", "url": "http://s/x.js", "active": True}]
     assert "已写回" in result.stdout
+
+
+def test_lx_activation_multi_url_activates_all(tmp_path):
+    """逗号分隔多 URL：逐个校验、逐个激活，平台并集与全部源写回 .env。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    urls = "http://s/a.js,http://s/b.js"
+    result = run_bash(lx_activation_script(tmp_path, urls, env_file),
+                      env={**os.environ,
+                           "VERIFY_REPORT_1": json.dumps({"ok": True, "data": {"platforms": ["kg"]}}),
+                           "VERIFY_REPORT_2": json.dumps({"ok": True, "data": {"platforms": ["wy", "kw"]}}),
+                           "STUB_STATE_DIR": str(tmp_path / "lxstate")})
+    assert result.returncode == 0, result.stderr
+    curl_log = (tmp_path / "lxstate" / "curl.log").read_text(encoding="utf-8")
+    # 每个源各一次校验 + 一次激活
+    assert curl_log.count("/api/v1/source/verify") == 2
+    assert curl_log.count("-X POST http://127.0.0.1:8772/api/v1/source ") == 2
+    assert "http://s/a.js" in curl_log and "http://s/b.js" in curl_log
+    content = env_file.read_text(encoding="utf-8")
+    assert "LX_SOURCES='kg,wy,kw'" in content
+    assert "LX_SOURCE_URL='http://s/a.js'" in content
+    assert json.loads(content.split("LX_SOURCE_LIST='")[1].split("'")[0]) == [
+        {"name": "a.js", "url": "http://s/a.js", "active": True},
+        {"name": "b.js", "url": "http://s/b.js", "active": True},
+    ]
+    assert "平台并集: kg,wy,kw" in result.stdout
 
 
 def test_lx_activation_noninteractive_failure_aborts(tmp_path):
@@ -341,6 +377,12 @@ def test_lx_activation_skip_verify_activates_without_probe(tmp_path):
     install = (BASE / "install.sh").read_text(encoding="utf-8")
     script = ("set -uo pipefail\n" + LX_STUBS
               + function(install, "dotenv_escape")
+              + function(install, "lx_source_list_json")
+              + function(install, "lx_verify_request")
+              + function(install, "lx_report_ok")
+              + function(install, "lx_report_platforms")
+              + function(install, "lx_report_field")
+              + function(install, "lx_merge_csv")
               + f'NON_INTERACTIVE=1\nCONTAINER_NAME=fnmusic-sources\nLX_SKIP_VERIFY=1\n'
               f'BASE_DIR="{BASE}"\nENV_PATH="{env_file}"\n'
               f'STUB_STATE_DIR="{state}"\nLX_SOURCE_URL_CLI="http://s/x.js"\n'
@@ -349,9 +391,9 @@ def test_lx_activation_skip_verify_activates_without_probe(tmp_path):
     result = run_bash(script, env={**os.environ, "STUB_STATE_DIR": str(state)})
     assert result.returncode == 0, result.stderr
     assert "跳过洛雪源可用性校验" in result.stdout
-    # 未走 docker exec 校验（校验次数文件不存在），只有激活 POST
+    # 未走 HTTP 校验（校验次数文件不存在），只有激活 POST
     assert not (state / "n").exists()
-    assert "-X POST http://127.0.0.1:8772/api/v1/source" in (
+    assert "-X POST http://127.0.0.1:8772/api/v1/source " in (
         state / "curl.log").read_text(encoding="utf-8")
 
 
@@ -372,9 +414,15 @@ def test_lx_activation_interactive_retry_recovers(tmp_path):
     state = tmp_path / "lxstate"
     state.mkdir()
     install = (BASE / "install.sh").read_text(encoding="utf-8")
-    ok_report = json.dumps({"ok": True, "platforms": ["kw"]})
+    ok_report = json.dumps({"ok": True, "data": {"platforms": ["kw"]}})
     script = ("set -uo pipefail\n" + LX_STUBS
               + function(install, "dotenv_escape")
+              + function(install, "lx_source_list_json")
+              + function(install, "lx_verify_request")
+              + function(install, "lx_report_ok")
+              + function(install, "lx_report_platforms")
+              + function(install, "lx_report_field")
+              + function(install, "lx_merge_csv")
               + f'NON_INTERACTIVE=0\nCONTAINER_NAME=fnmusic-sources\n'
               f'BASE_DIR="{BASE}"\nENV_PATH="{env_file}"\n'
               f'STUB_STATE_DIR="{state}"\nLX_SOURCE_URL_CLI="http://old/x.js"\n'
@@ -386,7 +434,7 @@ def test_lx_activation_interactive_retry_recovers(tmp_path):
                                    "VERIFY_REPORT_2": ok_report,
                                    "STUB_STATE_DIR": str(state)})
     assert result.returncode == 0, result.stderr
-    # docker exec 校验确实重试了两轮
+    # HTTP 校验确实重试了两轮
     assert (state / "n").read_text(encoding="utf-8").strip() == "2"
     content = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='http://new/y.js'" in content
@@ -398,12 +446,15 @@ def test_lx_activation_post_failure_degrades_but_persists_platforms(tmp_path):
     env_file.write_text("LX_SOURCE_URL='http://s/x.js'\n", encoding="utf-8")
     result = run_bash(lx_activation_script(tmp_path, "http://s/x.js", env_file),
                       env={**os.environ,
-                           "VERIFY_REPORT_1": json.dumps({"ok": True, "platforms": ["kg"]}),
+                           "VERIFY_REPORT_1": json.dumps({"ok": True, "data": {"platforms": ["kg"]}}),
                            "ACTIVATE_RC": "7",
                            "STUB_STATE_DIR": str(tmp_path / "lxstate")})
     assert result.returncode == 0, result.stderr
     assert "激活请求失败" in result.stdout
-    assert "LX_SOURCES='kg'" in env_file.read_text(encoding="utf-8")
+    # 校验已通过：平台与激活种子仍写回 .env（容器首启按种子自愈激活）
+    content = env_file.read_text(encoding="utf-8")
+    assert "LX_SOURCES='kg'" in content
+    assert "LX_SOURCE_URL='http://s/x.js'" in content
 
 
 # ---------------------------------------------------------- ensure_base_image ---

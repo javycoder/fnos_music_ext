@@ -198,7 +198,7 @@ test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () =
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
-test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入框并标脏", async () => {
+test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入框（上传本身不改配置不标脏）", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/lx/upload", {
     ok: true,
@@ -209,7 +209,84 @@ test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入�
   await global.lxAfterUpload(r);
   assert.strictEqual(els.get("#lx-url").value, "file:///data/lxmusic/uploads/mine.js");
   assert.strictEqual(els.get("#lx-upload-note").textContent, "已上传：上传源");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  assert.strictEqual(els.get("#save-bar"), undefined); // 添加进列表后才标脏
+});
+
+test("洛雪源列表：旧数据（无 active 标记）按 LX_SOURCE_URL 推导激活态", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_URL: "file:///a.js",
+      LX_SOURCE_LIST: '[{"name":"甲","url":"file:///a.js"},{"name":"乙","url":"file:///b.js"}]',
+    },
+  });
+  await global.loadConfig();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.ok(html.includes("已激活"), "匹配 LX_SOURCE_URL 的项应显示已激活徽标");
+  assert.ok(html.includes("取消激活"), "激活项应有取消激活按钮");
+  assert.ok(html.includes("激活"), "未激活项应有激活按钮");
+  // 恰好一处已激活
+  assert.strictEqual((html.match(/lx-badge/g) || []).length, 1);
+});
+
+test("洛雪源列表：多源同时激活共存渲染", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_LIST: JSON.stringify([
+        { name: "甲", url: "file:///a.js", active: true },
+        { name: "乙", url: "file:///b.js", active: true },
+        { name: "丙", url: "file:///c.js", active: false },
+      ]),
+    },
+  });
+  await global.loadConfig();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.strictEqual((html.match(/lx-badge/g) || []).length, 2, "两个已激活徽标");
+  assert.strictEqual((html.match(/lx-btn-deactivate/g) || []).length, 2, "两个取消激活按钮");
+  assert.strictEqual((html.match(/lx-btn-activate/g) || []).length, 1, "一个激活按钮");
+});
+
+test("collectConfig：lxmusic 下无激活源时拒绝提交", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { LX_SOURCE_LIST: '[{"name":"甲","url":"file:///a.js","active":false}]' },
+  });
+  await global.loadConfig();
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    assert.throws(() => global.collectConfig(), /请至少激活一个洛雪源/);
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+});
+
+test("collectConfig：有激活源时提交列表且不提交 LX_SOURCE_URL（后端派生）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_LIST: JSON.stringify([
+        { name: "甲", url: "file:///a.js", active: true },
+        { name: "乙", url: "file:///b.js", active: false },
+      ]),
+    },
+  });
+  await global.loadConfig();
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    const values = global.collectConfig();
+    assert.strictEqual(values.LX_SOURCE_URL, undefined);
+    assert.deepStrictEqual(JSON.parse(values.LX_SOURCE_LIST), [
+      { name: "甲", url: "file:///a.js", active: true },
+      { name: "乙", url: "file:///b.js", active: false },
+    ]);
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
 });
 
 test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {

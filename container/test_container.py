@@ -115,19 +115,23 @@ def test_export_source_env_from_env_file(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(
         "LX_SOURCE_URL='https://example.com/lx.js'\n"
+        "LX_SOURCE_LIST='[{\"name\":\"a\",\"url\":\"https://example.com/lx.js\",\"active\":true}]'\n"
         "LX_SOURCES=kw,kg\n"
         "MUSICDL_SOURCES=kugou,netease\n",
         encoding="utf-8",
     )
     lib = CONTAINER_DIR / "env_flag.sh"
-    script = f'. "{lib}"; export_source_env; printenv LX_SOURCE_URL; printenv LX_SOURCES; printenv MUSICDL_SOURCES\n'
+    script = (f'. "{lib}"; export_source_env; printenv LX_SOURCE_URL; printenv LX_SOURCE_LIST; '
+              'printenv LX_SOURCES; printenv MUSICDL_SOURCES\n')
     out = subprocess.run(
         ["sh", "-c", script], capture_output=True, text=True,
         env={"PATH": os.environ["PATH"], "FNMUSIC_ENV_FILE": str(env_file)}, timeout=15,
     )
     assert out.returncode == 0, out.stderr
     lines = out.stdout.strip().splitlines()
-    assert lines == ["https://example.com/lx.js", "kw,kg", "kugou,netease"]
+    assert lines == ["https://example.com/lx.js",
+                     "[{\"name\":\"a\",\"url\":\"https://example.com/lx.js\",\"active\":true}]",
+                     "kw,kg", "kugou,netease"]
 
 
 # ---------------------------------------------------------------- entrypoint.sh

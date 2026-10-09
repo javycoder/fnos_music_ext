@@ -21,6 +21,7 @@ set -euo pipefail
 #   ./install.sh --sources musicdl --sources=2,4 形式同下
 #   ./install.sh --sources musicbox
 #   ./install.sh --sources lxmusic --lx-source-url 'https://example.com/lx.js'
+#   ./install.sh --sources lxmusic --lx-source-url 'https://a/lx1.js,https://b/lx2.js'  # 多源同时激活
 #   ./install.sh --non-interactive --sources musicdl --webui \
 #       --enable-recommend --llm-base-url https://api.example.com/v1 --llm-api-key '***'
 # ==============================================================================
@@ -54,8 +55,10 @@ LX_PLATFORMS=""
 MDL_PLATFORMS=""
 LX_EXPLICIT=0
 MDL_EXPLICIT=0
-# 洛雪自定义源脚本 URL（CLI 或向导输入；安装后校验通过才激活）
+# 洛雪自定义源脚本 URL（CLI 或向导输入；支持逗号分隔多个；安装后校验通过才激活。
+# 经下方规范化后：本机 .js 路径已复制进数据卷并转为 file://，LX_SOURCE_URLS 为逗号分隔规范 URL）
 LX_SOURCE_URL_CLI=""
+LX_SOURCE_URLS=""
 # 跳过洛雪源可用性校验（--lx-skip-verify）：直接激活，源好坏交给 WebUI 观察；
 # 用于向导/升级场景不想因源服务器临时故障中断安装
 LX_SKIP_VERIFY=0
@@ -86,9 +89,11 @@ usage() {
                          示例: --sources musicbox
                                --sources musicdl-kuwo,musicdl-migu
                                --sources lxmusic --lx-source-url https://example.com/lx.js
+                               --sources lxmusic --lx-source-url 'https://a/lx1.js,https://b/lx2.js'（多源同时激活）
                                --sources lxmusic（无源安装，装后在管理页配置）
                          非交互缺省: musicdl
-  --lx-source-url SRC    洛雪自定义源脚本地址：http(s) URL、file:// URL 或本机 .js 文件路径
+  --lx-source-url SRC    洛雪自定义源脚本地址：http(s) URL、file:// URL 或本机 .js 文件路径，
+                         逗号分隔可同时配置多个源（全部校验通过后同时激活）
                          （本机路径会复制进 sources-data/lxmusic/uploads/ 并转为 file://；
                           留空=无源安装，装好在管理页 WebUI 配置）
   --lx-skip-verify       跳过洛雪源可用性校验（下载→init→搜索→解析→探活）直接激活；
@@ -819,43 +824,57 @@ ensure_docker_ready
 
 parse_sources "${SOURCES_RAW}"
 
-# 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置）；
+# 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置），逗号分隔可配多个同时激活；
 # 传入主机上存在的 .js 文件路径时自动复制进 sources-data/lxmusic/uploads/ 并转 file:// URL
 if [ "${ENABLE_LX}" -eq 1 ]; then
-    case "${LX_SOURCE_URL_CLI}" in
-        ""|http://*|https://*|file://*) ;;
+    _lx_rest="${LX_SOURCE_URL_CLI}"
+    while [ -n "${_lx_rest}" ]; do
+        _lx_entry="${_lx_rest%%,*}"
+        case "${_lx_rest}" in
+            *,*) _lx_rest="${_lx_rest#*,}" ;;
+            *)   _lx_rest="" ;;
+        esac
+        _lx_entry="$(printf '%s' "${_lx_entry}" | tr -d '[:space:]')"
+        [ -z "${_lx_entry}" ] && continue
+        case "${_lx_entry}" in
+            http://*|https://*|file://*) ;;
+            *)
+                # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
+                LX_HOST_FILE="${_lx_entry}"
+                if [ ! -f "${LX_HOST_FILE}" ]; then
+                    log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
+                    exit 1
+                fi
+                case "${LX_HOST_FILE}" in
+                    *.js|*.JS) : ;;
+                    *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
+                esac
+                LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
+                mkdir -p "${LX_UPLOAD_DIR}"
+                LX_BASENAME="$(basename "${LX_HOST_FILE}")"
+                if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
+                    LX_BASENAME="$(date +%s)-${LX_BASENAME}"
+                fi
+                cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
+                _lx_entry="file:///data/lxmusic/uploads/${LX_BASENAME}"
+                log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
+                ;;
+        esac
+        case "${LX_SOURCE_URLS}" in
+            "") LX_SOURCE_URLS="${_lx_entry}" ;;
+            *)  LX_SOURCE_URLS="${LX_SOURCE_URLS},${_lx_entry}" ;;
+        esac
+    done
+    case "${LX_SOURCE_URLS}" in
+        http://*|https://*|file://*|*,*|"") ;;
         *)
-            # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
-            LX_HOST_FILE="${LX_SOURCE_URL_CLI}"
-            if [ ! -f "${LX_HOST_FILE}" ]; then
-                log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
-                exit 1
-            fi
-            case "${LX_HOST_FILE}" in
-                *.js|*.JS) : ;;
-                *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
-            esac
-            LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
-            mkdir -p "${LX_UPLOAD_DIR}"
-            LX_BASENAME="$(basename "${LX_HOST_FILE}")"
-            if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
-                LX_BASENAME="$(date +%s)-${LX_BASENAME}"
-            fi
-            cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
-            LX_SOURCE_URL_CLI="file:///data/lxmusic/uploads/${LX_BASENAME}"
-            log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
-            ;;
-    esac
-    if [ -z "${LX_SOURCE_URL_CLI}" ]; then
-        log_info "未提供洛雪源（无源安装）：装好后在飞牛管理员打开的管理页配置源脚本并激活"
-    fi
-    case "${LX_SOURCE_URL_CLI}" in
-        ""|http://*|https://*|file://*) : ;;
-        *)
-            log_err "洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径: ${LX_SOURCE_URL_CLI}"
+            log_err "洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径: ${LX_SOURCE_URLS}"
             exit 1
             ;;
     esac
+    if [ -z "${LX_SOURCE_URLS}" ]; then
+        log_info "未提供洛雪源（无源安装）：装好后在飞牛管理员打开的管理页配置源脚本并激活"
+    fi
 fi
 
 MDL_SUMMARY=""
@@ -962,6 +981,19 @@ WEBUI_FLAG="false"
 # 三源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
+
+# 逗号分隔 URL → LX_SOURCE_LIST JSON（[{name,url,active:true},...]，name 取 URL 尾段，装好后可在 WebUI 改名）
+lx_source_list_json() {
+    python3 -c '
+import json, sys
+urls = [u.strip() for u in (sys.argv[1] or "").split(",") if u.strip()]
+def _name(u):
+    return u.split("?")[0].split("#")[0].rstrip("/").split("/")[-1] or "lx-source"
+print(json.dumps([{"name": _name(u), "url": u, "active": True} for u in urls],
+                 ensure_ascii=False, separators=(",", ":")))
+' "$1" 2>/dev/null || echo "[]"
+}
+
 ENV_DESIRED="$(mktemp)"
 {
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
@@ -986,9 +1018,11 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
-    if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then
-        # 源 URL 种子：容器首启加载，安装后校验通过再激活并推导 LX_SOURCES
-        echo "LX_SOURCE_URL='$(dotenv_escape "${LX_SOURCE_URL_CLI}")'"
+    if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ]; then
+        # 源种子（全部标记激活）：容器首启/重启时按此自愈恢复多源激活；
+        # LX_SOURCE_URL 为派生兼容字段 = 第一个激活源
+        echo "LX_SOURCE_LIST='$(dotenv_escape "$(lx_source_list_json "${LX_SOURCE_URLS}")")'"
+        echo "LX_SOURCE_URL='$(dotenv_escape "${LX_SOURCE_URLS%%,*}")'"
     fi
     if [ "${LX_EXPLICIT}" -eq 1 ]; then
         echo "LX_SOURCES='$(dotenv_escape "${LX_PLATFORMS}")'"
@@ -1013,8 +1047,8 @@ ENV_DESIRED="$(mktemp)"
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
-# lx 源 URL 种子（校验通过后会再写一次推导出的 LX_SOURCES）
-[ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_URL"
+# lx 源种子（校验通过后会再写一次推导出的 LX_SOURCE_LIST/LX_SOURCES）
+[ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_LIST,LX_SOURCE_URL"
 # 平台显式选择（向导菜单或 lx-kw/musicdl-kuwo 等 token）时覆盖平台键；裸音源 token 不动既有值
 [ "${LX_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCES"
 [ "${MDL_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_ONLINE_SOURCES,MUSICDL_SOURCES"
@@ -1205,106 +1239,146 @@ install_sources_container() {
     return 0
 }
 
-# 洛雪源校验回路：容器内 verify_source.py 全链路校验（下载→init→搜索→解析→探活），
-# 成功则 POST /api/v1/source 激活持久化 + 推导平台写回 .env；失败按分类提示循环重输。
+# 洛雪源校验激活回路：逐个源走 HTTP 全链路校验（下载→init→搜索→解析→探活），
+# 通过后逐个 POST /api/v1/source 叠加激活（多源同时生效），平台并集与最终激活集写回 .env；
+# 失败按分类提示循环重输。$1 = 逗号分隔的源 URL 列表。
 # --lx-skip-verify：跳过全链路校验直接激活（可用性交给 WebUI 观察，安装不中断）。
-lx_verify_and_activate() {
-    local url="${1}"
-    local report platforms
-    if [ "${LX_SKIP_VERIFY:-0}" -eq 1 ]; then
-        log_warn "已指定 --lx-skip-verify：跳过洛雪源可用性校验，直接激活"
-        if curl -sf -X POST "http://127.0.0.1:8772/api/v1/source" \
-            -H "Content-Type: application/json" \
-            -d "{\"url\": \"$(dotenv_escape "${url}")\"}" >/dev/null 2>&1; then
-            log_info "洛雪源已激活并持久化（未做可用性校验，如不可用请在 WebUI 中查看/更换）"
-        else
-            log_warn "洛雪源激活失败（脚本无法加载或 URL 不可达）：请在 WebUI(8774) 中检查源 URL"
-        fi
-        return 0
-    fi
-    while :; do
-        log_info "校验洛雪源（下载→init→搜索→解析→探活）..."
-        report="$(run_docker exec -w /srv/lxmusic-service "${CONTAINER_NAME}" \
-            python3 verify_source.py --json "${url}" 2>/dev/null || true)"
-        if [ -n "${report}" ] && printf '%s' "${report}" | python3 -c '
+lx_verify_request() {
+    curl -s --max-time 140 -X POST "http://127.0.0.1:8772/api/v1/source/verify" \
+        -H "Content-Type: application/json" \
+        -d "{\"url\": \"$(dotenv_escape "$1")\"}" 2>/dev/null || true
+}
+
+lx_report_ok() {
+    printf '%s' "${1:-}" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
     sys.exit(1)
 sys.exit(0 if d.get("ok") else 1)
-' 2>/dev/null; then
-            platforms="$(printf '%s' "${report}" | python3 -c '
-import json, sys
-d = json.loads(sys.stdin.read())
-print(",".join(d.get("platforms") or []))
-' 2>/dev/null || true)"
-            break
-        fi
-        # 失败：提取错误分类与报告原文（verify 输出 JSON 的 error 字段）
-        local err_kind err_msg
-        err_kind="$(printf '%s' "${report}" | python3 -c '
+' 2>/dev/null
+}
+
+lx_report_platforms() {
+    printf '%s' "${1:-}" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
-    sys.exit(0)
-print(d.get("category") or "unknown")
-' 2>/dev/null || true)"
-        err_msg="$(printf '%s' "${report}" | python3 -c '
+    print(""); raise SystemExit
+print(",".join((d.get("data") or {}).get("platforms") or d.get("platforms") or []))
+' 2>/dev/null || true
+}
+
+lx_report_field() {
+    printf '%s' "${1:-}" | python3 -c '
 import json, sys
+key = sys.argv[1]
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
-    sys.exit(0)
-print((d.get("message") or "")[:160])
-' 2>/dev/null || true)"
-        log_warn "洛雪源校验未通过（${err_kind:-无输出}）：${url}"
-        if [ "${NON_INTERACTIVE}" -eq 1 ]; then
-            log_err "洛雪源校验未通过（${err_kind:-unknown}）：${err_msg:-verify_source.py 无输出}"
-            log_err "安装已中止。可：1) 更换源脚本 URL 后重试；2) 改选 musicdl/musicbox 音源；"
-            log_err "3) 重装时勾选/追加 --lx-skip-verify 跳过校验（装好后在管理页 WebUI 查看/重配）"
-            return 1
-        fi
-        url="$(prompt "请重新输入洛雪源 URL（直接回车保留原值重试，输入 q 放弃激活）" "${url}")"
-        case "${url}" in
-            q|Q|quit|exit)
-                log_warn "跳过洛雪源激活：lxmusic 以无源状态运行，可稍后在 WebUI 中配置"
-                return 0
-                ;;
+    print(""); raise SystemExit
+data = d.get("data") or {}
+print(str(data.get(key) or d.get(key) or "")[:160])
+' "${2}" 2>/dev/null || true
+}
+
+lx_merge_csv() {
+    python3 -c '
+import sys
+a = [x for x in (sys.argv[1] or "").split(",") if x]
+for x in (sys.argv[2] or "").split(","):
+    if x and x not in a:
+        a.append(x)
+print(",".join(a))
+' "${1:-}" "${2:-}" 2>/dev/null || printf '%s' "${1:-}"
+}
+
+lx_verify_and_activate() {
+    local rest="${1}"
+    local accepted=""          # 已通过校验（或已激活）的 URL，写回 .env 作为多源激活种子
+    local platforms_union=""
+    local entry report platforms err_kind err_msg give_up=0
+    if [ "${LX_SKIP_VERIFY:-0}" -eq 1 ]; then
+        log_warn "已指定 --lx-skip-verify：跳过洛雪源可用性校验，直接激活"
+    fi
+    while [ -n "${rest}" ]; do
+        entry="${rest%%,*}"
+        case "${rest}" in
+            *,*) rest="${rest#*,}" ;;
+            *)   rest="" ;;
         esac
+        [ -z "${entry}" ] && continue
+        platforms=""
+        if [ "${LX_SKIP_VERIFY:-0}" -ne 1 ]; then
+            while :; do
+                log_info "校验洛雪源（下载→init→搜索→解析→探活）: ${entry}"
+                report="$(lx_verify_request "${entry}")"
+                if lx_report_ok "${report}"; then
+                    platforms="$(lx_report_platforms "${report}")"
+                    break
+                fi
+                err_kind="$(lx_report_field "${report}" category)"
+                err_msg="$(lx_report_field "${report}" message)"
+                log_warn "洛雪源校验未通过（${err_kind:-无输出}）：${entry}"
+                if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+                    log_err "洛雪源校验未通过（${err_kind:-unknown}）：${err_msg:-校验服务无响应}"
+                    log_err "安装已中止。可：1) 更换源脚本 URL 后重试；2) 改选 musicdl/musicbox 音源；"
+                    log_err "3) 重装时勾选/追加 --lx-skip-verify 跳过校验（装好后在管理页 WebUI 查看/重配）"
+                    return 1
+                fi
+                entry="$(prompt "请重新输入洛雪源 URL（直接回车保留原值重试，输入 q 放弃剩余源激活）" "${entry}")"
+                case "${entry}" in
+                    q|Q|quit|exit)
+                        log_warn "跳过剩余洛雪源激活：lxmusic 以已激活源状态运行，可稍后在 WebUI 中配置"
+                        give_up=1
+                        break
+                        ;;
+                esac
+            done
+            [ "${give_up}" -eq 1 ] && break
+            # 校验通过即纳入 .env 激活种子（激活请求失败时容器首启仍会按种子自愈）
+            case "${accepted}" in
+                "") accepted="${entry}" ;;
+                *)  accepted="${accepted},${entry}" ;;
+            esac
+        fi
+        # 激活并持久化（多源叠加语义，已启用源不受影响）
+        if curl -sf --max-time 140 -X POST "http://127.0.0.1:8772/api/v1/source" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"$(dotenv_escape "${entry}")\"}" >/dev/null 2>&1; then
+            log_info "洛雪源已激活并持久化: ${entry}"
+            case "${accepted}" in
+                *"${entry}"*) : ;;
+                "") accepted="${entry}" ;;
+                *)  accepted="${accepted},${entry}" ;;
+            esac
+        else
+            log_warn "洛雪源激活请求失败（服务仍以种子配置运行，可稍后在 WebUI 重试）: ${entry}"
+        fi
+        if [ -n "${platforms}" ]; then
+            platforms_union="$(lx_merge_csv "${platforms_union}" "${platforms}")"
+        fi
     done
 
-    # 激活并持久化（state.json 存 /data/lxmusic，容器重启自动恢复）
-    if curl -sf -X POST "http://127.0.0.1:8772/api/v1/source" \
-        -H "Content-Type: application/json" \
-        -d "{\"url\": \"$(dotenv_escape "${url}")\"}" >/dev/null 2>&1; then
-        log_info "洛雪源已激活并持久化"
-    else
-        log_warn "洛雪源激活请求失败（服务仍以种子 URL 运行，可稍后在 WebUI 重试）"
-    fi
-
-    # 校验通过的 URL 与推导平台写回 .env（LX_SOURCES=内置可搜索平台 ∩ 源声明平台）
-    if [ -n "${url}" ] && [ "${url}" != "${LX_SOURCE_URL_CLI}" ]; then
+    # 实际通过校验的源集合（多源）、派生激活指针与平台并集写回 .env
+    if [ -n "${accepted}" ]; then
         ENV_DESIRED2="$(mktemp)"
         {
-            echo "LX_SOURCE_URL='$(dotenv_escape "${url}")'"
+            echo "LX_SOURCE_LIST='$(dotenv_escape "$(lx_source_list_json "${accepted}")")'"
+            echo "LX_SOURCE_URL='$(dotenv_escape "${accepted%%,*}")'"
         } > "${ENV_DESIRED2}"
+        local explicit_keys="LX_SOURCE_LIST,LX_SOURCE_URL"
+        if [ -n "${platforms_union}" ]; then
+            echo "LX_SOURCES='$(dotenv_escape "${platforms_union}")'" >> "${ENV_DESIRED2}"
+            explicit_keys="${explicit_keys},LX_SOURCES"
+            log_info "洛雪源可用平台并集: ${platforms_union}（已写回 .env）"
+        fi
         python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
             --desired "${ENV_DESIRED2}" --output "${ENV_PATH}" \
-            --explicit "LX_SOURCE_URL" --quiet
+            --explicit "${explicit_keys}" --quiet
         rm -f "${ENV_DESIRED2}"
-    fi
-    if [ -n "${platforms}" ]; then
-        ENV_DESIRED2="$(mktemp)"
-        {
-            echo "LX_SOURCES='$(dotenv_escape "${platforms}")'"
-        } > "${ENV_DESIRED2}"
-        python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
-            --desired "${ENV_DESIRED2}" --output "${ENV_PATH}" \
-            --explicit "LX_SOURCES" --quiet
-        rm -f "${ENV_DESIRED2}"
-        log_info "洛雪源可用平台: ${platforms}（已写回 .env）"
     fi
     chmod 600 "${ENV_PATH}"
     return 0
@@ -1320,8 +1394,8 @@ fi
 
 takeover preflight --base "${BASE_DIR}"
 install_sources_container
-if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then
-    lx_verify_and_activate "${LX_SOURCE_URL_CLI}"
+if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ]; then
+    lx_verify_and_activate "${LX_SOURCE_URLS}"
 fi
 
 takeover preflight --base "${BASE_DIR}"

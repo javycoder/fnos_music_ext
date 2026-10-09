@@ -16,7 +16,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 - **三音源单选**（v2.0.0 起互斥，可在 WebUI 秒级切换）：
   - [musicbox](https://github.com/darknessomi/musicbox)：网易云高品质解析，支持扫码登录 VIP/无损曲库与原生每日推荐；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)：酷我/咪咕等 57 个平台聚合，可按平台粒度勾选（编号见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）。部分音乐源歌曲少，或返回的音乐不可播放，请自行测试并使用可靠音乐源；
-  - **lxmusic**：洛雪音乐自定义源运行时——搜索/歌词/榜单走内置平台接口，播放解析由你提供的洛雪自定义源脚本（在容器内执行）完成。源脚本支持三种配置方式：**粘贴 URL**、**上传电脑上的 `.js` 文件**、**从 NAS 选择 `.js`**（飞牛桌面内）。导入 URL 或 `.js` 前必须自行确认来源安全，不要导入来历不明的脚本；脚本在容器内执行。搜索结果以及能否播放视源脚本而定；
+  - **lxmusic**：洛雪音乐自定义源运行时——搜索/歌词/榜单走内置平台接口，播放解析由你提供的洛雪自定义源脚本（在容器内执行）完成。源脚本支持三种配置方式：**粘贴 URL**、**上传电脑上的 `.js` 文件**、**从 NAS 选择 `.js`**（飞牛桌面内）。支持**多源同时激活**（v2.8.0 起）：列表里可勾选多个源一起生效，解析失败自动在启用的源之间接力切换；`install.sh --lx-source-url` 也支持逗号分隔一次配置多个。导入 URL 或 `.js` 前必须自行确认来源安全，不要导入来历不明的脚本；脚本在容器内执行。搜索结果以及能否播放视源脚本而定；
 - **管理 WebUI**（可选，仅本机 8774）：在已登录的飞牛管理员页面打开。浏览器里完成音源切换、musicdl 平台勾选、网易扫码、洛雪源配置（URL/上传/NAS 选择）与测试保存、音质偏好、边听边存、推荐开关与 LLM 配置，全部热生效；
 - **音质偏好**：`高音质`（从高到低）/ `平衡`（取中间档）/ `流畅`（优先最低）三种模式，覆盖全部音源；只影响在线播放/搜索取源档位；
 - **下载音质**（v2.8.0 起）：`跟随 App`（默认，App 明确选"标准"才交 MP3 320k，其余一律交付无损原文件）/ `无损原文件` / `MP3 320k`；只影响 App 里点"下载"拿到的文件，无损歌曲不会被擅自转成 MP3；
@@ -68,7 +68,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
 
 - 桌面会出现「fnMusic 扩展管理」图标，点击即在飞牛桌面窗口内打开管理页（音源切换/扫码登录/平台选择/洛雪源配置）；
-- 选洛雪音源时向导不索要任何源信息：装好后打开管理页，在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑 `.js` 文件或从 NAS 选择，测试可用后保存即激活；
+- 选洛雪音源时向导不索要任何源信息：装好后打开管理页，在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑 `.js` 文件或从 NAS 选择，点源的「激活」做标记后保存即生效；支持多个源同时激活，解析失败自动在启用的源之间接力切换；
 - 在应用中心可随时「停止」（秒级还原官方直连）与「启动」（恢复扩展）；
 - 卸载前会自动把配置与数据（.env、网易云登录、收藏、播放历史）备份为存储卷根目录的 `fnmusic-ext-backup-<时间戳>.tar.gz`，需要彻底清理时手动删除该文件即可；
 - 也可用命令行安装：`sudo appcenter-cli install-fpk fnmusic-ext-<版本>.fpk`。
@@ -98,10 +98,12 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 # musicdl（酷我+咪咕精选）
 ./install.sh --non-interactive --sources musicdl --extend
 
-# 洛雪自定义源（可选直接给源：http(s) URL 或本机 .js 文件路径；
+# 洛雪自定义源（可选直接给源：http(s) URL 或本机 .js 文件路径，逗号分隔可配多个同时激活；
 # 不给则无源安装，装好在管理页 WebUI 里配置 URL / 上传 .js / NAS 选择）
 ./install.sh --non-interactive --sources lxmusic \
   --lx-source-url 'https://example.com/your-source.js' --extend
+./install.sh --non-interactive --sources lxmusic \
+  --lx-source-url 'https://a.example.com/src1.js,https://b.example.com/src2.js' --extend  # 多源同时激活
 ./install.sh --non-interactive --sources lxmusic \
   --lx-source-url "$HOME/scripts/my-source.js" --extend   # 本机路径自动复制进数据卷
 ./install.sh --non-interactive --sources lxmusic --webui --extend  # 无源安装
@@ -138,7 +140,8 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | :--- | :--- | :--- |
 | `FNMUSIC_MUSICDL_ENABLED` / `FNMUSIC_NETEASE_ENABLED` / `FNMUSIC_LX_ENABLED` | 单选 | 三音源互斥开关，只能一个为 `true`（热重载） |
 | `FNMUSIC_WEBUI_ENABLED` | `false` | 管理 WebUI 开关（仅本机 8774，飞牛管理员打开） |
-| `LX_SOURCE_URL` | *(空)* | 洛雪自定义源脚本地址：`http(s)://` URL 或 `file:///data/lxmusic/uploads/<名字>.js`（管理页上传/NAS 选择生成）；建议在 WebUI 里「测试并保存」 |
+| `LX_SOURCE_URL` | *(空)* | 洛雪自定义源脚本地址：`http(s)://` URL 或 `file:///data/lxmusic/uploads/<名字>.js`（管理页上传/NAS 选择生成）；多源激活时为派生字段 = 第一个激活项；建议在 WebUI 里配置 |
+| `LX_SOURCE_LIST` | `[]` | 洛雪源列表（JSON，管理台维护）：`[{"name":"备注","url":"…","active":true},…]`，多个 `active:true` 的源**同时激活**，解析失败自动接力切换 |
 | `LX_SOURCES` | `kg,wy,mg,kw` | lxmusic 启用的平台（kg/wy/mg/kw/tx） |
 | `FNMUSIC_ONLINE_SOURCES` / `MUSICDL_SOURCES` | 酷我+咪咕 | musicdl 平台白名单（短名/全名均可） |
 | `FNMUSIC_QUALITY_MODE` | `high` | 音质偏好：`high` / `balanced` / `smooth`（热重载；只影响在线取源档位） |

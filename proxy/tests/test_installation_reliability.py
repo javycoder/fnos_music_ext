@@ -579,8 +579,9 @@ def test_lx_url_required_and_webui_choice_wiring():
     assert 'file:///data/lxmusic/uploads/' in text
     assert '洛雪源文件必须是 .js 后缀' in text
     assert '洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径' in text
-    # 容器内校验必须 --json，安装脚本才能按 category 分类提示
-    assert 'verify_source.py --json' in text
+    # 校验必须走 lxmusic HTTP 端点（verify_source.py --json 已无 CLI 入口，属死路径）
+    assert '/api/v1/source/verify' in text
+    assert 'verify_source.py --json' not in text
     # WebUI：CLI 双向开关 + 向导询问 + 非交互默认不装 + 写入 .env
     assert '--webui) WEBUI_CHOICE="yes"' in text
     assert '--no-webui) WEBUI_CHOICE="no"' in text

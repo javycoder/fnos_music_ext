@@ -948,11 +948,17 @@ def _lx_source_entries() -> list[dict]:
 
 
 def _lx_source_remark() -> str:
-    """当前激活洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。"""
+    """当前洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。
+
+    多源同时激活时无法把单曲归属到具体源，返回空（回退 [lx] 标记）。"""
+    entries = _lx_source_entries()
+    active = [e for e in entries if e.get("active")]
+    if active:
+        return str(active[0].get("name") or "").strip() if len(active) == 1 else ""
     url = str(CONF.get("lx_source_url") or "").strip()
     if not url:
         return ""
-    for entry in _lx_source_entries():
+    for entry in entries:
         if str(entry.get("url") or "").strip() == url:
             return str(entry.get("name") or "").strip()
     return ""

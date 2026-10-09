@@ -222,10 +222,24 @@ def test_source_management_endpoints(test_app_client, fake_lx):
     res = test_app_client.post("/api/v1/source", json={"url": data["url"]})
     assert res.status_code == 200
     assert res.json()["ok"] is True
-    # 单源语义：目标启用、其余禁用
+    # 多源叠加语义：目标启用、既有激活源保持不变
     states = {s["id"]: s["enabled"] for s in fake_lx.sources}
     assert states.get("MyTest.js") is True
-    assert states.get("source1") is False
+    assert states.get("source1") is True
+
+    # enabled=false：停用目标源，其余不受影响
+    res = test_app_client.post("/api/v1/source", json={"url": data["url"], "enabled": False})
+    assert res.status_code == 200
+    states = {s["id"]: s["enabled"] for s in fake_lx.sources}
+    assert states.get("MyTest.js") is False
+    assert states.get("source1") is True
+
+    # describe 返回全部启用源列表
+    res = test_app_client.get("/api/v1/source")
+    src_data = res.json()["data"]
+    assert src_data["configured"] is True
+    assert src_data["active_count"] == 1
+    assert [s["id"] for s in src_data["sources"]] == ["source1"]
 
     # DELETE /api/v1/source (清除)
     res = test_app_client.delete("/api/v1/source")
@@ -341,15 +355,15 @@ def test_verify_source_json_format_guard():
 
 
 def test_source_set_http_url_activates_target(test_app_client, fake_lx):
-    """测试通过 HTTP URL 设置源，能够正确导入并激活该源（单源生效）。"""
+    """测试通过 HTTP URL 设置源，能够正确导入并激活该源（多源叠加，不动既有源）。"""
     res = test_app_client.post("/api/v1/source", json={"url": "https://example.com/remote_source.js"})
     assert res.status_code == 200
     assert res.json()["ok"] is True
     assert "https://example.com/remote_source.js" in fake_lx.import_calls
-    # 验证目标源已被激活，旧源已被禁用
+    # 验证目标源已被激活，旧激活源保持不变
     states = {s["id"]: s["enabled"] for s in fake_lx.sources}
     assert states.get("remote_source.js") is True
-    assert states.get("source1") is False
+    assert states.get("source1") is True
 
 
 def test_activate_nonexistent_source_does_not_disable_existing():
@@ -374,10 +388,102 @@ def test_activate_nonexistent_source_does_not_disable_existing():
     client.list_custom_sources = fake_list
     client.toggle_custom_source = fake_toggle
 
-    ok = asyncio.run(client.activate_single_source("non_existent_source"))
+    ok = asyncio.run(client.set_source_enabled("non_existent_source", True))
     assert ok is False
     # 没有任何 toggle 被执行，旧源保持原样
     assert toggled == []
+
+
+def test_set_source_enabled_overlay_semantics():
+    """set_source_enabled 只改目标源启用态，多源可同时启用。"""
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test")
+    sources = [
+        {"id": "source1", "name": "source1", "enabled": True},
+        {"id": "source2", "name": "source2", "enabled": False},
+    ]
+    toggled = []
+
+    async def fake_list():
+        return list(sources)
+
+    async def fake_toggle(sid, enable):
+        toggled.append((sid, enable))
+        for s in sources:
+            if s["id"] == sid:
+                s["enabled"] = enable
+        return True
+
+    client.list_custom_sources = fake_list
+    client.toggle_custom_source = fake_toggle
+
+    assert asyncio.run(client.set_source_enabled("source2", True)) is True
+    assert toggled == [("source2", True)]
+    assert {s["id"]: s["enabled"] for s in sources} == {"source1": True, "source2": True}
+
+    # 支持按名称匹配
+    assert asyncio.run(client.set_source_enabled("source1", False)) is True
+    assert toggled == [("source2", True), ("source1", False)]
+
+
+def test_source_capabilities_union_of_enabled_sources():
+    """多源同时激活时 capabilities 按启用源平台并集判定。"""
+    from app import source_capabilities
+    import app as lxapp
+
+    orig_lx = lxapp.LXSERVER
+    try:
+        class MultiClient:
+            async def is_alive(self):
+                return True
+
+            async def list_custom_sources(self):
+                return [
+                    {"id": "a.js", "name": "a", "enabled": True, "supportedSources": ["kw", "kg"]},
+                    {"id": "b.js", "name": "b", "enabled": True, "supportedSources": ["wy", "tx"]},
+                    {"id": "c.js", "name": "c", "enabled": False, "supportedSources": ["mg"]},
+                ]
+
+        lxapp.LXSERVER = MultiClient()
+        caps = asyncio.run(source_capabilities())
+        assert caps["kw"]["playback_available"] is True
+        assert caps["kg"]["playback_available"] is True
+        assert caps["wy"]["playback_available"] is True
+        assert caps["tx"]["playback_available"] is True
+        assert caps["mg"]["playback_available"] is False
+        assert "not supported" in caps["mg"]["reason"]
+    finally:
+        lxapp.LXSERVER = orig_lx
+
+
+def test_describe_user_source_lists_all_enabled():
+    """describe 返回全部启用源（sources 数组 + active_count），兼容字段取第一个。"""
+    from app import describe_user_source
+    import app as lxapp
+
+    orig_lx = lxapp.LXSERVER
+    try:
+        class MultiClient:
+            async def list_custom_sources(self):
+                return [
+                    {"id": "a.js", "name": "src-a", "enabled": True, "version": "1.0",
+                     "supportedSources": ["kw", "kg"]},
+                    {"id": "b.js", "name": "src-b", "enabled": True, "version": "2.0",
+                     "supportedSources": ["wy"]},
+                    {"id": "c.js", "name": "src-c", "enabled": False, "version": "1.0",
+                     "supportedSources": ["mg"]},
+                ]
+
+        lxapp.LXSERVER = MultiClient()
+        desc = asyncio.run(describe_user_source())
+        assert desc["configured"] is True
+        assert desc["active_count"] == 2
+        assert [s["id"] for s in desc["sources"]] == ["a.js", "b.js"]
+        assert [s["platforms"] for s in desc["sources"]] == [["kw", "kg"], ["wy"]]
+        assert desc["source"]["name"] == "src-a"
+    finally:
+        lxapp.LXSERVER = orig_lx
 
 
 def test_source_capabilities_reflects_failed_status():
@@ -410,6 +516,73 @@ def test_source_capabilities_reflects_failed_status():
         lxapp.LXSERVER = orig_lx
 
 
+
+def test_env_active_source_urls_parsing(monkeypatch):
+    """LX_SOURCE_LIST 环境变量解析：仅取 active 标记项的 URL，非法输入返回空。"""
+    from app import _env_active_source_urls
+
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
+        {"name": "a", "url": "https://s/a.js", "active": True},
+        {"name": "b", "url": "https://s/b.js", "active": False},
+        {"name": "c", "url": "https://s/c.js", "active": True},
+        {"name": "d", "url": "", "active": True},
+    ]))
+    assert _env_active_source_urls() == ["https://s/a.js", "https://s/c.js"]
+
+    monkeypatch.setenv("LX_SOURCE_LIST", "not-json")
+    assert _env_active_source_urls() == []
+    monkeypatch.setenv("LX_SOURCE_LIST", "")
+    assert _env_active_source_urls() == []
+    monkeypatch.delenv("LX_SOURCE_LIST", raising=False)
+    assert _env_active_source_urls() == []
+
+
+def test_bootstrap_migration_restores_multi_active_sources(tmp_path, monkeypatch):
+    """lxserver 无启用源（数据卷被清）时，按 LX_SOURCE_LIST 的 active 标记叠加恢复多源。"""
+    from conftest import FakeLxServerClient
+
+    fake = FakeLxServerClient()
+    for s in fake.sources:
+        s["enabled"] = False
+    orig_lx = lxapp.LXSERVER
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path))  # 无历史 uploads/state.json
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
+        {"name": "a", "url": "https://s/a.js", "active": True},
+        {"name": "b", "url": "https://s/b.js", "active": False},
+    ]))
+    monkeypatch.delenv("LX_SOURCE_URL", raising=False)
+    try:
+        asyncio.run(lxapp._bootstrap_migration())
+    finally:
+        lxapp.LXSERVER = orig_lx
+    states = {s["id"]: s["enabled"] for s in fake.sources}
+    # a.js 经导入 + 激活；既有 source1 保持停用（叠加语义不误开）
+    assert states.get("a.js") is True
+    assert states.get("source1") is False
+
+
+def test_bootstrap_migration_falls_back_to_single_url(tmp_path, monkeypatch):
+    """旧数据兼容：LX_SOURCE_LIST 无 active 标记时回退 LX_SOURCE_URL 单值激活。"""
+    from conftest import FakeLxServerClient
+
+    fake = FakeLxServerClient()
+    for s in fake.sources:
+        s["enabled"] = False
+    orig_lx = lxapp.LXSERVER
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
+        {"name": "a", "url": "https://s/a.js", "active": False},
+    ]))
+    monkeypatch.setenv("LX_SOURCE_URL", "file:///x/source1")
+    try:
+        asyncio.run(lxapp._bootstrap_migration())
+    finally:
+        lxapp.LXSERVER = orig_lx
+    states = {s["id"]: s["enabled"] for s in fake.sources}
+    assert states.get("source1") is True
+    assert "https://s/a.js" not in fake.import_calls
 # ------------------------------------------------- 播放直链缓存与并发合并 --
 # issue #45：同曲同音质重复解析治理——成功缓存、失败负缓存、探活续期、
 # 同键在途合并、fresh 旁路与切源失效。
@@ -600,5 +773,6 @@ async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cach
     r = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
     assert r["url"] == "https://media.test/song.flac"
     await probe_client.aclose()
+
 
 

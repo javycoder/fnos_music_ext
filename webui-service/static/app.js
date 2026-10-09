@@ -16,7 +16,7 @@ let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
-let lxSourceList = [];    // 洛雪源列表 [{ name, url }]
+let lxSourceList = [];    // 洛雪源列表 [{ name, url, active }]，active 可多开
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
@@ -78,15 +78,21 @@ async function loadStatus() {
     const lxCard = $("#ov-lx-card");
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
-      const s = st.lx_source.source;
+      const ls = st.lx_source;
       const rows = [];
-      rows.push(`<div class="kv"><b>状态</b>${st.lx_source.initialized ? "已加载" : "未加载"}</div>`);
-      if (s) {
-        rows.push(`<div class="kv"><b>源名称</b>${s.name || "-"} ${s.version ? "v" + s.version : ""}</div>`);
-        rows.push(`<div class="kv"><b>平台</b>${Object.keys(s.platforms || {}).join("、") || "-"}</div>`);
-        rows.push(`<div class="kv"><b>运行</b>${s.running ? "是" : "否"}</div>`);
+      rows.push(`<div class="kv"><b>状态</b>${ls.initialized ? "已加载" : "未加载"}</div>`);
+      const sources = ls.sources || [];
+      if (sources.length) {
+        rows.push(`<div class="kv"><b>已激活源</b>${sources.length} 个：${sources.map((s) =>
+          `${escapeHtml(s.name || "-")}${s.version ? " v" + s.version : ""}`).join("、")}</div>`);
+        const plats = new Set();
+        sources.forEach((s) => (s.platforms || []).forEach((p) => plats.add(p)));
+        rows.push(`<div class="kv"><b>平台</b>${[...plats].join("、") || "-"}</div>`);
+      } else if (ls.source) {
+        rows.push(`<div class="kv"><b>源名称</b>${ls.source.name || "-"} ${ls.source.version ? "v" + ls.source.version : ""}</div>`);
+        rows.push(`<div class="kv"><b>平台</b>${Object.keys(ls.source.platforms || {}).join("、") || "-"}</div>`);
       }
-      if (st.lx_source.last_error) rows.push(`<div class="kv"><b>错误</b>${st.lx_source.last_error}</div>`);
+      if (ls.last_error) rows.push(`<div class="kv"><b>错误</b>${ls.last_error}</div>`);
       $("#ov-lx").innerHTML = rows.join("");
     } else {
       lxCard.hidden = true;
@@ -137,8 +143,8 @@ function applyConfigToForm() {
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
-  $("#lx-url").value = v.LX_SOURCE_URL || "";
-  lxVerifiedUrl = v.LX_SOURCE_URL || null;
+  $("#lx-url").value = "";
+  lxVerifiedUrl = null;
   try {
     const rawList = v.LX_SOURCE_LIST;
     lxSourceList = rawList ? JSON.parse(rawList) : [];
@@ -146,16 +152,14 @@ function applyConfigToForm() {
   } catch (_) {
     lxSourceList = [];
   }
-  const currentUrl = (v.LX_SOURCE_URL || "").trim();
-  if (currentUrl && !lxSourceList.some((item) => item.url === currentUrl)) {
-    lxSourceList.unshift({
-      name: lxDefaultName(currentUrl),
-      url: currentUrl,
-    });
+  // 兼容旧数据：列表无任何 active 标记时按 LX_SOURCE_URL 推导
+  const savedUrl = (v.LX_SOURCE_URL || "").trim();
+  if (lxSourceList.length && !lxSourceList.some((item) => item.active)) {
+    lxSourceList.forEach((item) => { item.active = !!(savedUrl && item.url === savedUrl); });
   }
-  if ($("#lx-name")) {
-    const matched = lxSourceList.find((item) => item.url === currentUrl);
-    $("#lx-name").value = (matched && matched.name) || "";
+  // .env 里有激活地址但不在列表中（异常状态）：补进列表展示真实激活态
+  if (savedUrl && !lxSourceList.some((item) => item.url === savedUrl)) {
+    lxSourceList.unshift({ name: lxDefaultName(savedUrl), url: savedUrl, active: true });
   }
   renderLxSourceList();
   syncLxAddButton();
@@ -196,9 +200,10 @@ function collectConfig() {
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
   }
   if (provider === "lxmusic") {
-    const url = $("#lx-url").value.trim();
-    if (!url) throw new Error("洛雪源需要填写脚本 URL");
-    values.LX_SOURCE_URL = url;
+    if (!lxSourceList.some((item) => item.active)) {
+      throw new Error("请至少激活一个洛雪源");
+    }
+    // LX_SOURCE_URL 由后端按第一个激活项派生写入
   }
   return values;
 }
@@ -208,7 +213,11 @@ async function saveConfig() {
   try { values = collectConfig(); } catch (exc) { toast(exc.message, "fail"); return; }
   const btn = $("#save-btn");
   btn.disabled = true;
-  btn.textContent = "保存中…";
+  // 新激活的源保存时要逐个端到端校验（每源可达 1-2 分钟），给出预期提示
+  const pendingNew = lxPendingActivationCount();
+  btn.textContent = pendingNew > 0
+    ? `保存中（校验 ${pendingNew} 个新激活源，可能需要 1-2 分钟）…`
+    : "保存中…";
   try {
     const result = await api("/api/config", {
       method: "PUT",
@@ -220,7 +229,11 @@ async function saveConfig() {
     if (result.changed && result.changed.length) parts.push(`已保存 ${result.changed.length} 项`);
     (result.actions || []).forEach((a) => {
       if (a.kind === "process") parts.push(`进程 ${a.program} ${a.op} ${a.ok ? "成功" : "失败"}`);
-      if (a.kind === "lx_activate") parts.push(`洛雪源激活${a.ok ? "成功" : "失败"}`);
+      if (a.kind === "lx_activate") {
+        const label = a.source ? `「${a.source}」` : "";
+        const op = a.op === "deactivate" ? "取消激活" : "激活";
+        parts.push(`洛雪源${label}${op}${a.ok ? "成功" : "失败"}`);
+      }
     });
     if (failed.length) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
@@ -428,10 +441,28 @@ function syncLxAddButton() {
   if (addBtn) addBtn.disabled = !url;
 }
 
+// 已保存的激活 URL 集合（旧数据无 active 标记时回退 LX_SOURCE_URL 单值）
+function lxSavedActiveUrls() {
+  const saved = new Set();
+  try {
+    const items = JSON.parse(configValues.LX_SOURCE_LIST || "[]");
+    if (Array.isArray(items)) items.forEach((i) => { if (i && i.active && i.url) saved.add(i.url); });
+  } catch (_) { /* 忽略 */ }
+  if (!saved.size) {
+    const u = (configValues.LX_SOURCE_URL || "").trim();
+    if (u) saved.add(u);
+  }
+  return saved;
+}
+
+function lxPendingActivationCount() {
+  const saved = lxSavedActiveUrls();
+  return lxSourceList.filter((i) => i.active && !saved.has(i.url)).length;
+}
+
 function renderLxSourceList() {
   const container = $("#lx-source-list");
   if (!container) return;
-  const currentUrl = ($("#lx-url")?.value || "").trim();
 
   if (!lxSourceList.length) {
     container.innerHTML = `<span class="muted pad">暂无洛雪音乐源，上传 .js 或填写脚本地址后点击「添加」加入列表</span>`;
@@ -439,38 +470,32 @@ function renderLxSourceList() {
   }
 
   container.innerHTML = lxSourceList.map((item, idx) => {
-    const isActive = item.url === currentUrl;
+    const isActive = !!item.active;
     const displayName = escapeHtml(item.name || lxDefaultName(item.url));
     const safeUrl = escapeHtml(item.url);
-    if (isActive) {
-      return `
-        <div class="lx-item on">
-          <div class="lx-item-main">
-            <div class="lx-item-header">
-              <span class="lx-item-name">${displayName}</span>
-              <span class="lx-badge">已激活</span>
-            </div>
-            <div class="lx-item-url" title="${safeUrl}">${safeUrl}</div>
-          </div>
-        </div>`;
-    }
+    const btns = isActive
+      ? `<button class="btn small lx-btn-deactivate" data-idx="${idx}">取消激活</button>
+         <button class="btn small danger lx-btn-del" data-idx="${idx}">删除</button>`
+      : `<button class="btn small lx-btn-activate" data-idx="${idx}">激活</button>
+         <button class="btn small danger lx-btn-del" data-idx="${idx}">删除</button>`;
     return `
-      <div class="lx-item">
+      <div class="lx-item${isActive ? " on" : ""}">
         <div class="lx-item-main">
           <div class="lx-item-header">
             <span class="lx-item-name">${displayName}</span>
+            ${isActive ? `<span class="lx-badge">已激活</span>` : ""}
           </div>
           <div class="lx-item-url" title="${safeUrl}">${safeUrl}</div>
         </div>
-        <div class="lx-item-btns">
-          <button class="btn small lx-btn-activate" data-idx="${idx}">激活</button>
-          <button class="btn small danger lx-btn-del" data-idx="${idx}">删除</button>
-        </div>
+        <div class="lx-item-btns">${btns}</div>
       </div>`;
   }).join("");
 
   container.querySelectorAll(".lx-btn-activate").forEach((btn) => {
     btn.addEventListener("click", () => activateLxSource(parseInt(btn.dataset.idx, 10)));
+  });
+  container.querySelectorAll(".lx-btn-deactivate").forEach((btn) => {
+    btn.addEventListener("click", () => deactivateLxSource(parseInt(btn.dataset.idx, 10)));
   });
   container.querySelectorAll(".lx-btn-del").forEach((btn) => {
     btn.addEventListener("click", () => deleteLxSource(parseInt(btn.dataset.idx, 10)));
@@ -479,14 +504,20 @@ function renderLxSourceList() {
 
 function activateLxSource(idx) {
   const item = lxSourceList[idx];
-  if (!item) return;
-  $("#lx-url").value = item.url;
-  if ($("#lx-name")) $("#lx-name").value = item.name || "";
-  lxVerifiedUrl = null;
+  if (!item || item.active) return;
+  item.active = true;
   renderLxSourceList();
-  syncLxAddButton();
-  markDirty("已切换激活源，需点击下方「保存并生效」");
-  toast(`已激活「${item.name || lxDefaultName(item.url)}」，请点击下方「保存并生效」`, "ok");
+  markDirty("已标记激活，需点击下方「保存并生效」（新激活源会先自动校验）");
+  toast(`已标记激活「${item.name || lxDefaultName(item.url)}」，请点击下方「保存并生效」`, "ok");
+}
+
+function deactivateLxSource(idx) {
+  const item = lxSourceList[idx];
+  if (!item || !item.active) return;
+  item.active = false;
+  renderLxSourceList();
+  markDirty("已标记取消激活，需点击下方「保存并生效」");
+  toast(`已标记取消激活「${item.name || lxDefaultName(item.url)}」，保存后停用`, "ok");
 }
 
 function deleteLxSource(idx) {
@@ -496,7 +527,7 @@ function deleteLxSource(idx) {
   lxSourceList.splice(idx, 1);
   renderLxSourceList();
   markDirty("洛雪源列表已修改，需保存后生效");
-  toast(`已删除「${name}」`, "ok");
+  toast(`已从列表移除「${name}」${item.active ? "（保存后将一并停用）" : ""}`, "ok");
 }
 
 $("#lx-test").addEventListener("click", async () => {
@@ -571,9 +602,7 @@ async function lxAfterUpload(r) {
   }
   $("#lx-upload-note").textContent = scriptName ? `已上传：${scriptName}` : "已上传";
   syncLxAddButton();
-  renderLxSourceList();
-  markDirty("洛雪源已更新为上传脚本，测试后保存生效");
-  toast("脚本已上传，请点「测试」验证或点击「添加」加入列表", "ok");
+  toast("脚本已上传，请点「测试」验证，确认可用后点「添加」加入列表", "ok");
 }
 
 $("#lx-upload").addEventListener("click", () => $("#lx-file").click());
@@ -656,10 +685,12 @@ $("#lx-add").addEventListener("click", () => {
     lxSourceList[existingIdx].name = name;
     toast(`已更新列表中该源的名称为「${name}」`, "ok");
   } else {
-    lxSourceList.push({ name, url });
-    toast(`已添加「${name}」至洛雪源列表`, "ok");
+    lxSourceList.push({ name, url, active: false });
+    toast(`已添加「${name}」至洛雪源列表，点其「激活」并保存后生效`, "ok");
   }
+  $("#lx-url").value = "";
   if ($("#lx-name")) $("#lx-name").value = "";
+  syncLxAddButton();
   renderLxSourceList();
   markDirty("洛雪源列表已修改，需保存后生效");
 });
@@ -677,9 +708,8 @@ $("#lx-add").addEventListener("click", () => {
 ["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $("#lx-url").addEventListener("input", () => {
+  // #lx-url 仅为「添加」入口输入框，激活态由列表 active 标记决定，与它无关
   syncLxAddButton();
-  renderLxSourceList();
-  markDirty();
 });
 if ($("#lx-name")) {
   $("#lx-name").addEventListener("input", () => markDirty());
