@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # 补发入口：tag 已存在但发行版发布失败时（如 gitee 链路抖动），由此入口用
+  # 当前分支上修复过的工作流对任意已有 tag 重跑（重跑原 run 仍用旧脚本）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要（补）发布的 tag，如 v2.7.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,15 +21,19 @@ jobs:
     env:
       # secrets 不能用于 steps.if，先映射到 job 级 env 供条件判断与脚本共用
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      # push 触发时为被推的 tag；dispatch 补发时为输入的 tag
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Verify tag matches VERSION
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           version="$(head -n1 VERSION | tr -d '[:space:]')"
           if [ "$tag" != "$version" ]; then
-            echo "tag v${tag} 与 VERSION 文件 ${version} 不一致" >&2
+            echo "tag ${TAG} 与 VERSION 文件 ${version} 不一致" >&2
             exit 1
           fi
 
@@ -45,7 +57,7 @@ jobs:
 
       - name: Extract changelog for this version
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           awk -v ver="$version" '
             $0 ~ "^## \\[" ver "\\]" { found = 1; next }
             found && /^## \[/ { exit }
@@ -62,12 +74,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
-          title="fnmusic-ext ${GITHUB_REF_NAME#v}"
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" --draft=false --title "$title" --notes-file /tmp/release-notes.md
-            gh release upload "${GITHUB_REF_NAME}" "$fpk_file" "$fpk_file.sha256" --clobber
+          title="fnmusic-ext ${TAG#v}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --draft=false --title "$title" --notes-file /tmp/release-notes.md
+            gh release upload "${TAG}" "$fpk_file" "$fpk_file.sha256" --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" \
+            gh release create "${TAG}" \
               --title "$title" \
               --notes-file /tmp/release-notes.md \
               "$fpk_file" "$fpk_file.sha256"
@@ -75,15 +87,21 @@ jobs:
 
       # Gitee 镜像只同步分支/标签/提交，发行版需经 API 发布；发布的是同一份
       # fpk（字节一致，sha256 两边相同）。未配置 GITEE_TOKEN 密钥时本步跳过。
+      # v2.7.0 实测：runner→gitee.com TLS 间歇失败（curl exit 35），故所有
+      # API 调用必须带重试。
       - name: Publish release to Gitee
         if: env.GITEE_TOKEN != ''
         env:
           GITEE_REPO: javycoder/fnos_music_ext
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${TAG}"
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
           api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+
+          gcurl() {
+            curl -sS --connect-timeout 15 --retry 5 --retry-all-errors --retry-delay 4 "$@"
+          }
 
           # 镜像同步有延迟，轮询等 tag 出现在 Gitee（公开仓库 ls-remote 无需认证）
           synced=0
@@ -101,7 +119,7 @@ jobs:
 
           # 查发行版是否已存在（重跑安全）：gitee 对不存在的发行版返回 200 + body
           # 为 null 而非 404，必须按 body 里有无 id 判断，不能只看 HTTP 码
-          http="$(curl -sS -o /tmp/gitee-release.json -w '%{http_code}' \
+          http="$(gcurl -o /tmp/gitee-release.json -w '%{http_code}' \
             "${api}/releases/tags/${tag}?access_token=${GITEE_TOKEN}")"
           release_id=""
           if [ "${http}" = 200 ]; then
@@ -115,16 +133,16 @@ jobs:
           if [ -n "${release_id}" ]; then
             # 重发时清理同名旧附件（不动 gitee 自动生成的源码包）；by-tag 响应的
             # assets 不带附件 id，需走附件列表接口
-            curl -sSf -o /tmp/gitee-att-list.json \
+            gcurl -f -o /tmp/gitee-att-list.json \
               "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
             for attach_id in $(jq -r --arg fpk "fnmusic-ext-${ver}.fpk" --arg sum "fnmusic-ext-${ver}.fpk.sha256" \
                 '.[]? | select(.name == $fpk or .name == $sum) | .id' /tmp/gitee-att-list.json); do
-              curl -sS -o /dev/null -X DELETE \
+              gcurl -o /dev/null -X DELETE \
                 "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
             done
           else
             # 创建：gitee 要求 target_commitish 必传（tag 已存在时仅作落点声明）
-            create_http="$(curl -sS -o /tmp/gitee-create.json -w '%{http_code}' "${api}/releases" \
+            create_http="$(gcurl -o /tmp/gitee-create.json -w '%{http_code}' "${api}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
               -d "tag_name=${tag}" \
               -d "target_commitish=${tag}" \
@@ -139,10 +157,10 @@ jobs:
           fi
 
           # 上传 fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
-          # 保留数组/对象兼容解析以防变动）
+          # 保留数组/对象兼容解析以防变动）；fpk 体积大，放宽单次上传时限
           attach_links=""
           for f in "${fpk_file}" "${fpk_file}.sha256"; do
-            att_http="$(curl -sS -o /tmp/gitee-att-one.json -w '%{http_code}' \
+            att_http="$(gcurl --max-time 600 -o /tmp/gitee-att-one.json -w '%{http_code}' \
               "${api}/releases/${release_id}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
               -F "file=@${f}")"
@@ -166,7 +184,7 @@ jobs:
             echo "### 附件"
             printf '%s' "${attach_links}"
           } > /tmp/gitee-body.md
-          patch_http="$(curl -sS -o /tmp/gitee-patch.json -w '%{http_code}' -X PATCH \
+          patch_http="$(gcurl -o /tmp/gitee-patch.json -w '%{http_code}' -X PATCH \
             "${api}/releases/${release_id}?access_token=${GITEE_TOKEN}" \
             -d "tag_name=${tag}" \
             -d "name=fnmusic-ext ${ver}" \
@@ -177,4 +195,3 @@ jobs:
             exit 1
           fi
           echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
-
