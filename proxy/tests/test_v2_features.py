@@ -140,7 +140,7 @@ def test_ordered_stream_alternatives_unknown_bitrate_keep_tail(monkeypatch):
 
 _HOT_ENV_KEYS = [
     "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
-    "quality_mode", "tee_save_enabled", "tee_save_dir", "tee_cache_max",
+    "quality_mode", "tee_save_enabled", "tee_save_dir", "tee_cache_max", "cache_dir",
     "recommend_hot", "recommend_daily", "cover_enrich", "llm_base_url", "llm_model",
     "search_timeout",
 ]
@@ -158,6 +158,7 @@ def conf_guard():
         "FNMUSIC_MUSICDL_ENABLED", "FNMUSIC_NETEASE_ENABLED", "FNMUSIC_LX_ENABLED",
         "FNMUSIC_ONLINE_SOURCES", "LX_SOURCES", "FNMUSIC_QUALITY_MODE",
         "FNMUSIC_TEE_SAVE_ENABLED", "FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_TEE_CACHE_MAX",
+        "FNMUSIC_CACHE_DIR",
         "FNMUSIC_RECOMMEND_HOT", "FNMUSIC_RECOMMEND_DAILY", "FNMUSIC_COVER_ENRICH",
         "FNMUSIC_LLM_BASE_URL", "FNMUSIC_LLM_API_KEY", "FNMUSIC_LLM_MODEL",
         "FNMUSIC_SEARCH_TIMEOUT",
@@ -227,6 +228,51 @@ def test_env_hot_reload_ignores_invalid_values(tmp_path, conf_guard):
 
 def test_env_hot_reload_missing_file_noop(tmp_path, conf_guard):
     assert apply_env_hot_reload(str(tmp_path / "nope.env")) == []
+
+
+def test_env_hot_reload_cache_dir_migrates_refs(tmp_path, conf_guard):
+    """cache_dir 热重载：CONF/环境变量同步，旧目录 .ref 去重标记复制到新目录。"""
+    from proxy.app import _migrate_media_refs  # noqa: F401  存在性即契约
+    old_dir = tmp_path / "old_cache"
+    new_dir = tmp_path / "new_cache"
+    old_dir.mkdir()
+    (old_dir / "abc123.ref").write_text("/music/周杰伦 - 晴天", encoding="utf-8")
+    (old_dir / "not-a-ref.txt").write_text("x", encoding="utf-8")
+    CONF["cache_dir"] = str(old_dir)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"FNMUSIC_CACHE_DIR='{new_dir}'\n", encoding="utf-8")
+
+    changed = apply_env_hot_reload(str(env_file))
+
+    assert "cache_dir" in changed
+    assert CONF["cache_dir"] == str(new_dir)
+    assert os.environ.get("FNMUSIC_CACHE_DIR") == str(new_dir)
+    assert (new_dir / "abc123.ref").read_text(encoding="utf-8") == "/music/周杰伦 - 晴天"
+    assert not (new_dir / "not-a-ref.txt").exists()   # 非 .ref 不迁移
+    assert (old_dir / "abc123.ref").exists()          # 复制语义：不删原件
+
+
+def test_env_hot_reload_cache_dir_empty_restores_default(tmp_path, conf_guard, monkeypatch):
+    """空值=恢复默认 <home>/cache（home_dir 按 FNMUSIC_HOME 解析）。"""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("FNMUSIC_HOME", str(home))
+    CONF["cache_dir"] = str(tmp_path / "elsewhere")
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_CACHE_DIR=''\n", encoding="utf-8")
+
+    changed = apply_env_hot_reload(str(env_file))
+
+    assert "cache_dir" in changed
+    assert CONF["cache_dir"] == str(home / "cache")
+
+
+def test_migrate_media_refs_tolerates_missing_old_dir(tmp_path):
+    from proxy.app import _migrate_media_refs
+    # 旧目录不存在/不可读：不抛异常、返回 0（热重载不因迁移失败而失败）
+    assert _migrate_media_refs("", str(tmp_path / "a")) == 0
+    assert _migrate_media_refs(str(tmp_path / "nope"), str(tmp_path / "a")) == 0
+    assert _migrate_media_refs(str(tmp_path / "same"), str(tmp_path / "same")) == 0
 
 
 def test_reset_search_cache_cancels_pending_tasks():

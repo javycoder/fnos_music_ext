@@ -5,10 +5,12 @@
 <应用目录>/fnmusic-ext.sock，把 https://<主机>:<桌面端口>/app/fnmusic-ext/
 转到这个 socket。WebUI 自己监听 127.0.0.1:8774，并认识 /app/fnmusic-ext 前缀。
 
-本模块还处理一个例外端点：POST /app/fnmusic-ext/api/host-file——浏览器把
-NAS 上选中的 .js 源脚本路径发来，由宿主侧（本进程，root）代读文件内容。
-该端点只在桌面网关链路里存在（直连 8774 不经过这里），并要求网关注入的
-X-Trim-Isadmin: true。其余请求一律原样转发，不动字节。
+本模块还处理两个例外端点（都只在桌面网关链路里存在，直连 8774 不经过这里，
+都要求网关注入的 X-Trim-Isadmin: true；其余请求一律原样转发，不动字节）：
+- POST /app/fnmusic-ext/api/host-file——浏览器把 NAS 上选中的 .js 源脚本路径
+  发来，由宿主侧（本进程，root）代读文件内容。
+- POST /app/fnmusic-ext/api/fs-check——浏览器把储存目录（缓存/下载目录）路径
+  发来，由宿主侧按真实落盘视角（root proxy）探测目录存在性与可写性。
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import signal
 import socket
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 UPSTREAM = ("127.0.0.1", 8774)
@@ -31,6 +34,8 @@ RELAY_TIMEOUT = 180
 HOST_FILE_PATHS = ("/app/fnmusic-ext/api/host-file", "/api/host-file")
 HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径字符串）
 HOST_FILE_MAX_BYTES = 9_000_000       # 与 lxmusic SCRIPT_MAX_BYTES 对齐
+FS_CHECK_PATHS = ("/app/fnmusic-ext/api/fs-check", "/api/fs-check")
+FS_CHECK_MAX_BODY = 1 << 20           # 同 host-file：只装一个路径字符串
 
 
 def socket_path_for(base: Path) -> Path:
@@ -88,13 +93,14 @@ def _read_request_head(client: socket.socket) -> "tuple[bytes, dict[str, str]] |
     return head + b"\r\n\r\n" + rest, headers
 
 
-def _read_full_body(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> "bytes | None":
+def _read_full_body(client: socket.socket, headers: dict[str, str], head_raw: bytes,
+                    max_body: int = HOST_FILE_MAX_BODY) -> "bytes | None":
     """按 Content-Length 收齐 POST 体（小请求：仅路径字符串）。"""
     try:
         length = int(headers.get("content-length", "0"))
     except ValueError:
         return None
-    if length < 0 or length > HOST_FILE_MAX_BODY:
+    if length < 0 or length > max_body:
         return None
     head_end = head_raw.find(b"\r\n\r\n") + 4
     body = head_raw[head_end:]
@@ -169,6 +175,69 @@ def handle_host_file(client: socket.socket, headers: dict[str, str], head_raw: b
             pass
 
 
+def _probe_dir_writable(path: str) -> bool:
+    """写入试探：os.access 对只读挂载等场景可能误报，落一个临时文件再删才算数。"""
+    probe = os.path.join(path, f".fnmusic-fscheck-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
+def handle_fs_check(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
+    """POST /api/fs-check：校验 admin + 目录路径，按宿主 root 视角（真实落盘方是
+    root 跑的 proxy）探测目录存在性与可写性。无副作用：不创建目录，临时探测
+    文件即落即删。目录不存在时用最近存在祖先目录的可写性代表"能否创建"。"""
+    try:
+        if headers.get("x-trim-isadmin", "").lower() != "true":
+            client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可校验目录"}))
+            return
+        body = _read_full_body(client, headers, head_raw, FS_CHECK_MAX_BODY)
+        if body is None:
+            client.sendall(_json_response(400, {"ok": False, "error": "请求体无效"}))
+            return
+        try:
+            req = json.loads(body.decode("utf-8"))
+            path = str(req.get("path") or "")
+        except Exception:  # noqa: BLE001
+            client.sendall(_json_response(400, {"ok": False, "error": "请求体必须是 JSON"}))
+            return
+        target = Path(path)
+        if not path.startswith("/") or ".." in target.parts:
+            client.sendall(_json_response(400, {"ok": False, "error": "路径必须是绝对路径且不含 .."}))
+            return
+        try:
+            exists = target.is_dir()
+        except OSError:
+            exists = False
+        if exists:
+            client.sendall(_json_response(200, {
+                "ok": True, "path": path, "exists": True, "writable": _probe_dir_writable(path),
+            }))
+            return
+        ancestor = target.parent
+        while str(ancestor) != "/" and not ancestor.is_dir():
+            ancestor = ancestor.parent
+        writable = ancestor.is_dir() and _probe_dir_writable(str(ancestor))
+        client.sendall(_json_response(200, {
+            "ok": True, "path": path, "exists": False, "writable": writable,
+        }))
+    except OSError:
+        pass
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
 def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM) -> None:
     sock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -184,15 +253,24 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM) -> None:
         threading.Thread(target=_handle, args=(client, upstream), daemon=True).start()
 
 
-def _is_host_file_request(head_raw: bytes) -> bool:
+def _post_request_path(head_raw: bytes) -> "str | None":
+    """取请求行的 POST 路径；非 POST 或解析失败返回 None。"""
     try:
         request_line = head_raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
     except Exception:  # noqa: BLE001
-        return False
+        return None
     parts = request_line.split()
     if len(parts) < 2 or parts[0].upper() != "POST":
-        return False
-    return parts[1] in HOST_FILE_PATHS
+        return None
+    return parts[1]
+
+
+def _is_host_file_request(head_raw: bytes) -> bool:
+    return _post_request_path(head_raw) in HOST_FILE_PATHS
+
+
+def _is_fs_check_request(head_raw: bytes) -> bool:
+    return _post_request_path(head_raw) in FS_CHECK_PATHS
 
 
 def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
@@ -203,6 +281,9 @@ def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     head_raw, headers = head
     if _is_host_file_request(head_raw):
         handle_host_file(client, headers, head_raw)
+        return
+    if _is_fs_check_request(head_raw):
+        handle_fs_check(client, headers, head_raw)
         return
     try:
         remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)

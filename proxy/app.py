@@ -103,7 +103,8 @@ CONF = {
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
     "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
-    "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
+    # 空串同样回退默认：WebUI 允许把该键清空（恢复默认），热重载也走这条回退
+    "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR") or os.path.join(_HOME, "cache"),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
     "cover_dir": os.environ.get("FNMUSIC_COVER_DIR", ""),
@@ -477,7 +478,8 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
 # === .env 热重载（FNMUSIC_ENV_WATCH=1 默认开） ===
 # WebUI 切源 / 手工编辑 .env 后无需重启 proxy：白名单键同步进 CONF 与
 # os.environ（recommend 的 LLM 配置直接读环境变量），并清空搜索缓存让
-# 新选音源立即生效。路径/端口类配置不在白名单，仍需重启。
+# 新选音源立即生效。储存目录两键（FNMUSIC_TEE_SAVE_DIR/FNMUSIC_CACHE_DIR）
+# 已白名单化热重载；其余路径/端口类配置不在白名单，仍需重启。
 _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
@@ -494,6 +496,9 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
+    # 歌曲缓存目录（WebUI「储存 → 目录设置」可改）：变更时把已落库歌曲的
+    # .ref 去重标记迁到新目录，避免换目录后同一首歌重新出网、曲库重复
+    "FNMUSIC_CACHE_DIR": ("cache_dir", "cache_dir"),
     "FNMUSIC_FAV_AUTO_BIND": ("fav_auto_bind", "bool"),
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": ("official_bind_timeout_s", "bind_timeout"),
     "FNMUSIC_TEE_HANDOFF_MAX": ("tee_handoff_max", "tee_handoff_max"),
@@ -540,6 +545,9 @@ def _env_watch_parse(raw: str, kind: str):
     raw = str(raw or "").strip()
     if kind == "bool":
         return raw.lower() in ("true", "1", "yes")
+    if kind == "cache_dir":
+        # 空值=恢复默认（<home>/cache）；解析前 os.environ 已写入原始串，不能用环境变量兜底
+        return raw or os.path.join(dailyrec.home_dir(), "cache")
     if kind == "tee_cache_max":
         try:
             return max(1, min(100, int(raw)))
@@ -586,6 +594,41 @@ def _env_watch_parse(raw: str, kind: str):
     return raw
 
 
+def _migrate_media_refs(old_dir: str, new_dir: str) -> int:
+    """cache_dir 变更后把旧目录的 *.ref 去重标记复制到新目录（不删原件）。
+
+    .ref 记录已落库歌曲的文件词干，丢了会让同一首歌重新出网、曲库出现重复
+    文件；用复制而非搬移，迁移失败（旧目录不可读等）只告警不阻断热重载。
+    """
+    if not old_dir or not new_dir or old_dir == new_dir:
+        return 0
+    try:
+        names = os.listdir(old_dir)
+    except OSError:
+        return 0
+    try:
+        os.makedirs(new_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning("cache_dir 迁移：无法创建 %s: %s", new_dir, exc)
+        return 0
+    moved = 0
+    for name in names:
+        if not name.endswith(".ref"):
+            continue
+        dst = os.path.join(new_dir, name)
+        if os.path.exists(dst):
+            moved += 1
+            continue
+        try:
+            shutil.copyfile(os.path.join(old_dir, name), dst)
+            moved += 1
+        except OSError as exc:
+            logger.warning("cache_dir 迁移：%s 复制失败: %s", name, exc)
+    if moved:
+        logger.info("cache_dir 变更：已迁移 %d 个 .ref 去重标记到 %s", moved, new_dir)
+    return moved
+
+
 def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     """解析 .env 应用白名单键；返回发生变化的 CONF 键名（空 = 无变化）。
 
@@ -594,6 +637,7 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     path = env_path or _env_watch_path()
     kv = dict(parse_env_file(path)[0])
     changed: list[str] = []
+    old_cache_dir = CONF.get("cache_dir")
     for env_key, (conf_key, kind) in _ENV_WATCH_KEYS.items():
         if env_key not in kv:
             continue
@@ -604,6 +648,8 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         if conf_key and CONF.get(conf_key) != value:
             CONF[conf_key] = value
             changed.append(conf_key)
+    if "cache_dir" in changed:
+        _migrate_media_refs(old_cache_dir or "", CONF["cache_dir"])
     return changed
 
 

@@ -22,7 +22,11 @@
         <button class="nav-item" data-page="source">音乐源</button>
         <button class="nav-item" data-page="quality">播放与推荐</button>
         <button class="nav-item" data-page="search">搜索</button>
-        <button class="nav-item" data-page="tee">边听边存</button>
+        <div class="nav-group">
+          <button class="nav-item nav-group-title" id="nav-storage-title">储存</button>
+          <button class="nav-item nav-sub" data-page="tee">边听边存</button>
+          <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
+        </div>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
@@ -212,6 +216,36 @@
         </div>
       </section>
 
+      <!-- 目录设置 -->
+      <section class="page" id="page-dirs">
+        <h2>目录设置</h2>
+        <div class="card">
+          <div class="card-title">歌曲缓存目录</div>
+          <p class="hint">在线试听的滚动缓存、转码缓存、去重标记等临时文件存放目录，留空使用安装目录下的 cache。更换目录后旧缓存文件不自动迁移（已保存进本地曲库的歌曲不受影响，去重标记会自动带到新目录）。</p>
+          <label class="field"><span>缓存目录</span>
+            <input class="input" id="dir-cache" placeholder="留空=安装目录 cache">
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="dir-cache-pick" hidden>从 NAS 选择</button>
+            <span id="dir-cache-check" class="dir-check" hidden></span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">下载目录（边听边存保存位置）</div>
+          <p class="hint">边听边存、收藏自动绑定下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库目录。建议选择官方共享曲库目录，官方 App 扫描入库后即可在本地列表播放。与「边听边存」页的保存路径是同一项配置，两处修改会自动同步。</p>
+          <label class="field"><span>下载目录</span>
+            <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="dir-download-pick" hidden>从 NAS 选择</button>
+            <span id="dir-download-check" class="dir-check" hidden></span>
+          </div>
+        </div>
+        <div class="card">
+          <p class="hint">「从 NAS 选择」会打开飞牛文件选择器，选中即完成应用授权（仅飞牛桌面内可用，独立浏览器/直连端口请直接粘贴路径）；目录不存在时保存后会自动创建。两个目录不能相同或互为父子目录，否则滚动缓存会被官方扫描进曲库。</p>
+        </div>
+      </section>
+
       <!-- LLM -->
       <section class="page" id="page-llm">
         <h2>高级 · 大模型</h2>
@@ -231,7 +265,8 @@
     <button class="nav-item" data-page="source">音源</button>
     <button class="nav-item" data-page="quality">播放</button>
     <button class="nav-item" data-page="search">搜索</button>
-    <button class="nav-item" data-page="tee">缓存</button>
+    <button class="nav-item" data-page="tee">边听</button>
+    <button class="nav-item" data-page="dirs">目录</button>
     <button class="nav-item" data-page="llm">高级</button>
   </nav>
 

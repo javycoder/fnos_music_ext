@@ -46,6 +46,14 @@ body {
 }
 .nav-item:hover { background: var(--accent-soft); }
 .nav-item.active { background: var(--accent); color: #fff; }
+.nav-group { display: flex; flex-direction: column; gap: 2px; }
+.nav-group-title { font-weight: 600; }
+/* 储存父标题：子页激活时只做强调，不抢子项的实心高亮 */
+.nav-group-title.active {
+  background: transparent; color: var(--accent); font-weight: 700;
+}
+.nav-group-title.active:hover { background: var(--accent-soft); }
+.nav-sub { padding-left: 26px; font-size: 14px; }
 .sidebar-foot { margin-top: auto; font-size: 12px; color: var(--muted); padding: 0 8px; }
 
 /* -------------------------------------------------- 主区 */
@@ -168,6 +176,13 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 4px;
   font-size: 12px; font-weight: 500; background: #e6f7ed; color: var(--ok);
 }
+
+/* -------------------------------------------------- 目录权限校验状态行 */
+.dir-check { font-size: 13px; overflow-wrap: anywhere; }
+.dir-check.ok { color: var(--ok); }
+.dir-check.warn { color: var(--warn); }
+.dir-check.fail { color: var(--err); }
+.dir-check.skip { color: var(--muted); }
 
 /* -------------------------------------------------- 保存条/Toast */
 .save-bar {
