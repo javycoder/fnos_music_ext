@@ -651,7 +651,7 @@ async def api_config_put(body: ConfigBody, request: Request):
             str(updates.get("LX_SOURCE_URL") or after_preview.get("LX_SOURCE_URL") or "").strip(),
         )
         active_items = [i for i in items if i.get("active") and str(i.get("url") or "").strip()]
-        if items and not active_items:
+        if not active_items:
             return JSONResponse(
                 content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
             )
@@ -664,8 +664,9 @@ async def api_config_put(body: ConfigBody, request: Request):
             to_activate = [i for i in active_items
                            if str(i["url"]).strip() not in before_active]
             before_items = {str(i.get("url") or "").strip(): i for i in _lx_list_items(before.get("LX_SOURCE_LIST"))}
-            to_deactivate = [before_items[str(i["url"]).strip()] for i in items
-                             if not i.get("active") and str(i.get("url") or "").strip() in before_active]
+            new_active = {str(i["url"]).strip() for i in active_items}
+            to_deactivate = [before_items.get(url, {"url": url})
+                             for url in before_active if url not in new_active]
             updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
 
     # lx 换源前置校验：新激活的源必须先通过 lxmusic verify 才写入

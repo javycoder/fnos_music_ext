@@ -317,6 +317,8 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     patched = server_js.read_text(encoding="utf-8")
     assert "const result = await (_res && _res.promise ? _res.promise : _res);" in patched
     assert (repo / ".lxserver" / ".provisioned-version").read_text().strip() == "vtest"
+    # 真实包允许主脚本嵌套；幂等判定必须使用根入口而非 server/server.js。
+    server_js.unlink()
     # 幂等：同版本重跑直接跳过（不重新解压）
     r2 = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env=env)
     assert r2.returncode == 0, r2.stderr
@@ -356,3 +358,20 @@ def test_ensure_sources_native_rejects_bad_sha256(tmp_path):
     assert r.returncode != 0
     assert "校验和不符" in (r.stderr + r.stdout)
     assert not (repo / ".lxserver").exists()
+
+
+def test_migrate_lx_url_native_to_docker_checks_host_file(tmp_path):
+    text = (BASE / "install.sh").read_text()
+    func = function(text, "migrate_lx_url_between_modes")
+    uploads = tmp_path / "sources-data" / "lxmusic" / "uploads"
+    uploads.mkdir(parents=True)
+    (uploads / "local.js").write_text("// source")
+    (tmp_path / "proxy").mkdir()
+    shutil.copy(BASE / "proxy" / "env_merge.py", tmp_path / "proxy" / "env_merge.py")
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"LX_SOURCE_URL='file://{uploads}/local.js'\n")
+    r = run_bash(f'{func}\ndotenv_escape() {{ printf "%s" "$1"; }}; log_info() {{ :; }}; '
+                 f'ENV_PATH="{env_path}" DEPLOY_MODE=docker migrate_lx_url_between_modes',
+                 env={"BASE_DIR": str(tmp_path)})
+    assert r.returncode == 0, r.stderr
+    assert "file:///data/lxmusic/uploads/local.js" in env_path.read_text()
