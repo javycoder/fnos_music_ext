@@ -5,8 +5,17 @@
 
 ## [Unreleased]
 
-## [2.8.0a] - 2026-10-09
+## [2.8.0c] - 2026-10-09
 
+### 新增
+
+- **原生（无 Docker）部署形态**：机器上没有 Docker 也能完整使用全部功能——`./install.sh --deploy native` 后，音源四程序（musicdl / musicbox / lxmusic / WebUI）与 lxserver 由宿主机 systemd unit（`fnmusic-sources.service`）内的 supervisord 按需拉起，代码直接运行在仓库目录（Python 依赖装在 `.venv-sources`，supervisor 经 pip 提供，lxserver 预编译包落位 `.lxserver/` 并沿用镜像同版本与同补丁），音源直接监听与容器发布一致的 `127.0.0.1:8768/8770/8772/8774` 端口。WebUI 运行期切源/预览/扫码、洛雪源校验激活、网易扫码、musicdl 平台白名单、边听边存、推荐等全部功能两种形态行为一致；两形态共用同一份 `.env` 与 `sources-data/` 数据目录，同机互斥、`--deploy` 一键互切（洛雪源 `file://` 路径自动迁移），部署登记新增 `deploy_mode` 字段。
+  - nodejs（≥16）/ ffmpeg 缺失时安装阶段自动 `sudo apt-get` 补装；pip 依赖沿用多源回退链（腾讯云 → 阿里云 → 清华 → 官方）。
+  - `ensure_sources_native.sh` 负责运行时保障（venv / 系统组件 / lxserver 版本幂等落位）；`extend.sh` / `restore.sh` 按 `FNMUSIC_DEPLOY_MODE` 分派，原生形态升级 = `git pull` 后重跑 `extend.sh`（代码/依赖/.env 变化自动重启对齐，无需镜像构建）。
+
+### 变更
+
+- **音源服务路径可配置化（容器行为不变）**：`lxmusic-service` 的 lxserver 数据目录支持 `LXSERVER_DATA_DIR` 重指（默认 `/data/lxserver`），并对跨形态迁移的洛雪源 `file://` 路径自动归一（原路径不存在而当前形态对应路径存在时改写，docker↔native 互切后历史激活源可继续使用）；`webui-service` 的 `WEBUI_SUPERVISORCTL` 支持携带参数（如 `supervisorctl -c <配置路径>`），默认裸 `supervisorctl` 行为不变。
 ## [2.8.0b] - 2026-10-09
 
 ### 新增

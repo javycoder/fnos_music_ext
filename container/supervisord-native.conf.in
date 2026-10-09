@@ -1,0 +1,95 @@
+; fnmusic-ext 原生（无 Docker）音源进程表：五个程序全部 autostart=false，
+; 由 container/entrypoint.sh 按 .env 的启用开关 supervisorctl start（按需加载）。
+; 与容器形态（container/supervisord.conf）一一对应，差异仅在：
+;   1. 服务直接监听宿主发布端口 8768/8770/8772/8774（容器内为 8001-8004 由 docker 映射），
+;      proxy 侧 .env 的音源 URL 与 healthz 契约完全不变；
+;   2. 代码/数据直接指向宿主目录（@REPO@ / @DATA@），无容器内 /srv /repo /data 路径；
+;   3. supervisor 经 .venv-sources 的 pip 包提供，套接字/pid/日志收在 @RUN@。
+; 占位符由 proxy/install_common.sh 的 render_native_supervisor_conf 渲染。
+; 运行期切源 = supervisorctl stop/start（WebUI 经 WEBUI_SUPERVISORCTL 调用），与容器一致。
+
+[supervisord]
+nodaemon=true
+logfile=@RUN@/supervisord.log
+logfile_maxbytes=0
+pidfile=@RUN@/supervisord.pid
+; 全部子进程的公共环境：PATH 前置 venv（uvicorn/supervisorctl/musicbox CLI）、
+; 数据目录对齐容器卷映射（sources-data = 容器 /data，仓库 = 容器 /repo）
+environment=PATH="@VENV@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",PYTHONUNBUFFERED="1",FNMUSIC_ENV_FILE="@REPO@/.env",XDG_DATA_HOME="@DATA@",XDG_CACHE_HOME="@DATA@/cache",XDG_CONFIG_HOME="@DATA@/config",LX_DATA_DIR="@DATA@/lxmusic",LXSERVER_DATA_DIR="@DATA@/lxserver"
+
+[unix_http_server]
+file=@RUN@/supervisor.sock
+chmod=0700
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://@RUN@/supervisor.sock
+
+[program:musicdl]
+directory=@REPO@/musicdl-service
+command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8768
+autostart=false
+autorestart=true
+startretries=5
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=@RUN@/musicdl.log
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+
+[program:musicbox]
+directory=@REPO@/musicbox-service
+command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8770
+autostart=false
+autorestart=true
+startretries=5
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=@RUN@/musicbox.log
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+
+[program:lxserver]
+directory=@REPO@/.lxserver
+command=node index.js
+autostart=false
+autorestart=true
+startretries=5
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=@RUN@/lxserver.log
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+environment=DATA_PATH="@DATA@/lxserver",CONFIG_PATH="@DATA@/lxserver/config.js",PORT="8005",BIND_IP="127.0.0.1"
+
+[program:lxmusic]
+directory=@REPO@/lxmusic-service
+command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8772
+autostart=false
+autorestart=true
+startretries=5
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=@RUN@/lxmusic.log
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+
+[program:webui]
+directory=@REPO@/webui-service
+command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8774
+autostart=false
+autorestart=true
+startretries=5
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=@RUN@/webui.log
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+environment=WEBUI_REPO_DIR="@REPO@",WEBUI_MUSICDL_URL="http://127.0.0.1:8768",WEBUI_MUSICBOX_URL="http://127.0.0.1:8770",WEBUI_LX_URL="http://127.0.0.1:8772",WEBUI_SUPERVISORCTL="supervisorctl -c @RUN@/supervisord.conf"

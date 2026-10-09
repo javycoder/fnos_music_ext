@@ -45,24 +45,27 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 └───────────────┬─────────────────────────────────────────┘
                 │ 127.0.0.1（音源仅本机；WebUI 供浏览器）
 ┌───────────────▼─────────────────────────────────────────┐
-│ Docker 单容器 fnmusic-sources（supervisor 按需加载）      │
+│ 音源形态二选一（.env: FNMUSIC_DEPLOY_MODE）               │
+│ docker（默认）: 单容器 fnmusic-sources（supervisor 按需）  │
 │   ├─ musicdl  127.0.0.1:8768 → 容器 8001                 │
 │   ├─ musicbox 127.0.0.1:8770 → 容器 8002（扫码走 WebUI） │
 │   ├─ lxmusic  127.0.0.1:8772 → 容器 8003                 │
 │   └─ WebUI    127.0.0.1:8774 → 容器 8004（飞牛管理员） │
-│   只启动当前所选音源进程（+可选 WebUI），其余不驻留内存；  │
-│   切换音源 = supervisorctl 秒级 stop/start                │
+│ native（无 Docker）: 宿主机 systemd + supervisord 按需加载 │
+│   四程序直接监听同一组 127.0.0.1 发布端口，功能完全一致    │
+│   （两种形态均只启动当前所选音源进程 +可选 WebUI；         │
+│     切换音源 = supervisorctl 秒级 stop/start）             │
 └─────────────────────────────────────────────────────────┘
 ```
 
-核心代理必须在宿主机以 systemd 运行（接管 Socket）；三个音源 + WebUI 合并为一个 Docker 容器，镜像内由 supervisor 管理四个程序，启动时读取挂载的 `.env` 只拉起所选进程——常驻内存约 100-200MB。
+核心代理必须在宿主机以 systemd 运行（接管 Socket）；三个音源 + WebUI 默认合并为一个 Docker 容器，镜像内由 supervisor 管理四个程序，启动时读取挂载的 `.env` 只拉起所选进程——常驻内存约 100-200MB。机器上没有 Docker 时可改用原生部署（`./install.sh --deploy native`，详见 [docs/INSTALL.md](docs/INSTALL.md)），功能与 Docker 形态完全一致。
 
 ## 快速开始
 
 ### 前置条件
 
 1. fnOS 已在「应用中心」安装并启动官方**飞牛音乐**应用；
-2. fnOS 已安装 **Docker**（v2.0.0 起仅支持 Docker 部署音源，未安装 Docker 会直接报错退出）。
+2. 音源形态二选一：**Docker**（默认，未安装时会报错退出）或原生部署（`--deploy native`，需要 Python 3.10+，nodejs/ffmpeg 缺失时自动补装）。
 
 ### 安装（推荐：应用中心 fpk 包）
 

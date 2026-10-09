@@ -778,7 +778,7 @@ async def _bootstrap_migration():
             if multi_urls:
                 for url in multi_urls:
                     try:
-                        res = await source_set(SourceBody(url=url))
+                        res = await source_set(SourceBody(url=_normalize_legacy_file_url(url)))
                         if res.get("ok"):
                             logger.info("已自动激活洛雪源: %s", url)
                         else:
@@ -799,7 +799,7 @@ async def _bootstrap_migration():
                     source_url = os.environ.get("LX_SOURCE_URL", "").strip()
                 if source_url:
                     try:
-                        await source_set(SourceBody(url=source_url))
+                        await source_set(SourceBody(url=_normalize_legacy_file_url(source_url)))
                         logger.info("已自动激活历史音源: %s", source_url)
                     except Exception as e:
                         logger.warning("自动激活历史音源失败: %s", e)
@@ -1116,9 +1116,38 @@ def _parse_script_head_meta(script: str) -> dict:
     return meta
 
 
+LXSERVER_DATA_DIR = os.environ.get("LXSERVER_DATA_DIR", "/data/lxserver")
+
+
+def _normalize_legacy_file_url(url: str) -> str:
+    """跨部署形态的 file:// 源路径归一。
+
+    docker（/data = 数据卷）与原生（宿主 sources-data）两种部署形态共用同一份
+    sources-data，但 file:// URL 里的挂载路径前缀不同；互切后历史持久化的
+    URL（state.json / LX_SOURCE_URL 种子）指向另一形态路径。原路径不存在而
+    本形态对应路径存在时改写，其余（含 http(s) 与正常 file://）原样返回。
+    """
+    if not url.startswith("file://"):
+        return url
+    path = url[len("file://"):]
+    if os.path.exists(path):
+        return url
+    marker = "/lxmusic/uploads/"
+    idx = path.find(marker)
+    if idx >= 0:
+        data_dir = os.environ.get("LX_DATA_DIR", "/data/lxmusic")
+        candidate = f"{data_dir}/uploads/{path[idx + len(marker):]}"
+        if os.path.exists(candidate):
+            return f"file://{candidate}"
+    return url
+
+
 def _lx_source_fs_path(source_id: str) -> str:
-    """lxserver _open 用户源的容器内存储路径（与 lxserver getSourceDir/_open 约定一致）。"""
-    return f"/data/lxserver/users/source/_open/{source_id}"
+    """lxserver _open 用户源的存储路径（与 lxserver getSourceDir/_open 约定一致）。
+
+    容器内为 /data/lxserver（镜像默认值）；原生部署经 LXSERVER_DATA_DIR 指向宿主数据目录。
+    """
+    return f"{LXSERVER_DATA_DIR}/users/source/_open/{source_id}"
 
 
 async def _find_lxserver_source(*, by_id: str = "", by_name: str = "", by_url: str = "") -> dict | None:
@@ -1191,7 +1220,7 @@ async def source_set(body: SourceBody):
     """激活/停用自定义源（多源叠加语义：只改目标源启用态，不动其他源）。
 
     body.enabled=false 表示停用目标源；默认 true 为激活。同一脚本重复添加是正常操作。"""
-    url = (body.url or "").strip()
+    url = _normalize_legacy_file_url((body.url or "").strip())
     if not url and body.script:
         # 直接传入脚本内容：先上传再激活
         try:

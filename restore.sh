@@ -76,6 +76,7 @@ purge_local_state() {
     local removed="" target
     for target in "${BASE_DIR}"/.env "${BASE_DIR}"/.env.bak.* \
                   "${BASE_DIR}/musicbox-data" "${BASE_DIR}/sources-data" \
+                  "${BASE_DIR}/sources-native" "${BASE_DIR}/.lxserver" \
                   "${BASE_DIR}/cache" \
                   "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" \
                   "${BASE_DIR}/recommend_cache" "${BASE_DIR}"/.venv-*; do
