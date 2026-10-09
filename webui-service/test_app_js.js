@@ -15,6 +15,7 @@ const vm = require("node:vm");
 /* ------------------------------------------------ 最小 DOM/浏览器桩 -------- */
 function stubEl() {
   const classes = new Set();
+  const listeners = {};
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
     checked: false, disabled: false, src: "", dataset: {}, _t: null,
@@ -28,7 +29,17 @@ function stubEl() {
       },
       contains(c) { return classes.has(c); },
     },
-    addEventListener() {},
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
+    dispatch(type) { (listeners[type] || []).slice().forEach((fn) => fn({ type })); },
+    // 测试用：重置标量状态但保留元素身份与监听器——app.js 在加载期把监听器
+    // 绑到元素上，元素必须终身同一个对象（真实 DOM 亦如此），不能整体换新
+    _resetState() {
+      classes.clear();
+      this.hidden = false; this.textContent = ""; this.innerHTML = "";
+      this.className = ""; this.value = ""; this.checked = false;
+      this.disabled = false; this.src = ""; this.dataset = {}; this._t = null;
+    },
     querySelectorAll() { return []; },
   };
 }
@@ -73,14 +84,17 @@ const defaults = new Map([
   ["/app/fnmusic-ext/api/platforms", { ok: true, enabled: [], registered: [] }],
 ]);
 let routes = new Map(); // path -> bodies 队列（Error 表示 HTTP 非 2xx）
+const fetchCalls = [];  // 断言用：{path, method, body}
+global.fetchCalls = fetchCalls;
 
 function enqueue(p, ...bodies) {
   if (!routes.has(p)) routes.set(p, []);
   routes.get(p).push(...bodies);
 }
 
-global.fetch = async (url) => {
+global.fetch = async (url, options = {}) => {
   const p = String(url).split("?")[0];
+  fetchCalls.push({ path: p, method: (options.method || "GET").toUpperCase(), body: options.body });
   if (routes.has(p) && routes.get(p).length) {
     const body = routes.get(p).shift();
     if (body instanceof Error) {
@@ -92,8 +106,9 @@ global.fetch = async (url) => {
 };
 
 function reset() {
-  els.clear();
+  els.forEach((el) => el._resetState && el._resetState());
   routes = new Map();
+  fetchCalls.length = 0;
 }
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
@@ -209,7 +224,8 @@ test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入�
   await global.lxAfterUpload(r);
   assert.strictEqual(els.get("#lx-url").value, "file:///data/lxmusic/uploads/mine.js");
   assert.strictEqual(els.get("#lx-upload-note").textContent, "已上传：上传源");
-  assert.strictEqual(els.get("#save-bar"), undefined); // 添加进列表后才标脏
+  // 添加进列表后才标脏（桩元素常驻以保留加载期监听器绑定，改查 save-bar 的 show 类）
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
 test("洛雪源列表：旧数据（无 active 标记）按 LX_SOURCE_URL 推导激活态", async () => {
@@ -328,6 +344,86 @@ test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", asyn
   enqueue("/app/fnmusic-ext/api/config", { values: {} });
   await global.loadConfig();
   assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
+});
+
+test("储存目录：loadConfig 回填 + collectConfig 收集 + 格式/互斥校验", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_CACHE_DIR: "/vol2/cache", FNMUSIC_TEE_SAVE_DIR: "/vol1/music" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#dir-cache").value, "/vol2/cache");
+  assert.strictEqual(els.get("#dir-download").value, "/vol1/music");
+  assert.strictEqual(els.get("#tee-dir").value, "/vol1/music"); // 与目录设置页同一配置
+  const values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_CACHE_DIR, "/vol2/cache");
+  assert.strictEqual(values.FNMUSIC_TEE_SAVE_DIR, "/vol1/music");
+  // 互为父子 → 拒绝
+  els.get("#dir-cache").value = "/vol1/music/sub";
+  assert.throws(() => global.collectConfig(), /父子/);
+  // 相对路径 / .. → 拒绝
+  els.get("#dir-cache").value = "vol2/cache";
+  assert.throws(() => global.collectConfig(), /绝对路径/);
+  els.get("#dir-cache").value = "/vol1/../etc";
+  assert.throws(() => global.collectConfig(), /\.\./);
+  // 恢复合法值 → 通过
+  els.get("#dir-cache").value = "/vol2/cache";
+  assert.strictEqual(global.collectConfig().FNMUSIC_CACHE_DIR, "/vol2/cache");
+});
+
+test("下载目录与边听边存保存路径镜像同步（input 事件互写）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-download").value = "/vol1/new";
+  els.get("#dir-download").dispatch("input");
+  assert.strictEqual(els.get("#tee-dir").value, "/vol1/new");
+  els.get("#tee-dir").value = "/vol1/back";
+  els.get("#tee-dir").dispatch("input");
+  assert.strictEqual(els.get("#dir-download").value, "/vol1/back");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true); // 输入即标脏
+});
+
+test("目录输入防抖 fs-check：目录不存在但父目录可写 → warn 提示", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/fs-check", { ok: true, path: "/vol1/new", exists: false, writable: true });
+  els.get("#dir-download").value = "/vol1/new";
+  els.get("#dir-download").dispatch("input");
+  await tick(560); // 防抖 500ms 后校验
+  assert.strictEqual(els.get("#dir-download-check").hidden, false);
+  assert.ok(els.get("#dir-download-check").textContent.includes("自动创建"));
+  assert.strictEqual(els.get("#dir-download-check").className.includes("warn"), true);
+});
+
+test("目录输入防抖 fs-check：清空输入隐藏状态行", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-cache").value = "";
+  els.get("#dir-cache").dispatch("input");
+  await tick(560);
+  assert.strictEqual(els.get("#dir-cache-check").hidden, true);
+});
+
+test("saveConfig：fs-check 目录不可写 → 阻断保存（不发 PUT）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-cache").value = "/vol2/ro";
+  enqueue("/app/fnmusic-ext/api/fs-check", { ok: true, path: "/vol2/ro", exists: true, writable: false });
+  await global.saveConfig();
+  assert.ok(!fetchCalls.some((c) => c.method === "PUT"), "不可写时不得发 PUT /api/config");
+  assert.ok(els.get("#toast").textContent.includes("不可用"));
+});
+
+test("saveConfig：fs-check 不可用（直连 501/网络错误）→ 降级放行保存", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-cache").value = "/vol2/ok";
+  enqueue("/app/fnmusic-ext/api/fs-check", new Error("直连模式不支持目录权限校验"));
+  await global.saveConfig();
+  assert.ok(fetchCalls.some((c) => c.method === "PUT" && c.path === "/app/fnmusic-ext/api/config"));
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

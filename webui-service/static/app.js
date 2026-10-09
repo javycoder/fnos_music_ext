@@ -55,8 +55,13 @@ function clearDirty() {
 function switchPage(page) {
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === "page-" + page));
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
+  // 储存父标题：边听边存/目录设置任一子页激活时强调（子项保持各自的实心高亮）
+  const storageTitle = $("#nav-storage-title");
+  if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs");
 }
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
+const storageTitleBtn = $("#nav-storage-title");
+if (storageTitleBtn) storageTitleBtn.addEventListener("click", () => switchPage("tee"));
 
 /* -------------------------------------------------------------- 概览 */
 async function loadStatus() {
@@ -129,6 +134,8 @@ function applyConfigToForm() {
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
   $("#tee-dir").value = v.FNMUSIC_TEE_SAVE_DIR || "";
+  $("#dir-download").value = v.FNMUSIC_TEE_SAVE_DIR || "";
+  $("#dir-cache").value = v.FNMUSIC_CACHE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   $("#bind-timeout").value = v.FNMUSIC_OFFICIAL_BIND_TIMEOUT_S || "120";
   $("#handoff-max").value = v.FNMUSIC_TEE_HANDOFF_MAX != null ? v.FNMUSIC_TEE_HANDOFF_MAX : "3";
@@ -181,6 +188,7 @@ function collectConfig() {
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
     FNMUSIC_TEE_SAVE_DIR: $("#tee-dir").value.trim(),
+    FNMUSIC_CACHE_DIR: $("#dir-cache").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,
     FNMUSIC_TEE_HANDOFF_MAX: parseInt($("#handoff-max").value || "3", 10) || 0,
@@ -195,6 +203,16 @@ function collectConfig() {
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
+  const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
+  const cacheDir = values.FNMUSIC_CACHE_DIR;
+  for (const [label, p] of [["下载目录", dlDir], ["歌曲缓存目录", cacheDir]]) {
+    if (p && (!p.startsWith("/") || p.split("/").includes(".."))) {
+      throw new Error(label + "必须是以 / 开头的绝对路径，且不能包含 ..");
+    }
+  }
+  if (dlDir && cacheDir && (dlDir === cacheDir || dlDir.startsWith(cacheDir + "/") || cacheDir.startsWith(dlDir + "/"))) {
+    throw new Error("歌曲缓存目录与下载目录不能相同或互为父子目录");
+  }
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
@@ -211,6 +229,15 @@ function collectConfig() {
 async function saveConfig() {
   let values;
   try { values = collectConfig(); } catch (exc) { toast(exc.message, "fail"); return; }
+  // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
+  // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
+  for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
+    const next = values[key] || "";
+    if (next && next !== (configValues[key] || "")) {
+      const res = await fsCheckDir(next);
+      if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
+    }
+  }
   const btn = $("#save-btn");
   btn.disabled = true;
   // 新激活的源保存时要逐个端到端校验（每源可达 1-2 分钟），给出预期提示
@@ -625,21 +652,23 @@ $("#lx-file").addEventListener("change", async () => {
 });
 
 /* NAS 文件选择：仅桌面环境（统一网关 /app/fnmusic-ext 内）可用。
-   选中的主机路径经 /api/host-file 代读（webui_gateway 本地处理），再走上传落盘。 */
-let lxTrimSdk = null;
-async function lxLoadTrimSdk() {
-  if (lxTrimSdk !== null) return lxTrimSdk;
+   洛雪源选中的主机路径经 /api/host-file 代读（webui_gateway 本地处理），再走上传落盘；
+   储存目录选中即完成飞牛授权（pickUserFile directory 模式）。
+   SDK 全站共享单例：加载失败（直连 8774）置 false，调用方自行降级。 */
+let trimSdk = null;
+async function loadTrimSdk() {
+  if (trimSdk !== null) return trimSdk;
   try {
     const mod = await import("/app/fnmusic-ext/static/vendor/trim-web-app.js");
-    lxTrimSdk = new mod.TrimApp();
+    trimSdk = new mod.TrimApp();
   } catch (_) {
-    lxTrimSdk = false;
+    trimSdk = false;
   }
-  return lxTrimSdk;
+  return trimSdk;
 }
 
 async function lxPickFromNas() {
-  const sdk = await lxLoadTrimSdk();
+  const sdk = await loadTrimSdk();
   if (!sdk) { toast("当前环境不支持 NAS 文件选择（直连 8774 时请用上传或 URL）", "fail"); return; }
   try {
     const result = await sdk.pickUserFile({
@@ -695,17 +724,114 @@ $("#lx-add").addEventListener("click", () => {
   markDirty("洛雪源列表已修改，需保存后生效");
 });
 
+/* -------------------------------------------------- 储存目录：选择/授权/校验/镜像同步 */
+const DIR_FIELDS = [
+  { input: "#dir-cache", pick: "#dir-cache-pick", check: "#dir-cache-check", label: "歌曲缓存目录" },
+  { input: "#dir-download", pick: "#dir-download-pick", check: "#dir-download-check", label: "下载目录" },
+];
+let _fsCheckSeq = 0;                // 防抖竞态：只采纳最后一次输入的校验结果
+const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试一次，避免重复弹授权框
+
+/* 目录权限校验：桌面链路由宿主机网关（root，真实落盘视角）拦截应答；
+   直连 8774 时 WebUI 返回 501（容器内看不到宿主路径），降级为 skip 放行。 */
+async function fsCheckDir(path) {
+  try {
+    const r = await api("/api/fs-check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!r.writable) {
+      return { mode: "fail", message: r.exists ? "目录不可写（权限不足或只读挂载）" : "目录无法创建（父目录不可写）" };
+    }
+    if (!r.exists) return { mode: "warn", message: "目录不存在；父目录可写，保存后自动创建" };
+    return { mode: "ok", message: "目录可写 ✓" };
+  } catch (exc) {
+    return { mode: "skip", message: "目录校验不可用（" + exc.message + "），保存时不校验权限" };
+  }
+}
+
+function renderDirCheck(el, res) {
+  el.hidden = false;
+  el.className = "dir-check " + res.mode;
+  el.textContent = res.message;
+}
+
+/* 粘贴路径补一次官方授权（飞牛 userAccess；选择器选中的路径已自动授权，无需重复）。
+   授权失败不阻断：代理以 root 落盘，网关 fs-check 才是真实写入视角。 */
+async function authorizeDir(path) {
+  if (_authorizedDirs.has(path)) return;
+  _authorizedDirs.add(path);
+  try {
+    const sdk = await loadTrimSdk();
+    if (sdk && typeof sdk.authorizeUserFile === "function") await sdk.authorizeUserFile(path);
+  } catch (_) { /* 忽略 */ }
+}
+
+function bindDirField(field) {
+  const input = $(field.input);
+  let timer = null;
+  const mirror = () => {
+    // 下载目录与边听边存页的保存路径是同一配置，输入后同步到另一处
+    if (field.input === "#dir-download") $("#tee-dir").value = input.value;
+  };
+  const schedule = () => {
+    markDirty();
+    mirror();
+    clearTimeout(timer);
+    const seq = ++_fsCheckSeq;
+    const path = input.value.trim();
+    if (!path) { $(field.check).hidden = true; return; }
+    timer = setTimeout(async () => {
+      await authorizeDir(path);
+      const res = await fsCheckDir(path);
+      if (seq === _fsCheckSeq) renderDirCheck($(field.check), res);
+    }, 500);
+  };
+  input.addEventListener("input", schedule);
+  $(field.pick).addEventListener("click", async () => {
+    const sdk = await loadTrimSdk();
+    if (!sdk) { toast("当前环境不支持 NAS 目录选择（直连 8774 时请直接粘贴路径）", "fail"); return; }
+    try {
+      const result = await sdk.pickUserFile({
+        directory: true, // 目录授权只支持单选（官方文档：multiple 也会按单目录处理）
+        title: "选择" + field.label,
+        okText: "选择",
+        sidebarGroup: ["myFiles", "otherShare", "favorites"],
+      });
+      const paths = (result && result.data) || [];
+      if (!paths.length) return;
+      input.value = paths[0];
+      _authorizedDirs.add(paths[0]); // 选择器选中即完成授权
+      schedule();
+    } catch (exc) {
+      toast("NAS 目录选择失败：" + exc.message, "fail");
+    }
+  });
+}
+DIR_FIELDS.forEach(bindDirField);
+
+// 边听边存页的保存路径与目录设置页的下载目录是同一配置：此处输入同步过去并标脏
+// （反向同步由 bindDirField 的 mirror 完成）
+$("#tee-dir").addEventListener("input", () => {
+  markDirty();
+  $("#dir-download").value = $("#tee-dir").value;
+});
+
 (async function detectNasPicker() {
   // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
   const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
   if (pathname.startsWith("/app/")) {
-    const sdk = await lxLoadTrimSdk();
-    if (sdk) $("#lx-pick").hidden = false;
+    const sdk = await loadTrimSdk();
+    if (sdk) {
+      $("#lx-pick").hidden = false;
+      DIR_FIELDS.forEach((f) => { $(f.pick).hidden = false; });
+    }
   }
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
+["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $("#lx-url").addEventListener("input", () => {
   // #lx-url 仅为「添加」入口输入框，激活态由列表 active 标记决定，与它无关

@@ -75,7 +75,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
-    "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
+    "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
+    "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
     "FNMUSIC_FAV_AUTO_BIND": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "收藏自动绑定本地"},
     "FNMUSIC_AUTO_COVER": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "自动下载封面"},
@@ -363,11 +364,36 @@ async def _lx_enabled_platforms(request: Request) -> list[str]:
         return []
 
 
+def _normalize_dir_path(label: str, raw) -> str:
+    """储存目录归一化：空值合法（=恢复默认/自动探测）；要求绝对路径、
+    拒绝 .. 段与换行/空字符；折叠多余斜杠与尾斜杠。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if any(ch in text for ch in "\r\n\x00"):
+        raise ValueError(f"{label}: 路径不能包含换行或空字符")
+    if not text.startswith("/"):
+        raise ValueError(f"{label}: 必须是以 / 开头的绝对路径，收到 {raw!r}")
+    segs = [seg for seg in text.split("/") if seg]
+    if not segs:
+        raise ValueError(f"{label}: 不能是根目录 /")
+    if ".." in segs:
+        raise ValueError(f"{label}: 路径不能包含 .. 段")
+    return "/" + "/".join(segs)
+
+
+def _is_dir_within(child: str, parent: str) -> bool:
+    """child 是否与 parent 相同或位于 parent 之下（均应为归一化后的绝对路径）。"""
+    return child == parent or child.startswith(parent.rstrip("/") + "/")
+
+
 def _normalize_value(key: str, raw) -> str:
     if key == "LX_SOURCE_LIST":
         return _normalize_lx_source_list(raw)
     spec = SCHEMA[key]
     kind = spec["kind"]
+    if kind == "dir":
+        return _normalize_dir_path(spec.get("label", key), raw)
     if kind == "bool":
         if isinstance(raw, bool):
             return "true" if raw else "false"
@@ -412,6 +438,11 @@ def validate_updates(values: dict) -> dict[str, str]:
     # 三选一互斥：以"应用后的最终状态"判断
     final = dict(read_env())
     final.update(updates)
+    # 储存目录互斥：缓存目录与下载目录不能相同或互为父子（否则滚动缓存被官方扫描进曲库）
+    final_cache = (final.get("FNMUSIC_CACHE_DIR") or "").strip()
+    final_dl = (final.get("FNMUSIC_TEE_SAVE_DIR") or "").strip()
+    if final_cache and final_dl and (_is_dir_within(final_cache, final_dl) or _is_dir_within(final_dl, final_cache)):
+        raise ValueError("歌曲缓存目录与下载目录不能相同或互为父子目录")
     enabled = [name for name, key in PROVIDERS.items()
                if final.get(key, SCHEMA[key]["default"]).lower() in ("true", "1", "yes")]
     if len(enabled) > 1:
@@ -853,6 +884,17 @@ async def netease_qr(unikey: str = Query(...)):
     buf = io.BytesIO()
     img.save(buf)
     return Response(content=buf.getvalue(), media_type="image/svg+xml")
+
+
+@app.post("/api/fs-check")
+async def api_fs_check():
+    """目录权限校验占位端点（直连 8774 场景）。
+
+    桌面链路（统一网关）中该路径由宿主机侧 webui_gateway（root）拦截应答，
+    不会到达这里；能到达说明是独立浏览器/直连端口环境，WebUI 容器内看不到
+    宿主机真实目录，无法给出可信的可写性结论，明确回 501 让前端降级放行。
+    """
+    raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
 # ------------------------------------------------------------------ 静态前端 --

@@ -910,6 +910,86 @@ def test_lx_source_list_normalizes_items_and_dedupes(env_file):
         assert loaded[1]["url"] == "https://b.com/source.js"
 
 
+# ------------------------------------------------------------------ 储存目录 ---
+
+def test_storage_dirs_schema_and_roundtrip(env_file):
+    """缓存/下载目录：dir kind、热重载；保存时归一化（尾斜杠/重复斜杠折叠）。"""
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_CACHE_DIR"] == ""
+        assert view.json()["values"]["FNMUSIC_TEE_SAVE_DIR"] == ""
+        for key in ("FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"):
+            meta = view.json()["schema"][key]
+            assert meta["kind"] == "dir" and meta["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/music/",
+            "FNMUSIC_CACHE_DIR": "/vol2/cache//sub",
+        }})
+        assert saved.status_code == 200
+        assert set(saved.json()["changed"]) == {"FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"}
+        assert saved.json()["actions"] == []  # 热键无进程动作
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_TEE_SAVE_DIR='/vol1/music'" in text
+    assert "FNMUSIC_CACHE_DIR='/vol2/cache/sub'" in text
+
+
+def test_put_dir_rejects_relative_dotdot_and_newline(env_file):
+    with authed_client() as client:
+        for bad in ("vol1/music", "/vol1/../etc", "/vol1/a\n/b"):
+            for key in ("FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"):
+                r = client.put("/api/config", json={"values": {key: bad}})
+                assert r.status_code == 400, (key, bad)
+                assert r.json()["error"]
+
+
+def test_put_dir_rejects_root(env_file):
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": "/"}})
+        assert r.status_code == 400
+        assert "根目录" in r.json()["error"]
+
+
+def test_put_dirs_reject_same_or_nested(env_file):
+    """缓存目录与下载目录不能相同或互为父子（含只改其一时按最终状态判断）。"""
+    with authed_client() as client:
+        same = client.put("/api/config", json={"values": {
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/music", "FNMUSIC_CACHE_DIR": "/vol1/music",
+        }})
+        assert same.status_code == 400
+        assert "父子" in same.json()["error"]
+        nested = client.put("/api/config", json={"values": {
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/music", "FNMUSIC_CACHE_DIR": "/vol1/music/cache",
+        }})
+        assert nested.status_code == 400
+        assert "父子" in nested.json()["error"]
+    env_file.write_text(BASE_ENV + "FNMUSIC_TEE_SAVE_DIR='/vol1/music'\n", encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": "/vol1/music/cache"}})
+        assert r.status_code == 400
+        assert "父子" in r.json()["error"]
+
+
+def test_put_dirs_empty_clears_to_default(env_file):
+    """目录键清空=恢复默认/自动探测，合法且写回空值。"""
+    env_file.write_text(BASE_ENV + "FNMUSIC_CACHE_DIR='/vol2/cache'\n", encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": ""}})
+        assert r.status_code == 200
+        assert "FNMUSIC_CACHE_DIR" in r.json()["changed"]
+    assert "FNMUSIC_CACHE_DIR=''" in env_file.read_text(encoding="utf-8")
+
+
+def test_fs_check_endpoint_placeholder(env_file):
+    """直连 8774（无宿主网关拦截）到达 WebUI：明确 501；且要求管理员。"""
+    with authed_client() as client:
+        r = client.post("/api/fs-check", json={"path": "/vol1/music"})
+        assert r.status_code == 501
+    with TestClient(webui.app) as client:
+        denied = client.post("/api/fs-check", json={"path": "/vol1/music"})
+        assert denied.status_code == 403
+
+
 # ------------------------------------------------------------------ 网关管理员 ---
 
 def test_api_requires_admin(env_file):
