@@ -128,6 +128,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "transcode_ttl_s", 90.0)
     monkeypatch.setitem(CONF, "transcode_cache_max_mb", 512)
     monkeypatch.setitem(CONF, "transcode_dl_bitrate", "320k")
+    monkeypatch.setitem(CONF, "dl_quality", "app")
     monkeypatch.setitem(CONF, "fav_auto_bind", False)
     monkeypatch.setitem(CONF, "trace_forward", False)
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", dirs["play_history"])
@@ -506,21 +507,108 @@ def test_download_original_serves_cached_file(env, fake_ffmpeg):
         assert file_resp.content == payload      # 原始档：不转码，直接供原文件
 
 
-def test_download_standard_fails_without_ffmpeg(env):
-    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 100, ext="flac")
+def test_download_missing_quality_serves_original(env):
+    """缺省 quality 一律交付原文件：有损转码必须 App 显式请求"标准"档（2.8.0 修复）。
+
+    2.6.3-2.7.0 缺省=standard，App 无损偏好下发的值落到缺省被转成 MP3；
+    现在缺省走 original，无 ffmpeg 也能直接交付已落库文件。
+    """
+    payload = b"FLACDATA" * 500
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
     with TestClient(app) as client:
         did = client.post("/music/api/v1/download/track/transcode/prepare",
                           json={"guid": FAKE_KUWO}).json()["data"]["downloadId"]
 
-        def _failed():
+        def _ready():
             st = client.get("/music/api/v1/download/track/transcode/status",
                             params={"downloadId": did}).json()["data"]
-            return st if st["status"] == "failed" else None
-        st = wait_for(_failed)
-        assert st is not None and st["errmsg"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None and st["percent"] == 100
         file_resp = client.get("/music/api/v1/download/track/transcode/file",
                                params={"downloadId": did})
-        assert file_resp.status_code == 404
+        assert file_resp.content == payload
+        # 原始档按真实扩展名交付：flac 不再错标 audio/mp4
+        assert file_resp.headers["content-type"].startswith("audio/flac")
+
+
+def test_download_unknown_quality_word_serves_original(env, fake_ffmpeg):
+    """App 无损偏好下发的未知档位词（lossless 等）不再落缺省转码：交付原文件。"""
+    fake_ffmpeg("fail")   # 一旦走到转码即失败——原文件路径不应碰 ffmpeg
+    payload = b"FLACDATA" * 300
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "lossless"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+
+
+def test_download_is_original_truthy_string(env):
+    """isOriginal 兼容字符串 "true"/"1"（官方请求体可能不传布尔）。"""
+    payload = b"ORIGINALBYTES" * 100
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "standard",
+                                "isOriginal": "true"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready)
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+
+
+def test_download_dl_quality_force_original_overrides_standard(monkeypatch, env):
+    """dl_quality=original：App 显式要"标准"档也交付原文件（整体强制覆盖）。"""
+    monkeypatch.setitem(CONF, "dl_quality", "original")
+    payload = b"FLACDATA" * 200
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "standard"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready)
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+        assert file_resp.headers["content-type"].startswith("audio/flac")
+
+
+def test_download_dl_quality_standard_missing_quality_transcodes(monkeypatch, env, fake_ffmpeg):
+    """dl_quality=standard：缺省 quality 也按官方"标准"档转码 MP3 320k（回归 2.6.3 行为）。"""
+    monkeypatch.setitem(CONF, "dl_quality", "standard")
+    fake_ffmpeg("ok")
+    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 500, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.headers["content-type"].startswith("audio/mpeg")
 
 
 def test_download_fails_when_source_dead_and_no_cache(env, fake_ffmpeg):

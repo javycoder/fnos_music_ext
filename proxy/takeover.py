@@ -506,6 +506,7 @@ def diagnostic(text):
 # allowlist covers source/search/stream/auth/recommend failures in the current app.
 _SAFE_OUTCOME = re.compile(
     r'(?:\[dl-capture\] [ -~]{0,600}|'
+    r'\[dl\] prepare [ -~]{0,300}|'
     r'audio decode check failed for [!-~]{1,120} \(ext=[a-z0-9]{1,8} bytes=[0-9]{1,12}\)|'
     r'retrying [!-~]{1,120} with mp3 tier after corrupt lossless stream|'
     r'tee finalize rejected corrupt lossless for [!-~]{1,120}|'

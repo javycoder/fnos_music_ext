@@ -123,7 +123,7 @@
           </div>
           <div class="card">
             <div class="card-title">lx音乐源列表</div>
-            <p class="hint">可保存多个洛雪自定义源脚本。列表中同时只能激活一个；点击未激活源的「激活」并点击下方「保存并生效」即可切换使用。</p>
+            <p class="hint">可保存多个洛雪自定义源脚本，并支持多个源同时激活（解析时自动在启用的源之间接力切换）。点击源条目的「激活」/「取消激活」做好标记后，点下方「保存并生效」统一校验并应用；新激活的源会先做一次可用性校验（每个约需 1 分钟）。</p>
             <div id="lx-source-list" class="stack"></div>
           </div>
         </div>
@@ -144,6 +144,16 @@
             <label><input type="radio" name="quality" value="balanced"><div><b>平衡</b><span>取中间档（偶数档取中间偏高），失败先降后升</span></div></label>
             <label><input type="radio" name="quality" value="smooth"><div><b>流畅</b><span>优先最低档，最快出声</span></div></label>
           </div>
+          <p class="hint">音质偏好只影响在线播放/搜索时按什么档位取歌（高音质=优先无损原文件）。</p>
+        </div>
+        <div class="card">
+          <div class="card-title">下载音质</div>
+          <div class="radio-list" id="dl-quality-list">
+            <label><input type="radio" name="dl-quality" value="app"><div><b>跟随 App</b><span>App 明确选"标准"才交 MP3，其余一律无损原文件（FLAC 等）</span></div></label>
+            <label><input type="radio" name="dl-quality" value="original"><div><b>无损原文件</b><span>下载一律交付原文件，App 选"标准"也不转码</span></div></label>
+            <label><input type="radio" name="dl-quality" value="standard"><div><b>MP3 320k</b><span>一律按官方"标准"档交 MP3 320kbps（省空间，与官方一致）</span></div></label>
+          </div>
+          <p class="hint">只影响在 App 里点"下载"拿到的文件。默认"跟随 App"：无损歌曲不再被擅自转成 MP3（2.7.0 及以前的标准档缺省行为已修正）。保存后立即生效。</p>
         </div>
         <div class="card">
           <div class="card-title">推荐</div>
