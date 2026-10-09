@@ -293,6 +293,66 @@ async def test_resolve_lx_url_all_fail():
     await client.aclose()
 
 
+@pytest.mark.anyio
+async def test_resolve_lx_url_fresh_param_passthrough():
+    """fresh=True 时请求带 fresh=1 旁路 lxmusic 缓存；默认不带该参数（issue #45）。"""
+    seen: "list[dict]" = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({
+            "id": request.url.params.get("id"),
+            "quality": request.url.params.get("quality"),
+            "fresh": request.url.params.get("fresh"),
+        })
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "x", "url": "http://audio.test/a.flac", "ext": "flac"}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    res = await resolve_lx_url(client, "lx:kg:ABCDEF1234567890", fresh=True)
+    assert res and res["url"] == "http://audio.test/a.flac"
+    n_fresh = len(seen)
+    res2 = await resolve_lx_url(client, "lx:kg:ABCDEF1234567890")
+    assert res2 and res2["url"] == "http://audio.test/a.flac"
+    assert n_fresh >= 1
+    assert all(p["fresh"] == "1" for p in seen[:n_fresh])
+    assert all(p["fresh"] is None for p in seen[n_fresh:])
+    await client.aclose()
+
+
+def test_stream_track_lx_retry_passes_fresh_url(monkeypatch):
+    """取流重试（首次打开失败后）必须旁路 lxmusic 缓存：fresh_url 依次为 False、True。"""
+    import proxy.app as proxy_app
+
+    opened_fresh: "list[bool]" = []
+
+    async def fake_open(request, guid, range_header, force_mp3=False, fresh_url=False):
+        opened_fresh.append(fresh_url)
+        return None
+
+    async def fake_recover(request, guid, entry):
+        return True
+
+    monkeypatch.setattr(proxy_app, "_open_online_stream", fake_open)
+    monkeypatch.setattr(proxy_app, "_recover_source", fake_recover)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_lx_handler_factory()), base_url="http://127.0.0.1:8772"
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:lx:kg:ABCDEF1234567890")
+    assert resp.status_code == 404
+    assert opened_fresh == [False, True]
+
+
 # =========================================================================
 # 2. healthz 包含 lxmusic 状态
 # =========================================================================
