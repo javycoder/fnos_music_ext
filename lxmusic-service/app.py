@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 import urllib.parse
 
@@ -614,37 +615,42 @@ async def resolve_and_probe(
     return None
 
 
+def _source_supported_platforms(s: dict) -> list[str]:
+    """提取单个源的声明平台（兼容 supportedSources/sources 键与 dict 形态），空则视为全平台。"""
+    raw_supp = s.get("supportedSources") or s.get("sources") or []
+    if isinstance(raw_supp, dict):
+        raw_supp = list(raw_supp.keys())
+    supported = [normalize_source(str(p)) for p in raw_supp if normalize_source(str(p))]
+    return supported or list(SUPPORTED_PLATFORMS)
+
+
 async def source_capabilities() -> dict[str, dict]:
-    """描述各平台的可用性（搜索可用性、播放解析可用性、音质列表）。"""
+    """描述各平台的可用性（搜索可用性、播放解析可用性、音质列表）。
+
+    多源同时激活时按全部启用源（status != failed）的平台并集判定。"""
     lx_alive = await LXSERVER.is_alive()
     sources = await LXSERVER.list_custom_sources() if lx_alive else []
-    # 查找是否有启用的自定义源
-    active_source = None
-    for s in sources:
-        if s.get("enable") or s.get("enabled"):
-            active_source = s
-            break
+    enabled_sources = [s for s in sources if s.get("enable") or s.get("enabled")]
 
-    supported = []
-    source_status = (active_source or {}).get("status", "ok") if active_source else ""
-    if active_source and source_status != "failed":
-        raw_supp = active_source.get("supportedSources") or active_source.get("sources") or []
-        if isinstance(raw_supp, dict):
-            raw_supp = list(raw_supp.keys())
-        supported = [normalize_source(str(p)) for p in raw_supp if normalize_source(str(p))]
-        if not supported:
-            supported = list(SUPPORTED_PLATFORMS)
+    supported: set[str] = set()
+    first_error = ""
+    for s in enabled_sources:
+        if str(s.get("status") or "ok") == "failed":
+            if not first_error:
+                first_error = str(s.get("error") or "init error")
+            continue
+        supported.update(_source_supported_platforms(s))
 
     caps: dict[str, dict] = {}
     for src in SUPPORTED_PLATFORMS:
-        has_playback = bool(lx_alive and active_source and (src in supported))
+        has_playback = bool(lx_alive and enabled_sources and (src in supported))
         reason = ""
         if not lx_alive:
             reason = "lxserver unready"
-        elif not active_source:
+        elif not enabled_sources:
             reason = "no active custom source"
-        elif source_status == "failed":
-            reason = f"active source failed: {active_source.get('error', 'init error')}"
+        elif not supported and first_error:
+            reason = f"all active sources failed: {first_error}"
         elif src not in supported:
             reason = f"platform {src} not supported by active source"
 
@@ -659,63 +665,92 @@ async def source_capabilities() -> dict[str, dict]:
 
 
 async def describe_user_source() -> dict:
-    """描述当前激活的音源。保持与原 SourceManager.describe() 结构兼容。"""
+    """描述当前激活的音源（支持多源同时激活）。
+
+    兼容约定：configured/url/source/initialized/last_error 等既有字段取第一个启用源；
+    新增 sources 数组（全部启用源）与 active_count。"""
     try:
         sources = await LXSERVER.list_custom_sources()
     except Exception:
         sources = []
 
-    active = None
-    for s in sources:
-        if s.get("enable") or s.get("enabled"):
-            active = s
-            break
+    enabled = [s for s in sources if s.get("enable") or s.get("enabled")]
 
-    if not active:
+    def _entry(s: dict) -> dict:
+        status = str(s.get("status") or "ok")
+        return {
+            "id": str(s.get("id") or ""),
+            "name": str(s.get("name") or ""),
+            "version": str(s.get("version") or "1.0.0"),
+            "url": str(s.get("sourceUrl") or ""),
+            "status": status,
+            "error": str(s.get("error") or ""),
+            "initialized": status != "failed",
+            "platforms": _source_supported_platforms(s),
+        }
+
+    active_sources = [_entry(s) for s in enabled]
+
+    if not active_sources:
         return {
             "configured": False,
             "url": "",
             "initialized": False,
             "last_error": "",
             "source": None,
+            "sources": [],
+            "active_count": 0,
         }
 
-    status = str(active.get("status") or "ok")
-    err = str(active.get("error") or "")
-    initialized = status != "failed"
-
-    raw_supp = active.get("supportedSources") or active.get("sources") or []
-    if isinstance(raw_supp, dict):
-        raw_supp = list(raw_supp.keys())
-    supported = [normalize_source(str(p)) for p in raw_supp if normalize_source(str(p))]
-    if not supported:
-        supported = list(SUPPORTED_PLATFORMS)
-
-    platforms_desc = {p: {"qualitys": ["128k", "320k", "flac"]} for p in supported}
+    first_src, first = enabled[0], active_sources[0]
+    platforms_desc = {p: {"qualitys": ["128k", "320k", "flac"]} for p in first["platforms"]}
 
     return {
         "configured": True,
-        "url": active.get("name") or active.get("id") or "",
-        "initialized": initialized,
-        "last_error": err,
+        "url": first_src.get("name") or first_src.get("id") or "",
+        "initialized": first["initialized"],
+        "last_error": first["error"],
         "source": {
-            "name": active.get("name", "lx-source"),
-            "version": active.get("version", "1.0.0"),
-            "author": active.get("author", ""),
+            "name": first_src.get("name", "lx-source"),
+            "version": first_src.get("version", "1.0.0"),
+            "author": first_src.get("author", ""),
             "platforms": platforms_desc,
-            "running": initialized,
+            "running": first["initialized"],
             "pid": 0,
             "uptime_s": 3600,
         },
+        "sources": active_sources,
+        "active_count": len(active_sources),
     }
 
 
 # ------------------------------------------------------------- FastAPI 生命周期 --
 
+def _env_active_source_urls() -> list[str]:
+    """从 LX_SOURCE_LIST 环境变量解析 active 标记的源 URL（多源自愈恢复用）。"""
+    raw = os.environ.get("LX_SOURCE_LIST", "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(items, list):
+        return []
+    urls: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("active"):
+            continue
+        url = str(item.get("url") or "").strip()
+        if url:
+            urls.append(url)
+    return urls
+
+
 async def _bootstrap_migration():
     for _ in range(20):
         try:
-            if await LXSERVER.health():
+            if await LXSERVER.is_alive():
                 break
         except Exception:
             pass
@@ -738,22 +773,36 @@ async def _bootstrap_migration():
 
         active = await describe_user_source()
         if not active.get("configured"):
-            source_url = ""
-            state_file = old_dir / "state.json"
-            if state_file.is_file():
-                try:
-                    data = json.loads(state_file.read_text(encoding="utf-8"))
-                    source_url = str(data.get("source_url") or "")
-                except Exception:
-                    pass
-            if not source_url:
-                source_url = os.environ.get("LX_SOURCE_URL", "").strip()
-            if source_url:
-                try:
-                    await source_set(SourceBody(url=source_url))
-                    logger.info("已自动激活历史音源: %s", source_url)
-                except Exception as e:
-                    logger.warning("自动激活历史音源失败: %s", e)
+            # 优先按 LX_SOURCE_LIST 的 active 标记恢复多源激活（lxserver 数据卷被清时自愈）
+            multi_urls = _env_active_source_urls()
+            if multi_urls:
+                for url in multi_urls:
+                    try:
+                        res = await source_set(SourceBody(url=url))
+                        if res.get("ok"):
+                            logger.info("已自动激活洛雪源: %s", url)
+                        else:
+                            logger.warning("自动激活洛雪源失败: %s (%s)", url, res.get("error") or "")
+                    except Exception as e:
+                        logger.warning("自动激活洛雪源失败: %s: %s", url, e)
+            else:
+                # 旧单源路径回退：state.json / LX_SOURCE_URL
+                source_url = ""
+                state_file = old_dir / "state.json"
+                if state_file.is_file():
+                    try:
+                        data = json.loads(state_file.read_text(encoding="utf-8"))
+                        source_url = str(data.get("source_url") or "")
+                    except Exception:
+                        pass
+                if not source_url:
+                    source_url = os.environ.get("LX_SOURCE_URL", "").strip()
+                if source_url:
+                    try:
+                        await source_set(SourceBody(url=source_url))
+                        logger.info("已自动激活历史音源: %s", source_url)
+                    except Exception as e:
+                        logger.warning("自动激活历史音源失败: %s", e)
     except Exception as exc:
         logger.warning("历史数据检查与迁移异常: %s", exc)
 
@@ -1017,6 +1066,7 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
 class SourceBody(BaseModel):
     url: str = ""
     script: str = ""
+    enabled: bool = True  # false 表示停用该源（多源叠加语义下的取消激活）
 
 
 @app.get("/api/v1/source")
@@ -1138,7 +1188,9 @@ async def source_upload(body: UploadBody):
 
 @app.post("/api/v1/source")
 async def source_set(body: SourceBody):
-    """切换激活自定义源。第一期保持单源语义：激活目标源，其余禁用。"""
+    """激活/停用自定义源（多源叠加语义：只改目标源启用态，不动其他源）。
+
+    body.enabled=false 表示停用目标源；默认 true 为激活。同一脚本重复添加是正常操作。"""
     url = (body.url or "").strip()
     if not url and body.script:
         # 直接传入脚本内容：先上传再激活
@@ -1157,37 +1209,47 @@ async def source_set(body: SourceBody):
     try:
         source_id = ""
         if url.startswith(("http://", "https://")):
-            # http(s) URL：交给 lxserver 下载导入；同脚本已导入过则直接复用
-            try:
-                res = await LXSERVER.import_custom_source(url)
-                source_id = str(res.get("id") or "")
-            except Exception as exc:
-                if "已存在" not in str(exc):
-                    raise
+            if not body.enabled:
+                # 停用：无需重新导入，直接按导入 URL 反查源 id
                 existing = await _find_lxserver_source(by_url=url)
                 source_id = str((existing or {}).get("id") or "")
-            if not source_id:
-                existing = await _find_lxserver_source(by_url=url)
-                source_id = str((existing or {}).get("id") or "")
-            if not source_id or not await LXSERVER.activate_single_source(source_id):
-                return JSONResponse(
-                    content={
-                        "ok": False,
-                        "error": f"导入成功但未找到要激活的源: {source_id or url}",
-                        "category": "runtime",
-                    },
-                    status_code=500,
-                )
+                if not source_id or not await LXSERVER.set_source_enabled(source_id, False):
+                    return JSONResponse(
+                        content={"ok": False, "error": f"未找到要停用的源: {url}", "category": "runtime"},
+                        status_code=500,
+                    )
+            else:
+                # http(s) URL：交给 lxserver 下载导入；同脚本已导入过则直接复用
+                try:
+                    res = await LXSERVER.import_custom_source(url)
+                    source_id = str(res.get("id") or "")
+                except Exception as exc:
+                    if "已存在" not in str(exc):
+                        raise
+                    existing = await _find_lxserver_source(by_url=url)
+                    source_id = str((existing or {}).get("id") or "")
+                if not source_id:
+                    existing = await _find_lxserver_source(by_url=url)
+                    source_id = str((existing or {}).get("id") or "")
+                if not source_id or not await LXSERVER.set_source_enabled(source_id, True):
+                    return JSONResponse(
+                        content={
+                            "ok": False,
+                            "error": f"导入成功但未找到要激活的源: {source_id or url}",
+                            "category": "runtime",
+                        },
+                        status_code=500,
+                    )
         else:
             # file:// URL 或裸 id/名称：取最后一段作为 lxserver 源 id（与上传时返回的 id 一致）
             parsed = urllib.parse.urlparse(url)
             path_part = urllib.parse.unquote(parsed.path) if parsed.scheme else url
             source_id = path_part.rsplit("/", 1)[-1]
-            if not await LXSERVER.activate_single_source(source_id):
-                # 列表中无此 id：若本地确有脚本文件（如旧数据卷 /data/lxmusic/uploads），
-                # 自动补导入 lxserver 后激活，保证历史配置可继续使用
+            if not await LXSERVER.set_source_enabled(source_id, body.enabled):
+                # 列表中无此 id：激活语义下，若本地确有脚本文件（如旧数据卷 /data/lxmusic/uploads），
+                # 自动补导入 lxserver 后激活，保证历史配置可继续使用；停用语义不做补导入
                 imported = False
-                if path_part.startswith("/") and os.path.isfile(path_part):
+                if body.enabled and path_part.startswith("/") and os.path.isfile(path_part):
                     with open(path_part, "r", encoding="utf-8", errors="replace") as f:
                         script = f.read()
                     try:
@@ -1204,16 +1266,17 @@ async def source_set(body: SourceBody):
                         if existing:
                             source_id = str(existing.get("id") or source_id)
                             imported = True
-                if not imported or not await LXSERVER.activate_single_source(source_id):
+                if not imported or not await LXSERVER.set_source_enabled(source_id, body.enabled):
+                    action = "激活" if body.enabled else "停用"
                     return JSONResponse(
                         content={"ok": False,
-                                 "error": f"未找到要激活的源: {source_id}，请先上传或用测试校验源可用性",
+                                 "error": f"未找到要{action}的源: {source_id}，请先上传或用测试校验源可用性",
                                  "category": "runtime"},
                         status_code=500,
                     )
     except Exception as exc:
         return JSONResponse(
-            content={"ok": False, "error": f"激活源失败: {exc}", "category": "runtime"},
+            content={"ok": False, "error": f"切换源失败: {exc}", "category": "runtime"},
             status_code=500,
         )
 

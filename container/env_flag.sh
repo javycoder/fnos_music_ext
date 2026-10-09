@@ -33,7 +33,7 @@ export_source_env() {
     if [ ! -f "$ENV_FILE" ]; then
         return 0
     fi
-    for _key in LX_SOURCE_URL LX_SOURCES MUSICDL_SOURCES LXSERVER_ADMIN_PASSWORD; do
+    for _key in LX_SOURCE_URL LX_SOURCE_LIST LX_SOURCES MUSICDL_SOURCES LXSERVER_ADMIN_PASSWORD; do
         if printenv "$_key" >/dev/null 2>&1; then
             continue
         fi

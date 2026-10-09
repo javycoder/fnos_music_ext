@@ -300,9 +300,67 @@ def _normalize_lx_source_list(raw) -> str:
 
         name = str(item.get("name") or "").strip()
         name = re.sub(r"[\r\n\t]+", " ", name).strip()[:80]
-        normalized.append({"name": name, "url": url})
+        normalized.append({"name": name, "url": url, "active": bool(item.get("active"))})
 
     return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def _lx_list_items(raw) -> list[dict]:
+    """解析 LX_SOURCE_LIST JSON 字符串为 dict 列表（非法输入返回空列表）。"""
+    if isinstance(raw, list):
+        items = raw
+    else:
+        try:
+            items = json.loads(str(raw or "").strip() or "[]")
+        except Exception:
+            return []
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _list_active_urls(values: dict) -> set[str]:
+    """从 .env 值推导激活 URL 集合：优先列表 active 标记；无标记回退 LX_SOURCE_URL 单值（旧数据）。"""
+    urls: set[str] = set()
+    for item in _lx_list_items(values.get("LX_SOURCE_LIST")):
+        if item.get("active"):
+            url = str(item.get("url") or "").strip()
+            if url:
+                urls.add(url)
+    if not urls:
+        url = str(values.get("LX_SOURCE_URL") or "").strip()
+        if url:
+            urls.add(url)
+    return urls
+
+
+def _derive_lx_list_actives(items: list[dict], ref_url: str) -> list[dict]:
+    """兼容升级：列表无任何 active 标记时按 LX_SOURCE_URL 推导（全部项显式落布尔）。"""
+    if items and not any(i.get("active") for i in items):
+        for item in items:
+            item["active"] = bool(ref_url) and str(item.get("url") or "").strip() == ref_url
+    return items
+
+
+def _dumps_lx_list(items: list[dict]) -> str:
+    return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _lx_enabled_platforms(request: Request) -> list[str]:
+    """读取 lxmusic 当前全部启用源的声明平台并集（保持出现顺序）；不可达返回空列表。"""
+    try:
+        resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
+        data = _resp_json(resp)
+        sources = ((data or {}).get("data") or {}).get("sources") or []
+        platforms: list[str] = []
+        for s in sources:
+            for p in (s or {}).get("platforms") or []:
+                p = str(p).strip()
+                if p and p not in platforms:
+                    platforms.append(p)
+        return platforms
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _normalize_value(key: str, raw) -> str:
@@ -476,6 +534,12 @@ async def api_status(request: Request):
 @app.get("/api/config")
 async def api_config():
     values = read_env()
+    # 兼容升级：列表项缺 active 标记时按 LX_SOURCE_URL 推导（旧数据一次加载即升级）
+    ref_url = str(values.get("LX_SOURCE_URL") or "").strip()
+    if ref_url:
+        items = _derive_lx_list_actives(_lx_list_items(values.get("LX_SOURCE_LIST")), ref_url)
+        if items:
+            values["LX_SOURCE_LIST"] = _dumps_lx_list(items)
     return {
         "ok": True,
         "values": {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()},
@@ -538,16 +602,54 @@ async def api_config_put(body: ConfigBody, request: Request):
     except ValueError as exc:
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
 
-    # lx 换源前置校验：新 URL 必须先通过 lxmusic verify 才写入
-    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
     after_preview = dict(before)
     after_preview.update(updates)
-    if lx_url_changed and current_provider(after_preview) == "lxmusic":
-        new_url = updates["LX_SOURCE_URL"]
-        client = get_http(request)
+    lx_provider = current_provider(after_preview) == "lxmusic"
+
+    # lx 多源激活集合：active_items 待激活列表、to_activate 新激活（需校验）、to_deactivate 被取消激活
+    active_items: list[dict] = []
+    to_activate: list[dict] = []
+    to_deactivate: list[dict] = []
+    lx_reconcile = False
+    if lx_provider and "LX_SOURCE_LIST" in updates:
+        items = _derive_lx_list_actives(
+            _lx_list_items(updates["LX_SOURCE_LIST"]),
+            str(updates.get("LX_SOURCE_URL") or after_preview.get("LX_SOURCE_URL") or "").strip(),
+        )
+        active_items = [i for i in items if i.get("active") and str(i.get("url") or "").strip()]
+        if items and not active_items:
+            return JSONResponse(
+                content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
+            )
+        if active_items:
+            lx_reconcile = True
+            # LX_SOURCE_URL 退化为派生兼容字段 = 第一个激活项
+            updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip()
+            after_preview["LX_SOURCE_URL"] = updates["LX_SOURCE_URL"]
+            before_active = _list_active_urls(before)
+            to_activate = [i for i in active_items
+                           if str(i["url"]).strip() not in before_active]
+            before_items = {str(i.get("url") or "").strip(): i for i in _lx_list_items(before.get("LX_SOURCE_LIST"))}
+            to_deactivate = [before_items[str(i["url"]).strip()] for i in items
+                             if not i.get("active") and str(i.get("url") or "").strip() in before_active]
+            updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
+
+    # lx 换源前置校验：新激活的源必须先通过 lxmusic verify 才写入
+    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
+    verify_urls: list[str] = []
+    if lx_provider:
+        if lx_reconcile:
+            verify_urls = [str(i["url"]).strip() for i in to_activate]
+        elif lx_url_changed:
+            verify_urls = [str(updates["LX_SOURCE_URL"] or "").strip()]
+    client = get_http(request)
+    union_acc: list[str] = []  # LX_SOURCES 推导：新激活源声明平台 ∪ 现有启用源声明平台
+    for url in verify_urls:
+        if not url:
+            continue
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
-                                     json={"url": new_url}, timeout=130.0)
+                                     json={"url": url}, timeout=130.0)
             report = _resp_json(resp)
         except Exception as exc:  # noqa: BLE001
             report = {"ok": False, "data": {"message": str(exc)}}
@@ -556,9 +658,20 @@ async def api_config_put(body: ConfigBody, request: Request):
             return JSONResponse(
                 content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
             )
-        platforms = (report.get("data") or {}).get("platforms") or []
-        if platforms:
-            updates.setdefault("LX_SOURCES", ",".join(platforms))
+        # LX_SOURCES 推导累计各新激活源声明平台
+        for p in (report.get("data") or {}).get("platforms") or []:
+            p = str(p).strip()
+            if p and p not in union_acc:
+                union_acc.append(p)
+
+    if lx_reconcile:
+        # 并入现有启用源声明平台（激活前读取，保持出现顺序）
+        for p in await _lx_enabled_platforms(request):
+            p = str(p).strip()
+            if p and p not in union_acc:
+                union_acc.append(p)
+    if union_acc:
+        updates.setdefault("LX_SOURCES", ",".join(union_acc))
 
     old_provider = current_provider(before)
     changed = write_env(updates)
@@ -566,11 +679,11 @@ async def api_config_put(body: ConfigBody, request: Request):
     new_provider = current_provider(after)
     actions: list[dict] = []
 
-    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL 且当前是 lxmusic，仍应重试激活
+    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL/LX_SOURCE_LIST 且当前是 lxmusic，仍应重试激活
     force_lx_activate = (
         new_provider == "lxmusic"
-        and "LX_SOURCE_URL" in updates
-        and bool(after.get("LX_SOURCE_URL"))
+        and ("LX_SOURCE_URL" in updates or "LX_SOURCE_LIST" in updates)
+        and bool(after.get("LX_SOURCE_URL") or after.get("LX_SOURCE_LIST"))
     )
 
     if not changed and not force_lx_activate and not _preview_until:
@@ -579,18 +692,32 @@ async def api_config_put(body: ConfigBody, request: Request):
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, new_provider))
-    # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，或用户重试激活）
-    if new_provider == "lxmusic" and (lx_url_changed or force_lx_activate):
-        client = get_http(request)
+
+    async def _lx_source_post(payload: dict, source: str, op: str) -> None:
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
-                                     json={"url": after["LX_SOURCE_URL"]}, timeout=130.0)
-            payload = _resp_json(resp)
-            ok = resp.status_code == 200 and payload.get("ok", False)
-            err = "" if ok else (payload.get("error") or f"HTTP {resp.status_code}")
+                                     json=payload, timeout=130.0)
+            api_payload = _resp_json(resp)
+            ok = resp.status_code == 200 and api_payload.get("ok", False)
+            err = "" if ok else (api_payload.get("error") or f"HTTP {resp.status_code}")
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
-        actions.append({"kind": "lx_activate", "ok": ok, "error": err or ""})
+        actions.append({"kind": "lx_activate", "op": op, "source": source,
+                        "ok": ok, "error": err or ""})
+
+    # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
+    if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
+        if lx_reconcile:
+            for item in to_deactivate:
+                url = str(item.get("url") or "").strip()
+                await _lx_source_post({"url": url, "enabled": False},
+                                      str(item.get("name") or "") or url, "deactivate")
+            for item in active_items:
+                url = str(item["url"]).strip()
+                await _lx_source_post({"url": url},
+                                      str(item.get("name") or "") or url, "activate")
+        else:
+            await _lx_source_post({"url": after["LX_SOURCE_URL"]}, "", "activate")
     elif new_provider == "musicdl" and (
         "FNMUSIC_ONLINE_SOURCES" in changed or "MUSICDL_SOURCES" in changed
     ):
