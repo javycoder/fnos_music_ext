@@ -11,6 +11,7 @@ from proxy.app import (
     app,
     CONF,
     _SEARCH_CACHE,
+    _NETEASE_URL_PIN,
     _set_search_cache,
     _clean_search_cache,
     fetch_musicbox_search,
@@ -18,12 +19,16 @@ from proxy.app import (
     resolve_netease_url,
     resolve_online_lyric,
     find_cache_file,
+    register_fake_album,
+    _FAKE_ALBUM_REGISTRY,
+    _transcode_source,
 )
 
 
 @pytest.fixture(autouse=True)
 def setup_netease_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
+    _NETEASE_URL_PIN.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -330,6 +335,118 @@ async def test_resolve_netease_url_all_fail():
     )
     url = await resolve_netease_url(client, "186016")
     assert url is None
+
+
+@pytest.mark.anyio
+async def test_resolve_netease_url_pin_reuse_refresh_drop():
+    """直链钉住：有效期内同一首歌复用同一条 CDN URL；refresh=True 强制重解析。
+
+    防 seek/续传/后台整轨/转码在 URL 缓存边界后重解析出不同 rendition（音质
+    降档时字节布局不同，带偏移续拉错位断流）。
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": True, "data": {
+            "code": 200, "url": f"http://audio.test/{calls['n']}.flac", "expi": 1200,
+        }})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8770"
+    )
+    try:
+        u1 = await resolve_netease_url(client, "186016")
+        u2 = await resolve_netease_url(client, "186016")
+        assert u1 == u2 == "http://audio.test/1.flac"
+        assert calls["n"] == 1
+        u3 = await resolve_netease_url(client, "186016", refresh=True)
+        assert u3 == "http://audio.test/2.flac"
+        assert calls["n"] == 2
+        assert await resolve_netease_url(client, "186016") == u3
+        assert calls["n"] == 2
+        # 打不开的钉链被弃置（_open_online_stream 拒绝非 200/206 时调用）后重新解析
+        _NETEASE_URL_PIN.pop("186016", None)
+        assert await resolve_netease_url(client, "186016") == "http://audio.test/3.flac"
+        assert calls["n"] == 3
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_transcode_source_netease_returns_ua():
+    """转码输入源：网易直链带 UA（ffmpeg 与播放路径对齐），且命中钉住缓存。"""
+    calls = {"n": 0}
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": True, "data": {
+            "code": 200, "url": f"http://audio.test/tc{calls['n']}.flac", "expi": 1200,
+        }})
+
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    from starlette.requests import Request as StarletteRequest
+    req_obj = StarletteRequest({"type": "http", "app": app})
+    url, headers = await _transcode_source(req_obj, "online:netease:186016")
+    assert url == "http://audio.test/tc1.flac"
+    assert headers == {"User-Agent": "Mozilla/5.0"}
+    # 与播放共用同一条钉住直链：第二次转码解析不再打取链接口（rendition 一致）
+    url2, headers2 = await _transcode_source(req_obj, "online:netease:186016")
+    assert url2 == url and headers2 == headers
+    assert calls["n"] == 1
+
+
+def test_static_cover_album_anchor_falls_back_to_track_cover():
+    """网易专辑锚点行无封面字段时：借登记曲目 al.picUrl 出链，不再直接占位图。"""
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/song/186016/info":
+            return httpx.Response(200, json={"ok": True, "data": {
+                "name": "晴天", "ar": [{"name": "周杰伦"}],
+                "al": {"name": "叶惠美", "picUrl": "http://img.test/yhm.jpg"},
+                "dt": 269000, "sq": {"size": 25000000},
+            }})
+        return httpx.Response(404)
+
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    register_fake_album(
+        "online:netease:186016", "叶惠美",
+        item={"title": "晴天", "artist": "周杰伦", "cover_url": ""},
+    )
+    fake_album = fake_official_guid("online:netease:186016:album")
+    try:
+        with TestClient(app) as client:
+            resp = client.get(f"/music/api/v1/static/cover?coverId=track_{fake_album}",
+                              follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "http://img.test/yhm.jpg"
+    finally:
+        _FAKE_ALBUM_REGISTRY.pop(fake_album, None)
+
+
+@pytest.mark.anyio
+async def test_fetch_musicbox_search_row_cover_used_without_detail():
+    """搜索行自带封面（web 兜底注入）时直接采用；详情接口缺失不再退回空封面。"""
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(200, json={"ok": True, "data": [{
+                "song_id": 186016, "song_name": "晴天", "artist": "周杰伦",
+                "album_name": "叶惠美", "duration": 269, "quality": "SQ 999k",
+                "album_pic_url": "http://img.test/from-row.jpg",
+            }]})
+        # /songs/detail 挂掉：行内封面必须保留
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    items = await fetch_musicbox_search(client, "晴天", 10)
+    await client.aclose()
+    assert items is not None and len(items) == 1
+    assert items[0]["cover_url"] == "http://img.test/from-row.jpg"
 
 
 # =========================================================================

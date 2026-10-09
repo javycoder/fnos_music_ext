@@ -2029,7 +2029,8 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                 "album": album,
                 "duration_s": duration_s,
                 "ext": ext,
-                "cover_url": "",
+                # 主接口被风控走 web 兜底时行内自带封面；正常路径仍由 /songs/detail 补全覆盖
+                "cover_url": str(it.get("album_pic_url") or it.get("cover_url") or ""),
                 "lyric": "",
             })
             song_ids.append(sid)
@@ -2225,7 +2226,27 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
     return None
 
 
-async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
+# 网易直链钉住（2.8.0）：song_id -> (url, 过期时刻单调钟)。窗口型播放内核
+# seek/暂停续播、后台整轨、断点续传、转码会各自重新解析；musicbox 对取链结果
+# 缓存 600s，缓存边界后重解析可能因音质阶梯降档拿到不同 rendition——新旧文件
+# 字节布局不同，带偏移的续拉会 416/错位断流，表象即"播到一半跳歌"。同一首歌
+# 在直链有效期内钉住同一条 CDN URL，全部调用点自动一致。
+_NETEASE_URL_PIN: "dict[str, tuple[str, float]]" = {}
+
+
+def _netease_url_pin_drop(song_id: str) -> None:
+    _NETEASE_URL_PIN.pop(str(song_id), None)
+
+
+async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: bool = False) -> str | None:
+    key = str(song_id)
+    now = time.monotonic()
+    if not refresh:
+        pin = _NETEASE_URL_PIN.get(key)
+        if pin:
+            if now < pin[1]:
+                return pin[0]
+            _NETEASE_URL_PIN.pop(key, None)
     primary = str(CONF.get("netease_quality") or "lossless").strip()
     qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2242,7 +2263,16 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
                         code = inner.get("code")
                         url = inner.get("url")
                         if code == 200 and url:
-                            return str(url)
+                            url = str(url)
+                            # TTL 以服务端 expi（秒）为准，预留 60s 网络余量；上限 30min，
+                            # 无 expi 时保守 5min。失败重解析由调用方 refresh=True 触发。
+                            try:
+                                expi = float(inner.get("expi") or 0)
+                            except (TypeError, ValueError):
+                                expi = 0.0
+                            ttl = min(max(expi - 60.0, 60.0), 1800.0) if expi > 60.0 else 300.0
+                            _NETEASE_URL_PIN[key] = (url, time.monotonic() + ttl)
+                            return url
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s", song_id, q, e)
     return None
@@ -3785,24 +3815,56 @@ def stream_tee_response(
         try:
             tee_enabled = bool(CONF.get("tee_save_enabled"))
             if should_cache(range_header) and full_resource:
-                directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
-                os.makedirs(directory, exist_ok=True)
-                part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
-                fp = open(part, "wb")
-                tee_active_token = _tee_active_acquire(guid)
-                if pre_info is None and coro_factory:
-                    info_task = asyncio.create_task(coro_factory())
+                try:
+                    directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
+                    os.makedirs(directory, exist_ok=True)
+                    part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
+                    fp = open(part, "wb")
+                except OSError as disk_exc:
+                    # 建目录/开文件失败（磁盘满/权限）：放弃落库照常播放
+                    logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                    part = None
+                if fp:
+                    tee_active_token = _tee_active_acquire(guid)
+                    if pre_info is None and coro_factory:
+                        info_task = asyncio.create_task(coro_factory())
+
+            def _abandon_tee_part() -> None:
+                # 本地写盘失败（磁盘满/IO 错）只放弃边听边存，绝不上抛掐断播放流：
+                # 上游是好的，客户端不能为落库买单。弃件清走，handoff 条件随之失效。
+                nonlocal fp, part
+                if fp:
+                    try:
+                        fp.close()
+                    except OSError:
+                        pass
+                    fp = None
+                if part and os.path.exists(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
+                part = None
+
             iterator = chunks if chunks is not None else resp.aiter_bytes()
             if first_chunk:
                 if fp:
-                    fp.write(first_chunk)
+                    try:
+                        fp.write(first_chunk)
+                    except OSError as disk_exc:
+                        logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                        _abandon_tee_part()
                 written += len(first_chunk)
                 yield first_chunk
             try:
                 async for chunk in iterator:
                     if chunk:
                         if fp:
-                            fp.write(chunk)
+                            try:
+                                fp.write(chunk)
+                            except OSError as disk_exc:
+                                logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                                _abandon_tee_part()
                         written += len(chunk)
                         yield chunk
             except Exception as exc:
@@ -3940,10 +4002,11 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
 
 
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
-                              force_mp3: bool = False, fresh_url: bool = False):
+                              force_mp3: bool = False, fresh_url: bool = False, refresh: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client.
 
-    fresh_url：lx 直链解析旁路 lxmusic 成功缓存强制刷新（仅重试路径使用）。"""
+    fresh_url：lx 直链解析旁路 lxmusic 成功缓存强制刷新（仅重试路径使用）。
+    refresh：网易钉住直链弃钉强制重解析（仅重试路径使用）。"""
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
     headers = {"Accept-Encoding": "identity"}
@@ -3956,7 +4019,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     try:
         if source in ("netease", "lx"):
             if source == "netease":
-                url = await resolve_netease_url(get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+                song_id = song_id_from_online_guid(guid).split(":")[-1]
+                url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh)
                 if not url:
                     return None
             else:
@@ -3999,6 +4063,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
             # Reject servers ignoring identity: decoded bytes cannot use encoded
             # Content-Length/Range offsets, and must not enter the audio cache.
+            if source == "netease":
+                # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
+                _netease_url_pin_drop(song_id)
             return None
         chunks = resp.aiter_bytes()
         first = await anext(chunks, b"")
@@ -4985,9 +5052,11 @@ async def stream_track(request: Request, subpath: str = ""):
                 break
             try:
                 # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐；
-                # 重试（首次打开失败后）旁路 lxmusic 成功缓存，避免反复取到同一条失效直链
+                # 重试（首次打开失败后）旁路 lxmusic 成功缓存并弃用网易钉住直链
+                # 强制重解析——首轮打不开的链不值得再试
                 opened = await asyncio.wait_for(
-                    _open_online_stream(request, candidate, range_header, fresh_url=attempt > 0),
+                    _open_online_stream(request, candidate, range_header,
+                                        fresh_url=attempt > 0, refresh=attempt > 0),
                     timeout=min(6.0, remaining),
                 )
             except Exception as exc:
@@ -5041,7 +5110,11 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
         if source == "netease":
             url = await resolve_netease_url(
                 get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
-            return (url or None, None)
+            if not url:
+                return None, None
+            # 与播放路径对齐：ffmpeg 拉网易 CDN 也带 UA，降低源站拒无头客户端导致的
+            # 转码中途退出（表现为标准音质下播一半分片 404 跳歌）
+            return url, {"User-Agent": "Mozilla/5.0"}
         if source == "lx":
             resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
             if not resolved or not resolved.get("url"):
@@ -5949,9 +6022,26 @@ async def static_cover(request: Request, subpath: str = ""):
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
-        cover = str((album_entry.get("item") or {}).get("cover_url") or "")
+        item = album_entry.get("item") if isinstance(album_entry.get("item"), dict) else {}
+        cover = str(item.get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
             return RedirectResponse(cover, status_code=302)
+        # 登记封面缺失（如网易锚点行本就不带封面字段）不再直接占位：借登记的
+        # 所属曲目走在线信息兜底（netease 由 al.picUrl 出链），再试直构，最后占位
+        track_guid = str(album_entry.get("track_guid") or "")
+        if track_guid and _source_enabled(track_guid):
+            data = await _online_info(request, track_guid)
+            cover = str((data or {}).get("cover_url") or "")
+            if cover and _KW_TEXT_COVER_HOST not in cover:
+                return RedirectResponse(cover, status_code=302)
+        direct = ""
+        kw_rid = _kw_rid_from_guid(track_guid or guid)
+        if kw_rid:
+            direct = await _kw_cover_by_rid(kw_rid)
+        if not direct:
+            direct = _qq_cover_by_albummid(str(item.get("albummid") or ""))
+        if direct:
+            return RedirectResponse(direct, status_code=302)
         return _placeholder_cover_response(guid)
 
     data = await _online_info(request, guid)

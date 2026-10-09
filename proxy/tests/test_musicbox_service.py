@@ -205,7 +205,13 @@ def test_musicbox_search_filters_unplayable_songs(monkeypatch):
         assert data["data"][0]["song_id"] == 101
 
 
-def test_musicbox_songs_detail_filters_unplayable(monkeypatch):
+def test_musicbox_songs_detail_returns_all_rows_with_covers(monkeypatch):
+    """详情接口与可播性解耦（2.8.0）：封面/元数据绝不因取链判定整行丢弃。
+
+    登录态抖动/VIP 权益波动会让 songs_url 拿不到完整 url，此前 102（取不到
+    url）与 103（试听片段）的详情连同专辑封面一起消失，表现为"已登录 VIP
+    却大面积无封面"。可播过滤只属于搜索入口。
+    """
     import netease_ext
 
     def mock_songs_detail(ids):
@@ -227,7 +233,7 @@ def test_musicbox_songs_detail_filters_unplayable(monkeypatch):
             return mock_songs_detail(ids)
 
         def songs_url(self, ids):
-            return mock_songs_url(ids)
+            raise AssertionError("详情接口不得触发取链过滤")
 
         def get_account_info(self):
             return {"code": 200, "account": None, "profile": None}
@@ -239,9 +245,11 @@ def test_musicbox_songs_detail_filters_unplayable(monkeypatch):
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
-        # Only 101 is returned
-        assert len(data["data"]) == 1
-        assert data["data"][0]["song_id"] == 101
+        # 全量返回且保持请求顺序，封面随行
+        assert [row["song_id"] for row in data["data"]] == [101, 102, 103]
+        assert [row["album_pic_url"] for row in data["data"]] == [
+            "http://img/1.jpg", "http://img/2.jpg", "http://img/3.jpg",
+        ]
 
 
 def test_musicbox_search_logged_in_vip_playable(monkeypatch):
@@ -459,6 +467,8 @@ def test_song_info_artist_album_playlist_cli_args(monkeypatch):
         captured.append(args)
         return 0, '{"ok": true, "data": {"id": 1}}', ""
 
+    # 本测试校验 CLI 参数透传：进程内详情路径置为失败，强制走 CLI 兜底
+    monkeypatch.setattr(musicbox_app, "song_detail_raw", lambda sid: None)
     monkeypatch.setattr(runner, "run_musicbox", mock_run)
     with TestClient(app) as client:
         assert client.get("/api/v1/song/123/info").status_code == 200
@@ -471,6 +481,69 @@ def test_song_info_artist_album_playlist_cli_args(monkeypatch):
         ["album", "789", "--json"],
         ["playlist", "show", "1000", "--json"],
     ]
+
+
+def test_song_info_in_process_raw_detail_first(monkeypatch):
+    """/song/{id}/info 进程内直取优先（毫秒级）：CLI 子进程冷启动会超代理 4s 预算。"""
+    raw = {
+        "name": "晴天", "ar": [{"name": "周杰伦"}],
+        "al": {"name": "叶惠美", "picUrl": "http://img.test/yhm.jpg"},
+        "dt": 269000, "sq": {"size": 25000000},
+    }
+    cli_calls = []
+
+    def mock_run(args, timeout=30.0):
+        cli_calls.append(args)
+        return 0, '{"ok": true, "data": {}}', ""
+
+    monkeypatch.setattr(musicbox_app, "song_detail_raw", lambda sid: raw if sid == 186016 else None)
+    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/song/186016/info")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True and body["data"] == raw
+    assert cli_calls == []
+
+    # 进程内拿不到（返回 None）时降级 CLI
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/song/42/info")
+    assert resp.status_code == 200
+    assert cli_calls == [["song", "info", "42", "--json"]]
+
+
+def test_search_web_fallback_row_carries_album_cover(monkeypatch):
+    """web 兜底搜索行带 album.picUrl：主接口被风控时行内自带封面。"""
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"result": {"songs": [{
+                "id": 186016, "name": "晴天",
+                "artists": [{"name": "周杰伦"}],
+                "album": {"name": "叶惠美", "picUrl": "http://img.test/yhm.jpg"},
+                "duration": 269000,
+            }]}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            return FakeResp()
+
+    monkeypatch.setattr(netease_ext.httpx, "Client", FakeClient)
+    rows = netease_ext.search_web_fallback("晴天")
+    assert rows and rows[0]["song_id"] == 186016
+    assert rows[0]["album_pic_url"] == "http://img.test/yhm.jpg"
+    assert rows[0]["album_name"] == "叶惠美"
 
 
 def test_song_lyric_ok_and_upstream_error(monkeypatch):
