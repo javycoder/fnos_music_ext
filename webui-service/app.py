@@ -1120,3 +1120,43 @@ class AuthMiddleware:
 
 app.add_middleware(AuthMiddleware)
 app.add_middleware(DesktopPrefixMiddleware)
+
+
+class NoCacheStaticMiddleware:
+    """HTML 与静态资源强制协商缓存。
+
+    响应原本只有 etag/last-modified、没有 Cache-Control，飞牛桌面 WebView 与
+    浏览器会按启发式缓存沿用旧页面——升级后版本文案（接口）是新的、菜单却
+    缺失（新 HTML 没被加载）。no-cache 每次带 etag 回源验证，命中即 304。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # 无论本中间件位于 DesktopPrefix 内层还是外层，/static/ 子串都能匹配
+        no_cache_path = "/static/" in (scope.get("path") or "")
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start" and (
+                    no_cache_path or _is_html(message)):
+                message = dict(message)
+                message["headers"] = list(message.get("headers", [])) + [
+                    [b"cache-control", b"no-cache"],
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _is_html(message) -> bool:
+    for key, value in message.get("headers", []):
+        if key.lower() == b"content-type" and value.lower().startswith(b"text/html"):
+            return True
+    return False
+
+
+app.add_middleware(NoCacheStaticMiddleware)
