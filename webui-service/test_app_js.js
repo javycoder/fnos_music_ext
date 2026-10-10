@@ -441,7 +441,7 @@ test("saveConfig：fs-check 不可用（直连 501/网络错误）→ 降级放�
 /* ------------------------------------------------ 关于页 ------------------- */
 test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=false 隐藏打赏", async () => {
   enqueue("/app/fnmusic-ext/api/about", {
-    ok: true, version: "2.9.0", deploy_mode: "docker",
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
     author: "javycoder", author_url: "https://github.com/javycoder",
                 repo_url: "https://github.com/javycoder/fnos_music_ext",
     issues_url: "https://github.com/javycoder/fnos_music_ext/issues",
@@ -454,7 +454,7 @@ test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=f
     log_retention_days: 3,
   });
   await global.loadAbout();
-  assert.strictEqual(global.document.querySelector("#about-version").textContent, "v2.9.0");
+  assert.strictEqual(global.document.querySelector("#about-version").textContent, "v2.8.0e");
   assert.strictEqual(global.document.querySelector("#about-deploy").textContent, "Docker 部署");
   const html = global.document.querySelector("#about-disclaimer").innerHTML;
   assert.ok(html.includes("本项目基于 MIT 许可证开源") && html.includes("仅限个人技术研究"));
@@ -466,7 +466,7 @@ test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=f
 
 test("loadAbout：donate=true 展示打赏卡片并指向静态二维码", async () => {
   enqueue("/app/fnmusic-ext/api/about", {
-    ok: true, version: "2.9.0", deploy_mode: "native",
+    ok: true, version: "2.8.0e", deploy_mode: "native",
     disclaimer: [], donate: true, logs: [], log_retention_days: 3,
   });
   await global.loadAbout();
@@ -498,7 +498,7 @@ test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async 
 
 test("switchPage('about') 懒加载关于数据", async () => {
   enqueue("/app/fnmusic-ext/api/about", {
-    ok: true, version: "2.9.0", deploy_mode: "docker",
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
     disclaimer: [], donate: false, logs: [], log_retention_days: 3,
   });
   global.switchPage("about");

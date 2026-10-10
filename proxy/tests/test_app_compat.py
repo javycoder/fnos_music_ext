@@ -328,12 +328,12 @@ def test_safe_child_log_allows_request_log_and_degrade():
 
 
 def test_safe_child_log_allows_diag_cfg_env_and_rich_request_lines():
-    """2.9.0 日志系统新前缀（[diag]/[cfg]/[env]）与带 ms/host/xff 的请求行需放行进 journal。"""
+    """2.8.0e 日志系统新前缀（[diag]/[cfg]/[env]）与带 ms/host/xff 的请求行需放行进 journal。"""
     for line in (
         "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [diag] stream_unresolved guid=online:kw:9 candidates=online:kw:9 enabled=none",
         "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [diag] cover_miss guid=online:wy:1 info=True cover_url=False kw_qq=False enrich=False embedded=False",
         "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [cfg] quality_mode=balanced",
-        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [env] context=host app_version=2.9.0 deploy_mode=docker",
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [env] context=host app_version=2.8.0e deploy_mode=docker",
         "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: "
         "client request GET /music/api/v1/track/stream status=200 ua=fnos-music/1.0 ms=123 host=nas.local:5666 xff=yes",
         # 旧格式（无后缀）保持兼容
