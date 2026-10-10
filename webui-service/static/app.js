@@ -133,7 +133,6 @@ function applyConfigToForm() {
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
-  $("#tee-dir").value = v.FNMUSIC_TEE_SAVE_DIR || "";
   $("#dir-download").value = v.FNMUSIC_TEE_SAVE_DIR || "";
   $("#dir-cache").value = v.FNMUSIC_CACHE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
@@ -187,7 +186,7 @@ function collectConfig() {
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
-    FNMUSIC_TEE_SAVE_DIR: $("#tee-dir").value.trim(),
+    FNMUSIC_TEE_SAVE_DIR: $("#dir-download").value.trim(),
     FNMUSIC_CACHE_DIR: $("#dir-cache").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,
@@ -724,7 +723,7 @@ $("#lx-add").addEventListener("click", () => {
   markDirty("洛雪源列表已修改，需保存后生效");
 });
 
-/* -------------------------------------------------- 储存目录：选择/授权/校验/镜像同步 */
+/* -------------------------------------------------- 储存目录：选择/授权/校验 */
 const DIR_FIELDS = [
   { input: "#dir-cache", pick: "#dir-cache-pick", check: "#dir-cache-check", label: "歌曲缓存目录" },
   { input: "#dir-download", pick: "#dir-download-pick", check: "#dir-download-check", label: "下载目录" },
@@ -771,13 +770,8 @@ async function authorizeDir(path) {
 function bindDirField(field) {
   const input = $(field.input);
   let timer = null;
-  const mirror = () => {
-    // 下载目录与边听边存页的保存路径是同一配置，输入后同步到另一处
-    if (field.input === "#dir-download") $("#tee-dir").value = input.value;
-  };
   const schedule = () => {
     markDirty();
-    mirror();
     clearTimeout(timer);
     const seq = ++_fsCheckSeq;
     const path = input.value.trim();
@@ -810,13 +804,6 @@ function bindDirField(field) {
   });
 }
 DIR_FIELDS.forEach(bindDirField);
-
-// 边听边存页的保存路径与目录设置页的下载目录是同一配置：此处输入同步过去并标脏
-// （反向同步由 bindDirField 的 mirror 完成）
-$("#tee-dir").addEventListener("input", () => {
-  markDirty();
-  $("#dir-download").value = $("#tee-dir").value;
-});
 
 (async function detectNasPicker() {
   // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
