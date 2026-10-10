@@ -904,3 +904,119 @@ def test_source_deactivate_filename_differs_from_name(test_app_client, fake_lx, 
     r = test_app_client.post("/api/v1/source", json={"url": script.as_uri(), "enabled": False})
     assert r.status_code == 200, r.text
     assert ("real-id", False) in calls
+
+
+@pytest.mark.asyncio
+async def test_url_inflight_isolated_across_source_generations(monkeypatch, fresh_url_cache):
+    started = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    calls = []
+    async def resolve(*args, **kwargs):
+        n = len(calls)
+        calls.append(lxapp._URL_CACHE_GEN)
+        started[n].set()
+        await release[n].wait()
+        return {"url": f"https://media.test/gen-{calls[n]}"}
+    monkeypatch.setattr(lxapp, "resolve_and_probe", resolve)
+    item = {"id": "lx:kw:gen"}
+    old = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item))
+    await started[0].wait()
+    lxapp._url_cache_reset()
+    new = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item))
+    try:
+        await asyncio.wait_for(started[1].wait(), 1)
+        release[0].set()
+        await old
+        assert len(lxapp._URL_INFLIGHT) == 1  # 旧任务不能清理新代任务
+        follower = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item))
+        await asyncio.sleep(0)
+        release[1].set()
+        r, f = await asyncio.gather(new, follower)
+        assert r == f == {"url": f"https://media.test/gen-{calls[1]}"}
+        assert calls[1] == calls[0] + 1
+        assert lxapp._URL_CACHE[(item["id"], "lossless")]["data"] == r
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.gather(old, new, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usable", [False, True])
+async def test_expired_url_probe_and_resolution_are_singleflight(monkeypatch, fresh_url_cache, usable):
+    item = {"id": "lx:kw:expired"}
+    key = (item["id"], "lossless")
+    lxapp._URL_CACHE[key] = {"data": {"url": "https://media.test/old"},
+                            "ts": lxapp.time.monotonic() - 1000}
+    probing, release = asyncio.Event(), asyncio.Event()
+    counts = {"probe": 0, "resolve": 0}
+    async def refresh(*args):
+        counts["probe"] += 1
+        probing.set()
+        await release.wait()
+        return {"url": "https://media.test/old"} if usable else None
+    async def resolve(*args, **kwargs):
+        counts["resolve"] += 1
+        return {"url": "https://media.test/new"}
+    monkeypatch.setattr(lxapp, "_refresh_cached_url", refresh)
+    monkeypatch.setattr(lxapp, "resolve_and_probe", resolve)
+    leader = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item))
+    await probing.wait()
+    follower = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item))
+    await asyncio.sleep(0)
+    release.set()
+    a, b = await asyncio.gather(leader, follower)
+    assert a == b
+    assert counts == {"probe": 1, "resolve": 0 if usable else 1}
+
+
+def test_bootstrap_recovers_partial_failure_and_uses_latest_env(tmp_path, monkeypatch):
+    from conftest import FakeLxServerClient
+    fake = FakeLxServerClient()
+    for s in fake.sources:
+        s["enabled"] = False
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path / "data"))
+    env_path = tmp_path / ".env"
+    monkeypatch.setenv("LX_ENV_PATH", str(env_path))
+    urls = ["https://s/a.js", "https://s/b.js"]
+    def save(active_urls):
+        env_path.write_text("LX_SOURCE_LIST='" + json.dumps([
+            {"url": u, "active": u in active_urls} for u in urls
+        ]) + "'\nLX_SOURCE_URL='" + (active_urls[0] if active_urls else "") + "'\n")
+    save(urls)
+    original_import = fake.import_custom_source
+    async def fail_b(url):
+        if url == urls[1]:
+            raise RuntimeError("temporarily unavailable")
+        return await original_import(url)
+    monkeypatch.setattr(fake, "import_custom_source", fail_b)
+    asyncio.run(lxapp._bootstrap_migration())
+    assert {s["id"] for s in fake.sources if s["enabled"]} == {"a.js"}
+    monkeypatch.setattr(fake, "import_custom_source", original_import)
+    asyncio.run(lxapp._bootstrap_migration())
+    assert {s["id"] for s in fake.sources if s["enabled"]} == {"a.js", "b.js"}
+    # 旧进程环境仍保留 A/B；最新磁盘目标只启用 A，随后全部显式关闭。
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([{"url": u, "active": True} for u in urls]))
+    save([urls[0]])
+    asyncio.run(lxapp._bootstrap_migration())
+    assert {s["id"] for s in fake.sources if s["enabled"]} == {"a.js"}
+    save([])
+    asyncio.run(lxapp._bootstrap_migration())
+    assert not any(s["enabled"] for s in fake.sources)
+
+
+def test_bootstrap_failed_new_target_keeps_old_available_source(tmp_path, monkeypatch):
+    from conftest import FakeLxServerClient
+    fake = FakeLxServerClient()
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path / "data"))
+    env = tmp_path / ".env"
+    env.write_text('LX_SOURCE_LIST=\'[{"url":"https://s/new.js","active":true}]\'\n')
+    monkeypatch.setenv("LX_ENV_PATH", str(env))
+    async def fail(*args):
+        raise RuntimeError("temporary import failure")
+    monkeypatch.setattr(fake, "import_custom_source", fail)
+    asyncio.run(lxapp._bootstrap_migration())
+    assert fake.sources[0]["enabled"] is True
+    assert not fake.toggle_calls

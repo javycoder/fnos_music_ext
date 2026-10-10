@@ -79,7 +79,7 @@ _SONG_CACHE: dict[str, dict] = {}
 # 播放直链缓存: (canonical_id, tier) -> {"data": dict | None, "ts": float}；data=None 为失败负缓存
 _URL_CACHE: dict[tuple[str, str], dict] = {}
 # 同键在途解析合并：key -> Future（与 musicdl SingleFlight 同型的 shielded-future 去重）
-_URL_INFLIGHT: dict[tuple[str, str], asyncio.Future] = {}
+_URL_INFLIGHT: dict[tuple[int, str, str, bool], asyncio.Future] = {}
 # 源代计数：切源/重导入脚本时自增，代间在途解析的回写据此丢弃，防止串源
 _URL_CACHE_GEN = 0
 _STATS = {"searches": 0, "url_resolutions": 0, "url_cache_hits": 0, "errors": 0}
@@ -198,19 +198,9 @@ async def _resolve_url_cached(
                 fn_diag(logger, "url_cache", op="hit", song=str(canonical_id)[:60],
                         quality=str(tiers[0] if tiers else "standard"))
                 return data
-            else:
-                refreshed = await _refresh_cached_url(client, data)
-                if refreshed is not None:
-                    if _URL_CACHE_GEN == gen:
-                        entry["data"] = refreshed
-                        entry["ts"] = time.monotonic()
-                    _STATS["url_cache_hits"] += 1
-                    fn_diag(logger, "url_cache", op="refreshed", song=str(canonical_id)[:60],
-                            quality=str(tiers[0] if tiers else "standard"))
-                    return refreshed
 
     remaining = deadline - time.monotonic()
-    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen)
+    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen, fresh)
 
 
 async def _resolve_url_inflight(
@@ -221,18 +211,38 @@ async def _resolve_url_inflight(
     budget: float,
     key: tuple[str, str],
     gen: int,
+    fresh: bool = False,
 ) -> dict | None:
-    """实际解析执行段：同键在途合并，失败/取消正确清理在途状态供后续重试。"""
-    existing = _URL_INFLIGHT.get(key)
+    """探活及解析整体合并；不同源代和强制刷新不共享旧探活任务。"""
+    inflight_key = (gen, *key, fresh)
+    existing = _URL_INFLIGHT.get(inflight_key)
     if existing is not None:
         # issue #45：同键并发跟随者共享领队的实际解析，不再重复消耗音源额度
         fn_diag(logger, "url_inflight", op="join", song=str(key[0])[:60], quality=str(key[1]))
         return await asyncio.shield(existing)
 
     fut = asyncio.get_running_loop().create_future()
-    _URL_INFLIGHT[key] = fut
+    _URL_INFLIGHT[inflight_key] = fut
     try:
-        result = await resolve_and_probe(client, src, item, quality, budget=budget)
+        deadline = time.monotonic() + budget
+        result = None
+        refreshed_hit = False
+        if not fresh:
+            entry = _URL_CACHE.get(key)
+            if entry and entry.get("data") is not None:
+                remaining = deadline - time.monotonic()
+                try:
+                    async with asyncio.timeout(max(remaining, 0.001)):
+                        result = await _refresh_cached_url(client, entry["data"])
+                except TimeoutError:
+                    result = None
+                refreshed_hit = result is not None
+        if not refreshed_hit:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                result = await resolve_and_probe(client, src, item, quality, budget=remaining)
+        else:
+            _STATS["url_cache_hits"] += 1
     except BaseException as exc:
         if not fut.done():
             # 领队被取消时不能把 CancelledError 设给跟随者：跟随者的任务并未被
@@ -246,7 +256,8 @@ async def _resolve_url_inflight(
             fut.exception()
         raise
     finally:
-        _URL_INFLIGHT.pop(key, None)
+        if _URL_INFLIGHT.get(inflight_key) is fut:
+            _URL_INFLIGHT.pop(inflight_key, None)
 
     # issue #45：留档每次真实上游解析（领队），与 hit/join 对比可核对额度消耗
     fn_diag(logger, "url_resolve", op="ok" if result else "none",
@@ -821,6 +832,92 @@ def _env_active_source_urls() -> list[str]:
     return urls
 
 
+def _persisted_source_targets() -> list[str] | None:
+    """最新 .env 为准；缺少可读的配置才回退进程环境，None 表示旧单源配置。"""
+    from proxy.env_merge import parse_env_file
+
+    configured_path = os.environ.get("LX_ENV_PATH")
+    paths = [Path(configured_path)] if configured_path else [
+        Path(os.environ.get("WEBUI_REPO_DIR", "/repo")) / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    values = dict(os.environ)
+    from_disk = False
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8"):
+                pass
+            entries, _ = parse_env_file(path)
+            values = dict(entries)
+            from_disk = True
+            break
+        except OSError:
+            continue
+    try:
+        items = json.loads(values.get("LX_SOURCE_LIST") or "[]")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    if not items and "LX_SOURCE_LIST" in values and not values.get("LX_SOURCE_URL"):
+        return []
+    if not any(isinstance(i, dict) and "active" in i for i in items):
+        if from_disk:
+            url = str(values.get("LX_SOURCE_URL") or "").strip()
+            return [_normalize_legacy_file_url(url)] if url else []
+        return None
+    urls = [str(i.get("url") or "").strip() for i in items
+            if isinstance(i, dict) and i.get("active") and i.get("url")]
+    # 兼容此前 .env 写入无激活列表但保留旧单源指针的情况。
+    if not urls and not from_disk and values.get("LX_SOURCE_URL"):
+        urls = [str(values["LX_SOURCE_URL"]).strip()]
+    return list(dict.fromkeys(_normalize_legacy_file_url(url) for url in urls if url))
+
+
+async def _reconcile_source_targets(urls: list[str]) -> None:
+    """按持久化目标逐项恢复，并关闭未在目标集合中的启用源。"""
+    target_ids: set[str] = set()
+    all_ok = True
+    for url in urls:
+        latest = _persisted_source_targets()
+        if latest is not None and latest != urls:
+            # 保存配置与启动恢复交错时，不再依据旧快照激活。
+            return
+        try:
+            res = await source_set(SourceBody(url=url))
+            if isinstance(res, JSONResponse):
+                res = json.loads(res.body)
+            if not res.get("ok"):
+                all_ok = False
+                logger.warning("自动激活洛雪源失败: %s (%s)", url, res.get("error") or "")
+            elif res.get("source_id"):
+                target_ids.add(str(res["source_id"]))
+                continue
+        except Exception as exc:
+            all_ok = False
+            logger.warning("自动激活洛雪源失败: %s: %s", url, exc)
+        if url.startswith(("http://", "https://")):
+            existing = await _find_lxserver_source(by_url=url)
+        else:
+            parsed = urllib.parse.urlparse(url)
+            source_id = urllib.parse.unquote(parsed.path).rsplit("/", 1)[-1]
+            existing = await _find_lxserver_source(by_id=source_id, by_name=source_id.removesuffix(".js"))
+            if not existing and os.path.isfile(urllib.parse.unquote(parsed.path)):
+                script = Path(urllib.parse.unquote(parsed.path)).read_text(encoding="utf-8", errors="replace")
+                existing = await _find_lxserver_source(by_name=_parse_script_head_meta(script).get("name") or "")
+        if existing:
+            target_ids.add(str(existing.get("id") or ""))
+    latest = _persisted_source_targets()
+    if not all_ok or (latest is not None and latest != urls):
+        return
+    for s in await LXSERVER.list_custom_sources():
+        sid = str(s.get("id") or "")
+        if sid and sid not in target_ids and (s.get("enabled") or s.get("enable")):
+            await LXSERVER.set_source_enabled(sid, False)
+            _url_cache_reset()
+    _CHAIN_HEALTH.clear()
+
+
 async def _bootstrap_migration():
     for _ in range(20):
         try:
@@ -845,6 +942,10 @@ async def _bootstrap_migration():
                     except Exception as e:
                         logger.warning("迁移脚本 %s 失败: %s", js_file.name, e)
 
+        targets = _persisted_source_targets()
+        if targets is not None:
+            await _reconcile_source_targets(targets)
+            return
         active = await describe_user_source()
         if not active.get("configured"):
             # 优先按 LX_SOURCE_LIST 的 active 标记恢复多源激活（lxserver 数据卷被清时自愈）
@@ -1404,7 +1505,7 @@ async def source_set(body: SourceBody):
     _CHAIN_HEALTH.clear()
     _url_cache_reset()
     user_src = await describe_user_source()
-    return {"ok": True, "data": user_src}
+    return {"ok": True, "data": user_src, "source_id": source_id}
 
 
 @app.delete("/api/v1/source")

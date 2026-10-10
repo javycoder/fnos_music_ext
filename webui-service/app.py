@@ -360,6 +360,14 @@ def _dumps_lx_list(items: list[dict]) -> str:
     return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
 
 
+async def _lx_enabled_sources(request: Request) -> list[dict]:
+    resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
+    data = _resp_json(resp)
+    if resp.status_code != 200 or not data.get("ok"):
+        raise RuntimeError(data.get("error") or f"HTTP {resp.status_code}")
+    return ((data.get("data") or {}).get("sources") or [])
+
+
 async def _lx_enabled_platforms(request: Request) -> list[str]:
     """读取 lxmusic 当前全部启用源的声明平台并集（保持出现顺序）；不可达返回空列表。"""
     try:
@@ -379,15 +387,16 @@ async def _lx_enabled_platforms(request: Request) -> list[str]:
 
 def _normalize_dir_path(label: str, raw) -> str:
     """储存目录归一化：空值合法（=恢复默认/自动探测）；要求绝对路径、
-    拒绝 .. 段与换行/空字符；折叠多余斜杠与尾斜杠。"""
-    text = str(raw or "").strip()
-    if not text:
-        return ""
+    拒绝 .. 段与换行/空字符；折叠 . 段、多余斜杠与尾斜杠。"""
+    text = str(raw or "")
     if any(ch in text for ch in "\r\n\x00"):
         raise ValueError(f"{label}: 路径不能包含换行或空字符")
+    text = text.strip()
+    if not text:
+        return ""
     if not text.startswith("/"):
         raise ValueError(f"{label}: 必须是以 / 开头的绝对路径，收到 {raw!r}")
-    segs = [seg for seg in text.split("/") if seg]
+    segs = [seg for seg in text.split("/") if seg and seg != "."]
     if not segs:
         raise ValueError(f"{label}: 不能是根目录 /")
     if ".." in segs:
@@ -452,10 +461,17 @@ def validate_updates(values: dict) -> dict[str, str]:
     final = dict(read_env())
     final.update(updates)
     # 储存目录互斥：缓存目录与下载目录不能相同或互为父子（否则滚动缓存被官方扫描进曲库）
-    final_cache = (final.get("FNMUSIC_CACHE_DIR") or "").strip()
-    final_dl = (final.get("FNMUSIC_TEE_SAVE_DIR") or "").strip()
-    if final_cache and final_dl and (_is_dir_within(final_cache, final_dl) or _is_dir_within(final_dl, final_cache)):
-        raise ValueError("歌曲缓存目录与下载目录不能相同或互为父子目录")
+    if updates.keys() & {"FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"}:
+        final_cache = _normalize_dir_path("歌曲缓存目录", final.get("FNMUSIC_CACHE_DIR"))
+        final_dl = _normalize_dir_path("下载目录", final.get("FNMUSIC_TEE_SAVE_DIR"))
+        if not final_cache:
+            # .env 的 FNMUSIC_HOME 是宿主 proxy 的显式安装目录；容器 /repo
+            # 只是挂载别名，不能据此推断宿主默认缓存路径并误阻断合法下载目录。
+            host_home = (final.get("FNMUSIC_HOME") or "").strip()
+            if host_home.startswith("/"):
+                final_cache = _normalize_dir_path("默认歌曲缓存目录", host_home.rstrip("/") + "/cache")
+        if final_cache and final_dl and (_is_dir_within(final_cache, final_dl) or _is_dir_within(final_dl, final_cache)):
+            raise ValueError("歌曲缓存目录与下载目录不能相同或互为父子目录")
     enabled = [name for name, key in PROVIDERS.items()
                if final.get(key, SCHEMA[key]["default"]).lower() in ("true", "1", "yes")]
     if len(enabled) > 1:
@@ -758,7 +774,8 @@ async def api_config_put(body: ConfigBody, request: Request):
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, new_provider))
 
-    async def _lx_source_post(payload: dict, source: str, op: str) -> None:
+    async def _lx_source_post(payload: dict, source: str, op: str) -> str:
+        api_payload: dict = {}
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
                                      json=payload, timeout=130.0)
@@ -769,6 +786,7 @@ async def api_config_put(body: ConfigBody, request: Request):
             ok, err = False, str(exc)
         actions.append({"kind": "lx_activate", "op": op, "source": source,
                         "ok": ok, "error": err or ""})
+        return str(api_payload.get("source_id") or "") if ok else ""
 
     # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
     if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
@@ -777,10 +795,29 @@ async def api_config_put(body: ConfigBody, request: Request):
                 url = str(item.get("url") or "").strip()
                 await _lx_source_post({"url": url, "enabled": False},
                                       str(item.get("name") or "") or url, "deactivate")
+            target_ids: set[str] = set()
             for item in active_items:
                 url = str(item["url"]).strip()
-                await _lx_source_post({"url": url},
-                                      str(item.get("name") or "") or url, "activate")
+                sid = await _lx_source_post({"url": url},
+                                            str(item.get("name") or "") or url, "activate")
+                if sid:
+                    target_ids.add(sid)
+            # 不仅比较已写入的 .env：失败的停用仍会出现在实际启用集合中。
+            # 只有所有目标激活成功才清理额外脚本，避免失败时误停旧的可用源。
+            if not any(not a["ok"] for a in actions if a.get("op") == "activate"):
+                try:
+                    actual = await _lx_enabled_sources(request)
+                    for s in actual:
+                        sid = str(s.get("id") or "")
+                        url = str(s.get("url") or "")
+                        if sid in target_ids or url in new_active:
+                            continue
+                        if sid or url:
+                            await _lx_source_post({"url": sid or url, "enabled": False},
+                                                  str(s.get("name") or sid or url), "deactivate")
+                except Exception as exc:
+                    actions.append({"kind": "lx_activate", "op": "reconcile", "source": "",
+                                    "ok": False, "error": str(exc)})
         else:
             await _lx_source_post({"url": after["LX_SOURCE_URL"]}, "", "activate")
     elif new_provider == "musicdl" and (

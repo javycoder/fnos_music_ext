@@ -168,6 +168,48 @@ def test_write_env_atomic_permissions_and_content(tmp_path):
     assert dict(kv)["FNMUSIC_VERSION"] == "1.1.0"
 
 
+def test_write_env_atomic_root_preserves_existing_owner(tmp_path, monkeypatch):
+    out = tmp_path / ".env"
+    out.write_text("A='old'\n", encoding="utf-8")
+    owner = out.stat()
+    calls = []
+    monkeypatch.setattr(env_merge.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(env_merge.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    env_merge.write_env_atomic(out, "A='new'\n")
+    assert calls == [(owner.st_uid, owner.st_gid)]
+    assert out.read_text(encoding="utf-8") == "A='new'\n"
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert not list(tmp_path.glob(".env.merge.*"))
+
+
+def test_write_env_atomic_chown_failure_keeps_old_config(tmp_path, monkeypatch):
+    out = tmp_path / ".env"
+    out.write_text("A='old'\n", encoding="utf-8")
+    monkeypatch.setattr(env_merge.os, "geteuid", lambda: 0)
+
+    def denied(fd, uid, gid):
+        raise PermissionError("cannot preserve owner")
+
+    monkeypatch.setattr(env_merge.os, "fchown", denied)
+    with pytest.raises(PermissionError):
+        env_merge.write_env_atomic(out, "A='new'\n")
+    assert out.read_text(encoding="utf-8") == "A='old'\n"
+    assert not list(tmp_path.glob(".env.merge.*"))
+
+
+def test_write_env_atomic_nonroot_does_not_chown(tmp_path, monkeypatch):
+    out = tmp_path / ".env"
+    out.write_text("A='old'\n", encoding="utf-8")
+    monkeypatch.setattr(env_merge.os, "geteuid", lambda: 1000)
+
+    def unexpected(fd, uid, gid):
+        pytest.fail("non-root writer must not require chown privileges")
+
+    monkeypatch.setattr(env_merge.os, "fchown", unexpected)
+    env_merge.write_env_atomic(out, "A='new'\n")
+    assert out.read_text(encoding="utf-8") == "A='new'\n"
+
+
 def test_read_installed_version(tmp_path):
     p = tmp_path / ".env"
     env_merge.write_env_atomic(p, env_merge.render_env(DESIRED))

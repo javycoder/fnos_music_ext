@@ -226,6 +226,13 @@ class TestPayload:
         env_files = [p.name for p in repo.glob(".env*")]
         assert env_files == [".env.example"], f"payload 只应保留 .env.example，实际: {env_files}"
 
+    def test_no_runtime_logs_or_exports(self, stage: Path):
+        repo = stage / "app" / "repo"
+        assert not list(repo.rglob("logs"))
+        assert not list(repo.rglob("*.log"))
+        assert not list(repo.rglob("*.logzip"))
+        assert not list(repo.rglob("env_snapshot.txt"))
+
     def test_no_pycache_or_venv(self, stage: Path):
         repo = stage / "app" / "repo"
         assert not list(repo.rglob("__pycache__"))

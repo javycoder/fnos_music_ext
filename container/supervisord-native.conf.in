@@ -29,7 +29,7 @@ serverurl=unix://@RUN@/supervisor.sock
 
 [program:musicdl]
 directory=@REPO@/musicdl-service
-command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8768
+command="@VENV@/bin/uvicorn" app:app --host 127.0.0.1 --port 8768
 autostart=false
 autorestart=true
 startretries=5
@@ -42,7 +42,7 @@ redirect_stderr=true
 
 [program:musicbox]
 directory=@REPO@/musicbox-service
-command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8770
+command="@VENV@/bin/uvicorn" app:app --host 127.0.0.1 --port 8770
 autostart=false
 autorestart=true
 startretries=5
@@ -69,7 +69,7 @@ environment=DATA_PATH="@DATA@/lxserver",CONFIG_PATH="@DATA@/lxserver/config.js",
 
 [program:lxmusic]
 directory=@REPO@/lxmusic-service
-command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8772
+command="@VENV@/bin/uvicorn" app:app --host 127.0.0.1 --port 8772
 autostart=false
 autorestart=true
 startretries=5
@@ -82,7 +82,7 @@ redirect_stderr=true
 
 [program:webui]
 directory=@REPO@/webui-service
-command=@VENV@/bin/uvicorn app:app --host 127.0.0.1 --port 8774
+command="@VENV@/bin/uvicorn" app:app --host 127.0.0.1 --port 8774
 autostart=false
 autorestart=true
 startretries=5

@@ -12,8 +12,11 @@
 
 from __future__ import annotations
 
+import configparser
 import importlib.util
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -150,9 +153,9 @@ def test_native_unit_template_shape():
     text = (BASE / "fnmusic-sources-native.service.in").read_text(encoding="utf-8")
     assert "WorkingDirectory=@REPO@" in text
     assert "ExecStart=/bin/bash \"@REPO@/container/entrypoint.sh\"" in text
-    assert "Environment=SUPERVISOR_CONF=@RUN@/supervisord.conf" in text
-    assert "Environment=FNMUSIC_ENV_FILE=@REPO@/.env" in text
-    assert "Environment=DATA_PATH=@DATA@/lxserver" in text
+    assert 'Environment="SUPERVISOR_CONF=@RUN@/supervisord.conf"' in text
+    assert 'Environment="FNMUSIC_ENV_FILE=@REPO@/.env"' in text
+    assert 'Environment="DATA_PATH=@DATA@/lxserver"' in text
 
 
 # ------------------------------------------------- install.sh 形态解析/迁移 ---
@@ -259,7 +262,7 @@ def test_render_native_supervisor_conf_placeholders(tmp_path):
     assert f"directory={tmp_path}/musicdl-service" in out
     assert f"{tmp_path}/.venv-sources/bin/uvicorn" in out
     assert f"directory={tmp_path}/.lxserver" in out
-    assert f'WEBUI_SUPERVISORCTL="supervisorctl -c {tmp_path}/sources-native/supervisord.conf"' in out
+    assert f"WEBUI_SUPERVISORCTL=\"supervisorctl -c '{tmp_path}/sources-native/supervisord.conf'\"" in out
     # 渲染产物落在 sources-native/ 下
     assert (tmp_path / "sources-native" / "supervisord.conf").is_file()
 
@@ -375,3 +378,134 @@ def test_migrate_lx_url_native_to_docker_checks_host_file(tmp_path):
                  env={"BASE_DIR": str(tmp_path)})
     assert r.returncode == 0, r.stderr
     assert "file:///data/lxmusic/uploads/local.js" in env_path.read_text()
+
+
+@pytest.mark.parametrize("adopt", [0, 1])
+def test_install_native_unit_foreign_owner_requires_explicit_adopt(tmp_path, adopt):
+    install = (BASE / "install.sh").read_text()
+    src = tmp_path / "new-unit"
+    dest = tmp_path / "old-unit"
+    src.write_text("unit")
+    dest.write_text("WorkingDirectory=/old/checkout\n")
+    script = function(install, "install_unit") + '''
+log_err() { printf '%s\\n' "$*" >&2; }
+log_warn() { :; }
+unit_working_dir() { printf '/old/checkout'; }
+same_dir() { [ "$1" = "$2" ]; }
+sudo() { printf 'mock-sudo %s\\n' "$*"; }
+'''
+    result = run_bash(script + f"install_unit {shlex.quote(str(src))} {shlex.quote(str(dest))}",
+                      env={"BASE_DIR": str(tmp_path), "ADOPT": str(adopt)})
+    assert result.returncode == (0 if adopt else 1), result.stderr
+    assert ("mock-sudo cp" in result.stdout) == bool(adopt)
+    assert ("mock-sudo systemctl restart" in result.stdout) == bool(adopt)
+    assert dest.read_text() == "WorkingDirectory=/old/checkout\n"
+
+
+@pytest.mark.parametrize("name", ["Music & Tools", "Music | Library", "Music 100%"])
+def test_native_render_special_paths_and_webui_command(tmp_path, monkeypatch, name):
+    repo = tmp_path / name
+    (repo / "container").mkdir(parents=True)
+    shutil.copy(BASE / "container/supervisord-native.conf.in",
+                repo / "container/supervisord-native.conf.in")
+    shutil.copy(BASE / "fnmusic-sources-native.service.in", repo / "unit.in")
+    common = (BASE / "proxy/install_common.sh").read_text()
+    funcs = "".join(function(common, n) for n in (
+        "native_venv_dir", "native_run_dir", "native_sup_conf",
+        "render_native_placeholders", "render_native_supervisor_conf"))
+    result = run_bash(funcs + '\nrender_native_supervisor_conf\n', env={"BASE_DIR": str(repo)})
+    assert result.returncode == 0, result.stderr
+    conf = configparser.ConfigParser()
+    conf.read(repo / "sources-native/supervisord.conf")
+    assert conf["program:musicdl"]["directory"] == str(repo / "musicdl-service")
+    assert shlex.split(conf["program:musicdl"]["command"])[0] == str(repo / ".venv-sources/bin/uvicorn")
+    env = conf["program:webui"]["environment"]
+    ctl = env.split('WEBUI_SUPERVISORCTL="', 1)[1].rsplit('"', 1)[0]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "supervisorctl"
+    stub.write_text(f"#!{sys.executable}\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setitem(webui.CONF, "supervisorctl", ctl)
+    code, out = webui.supervisorctl("status", "musicdl")
+    assert code == 0, out
+    assert json.loads(out) == ["-c", str(repo / "sources-native/supervisord.conf"), "status", "musicdl"]
+    result = run_bash(funcs + '\nrender_native_placeholders "$BASE_DIR/unit.in"',
+                      env={"BASE_DIR": str(repo)})
+    assert result.returncode == 0, result.stderr
+    for line in result.stdout.splitlines():
+        if line.startswith("Environment="):
+            assignments = shlex.split(line.partition("=")[2])
+            assert len(assignments) == 1
+            if assignments[0].startswith("FNMUSIC_ENV_FILE="):
+                assert assignments[0].replace("%%", "%") == f"FNMUSIC_ENV_FILE={repo}/.env"
+    assert "@REPO@" not in result.stdout
+    unit = repo / "rendered.service"
+    unit.write_text(result.stdout)
+    result = run_bash(function(common, "unit_working_dir") + '\nunit_working_dir "$BASE_DIR/rendered.service"',
+                      env={"BASE_DIR": str(repo)})
+    assert result.returncode == 0 and result.stdout.strip() == str(repo)
+
+
+@pytest.mark.parametrize("mode", ["native", "docker"])
+def test_migrate_lx_lists_and_open_sources_between_modes(tmp_path, mode):
+    from proxy.env_merge import parse_env_file, render_env
+
+    repo = tmp_path / "Music Library"
+    (repo / "proxy").mkdir(parents=True)
+    shutil.copy(BASE / "proxy/env_merge.py", repo / "proxy/env_merge.py")
+    relative = ["lxmusic/uploads/legacy.js", "lxserver/users/source/_open/My Source"]
+    for rel in relative:
+        path = repo / "sources-data" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("// source")
+    old = ([f"file:///data/{rel}" for rel in relative] if mode == "native" else
+           [f"file:///old/checkout/sources-data/{rel}" for rel in relative])
+    items = [{"name": "legacy", "url": old[0], "active": False},
+             {"name": "uploaded", "url": old[1], "active": True},
+             {"name": "external", "url": "https://example.com/a.js", "active": True},
+             {"name": "missing", "url": "file:///data/lxmusic/uploads/missing.js", "active": False}]
+    env_path = repo / ".env"
+    env_path.write_text(render_env([("LX_SOURCE_URL", old[1]),
+                                   ("LX_SOURCE_LIST", json.dumps(items)), ("SECRET", "keep")],
+                                  trailing=["# custom note"]))
+    script = function((BASE / "install.sh").read_text(), "migrate_lx_url_between_modes")
+    result = run_bash(script + '\nmigrate_lx_url_between_modes',
+                      env={"BASE_DIR": str(repo), "ENV_PATH": str(env_path), "DEPLOY_MODE": mode})
+    assert result.returncode == 0, result.stderr
+    values = dict(parse_env_file(env_path)[0])
+    expected = ([(repo / "sources-data" / rel).as_uri() for rel in relative] if mode == "native" else
+                ["file:///data/" + rel.replace(" ", "%20") for rel in relative])
+    assert values["LX_SOURCE_URL"] == expected[1]
+    after = json.loads(values["LX_SOURCE_LIST"])
+    assert [i["url"] for i in after[:2]] == expected
+    assert [i["active"] for i in after] == [False, True, True, False]
+    assert after[2:] == items[2:]
+    assert values["SECRET"] == "keep" and "# custom note" in env_path.read_text()
+    before = env_path.read_bytes()
+    result = run_bash(script + '\nmigrate_lx_url_between_modes',
+                      env={"BASE_DIR": str(repo), "ENV_PATH": str(env_path), "DEPLOY_MODE": mode})
+    assert result.returncode == 0, result.stderr
+    assert env_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("adopt", [False, True])
+def test_restore_adopt_parser_drives_foreign_native_cleanup(tmp_path, adopt):
+    text = (BASE / "restore.sh").read_text()
+    parser = text[text.index("FULL_RESTORE=0"):text.index("\nlog_info()")]
+    start = text.index("for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic fnmusic-sources; do")
+    cleanup = text[start:text.index("\ndone", start) + len("\ndone")]
+    mocks = '''
+remove_owned_container() { printf 'remove %s\\n' "$*"; }
+stop_owned_source_unit() { printf 'stop %s\\n' "$*"; }
+owned_source_unit() { return 1; }
+sudo() { printf 'mock-sudo %s\\n' "$*"; }
+'''
+    script = "set -euo pipefail\n" + parser + mocks + cleanup
+    result = subprocess.run([BASH, "-c", script, "review"] + (["--adopt"] if adopt else []),
+                            env={**os.environ, "ADOPT": "1"}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert ("stop fnmusic-sources --adopt" in result.stdout) == adopt
+    assert ("mock-sudo rm -f /etc/systemd/system/fnmusic-sources.service" in result.stdout) == adopt
+    assert ("remove fnmusic-sources --adopt" in result.stdout) == adopt

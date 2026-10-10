@@ -22,6 +22,7 @@ installation_lock "$@"
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 FULL_RESTORE=0
+ADOPT=0
 
 for arg in "$@"; do
     case "${arg}" in
@@ -31,6 +32,7 @@ for arg in "$@"; do
         --adopt)
             # Explicit deployment migration: skip the cross-checkout registry
             # check so this checkout can retire the deployment (install_common.sh).
+            ADOPT=1
             ;;
         -h|--help)
             echo "用法: $0 [--full] [--adopt]"

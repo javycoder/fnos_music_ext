@@ -68,6 +68,30 @@ def gateway_block(conf_path: Path) -> str:
 GW_TOOLS = ("cat", "python3")
 
 
+def test_lx_cli_local_paths_preserve_internal_spaces(tmp_path):
+    directory = tmp_path / "My Sources"
+    directory.mkdir()
+    script = directory / "My Source.js"
+    script.write_text("/** @name Example */")
+    text = (BASE / "install.sh").read_text()
+    start = text.index('if [ "${ENABLE_LX}" -eq 1 ]; then', text.index("# 洛雪自定义源："))
+    end = text.index("\nMDL_SUMMARY=", start)
+    block = text[start:end]
+    body = '''set -euo pipefail
+ENABLE_LX=1
+DEPLOY_MODE=docker
+LX_SOURCE_URLS=""
+log_info() { :; }
+log_err() { printf '%s\\n' "$*" >&2; }
+''' + block + '\nprintf "%s" "$LX_SOURCE_URLS"\n'
+    env = dict(os.environ, BASE_DIR=str(tmp_path),
+               LX_SOURCE_URL_CLI=f"  {script} , https://example.test/other.js  ")
+    out = run_bash(body, env=env)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "file:///data/lxmusic/uploads/My Source.js,https://example.test/other.js"
+    assert (tmp_path / "sources-data/lxmusic/uploads/My Source.js").read_text() == script.read_text()
+
+
 def test_gateway_ports_defaults_when_conf_missing(tmp_path):
     script = gateway_block(tmp_path / "absent.conf") + 'get_fnos_gateway_ports\n'
     out = run_bash(script)

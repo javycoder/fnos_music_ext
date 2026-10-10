@@ -2412,10 +2412,17 @@ _NETEASE_URL_PIN: "dict[str, tuple[str, float]]" = {}
 # 钉链表容量上限：过期是惰性清理（同 key 再查才剔），必须配硬顶防进程
 # 生命周期内无限增长（与洛雪取链缓存同思路）
 _NETEASE_URL_PIN_MAX = 1024
+# 同键解析串行化；状态仅在调用者/等待者存活期间保留，并按事件循环隔离。
+# 不启动脱离调用者的后台解析任务：取消 leader 后，等待者使用自己的 client 接管。
+_NETEASE_URL_INFLIGHT: dict = {}
 
 
 def _netease_url_pin_drop(song_id: str) -> None:
-    _NETEASE_URL_PIN.pop(str(song_id), None)
+    key = str(song_id)
+    pin = _NETEASE_URL_PIN.get(key)
+    if pin:
+        # 保留有界的失效标记，让后台普通调用也旁路旧成功缓存；不是负缓存。
+        _NETEASE_URL_PIN[key] = (pin[0], 0.0)
 
 
 def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
@@ -2432,13 +2439,44 @@ def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: bool = False) -> str | None:
     key = str(song_id)
-    now = time.monotonic()
-    if not refresh:
-        pin = _NETEASE_URL_PIN.get(key)
-        if pin:
-            if now < pin[1]:
+    observed_pin = _NETEASE_URL_PIN.get(key)
+    if not refresh and observed_pin and time.monotonic() < observed_pin[1]:
+        return observed_pin[0]
+    gate_key = (asyncio.get_running_loop(), key)
+    state = _NETEASE_URL_INFLIGHT.get(gate_key)
+    if state is None:
+        state = {"lock": asyncio.Lock(), "users": 0, "completed": False, "result": None}
+        _NETEASE_URL_INFLIGHT[gate_key] = state
+    state["users"] += 1
+    try:
+        async with state["lock"]:
+            if state["completed"] and state["result"] is None:
+                # 同一批失败请求也共享结果，避免 refresh 等待者重复出网。
+                return None
+            pin = _NETEASE_URL_PIN.get(key)
+            if pin and time.monotonic() < pin[1] and (not refresh or pin is not observed_pin):
+                # 等待期间已完成刷新：全部调用者沿用该 rendition，不再次覆盖。
                 return pin[0]
-            _NETEASE_URL_PIN.pop(key, None)
+            fresh = refresh or pin is not None or observed_pin is not None
+            if pin:
+                _NETEASE_URL_PIN.pop(key, None)
+            try:
+                result = await _resolve_netease_url_uncached(client, key, fresh)
+                state["result"], state["completed"] = result, True
+                return result
+            except asyncio.CancelledError:
+                # 取消不能消费掉过期/死链标记：下一位 caller 仍须旁路旧成功缓存。
+                if pin and key not in _NETEASE_URL_PIN:
+                    _netease_url_pin_store(key, pin[0], -1.0)
+                raise
+    finally:
+        state["users"] -= 1
+        if not state["users"]:
+            _NETEASE_URL_INFLIGHT.pop(gate_key, None)
+
+
+async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str, fresh: bool) -> str | None:
+    key = str(song_id)
     primary = str(CONF.get("netease_quality") or "lossless").strip()
     qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2447,10 +2485,8 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: 
     for q in qualities:
         try:
             params = {"quality": q}
-            if refresh or key not in _NETEASE_URL_PIN:
-                # 无有效钉链时也旁路：后台失败重试不一定传 refresh。
-                # 旁路 musicbox 的取链短缓存：钉链确认失效后的强制重解析必须
-                # 拿到新链，否则会缓存命中同一条死链再钉回去（假修复）
+            if fresh:
+                # 仅明确刷新、过期/失效钉链旁路；普通冷请求保留 musicbox 负缓存。
                 params["fresh"] = "1"
             r = await client.get(f"/api/v1/song/{song_id}/url", params=params, timeout=10.0)
             if r.status_code == 200:
@@ -4025,6 +4061,20 @@ def stream_tee_response(
         info_task = None
         tee_active_token = False
         upstream_aborted = False
+
+        def _close_tee_file() -> None:
+            nonlocal fp, part
+            if fp is None:
+                return
+            closing, fp = fp, None
+            try:
+                closing.close()
+            except OSError as disk_exc:
+                # buffered write 可能到 close/flush 才报磁盘满；弃件但继续清理连接。
+                logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                _remove_quiet(part)
+                part = None
+
         try:
             tee_enabled = bool(CONF.get("tee_save_enabled"))
             if should_cache(range_header) and full_resource:
@@ -4092,9 +4142,7 @@ def stream_tee_response(
                         expected=expected if expected is not None else -1, range=range_header or "-")
                 raise
             eof = True
-            if fp:
-                fp.close()
-                fp = None
+            _close_tee_file()
             if part and eof and written >= 1024 and (expected is None or written == expected):
                 # 无论客户端连接此时是否已关闭（curl 接收完直接 EOF 退出，Starlette 会 aclose 生成器），
                 # 完整的音频已全部接收完毕，落盘与标签写入必须受 shield 保护完整执行完毕，
@@ -4127,9 +4175,7 @@ def stream_tee_response(
                             except OSError:
                                 pass
         finally:
-            if fp:
-                fp.close()
-                fp = None
+            _close_tee_file()
             resume_part = None
             if part and os.path.exists(part):
                 # 切歌/客户端退出不中断下载：未写完的 part 交接给后台续传任务完成
@@ -5318,8 +5364,10 @@ async def stream_track(request: Request, subpath: str = ""):
                     post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta))
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
-            if not await _recover_source(request, candidate, entry):
-                break
+            if source_from_online_guid(candidate) not in ("netease", "lx"):
+                if not await _recover_source(request, candidate, entry):
+                    break
+            # 直链源的 URL 刷新不依赖搜索缓存；收藏/重启/缓存过期也可有界重试。
     # issue #51/#52：搜到但不能播的最终结局留档（候选源、启用状态）
     fn_diag(logger, "stream_unresolved", guid=guid,
             candidates=",".join(list(dict.fromkeys(candidates))[:3]),
@@ -6261,7 +6309,7 @@ async def static_cover(request: Request, subpath: str = ""):
         # 所属曲目走在线信息兜底（netease 由 al.picUrl 出链），再试直构，最后占位
         track_guid = str(album_entry.get("track_guid") or "")
         if track_guid and _source_enabled(track_guid):
-            data = await _online_info(request, track_guid)
+            data = await _online_info(request, track_guid, include_lyric=False)
             cover = str((data or {}).get("cover_url") or "")
             if cover and _KW_TEXT_COVER_HOST not in cover:
                 return RedirectResponse(cover, status_code=302)
@@ -6278,7 +6326,7 @@ async def static_cover(request: Request, subpath: str = ""):
                 kw=bool(kw_rid), qq=bool(item.get("albummid")))
         return _placeholder_cover_response(guid)
 
-    data = await _online_info(request, guid)
+    data = await _online_info(request, guid, include_lyric=False)
     cover = str((data or {}).get("cover_url") or "")
     # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
