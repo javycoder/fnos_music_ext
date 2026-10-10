@@ -1188,6 +1188,18 @@ def test_about_requires_admin(about_env):
     assert r.status_code == 403
 
 
+def test_html_and_static_served_with_no_cache(about_env):
+    """升级后 WebView 不得沿用旧页面：HTML/静态资源必须带 no-cache（协商缓存）。"""
+    (about_env / "static" / "app.js").write_text("// js", encoding="utf-8")
+    (about_env / "static" / "index.html").write_text("<html></html>", encoding="utf-8")
+    with TestClient(webui.app) as client:
+        assert client.get("/").headers["cache-control"] == "no-cache"
+        assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
+        # 接口响应不受影响（本来就是动态的）
+        r = client.get("/api/about")
+    assert "cache-control" not in r.headers
+
+
 def test_logs_export_pack_and_cleanup(about_env):
     import io
     import os as _os
