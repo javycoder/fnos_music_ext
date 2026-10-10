@@ -603,10 +603,11 @@ def fresh_url_cache():
     """隔离模块级直链缓存/在途/熔断状态。"""
     lxapp._URL_CACHE.clear()
     lxapp._URL_INFLIGHT.clear()
-    lxapp._CHAIN_HEALTH.pop("user_source", None)
+    lxapp._CHAIN_HEALTH.clear()
     yield
     lxapp._URL_CACHE.clear()
     lxapp._URL_INFLIGHT.clear()
+    lxapp._CHAIN_HEALTH.clear()
 
 
 def test_track_url_success_cache_reuses_resolution(test_app_client, fresh_url_cache, fake_lx):
@@ -708,6 +709,97 @@ def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_ca
     finally:
         lxapp.app.state.client = orig_client
     assert len(fake_lx.url_calls) == 7  # 成功解析在首档即命中，仅 +1
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_scoped_per_platform(fake_lx, fresh_url_cache):
+    """平台级熔断：tx 连续失败只熔断 tx，kw 解析不受牵连。
+
+    2026-10-10 回归：全局 user_source 熔断下 tx/mg 第三方源故障（tx 只产出加密
+    mflac、mg 后端全挂）连累 kw/kg/wy 全平台 404，表现为"几乎所有洛雪曲目不可播"。"""
+    probe_client = mock_client(_flac_probe_handler)
+    fake_lx.url_result = None
+    try:
+        # 3 首不同 tx 曲目各失败一次（同曲会命中失败负缓存不再打音源）→ 触发 tx 平台熔断
+        for i, songmid in enumerate(["001abc", "002def", "003ghi"]):
+            r = await lxapp._resolve_url_cached(
+                probe_client, "tx", {"id": f"lx:tx:{songmid}", "lx_source": "tx"}, "lossless", 20.0)
+            assert r is None
+        tx_calls = len(fake_lx.url_calls)
+        assert tx_calls == 9  # 3 次解析 × 完整音质阶梯 3 档
+
+        # 第 4 首 tx 曲目被平台熔断直接跳过：不再消耗音源调用
+        r4 = await lxapp._resolve_url_cached(
+            probe_client, "tx", {"id": "lx:tx:004jkl", "lx_source": "tx"}, "lossless", 20.0)
+        assert r4 is None
+        assert len(fake_lx.url_calls) == tx_calls
+
+        # kw 不受 tx 熔断影响，正常解析成功
+        fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
+        rw = await lxapp._resolve_url_cached(
+            probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
+        assert rw and rw["url"] == "https://media.test/song.flac"
+        assert len(fake_lx.url_calls) == tx_calls + 1
+    finally:
+        await probe_client.aclose()
+        fake_lx.url_script.clear()
+
+
+@pytest.mark.asyncio
+async def test_probe_reject_rotates_to_next_source(fake_lx, fresh_url_cache):
+    """同档直链探活失败：excludeApiSources 排除产出坏链的脚本换下一个激活源重试。"""
+    probe_client = mock_client(_flac_probe_handler)
+    fake_lx.url_script = [
+        {"url": "https://media.test/dead.flac", "type": "flac",
+         "sourceName": "坏链源", "sourceId": "bad.js", "hasMoreSources": True},
+        {"url": "https://media.test/song.flac", "type": "flac",
+         "sourceName": "好链源", "sourceId": "good.js"},
+    ]
+    try:
+        r = await lxapp._resolve_url_cached(
+            probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
+        assert r and r["url"] == "https://media.test/song.flac"
+        # 第 2 次调用排除了第 1 个产出坏链的脚本（name 与 id 都传，lxserver 按二者过滤）
+        assert fake_lx.url_excludes == [None, ["bad.js", "坏链源"]]
+    finally:
+        await probe_client.aclose()
+        fake_lx.url_script.clear()
+
+
+@pytest.mark.asyncio
+async def test_probe_reject_no_more_sources_falls_to_next_tier(fake_lx, fresh_url_cache):
+    """服务端确认无更多候选源（hasMoreSources=false）：同档不再轮换，直接降档。"""
+    probe_client = mock_client(_flac_probe_handler)
+    # 每档都返回探活失败且无更多源；脚本标识不重复计数（tried 已全在 excluded 时停止）
+    fake_lx.url_script = [
+        {"url": "https://media.test/dead.flac", "type": "flac",
+         "sourceName": "唯一源", "sourceId": "only.js", "hasMoreSources": False},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "唯一源"},
+    ]
+    try:
+        r = await lxapp._resolve_url_cached(
+            probe_client, "wy", {"id": "lx:wy:1970560262", "lx_source": "wy"}, "lossless", 20.0)
+        assert r and r["url"] == "https://media.test/song.flac"
+        # lossless 档 1 次调用后即降档（无轮换），high 档成功：共 2 次
+        assert [q for _, q in fake_lx.url_calls] == ["flac", "320k"]
+    finally:
+        await probe_client.aclose()
+        fake_lx.url_script.clear()
+
+
+def test_chain_half_open_stuck_guard(fresh_url_cache):
+    """半开试探超时未回填（解析被取消等）自动放行新试探，避免平台熔断被永久卡死。"""
+    import time as _time
+    lxapp._CHAIN_HEALTH["user_source:tx"] = {
+        "fails": 5, "open_until": _time.time() + 600, "next_try": 0,
+        "half_open": True, "half_open_since": _time.time() - 120,
+    }
+    # 超过一个试探周期：放行新的半开试探
+    assert lxapp._chain_available("user_source:tx") is True
+    h = lxapp._CHAIN_HEALTH["user_source:tx"]
+    assert h["half_open"] is True and h["half_open_since"] > _time.time() - 5
+    # 新试探在途期间（未超时）其他请求被挡
+    assert lxapp._chain_available("user_source:tx") is False
 
 
 def test_track_url_quality_isolation(test_app_client, fresh_url_cache, fake_lx):
