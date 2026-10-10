@@ -340,7 +340,9 @@ class LxServerClient:
 
         返回格式:
         {"url": "...", "type": "128k", "sourceName": "...", "sourceId": "...", ...}
-        若解析失败返回 None。
+        200 但无 url（脚本"成功"却拿不出直链，如平台未激活的静默空返回）时同样
+        返回完整响应（url 为空串/缺失，含 attempts 供换源排除）；非 200 或解析
+        异常才返回 None。
         """
         client = await self.get_client()
         body = {
@@ -355,7 +357,7 @@ class LxServerClient:
             logger.warning("lxserver get_music_url error %s: %.150s", resp.status_code, resp.text)
             return None
         data = resp.json()
-        if isinstance(data, dict) and data.get("url"):
+        if isinstance(data, dict):
             return data
         return None
 

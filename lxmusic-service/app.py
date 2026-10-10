@@ -614,7 +614,8 @@ async def resolve_and_probe(
 
     熔断按平台独立计数：某一平台（如 tx 只产出加密 mflac、mg 后端全挂）连续失败
     只熔断该平台，不再拖垮其他健康平台的解析（2026-10-10 全局熔断误伤全平台故障）。
-    同档位直链探活失败时按 excludeApiSources 排除已试脚本换下一个激活源重试。"""
+    同档位直链探活失败或脚本静默空返回（200 无 url）时，按 excludeApiSources 排除
+    已试脚本换下一个激活源重试。"""
     src = normalize_source(source)
     track_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
     chain_key = f"user_source:{src}" if src else "user_source"
@@ -652,7 +653,15 @@ async def resolve_and_probe(
                 res = None
 
             if not res or not res.get("url"):
-                break  # 服务端无可用源/调用出错：降档
+                if res is None:
+                    break  # 服务端无可用源/调用出错（已试尽全部源）：降档
+                # 200 但空 url：脚本"成功"却拿不出直链（如平台未激活的静默空返回），
+                # 与探活失败同等换源轮换
+                tried = [n for n in _scripts_tried(res) if n not in excluded]
+                excluded.extend(tried)
+                if res.get("hasMoreSources") is False or not tried:
+                    break
+                continue
 
             raw_url = res["url"]
             headers = {}
