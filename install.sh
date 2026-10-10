@@ -943,7 +943,9 @@ if [ "${ENABLE_LX}" -eq 1 ]; then
             *,*) _lx_rest="${_lx_rest#*,}" ;;
             *)   _lx_rest="" ;;
         esac
-        _lx_entry="$(printf '%s' "${_lx_entry}" | tr -d '[:space:]')"
+        # 仅去掉分隔项两端空白，保留文件名/目录名内部空格。
+        _lx_entry="${_lx_entry#"${_lx_entry%%[![:space:]]*}"}"
+        _lx_entry="${_lx_entry%"${_lx_entry##*[![:space:]]}"}"
         [ -z "${_lx_entry}" ] && continue
         case "${_lx_entry}" in
             http://*|https://*|file://*) ;;
@@ -1231,38 +1233,72 @@ migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.aliyun.com" "https://
 # sources-data（docker=容器 /data），只改 URL 不动任何数据；目标文件不存在则不动
 # （外部 URL 与异常值一律保留原样）。
 migrate_lx_url_between_modes() {
-    local current target fs_target
-    current="$(sed -n "s/^LX_SOURCE_URL=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
-    [ -n "${current}" ] || return 0
-    if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
-        case "${current}" in
-            file:///data/lxmusic/uploads/*)
-                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file:///data/lxmusic/uploads/}"
-                target="file://${fs_target}"
-                ;;
-            *) return 0 ;;
-        esac
-    else
-        case "${current}" in
-            file://${BASE_DIR}/sources-data/lxmusic/uploads/*)
-                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
-                target="file:///data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
-                ;;
-            *) return 0 ;;
-        esac
-    fi
-    if [ ! -f "${fs_target#file://}" ]; then
-        return 0
-    fi
-    local desired
-    desired="$(mktemp)"
-    { echo "LX_SOURCE_URL='$(dotenv_escape "${target}")'"; } > "${desired}"
-    python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
-        --desired "${desired}" --output "${ENV_PATH}" \
-        --explicit "LX_SOURCE_URL" --quiet
-    rm -f "${desired}"
-    chmod 600 "${ENV_PATH}"
-    log_info "已将洛雪源 URL 迁移为当前部署形态路径（数据原样共用）"
+    python3 - "${BASE_DIR}" "${ENV_PATH}" "${DEPLOY_MODE:-docker}" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+
+base, env_path, mode = sys.argv[1:]
+sys.path.insert(0, str(pathlib.Path(base) / "proxy"))
+from env_merge import parse_env_file, render_env, write_env_atomic
+
+pairs, others = parse_env_file(env_path)
+values = dict(pairs)
+data = pathlib.Path(base) / "sources-data"
+
+def rewrite(url):
+    if not isinstance(url, str) or not url.startswith("file://"):
+        return url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if parsed.netloc or parsed.query or parsed.fragment:
+        return url
+    path = urllib.parse.unquote(parsed.path)
+    # Only app-owned persistent script locations may be remapped. Accept a
+    # previous checkout's sources-data prefix for explicit cross-directory adopt.
+    relative = None
+    for marker in ("/data/", "/sources-data/"):
+        if marker in path:
+            tail = path.split(marker, 1)[1]
+            if tail.startswith(("lxmusic/uploads/", "lxserver/users/source/_open/")):
+                relative = pathlib.PurePosixPath(tail)
+                break
+    if relative is None or ".." in relative.parts:
+        return url
+    target = data / str(relative)
+    if not target.is_file():
+        return url
+    if mode == "native":
+        return target.as_uri()
+    return "file:///data/" + urllib.parse.quote(str(relative), safe="/")
+
+updates = {}
+if "LX_SOURCE_URL" in values:
+    target = rewrite(values["LX_SOURCE_URL"])
+    if target != values["LX_SOURCE_URL"]:
+        updates["LX_SOURCE_URL"] = target
+try:
+    items = json.loads(values.get("LX_SOURCE_LIST", ""))
+except (ValueError, TypeError):
+    items = None
+if isinstance(items, list):
+    changed = False
+    for item in items:
+        if isinstance(item, dict) and "url" in item:
+            target = rewrite(item["url"])
+            if target != item["url"]:
+                item["url"] = target
+                changed = True
+    if changed:
+        updates["LX_SOURCE_LIST"] = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+if updates:
+    merged = [(key, updates.get(key, value)) for key, value in pairs]
+    write_env_atomic(env_path, render_env(merged, trailing=others))
+    print("[INFO] 已将洛雪源 URL/列表迁移为当前部署形态路径（数据原样共用）")
+PY
 }
 migrate_lx_url_between_modes
 
@@ -1286,8 +1322,11 @@ install_unit() {
         return 1
     fi
     if [ -f "${dest}" ] && ! same_dir "$(unit_working_dir "${dest}")" "${BASE_DIR}"; then
-        log_err "目标 unit 不属于当前目录；拒绝覆盖。"
-        return 1
+        if [ "${ADOPT:-0}" -ne 1 ]; then
+            log_err "目标 unit 不属于当前目录；拒绝覆盖（迁移请追加 --adopt）。"
+            return 1
+        fi
+        log_warn "按 --adopt 将原生音源 unit 迁移到当前目录 ${BASE_DIR}。"
     fi
     sudo cp "${src}" "${dest}" || return 1
     rm -f "${src}"

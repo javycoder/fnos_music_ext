@@ -209,25 +209,34 @@ def handle_fs_check(client: socket.socket, headers: dict[str, str], head_raw: by
         except Exception:  # noqa: BLE001
             client.sendall(_json_response(400, {"ok": False, "error": "请求体必须是 JSON"}))
             return
+        if any(ch in path for ch in "\r\n\x00"):
+            client.sendall(_json_response(400, {"ok": False, "error": "路径不能包含换行或空字符"}))
+            return
         target = Path(path)
         if not path.startswith("/") or ".." in target.parts:
             client.sendall(_json_response(400, {"ok": False, "error": "路径必须是绝对路径且不含 .."}))
             return
-        try:
-            exists = target.is_dir()
-        except OSError:
-            exists = False
-        if exists:
-            client.sendall(_json_response(200, {
-                "ok": True, "path": path, "exists": True, "writable": _probe_dir_writable(path),
-            }))
-            return
-        ancestor = target.parent
-        while str(ancestor) != "/" and not ancestor.is_dir():
-            ancestor = ancestor.parent
-        writable = ancestor.is_dir() and _probe_dir_writable(str(ancestor))
+        exists = writable = False
+        ancestor = target
+        while True:
+            try:
+                ancestor.stat()
+            except FileNotFoundError:
+                # 只能跳过真正缺失的路径；悬空链接本身占位，mkdir 无法替换它。
+                if ancestor.is_symlink() or ancestor.parent == ancestor:
+                    break
+                ancestor = ancestor.parent
+                continue
+            except OSError:
+                # ENOTDIR（文件祖先）、EACCES 等不能当作缺失后继续向上放行。
+                break
+            if ancestor.is_dir():
+                exists = ancestor == target
+                writable = _probe_dir_writable(str(ancestor))
+            # 首个存在节点不是目录时同样停止，不能跳过普通文件。
+            break
         client.sendall(_json_response(200, {
-            "ok": True, "path": path, "exists": False, "writable": writable,
+            "ok": True, "path": path, "exists": exists, "writable": writable,
         }))
     except OSError:
         pass

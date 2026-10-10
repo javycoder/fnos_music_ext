@@ -936,7 +936,7 @@ def test_storage_dirs_schema_and_roundtrip(env_file):
 
 def test_put_dir_rejects_relative_dotdot_and_newline(env_file):
     with authed_client() as client:
-        for bad in ("vol1/music", "/vol1/../etc", "/vol1/a\n/b"):
+        for bad in ("vol1/music", "/vol1/../etc", "/vol1/a\n/b", "/vol1/a\x00b", "\n/vol1/music", "/vol1/music\r"):
             for key in ("FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"):
                 r = client.put("/api/config", json={"values": {key: bad}})
                 assert r.status_code == 400, (key, bad)
@@ -977,6 +977,96 @@ def test_put_dirs_empty_clears_to_default(env_file):
         r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": ""}})
         assert r.status_code == 200
         assert "FNMUSIC_CACHE_DIR" in r.json()["changed"]
+    assert "FNMUSIC_CACHE_DIR=''" in env_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("path", ["/.", "/././", "//./"])
+def test_put_dir_rejects_dot_root(env_file, path):
+    with authed_client() as client:
+        for key in ("FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"):
+            response = client.put("/api/config", json={"values": {key: path}})
+            assert response.status_code == 400
+            assert "根目录" in response.json()["error"]
+
+
+def test_put_dir_folds_dot_segments(env_file):
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_CACHE_DIR": "/./vol2/./cache//sub/./",
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/./music/.",
+        }})
+        assert response.status_code == 200
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_CACHE_DIR='/vol2/cache/sub'" in text
+    assert "FNMUSIC_TEE_SAVE_DIR='/vol1/music'" in text
+
+
+@pytest.mark.parametrize("cache,download", [
+    ("/music/.", "/music"),
+    ("/./music", "/music"),
+    ("/music/./cache", "/music/cache"),
+    ("/music/./cache", "/music/cache/sub"),
+    ("/music/cache/sub", "/music/./cache"),
+])
+def test_put_dirs_dot_aliases_conflict(env_file, cache, download):
+    before = env_file.read_bytes()
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_CACHE_DIR": cache, "FNMUSIC_TEE_SAVE_DIR": download,
+        }})
+        assert response.status_code == 400
+        assert "父子" in response.json()["error"]
+    assert env_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("existing_key,updated_key", [
+    ("FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"),
+    ("FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"),
+])
+def test_put_dirs_normalizes_existing_value_for_comparison(env_file, existing_key, updated_key):
+    env_file.write_text(BASE_ENV + f"{existing_key}='/vol1/./music//'\n", encoding="utf-8")
+    before = env_file.read_bytes()
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {updated_key: "/vol1/music"}})
+        assert response.status_code == 400
+        assert "父子" in response.json()["error"]
+    assert env_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("download", ["/host/repo/cache", "/host/repo", "/host/repo/cache/sub"])
+@pytest.mark.parametrize("cache", [None, "", "/elsewhere/cache"])
+def test_put_dirs_known_default_cache_conflicts(env_file, cache, download):
+    """只用 .env 显式宿主 FNMUSIC_HOME；也覆盖清空自定义缓存后的最终状态。"""
+    env_file.write_text(BASE_ENV + "FNMUSIC_HOME='/host/repo'\n"
+                        + (f"FNMUSIC_CACHE_DIR='{cache}'\n" if cache is not None else ""),
+                        encoding="utf-8")
+    before = env_file.read_bytes()
+    values = {"FNMUSIC_TEE_SAVE_DIR": download}
+    if cache == "/elsewhere/cache":
+        values["FNMUSIC_CACHE_DIR"] = ""
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": values})
+        assert response.status_code == 400
+        assert "父子" in response.json()["error"]
+    assert env_file.read_bytes() == before
+
+
+def test_put_dirs_unknown_host_default_not_inferred_from_container_repo(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "repo_dir", "/repo")
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_CACHE_DIR": "", "FNMUSIC_TEE_SAVE_DIR": "/repo/cache",
+        }})
+        assert response.status_code == 200
+
+
+def test_put_dirs_known_default_allows_separate_download(env_file):
+    env_file.write_text(BASE_ENV + "FNMUSIC_HOME='/host/repo'\n", encoding="utf-8")
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_CACHE_DIR": "", "FNMUSIC_TEE_SAVE_DIR": "/host/repo/cache-other",
+        }})
+        assert response.status_code == 200
     assert "FNMUSIC_CACHE_DIR=''" in env_file.read_text(encoding="utf-8")
 
 
@@ -1116,6 +1206,44 @@ def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch)
     saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
     assert [(i["name"], i["active"]) for i in saved] == [("源A", True)]
     assert "LX_SOURCES='kw,kg'" in text  # 平台并集与描述一致
+
+def test_lx_failed_deactivation_retries_actual_enabled_set(env_file, svctl, monkeypatch):
+    import json
+    a, b = "https://s/a.js", "https://s/b.js"
+    env_file.write_text("FNMUSIC_LX_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=false\n"
+                        "LX_SOURCE_URL='" + a + "'\nLX_SOURCE_LIST='" + json.dumps([
+                            {"url": a, "active": True}, {"url": b, "active": True}
+                        ]) + "'\n")
+    enabled = {"a.js": True, "b.js": True}
+    attempts = []
+    allow_disable = False
+    def handler(req):
+        if req.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": sid, "url": a if sid == "a.js" else b, "platforms": ["kw"]}
+                for sid, value in enabled.items() if value
+            ]}})
+        body = json.loads(req.content)
+        sid = body["url"].rsplit("/", 1)[-1]
+        if body.get("enabled") is False:
+            attempts.append(sid)
+            if not allow_disable:
+                return httpx.Response(500, json={"ok": False, "error": "temporarily failed"})
+        enabled[sid] = body.get("enabled", True)
+        return httpx.Response(200, json={"ok": True, "source_id": sid})
+    _mock_http(handler)
+    payload = {"values": {"LX_SOURCE_LIST": json.dumps([{"url": a, "active": True}])}}
+    with authed_client() as client:
+        first = client.put("/api/config", json=payload).json()
+        assert any(not act["ok"] for act in first["actions"])
+        assert enabled["b.js"]
+        count = len(attempts)
+        allow_disable = True
+        retry = client.put("/api/config", json=payload).json()
+    assert len(attempts) > count
+    assert all(act["ok"] for act in retry["actions"])
+    assert enabled == {"a.js": True, "b.js": False}
+
 
 def test_lx_empty_active_list_rejected(env_file, svctl):
     env_file.write_text("FNMUSIC_LX_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=false\n")

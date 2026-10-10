@@ -225,7 +225,7 @@ def test_fs_check_validates_path(tmp_path: Path):
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
-    for bad in ("relative/x", "/tmp/../etc", ""):
+    for bad in ("relative/x", "/tmp/../etc", "", "/tmp/a\x00b", "/tmp/a\x00b/sub", "/tmp/a\nb", "/tmp/a\rb"):
         status, payload = _fs_check(sock_path, bad)
         assert b"400" in status, bad
         assert payload["ok"] is False, bad
@@ -269,6 +269,42 @@ def test_fs_check_missing_dir_probes_nearest_ancestor(tmp_path: Path):
     assert not missing.exists()  # 无副作用
     # 探测临时文件已自删
     assert not list(tmp_path.glob(".fnmusic-fscheck-*"))
+
+
+@pytest.mark.parametrize("suffix", ["", "/sub", "/sub/deep"])
+@pytest.mark.parametrize("kind", ["file", "file_link", "dangling_link"])
+def test_fs_check_non_directory_blocks_creation(tmp_path: Path, suffix: str, kind: str):
+    """目标或祖先不是目录时不可创建，不能跳过它去探测更上层目录。"""
+    obstacle = tmp_path / "obstacle"
+    if kind == "file":
+        obstacle.write_text("unchanged")
+    elif kind == "file_link":
+        regular = tmp_path / "regular"
+        regular.write_text("unchanged")
+        obstacle.symlink_to(regular)
+    else:
+        obstacle.symlink_to(tmp_path / "missing")
+    sock_path = _start_gateway(tmp_path, 1)  # 本地拦截不需要上游
+    path = str(obstacle) + suffix
+    status, payload = _fs_check(sock_path, path)
+    assert b"200" in status
+    assert payload == {"ok": True, "path": path, "exists": False, "writable": False}
+    assert obstacle.is_symlink() if kind != "file" else obstacle.read_text() == "unchanged"
+    assert not list(tmp_path.glob(".fnmusic-fscheck-*"))
+    assert not (tmp_path / "missing").exists()
+
+
+def test_fs_check_directory_symlink_allows_missing_child(tmp_path: Path):
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(directory, target_is_directory=True)
+    sock_path = _start_gateway(tmp_path, 1)
+    path = str(link / "missing" / "child")
+    status, payload = _fs_check(sock_path, path)
+    assert b"200" in status
+    assert payload == {"ok": True, "path": path, "exists": False, "writable": True}
+    assert not list(directory.iterdir())
 
 
 def test_fs_check_only_post_intercepted(tmp_path: Path):

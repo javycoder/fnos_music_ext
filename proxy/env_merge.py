@@ -193,11 +193,19 @@ def preserve_user_comments(
 
 def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
     path = Path(path)
+    try:
+        existing = path.stat()
+    except FileNotFoundError:
+        existing = None
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent or "."), prefix=".env.merge.")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             f.write(content)
-        os.chmod(tmp_name, mode)
+            # Native WebUI runs as root, but the installer user's private .env
+            # must remain readable by that user after an atomic replacement.
+            if existing is not None and os.geteuid() == 0:
+                os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
+            os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, str(path))
     finally:
         if os.path.exists(tmp_name):

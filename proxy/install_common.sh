@@ -133,7 +133,21 @@ same_dir() {
 
 unit_working_dir() {
     # WorkingDirectory as recorded in a unit file (no systemd interaction needed).
-    sed -n 's/^[[:space:]]*WorkingDirectory=//p' "$1" 2>/dev/null | head -n1
+    python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+try:
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("WorkingDirectory="):
+            value = line.partition("=")[2].strip()
+            if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+                value = value[1:-1]
+            print(value.replace("%%", "%"))
+            break
+except OSError:
+    pass
+PY
 }
 
 check_proxy_unit_owner() {
@@ -315,11 +329,26 @@ native_sup_conf() {
 
 render_native_placeholders() {
     # $1 = 模板文件，渲染结果输出到 stdout（@REPO@/@VENV@/@DATA@/@RUN@ 四占位符）
-    sed -e "s|@REPO@|${BASE_DIR}|g" \
-        -e "s|@VENV@|$(native_venv_dir)|g" \
-        -e "s|@DATA@|${BASE_DIR}/sources-data|g" \
-        -e "s|@RUN@|$(native_run_dir)|g" \
-        "$1"
+    python3 - "$1" "${BASE_DIR}" "$(native_venv_dir)" \
+        "${BASE_DIR}/sources-data" "$(native_run_dir)" <<'PY'
+import pathlib
+import sys
+
+template, *paths = sys.argv[1:]
+# These paths cross INI environment, shell argv and systemd parsers. Fail clearly
+# on ambiguous quoting rather than install a malformed unit or command.
+if any(any(c in path for c in "\n\r\"'\\") for path in paths):
+    raise SystemExit("原生部署路径不能包含换行、引号或反斜杠")
+text = pathlib.Path(template).read_text(encoding="utf-8")
+for key, value in zip(("REPO", "VENV", "DATA", "RUN"), paths):
+    # Both supervisor's interpolation and systemd's specifiers use percent.
+    text = text.replace("@" + key + "@", value.replace("%", "%%"))
+if pathlib.Path(template).name == "supervisord-native.conf.in":
+    text = text.replace('WEBUI_SUPERVISORCTL="supervisorctl -c ',
+                        'WEBUI_SUPERVISORCTL="supervisorctl -c \'')
+    text = text.replace('/supervisord.conf"', '/supervisord.conf\'"')
+sys.stdout.write(text)
+PY
 }
 
 render_native_supervisor_conf() {

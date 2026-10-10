@@ -12,13 +12,13 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=@REPO@
-Environment=PATH=@VENV@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment="PATH=@VENV@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment=PYTHONUNBUFFERED=1
-Environment=SUPERVISOR_CONF=@RUN@/supervisord.conf
-Environment=ENV_FLAG_LIB=@REPO@/container/env_flag.sh
-Environment=FNMUSIC_ENV_FILE=@REPO@/.env
-Environment=DATA_PATH=@DATA@/lxserver
-Environment=LX_DATA_DIR=@DATA@/lxmusic
+Environment="SUPERVISOR_CONF=@RUN@/supervisord.conf"
+Environment="ENV_FLAG_LIB=@REPO@/container/env_flag.sh"
+Environment="FNMUSIC_ENV_FILE=@REPO@/.env"
+Environment="DATA_PATH=@DATA@/lxserver"
+Environment="LX_DATA_DIR=@DATA@/lxmusic"
 ExecStart=/bin/bash "@REPO@/container/entrypoint.sh"
 TimeoutStartSec=75
 TimeoutStopSec=20
