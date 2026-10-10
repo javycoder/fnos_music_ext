@@ -33,6 +33,9 @@ from proxy.app import (
 @pytest.fixture(autouse=True)
 def setup_test_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
+    monkeypatch.setenv("FNMUSIC_BACKGROUND_JOBS", "0")
+    monkeypatch.setattr(pa, "_LX_SCRIPT_MAP_TASK", None)
+    monkeypatch.setattr(pa, "_LX_DISPLAY_TAGS", {})
     _LX_SCRIPT_MAP_CACHE["ts"] = -1.0
     _LX_SCRIPT_MAP_CACHE["by_platform"] = {}
     monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
@@ -60,9 +63,14 @@ def setup_test_env(tmp_path, monkeypatch):
     def quiet_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"ok": False, "data": []})
 
-    app.state.musicbox_client = httpx.AsyncClient(
+    musicbox_client = httpx.AsyncClient(
         transport=httpx.MockTransport(quiet_handler), base_url="http://127.0.0.1:8770"
     )
+    monkeypatch.setattr(app.state, "musicbox_client", musicbox_client, raising=False)
+    yield
+    asyncio.run(musicbox_client.aclose())
+    _SEARCH_CACHE.clear()
+    _LX_SCRIPT_MAP_CACHE.update(ts=-1.0, by_platform={})
 
 
 def _set_lx_source(monkeypatch, url: str, entries: list[dict]):
@@ -202,6 +210,157 @@ def test_refresh_lx_script_map_attribution(monkeypatch):
     assert called["n"] == 1
 
 
+@pytest.mark.parametrize("name_field", ["descriptor", "remark"])
+def test_same_name_distinct_sources_are_ambiguous(monkeypatch, name_field):
+    """Distinct owners must not collapse to one merely because labels match."""
+    entries = [
+        {"url": "http://s1/one.js", "name": "同名" if name_field == "remark" else "", "active": True},
+        {"url": "http://s2/two.js", "name": "同名" if name_field == "remark" else "", "active": True},
+    ]
+    _set_lx_source(monkeypatch, "", entries)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+            "data": {"sources": [
+                {"url": entries[0]["url"], "name": "同名", "platforms": ["kg", "kw"]},
+                {"url": entries[1]["url"], "name": "同名", "platforms": ["kg", "wy"]},
+            ]},
+        })), base_url="http://lx") as client:
+            assert await refresh_lx_script_map(client) == {"kw": "同名", "wy": "同名"}
+            assert source_display_prefix("lx", {"id": "lx:kg:1"}) == "[lx-kg] "
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("platforms", [17, "kg", {"kg": True}, [[], {}, "kg", None]])
+def test_malformed_descriptor_platforms_do_not_fail_background_refresh(monkeypatch, platforms):
+    async def run():
+        errors = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: errors.append(context))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+            "data": {"sources": [{"name": "实际脚本", "platforms": platforms}]},
+        })), base_url="http://lx") as client:
+            pa._schedule_lx_script_map_refresh(client)
+            task = pa._LX_SCRIPT_MAP_TASK
+            assert task is not None
+            assert await task == dict.fromkeys(pa._LX_PLATFORMS, "实际脚本")
+            await asyncio.sleep(0)
+            assert pa._LX_SCRIPT_MAP_TASK is None
+            assert not errors
+    asyncio.run(run())
+
+
+def test_unnamed_source_still_counts_as_platform_owner():
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+            "data": {"sources": [
+                {"name": "有名", "platforms": ["kg", "kw"]},
+                {"name": "", "platforms": ["kg"]},
+            ]},
+        })), base_url="http://lx") as client:
+            assert await refresh_lx_script_map(client) == {"kw": "有名"}
+    asyncio.run(run())
+
+
+def test_refresh_exception_is_consumed_and_retryable(monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger=pa.logger.name)
+
+    async def run():
+        errors = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: errors.append(context))
+        finished = asyncio.Event()
+        calls = []
+
+        async def broken(client):
+            calls.append(client)
+            raise RuntimeError("descriptor failure")
+
+        monkeypatch.setattr(pa, "refresh_lx_script_map", broken)
+        pa._schedule_lx_script_map_refresh(None)
+        task = pa._LX_SCRIPT_MAP_TASK
+        task.add_done_callback(lambda task: finished.set())
+        await asyncio.wait_for(finished.wait(), 1)
+        assert pa._LX_SCRIPT_MAP_TASK is None
+        assert "lx script map refresh failed: RuntimeError" in caplog.text
+        pa._schedule_lx_script_map_refresh(None)
+        retry = pa._LX_SCRIPT_MAP_TASK
+        assert retry is not task
+        finished.clear()
+        retry.add_done_callback(lambda task: finished.set())
+        await asyncio.wait_for(finished.wait(), 1)
+        assert len(calls) == 2
+        # Drop references so an unconsumed failure would reach the loop error handler.
+        del task, retry
+        import gc
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not errors
+    asyncio.run(run())
+
+
+def test_refresh_task_from_foreign_loop_does_not_block_new_loop(monkeypatch):
+    old_loop = asyncio.new_event_loop()
+    old_task = old_loop.create_task(asyncio.sleep(3600))
+    monkeypatch.setattr(pa, "_LX_SCRIPT_MAP_TASK", old_task)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)),
+                                    base_url="http://lx") as client:
+            pa._schedule_lx_script_map_refresh(client)
+            assert pa._LX_SCRIPT_MAP_TASK is not old_task
+            await pa._LX_SCRIPT_MAP_TASK
+            await asyncio.sleep(0)
+            assert pa._LX_SCRIPT_MAP_TASK is None
+
+    try:
+        # Even a dormant task belonging to another loop must not suppress this refresh.
+        asyncio.run(run())
+    finally:
+        old_task.cancel()
+        old_loop.run_until_complete(asyncio.gather(old_task, return_exceptions=True))
+        old_loop.close()
+
+
+@pytest.mark.parametrize("descriptor", [None, [], {"data": []}, {"data": {"sources": 1}},
+                                       {"data": {"sources": [None, "not a source"]}}])
+def test_invalid_descriptor_envelope_is_cached_without_unhandled_errors(monkeypatch, descriptor):
+    async def run():
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, json=descriptor)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lx") as client:
+            pa._schedule_lx_script_map_refresh(client)
+            await pa._LX_SCRIPT_MAP_TASK
+            await asyncio.sleep(0)
+            assert pa._LX_SCRIPT_MAP_TASK is None
+            assert _LX_SCRIPT_MAP_CACHE["by_platform"] == {}
+            assert _LX_SCRIPT_MAP_CACHE["ts"] >= 0
+            pa._schedule_lx_script_map_refresh(client)
+            assert pa._LX_SCRIPT_MAP_TASK is None
+            assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_cold_cache_refreshes_at_low_monotonic_uptime(monkeypatch):
+    # ts=-1 is invalid, not a freshly populated cache during the first minute of boot.
+    monkeypatch.setattr(pa, "time", type("Clock", (), {"monotonic": staticmethod(lambda: 2.0)}))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+            "data": {"sources": [{"name": "开机脚本"}]},
+        })), base_url="http://lx") as client:
+            pa._schedule_lx_script_map_refresh(client)
+            assert pa._LX_SCRIPT_MAP_TASK is not None
+            assert await pa._LX_SCRIPT_MAP_TASK == dict.fromkeys(pa._LX_PLATFORMS, "开机脚本")
+            await asyncio.sleep(0)
+            assert pa._LX_SCRIPT_MAP_TASK is None
+    asyncio.run(run())
+
+
 def test_strip_source_tag_precise(monkeypatch):
     _set_lx_source(monkeypatch, "http://s1/one.js", [{"name": "星海源", "url": "http://s1/one.js"}])
     assert strip_source_tag("[music box] 晴天") == "晴天"
@@ -326,6 +485,8 @@ def test_search_merge_lx_script_platform_and_fallback(monkeypatch):
     app.state.lx_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772"
     )
+    # 标签刷新不阻塞搜索；精确标签用例预填已有描述映射，冷缓存另用事件控制测试。
+    _LX_SCRIPT_MAP_CACHE.update(ts=time.monotonic(), by_platform={"kg": "星海源", "wy": "云海源"})
     with TestClient(app) as client:
         resp = client.get("/music/api/v1/search/track?keyword=晴天")
         titles = [it["title"] for it in resp.json()["data"]["list"]]
@@ -359,7 +520,8 @@ def test_search_merge_lx_script_platform_and_fallback(monkeypatch):
         assert titles == ["[lx] 夜曲"]
 
 
-def test_event_report_strips_source_tag(tmp_path, monkeypatch):
+@pytest.mark.parametrize("refresh_after_display", [False, True])
+def test_event_report_strips_source_tag(tmp_path, monkeypatch, refresh_after_display):
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
     _set_lx_source(monkeypatch, "http://s1/one.js", [{"name": "星海源", "url": "http://s1/one.js"}])
 
@@ -367,6 +529,23 @@ def test_event_report_strips_source_tag(tmp_path, monkeypatch):
         if request.url.path.endswith("/user/me"):
             return httpx.Response(200, json={"code": 0, "data": {"guid": "user-tag-1"}})
         return httpx.Response(200, json={"code": 0, "msg": "ok", "data": None})
+
+    # Actual descriptor name is absent from LX_SOURCE_LIST (no user remark).
+    async def load_descriptor(name):
+        _LX_SCRIPT_MAP_CACHE["ts"] = -1.0
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+            "data": {"sources": [{"name": name, "url": "http://unnamed/source.js", "platforms": ["kg"]}]},
+        })), base_url="http://lx") as lx:
+            await refresh_lx_script_map(lx)
+
+    asyncio.run(load_descriptor("脚本自带名"))
+    actual_title = build_online_track({
+        "id": "lx:kg:actual", "source": "lx", "title": "原名", "artist": "歌手",
+    }, mark_source=True)["title"]
+    assert actual_title == "[脚本自带名-kg] 原名"
+    if refresh_after_display:
+        asyncio.run(load_descriptor("新脚本名"))
+        assert "脚本自带名" not in _LX_SCRIPT_MAP_CACHE["by_platform"].values()
 
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(auth_handler), base_url="http://unix"
@@ -383,6 +562,10 @@ def test_event_report_strips_source_tag(tmp_path, monkeypatch):
              "payload": {"trackGUID": "online:lx:kw:3", "title": "[星海源-kw] 搁浅", "artist": "周杰伦"}},
             {"eventType": "track_play", "occurredAt": 5,
              "payload": {"trackGUID": "online:lx:mg:4", "title": "[lx-mg] 七里香（Live）", "artist": "周杰伦"}},
+            {"eventType": "track_play", "occurredAt": 6,
+             "payload": {"trackGUID": "online:lx:kg:actual", "title": actual_title, "artist": "歌手"}},
+            {"eventType": "track_play", "occurredAt": 7,
+             "payload": {"trackGUID": "online:lx:kg:unknown", "title": "[AI生成-kg] 原名", "artist": "歌手"}},
         ]})
         assert resp.json()["code"] == 0
 
@@ -395,6 +578,128 @@ def test_event_report_strips_source_tag(tmp_path, monkeypatch):
     assert by_guid["online:netease:5"]["track"]["title"] == "七里香"
     assert by_guid["online:lx:kw:3"]["track"]["title"] == "搁浅"
     assert by_guid["online:lx:mg:4"]["track"]["title"] == "七里香（Live）"
+    assert by_guid["online:lx:kg:actual"]["track"]["title"] == "原名"
+    assert by_guid["online:lx:kg:unknown"]["track"]["title"] == "[AI生成-kg] 原名"
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_slow_descriptor_preserves_aggregate_and_refreshes_cached_labels(monkeypatch, warm_cache):
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "search_timeout", 0.05)
+    monkeypatch.setitem(CONF, "search_deep_page", False)
+    if warm_cache:
+        _LX_SCRIPT_MAP_CACHE.update(ts=time.monotonic() - pa._LX_SCRIPT_MAP_TTL - 1,
+                                    by_platform={"kg": "旧脚本"})
+
+    async def run():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        descriptor_calls = []
+        search_calls = []
+
+        async def lx_handler(request):
+            if request.url.path == "/api/v1/source":
+                descriptor_calls.append(request)
+                entered.set()
+                await release.wait()
+                return httpx.Response(200, json={"data": {"sources": [
+                    {"name": "实际脚本", "url": "http://s1/one.js", "platforms": ["kg"]},
+                ]}})
+            search_calls.append(request)
+            return httpx.Response(200, json={"ok": True, "items": [{
+                "id": "lx:kg:slow", "lx_source": "kg", "title": "晴天", "artist": "周杰伦",
+                "duration_s": 269, "ext": "flac", "file_size": 28000000,
+            }]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lx_handler), base_url="http://lx") as lx, \
+                httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+                    "code": 0, "data": {"list": [], "total": 0},
+                })), base_url="http://unix") as upstream, \
+                httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={
+                    "ok": True, "items": [{"id": "migu:1", "source": "migu", "title": "夜曲", "artist": "周杰伦"}],
+                })), base_url="http://dl") as dl, \
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as api:
+            monkeypatch.setattr(app.state, "lx_client", lx, raising=False)
+            monkeypatch.setattr(app.state, "upstream_client", upstream, raising=False)
+            monkeypatch.setattr(app.state, "musicdl_client", dl, raising=False)
+            async with pa.lifespan(app):
+                response = await asyncio.wait_for(api.get("/music/api/v1/search/track?keyword=晴天"), 1)
+                await asyncio.wait_for(entered.wait(), 1)
+                task = pa._LX_SCRIPT_MAP_TASK
+                assert task is not None and not task.done()
+                assert not release.is_set()
+                entry = next(iter(_SEARCH_CACHE.values()))
+                await asyncio.wait_for(entry["task"], 1)
+                assert {item["source"] for item in entry["items"]} == {"lx", "migu"}
+                assert entry["partial"] is False
+                assert not entry.get("abandoned")
+                assert all("lx_script" not in item for item in entry["items"])
+                expected_lx = "[旧脚本-kg] 晴天" if warm_cache else "[lx-kg] 晴天"
+                assert response.status_code == 200
+                assert expected_lx in [item["title"] for item in response.json()["data"]["list"]]
+
+                # Repeated requests/scheduling while the descriptor is blocked are single-flight.
+                repeat_items = await pa._lx_search_request(lx, "晴天", 30, None, "")
+                assert repeat_items and "lx_script" not in repeat_items[0]
+                for _ in range(10):
+                    pa._schedule_lx_script_map_refresh(lx)
+                assert pa._LX_SCRIPT_MAP_TASK is task
+                assert len(descriptor_calls) == 1
+                release.set()
+                await asyncio.wait_for(task, 1)
+                await asyncio.sleep(0)
+                assert pa._LX_SCRIPT_MAP_TASK is None
+                assert _LX_SCRIPT_MAP_CACHE["by_platform"]["kg"] == "实际脚本"
+
+                # Same cached search, no reaggregation: only its display label changes.
+                count = len(search_calls)
+                response = await api.get("/music/api/v1/search/track?keyword=晴天")
+                titles = [item["title"] for item in response.json()["data"]["list"]]
+                assert set(titles) == {"[实际脚本-kg] 晴天", "[dl] 夜曲"}
+                assert len(search_calls) == count
+                assert all("lx_script" not in item for item in entry["items"])
+                pa._schedule_lx_script_map_refresh(lx)
+                assert pa._LX_SCRIPT_MAP_TASK is None  # fresh TTL suppresses refresh
+                assert len(descriptor_calls) == 1
+    asyncio.run(run())
+
+
+def test_lifespan_cancels_pending_descriptor(monkeypatch):
+    async def run():
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def handler(request):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lx") as lx:
+            async with pa.lifespan(app):
+                pa._schedule_lx_script_map_refresh(lx)
+                task = pa._LX_SCRIPT_MAP_TASK
+                await asyncio.wait_for(entered.wait(), 1)
+            assert cancelled.is_set()
+            assert task.cancelled()
+            assert pa._LX_SCRIPT_MAP_TASK is None
+    asyncio.run(run())
+
+
+def test_lx_display_tags_are_bounded_and_only_track_displayed_labels():
+    _LX_SCRIPT_MAP_CACHE.update(ts=time.monotonic(), by_platform={"kg": "当前映射"})
+    assert strip_source_tag("[当前映射-kg] 歌名") == "歌名"
+    build_online_track({"id": "lx:kg:clean", "source": "lx", "title": "未标记", "lx_script": "未显示"})
+    assert "[未显示-kg] " not in pa._LX_DISPLAY_TAGS
+    for i in range(4097):
+        build_online_track({"id": f"lx:kg:{i}", "source": "lx", "title": "歌名", "lx_script": f"脚本{i}"},
+                           mark_source=True)
+    assert len(pa._LX_DISPLAY_TAGS) == 4096
+    assert "[脚本0-kg] " not in pa._LX_DISPLAY_TAGS
+    _LX_SCRIPT_MAP_CACHE["by_platform"] = {}
+    assert strip_source_tag("[脚本4096-kg] 歌名") == "歌名"
+    assert strip_source_tag("[未知-kg] 歌名") == "[未知-kg] 歌名"
 
 
 def test_env_hot_reload_lx_source(tmp_path, monkeypatch):

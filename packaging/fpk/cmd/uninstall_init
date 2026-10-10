@@ -28,7 +28,17 @@ fi
 
 # 运行日志（logs/，含导出的 .logzip）不属于需备份的用户数据：卸载即删。
 # 应用中心随后会删整个应用目录，这里先删一次确保降级/异常路径下也不残留。
-rm -rf "${FNMUSIC_REPO_DIR}/logs" >> "${FNMUSIC_LOG}" 2>&1 || true
+# _common leaves the repo empty when the payload has already disappeared.
+# Require a canonical, non-root repo with its installer marker before cleanup;
+# never let an empty/root/invalid repo turn this into rm -rf /logs.
+if [[ "${FNMUSIC_REPO_DIR}" = /* ]] && [ "${FNMUSIC_REPO_DIR}" != "/" ] \
+   && [ -d "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/install.sh" ]; then
+    LOG_REPO="$(cd "${FNMUSIC_REPO_DIR}" && pwd -P)"
+    if [ -n "${LOG_REPO}" ] && [ "${LOG_REPO}" != "/" ] \
+       && [ -f "${LOG_REPO}/install.sh" ]; then
+        rm -rf -- "${LOG_REPO}/logs" >> "${FNMUSIC_LOG}" 2>&1 || true
+    fi
+fi
 
 # 兼容旧的向导开关（历史版本安装时可能记录）：显式 false 才跳过备份
 KEEP="${wizard_keep_data:-true}"

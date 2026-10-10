@@ -83,10 +83,81 @@ log_err() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 
 # 安装/升级事件留档：追加到 logs/install.log（运行日志保留 3 天，写失败绝不影响安装）
 APP_LOG_DIR="${BASE_DIR}/logs"
+configure_app_logs() {
+    # Only checkout/logs is managed. Descriptor-relative, no-follow operations
+    # avoid chmod/chown through symlinks (or hardlinks to unrelated files).
+    # Keep native paths unchanged; Docker's appuser shares numeric group 1000.
+    local python_cmd=(python3)
+    if [ "${EUID}" -ne 0 ] && sudo -n true 2>/dev/null; then
+        python_cmd=(sudo -n python3)
+    fi
+    "${python_cmd[@]}" - "$(cd "${BASE_DIR}" && pwd -P)" "$@" <<'PY'
+import datetime
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+base = os.open(sys.argv[1], flags)
+try:
+    try:
+        os.mkdir("logs", 0o700, dir_fd=base)
+    except FileExistsError:
+        pass
+    logs = os.open("logs", flags, dir_fd=base)
+    try:
+        device = os.fstat(logs).st_dev
+
+        def repair(fd):
+            if os.geteuid() == 0:
+                os.fchown(fd, 0, 1000)
+            else:
+                os.fchown(fd, -1, 1000)
+            os.fchmod(fd, 0o2770)
+            for name in os.listdir(fd):
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if info.st_dev != device:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, flags, dir_fd=fd)
+                    try:
+                        if os.fstat(child).st_dev == device:
+                            repair(child)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                    try:
+                        actual = os.fstat(child)
+                        if (stat.S_ISREG(actual.st_mode) and actual.st_nlink == 1
+                                and actual.st_dev == device):
+                            os.fchown(child, -1, 1000)
+                            os.fchmod(child, 0o640)
+                    finally:
+                        os.close(child)
+
+        repair(logs)
+        if len(sys.argv) > 2:
+            out = os.open("install.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                          0o640, dir_fd=logs)
+            try:
+                info = os.fstat(out)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("install.log must be an unlinked regular file")
+                os.fchown(out, -1, 1000)
+                os.fchmod(out, 0o640)
+                stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                os.write(out, f"[{stamp}] [install] {sys.argv[2]}\n".encode("utf-8"))
+            finally:
+                os.close(out)
+    finally:
+        os.close(logs)
+finally:
+    os.close(base)
+PY
+}
 log_install() {
-    mkdir -p "${APP_LOG_DIR}" 2>/dev/null || true
-    printf '[%s] [install] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" \
-        >> "${APP_LOG_DIR}/install.log" 2>/dev/null || true
+    configure_app_logs "$*" 2>/dev/null || true
 }
 trap 'log_install "aborted line=${BASH_LINENO[0]:-?}"' ERR
 
@@ -706,6 +777,7 @@ else
 fi
 
 precheck_environment
+configure_app_logs || { log_err "无法安全配置私有共享日志目录: ${APP_LOG_DIR}"; exit 1; }
 log_install "begin version=${FNMUSIC_VERSION} args=$*"
 
 dotenv_escape() {
@@ -1033,6 +1105,9 @@ if [ -d "${KEEP_DATA_DIR}" ] && [ ! -f "${BASE_DIR}/.env" ]; then
         log_warn "历史数据未完全成功恢复，将保留备份目录以防止数据丢失: ${KEEP_DATA_DIR}"
     fi
 fi
+
+# Reapply after retained-data restoration, before any service starts.
+configure_app_logs || { log_err "无法安全配置私有共享日志目录: ${APP_LOG_DIR}"; exit 1; }
 
 # v2.0.0 升级检测：旧 .env 三源并存（多 true）时强制重新三选一
 if [ -f "${BASE_DIR}/.env" ]; then

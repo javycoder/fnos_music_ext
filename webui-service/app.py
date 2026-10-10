@@ -15,17 +15,23 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
 from proxy.env_merge import (  # noqa: E402
@@ -1017,24 +1023,62 @@ def _read_disclaimer() -> "list[dict[str, str]]":
     return items
 
 
-def _log_files_info() -> "list[dict]":
-    """日志目录文件清单（名称/大小/修改时间），供关于页展示与导出前确认。"""
-    out: list[dict] = []
+def _export_log_files(directory: Path):
+    """关于页与导出共用清单：近 3 天的普通文件，不跟随符号链接。"""
+    cutoff = time.time() - RETENTION_DAYS * 86400
     try:
-        for item in sorted(log_dir().iterdir(), key=lambda p: p.name):
+        for item in sorted(directory.iterdir(), key=lambda p: p.name):
             try:
-                if item.is_file():
-                    st = item.stat()
-                    out.append({
-                        "name": item.name,
-                        "size": st.st_size,
-                        "mtime": int(st.st_mtime),
-                    })
+                st = item.lstat()
+                if (stat.S_ISREG(st.st_mode) and item.suffix != ".logzip"
+                        and st.st_mtime >= cutoff):
+                    yield item, st
             except OSError:
                 continue
     except OSError:
         pass
-    return out
+
+
+def _log_files_info() -> "list[dict]":
+    """可导出的日志文件清单（名称/大小/修改时间），不展示临时导出包。"""
+    return [
+        {"name": item.name, "size": st.st_size, "mtime": int(st.st_mtime)}
+        for item, st in _export_log_files(log_dir())
+    ]
+
+
+def _write_log_archive(directory: Path, target: Path) -> None:
+    """在线程池中执行日志读取、压缩与环境探测。"""
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item, listed in _export_log_files(directory):
+            try:
+                # lstat 后文件仍可能被换成链接/FIFO；打开时也拒绝跟随/阻塞。
+                fd = os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as source:
+                    opened = os.fstat(source.fileno())
+                    if (not stat.S_ISREG(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)):
+                        continue
+                    with zf.open(item.name, "w") as member:
+                        shutil.copyfileobj(source, member)
+            except OSError:
+                continue
+        snapshot = "\n".join(env_snapshot_lines(
+            "container" if Path("/.dockerenv").exists() else "host"))
+        zf.writestr("export_env_snapshot.txt", snapshot + "\n")
+
+
+class _LogExportResponse(FileResponse):
+    """临时目录仅属于本响应，发送结束（含中断/异常）后才清理。"""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # FileResponse 的 BackgroundTask 在发送异常/某些 Range 响应中不会运行。
+            # finally + shield 保证这些路径也不会留下包；从不扫描/删除其他响应的文件。
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(shutil.rmtree, Path(self.path).parent)
 
 
 @app.get("/api/about")
@@ -1056,46 +1100,36 @@ async def api_about():
 
 @app.get("/api/logs/export")
 async def api_logs_export():
-    """打包近 3 天日志为 <YYYYMMDDHHMMSS>.logzip 并触发浏览器下载。
+    """近 3 天日志 + 环境快照；下载名为 <YYYYMMDDHHMMSS>.logzip。
 
-    规则：打包前先删除上一次的导出包（同时最多存在一份）；只收集近 3 天的
-    日志文件（排除 .logzip 导出产物自身）；包内附带导出时刻的环境快照。
+    每个请求独占系统临时目录（不在日志目录内，避免日志清理影响下载）。
+    压缩在线程池执行；仅在本响应发送结束后清理，不保留历史导出包，
+    因此磁盘占用限于仍在压缩/发送的请求，同秒导出也不会互相覆盖。
     """
-    import zipfile
-
     directory = log_dir()
-    stamp = time.strftime("%Y%m%d%H%M%S")
-    target = directory / f"{stamp}.logzip"
+    filename = f"{time.strftime('%Y%m%d%H%M%S')}.logzip"
+    temp_dir = None
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        # 上一次导出包清理：同时最多保留一份导出产物
-        for stale in directory.glob("*.logzip"):
+        # 不能在 worker 仍写包时取消并删除其目录；等压缩结束再移交给响应。
+        with anyio.CancelScope(shield=True):
             try:
-                stale.unlink()
-            except OSError:
-                pass
-        cutoff = time.time() - RETENTION_DAYS * 86400
-        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-            for item in sorted(directory.iterdir(), key=lambda p: p.name):
-                try:
-                    if (not item.is_file() or item.suffix == ".logzip"
-                            or item.stat().st_mtime < cutoff):
-                        continue
-                    zf.write(item, arcname=item.name)
-                except OSError:
-                    continue
-            snapshot = "\n".join(env_snapshot_lines(
-                "container" if Path("/.dockerenv").exists() else "host"))
-            zf.writestr("export_env_snapshot.txt", snapshot + "\n")
+                temp_dir = Path(await run_in_threadpool(tempfile.mkdtemp, prefix="fnmusic-log-export-"))
+                target = temp_dir / filename
+                await run_in_threadpool(_write_log_archive, directory, target)
+                response = _LogExportResponse(
+                    target,
+                    media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
+            except BaseException:
+                if temp_dir is not None:
+                    await run_in_threadpool(shutil.rmtree, temp_dir, ignore_errors=True)
+                raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("[diag] log_export_failed error=%s", type(exc).__name__)
         return JSONResponse(content={"ok": False, "error": f"日志打包失败: {exc}"}, status_code=500)
-    logger.info("[diag] log_export file=%s", target.name)
-    return FileResponse(
-        target,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
-    )
+    logger.info("[diag] log_export file=%s", filename)
+    return response
 
 
 # ------------------------------------------------------------------ 静态前端 --
