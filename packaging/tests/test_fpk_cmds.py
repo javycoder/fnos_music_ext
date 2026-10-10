@@ -711,11 +711,63 @@ def test_uninstall_init_archives_to_volume_root(sb):
         assert item in tar_args
 
 
-def test_uninstall_init_without_repo_exits_cleanly(sb):
+@pytest.mark.parametrize("keep", ["true", "false"])
+def test_uninstall_init_without_repo_never_removes_root_logs(sb, keep):
     sb.add_tar()
-    result = sb.run("uninstall_init")
+    rm_log = sb.tmp / "rm.log"
+    # Intercept every rm: the regression must detect /logs without ever actually
+    # deleting a host path, including on the old vulnerable implementation.
+    _write_stub(sb.bindir, "rm",
+                f'#!/bin/bash\nprintf \'%s\\n\' "$@" >> "{rm_log}"\n')
+    result = sb.run("uninstall_init", wizard_keep_data=keep)
     assert result.returncode == 0, result.stderr
     assert not sb.tar_log.exists()
+    assert not rm_log.exists(), "empty payload must not invoke rm at all"
+
+
+@pytest.mark.parametrize("invalid_repo", ["/", "//", "/missing/payload", "relative/path"])
+def test_uninstall_init_invalid_repo_does_not_remove_logs(sb, invalid_repo):
+    # Inject the invalid repo only after common's discovery (no real root marker
+    # files are needed). Disable backups so this isolates the cleanup guard.
+    with (sb.cmd / "_common").open("a") as common:
+        common.write(f'\nFNMUSIC_REPO_DIR="{invalid_repo}"\n')
+    rm_log = sb.tmp / "rm.log"
+    _write_stub(sb.bindir, "rm",
+                f'#!/bin/bash\nprintf \'%s\\n\' "$@" >> "{rm_log}"\n')
+    result = sb.run("uninstall_init", wizard_keep_data="false")
+    assert result.returncode == 0, result.stderr
+    assert not rm_log.exists()
+
+
+def test_uninstall_init_removes_only_payload_logs(sb):
+    repo = sb.make_repo()
+    logs = repo / "logs"
+    logs.mkdir()
+    (logs / "proxy.log.2026-10-09").write_text("runtime")
+    (logs / "env_snapshot.txt").write_text("environment")
+    (logs / "export.logzip").write_text("support")
+    unrelated = sb.tmp / "unrelated"
+    unrelated.mkdir()
+    marker = unrelated / "keep"
+    marker.write_text("keep")
+    (logs / "outside").symlink_to(unrelated, target_is_directory=True)
+    result = sb.run("uninstall_init", wizard_keep_data="false")
+    assert result.returncode == 0, result.stderr
+    assert not logs.exists()
+    assert marker.read_text() == "keep"
+    assert (repo / "install.sh").is_file()
+
+
+def test_uninstall_init_removes_log_symlink_not_target(sb):
+    repo = sb.make_repo()
+    outside = sb.tmp / "outside-logs"
+    outside.mkdir()
+    (outside / "keep").write_text("keep")
+    (repo / "logs").symlink_to(outside, target_is_directory=True)
+    result = sb.run("uninstall_init", wizard_keep_data="false")
+    assert result.returncode == 0, result.stderr
+    assert not (repo / "logs").is_symlink()
+    assert (outside / "keep").read_text() == "keep"
 
 
 def test_uninstall_init_preserves_data_to_keep_dir(sb):

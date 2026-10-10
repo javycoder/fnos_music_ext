@@ -1271,6 +1271,15 @@ README_SAMPLE = """# fnmusic-ext
 
 
 @pytest.fixture
+def export_temp_root(about_env, monkeypatch):
+    root = about_env / "exports"
+    root.mkdir()
+    mkdtemp = webui.tempfile.mkdtemp
+    monkeypatch.setattr(webui.tempfile, "mkdtemp", lambda **kw: mkdtemp(dir=root, **kw))
+    return root
+
+
+@pytest.fixture
 def about_env(env_file, tmp_path, monkeypatch):
     monkeypatch.setitem(webui.CONF, "repo_dir", str(tmp_path))
     (tmp_path / "README.md").write_text(README_SAMPLE, encoding="utf-8")
@@ -1328,7 +1337,7 @@ def test_html_and_static_served_with_no_cache(about_env):
     assert "cache-control" not in r.headers
 
 
-def test_logs_export_pack_and_cleanup(about_env):
+def test_logs_export_pack_and_cleanup(about_env, export_temp_root):
     import io
     import os as _os
     import zipfile
@@ -1353,17 +1362,208 @@ def test_logs_export_pack_and_cleanup(about_env):
         assert "install.log" not in names  # 超 3 天不入包
         assert "export_env_snapshot.txt" in names
         assert "[env] context=" in zf.read("export_env_snapshot.txt").decode("utf-8")
-        # 导出包落盘
-        first_zip = logs / f"{m.group(1)}.logzip"
-        assert first_zip.exists()
-        # 二次导出：上一次的包必须被清掉，仅保留新包
-        time.sleep(1.1)  # 保证时间戳不同
+        # 响应结束就删除其私有包，不把下载产物留在日志目录。
+        assert not list(export_temp_root.iterdir())
+        assert not list(logs.glob("*.logzip"))
         r2 = client.get("/api/logs/export")
-        disp2 = r2.headers.get("content-disposition", "")
-        stamp2 = _re.search(r'filename="(\d{14})\.logzip"', disp2).group(1)
-        zips = sorted(p.name for p in logs.glob("*.logzip"))
-        assert zips == [f"{stamp2}.logzip"]
-        assert not first_zip.exists()
+        assert r2.status_code == 200
+        assert _re.search(r'filename="(\d{14})\.logzip"', r2.headers["content-disposition"])
+        assert not list(export_temp_root.iterdir())
+        assert not list(logs.glob("*.logzip"))
+
+
+def test_logs_export_concurrent_same_second_before_file_open(about_env, export_temp_root, monkeypatch):
+    """真实认证请求：第一份包尚未打开，第二份同秒下载不能覆盖/删除它。"""
+    import asyncio
+    import io
+    import zipfile
+
+    log = about_env / "logs" / "proxy.log"
+    log.write_text("first request\n")
+    monkeypatch.setattr(webui.time, "strftime", lambda *args: "20261010235959")
+    original_call = webui._LogExportResponse.__call__
+    paths = []
+
+    async def exercise():
+        first_ready = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def paused_call(response, scope, receive, send):
+            paths.append(Path(response.path))
+            if len(paths) == 1:
+                first_ready.set()
+                await release_first.wait()  # FileResponse 尚未 stat/open
+            return await original_call(response, scope, receive, send)
+
+        monkeypatch.setattr(webui._LogExportResponse, "__call__", paused_call)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=webui.app),
+                                     base_url="http://test", headers={"X-Trim-Isadmin": "true"}) as client:
+            first = asyncio.create_task(client.get("/api/logs/export"))
+            try:
+                await asyncio.wait_for(first_ready.wait(), 5)
+                assert paths[0].exists()
+                assert paths[0].parent.stat().st_mode & 0o777 == 0o700
+                log.write_text("second request\n")
+                second = await asyncio.wait_for(client.get("/api/logs/export"), 5)
+                assert second.status_code == 200
+                assert paths[0] != paths[1]
+                assert paths[0].name == paths[1].name == "20261010235959.logzip"
+                assert paths[0].exists()  # 第二个请求清理不影响第一个
+                assert not paths[1].parent.exists()
+                listing = await client.get("/api/about")
+                assert [item["name"] for item in listing.json()["logs"]] == ["proxy.log"]
+            finally:
+                release_first.set()
+                first_response = await asyncio.wait_for(first, 5)
+            for response, expected in ((first_response, b"first request\n"),
+                                       (second, b"second request\n")):
+                assert response.status_code == 200
+                assert response.headers["content-disposition"] == 'attachment; filename="20261010235959.logzip"'
+                with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                    assert archive.read("proxy.log") == expected
+                    assert "export_env_snapshot.txt" in archive.namelist()
+            assert not list(export_temp_root.iterdir())
+            assert not list((about_env / "logs").glob("*.logzip"))
+
+    asyncio.run(exercise())
+
+
+def test_logs_export_compression_does_not_block_event_loop(about_env, export_temp_root, monkeypatch):
+    import asyncio
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    original_write = webui._write_log_archive
+    worker_threads = []
+
+    def slow_write(directory, target):
+        worker_threads.append(threading.get_ident())
+        started.set()
+        assert release.wait(5), "archive writer was not released"
+        original_write(directory, target)
+
+    monkeypatch.setattr(webui, "_write_log_archive", slow_write)
+
+    async def exercise():
+        loop_thread = threading.get_ident()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=webui.app),
+                                     base_url="http://test", headers={"X-Trim-Isadmin": "true"}) as client:
+            export = asyncio.create_task(client.get("/api/logs/export"))
+            try:
+                # 等待 worker 的事件不占据事件循环；若打包同步执行，则 writer 超时失败。
+                assert await asyncio.wait_for(asyncio.to_thread(started.wait, 3), 4)
+                assert worker_threads != [loop_thread]
+                about = await asyncio.wait_for(client.get("/api/about"), 1)
+                assert about.status_code == 200
+                assert not export.done()
+            finally:
+                release.set()
+                response = await asyncio.wait_for(export, 5)
+            assert response.status_code == 200
+            assert not list(export_temp_root.iterdir())
+
+    asyncio.run(exercise())
+
+
+def test_logs_export_excludes_symlinks_and_listing_matches(about_env, export_temp_root):
+    import io
+    import os
+    import zipfile
+
+    logs = about_env / "logs"
+    (logs / "proxy.log").write_text("safe\n")
+    secret = about_env / "secret"
+    secret.write_text("must not export")
+    (logs / "linked.log").symlink_to(secret)
+    (logs / "broken.log").symlink_to(about_env / "missing")
+    (logs / "nested").mkdir()
+    os.mkfifo(logs / "pipe.log")
+    (logs / "old.logzip").write_bytes(b"legacy archive")
+    old = logs / "old.log"
+    old.write_text("expired")
+    os.utime(old, (time.time() - 4 * 86400,) * 2)
+    with authed_client() as client:
+        listed = client.get("/api/about").json()["logs"]
+        response = client.get("/api/logs/export")
+    assert [item["name"] for item in listed] == ["proxy.log"]
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert set(archive.namelist()) == {"proxy.log", "export_env_snapshot.txt"}
+        assert archive.read("proxy.log") == b"safe\n"
+    assert not list(export_temp_root.iterdir())
+    assert secret.read_text() == "must not export"
+    # 不扫描删除历史包：它可能是旧版本仍在发送的响应。
+    assert (logs / "old.logzip").exists()
+
+
+def test_logs_export_rejects_symlink_swapped_after_listing(about_env, export_temp_root, monkeypatch):
+    import io
+    import zipfile
+
+    log = about_env / "logs" / "proxy.log"
+    log.write_text("safe")
+    secret = about_env / "secret"
+    secret.write_text("must not export")
+    original_open = webui.os.open
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if Path(path) == log:
+            log.unlink()
+            log.symlink_to(secret)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(webui.os, "open", swap_then_open)
+    with authed_client() as client:
+        response = client.get("/api/logs/export")
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == ["export_env_snapshot.txt"]
+    assert not list(export_temp_root.iterdir())
+
+
+def test_logs_export_failed_compression_cleans_partial_archive(about_env, export_temp_root, monkeypatch):
+    def fail_write(directory, target):
+        target.write_bytes(b"partial")
+        raise OSError("archive failure")
+
+    monkeypatch.setattr(webui, "_write_log_archive", fail_write)
+    with authed_client() as client:
+        response = client.get("/api/logs/export")
+    assert response.status_code == 500
+    assert response.json()["ok"] is False
+    assert not list(export_temp_root.iterdir())
+
+
+@pytest.mark.parametrize("send_failure", [False, True])
+def test_logs_export_response_cleanup_on_range_or_send_failure(about_env, export_temp_root, send_failure):
+    import asyncio
+
+    async def exercise():
+        response = await webui.api_logs_export()
+        target = Path(response.path)
+        assert target.exists()
+        scope = {"type": "http", "method": "GET", "headers": [(b"range", b"bytes=999999999-")]}
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        messages = []
+
+        async def send(message):
+            if send_failure:
+                raise OSError("disconnected")
+            messages.append(message)
+
+        if send_failure:
+            with pytest.raises(OSError, match="disconnected"):
+                await response(scope, receive, send)
+        else:
+            await response(scope, receive, send)
+            assert messages[0]["status"] == 416
+        assert not target.parent.exists()
+        assert not list(export_temp_root.iterdir())
+
+    asyncio.run(exercise())
 
 
 def test_logs_export_empty_dir(about_env):

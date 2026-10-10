@@ -1,8 +1,8 @@
 """fnmusic-ext 统一日志模块.
 
 三个进程（proxy 宿主侧 / webui / lxmusic）共用：
-- 本地文件日志，按天午夜滚动，backupCount=2 → 恰好保留 3 天（当前 + 2 个轮转）；
-  另设单文件 50MB 保险上限，防异常刷屏撑爆磁盘。
+- 本地文件日志，按天午夜或单文件 50MB 滚动；最多保留当前 + 2 个轮转，
+  同一天多次大小轮转也不覆盖已有文件，且不会无限积累。
 - purge_stale() 按 mtime 清理超期文件（覆盖 install.log 等无法自轮转的追加文件
   与历史导出的 .logzip），服务启动时与每日调用。
 - 所有文件 IO 失败一律静默降级为仅 stdout，绝不影响业务。
@@ -22,9 +22,12 @@ import logging.handlers
 import os
 import re
 import socket
+import stat
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 try:
     from .env_merge import parse_env_file
@@ -37,13 +40,14 @@ RETENTION_DAYS = 3
 MAX_FILE_BYTES = 50 * 1024 * 1024
 SNAPSHOT_FILE = "env_snapshot.txt"
 
-# 与 takeover.py 的秘密变量名规则保持一致；authorization 头的值含空格，单独兜住
-_SECRET_VALUE_RE = re.compile(
-    r"\b(?i:(authorization))(\s*[=:]\s*)([^\r\n]{1,160})"
-    r"|\b(?i:([A-Za-z0-9_]*(?:key|token|secret|passwd|password|cookie)[A-Za-z0-9_]*))"
-    r"(\s*[=:]\s*)(\"[^\"]{0,120}\"|'[^']{0,120}'|[^\s,;\"']{1,120})"
+# Match assignments, including JSON/Python quoted keys and URL query parameters.
+# Values are scanned below: length-limited regexes leak the tail of long secrets.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w.-])(?P<quote>[\"']?)(?P<key>[\w.-]*"
+    r"(?:authorization|key|token|secret|passwd|password|cookie)[\w.-]*)"
+    r"(?P=quote)(?P<sep>\s*[=:]\s*)", re.IGNORECASE
 )
-_SECRET_ENV_KEYS = re.compile(r"(?i)key|token|secret|password|cookie")
+_SECRET_ENV_KEYS = re.compile(r"(?i)authorization|key|token|secret|passwd|password|cookie")
 
 _TRIM_MUSIC_SOCKETS = (
     "/var/run/trim_music.socket",
@@ -54,37 +58,144 @@ _GATEWAY_CONF = "/usr/trim/etc/network_gateway_setting.conf"
 
 
 def log_dir() -> Path:
-    """日志目录：FNMUSIC_LOG_DIR > FNMUSIC_HOME/logs > 仓库根/logs。"""
+    """FNMUSIC_LOG_DIR > FNMUSIC_HOME/logs > WEBUI_REPO_DIR/logs > 仓库/logs。"""
     override = (os.environ.get("FNMUSIC_LOG_DIR") or "").strip()
     if override:
         return Path(override)
     home = (os.environ.get("FNMUSIC_HOME") or "").strip()
     if home:
         return Path(home) / "logs"
+    repo = (os.environ.get("WEBUI_REPO_DIR") or "").strip()
+    if repo:
+        return Path(repo) / "logs"
     here = Path(__file__).resolve()
     for cand in here.parent.parents:
         if (cand / "proxy").is_dir() and (cand / "VERSION").exists():
             return cand / "logs"
-    return here.parent.parent / "logs"
+    # Images copy fnlog into /app, whereas the shared repository is mounted /repo.
+    return Path("/repo/logs")
+
+
+def _open_log_file(filename: str | Path, mode: str = "a", encoding: str = "utf-8",
+                   errors: str | None = None):
+    """Open a regular, single-link log safely; only chmod files owned by this uid.
+
+    O_EXCL identifies newly created files, initially 0600 even with a lax umask.
+    fchmod(0640) defeats root's umask 0077 without changing process-wide umask.
+    The setgid logs directory supplies the group; never chown existing paths or
+    follow symlinks/hardlinks (especially when called by the host root process).
+    Never change a foreign-owned file's permissions; only accept one already
+    at 0640 if the OS permits opening it. Insecure foreign-owned files are rejected.
+    """
+    flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    if mode == "a":
+        flags |= os.O_APPEND
+    elif mode != "w":
+        raise ValueError("log files support only append or write mode")
+    try:
+        fd = os.open(filename, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        fd = os.open(filename, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("log path must be a regular file with one link")
+        if info.st_uid == os.geteuid():
+            os.fchmod(fd, 0o640)
+        elif stat.S_IMODE(info.st_mode) != 0o640:
+            raise PermissionError("refusing to change a foreign-owned log file")
+        if mode == "w":
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, mode, encoding=encoding, errors=errors)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class _BoundedTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
-    """按天滚动 + 单文件大小保险双保险。"""
+    """Daily + byte-size rollover, with a bounded, collision-free archive set.
+
+    Own the rollover rather than delegating to TimedRotatingFileHandler: 3.11
+    deletes a same-day destination, while 3.13 returns early and leaves the
+    active file growing. Size rollovers must not postpone the midnight timer.
+    """
 
     def __init__(self, *args, max_bytes: int = MAX_FILE_BYTES, **kwargs):
         self._max_bytes = max_bytes
         super().__init__(*args, **kwargs)
 
+    def _open(self):
+        return _open_log_file(self.baseFilename, self.mode, self.encoding, self.errors)
+
+    def computeRollover(self, current_time):  # noqa: N802
+        if self.when != "MIDNIGHT":
+            return super().computeRollover(current_time)
+        # Calendar days keep creation and later rollovers at midnight across
+        # DST on both versions (3.11 lacks the fixes in 3.13's implementation).
+        tz = timezone.utc if self.utc else None
+        today = datetime.fromtimestamp(current_time, tz).date()
+        at = self.atTime or datetime.min.time()
+        candidate = datetime.combine(today, at, tzinfo=tz)
+        if candidate.timestamp() <= current_time:
+            candidate += timedelta(days=1)
+        candidate += timedelta(days=max(0, self.interval // 86400 - 1))
+        return int(candidate.timestamp())
+
     def shouldRollover(self, record: logging.LogRecord) -> bool:  # noqa: N802
-        try:
-            if super().shouldRollover(record):
-                return True
-            if self.stream is None:
-                self.stream = self.open()
-            msg = "%s\n" % self.format(record)
-            return self.stream.tell() + len(msg) > self._max_bytes
-        except Exception:  # noqa: BLE001
+        if super().shouldRollover(record):
+            return True
+        if self._max_bytes <= 0:
             return False
+        if self.stream is None:
+            self.stream = self._open()
+        size = os.fstat(self.stream.fileno()).st_size
+        msg = self.format(record) + self.terminator
+        # A single oversized record is unavoidable; do not rotate an empty file.
+        return size > 0 and size + len(msg.encode(self.stream.encoding, self.stream.errors)) > self._max_bytes
+
+    def _archives(self) -> list[Path]:
+        base = Path(self.baseFilename)
+        date_pattern = re.escape(self.suffix)
+        for directive, digits in (("%Y", 4), ("%m", 2), ("%d", 2), ("%H", 2), ("%M", 2), ("%S", 2)):
+            date_pattern = date_pattern.replace(directive, rf"\d{{{digits}}}")
+        pattern = re.compile(re.escape(base.name) + r"\." + date_pattern
+                             + r"(?:\.\d+)?$", re.ASCII)
+        return sorted(p for p in base.parent.iterdir() if pattern.fullmatch(p.name))
+
+    def getFilesToDelete(self) -> list[str]:  # noqa: N802
+        files = self._archives()
+        # Unlike the stdlib's backupCount=0 (unlimited), zero means no archives.
+        return [str(p) for p in files[:max(0, len(files) - self.backupCount)]]
+
+    def doRollover(self) -> None:  # noqa: N802
+        current_time = int(time.time())
+        timed = current_time >= self.rolloverAt
+        stamp = time.strftime(self.suffix, time.gmtime(self.rolloverAt - self.interval)
+                              if self.utc else time.localtime(self.rolloverAt - self.interval))
+        destination = self.baseFilename + "." + stamp
+        # Fixed-width suffixes sort in creation order and survive process restart.
+        sequences = [int(p.name.rsplit(".", 1)[-1]) for p in self._archives()
+                     if str(p).startswith(destination + ".") and p.name.rsplit(".", 1)[-1].isdigit()]
+        sequence = max(sequences, default=0) + 1
+        destination = self.rotation_filename(f"{destination}.{sequence:08d}")
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        self.rotate(self.baseFilename, destination)
+        for filename in self.getFilesToDelete():
+            os.remove(filename)
+        if not self.delay:
+            self.stream = self._open()
+        if timed:
+            next_time = self.computeRollover(current_time)
+            while next_time <= current_time:
+                next_time += self.interval
+            self.rolloverAt = next_time
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802
+        # Disk full, permissions, or a vanished mount must not affect business or
+        # print an unredacted record in logging's default stderr diagnostic.
+        pass
 
 
 _SET_UP: set[str] = set()
@@ -132,11 +243,74 @@ def purge_stale(days: int = RETENTION_DAYS, now: "float | None" = None) -> list[
     return removed
 
 
+def _secret_value_end(text: str, start: int, key: str, quoted_key: bool) -> int:
+    if start >= len(text):
+        return start
+    is_header = not quoted_key and re.search(r"authorization|cookie", key, re.IGNORECASE)
+    if text[start] in "\"'[{":
+        # Quoted strings may contain escapes, commas, spaces and URL tokens;
+        # JSON secret objects/arrays must be masked in their entirety as well.
+        stack = [text[start]]
+        end = start + 1
+        while end < len(text) and stack:
+            char = text[end]
+            if stack[-1] in "\"'":
+                if char == "\\":
+                    end += 2
+                    continue
+                if char == stack[-1]:
+                    stack.pop()
+            elif char in "\"'[{":
+                stack.append(char)
+            elif char == {"[": "]", "{": "}"}.get(stack[-1]):
+                stack.pop()
+            end += 1
+        # A quoted auth/cookie assignment may still have additional unquoted
+        # header values after it; cover that tail, not just the first quote.
+        if not is_header:
+            return min(end, len(text))
+        if end >= len(text):
+            return len(text)
+        start = end
+    if is_header:
+        newline = re.search(r"[\r\n]", text[start:])
+        return start + newline.start() if newline else len(text)
+    end = start
+    while end < len(text) and text[end] not in " \t\r\n,;\"'&{}[]":
+        end += 1
+    return end
+
+
 def redact(text: str) -> str:
-    """对疑似秘密的 键=值 / 键: 值 打码（authorization 值整体打码）。"""
-    def _mask(m: "re.Match[str]") -> str:
-        return f"{m.group(1) or m.group(4)}{m.group(2) or m.group(5)}***"
-    return _SECRET_VALUE_RE.sub(_mask, str(text))
+    """Mask complete secret assignments, headers, JSON values and URL tokens.
+
+    Decode percent-encoded nested URL parameters only when the decoded form
+    contains a secret key; normal diagnostic URLs retain their original form.
+    """
+    def mask_encoded(match: re.Match[str]) -> str:
+        original = decoded = match.group()
+        # Each successful decode shortens the input, so this also handles URLs
+        # nested more than an arbitrary fixed number of encoding levels.
+        while True:
+            next_text = unquote(decoded)
+            if next_text == decoded:
+                break
+            decoded = next_text
+        if decoded != original and _SECRET_ASSIGNMENT_RE.search(decoded):
+            # Do not emit decoded secret tails containing %20/%26/etc. Mask the
+            # whole URL fragment rather than guessing its encoded boundaries.
+            return "***"
+        return original
+
+    text = re.sub(r"[^\s\"'<>]+", mask_encoded, str(text))
+    parts = []
+    position = 0
+    while match := _SECRET_ASSIGNMENT_RE.search(text, position):
+        parts.append(text[position:match.end()])
+        parts.append("***")
+        position = _secret_value_end(text, match.end(), match.group("key"), bool(match.group("quote")))
+    parts.append(text[position:])
+    return "".join(parts)
 
 
 def diag(logger: logging.Logger, event: str, **fields: object) -> None:
@@ -292,9 +466,8 @@ def write_env_snapshot(context: str = "host") -> bool:
             f"fnmusic-ext 环境快照  生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             "-" * 60 + "\n"
         )
-        (directory / SNAPSHOT_FILE).write_text(
-            header + "\n".join(env_snapshot_lines(context)) + "\n", encoding="utf-8"
-        )
+        with _open_log_file(directory / SNAPSHOT_FILE, "w") as snapshot:
+            snapshot.write(redact(header + "\n".join(env_snapshot_lines(context)) + "\n"))
         return True
     except Exception:  # noqa: BLE001
         return False

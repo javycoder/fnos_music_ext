@@ -689,16 +689,16 @@ def _cancel_daily_tasks() -> None:
             old.cancel()
 
 
-_last_purge_day = 0
-
-
-def _purge_stale_daily() -> None:
-    """每天一次清理超期日志文件（3 天滚动兜底；watch 循环每 2s 调用）。"""
-    global _last_purge_day
-    today = time.localtime().tm_yday
-    if today != _last_purge_day:
-        _last_purge_day = today
-        purge_stale()
+async def _log_retention_loop() -> None:
+    """日志保留独立于配置监听开关，按小时检查三天期限。"""
+    while True:
+        try:
+            await asyncio.to_thread(purge_stale)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("log retention failed: %s", type(exc).__name__)
+        await asyncio.sleep(3600)
 
 
 async def _env_watch_loop() -> None:
@@ -731,7 +731,6 @@ async def _env_watch_loop() -> None:
                 # 功能开启情况留档（[cfg] 行进本地日志，秘密值打码）
                 for key in sorted(changed):
                     logger.info("[cfg] %s", redact(f"{key}={CONF.get(key)}"))
-            _purge_stale_daily()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1035,10 +1034,12 @@ def lx_platform_from_item(item: dict | None) -> str:
 
 
 # 平台→激活脚本名 映射缓存：lx 搜索时异步刷新（TTL 内复用），同步标记路径只读；
-# 条目自带 lx_script（搜索时已注记）时无需查缓存
+# 不在搜索缓存条目上固化标签，以便后续响应使用最新映射。
 _LX_SCRIPT_MAP_CACHE: dict = {"ts": -1.0, "by_platform": {}}
 _LX_SCRIPT_MAP_TTL = 60.0
 _LX_SCRIPT_MAP_STALE_S = 300.0
+_LX_SCRIPT_MAP_TASK: asyncio.Task | None = None
+_LX_DISPLAY_TAGS: dict[str, None] = {}
 
 
 def _lx_source_entries() -> list[dict]:
@@ -1072,7 +1073,7 @@ async def refresh_lx_script_map(client: httpx.AsyncClient) -> dict[str, str]:
     归属规则：仅 1 个激活脚本 → 全平台归属它；多脚本时仅"该平台的声明脚本唯一"
     才归属（A 声明 kg、B 声明 wy → kg→A、wy→B；A/B 都声明 kg → kg 不归属）。
     描述接口不可用（lxmusic 未启用/超时）时回退 LX_SOURCE_LIST 单激活备注。"""
-    if time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] < _LX_SCRIPT_MAP_TTL:
+    if _LX_SCRIPT_MAP_CACHE["ts"] >= 0 and time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] < _LX_SCRIPT_MAP_TTL:
         return dict(_LX_SCRIPT_MAP_CACHE["by_platform"])
     by_platform: dict[str, str] = {}
     sources: "list[dict] | None" = None
@@ -1099,19 +1100,45 @@ async def refresh_lx_script_map(client: httpx.AsyncClient) -> dict[str, str]:
         scripts: list[tuple[str, set[str]]] = []
         for s in sources:
             name = remarks_by_url.get(str(s.get("url") or "").strip()) or str(s.get("name") or "").strip()
-            platforms = {p for p in (s.get("platforms") or []) if p in _LX_PLATFORMS}
-            if name:
-                scripts.append((name, platforms or set(_LX_PLATFORMS)))
-        if len(scripts) == 1:
+            raw_platforms = s.get("platforms")
+            platforms = {
+                p for p in raw_platforms if isinstance(p, str) and p in _LX_PLATFORMS
+            } if isinstance(raw_platforms, list) else set()
+            # 未声明/畸形平台按全平台处理；无名脚本也计入归属，不能让另一源冒领。
+            scripts.append((name, platforms or set(_LX_PLATFORMS)))
+        if len(scripts) == 1 and scripts[0][0]:
             by_platform = dict.fromkeys(_LX_PLATFORMS, scripts[0][0])
         else:
             for p in _LX_PLATFORMS:
-                names = {n for n, ps in scripts if p in ps}
-                if len(names) == 1:
-                    by_platform[p] = next(iter(names))
+                owners = [n for n, ps in scripts if p in ps]
+                if len(owners) == 1 and owners[0]:
+                    by_platform[p] = owners[0]
     _LX_SCRIPT_MAP_CACHE["ts"] = time.monotonic()
     _LX_SCRIPT_MAP_CACHE["by_platform"] = by_platform
     return by_platform
+
+
+def _schedule_lx_script_map_refresh(client: httpx.AsyncClient) -> None:
+    global _LX_SCRIPT_MAP_TASK
+    if _LX_SCRIPT_MAP_CACHE["ts"] >= 0 and time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] < _LX_SCRIPT_MAP_TTL:
+        return
+    loop = asyncio.get_running_loop()
+    if (_LX_SCRIPT_MAP_TASK is not None and not _LX_SCRIPT_MAP_TASK.done()
+            and _LX_SCRIPT_MAP_TASK.get_loop() is loop):
+        return
+    _LX_SCRIPT_MAP_TASK = loop.create_task(refresh_lx_script_map(client))
+    _LX_SCRIPT_MAP_TASK.add_done_callback(_finish_lx_script_map_refresh)
+
+
+def _finish_lx_script_map_refresh(task: asyncio.Task) -> None:
+    """回收 single-flight 引用并取出异常，后台标签刷新失败不影响搜索。"""
+    global _LX_SCRIPT_MAP_TASK
+    if _LX_SCRIPT_MAP_TASK is task:
+        _LX_SCRIPT_MAP_TASK = None
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("lx script map refresh failed: %s", type(exc).__name__)
 
 
 def _lx_script_for_platform(platform: str) -> str:
@@ -1148,8 +1175,8 @@ def strip_source_tag(title: str) -> str:
     """剥离来源标记前缀。仅精确匹配已知标记（含 [脚本名-平台] 全部变体与
     列表里全部洛雪备注名），不用泛化正则，避免误伤本身以方括号开头的歌名。"""
     t = str(title or "")
-    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK]
-    script_parts = {"lx"}
+    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK, *_LX_DISPLAY_TAGS]
+    script_parts = {"lx", *_LX_SCRIPT_MAP_CACHE["by_platform"].values()}
     for entry in _lx_source_entries():
         name = str(entry.get("name") or "").strip()
         if name:
@@ -1177,6 +1204,10 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
     if mark_source and title:
         prefix = source_display_prefix(src, item)
         if prefix:
+            if src == "lx":
+                _LX_DISPLAY_TAGS[prefix] = None
+                if len(_LX_DISPLAY_TAGS) > 4096:
+                    _LX_DISPLAY_TAGS.pop(next(iter(_LX_DISPLAY_TAGS)))
             title = prefix + title
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
@@ -2329,12 +2360,8 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
                 "lyric": "",
                 "verified": it.get("verified") is True,
             })
-        # 逐曲注记归属脚本名（平台→唯一激活脚本；无法归属留空，标记时落 lx），随搜索缓存落盘
-        script_map = await refresh_lx_script_map(client)
-        for it in items:
-            platform = lx_platform_from_item(it)
-            if platform:
-                it["lx_script"] = script_map.get(platform, "")
+        # 显示标签刷新不能占用搜索预算；响应渲染时读取最新映射。
+        _schedule_lx_script_map_refresh(client)
         return _SearchItems([it for it in items if is_playable_online_track(it, allow_paywall=allow_paywall)], partial=bool(data.get("errors")))
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
@@ -3128,6 +3155,7 @@ async def _lyric_orphan_sweeper() -> None:
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
+    global _LX_SCRIPT_MAP_TASK
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
@@ -3139,6 +3167,7 @@ async def lifespan(fastapi_app: FastAPI):
     write_env_snapshot("host")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
+    log_task = asyncio.create_task(_log_retention_loop()) if _background_jobs_enabled() else None
     env_task = asyncio.create_task(_env_watch_loop()) if (
         _background_jobs_enabled() and CONF.get("env_watch", True)
     ) else None
@@ -3195,6 +3224,14 @@ async def lifespan(fastapi_app: FastAPI):
         if env_task:
             env_task.cancel()
             await asyncio.gather(env_task, return_exceptions=True)
+        if log_task:
+            log_task.cancel()
+            await asyncio.gather(log_task, return_exceptions=True)
+        map_task = _LX_SCRIPT_MAP_TASK
+        _LX_SCRIPT_MAP_TASK = None
+        if map_task is not None and map_task.get_loop() is asyncio.get_running_loop():
+            map_task.cancel()
+            await asyncio.gather(map_task, return_exceptions=True)
         try:
             await tc.shutdown_all()
         except Exception:  # noqa: BLE001

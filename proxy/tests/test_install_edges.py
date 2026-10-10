@@ -57,6 +57,109 @@ def link_tools(bindir: Path, tools: tuple[str, ...]) -> None:
             (bindir / tool).symlink_to(real)
 
 
+# ------------------------------------------------------ private shared logs ---
+
+def logs_script(repo: Path) -> str:
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    return (f'set -euo pipefail\numask 0077\nBASE_DIR="{repo}"\n'
+            f'APP_LOG_DIR="{repo}/logs"\n'
+            + function(install, "configure_app_logs")
+            + function(install, "log_install"))
+
+
+@pytest.mark.parametrize("as_root", [False, True])
+def test_installer_logs_private_shared_permissions(tmp_path, as_root):
+    repo = tmp_path / "repo"
+    logs = repo / "logs"
+    nested = logs / "exports"
+    nested.mkdir(parents=True)
+    existing = logs / "proxy.log.2026-10-09"
+    snapshot = logs / "env_snapshot.txt"
+    export = nested / "support.logzip"
+    for path in (existing, snapshot, export):
+        path.write_text("private\n")
+        path.chmod(0o600)
+    unrelated = repo / "private.txt"
+    unrelated.write_text("outside\n")
+    unrelated.chmod(0o600)
+    unrelated_before = unrelated.stat()
+    (logs / "linked-file").symlink_to(unrelated)
+    (logs / "linked-dir").symlink_to(repo, target_is_directory=True)
+    os.link(unrelated, logs / "hardlink")
+    # Do not silently escalate the non-root case on machines with sudo.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    write_stub(bindir, "sudo", "exit 1\n")
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    script = logs_script(repo) + 'configure_app_logs\nlog_install "shared install event"\n'
+    if as_root and os.geteuid() != 0:
+        sudo = shutil.which("sudo")
+        if not sudo or subprocess.run([sudo, "-n", "true"], capture_output=True).returncode:
+            pytest.skip("root permission regression requires passwordless sudo")
+        result = subprocess.run([sudo, "-n", BASH, "-c", script], env=env,
+                                capture_output=True, text=True, timeout=30)
+    else:
+        if os.geteuid() != 0 and 1000 not in os.getgroups() and os.getgid() != 1000:
+            pytest.skip("non-root sharing requires membership in group 1000")
+        result = run_bash(script, env=env)
+    assert result.returncode == 0, result.stderr
+    for path in (logs, nested):
+        assert path.stat().st_mode & 0o7777 == 0o2770
+        assert path.stat().st_gid == 1000
+        if as_root or os.geteuid() == 0:
+            assert path.stat().st_uid == 0
+    for path in (existing, snapshot, export, logs / "install.log"):
+        assert path.stat().st_mode & 0o777 == 0o640
+        assert path.stat().st_gid == 1000
+    assert "shared install event" in (logs / "install.log").read_text()
+    assert unrelated.stat().st_mode == unrelated_before.st_mode
+    assert unrelated.stat().st_gid == unrelated_before.st_gid
+    assert unrelated.read_text() == "outside\n"
+    assert (logs / "linked-file").is_symlink()
+    assert (logs / "linked-dir").is_symlink()
+    # The setgid directory, not caller umask/gid, defines new runtime groups.
+    created = logs / "new-runtime.log"
+    created.write_text("runtime\n")
+    assert created.stat().st_gid == 1000
+
+
+def test_installer_logs_supports_symlink_checkout_path(tmp_path):
+    repo = tmp_path / "physical-repo"
+    repo.mkdir()
+    alias = tmp_path / "checkout"
+    alias.symlink_to(repo, target_is_directory=True)
+    result = run_bash(logs_script(alias) + 'configure_app_logs "symlink checkout"\n')
+    assert result.returncode == 0, result.stderr
+    assert "symlink checkout" in (repo / "logs" / "install.log").read_text()
+    assert (repo / "logs").stat().st_gid == 1000
+
+
+@pytest.mark.parametrize("symlink_target", ["directory", "install-file", "install-hardlink"])
+def test_installer_logs_refuses_symlink_targets(tmp_path, symlink_target):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker"
+    marker.write_text("untouched")
+    marker.chmod(0o600)
+    before = marker.stat()
+    if symlink_target == "directory":
+        (repo / "logs").symlink_to(outside, target_is_directory=True)
+    else:
+        (repo / "logs").mkdir()
+        if symlink_target == "install-hardlink":
+            os.link(marker, repo / "logs" / "install.log")
+        else:
+            (repo / "logs" / "install.log").symlink_to(marker)
+    result = run_bash(logs_script(repo) + 'configure_app_logs "unsafe append"\n')
+    assert result.returncode != 0
+    assert marker.read_text() == "untouched"
+    assert marker.stat().st_mode == before.st_mode
+    assert marker.stat().st_gid == before.st_gid
+    assert outside.stat().st_mode & 0o7777 != 0o2770
+
+
 # ------------------------------------------------------ get_fnos_gateway_ports ---
 
 def gateway_block(conf_path: Path) -> str:

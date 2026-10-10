@@ -14,7 +14,8 @@ ENV PYTHONUNBUFFERED=1 \
     XDG_CACHE_HOME=/data/cache \
     XDG_CONFIG_HOME=/data/config \
     LX_DATA_DIR=/data/lxmusic \
-    WEBUI_REPO_DIR=/repo
+    WEBUI_REPO_DIR=/repo \
+    FNMUSIC_LOG_DIR=/repo/logs
 
 WORKDIR /srv
 
@@ -83,7 +84,8 @@ RUN set -eu; \
             -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
-RUN useradd -m -u 1000 appuser \
+RUN groupadd -g 1000 appuser \
+    && useradd -m -u 1000 -g 1000 appuser \
     && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
     && chown -R appuser:appuser /data
 

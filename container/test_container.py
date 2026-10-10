@@ -281,6 +281,25 @@ def test_dockerfile_assembly():
     assert "chmod 0644 /etc/supervisor/supervisord.conf" in text
 
 
+def test_container_logging_root_contract():
+    text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    env_block = text.split("ENV ", 1)[1].split("\n\n", 1)[0]
+    assert "FNMUSIC_LOG_DIR=/repo/logs" in env_block
+    assert "groupadd -g 1000 appuser" in text
+    assert "useradd -m -u 1000 -g 1000 appuser" in text
+    assert "USER appuser" in text
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+    service = compose["services"]["fnmusic-sources"]
+    assert ".:/repo" in service["volumes"]
+    # Host .env values must not replace the image's container-only log root.
+    assert "env_file" not in service
+    assert "FNMUSIC_LOG_DIR" not in service.get("environment", {})
+    env_lib = (CONTAINER_DIR / "env_flag.sh").read_text()
+    exports = env_lib.split("export_source_env()", 1)[1]
+    assert "FNMUSIC_LOG_DIR" not in exports
+    assert "FNMUSIC_HOME" not in exports
+
+
 def test_dockerfile_network_fallback_resilience():
     """构建容器网络自愈：始终注入备用公共 DNS；apt 回退看索引落地而非退出码；pip 回退官方源。
 

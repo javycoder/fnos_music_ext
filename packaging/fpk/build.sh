@@ -88,7 +88,7 @@ rsync -a --delete \
     --exclude='tests/' --exclude='docs/' --exclude='pytest.ini' \
     --exclude='CONTRIBUTING.md' \
     --exclude='.venv*/' --exclude='__pycache__/' --exclude='.pytest_cache/' \
-    --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' --exclude='logs/' \
+    --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' --exclude='logs/' --exclude='/logs' \
     --exclude='*.part' --exclude='.DS_Store' \
     --exclude='cache/' --exclude='sources-data/' --exclude='backup/' \
     --exclude='musicbox-data/' --exclude='musicdl_outputs/' \
