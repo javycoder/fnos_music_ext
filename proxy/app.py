@@ -1001,10 +1001,39 @@ def source_from_online_guid(guid: str) -> str:
 
 
 # 搜索结果在线条目的来源标记（仅显示，不入库不影响业务逻辑）：
-# 网易盒子→[music box]，musicdl→[dl]，洛雪→激活源备注名（无备注则 [lx]）
+# 网易盒子→[music box]，musicdl→[dl]，洛雪→逐曲平台 [lx·酷我]（平台未知时回退备注名/[lx]）
 _SOURCE_TAG_NETEASE = "[music box] "
 _SOURCE_TAG_MUSICDL = "[dl] "
 _SOURCE_TAG_LX_FALLBACK = "[lx] "
+
+# lx 搜索固定走平台官方接口（lxserver 内置 musicSdk），自定义源脚本仅参与播放链接解析，
+# 因此 lx 条目唯一可逐曲归属的维度是平台（item["lx_source"] / id "lx:<平台>:"）。
+_LX_PLATFORM_NAMES = {"kw": "酷我", "kg": "酷狗", "tx": "QQ", "wy": "网易", "mg": "咪咕"}
+
+
+def lx_platform_from_item(item: dict | None) -> str:
+    """lx 条目的平台码（kw/kg/tx/wy/mg）；非 lx 条目或平台未知返回空。
+
+    优先取 item["lx_source"]（lxmusic 搜索逐曲携带），回退解析 id/guid 第 3 段。"""
+    if not isinstance(item, dict):
+        return ""
+    platform = str(item.get("lx_source") or "").strip().lower()
+    if platform in _LX_PLATFORM_NAMES:
+        return platform
+    raw_id = str(item.get("id") or "")
+    if raw_id.startswith("online:"):
+        raw_id = raw_id[len("online:"):]
+    parts = raw_id.split(":")
+    if len(parts) >= 2 and parts[0] == "lx":
+        platform = parts[1].strip().lower()
+        if platform in _LX_PLATFORM_NAMES:
+            return platform
+    return ""
+
+
+def _lx_platform_tag(platform: str) -> str:
+    name = _LX_PLATFORM_NAMES.get(str(platform or "").strip().lower())
+    return f"[lx·{name}] " if name else ""
 
 
 def _lx_source_entries() -> list[dict]:
@@ -1018,7 +1047,7 @@ def _lx_source_entries() -> list[dict]:
 def _lx_source_remark() -> str:
     """当前洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。
 
-    多源同时激活时无法把单曲归属到具体源，返回空（回退 [lx] 标记）。"""
+    仅作为 lx 条目平台未知时的回退标记（逐曲优先显示 [lx·平台名]）。"""
     entries = _lx_source_entries()
     active = [e for e in entries if e.get("active")]
     if active:
@@ -1032,12 +1061,16 @@ def _lx_source_remark() -> str:
     return ""
 
 
-def source_display_prefix(src: str) -> str:
-    """在线条目来源标记前缀：netease→[music box]，lx→备注名或 [lx]，其余(musicdl 平台)→[dl]。"""
+def source_display_prefix(src: str, item: dict | None = None) -> str:
+    """在线条目来源标记前缀：netease→[music box]，lx→逐曲平台 [lx·酷我]
+    （平台未知回退备注名或 [lx]），其余(musicdl 平台)→[dl]。"""
     s = str(src or "").strip()
     if s == "netease":
         return _SOURCE_TAG_NETEASE
     if s == "lx":
+        tag = _lx_platform_tag(lx_platform_from_item(item))
+        if tag:
+            return tag
         remark = _lx_source_remark()
         return f"[{remark}] " if remark else _SOURCE_TAG_LX_FALLBACK
     if s:
@@ -1046,10 +1079,11 @@ def source_display_prefix(src: str) -> str:
 
 
 def strip_source_tag(title: str) -> str:
-    """剥离来源标记前缀。仅精确匹配已知标记（含列表里全部洛雪备注名），
-    不用泛化正则，避免误伤本身以方括号开头的歌名。"""
+    """剥离来源标记前缀。仅精确匹配已知标记（含 [lx·平台名] 全部变体与
+    列表里全部洛雪备注名），不用泛化正则，避免误伤本身以方括号开头的歌名。"""
     t = str(title or "")
     candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK]
+    candidates.extend(_lx_platform_tag(p) for p in _LX_PLATFORM_NAMES)
     for entry in _lx_source_entries():
         name = str(entry.get("name") or "").strip()
         if name:
@@ -1072,7 +1106,7 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
     if mark_source and title:
-        prefix = source_display_prefix(src)
+        prefix = source_display_prefix(src, item)
         if prefix:
             title = prefix + title
     artist = str(item.get("artist") or "")
