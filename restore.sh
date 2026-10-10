@@ -22,6 +22,7 @@ installation_lock "$@"
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 FULL_RESTORE=0
+ADOPT=0
 
 for arg in "$@"; do
     case "${arg}" in
@@ -31,6 +32,7 @@ for arg in "$@"; do
         --adopt)
             # Explicit deployment migration: skip the cross-checkout registry
             # check so this checkout can retire the deployment (install_common.sh).
+            ADOPT=1
             ;;
         -h|--help)
             echo "用法: $0 [--full] [--adopt]"
@@ -57,6 +59,13 @@ log_warn() {
     echo -e "\033[33m[WARN]\033[0m $*"
 }
 
+# 还原/卸载事件留档：与 install.sh 写同一份 logs/install.log（写失败不影响还原）
+_log_install() {
+    mkdir -p "${BASE_DIR}/logs" 2>/dev/null || true
+    printf '[%s] [install] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" \
+        >> "${BASE_DIR}/logs/install.log" 2>/dev/null || true
+}
+
 log_err() {
     echo -e "\033[31m[ERROR]\033[0m $*" >&2
 }
@@ -76,9 +85,10 @@ purge_local_state() {
     local removed="" target
     for target in "${BASE_DIR}"/.env "${BASE_DIR}"/.env.bak.* \
                   "${BASE_DIR}/musicbox-data" "${BASE_DIR}/sources-data" \
+                  "${BASE_DIR}/sources-native" "${BASE_DIR}/.lxserver" \
                   "${BASE_DIR}/cache" \
                   "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" \
-                  "${BASE_DIR}/recommend_cache" "${BASE_DIR}"/.venv-*; do
+                  "${BASE_DIR}/recommend_cache" "${BASE_DIR}/logs" "${BASE_DIR}"/.venv-*; do
         # 通配符未匹配时会原样出现，且仅允许清理本目录内的路径
         if [ -e "${target}" ] && [[ "${target}" == "${BASE_DIR}"/* ]]; then
             rm -rf -- "${target}"
@@ -97,6 +107,7 @@ check_proxy_unit_owner "$@" || exit 1
 check_deployment_owner "$@" || exit 1
 
 log_info "==> 开始还原 fnmusic 原生直连模式..."
+_log_install "restore-begin full=${FULL_RESTORE}"
 
 # 1. sudo 权限检查
 if ! sudo -n true 2>/dev/null; then
@@ -190,3 +201,7 @@ log_info "============================================================"
 takeover deployment-clear || true
 log_info "fnmusic 已成功还原为原生直连模式！"
 log_info "============================================================"
+# --full 时 logs/ 已随 purge 整体删除，不再重建留痕
+if [ "${FULL_RESTORE}" -eq 0 ]; then
+    _log_install "restore-done full=0"
+fi

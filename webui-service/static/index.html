@@ -22,8 +22,13 @@
         <button class="nav-item" data-page="source">音乐源</button>
         <button class="nav-item" data-page="quality">播放与推荐</button>
         <button class="nav-item" data-page="search">搜索</button>
-        <button class="nav-item" data-page="tee">边听边存</button>
+        <div class="nav-group">
+          <button class="nav-item nav-group-title" id="nav-storage-title">储存</button>
+          <button class="nav-item nav-sub" data-page="tee">边听边存</button>
+          <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
+        </div>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
+        <button class="nav-item" data-page="about">关于</button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -85,6 +90,10 @@
               <span id="qr-check" class="muted"></span>
             </div>
           </div>
+          <div class="card">
+            <div class="card-title">网易账号歌单</div>
+            <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
+          </div>
         </div>
 
         <!-- musicdl：平台多选 -->
@@ -123,15 +132,11 @@
           </div>
           <div class="card">
             <div class="card-title">lx音乐源列表</div>
-            <p class="hint">可保存多个洛雪自定义源脚本。列表中同时只能激活一个；点击未激活源的「激活」并点击下方「保存并生效」即可切换使用。</p>
+            <p class="hint">可保存多个洛雪自定义源脚本，并支持多个源同时激活（解析时自动在启用的源之间接力切换）。点击源条目的「激活」/「取消激活」做好标记后，点下方「保存并生效」统一校验并应用；新激活的源会先做一次可用性校验（每个约需 1 分钟）。</p>
             <div id="lx-source-list" class="stack"></div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-title">网易账号歌单</div>
-          <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
-        </div>
       </section>
 
       <!-- 播放与推荐 -->
@@ -144,6 +149,16 @@
             <label><input type="radio" name="quality" value="balanced"><div><b>平衡</b><span>取中间档（偶数档取中间偏高），失败先降后升</span></div></label>
             <label><input type="radio" name="quality" value="smooth"><div><b>流畅</b><span>优先最低档，最快出声</span></div></label>
           </div>
+          <p class="hint">音质偏好只影响在线播放/搜索时按什么档位取歌（高音质=优先无损原文件）。</p>
+        </div>
+        <div class="card">
+          <div class="card-title">下载音质</div>
+          <div class="radio-list" id="dl-quality-list">
+            <label><input type="radio" name="dl-quality" value="app"><div><b>跟随 App</b><span>App 明确选"标准"才交 MP3，其余一律无损原文件（FLAC 等）</span></div></label>
+            <label><input type="radio" name="dl-quality" value="original"><div><b>无损原文件</b><span>下载一律交付原文件，App 选"标准"也不转码</span></div></label>
+            <label><input type="radio" name="dl-quality" value="standard"><div><b>MP3 320k</b><span>一律按官方"标准"档交 MP3 320kbps（省空间，与官方一致）</span></div></label>
+          </div>
+          <p class="hint">只影响在 App 里点"下载"拿到的文件。默认"跟随 App"：无损歌曲不再被擅自转成 MP3（2.7.0 及以前的标准档缺省行为已修正）。保存后立即生效。</p>
         </div>
         <div class="card">
           <div class="card-title">推荐</div>
@@ -178,9 +193,6 @@
           <label class="switch-row"><span>边听边存<div class="sub">完整试听在线歌后自动保存到本地曲库</div></span><input type="checkbox" id="tee-enabled"></label>
           <label class="switch-row"><span>自动下载封面<div class="sub">自动保存到本地的歌曲会顺带把封面一起下回来，直接嵌进音频文件里；飞牛音乐认的就是内嵌封面，这样官方 App 里下载的歌就有图。歌曲保存成功后才会去下封面，不会出现只有封面没有歌的垃圾文件。默认开启。</div></span><input type="checkbox" id="auto-cover"></label>
           <label class="switch-row"><span>自动下载歌词<div class="sub">自动保存到本地的歌曲在完整下载成功后，自动下载同名 .lrc 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放就能显示歌词。歌曲下载成功后才会去下歌词，不会出现只有歌词没有歌的垃圾文件。酷我源的歌词接口已失效，暂无歌词。默认关闭。</div></span><input type="checkbox" id="lyric-auto-dl"></label>
-          <label class="field"><span>保存路径</span>
-            <input class="input" id="tee-dir" placeholder="留空自动探测共享曲库目录">
-          </label>
           <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
             <input class="input" id="tee-max" type="number" min="1" max="100">
           </label>
@@ -202,6 +214,33 @@
         </div>
       </section>
 
+      <!-- 目录设置 -->
+      <section class="page" id="page-dirs">
+        <h2>目录设置</h2>
+        <div class="card">
+          <div class="card-title">歌曲缓存目录</div>
+          <p class="hint">在线试听的滚动缓存、转码缓存、去重标记等临时文件存放目录，留空使用安装目录下的 cache。更换目录后旧缓存文件不自动迁移（已保存进本地曲库的歌曲不受影响，去重标记会自动带到新目录）。</p>
+          <label class="field"><span>缓存目录</span>
+            <input class="input" id="dir-cache" placeholder="留空=安装目录 cache">
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="dir-cache-pick" hidden>从 NAS 选择</button>
+            <span id="dir-cache-check" class="dir-check" hidden></span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">下载目录</div>
+          <p class="hint">边听边存、收藏/加入歌单自动下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库目录。建议选择官方共享曲库目录，官方 App 扫描入库后即可在本地列表播放。</p>
+          <label class="field"><span>下载目录</span>
+            <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="dir-download-pick" hidden>从 NAS 选择</button>
+            <span id="dir-download-check" class="dir-check" hidden></span>
+          </div>
+        </div>
+      </section>
+
       <!-- LLM -->
       <section class="page" id="page-llm">
         <h2>高级 · 大模型</h2>
@@ -210,6 +249,47 @@
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+        </div>
+      </section>
+
+      <!-- 关于 -->
+      <section class="page" id="page-about">
+        <div class="about-wrap">
+          <div class="card about-head">
+            <img class="about-logo" src="/app/fnmusic-ext/static/icon.png" width="72" height="72" alt="">
+            <div class="about-name">fnmusic-ext</div>
+            <div class="about-badges">
+              <span class="badge" id="about-version">v-</span>
+              <span class="badge dim" id="about-deploy">-</span>
+            </div>
+            <div class="about-author">作者 <a href="https://github.com/javycoder" target="_blank" rel="noopener">javycoder</a></div>
+            <div class="about-links">
+              <a class="about-link" href="https://github.com/javycoder/fnos_music_ext" target="_blank" rel="noopener" title="项目开源地址">
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+                <span>fnos_music_ext</span>
+              </a>
+              <a class="about-link" href="https://github.com/javycoder/fnos_music_ext/issues" target="_blank" rel="noopener" id="about-issues">问题反馈</a>
+            </div>
+          </div>
+          <div class="card" id="about-disclaimer-card">
+            <div class="card-title">免责声明</div>
+            <ul class="about-disclaimer" id="about-disclaimer"></ul>
+          </div>
+          <div class="card">
+            <div class="card-title">运行日志</div>
+            <p class="hint">日志在本地滚动保留 3 天，卸载时随应用一并删除。导出包含近 3 天全部日志与环境快照，问题反馈时可一并附上。</p>
+            <div id="about-logs" class="stack"></div>
+            <div class="btn-row">
+              <button class="btn" id="log-export-btn">导出日志</button>
+              <span class="muted" id="log-export-note"></span>
+            </div>
+          </div>
+          <div class="card about-donate" id="about-donate" hidden>
+            <div class="card-title">请作者喝杯咖啡</div>
+            <p class="hint">本项目用爱发电，全部功能免费开放。如果它对你有帮助，可以请作者喝杯咖啡 ☕</p>
+            <img class="about-donate-img" id="about-donate-img" alt="支付宝收款码" width="300">
+            <p class="about-donate-note"><span class="about-donate-badge">支付宝</span>打开支付宝扫一扫，请作者喝杯咖啡</p>
+          </div>
         </div>
       </section>
     </main>
@@ -221,8 +301,10 @@
     <button class="nav-item" data-page="source">音源</button>
     <button class="nav-item" data-page="quality">播放</button>
     <button class="nav-item" data-page="search">搜索</button>
-    <button class="nav-item" data-page="tee">缓存</button>
+    <button class="nav-item" data-page="tee">边听</button>
+    <button class="nav-item" data-page="dirs">目录</button>
     <button class="nav-item" data-page="llm">高级</button>
+    <button class="nav-item" data-page="about">关于</button>
   </nav>
 
   <!-- 保存条 -->

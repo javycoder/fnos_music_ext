@@ -1,13 +1,16 @@
-"""桌面网关 socket 把 HTTP 原样转到 WebUI 端口；/api/host-file 由网关本地处理。"""
+"""桌面网关 socket 把 HTTP 原样转到 WebUI 端口；/api/host-file、/api/fs-check 由网关本地处理。"""
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
     "webui_gateway", Path(__file__).resolve().parents[1] / "webui_gateway.py")
@@ -183,3 +186,133 @@ def test_host_file_only_post_intercepted(tmp_path: Path):
     upstream.shutdown()
     # 上游原样回显请求路径（未拦截）
     assert b"/app/fnmusic-ext/api/host-file" in data
+
+
+# ------------------------------------------------------------------ fs-check ---
+
+def _post_fs_check(path: str, is_admin: str = "true") -> bytes:
+    body = json.dumps({"path": path}).encode()
+    return (
+        "POST /app/fnmusic-ext/api/fs-check HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        f"X-Trim-Isadmin: {is_admin}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode() + body
+
+
+def _fs_check(sock_path: Path, path: str, is_admin: str = "true") -> "tuple[bytes, dict]":
+    data = _request(sock_path, _post_fs_check(path, is_admin))
+    head, _, body = data.partition(b"\r\n\r\n")
+    return head.split(b"\r\n", 1)[0], (json.loads(body.decode()) if body else {})
+
+
+def test_fs_check_requires_admin(tmp_path: Path):
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    status, payload = _fs_check(sock_path, str(tmp_path), is_admin="false")
+    upstream.shutdown()
+    assert b"403" in status
+    assert payload["ok"] is False
+    assert "仅管理员" in payload["error"]
+
+
+def test_fs_check_validates_path(tmp_path: Path):
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    for bad in ("relative/x", "/tmp/../etc", "", "/tmp/a\x00b", "/tmp/a\x00b/sub", "/tmp/a\nb", "/tmp/a\rb"):
+        status, payload = _fs_check(sock_path, bad)
+        assert b"400" in status, bad
+        assert payload["ok"] is False, bad
+    upstream.shutdown()
+
+
+def test_fs_check_existing_dir_writability(tmp_path: Path):
+    """存在目录：root 之外的运行身份下可写目录 → True，只读目录 → False。"""
+    if os.geteuid() == 0:
+        pytest.skip("root 不受权限位约束，只读目录用例无意义")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    status, payload = _fs_check(sock_path, str(tmp_path))
+    assert b"200" in status
+    assert payload == {"ok": True, "path": str(tmp_path), "exists": True, "writable": True}
+    readonly = tmp_path / "ro"
+    readonly.mkdir()
+    readonly.chmod(0o500)
+    try:
+        status, payload = _fs_check(sock_path, str(readonly))
+        assert b"200" in status
+        assert payload["exists"] is True and payload["writable"] is False
+    finally:
+        readonly.chmod(0o700)
+    upstream.shutdown()
+
+
+def test_fs_check_missing_dir_probes_nearest_ancestor(tmp_path: Path):
+    """目录不存在：用最近存在祖先的可写性代表"能否创建"，且不创建目录。"""
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    missing = tmp_path / "a" / "b" / "c"
+    status, payload = _fs_check(sock_path, str(missing))
+    upstream.shutdown()
+    assert b"200" in status
+    assert payload == {"ok": True, "path": str(missing), "exists": False, "writable": True}
+    assert not missing.exists()  # 无副作用
+    # 探测临时文件已自删
+    assert not list(tmp_path.glob(".fnmusic-fscheck-*"))
+
+
+@pytest.mark.parametrize("suffix", ["", "/sub", "/sub/deep"])
+@pytest.mark.parametrize("kind", ["file", "file_link", "dangling_link"])
+def test_fs_check_non_directory_blocks_creation(tmp_path: Path, suffix: str, kind: str):
+    """目标或祖先不是目录时不可创建，不能跳过它去探测更上层目录。"""
+    obstacle = tmp_path / "obstacle"
+    if kind == "file":
+        obstacle.write_text("unchanged")
+    elif kind == "file_link":
+        regular = tmp_path / "regular"
+        regular.write_text("unchanged")
+        obstacle.symlink_to(regular)
+    else:
+        obstacle.symlink_to(tmp_path / "missing")
+    sock_path = _start_gateway(tmp_path, 1)  # 本地拦截不需要上游
+    path = str(obstacle) + suffix
+    status, payload = _fs_check(sock_path, path)
+    assert b"200" in status
+    assert payload == {"ok": True, "path": path, "exists": False, "writable": False}
+    assert obstacle.is_symlink() if kind != "file" else obstacle.read_text() == "unchanged"
+    assert not list(tmp_path.glob(".fnmusic-fscheck-*"))
+    assert not (tmp_path / "missing").exists()
+
+
+def test_fs_check_directory_symlink_allows_missing_child(tmp_path: Path):
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(directory, target_is_directory=True)
+    sock_path = _start_gateway(tmp_path, 1)
+    path = str(link / "missing" / "child")
+    status, payload = _fs_check(sock_path, path)
+    assert b"200" in status
+    assert payload == {"ok": True, "path": path, "exists": False, "writable": True}
+    assert not list(directory.iterdir())
+
+
+def test_fs_check_only_post_intercepted(tmp_path: Path):
+    """GET /api/fs-check 不是校验端点，走正常转发。"""
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    data = _request(sock_path, b"GET /app/fnmusic-ext/api/fs-check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    upstream.shutdown()
+    assert b"/app/fnmusic-ext/api/fs-check" in data

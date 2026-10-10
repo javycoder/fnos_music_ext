@@ -183,18 +183,19 @@ def filter_playable_song_ids(ids: list[int]) -> set[int]:
     return playable_ids
 
 
-def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
+def get_song_url(song_id: int, quality: str, fresh: bool = False) -> "dict[str, Any] | None":
     """进程内解析单曲播放链接（复用常驻实例，免起 CLI 子进程）。
 
     返回对齐 CLI `song url --json` 的 data 字段（含 url/code/fee 等）；接口
     异常或返回空时返回 None，由调用方降级 CLI（保留结构化错误语义）。
-    结果短缓存（成功 600s / 失败 60s，键含音质），reset_api 时随实例一并清空。
+    结果短缓存（成功 600s / 失败 60s，键含音质），reset_api 时随实例一并清空；
+    fresh=True 旁路缓存读（仍回写结果），供代理确认旧直链失效后强制重解析。
     """
     key = (int(song_id), str(quality))
     now = time.monotonic()
     with _url_cache_lock:
         hit = _url_cache.get(key)
-        if hit and now < hit[1]:
+        if hit and now < hit[1] and not fresh:
             return hit[0]
     try:
         with _api_lock:
@@ -220,11 +221,21 @@ def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
             expire = time.monotonic()
             for k in [k for k, v in _url_cache.items() if v[1] <= expire]:
                 del _url_cache[k]
+            if key not in _url_cache and len(_url_cache) >= _URL_CACHE_MAX:
+                del _url_cache[min(_url_cache, key=lambda k: _url_cache[k][1])]
         _url_cache[key] = (item, time.monotonic() + (_URL_CACHE_TTL_OK_S if ok else _URL_CACHE_TTL_FAIL_S))
     return item
 
 
 def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:
+    """批量歌曲详情（名称/歌手/专辑/封面/时长/有无无损），按请求顺序返回。
+
+    封面与可播性解耦（2.8.0）：详情行是纯展示元数据，绝不能因取链判定的
+    可播状态整行丢弃——登录态抖动（NEMbox 任一 cookie 过期即清空整个 jar）、
+    VIP 权益波动或风控都会让 songs_url 拿不到完整 url，此前把这些歌的详情
+    连同专辑封面一起丢掉，表现为"已登录 VIP 却大面积无封面"。可播过滤只属
+    于搜索入口（filter_playable_song_ids），详情接口一律全量返回。
+    """
     if not ids:
         return []
     with _api_lock:
@@ -233,15 +244,31 @@ def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:
     if not raw_items or not isinstance(raw_items, list):
         return []
 
-    playable_ids = filter_playable_song_ids(ids)
-
     detail_map: dict[int, dict[str, Any]] = {}
     for item in raw_items:
         if isinstance(item, dict):
             mapped = _map_song_detail(item)
-            if mapped["song_id"] in playable_ids:
+            if mapped["song_id"]:
                 detail_map[mapped["song_id"]] = mapped
     return [detail_map[sid] for sid in ids if sid in detail_map]
+
+
+def song_detail_raw(song_id: int) -> "dict[str, Any] | None":
+    """单曲原生详情（weapi v3 song/detail 原始对象，含 al.picUrl/dt/sq/hr 等）。
+
+    供 /api/v1/song/{id}/info 进程内直取（毫秒级），失败返回 None 由调用方
+    降级 CLI 子进程。匿名可用，不经过可播过滤。
+    """
+    try:
+        with _api_lock:
+            api = _get_api_locked()
+            rows = api.songs_detail([int(song_id)])
+    except Exception as e:
+        logger.warning("song_detail_raw failed for %s: %s", song_id, type(e).__name__)
+        return None
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return rows[0]
+    return None
 
 
 def song_lyric_pair(song_id: int) -> dict[str, str]:
@@ -332,6 +359,7 @@ def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20, offs
             artist = str(s.get("artist") or "")
         album = s.get("album") or {}
         album_name = str(album.get("name") or "") if isinstance(album, dict) else str(s.get("album_name") or "")
+        album_pic = str(album.get("picUrl") or album.get("pic_url") or "") if isinstance(album, dict) else ""
         duration_raw = s.get("duration") or 0
         try:
             dur = float(duration_raw)
@@ -349,6 +377,8 @@ def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20, offs
             "artist": artist,
             "album_name": album_name,
             "album": album_name,
+            # 主接口被风控走本兜底时行内自带封面，免去代理二次补全对详情接口的依赖
+            "album_pic_url": album_pic,
             "duration": dur,
             "quality": "lossless",
         })

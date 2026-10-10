@@ -1,0 +1,31 @@
+# Canonical template; rendered by proxy/install_common.sh render_native_unit.
+# 原生（无 Docker）音源服务：宿主机 supervisord 按 .env 按需拉起所选音源 + WebUI。
+# 复用容器入口 container/entrypoint.sh（SUPERVISOR_CONF/ENV_FLAG_LIB/DATA_PATH/
+# LX_DATA_DIR 均可经环境重指），音源服务直接监听宿主 127.0.0.1 发布端口，
+# proxy（fnmusic-ext.service）的 URL/healthz 契约与 Docker 形态完全一致。
+[Unit]
+Description=fnmusic-ext Sources (Native, supervisord)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@REPO@
+Environment="PATH=@VENV@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment=PYTHONUNBUFFERED=1
+Environment="SUPERVISOR_CONF=@RUN@/supervisord.conf"
+Environment="ENV_FLAG_LIB=@REPO@/container/env_flag.sh"
+Environment="FNMUSIC_ENV_FILE=@REPO@/.env"
+Environment="DATA_PATH=@DATA@/lxserver"
+Environment="LX_DATA_DIR=@DATA@/lxmusic"
+ExecStart=/bin/bash "@REPO@/container/entrypoint.sh"
+TimeoutStartSec=75
+TimeoutStopSec=20
+KillMode=mixed
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

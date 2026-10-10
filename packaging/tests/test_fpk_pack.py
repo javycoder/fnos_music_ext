@@ -14,6 +14,7 @@
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -208,6 +209,42 @@ class TestCmdScripts:
 
 
 class TestPayload:
+    def test_logs_and_exports_excluded_by_real_rsync(self, tmp_path):
+        # Execute the exact production rsync stanza against a miniature checkout,
+        # without adding fixture secrets/logs to the actual working tree.
+        source = tmp_path / "source"
+        source.mkdir()
+        paths = (
+            "logs/proxy.log", "logs/proxy.log.2026-10-09",
+            "logs/env_snapshot.txt", "logs/exports/support.logzip",
+            "logs/other/nested.bin", "export.logzip", "support/export.logzip",
+            "proxy/debug.log", "keep.py", ".env.example",
+        )
+        for rel in paths:
+            path = source / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+        stage = tmp_path / "stage"
+        target = stage / "app" / "repo"
+        target.mkdir(parents=True)
+        text = (FPK_DIR / "build.sh").read_text()
+        start = text.index("rsync -a --delete")
+        end = text.index('"${REPO_ROOT}/" "${STAGE}/app/repo/"', start)
+        block = text[start:end] + '"${REPO_ROOT}/" "${STAGE}/app/repo/"'
+        subprocess.run(["bash", "-c", block], check=True, capture_output=True,
+                       env={**os.environ, "REPO_ROOT": str(source), "STAGE": str(stage)})
+        assert not (target / "logs").exists()
+        assert not list(target.rglob("*.logzip"))
+        assert not list(target.rglob("*.log"))
+        assert (target / "keep.py").is_file()
+        assert (target / ".env.example").is_file()
+        # The root logs entry is excluded even when it is a symlink.
+        shutil.rmtree(source / "logs")
+        (source / "logs").symlink_to(source / "support", target_is_directory=True)
+        subprocess.run(["bash", "-c", block], check=True, capture_output=True,
+                       env={**os.environ, "REPO_ROOT": str(source), "STAGE": str(stage)})
+        assert not (target / "logs").is_symlink()
+
     def test_runtime_files_present(self, stage: Path):
         repo = stage / "app" / "repo"
         for rel in (
@@ -225,6 +262,13 @@ class TestPayload:
         # .env.* 排除但 .env.example 保留
         env_files = [p.name for p in repo.glob(".env*")]
         assert env_files == [".env.example"], f"payload 只应保留 .env.example，实际: {env_files}"
+
+    def test_no_runtime_logs_or_exports(self, stage: Path):
+        repo = stage / "app" / "repo"
+        assert not list(repo.rglob("logs"))
+        assert not list(repo.rglob("*.log"))
+        assert not list(repo.rglob("*.logzip"))
+        assert not list(repo.rglob("env_snapshot.txt"))
 
     def test_no_pycache_or_venv(self, stage: Path):
         repo = stage / "app" / "repo"

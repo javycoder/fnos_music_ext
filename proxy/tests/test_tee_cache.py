@@ -381,7 +381,7 @@ async def test_full_fetch_saves_library_for_windowed_client(monkeypatch):
     info = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}
     opens = []
 
-    async def fake_open(request, g, range_header, force_mp3=False):
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
         opens.append(range_header)
         if range_header is None:
             resp = httpx.Response(200, stream=Whole(full), headers={"content-length": str(len(full))})
@@ -412,7 +412,7 @@ async def test_full_fetch_dedup_and_failure_cooldown(monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_open(request, g, range_header, force_mp3=False):
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
         calls.append(g)
         started.set()
         await release.wait()
@@ -435,7 +435,7 @@ async def test_full_fetch_skips_when_cached_or_tee_off(monkeypatch):
     """缓存已命中或边听边存关闭时不注册下载任务。"""
     called = []
 
-    async def fake_open(request, g, range_header, force_mp3=False):
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
         called.append(g)
         return None
 

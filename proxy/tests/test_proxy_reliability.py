@@ -292,6 +292,72 @@ async def test_mid_stream_abort_is_logged(tmp_path, caplog):
     assert not list(tmp_path.rglob("*.part")) and not list(tmp_path.rglob("*.mp3"))
 
 
+class _EnospcPartFile:
+    """首次写成功、第二次写抛 ENOSPC 的 .part 文件替身（模拟磁盘写满）。"""
+
+    def __init__(self, fh):
+        self._fh = fh
+        self._writes = 0
+
+    def write(self, data):
+        self._writes += 1
+        if self._writes >= 2:
+            raise OSError(28, "No space left on device")
+        return self._fh.write(data)
+
+    def close(self):
+        return self._fh.close()
+
+
+@pytest.mark.anyio
+async def test_tee_disk_write_failure_keeps_streaming(tmp_path, caplog, monkeypatch):
+    """本地写盘失败只弃件不停流：磁盘满/IO 错绝不能掐断对客户端的播放响应。"""
+    real_open = open
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        if mode == "wb" and str(file).endswith(".part"):
+            return _EnospcPartFile(real_open(file, mode, *args, **kwargs))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    audio = Audio()
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=audio, headers={"content-length": "4096"}),
+        "online:kuwo:9", None, pre_info=song("kuwo:9"))
+    with caplog.at_level(logging.WARNING, logger=p.logger.name):
+        chunks = [chunk async for chunk in response.body_iterator]
+    # 客户端字节流完整：上游是好的，播放不为落库买单
+    assert chunks == [b"x" * 2048, b"y" * 2048]
+    assert any("tee disk write failed for online:kuwo:9" in rec.message
+               and "OSError" in rec.message for rec in caplog.records)
+    assert not any("Stream aborted mid-way" in rec.message for rec in caplog.records)
+    # 弃件清走：不完整 part 既不残留也不转正
+    assert not list(tmp_path.rglob("*.part")) and not list(tmp_path.rglob("*.mp3"))
+
+
+@pytest.mark.anyio
+async def test_tee_part_open_failure_keeps_streaming(tmp_path, caplog, monkeypatch):
+    """开 .part 文件即失败（磁盘满/权限）时放弃落库，照常播放。"""
+    real_open = open
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        if mode == "wb" and str(file).endswith(".part"):
+            raise OSError(28, "No space left on device")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    audio = Audio()
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=audio, headers={"content-length": "4096"}),
+        "online:kuwo:10", None, pre_info=song("kuwo:10"))
+    with caplog.at_level(logging.WARNING, logger=p.logger.name):
+        chunks = [chunk async for chunk in response.body_iterator]
+    assert chunks == [b"x" * 2048, b"y" * 2048]
+    assert any("tee disk write failed for online:kuwo:10" in rec.message for rec in caplog.records)
+    assert not any("Stream aborted mid-way" in rec.message for rec in caplog.records)
+    assert not list(tmp_path.rglob("*.part")) and not list(tmp_path.rglob("*.mp3"))
+
+
 @pytest.mark.anyio
 async def test_disconnect_closes_stream_without_detached_downloader(tmp_path):
     audio = Audio()
@@ -311,7 +377,7 @@ async def test_prebyte_fallback_and_no_splicing(monkeypatch):
     session(req, items)
     attempts = []
     streams = []
-    async def opened(req, guid, rang):
+    async def opened(req, guid, rang, force_mp3=False, fresh_url=False, refresh=False):
         attempts.append(guid)
         if guid == "online:kuwo:1":
             raise httpx.ReadError("before first byte")
@@ -358,7 +424,7 @@ async def test_fallback_redirect_survives_relayed_https_client(monkeypatch):
     items = p.deduplicate_online_items([song("kuwo:1"), song("netease:2")])
     session(req, items)
 
-    async def opened(req, guid, rang):
+    async def opened(req, guid, rang, force_mp3=False, fresh_url=False, refresh=False):
         if guid == "online:kuwo:1":
             raise httpx.ReadError("before first byte")
         audio = Audio()
@@ -390,7 +456,7 @@ async def test_disabled_alternative_and_seek_never_cross_sources(monkeypatch):
     session(req, p.deduplicate_online_items([song("kuwo:1"), song("netease:2")]))
     monkeypatch.setitem(p.CONF, "netease_enabled", False)
     attempts = []
-    async def failed(req, guid, rang):
+    async def failed(req, guid, rang, force_mp3=False, fresh_url=False, refresh=False):
         attempts.append(guid)
         return None
     async def no_recovery(*args):

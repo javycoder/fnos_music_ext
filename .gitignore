@@ -3,6 +3,9 @@
 .venv-research/
 .venv-musicdl/
 .venv-musicbox/
+.venv-sources/
+.lxserver/
+sources-native/
 musicbox-data/
 sources-data/
 cache/
@@ -26,6 +29,11 @@ __pycache__/
 .zcode/
 *.part
 *.log
+# 支付宝收款码：本地测试/CI 生成（ALIPAY_QRCODE secret），绝不入库
+webui-service/static/alipay.png
+# 运行日志目录（本地滚动 3 天）与日志导出包
+logs/
+*.logzip
 .DS_Store
 .git.nested/
 **/.git.nested/
