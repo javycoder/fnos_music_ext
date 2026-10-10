@@ -58,6 +58,7 @@ function switchPage(page) {
   // 储存父标题：边听边存/目录设置任一子页激活时强调（子项保持各自的实心高亮）
   const storageTitle = $("#nav-storage-title");
   if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs");
+  if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
 }
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
 const storageTitleBtn = $("#nav-storage-title");
@@ -847,6 +848,78 @@ $("#bind-timeout").addEventListener("input", updateBindTimeoutLabel);
 window.addEventListener("beforeunload", (ev) => {
   if (dirty) ev.preventDefault();
 });
+
+/* -------------------------------------------------------------- 关于页 */
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return "-";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function loadAbout() {
+  const info = await api("/api/about");
+  $("#about-version").textContent = `v${info.version}`;
+  $("#about-deploy").textContent = info.deploy_mode === "native" ? "原生部署" : "Docker 部署";
+  // 免责声明来自 README「免责与版权声明」小节；解析失败时后端返回空数组，隐藏卡片
+  const card = $("#about-disclaimer-card");
+  const list = $("#about-disclaimer");
+  const items = Array.isArray(info.disclaimer) ? info.disclaimer : [];
+  if (items.length) {
+    card.hidden = false;
+    list.innerHTML = items.map((d) =>
+      `<li><b>${escapeHtml(d.title)}</b>${d.text ? "：" + escapeHtml(d.text) : ""}</li>`).join("");
+  } else {
+    card.hidden = true;
+  }
+  const logs = $("#about-logs");
+  const files = Array.isArray(info.logs) ? info.logs : [];
+  logs.innerHTML = files.length
+    ? files.map((f) => `<span class="state-line"><span class="dot ok"></span>${escapeHtml(f.name)} · ${fmtBytes(f.size)}</span>`).join("")
+    : '<span class="muted">暂无日志文件</span>';
+  // 打赏二维码是打包时的可选资源（CI 从 ALIPAY_QRCODE 生成）；开源发布包里没有则不展示
+  const donate = $("#about-donate");
+  if (info.donate) {
+    donate.hidden = false;
+    $("#about-donate-img").src = `${APP_BASE}/static/alipay.png`;
+  } else {
+    donate.hidden = true;
+  }
+}
+
+async function exportLogs() {
+  const btn = $("#log-export-btn");
+  const note = $("#log-export-note");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  note.textContent = "打包中…";
+  try {
+    const resp = await fetch(APP_BASE + "/api/logs/export");
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await resp.blob();
+    const m = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
+    const name = m ? m[1] : `fnmusic-logs-${Date.now()}.logzip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    note.textContent = `已导出 ${name}`;
+  } catch (exc) {
+    note.textContent = "";
+    toast("日志导出失败：" + exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+  }
+}
+$("#log-export-btn").addEventListener("click", () => { exportLogs().catch(() => {}); });
 
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {

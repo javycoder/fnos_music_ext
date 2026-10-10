@@ -25,7 +25,19 @@ from netease_ext import (
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
+# 与其他服务对齐：不配 handler 时 INFO 会被丢弃（只剩 lastResort 的 WARNING+）
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("musicbox_service.app")
+try:  # 本地文件日志（logs/musicbox.log，按天滚动保留 3 天）；失败静默降级
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    from proxy.fnlog import setup_logging as _setup_logging
+
+    _setup_logging("musicbox_service.app", "musicbox")
+except Exception:  # noqa: BLE001  无 proxy/ 上下文（如独立调试）时仅 stdout
+    pass
 
 ensure_xdg_dirs()
 

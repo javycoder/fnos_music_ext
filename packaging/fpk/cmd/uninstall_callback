@@ -13,4 +13,7 @@ docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
 FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
 rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
 
+# 兜底清理运行日志目录（正常路径应用中心已随应用目录整体删除）
+[ -n "${FNMUSIC_REPO_DIR}" ] && rm -rf "${FNMUSIC_REPO_DIR}/logs" >> "${FNMUSIC_LOG}" 2>&1
+
 exit 0

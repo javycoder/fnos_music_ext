@@ -248,6 +248,25 @@ else
   bad "专辑搜索" "code=$(echo "$ALBUM_SEARCH" | jget code) guid=$ALBUM_GUID"
 fi
 
+# ── 9. WebUI 关于页与日志导出（8774 直连 + 管理员头） ─────
+WEBUI="http://127.0.0.1:8774/app/fnmusic-ext"
+if curl -s --max-time 5 -H "X-Trim-Isadmin: true" "$WEBUI/api/about" | grep -q '"author":"javycoder"'; then
+  ok "WebUI 关于页接口（版本/作者/免责声明）"
+  EXPORT_HEADERS=$(curl -s --max-time 20 -o /tmp/fnmusic-e2e-export.logzip -D - \
+    -H "X-Trim-Isadmin: true" "$WEBUI/api/logs/export")
+  if echo "$EXPORT_HEADERS" | grep -qi 'content-disposition: attachment; filename="[0-9]\{14\}\.logzip"' \
+     && python3 -c "import zipfile,sys; sys.exit(0 if zipfile.is_zipfile('/tmp/fnmusic-e2e-export.logzip') else 1)"; then
+    ok "WebUI 日志导出（.logzip，浏览器下载流）"
+    rm -f /tmp/fnmusic-e2e-export.logzip
+  else
+    bad "WebUI 日志导出" "$EXPORT_HEADERS"
+  fi
+elif curl -s --max-time 5 "$WEBUI/healthz" | grep -q '"ok"'; then
+  bad "WebUI 关于页接口" "WebUI 可达但 /api/about 响应异常"
+else
+  echo "SKIP  WebUI 未启用（关于页/日志导出未测，安装时选择 WebUI 后才会覆盖）"
+fi
+
 echo "──────────────────────────────"
 echo "结果：PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || exit 1

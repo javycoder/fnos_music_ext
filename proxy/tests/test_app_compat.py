@@ -327,6 +327,34 @@ def test_safe_child_log_allows_request_log_and_degrade():
     assert safe_child_log("2026-09-18 10:00:00,123 [INFO] fnmusic_proxy: secret token abc123") is None
 
 
+def test_safe_child_log_allows_diag_cfg_env_and_rich_request_lines():
+    """2.9.0 日志系统新前缀（[diag]/[cfg]/[env]）与带 ms/host/xff 的请求行需放行进 journal。"""
+    for line in (
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [diag] stream_unresolved guid=online:kw:9 candidates=online:kw:9 enabled=none",
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [diag] cover_miss guid=online:wy:1 info=True cover_url=False kw_qq=False enrich=False embedded=False",
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [cfg] quality_mode=balanced",
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [env] context=host app_version=2.9.0 deploy_mode=docker",
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: "
+        "client request GET /music/api/v1/track/stream status=200 ua=fnos-music/1.0 ms=123 host=nas.local:5666 xff=yes",
+        # 旧格式（无后缀）保持兼容
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: "
+        "client request GET /music/api/v1/track/stream status=200 ua=fnos-music/1.0",
+    ):
+        assert safe_child_log(line) is not None, line
+
+    # 超长诊断行只输出白名单匹配到的有界片段（[diag] 限 300 可打印字符，
+    # 其余尾部丢弃——与 [dl-capture] 同一截断设计）
+    out = safe_child_log(
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [diag] leak " + "x" * 400
+    )
+    assert out is not None and "x" * 320 not in out
+
+    # 未加白的新前缀仍被丢弃
+    assert safe_child_log(
+        "2026-10-10 10:00:00,123 [INFO] fnmusic_proxy: [unknown-prefix] something happened"
+    ) is None
+
+
 def test_search_response_disguised_no_online_prefix():
     """搜索结果零 online: 泄漏，假 id 可反解，coverId 带 track_ 前缀。"""
     from proxy.app import resolve_real_guid

@@ -1122,3 +1122,134 @@ def test_lx_empty_active_list_rejected(env_file, svctl):
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": "[]"}})
     assert r.status_code == 400
+
+
+# ------------------------------------------------------------------ 关于页 ---
+
+README_SAMPLE = """# fnmusic-ext
+
+简介行。
+
+## 免责与版权声明
+
+- 本项目基于 MIT 许可证 开源（见 LICENSE），严格限定于个人技术研究与非商业用途；
+- 本项目是协议中继与数据适配层，不托管任何受版权保护的音频与元数据；
+- 使用者应遵守所在国家/地区法律法规。
+
+## 上游致谢
+
+感谢上游项目。
+"""
+
+
+@pytest.fixture
+def about_env(env_file, tmp_path, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "repo_dir", str(tmp_path))
+    (tmp_path / "README.md").write_text(README_SAMPLE, encoding="utf-8")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setenv("FNMUSIC_LOG_DIR", str(logs))
+    # STATIC_DIR 指向临时目录：与真实 static/（可能放着本地测试用 alipay.png）隔离
+    static = tmp_path / "static"
+    static.mkdir()
+    monkeypatch.setattr(webui, "STATIC_DIR", static)
+    return tmp_path
+
+
+def test_about_fields_and_disclaimer(about_env):
+    with authed_client() as client:
+        r = client.get("/api/about")
+    assert r.status_code == 200
+    rj = r.json()
+    assert rj["version"] == "2.0.0"
+    assert rj["author"] == "javycoder"
+    assert rj["author_url"] == "https://github.com/javycoder"
+    assert rj["repo_url"] == "https://github.com/javycoder/fnos_music_ext"
+    assert rj["issues_url"] == "https://github.com/javycoder/fnos_music_ext/issues"
+    assert rj["donate"] is False  # 无 alipay.png 时不展示打赏
+    assert rj["log_retention_days"] == 3
+    # 免责声明解析：只取「免责与版权声明」小节的 bullet，到下一节截止
+    titles = [d["title"] for d in rj["disclaimer"]]
+    assert len(titles) == 3
+    assert "上游致谢" not in " ".join(titles)
+    assert all("[" not in t for t in titles)  # markdown 链接已剥离
+
+
+def test_about_donate_true_when_qr_exists(about_env):
+    (about_env / "static" / "alipay.png").write_bytes(b"\x89PNG fake")
+    with authed_client() as client:
+        r = client.get("/api/about")
+    assert r.json()["donate"] is True
+
+
+def test_about_requires_admin(about_env):
+    with TestClient(webui.app) as client:
+        r = client.get("/api/about")
+    assert r.status_code == 403
+
+
+def test_logs_export_pack_and_cleanup(about_env):
+    import io
+    import os as _os
+    import zipfile
+
+    logs = about_env / "logs"
+    (logs / "proxy.log").write_text("proxy-line\n", encoding="utf-8")
+    (logs / "webui.log").write_text("webui-line\n", encoding="utf-8")
+    old = logs / "install.log"
+    old.write_text("too old\n", encoding="utf-8")
+    _os.utime(old, (time.time() - 4 * 86400, time.time() - 4 * 86400))
+
+    with authed_client() as client:
+        r1 = client.get("/api/logs/export")
+        assert r1.status_code == 200
+        disp = r1.headers.get("content-disposition", "")
+        import re as _re
+        m = _re.search(r'filename="(\d{14})\.logzip"', disp)
+        assert m, disp
+        zf = zipfile.ZipFile(io.BytesIO(r1.content))
+        names = set(zf.namelist())
+        assert "proxy.log" in names and "webui.log" in names
+        assert "install.log" not in names  # 超 3 天不入包
+        assert "export_env_snapshot.txt" in names
+        assert "[env] context=" in zf.read("export_env_snapshot.txt").decode("utf-8")
+        # 导出包落盘
+        first_zip = logs / f"{m.group(1)}.logzip"
+        assert first_zip.exists()
+        # 二次导出：上一次的包必须被清掉，仅保留新包
+        time.sleep(1.1)  # 保证时间戳不同
+        r2 = client.get("/api/logs/export")
+        disp2 = r2.headers.get("content-disposition", "")
+        stamp2 = _re.search(r'filename="(\d{14})\.logzip"', disp2).group(1)
+        zips = sorted(p.name for p in logs.glob("*.logzip"))
+        assert zips == [f"{stamp2}.logzip"]
+        assert not first_zip.exists()
+
+
+def test_logs_export_empty_dir(about_env):
+    import io
+    import zipfile
+
+    (about_env / "logs").mkdir(exist_ok=True)
+    with authed_client() as client:
+        r = client.get("/api/logs/export")
+    assert r.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    assert "export_env_snapshot.txt" in zf.namelist()
+
+
+def test_logs_export_requires_admin(about_env):
+    with TestClient(webui.app) as client:
+        r = client.get("/api/logs/export")
+    assert r.status_code == 403
+
+
+def test_config_put_logs_cfg_lines(env_file, svctl, caplog):
+    import logging as _logging
+    with authed_client() as client:
+        with caplog.at_level(_logging.INFO, logger="webui_service"):
+            r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "balanced"}})
+    assert r.status_code == 200
+    assert r.json()["changed"] == ["FNMUSIC_QUALITY_MODE"]
+    joined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "[cfg] FNMUSIC_QUALITY_MODE high -> balanced" in joined

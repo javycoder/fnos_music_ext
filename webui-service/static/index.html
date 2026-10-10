@@ -28,6 +28,7 @@
           <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
         </div>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
+        <button class="nav-item" data-page="about">关于</button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -253,6 +254,46 @@
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
         </div>
       </section>
+
+      <!-- 关于 -->
+      <section class="page" id="page-about">
+        <div class="about-wrap">
+          <div class="card about-head">
+            <img class="about-logo" src="/app/fnmusic-ext/static/icon.png" width="72" height="72" alt="">
+            <div class="about-name">fnmusic-ext</div>
+            <div class="about-badges">
+              <span class="badge" id="about-version">v-</span>
+              <span class="badge dim" id="about-deploy">-</span>
+            </div>
+            <div class="about-author">作者 <a href="https://github.com/javycoder" target="_blank" rel="noopener">javycoder</a></div>
+            <div class="about-links">
+              <a class="about-link" href="https://github.com/javycoder/fnos_music_ext" target="_blank" rel="noopener" title="项目开源地址">
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+                <span>fnos_music_ext</span>
+              </a>
+              <a class="about-link" href="https://github.com/javycoder/fnos_music_ext/issues" target="_blank" rel="noopener" id="about-issues">问题反馈</a>
+            </div>
+          </div>
+          <div class="card" id="about-disclaimer-card">
+            <div class="card-title">免责声明</div>
+            <ul class="about-disclaimer" id="about-disclaimer"></ul>
+          </div>
+          <div class="card">
+            <div class="card-title">运行日志</div>
+            <p class="hint">日志在本地滚动保留 3 天，卸载时随应用一并删除。导出包含近 3 天全部日志与环境快照，问题反馈时可一并附上。</p>
+            <div id="about-logs" class="stack"></div>
+            <div class="btn-row">
+              <button class="btn" id="log-export-btn">导出日志</button>
+              <span class="muted" id="log-export-note"></span>
+            </div>
+          </div>
+          <div class="card about-donate" id="about-donate" hidden>
+            <div class="card-title">请作者喝杯咖啡</div>
+            <p class="hint">本项目用爱发电，全部功能免费开放。如果它对你有帮助，可以请作者喝杯咖啡 ☕</p>
+            <img class="about-donate-img" id="about-donate-img" alt="支付宝收款码" width="300">
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -265,6 +306,7 @@
     <button class="nav-item" data-page="tee">边听</button>
     <button class="nav-item" data-page="dirs">目录</button>
     <button class="nav-item" data-page="llm">高级</button>
+    <button class="nav-item" data-page="about">关于</button>
   </nav>
 
   <!-- 保存条 -->
