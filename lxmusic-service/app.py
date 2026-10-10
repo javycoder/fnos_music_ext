@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -37,8 +38,14 @@ from lxserver_client import (
     parse_interval_to_seconds,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 仓库根：复用 proxy/fnlog
+from proxy.fnlog import diag as fn_diag  # noqa: E402
+from proxy.fnlog import setup_logging  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fnmusic.lxmusic")
+# 本地文件日志（logs/lxmusic.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+setup_logging("fnmusic.lxmusic", "lxmusic")
 
 SERVICE_VERSION = "2.7.0"
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -183,9 +190,13 @@ async def _resolve_url_cached(
             data = entry.get("data")
             if data is None:
                 if age <= CONF["url_cache_neg_ttl"]:
+                    fn_diag(logger, "url_cache", op="neg_hit", song=str(canonical_id)[:60],
+                            quality=str(tiers[0] if tiers else "standard"))
                     return None
             elif age <= CONF["url_cache_ttl"]:
                 _STATS["url_cache_hits"] += 1
+                fn_diag(logger, "url_cache", op="hit", song=str(canonical_id)[:60],
+                        quality=str(tiers[0] if tiers else "standard"))
                 return data
             else:
                 refreshed = await _refresh_cached_url(client, data)
@@ -194,6 +205,8 @@ async def _resolve_url_cached(
                         entry["data"] = refreshed
                         entry["ts"] = time.monotonic()
                     _STATS["url_cache_hits"] += 1
+                    fn_diag(logger, "url_cache", op="refreshed", song=str(canonical_id)[:60],
+                            quality=str(tiers[0] if tiers else "standard"))
                     return refreshed
 
     remaining = deadline - time.monotonic()
@@ -212,6 +225,8 @@ async def _resolve_url_inflight(
     """实际解析执行段：同键在途合并，失败/取消正确清理在途状态供后续重试。"""
     existing = _URL_INFLIGHT.get(key)
     if existing is not None:
+        # issue #45：同键并发跟随者共享领队的实际解析，不再重复消耗音源额度
+        fn_diag(logger, "url_inflight", op="join", song=str(key[0])[:60], quality=str(key[1]))
         return await asyncio.shield(existing)
 
     fut = asyncio.get_running_loop().create_future()
@@ -233,6 +248,9 @@ async def _resolve_url_inflight(
     finally:
         _URL_INFLIGHT.pop(key, None)
 
+    # issue #45：留档每次真实上游解析（领队），与 hit/join 对比可核对额度消耗
+    fn_diag(logger, "url_resolve", op="ok" if result else "none",
+            song=str(key[0])[:60], quality=str(key[1]))
     if _URL_CACHE_GEN == gen:
         if len(_URL_CACHE) >= CONF["url_cache_max"]:
             # 容量超限清理最早的一半（与 _cache_put 同策略）

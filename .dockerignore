@@ -10,6 +10,8 @@
 proxy/*
 !proxy/__init__.py
 !proxy/env_merge.py
+!proxy/fnlog.py
+!proxy/version.py
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/

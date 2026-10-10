@@ -81,6 +81,15 @@ log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
 log_warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
 log_err() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 
+# 安装/升级事件留档：追加到 logs/install.log（运行日志保留 3 天，写失败绝不影响安装）
+APP_LOG_DIR="${BASE_DIR}/logs"
+log_install() {
+    mkdir -p "${APP_LOG_DIR}" 2>/dev/null || true
+    printf '[%s] [install] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" \
+        >> "${APP_LOG_DIR}/install.log" 2>/dev/null || true
+}
+trap 'log_install "aborted line=${BASH_LINENO[0]:-?}"' ERR
+
 usage() {
     cat <<'EOF'
 用法: ./install.sh [选项]
@@ -697,6 +706,7 @@ else
 fi
 
 precheck_environment
+log_install "begin version=${FNMUSIC_VERSION} args=$*"
 
 dotenv_escape() {
     printf "%s" "$1" | sed "s/'/'\\\\''/g"
@@ -1174,9 +1184,11 @@ if [ -f "${ENV_PATH}" ]; then
     if [ -n "${PREV_VERSION}" ] && [ "${PREV_VERSION}" = "${FNMUSIC_VERSION}" ]; then
         log_warn "检测到同版本 (v${FNMUSIC_VERSION}) 重复安装：现有配置将被保护，"
         log_warn "仅补齐缺失配置项；密钥/自定义路径/ONLINE_SOURCES 等沿用已有值（备份: ${ENV_BACKUP}）。"
+        log_install "mode=reinstall version=${FNMUSIC_VERSION} backup=$(basename "${ENV_BACKUP}")"
     else
         log_info "检测到已有配置（v${PREV_VERSION:-未知} -> v${FNMUSIC_VERSION}）平滑升级："
         log_info "保留用户自定义配置与密钥，仅安全补齐新增/缺失配置项（备份: ${ENV_BACKUP}）。"
+        log_install "mode=upgrade from=${PREV_VERSION:-unknown} to=${FNMUSIC_VERSION} backup=$(basename "${ENV_BACKUP}")"
     fi
     MERGE_SUMMARY="$(python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing "${ENV_PATH}" --desired "${ENV_DESIRED}" \
@@ -1194,6 +1206,7 @@ else
         --existing /dev/null --desired "${ENV_DESIRED}" \
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
     log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
+    log_install "mode=fresh-install version=${FNMUSIC_VERSION}"
 fi
 
 # 存量迁移：历史安装会把当时的默认源写进 .env；env_merge 对该键保留旧值，
@@ -1669,6 +1682,7 @@ done
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
 log_info "已启用音源（${MODE_LABEL}）:${SELECTED}"
+log_install "done version=${FNMUSIC_VERSION} deploy=${DEPLOY_MODE} sources=${SELECTED} webui=${WEBUI_FLAG}"
 log_info "------------------------------------------------------------"
 log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"

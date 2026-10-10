@@ -40,6 +40,8 @@ try:
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
+    from .fnlog import diag as fn_diag
+    from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
@@ -47,10 +49,14 @@ except ImportError:  # uvicorn --app-dir proxy
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
+    from fnlog import diag as fn_diag  # type: ignore
+    from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# 本地文件日志（logs/proxy.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+setup_logging("fnmusic_proxy", "proxy")
 
 _HOME = dailyrec.home_dir()
 
@@ -683,6 +689,18 @@ def _cancel_daily_tasks() -> None:
             old.cancel()
 
 
+_last_purge_day = 0
+
+
+def _purge_stale_daily() -> None:
+    """每天一次清理超期日志文件（3 天滚动兜底；watch 循环每 2s 调用）。"""
+    global _last_purge_day
+    today = time.localtime().tm_yday
+    if today != _last_purge_day:
+        _last_purge_day = today
+        purge_stale()
+
+
 async def _env_watch_loop() -> None:
     last = _env_watch_stat()
     while True:
@@ -710,6 +728,10 @@ async def _env_watch_loop() -> None:
                         ",".join(sorted(_SOURCE_CONF_KEYS & set(changed))), removed,
                     )
                 logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
+                # 功能开启情况留档（[cfg] 行进本地日志，秘密值打码）
+                for key in sorted(changed):
+                    logger.info("[cfg] %s", redact(f"{key}={CONF.get(key)}"))
+            _purge_stale_daily()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2966,6 +2988,10 @@ async def lifespan(fastapi_app: FastAPI):
         logger.info("  %s = %s", k, _conf_log_value(k, v))
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
     logger.info("==================================")
+    # 运行环境快照（issue 诊断 + 日志导出）：宿主视角落 proxy.log 与 env_snapshot.txt
+    for line in env_snapshot_lines("host"):
+        logger.info(line)
+    write_env_snapshot("host")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
     env_task = asyncio.create_task(_env_watch_loop()) if (
@@ -3050,19 +3076,26 @@ app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
 
 @app.middleware("http")
 async def log_client_requests(request: Request, call_next):
-    """记录 /music/ 请求的方法/路径/状态/UA，供 App 端兼容问题远程定位。
+    """记录 /music/ 请求的方法/路径/状态/UA/耗时/Host/XFF，供 App 端兼容问题远程定位。
 
-    不记 query（guid 无必要），UA 折叠空白并截断，配合 takeover 日志白名单的固定格式。
+    不记 query（guid 无必要），UA 折叠空白并截断；host/xff 用于反代场景诊断
+    （issue #49 外网反代后不能播/无封面），格式与 takeover 日志白名单对齐。
     """
+    started = time.monotonic()
     response = await call_next(request)
     if request.url.path.startswith("/music/"):
         ua = re.sub(r"\s+", " ", request.headers.get("user-agent") or "-")[:100]
+        host = re.sub(r"\s+", " ", request.headers.get("host") or "-")[:80]
+        xff = "yes" if request.headers.get("x-forwarded-for") else "no"
         logger.info(
-            "client request %s %s status=%s ua=%s",
+            "client request %s %s status=%s ua=%s ms=%d host=%s xff=%s",
             request.method,
             request.url.path,
             response.status_code,
             ua,
+            (time.monotonic() - started) * 1000,
+            host,
+            xff,
         )
     return response
 
@@ -3752,6 +3785,10 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
         os.replace(part, dest)
     logger.info("tee finalize done for %s: dest=%s", guid, dest)
+    # issue #52 重复曲目/未知歌手-未知曲目：留档标题/歌手/格式，配合 missing metadata
+    # 告警可定位重复文件对与元数据缺失来源
+    fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+            ext=ext or "?", tee=tee_enabled)
     # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
     # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
     if tee_enabled and CONF.get("lyric_auto_dl"):
@@ -3941,6 +3978,9 @@ def stream_tee_response(
                 # here) and stay silent on purpose.
                 upstream_aborted = True
                 logger.warning("Stream aborted mid-way for %s: %s", guid, type(exc).__name__)
+                # issue #48/#50 播放中途断流：补齐断点细节（已发字节 vs 期望总长）
+                fn_diag(logger, "stream_abort_detail", guid=guid, written=written,
+                        expected=expected if expected is not None else -1, range=range_header or "-")
                 raise
             eof = True
             if fp:
@@ -5171,6 +5211,10 @@ async def stream_track(request: Request, subpath: str = ""):
                 break
             if not await _recover_source(request, candidate, entry):
                 break
+    # issue #51/#52：搜到但不能播的最终结局留档（候选源、启用状态）
+    fn_diag(logger, "stream_unresolved", guid=guid,
+            candidates=",".join(list(dict.fromkeys(candidates))[:3]),
+            enabled=",".join(c for c in list(dict.fromkeys(candidates))[:3] if _source_enabled(c)) or "none")
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
@@ -5200,6 +5244,8 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             return str(resolved["url"]), headers or None
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
+            # issue #46 音质降级：无损流损坏拉黑后降级 mp3，留档实际交付格式
+            fn_diag(logger, "lossless_downgrade", guid=guid, path="transcode_source", tier="mp3")
             url += "&quality=mp3"
         return url, None
     except Exception as e:  # noqa: BLE001
@@ -6118,6 +6164,9 @@ async def static_cover(request: Request, subpath: str = ""):
             direct = _qq_cover_by_albummid(str(item.get("albummid") or ""))
         if direct:
             return RedirectResponse(direct, status_code=302)
+        # issue #48 封面缺失：专辑锚点全链路未取到封面，留档各环节结果
+        fn_diag(logger, "cover_miss_album_anchor", guid=guid, anchor_cover=bool(cover),
+                kw=bool(kw_rid), qq=bool(item.get("albummid")))
         return _placeholder_cover_response(guid)
 
     data = await _online_info(request, guid)
@@ -6148,6 +6197,9 @@ async def static_cover(request: Request, subpath: str = ""):
         return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
     # ⑤ 本地占位图池：在线曲目封面永不 404
+    # issue #48 封面缺失：四级回退全部落空才走到占位图，留档各环节结果
+    fn_diag(logger, "cover_miss", guid=guid, info=bool(data), cover_url=bool(cover),
+            kw_qq=bool(direct), enrich=bool(enriched), embedded=bool(embedded))
     return _placeholder_cover_response(guid)
 
 

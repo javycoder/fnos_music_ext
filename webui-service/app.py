@@ -34,9 +34,19 @@ from proxy.env_merge import (  # noqa: E402
     render_env,
     write_env_atomic,
 )
+from proxy.fnlog import (  # noqa: E402
+    RETENTION_DAYS,
+    env_snapshot_lines,
+    log_dir,
+    purge_stale,
+    redact,
+    setup_logging,
+)
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# 本地文件日志（logs/webui.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+setup_logging("webui_service", "webui")
 
 SERVICE_VERSION = "2.0.0"
 
@@ -462,13 +472,22 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # 运行环境快照（webui 视角；宿主全量快照由 proxy 落 env_snapshot.txt）
+    for line in env_snapshot_lines("container" if Path("/.dockerenv").exists() else "host"):
+        logger.info(line)
+
     async def _preview_reaper():
+        day = 0
         while True:
             await asyncio.sleep(15.0)
             try:
                 preview_reap()
             except Exception:  # noqa: BLE001
                 logger.exception("预览清退循环异常")
+            today = time.localtime().tm_yday
+            if today != day:  # 每天一次清理超期日志（3 天滚动兜底）
+                day = today
+                purge_stale()
     reaper = asyncio.create_task(_preview_reaper())
     try:
         yield
@@ -712,6 +731,17 @@ async def api_config_put(body: ConfigBody, request: Request):
     changed = write_env(updates)
     after = read_env()
     new_provider = current_provider(after)
+    # 功能开关/配置变更留档（[cfg] 行进 webui.log；secret 类只记键名不打值）
+    for key in changed:
+        if SCHEMA.get(key, {}).get("kind") == "secret":
+            logger.info("[cfg] %s=***（值已更新）", key)
+        else:
+            old_val = str(before.get(key) or "").strip()
+            new_val = str(after.get(key) or "").strip()
+            logger.info("[cfg] %s %s -> %s", key, redact(f"{key}={old_val}").split("=", 1)[-1][:80],
+                        redact(f"{key}={new_val}").split("=", 1)[-1][:80])
+    if old_provider != new_provider:
+        logger.info("[src] 音源切换: %s -> %s", old_provider or "none", new_provider or "none")
     actions: list[dict] = []
 
     # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL/LX_SOURCE_LIST 且当前是 lxmusic，仍应重试激活
@@ -899,6 +929,136 @@ async def api_fs_check():
     宿主机真实目录，无法给出可信的可写性结论，明确回 501 让前端降级放行。
     """
     raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
+
+
+# ------------------------------------------------------------------ 关于页 --
+
+ABOUT = {
+    "author": "javycoder",
+    "author_url": "https://github.com/javycoder",
+    "repo_url": "https://github.com/javycoder/fnos_music_ext",
+    "issues_url": "https://github.com/javycoder/fnos_music_ext/issues",
+}
+
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_DISCLAIMER_HEADING = "## 免责与版权声明"
+
+
+def _strip_md_inline(text: str) -> str:
+    """剥离 markdown 行内语法（链接取文字、加粗/斜体/代码去符号），保留纯文本。"""
+    text = _MD_LINK_RE.sub(r"\1", text)
+    return re.sub(r"[*`_]", "", text).strip()
+
+
+def _read_disclaimer() -> "list[dict[str, str]]":
+    """解析 README.md 尾部「免责与版权声明」小节为 [{title, text}] 列表。
+
+    与 README 单一来源同步：仓库 README 改了这里跟着变；解析失败返回空列表，
+    前端隐藏该卡片（比内置过时副本更稳妥）。
+    """
+    try:
+        lines = (Path(CONF["repo_dir"]) / "README.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    items: list[dict[str, str]] = []
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == _DISCLAIMER_HEADING)
+    except StopIteration:
+        return []
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped.startswith("## "):  # 下一节（上游致谢）截止
+            break
+        if not stripped.startswith("- "):
+            continue
+        text = _strip_md_inline(stripped[2:])
+        if not text:
+            continue
+        # 「标题：说明」按首个全角冒号拆两行展示，无冒号整句展示
+        title, sep, desc = text.partition("：")
+        items.append({"title": title.strip(), "text": desc.strip()} if sep else {"title": text, "text": ""})
+    return items
+
+
+def _log_files_info() -> "list[dict]":
+    """日志目录文件清单（名称/大小/修改时间），供关于页展示与导出前确认。"""
+    out: list[dict] = []
+    try:
+        for item in sorted(log_dir().iterdir(), key=lambda p: p.name):
+            try:
+                if item.is_file():
+                    st = item.stat()
+                    out.append({
+                        "name": item.name,
+                        "size": st.st_size,
+                        "mtime": int(st.st_mtime),
+                    })
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+@app.get("/api/about")
+async def api_about():
+    values = read_env()
+    return {
+        "ok": True,
+        "version": _read_version(),
+        "deploy_mode": values.get("FNMUSIC_DEPLOY_MODE", "docker"),
+        **ABOUT,
+        "disclaimer": _read_disclaimer(),
+        # 打赏二维码是包内可选资源（CI 从 ALIPAY_QRCODE secret 生成）；
+        # 开源发布包不带此文件，此时不展示打赏卡片
+        "donate": (STATIC_DIR / "alipay.png").is_file(),
+        "logs": _log_files_info(),
+        "log_retention_days": RETENTION_DAYS,
+    }
+
+
+@app.get("/api/logs/export")
+async def api_logs_export():
+    """打包近 3 天日志为 <YYYYMMDDHHMMSS>.logzip 并触发浏览器下载。
+
+    规则：打包前先删除上一次的导出包（同时最多存在一份）；只收集近 3 天的
+    日志文件（排除 .logzip 导出产物自身）；包内附带导出时刻的环境快照。
+    """
+    import zipfile
+
+    directory = log_dir()
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    target = directory / f"{stamp}.logzip"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        # 上一次导出包清理：同时最多保留一份导出产物
+        for stale in directory.glob("*.logzip"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(directory.iterdir(), key=lambda p: p.name):
+                try:
+                    if (not item.is_file() or item.suffix == ".logzip"
+                            or item.stat().st_mtime < cutoff):
+                        continue
+                    zf.write(item, arcname=item.name)
+                except OSError:
+                    continue
+            snapshot = "\n".join(env_snapshot_lines(
+                "container" if Path("/.dockerenv").exists() else "host"))
+            zf.writestr("export_env_snapshot.txt", snapshot + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[diag] log_export_failed error=%s", type(exc).__name__)
+        return JSONResponse(content={"ok": False, "error": f"日志打包失败: {exc}"}, status_code=500)
+    logger.info("[diag] log_export file=%s", target.name)
+    return FileResponse(
+        target,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+    )
 
 
 # ------------------------------------------------------------------ 静态前端 --
