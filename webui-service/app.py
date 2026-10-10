@@ -14,17 +14,24 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
 from proxy.env_merge import (  # noqa: E402
@@ -33,9 +40,19 @@ from proxy.env_merge import (  # noqa: E402
     render_env,
     write_env_atomic,
 )
+from proxy.fnlog import (  # noqa: E402
+    RETENTION_DAYS,
+    env_snapshot_lines,
+    log_dir,
+    purge_stale,
+    redact,
+    setup_logging,
+)
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# 本地文件日志（logs/webui.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+setup_logging("webui_service", "webui")
 
 SERVICE_VERSION = "2.0.0"
 
@@ -71,10 +88,12 @@ SCHEMA: dict[str, dict] = {
     "LX_SOURCE_LIST": {"kind": "str", "default": "[]", "group": "lx", "reload": "hot", "label": "洛雪源列表（JSON 数组）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
+    "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
-    "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
+    "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
+    "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
     "FNMUSIC_FAV_AUTO_BIND": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "收藏自动绑定本地"},
     "FNMUSIC_AUTO_COVER": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "自动下载封面"},
@@ -147,7 +166,9 @@ def write_env(updates: dict[str, str]) -> list[str]:
 # ------------------------------------------------------------------ supervisor --
 
 def supervisorctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
-    cmd = [CONF["supervisorctl"], *args]
+    # WEBUI_SUPERVISORCTL 可携带参数（如 "supervisorctl -c /path/supervisord.conf"），
+    # 按 shell 词法拆分；默认裸 "supervisorctl" 拆分后行为不变。
+    cmd = shlex.split(CONF["supervisorctl"]) + list(args)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
@@ -299,9 +320,99 @@ def _normalize_lx_source_list(raw) -> str:
 
         name = str(item.get("name") or "").strip()
         name = re.sub(r"[\r\n\t]+", " ", name).strip()[:80]
-        normalized.append({"name": name, "url": url})
+        normalized.append({"name": name, "url": url, "active": bool(item.get("active"))})
 
     return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def _lx_list_items(raw) -> list[dict]:
+    """解析 LX_SOURCE_LIST JSON 字符串为 dict 列表（非法输入返回空列表）。"""
+    if isinstance(raw, list):
+        items = raw
+    else:
+        try:
+            items = json.loads(str(raw or "").strip() or "[]")
+        except Exception:
+            return []
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _list_active_urls(values: dict) -> set[str]:
+    """从 .env 值推导激活 URL 集合：优先列表 active 标记；无标记回退 LX_SOURCE_URL 单值（旧数据）。"""
+    urls: set[str] = set()
+    for item in _lx_list_items(values.get("LX_SOURCE_LIST")):
+        if item.get("active"):
+            url = str(item.get("url") or "").strip()
+            if url:
+                urls.add(url)
+    if not urls:
+        url = str(values.get("LX_SOURCE_URL") or "").strip()
+        if url:
+            urls.add(url)
+    return urls
+
+
+def _derive_lx_list_actives(items: list[dict], ref_url: str) -> list[dict]:
+    """兼容升级：列表无任何 active 标记时按 LX_SOURCE_URL 推导（全部项显式落布尔）。"""
+    if items and not any(i.get("active") for i in items):
+        for item in items:
+            item["active"] = bool(ref_url) and str(item.get("url") or "").strip() == ref_url
+    return items
+
+
+def _dumps_lx_list(items: list[dict]) -> str:
+    return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _lx_enabled_sources(request: Request) -> list[dict]:
+    resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
+    data = _resp_json(resp)
+    if resp.status_code != 200 or not data.get("ok"):
+        raise RuntimeError(data.get("error") or f"HTTP {resp.status_code}")
+    return ((data.get("data") or {}).get("sources") or [])
+
+
+async def _lx_enabled_platforms(request: Request) -> list[str]:
+    """读取 lxmusic 当前全部启用源的声明平台并集（保持出现顺序）；不可达返回空列表。"""
+    try:
+        resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
+        data = _resp_json(resp)
+        sources = ((data or {}).get("data") or {}).get("sources") or []
+        platforms: list[str] = []
+        for s in sources:
+            for p in (s or {}).get("platforms") or []:
+                p = str(p).strip()
+                if p and p not in platforms:
+                    platforms.append(p)
+        return platforms
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _normalize_dir_path(label: str, raw) -> str:
+    """储存目录归一化：空值合法（=恢复默认/自动探测）；要求绝对路径、
+    拒绝 .. 段与换行/空字符；折叠 . 段、多余斜杠与尾斜杠。"""
+    text = str(raw or "")
+    if any(ch in text for ch in "\r\n\x00"):
+        raise ValueError(f"{label}: 路径不能包含换行或空字符")
+    text = text.strip()
+    if not text:
+        return ""
+    if not text.startswith("/"):
+        raise ValueError(f"{label}: 必须是以 / 开头的绝对路径，收到 {raw!r}")
+    segs = [seg for seg in text.split("/") if seg and seg != "."]
+    if not segs:
+        raise ValueError(f"{label}: 不能是根目录 /")
+    if ".." in segs:
+        raise ValueError(f"{label}: 路径不能包含 .. 段")
+    return "/" + "/".join(segs)
+
+
+def _is_dir_within(child: str, parent: str) -> bool:
+    """child 是否与 parent 相同或位于 parent 之下（均应为归一化后的绝对路径）。"""
+    return child == parent or child.startswith(parent.rstrip("/") + "/")
 
 
 def _normalize_value(key: str, raw) -> str:
@@ -309,6 +420,8 @@ def _normalize_value(key: str, raw) -> str:
         return _normalize_lx_source_list(raw)
     spec = SCHEMA[key]
     kind = spec["kind"]
+    if kind == "dir":
+        return _normalize_dir_path(spec.get("label", key), raw)
     if kind == "bool":
         if isinstance(raw, bool):
             return "true" if raw else "false"
@@ -353,6 +466,18 @@ def validate_updates(values: dict) -> dict[str, str]:
     # 三选一互斥：以"应用后的最终状态"判断
     final = dict(read_env())
     final.update(updates)
+    # 储存目录互斥：缓存目录与下载目录不能相同或互为父子（否则滚动缓存被官方扫描进曲库）
+    if updates.keys() & {"FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"}:
+        final_cache = _normalize_dir_path("歌曲缓存目录", final.get("FNMUSIC_CACHE_DIR"))
+        final_dl = _normalize_dir_path("下载目录", final.get("FNMUSIC_TEE_SAVE_DIR"))
+        if not final_cache:
+            # .env 的 FNMUSIC_HOME 是宿主 proxy 的显式安装目录；容器 /repo
+            # 只是挂载别名，不能据此推断宿主默认缓存路径并误阻断合法下载目录。
+            host_home = (final.get("FNMUSIC_HOME") or "").strip()
+            if host_home.startswith("/"):
+                final_cache = _normalize_dir_path("默认歌曲缓存目录", host_home.rstrip("/") + "/cache")
+        if final_cache and final_dl and (_is_dir_within(final_cache, final_dl) or _is_dir_within(final_dl, final_cache)):
+            raise ValueError("歌曲缓存目录与下载目录不能相同或互为父子目录")
     enabled = [name for name, key in PROVIDERS.items()
                if final.get(key, SCHEMA[key]["default"]).lower() in ("true", "1", "yes")]
     if len(enabled) > 1:
@@ -369,13 +494,22 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # 运行环境快照（webui 视角；宿主全量快照由 proxy 落 env_snapshot.txt）
+    for line in env_snapshot_lines("container" if Path("/.dockerenv").exists() else "host"):
+        logger.info(line)
+
     async def _preview_reaper():
+        day = 0
         while True:
             await asyncio.sleep(15.0)
             try:
                 preview_reap()
             except Exception:  # noqa: BLE001
                 logger.exception("预览清退循环异常")
+            today = time.localtime().tm_yday
+            if today != day:  # 每天一次清理超期日志（3 天滚动兜底）
+                day = today
+                purge_stale()
     reaper = asyncio.create_task(_preview_reaper())
     try:
         yield
@@ -475,6 +609,12 @@ async def api_status(request: Request):
 @app.get("/api/config")
 async def api_config():
     values = read_env()
+    # 兼容升级：列表项缺 active 标记时按 LX_SOURCE_URL 推导（旧数据一次加载即升级）
+    ref_url = str(values.get("LX_SOURCE_URL") or "").strip()
+    if ref_url:
+        items = _derive_lx_list_actives(_lx_list_items(values.get("LX_SOURCE_LIST")), ref_url)
+        if items:
+            values["LX_SOURCE_LIST"] = _dumps_lx_list(items)
     return {
         "ok": True,
         "values": {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()},
@@ -537,16 +677,55 @@ async def api_config_put(body: ConfigBody, request: Request):
     except ValueError as exc:
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
 
-    # lx 换源前置校验：新 URL 必须先通过 lxmusic verify 才写入
-    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
     after_preview = dict(before)
     after_preview.update(updates)
-    if lx_url_changed and current_provider(after_preview) == "lxmusic":
-        new_url = updates["LX_SOURCE_URL"]
-        client = get_http(request)
+    lx_provider = current_provider(after_preview) == "lxmusic"
+
+    # lx 多源激活集合：active_items 待激活列表、to_activate 新激活（需校验）、to_deactivate 被取消激活
+    active_items: list[dict] = []
+    to_activate: list[dict] = []
+    to_deactivate: list[dict] = []
+    lx_reconcile = False
+    if lx_provider and "LX_SOURCE_LIST" in updates:
+        items = _derive_lx_list_actives(
+            _lx_list_items(updates["LX_SOURCE_LIST"]),
+            str(updates.get("LX_SOURCE_URL") or after_preview.get("LX_SOURCE_URL") or "").strip(),
+        )
+        active_items = [i for i in items if i.get("active") and str(i.get("url") or "").strip()]
+        if not active_items:
+            return JSONResponse(
+                content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
+            )
+        if active_items:
+            lx_reconcile = True
+            # LX_SOURCE_URL 退化为派生兼容字段 = 第一个激活项
+            updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip()
+            after_preview["LX_SOURCE_URL"] = updates["LX_SOURCE_URL"]
+            before_active = _list_active_urls(before)
+            to_activate = [i for i in active_items
+                           if str(i["url"]).strip() not in before_active]
+            before_items = {str(i.get("url") or "").strip(): i for i in _lx_list_items(before.get("LX_SOURCE_LIST"))}
+            new_active = {str(i["url"]).strip() for i in active_items}
+            to_deactivate = [before_items.get(url, {"url": url})
+                             for url in before_active if url not in new_active]
+            updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
+
+    # lx 换源前置校验：新激活的源必须先通过 lxmusic verify 才写入
+    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
+    verify_urls: list[str] = []
+    if lx_provider:
+        if lx_reconcile:
+            verify_urls = [str(i["url"]).strip() for i in to_activate]
+        elif lx_url_changed:
+            verify_urls = [str(updates["LX_SOURCE_URL"] or "").strip()]
+    client = get_http(request)
+    union_acc: list[str] = []  # LX_SOURCES 推导：新激活源声明平台 ∪ 现有启用源声明平台
+    for url in verify_urls:
+        if not url:
+            continue
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
-                                     json={"url": new_url}, timeout=130.0)
+                                     json={"url": url}, timeout=130.0)
             report = _resp_json(resp)
         except Exception as exc:  # noqa: BLE001
             report = {"ok": False, "data": {"message": str(exc)}}
@@ -555,21 +734,43 @@ async def api_config_put(body: ConfigBody, request: Request):
             return JSONResponse(
                 content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
             )
-        platforms = (report.get("data") or {}).get("platforms") or []
-        if platforms:
-            updates.setdefault("LX_SOURCES", ",".join(platforms))
+        # LX_SOURCES 推导累计各新激活源声明平台
+        for p in (report.get("data") or {}).get("platforms") or []:
+            p = str(p).strip()
+            if p and p not in union_acc:
+                union_acc.append(p)
+
+    if lx_reconcile:
+        # 并入现有启用源声明平台（激活前读取，保持出现顺序）
+        for p in await _lx_enabled_platforms(request):
+            p = str(p).strip()
+            if p and p not in union_acc:
+                union_acc.append(p)
+    if union_acc:
+        updates.setdefault("LX_SOURCES", ",".join(union_acc))
 
     old_provider = current_provider(before)
     changed = write_env(updates)
     after = read_env()
     new_provider = current_provider(after)
+    # 功能开关/配置变更留档（[cfg] 行进 webui.log；secret 类只记键名不打值）
+    for key in changed:
+        if SCHEMA.get(key, {}).get("kind") == "secret":
+            logger.info("[cfg] %s=***（值已更新）", key)
+        else:
+            old_val = str(before.get(key) or "").strip()
+            new_val = str(after.get(key) or "").strip()
+            logger.info("[cfg] %s %s -> %s", key, redact(f"{key}={old_val}").split("=", 1)[-1][:80],
+                        redact(f"{key}={new_val}").split("=", 1)[-1][:80])
+    if old_provider != new_provider:
+        logger.info("[src] 音源切换: %s -> %s", old_provider or "none", new_provider or "none")
     actions: list[dict] = []
 
-    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL 且当前是 lxmusic，仍应重试激活
+    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL/LX_SOURCE_LIST 且当前是 lxmusic，仍应重试激活
     force_lx_activate = (
         new_provider == "lxmusic"
-        and "LX_SOURCE_URL" in updates
-        and bool(after.get("LX_SOURCE_URL"))
+        and ("LX_SOURCE_URL" in updates or "LX_SOURCE_LIST" in updates)
+        and bool(after.get("LX_SOURCE_URL") or after.get("LX_SOURCE_LIST"))
     )
 
     if not changed and not force_lx_activate and not _preview_until:
@@ -578,18 +779,53 @@ async def api_config_put(body: ConfigBody, request: Request):
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, new_provider))
-    # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，或用户重试激活）
-    if new_provider == "lxmusic" and (lx_url_changed or force_lx_activate):
-        client = get_http(request)
+
+    async def _lx_source_post(payload: dict, source: str, op: str) -> str:
+        api_payload: dict = {}
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
-                                     json={"url": after["LX_SOURCE_URL"]}, timeout=130.0)
-            payload = _resp_json(resp)
-            ok = resp.status_code == 200 and payload.get("ok", False)
-            err = "" if ok else (payload.get("error") or f"HTTP {resp.status_code}")
+                                     json=payload, timeout=130.0)
+            api_payload = _resp_json(resp)
+            ok = resp.status_code == 200 and api_payload.get("ok", False)
+            err = "" if ok else (api_payload.get("error") or f"HTTP {resp.status_code}")
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
-        actions.append({"kind": "lx_activate", "ok": ok, "error": err or ""})
+        actions.append({"kind": "lx_activate", "op": op, "source": source,
+                        "ok": ok, "error": err or ""})
+        return str(api_payload.get("source_id") or "") if ok else ""
+
+    # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
+    if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
+        if lx_reconcile:
+            for item in to_deactivate:
+                url = str(item.get("url") or "").strip()
+                await _lx_source_post({"url": url, "enabled": False},
+                                      str(item.get("name") or "") or url, "deactivate")
+            target_ids: set[str] = set()
+            for item in active_items:
+                url = str(item["url"]).strip()
+                sid = await _lx_source_post({"url": url},
+                                            str(item.get("name") or "") or url, "activate")
+                if sid:
+                    target_ids.add(sid)
+            # 不仅比较已写入的 .env：失败的停用仍会出现在实际启用集合中。
+            # 只有所有目标激活成功才清理额外脚本，避免失败时误停旧的可用源。
+            if not any(not a["ok"] for a in actions if a.get("op") == "activate"):
+                try:
+                    actual = await _lx_enabled_sources(request)
+                    for s in actual:
+                        sid = str(s.get("id") or "")
+                        url = str(s.get("url") or "")
+                        if sid in target_ids or url in new_active:
+                            continue
+                        if sid or url:
+                            await _lx_source_post({"url": sid or url, "enabled": False},
+                                                  str(s.get("name") or sid or url), "deactivate")
+                except Exception as exc:
+                    actions.append({"kind": "lx_activate", "op": "reconcile", "source": "",
+                                    "ok": False, "error": str(exc)})
+        else:
+            await _lx_source_post({"url": after["LX_SOURCE_URL"]}, "", "activate")
     elif new_provider == "musicdl" and (
         "FNMUSIC_ONLINE_SOURCES" in changed or "MUSICDL_SOURCES" in changed
     ):
@@ -727,6 +963,175 @@ async def netease_qr(unikey: str = Query(...)):
     return Response(content=buf.getvalue(), media_type="image/svg+xml")
 
 
+@app.post("/api/fs-check")
+async def api_fs_check():
+    """目录权限校验占位端点（直连 8774 场景）。
+
+    桌面链路（统一网关）中该路径由宿主机侧 webui_gateway（root）拦截应答，
+    不会到达这里；能到达说明是独立浏览器/直连端口环境，WebUI 容器内看不到
+    宿主机真实目录，无法给出可信的可写性结论，明确回 501 让前端降级放行。
+    """
+    raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
+
+
+# ------------------------------------------------------------------ 关于页 --
+
+ABOUT = {
+    "author": "javycoder",
+    "author_url": "https://github.com/javycoder",
+    "repo_url": "https://github.com/javycoder/fnos_music_ext",
+    "issues_url": "https://github.com/javycoder/fnos_music_ext/issues",
+}
+
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_DISCLAIMER_HEADING = "## 免责与版权声明"
+
+
+def _strip_md_inline(text: str) -> str:
+    """剥离 markdown 行内语法（链接取文字、加粗/斜体/代码去符号），保留纯文本。"""
+    text = _MD_LINK_RE.sub(r"\1", text)
+    return re.sub(r"[*`_]", "", text).strip()
+
+
+def _read_disclaimer() -> "list[dict[str, str]]":
+    """解析 README.md 尾部「免责与版权声明」小节为 [{title, text}] 列表。
+
+    与 README 单一来源同步：仓库 README 改了这里跟着变；解析失败返回空列表，
+    前端隐藏该卡片（比内置过时副本更稳妥）。
+    """
+    try:
+        lines = (Path(CONF["repo_dir"]) / "README.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    items: list[dict[str, str]] = []
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == _DISCLAIMER_HEADING)
+    except StopIteration:
+        return []
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped.startswith("## "):  # 下一节（上游致谢）截止
+            break
+        if not stripped.startswith("- "):
+            continue
+        text = _strip_md_inline(stripped[2:])
+        if not text:
+            continue
+        # 「标题：说明」按首个全角冒号拆两行展示，无冒号整句展示
+        title, sep, desc = text.partition("：")
+        items.append({"title": title.strip(), "text": desc.strip()} if sep else {"title": text, "text": ""})
+    return items
+
+
+def _export_log_files(directory: Path):
+    """关于页与导出共用清单：近 3 天的普通文件，不跟随符号链接。"""
+    cutoff = time.time() - RETENTION_DAYS * 86400
+    try:
+        for item in sorted(directory.iterdir(), key=lambda p: p.name):
+            try:
+                st = item.lstat()
+                if (stat.S_ISREG(st.st_mode) and item.suffix != ".logzip"
+                        and st.st_mtime >= cutoff):
+                    yield item, st
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _log_files_info() -> "list[dict]":
+    """可导出的日志文件清单（名称/大小/修改时间），不展示临时导出包。"""
+    return [
+        {"name": item.name, "size": st.st_size, "mtime": int(st.st_mtime)}
+        for item, st in _export_log_files(log_dir())
+    ]
+
+
+def _write_log_archive(directory: Path, target: Path) -> None:
+    """在线程池中执行日志读取、压缩与环境探测。"""
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item, listed in _export_log_files(directory):
+            try:
+                # lstat 后文件仍可能被换成链接/FIFO；打开时也拒绝跟随/阻塞。
+                fd = os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as source:
+                    opened = os.fstat(source.fileno())
+                    if (not stat.S_ISREG(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)):
+                        continue
+                    with zf.open(item.name, "w") as member:
+                        shutil.copyfileobj(source, member)
+            except OSError:
+                continue
+        snapshot = "\n".join(env_snapshot_lines(
+            "container" if Path("/.dockerenv").exists() else "host"))
+        zf.writestr("export_env_snapshot.txt", snapshot + "\n")
+
+
+class _LogExportResponse(FileResponse):
+    """临时目录仅属于本响应，发送结束（含中断/异常）后才清理。"""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # FileResponse 的 BackgroundTask 在发送异常/某些 Range 响应中不会运行。
+            # finally + shield 保证这些路径也不会留下包；从不扫描/删除其他响应的文件。
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(shutil.rmtree, Path(self.path).parent)
+
+
+@app.get("/api/about")
+async def api_about():
+    values = read_env()
+    return {
+        "ok": True,
+        "version": _read_version(),
+        "deploy_mode": values.get("FNMUSIC_DEPLOY_MODE", "docker"),
+        **ABOUT,
+        "disclaimer": _read_disclaimer(),
+        # 打赏二维码是包内可选资源（CI 从 ALIPAY_QRCODE secret 生成）；
+        # 开源发布包不带此文件，此时不展示打赏卡片
+        "donate": (STATIC_DIR / "alipay.png").is_file(),
+        "logs": _log_files_info(),
+        "log_retention_days": RETENTION_DAYS,
+    }
+
+
+@app.get("/api/logs/export")
+async def api_logs_export():
+    """近 3 天日志 + 环境快照；下载名为 <YYYYMMDDHHMMSS>.logzip。
+
+    每个请求独占系统临时目录（不在日志目录内，避免日志清理影响下载）。
+    压缩在线程池执行；仅在本响应发送结束后清理，不保留历史导出包，
+    因此磁盘占用限于仍在压缩/发送的请求，同秒导出也不会互相覆盖。
+    """
+    directory = log_dir()
+    filename = f"{time.strftime('%Y%m%d%H%M%S')}.logzip"
+    temp_dir = None
+    try:
+        # 不能在 worker 仍写包时取消并删除其目录；等压缩结束再移交给响应。
+        with anyio.CancelScope(shield=True):
+            try:
+                temp_dir = Path(await run_in_threadpool(tempfile.mkdtemp, prefix="fnmusic-log-export-"))
+                target = temp_dir / filename
+                await run_in_threadpool(_write_log_archive, directory, target)
+                response = _LogExportResponse(
+                    target,
+                    media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
+            except BaseException:
+                if temp_dir is not None:
+                    await run_in_threadpool(shutil.rmtree, temp_dir, ignore_errors=True)
+                raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[diag] log_export_failed error=%s", type(exc).__name__)
+        return JSONResponse(content={"ok": False, "error": f"日志打包失败: {exc}"}, status_code=500)
+    logger.info("[diag] log_export file=%s", filename)
+    return response
+
+
 # ------------------------------------------------------------------ 静态前端 --
 
 @app.get("/")
@@ -786,3 +1191,43 @@ class AuthMiddleware:
 
 app.add_middleware(AuthMiddleware)
 app.add_middleware(DesktopPrefixMiddleware)
+
+
+class NoCacheStaticMiddleware:
+    """HTML 与静态资源强制协商缓存。
+
+    响应原本只有 etag/last-modified、没有 Cache-Control，飞牛桌面 WebView 与
+    浏览器会按启发式缓存沿用旧页面——升级后版本文案（接口）是新的、菜单却
+    缺失（新 HTML 没被加载）。no-cache 每次带 etag 回源验证，命中即 304。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # 无论本中间件位于 DesktopPrefix 内层还是外层，/static/ 子串都能匹配
+        no_cache_path = "/static/" in (scope.get("path") or "")
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start" and (
+                    no_cache_path or _is_html(message)):
+                message = dict(message)
+                message["headers"] = list(message.get("headers", [])) + [
+                    [b"cache-control", b"no-cache"],
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _is_html(message) -> bool:
+    for key, value in message.get("headers", []):
+        if key.lower() == b"content-type" and value.lower().startswith(b"text/html"):
+            return True
+    return False
+
+
+app.add_middleware(NoCacheStaticMiddleware)

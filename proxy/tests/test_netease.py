@@ -11,6 +11,7 @@ from proxy.app import (
     app,
     CONF,
     _SEARCH_CACHE,
+    _NETEASE_URL_PIN,
     _set_search_cache,
     _clean_search_cache,
     fetch_musicbox_search,
@@ -18,12 +19,16 @@ from proxy.app import (
     resolve_netease_url,
     resolve_online_lyric,
     find_cache_file,
+    register_fake_album,
+    _FAKE_ALBUM_REGISTRY,
+    _transcode_source,
 )
 
 
 @pytest.fixture(autouse=True)
 def setup_netease_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
+    _NETEASE_URL_PIN.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -330,6 +335,120 @@ async def test_resolve_netease_url_all_fail():
     )
     url = await resolve_netease_url(client, "186016")
     assert url is None
+
+
+@pytest.mark.anyio
+async def test_resolve_netease_url_pin_reuse_refresh_drop():
+    """直链钉住：有效期内同一首歌复用同一条 CDN URL；refresh=True 强制重解析。
+
+    防 seek/续传/后台整轨/转码在 URL 缓存边界后重解析出不同 rendition（音质
+    降档时字节布局不同，带偏移续拉错位断流）。
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        assert request.url.params.get("fresh") == (None if calls["n"] == 1 else "1")
+        return httpx.Response(200, json={"ok": True, "data": {
+            "code": 200, "url": f"http://audio.test/{calls['n']}.flac", "expi": 1200,
+        }})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8770"
+    )
+    try:
+        u1 = await resolve_netease_url(client, "186016")
+        u2 = await resolve_netease_url(client, "186016")
+        assert u1 == u2 == "http://audio.test/1.flac"
+        assert calls["n"] == 1
+        u3 = await resolve_netease_url(client, "186016", refresh=True)
+        assert u3 == "http://audio.test/2.flac"
+        assert calls["n"] == 2
+        assert await resolve_netease_url(client, "186016") == u3
+        assert calls["n"] == 2
+        # 打不开的钉链被弃置（_open_online_stream 拒绝非 200/206 时调用）后重新解析
+        from proxy.app import _netease_url_pin_drop
+        _netease_url_pin_drop("186016")
+        assert await resolve_netease_url(client, "186016") == "http://audio.test/3.flac"
+        assert calls["n"] == 3
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_transcode_source_netease_returns_ua():
+    """转码输入源：网易直链带 UA（ffmpeg 与播放路径对齐），且命中钉住缓存。"""
+    calls = {"n": 0}
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": True, "data": {
+            "code": 200, "url": f"http://audio.test/tc{calls['n']}.flac", "expi": 1200,
+        }})
+
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    from starlette.requests import Request as StarletteRequest
+    req_obj = StarletteRequest({"type": "http", "app": app})
+    url, headers = await _transcode_source(req_obj, "online:netease:186016")
+    assert url == "http://audio.test/tc1.flac"
+    assert headers == {"User-Agent": "Mozilla/5.0"}
+    # 与播放共用同一条钉住直链：第二次转码解析不再打取链接口（rendition 一致）
+    url2, headers2 = await _transcode_source(req_obj, "online:netease:186016")
+    assert url2 == url and headers2 == headers
+    assert calls["n"] == 1
+
+
+def test_static_cover_album_anchor_falls_back_to_track_cover():
+    """网易专辑锚点行无封面字段时：借登记曲目 al.picUrl 出链，不再直接占位图。"""
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/song/186016/info":
+            return httpx.Response(200, json={"ok": True, "data": {
+                "name": "晴天", "ar": [{"name": "周杰伦"}],
+                "al": {"name": "叶惠美", "picUrl": "http://img.test/yhm.jpg"},
+                "dt": 269000, "sq": {"size": 25000000},
+            }})
+        return httpx.Response(404)
+
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    register_fake_album(
+        "online:netease:186016", "叶惠美",
+        item={"title": "晴天", "artist": "周杰伦", "cover_url": ""},
+    )
+    fake_album = fake_official_guid("online:netease:186016:album")
+    try:
+        with TestClient(app) as client:
+            resp = client.get(f"/music/api/v1/static/cover?coverId=track_{fake_album}",
+                              follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "http://img.test/yhm.jpg"
+    finally:
+        _FAKE_ALBUM_REGISTRY.pop(fake_album, None)
+
+
+@pytest.mark.anyio
+async def test_fetch_musicbox_search_row_cover_used_without_detail():
+    """搜索行自带封面（web 兜底注入）时直接采用；详情接口缺失不再退回空封面。"""
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(200, json={"ok": True, "data": [{
+                "song_id": 186016, "song_name": "晴天", "artist": "周杰伦",
+                "album_name": "叶惠美", "duration": 269, "quality": "SQ 999k",
+                "album_pic_url": "http://img.test/from-row.jpg",
+            }]})
+        # /songs/detail 挂掉：行内封面必须保留
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    items = await fetch_musicbox_search(client, "晴天", 10)
+    await client.aclose()
+    assert items is not None and len(items) == 1
+    assert items[0]["cover_url"] == "http://img.test/from-row.jpg"
 
 
 # =========================================================================
@@ -1189,3 +1308,273 @@ def test_search_musicbox_only_skips_musicdl(monkeypatch):
         assert len(items) == 1
         assert items[0]["guid"] == fake_official_guid("online:netease:228908")
         assert called["musicdl"] == 0
+
+
+def test_netease_pin_hard_capacity(monkeypatch):
+    import importlib
+    proxy_app = importlib.import_module("proxy.app")
+    monkeypatch.setattr(proxy_app, "_NETEASE_URL_PIN_MAX", 2)
+    proxy_app._NETEASE_URL_PIN.clear()
+    try:
+        for i in range(5):
+            proxy_app._netease_url_pin_store(str(i), "https://media.test/song", 300)
+        assert len(proxy_app._NETEASE_URL_PIN) == 2
+        assert "4" in proxy_app._NETEASE_URL_PIN
+    finally:
+        proxy_app._NETEASE_URL_PIN.clear()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("refresh", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_netease_concurrent_resolution_shares_rendition(refresh, failure):
+    import importlib
+    p = importlib.import_module("proxy.app")
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    if refresh:
+        p._netease_url_pin_store("123", "http://cdn.test/old.flac", 1200)
+
+    async def handler(request):
+        calls.append(request)
+        entered.set()
+        await release.wait()
+        # A second resolution would deliver a different rendition.
+        return httpx.Response(200, json={"ok": True, "data": {
+            "code": 404 if failure else 200,
+            "url": None if failure else f"http://cdn.test/{len(calls)}.flac", "expi": 1200,
+        }})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://mb.test") as client:
+        first = asyncio.create_task(resolve_netease_url(client, "123", refresh=refresh))
+        await entered.wait()
+        second = asyncio.create_task(resolve_netease_url(client, "123", refresh=refresh))
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.gather(first, second) == ([None] * 2 if failure else ["http://cdn.test/1.flac"] * 2)
+    assert len(calls) == (4 if failure else 1)
+    assert not p._NETEASE_URL_INFLIGHT
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cancel_leader", [False, True])
+@pytest.mark.parametrize("expired_pin", [False, True])
+async def test_netease_inflight_cancellation_uses_live_callers_client(cancel_leader, expired_pin):
+    import importlib
+    p = importlib.import_module("proxy.app")
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    if expired_pin:
+        p._NETEASE_URL_PIN["123"] = ("http://cdn.test/expired.flac", time.monotonic() - 1)
+
+    async def leader_handler(request):
+        assert request.url.params.get("fresh") == ("1" if expired_pin else None)
+        calls.append("leader")
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"ok": True, "data": {"code": 200, "url": "http://cdn.test/A.flac"}})
+
+    def waiter_handler(request):
+        assert request.url.params.get("fresh") == ("1" if expired_pin else None)
+        calls.append("waiter")
+        return httpx.Response(200, json={"ok": True, "data": {"code": 200, "url": "http://cdn.test/B.flac"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(leader_handler), base_url="http://leader.test") as a:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(waiter_handler), base_url="http://waiter.test") as b:
+            leader = asyncio.create_task(resolve_netease_url(a, "123"))
+            await entered.wait()
+            waiter = asyncio.create_task(resolve_netease_url(b, "123"))
+            await asyncio.sleep(0)
+            cancelled = leader if cancel_leader else waiter
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            if cancel_leader:
+                await a.aclose()
+                assert await waiter == "http://cdn.test/B.flac"
+                assert calls == ["leader", "waiter"]
+            else:
+                await b.aclose()
+                release.set()
+                assert await leader == "http://cdn.test/A.flac"
+                assert calls == ["leader"]
+    assert not p._NETEASE_URL_INFLIGHT
+
+
+@pytest.mark.anyio
+async def test_netease_negative_cache_and_pin_expiry_refresh(monkeypatch):
+    """普通冷失败保留负缓存；TTL过期、dead pin与显式refresh仍旁路。"""
+    import importlib.util
+    import sys
+    import types
+    from pathlib import Path
+    import importlib
+    p = importlib.import_module("proxy.app")
+    path = Path(__file__).resolve().parents[2] / "musicbox-service" / "netease_ext.py"
+    spec = importlib.util.spec_from_file_location("netease_negative_cache_test", path)
+    ne = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ne)
+    calls, params = [], []
+
+    class Config:
+        config = {"music_quality": {"value": "standard"}}
+        def get(self, key):
+            return self.config[key]["value"]
+
+    class Api:
+        def songs_url(self, ids):
+            calls.append(Config().get("music_quality"))
+            return [{"id": ids[0], "code": 404, "url": None}]
+
+    monkeypatch.setitem(sys.modules, "NEMbox.config", types.SimpleNamespace(Config=Config))
+    monkeypatch.setattr(ne, "_get_api_locked", lambda: Api())
+
+    def handler(request):
+        q = dict(request.url.params)
+        params.append(q)
+        data = ne.get_song_url(123, q["quality"], fresh=q.get("fresh") == "1")
+        return httpx.Response(200, json={"ok": True, "data": data})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://mb.test") as client:
+        for _ in range(3):
+            assert await resolve_netease_url(client, "123") is None
+        assert len(calls) == 4 and all("fresh" not in q for q in params)
+        for mode in ("expired", "dropped", "explicit"):
+            params.clear()
+            if mode == "expired":
+                p._NETEASE_URL_PIN["123"] = ("http://cdn.test/old.flac", time.monotonic() - 1)
+            elif mode == "dropped":
+                p._netease_url_pin_store("123", "http://cdn.test/dead.flac", 1200)
+                p._netease_url_pin_drop("123")
+            assert await resolve_netease_url(client, "123", refresh=mode == "explicit") is None
+            assert len(params) == 4 and all(q.get("fresh") == "1" for q in params)
+            assert "123" not in p._NETEASE_URL_PIN
+    assert len(calls) == 16
+
+
+@pytest.mark.anyio
+async def test_netease_dead_pin_refresh_without_search_cache(monkeypatch):
+    import importlib
+    from starlette.requests import Request
+    p = importlib.import_module("proxy.app")
+    guid = "online:netease:123"
+    p._netease_url_pin_store("123", "http://cdn.test/dead.flac", 1200)
+    resolved, fetched = [], []
+
+    def mb_handler(request):
+        resolved.append(dict(request.url.params))
+        return httpx.Response(200, json={"ok": True, "data": {"code": 200, "url": "http://cdn.test/live.flac"}})
+
+    def cdn_handler(request):
+        fetched.append(str(request.url))
+        if "dead" in str(request.url):
+            return httpx.Response(404)
+        return httpx.Response(206, content=b"live", headers={"content-type": "audio/flac", "content-range": "bytes 100-103/104"})
+
+    real_client = httpx.AsyncClient
+    async with real_client(transport=httpx.MockTransport(mb_handler), base_url="http://mb.test") as client:
+        monkeypatch.setattr(p, "get_musicbox_client", lambda a: client)
+        monkeypatch.setattr(p, "_retained_track", lambda *a: ({"ext": "flac"}, None))
+        monkeypatch.setattr(p, "find_cache_file", lambda *a: None)
+        monkeypatch.setattr(p, "_register_full_fetch", lambda *a: None)
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(cdn_handler), **kw))
+        req = Request({"type": "http", "app": app, "method": "GET", "path": "/music/api/v1/track/stream", "query_string": f"guid={guid}".encode(), "headers": [(b"range", b"bytes=100-103")]})
+        response = await p.stream_track(req)
+        assert response.status_code == 206
+        assert b"".join([chunk async for chunk in response.body_iterator]) == b"live"
+    assert fetched == ["http://cdn.test/dead.flac", "http://cdn.test/live.flac"]
+    assert resolved == [{"quality": "lossless", "fresh": "1"}]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("album", [False, True])
+async def test_cover_does_not_fetch_slow_lyrics(monkeypatch, album):
+    import importlib
+    from starlette.requests import Request
+    p = importlib.import_module("proxy.app")
+    guid = "online:netease:123"
+    calls = []
+
+    async def handler(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("/lyric"):
+            await asyncio.Event().wait()
+        return httpx.Response(200, json={"ok": True, "data": {"name": "Song", "al": {"picUrl": "http://img.test/real.jpg"}}})
+
+    monkeypatch.setattr(p, "album_entry_from_real_guid", lambda g: {"item": {}, "track_guid": guid} if album else None)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://mb.test") as client:
+        monkeypatch.setattr(p, "get_musicbox_client", lambda a: client)
+        req = Request({"type": "http", "app": app, "path": "/music/api/v1/static/cover", "query_string": f"guid={guid}".encode(), "headers": []})
+        response = await asyncio.wait_for(p.static_cover(req), timeout=0.5)
+        assert response.status_code == 302
+        assert response.headers["location"] == "http://img.test/real.jpg"
+    assert calls == ["/api/v1/song/123/info"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("early_disconnect", [False, True])
+async def test_tee_buffered_close_failure_cleans_every_resource(tmp_path, monkeypatch, early_disconnect):
+    import importlib
+    from unittest.mock import Mock
+    p = importlib.import_module("proxy.app")
+    guid = "online:netease:123"
+    parts = []
+    active = {}
+    monkeypatch.setattr(p, "_tee_active", active)
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    monkeypatch.setattr(p, "tee_save_dir", lambda: str(tmp_path))
+    finalize, handoff = Mock(), Mock()
+    monkeypatch.setattr(p, "_tee_finalize", finalize)
+    monkeypatch.setattr(p, "_register_tee_handoff", handoff)
+    real_open = open
+
+    class BufferedCloseFailure:
+        def __init__(self, path):
+            parts.append(path)
+            self.fp = real_open(path, "wb")
+        def write(self, data):
+            return self.fp.write(data)
+        def close(self):
+            self.fp.close()
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(p, "open", lambda path, mode: BufferedCloseFailure(path), raising=False)
+    metadata_started = asyncio.Event()
+    metadata_cancelled = asyncio.Event()
+
+    async def metadata():
+        metadata_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            metadata_cancelled.set()
+
+    class Audio(httpx.AsyncByteStream):
+        closed = False
+        async def __aiter__(self):
+            yield b"a" * 2048
+            yield b"b" * 2048
+        async def aclose(self):
+            self.closed = True
+
+    class Owned:
+        closed = False
+        async def aclose(self):
+            self.closed = True
+
+    audio, owned = Audio(), Owned()
+    resp = httpx.Response(200, stream=audio, headers={"content-type": "audio/flac", "content-length": "4096"})
+    result = p.stream_tee_response(resp, guid, None, coro_factory=metadata, client_to_close=owned)
+    first = await anext(result.body_iterator)
+    await metadata_started.wait()
+    if early_disconnect:
+        await result.body_iterator.aclose()
+    else:
+        remaining = b"".join([chunk async for chunk in result.body_iterator])
+        assert first + remaining == b"a" * 2048 + b"b" * 2048
+    assert resp.is_closed and audio.closed and owned.closed
+    assert not active and metadata_cancelled.is_set()
+    assert parts and all(not os.path.exists(path) for path in parts)
+    finalize.assert_not_called()
+    handoff.assert_not_called()

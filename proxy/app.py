@@ -40,6 +40,8 @@ try:
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
+    from .fnlog import diag as fn_diag
+    from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
@@ -47,10 +49,14 @@ except ImportError:  # uvicorn --app-dir proxy
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
+    from fnlog import diag as fn_diag  # type: ignore
+    from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# 本地文件日志（logs/proxy.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+setup_logging("fnmusic_proxy", "proxy")
 
 _HOME = dailyrec.home_dir()
 
@@ -103,7 +109,8 @@ CONF = {
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
     "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
-    "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
+    # 空串同样回退默认：WebUI 允许把该键清空（恢复默认），热重载也走这条回退
+    "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR") or os.path.join(_HOME, "cache"),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
     "cover_dir": os.environ.get("FNMUSIC_COVER_DIR", ""),
@@ -169,9 +176,12 @@ CONF = {
     ),
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
-    # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order）；
+    # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order，只影响在线取源）；
     # 推荐双开关 / 封面补全 / .env 热重载默认开，均可被 .env 覆盖
     "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
+    # App 下载档（2.8.0）：app=跟随 App 显式请求，未知/缺省一律原文件（不擅自有损
+    # 转码）；original=强制原文件；standard=强制 MP3 320k（官方"标准"档语义）
+    "dl_quality": (os.environ.get("FNMUSIC_DL_QUALITY") or "app").strip().lower(),
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
@@ -474,7 +484,8 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
 # === .env 热重载（FNMUSIC_ENV_WATCH=1 默认开） ===
 # WebUI 切源 / 手工编辑 .env 后无需重启 proxy：白名单键同步进 CONF 与
 # os.environ（recommend 的 LLM 配置直接读环境变量），并清空搜索缓存让
-# 新选音源立即生效。路径/端口类配置不在白名单，仍需重启。
+# 新选音源立即生效。储存目录两键（FNMUSIC_TEE_SAVE_DIR/FNMUSIC_CACHE_DIR）
+# 已白名单化热重载；其余路径/端口类配置不在白名单，仍需重启。
 _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
@@ -487,9 +498,13 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
+    "FNMUSIC_DL_QUALITY": ("dl_quality", "dl_quality"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
+    # 歌曲缓存目录（WebUI「储存 → 目录设置」可改）：变更时把已落库歌曲的
+    # .ref 去重标记迁到新目录，避免换目录后同一首歌重新出网、曲库重复
+    "FNMUSIC_CACHE_DIR": ("cache_dir", "cache_dir"),
     "FNMUSIC_FAV_AUTO_BIND": ("fav_auto_bind", "bool"),
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": ("official_bind_timeout_s", "bind_timeout"),
     "FNMUSIC_TEE_HANDOFF_MAX": ("tee_handoff_max", "tee_handoff_max"),
@@ -536,6 +551,9 @@ def _env_watch_parse(raw: str, kind: str):
     raw = str(raw or "").strip()
     if kind == "bool":
         return raw.lower() in ("true", "1", "yes")
+    if kind == "cache_dir":
+        # 空值=恢复默认（<home>/cache）；解析前 os.environ 已写入原始串，不能用环境变量兜底
+        return raw or os.path.join(dailyrec.home_dir(), "cache")
     if kind == "tee_cache_max":
         try:
             return max(1, min(100, int(raw)))
@@ -543,6 +561,8 @@ def _env_watch_parse(raw: str, kind: str):
             return None
     if kind == "quality_mode":
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
+    if kind == "dl_quality":
+        return raw.lower() if raw.lower() in ("app", "original", "standard") else None
     if kind == "lx_sources":
         return _normalize_lx_sources(raw)
     if kind == "llm_url":
@@ -580,6 +600,41 @@ def _env_watch_parse(raw: str, kind: str):
     return raw
 
 
+def _migrate_media_refs(old_dir: str, new_dir: str) -> int:
+    """cache_dir 变更后把旧目录的 *.ref 去重标记复制到新目录（不删原件）。
+
+    .ref 记录已落库歌曲的文件词干，丢了会让同一首歌重新出网、曲库出现重复
+    文件；用复制而非搬移，迁移失败（旧目录不可读等）只告警不阻断热重载。
+    """
+    if not old_dir or not new_dir or old_dir == new_dir:
+        return 0
+    try:
+        names = os.listdir(old_dir)
+    except OSError:
+        return 0
+    try:
+        os.makedirs(new_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning("cache_dir 迁移：无法创建 %s: %s", new_dir, exc)
+        return 0
+    moved = 0
+    for name in names:
+        if not name.endswith(".ref"):
+            continue
+        dst = os.path.join(new_dir, name)
+        if os.path.exists(dst):
+            moved += 1
+            continue
+        try:
+            shutil.copyfile(os.path.join(old_dir, name), dst)
+            moved += 1
+        except OSError as exc:
+            logger.warning("cache_dir 迁移：%s 复制失败: %s", name, exc)
+    if moved:
+        logger.info("cache_dir 变更：已迁移 %d 个 .ref 去重标记到 %s", moved, new_dir)
+    return moved
+
+
 def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     """解析 .env 应用白名单键；返回发生变化的 CONF 键名（空 = 无变化）。
 
@@ -588,6 +643,7 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     path = env_path or _env_watch_path()
     kv = dict(parse_env_file(path)[0])
     changed: list[str] = []
+    old_cache_dir = CONF.get("cache_dir")
     for env_key, (conf_key, kind) in _ENV_WATCH_KEYS.items():
         if env_key not in kv:
             continue
@@ -598,6 +654,8 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         if conf_key and CONF.get(conf_key) != value:
             CONF[conf_key] = value
             changed.append(conf_key)
+    if "cache_dir" in changed:
+        _migrate_media_refs(old_cache_dir or "", CONF["cache_dir"])
     return changed
 
 
@@ -631,6 +689,18 @@ def _cancel_daily_tasks() -> None:
             old.cancel()
 
 
+async def _log_retention_loop() -> None:
+    """日志保留独立于配置监听开关，按小时检查三天期限。"""
+    while True:
+        try:
+            await asyncio.to_thread(purge_stale)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("log retention failed: %s", type(exc).__name__)
+        await asyncio.sleep(3600)
+
+
 async def _env_watch_loop() -> None:
     last = _env_watch_stat()
     while True:
@@ -658,6 +728,9 @@ async def _env_watch_loop() -> None:
                         ",".join(sorted(_SOURCE_CONF_KEYS & set(changed))), removed,
                     )
                 logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
+                # 功能开启情况留档（[cfg] 行进本地日志，秘密值打码）
+                for key in sorted(changed):
+                    logger.info("[cfg] %s", redact(f"{key}={CONF.get(key)}"))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -927,10 +1000,46 @@ def source_from_online_guid(guid: str) -> str:
 
 
 # 搜索结果在线条目的来源标记（仅显示，不入库不影响业务逻辑）：
-# 网易盒子→[music box]，musicdl→[dl]，洛雪→激活源备注名（无备注则 [lx]）
+# 网易盒子→[music box]，musicdl→[dl]，洛雪→逐曲 [脚本名-平台]（如 [墨澜-kg]）；
+# 多源同时激活且平台无法唯一归属某脚本时脚本名退 "lx"；平台未知回退备注名/[lx]
 _SOURCE_TAG_NETEASE = "[music box] "
 _SOURCE_TAG_MUSICDL = "[dl] "
 _SOURCE_TAG_LX_FALLBACK = "[lx] "
+
+# lx 搜索固定走平台官方接口（lxserver 内置 musicSdk），自定义源脚本仅参与播放链接解析，
+# 故逐曲归属 = 平台（item["lx_source"] / id "lx:<平台>:"）+ 脚本名（该平台唯一归属的
+# 激活脚本，按 lxmusic /api/v1/source 的 sources[].platforms 声明判定；多个脚本声明
+# 同一平台时无法归属，脚本名落 "lx"）。
+_LX_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
+
+
+def lx_platform_from_item(item: dict | None) -> str:
+    """lx 条目的平台码（kw/kg/tx/wy/mg）；非 lx 条目或平台未知返回空。
+
+    优先取 item["lx_source"]（lxmusic 搜索逐曲携带），回退解析 id/guid 第 3 段。"""
+    if not isinstance(item, dict):
+        return ""
+    platform = str(item.get("lx_source") or "").strip().lower()
+    if platform in _LX_PLATFORMS:
+        return platform
+    raw_id = str(item.get("id") or "")
+    if raw_id.startswith("online:"):
+        raw_id = raw_id[len("online:"):]
+    parts = raw_id.split(":")
+    if len(parts) >= 2 and parts[0] == "lx":
+        platform = parts[1].strip().lower()
+        if platform in _LX_PLATFORMS:
+            return platform
+    return ""
+
+
+# 平台→激活脚本名 映射缓存：lx 搜索时异步刷新（TTL 内复用），同步标记路径只读；
+# 不在搜索缓存条目上固化标签，以便后续响应使用最新映射。
+_LX_SCRIPT_MAP_CACHE: dict = {"ts": -1.0, "by_platform": {}}
+_LX_SCRIPT_MAP_TTL = 60.0
+_LX_SCRIPT_MAP_STALE_S = 300.0
+_LX_SCRIPT_MAP_TASK: asyncio.Task | None = None
+_LX_DISPLAY_TAGS: dict[str, None] = {}
 
 
 def _lx_source_entries() -> list[dict]:
@@ -942,22 +1051,119 @@ def _lx_source_entries() -> list[dict]:
 
 
 def _lx_source_remark() -> str:
-    """当前激活洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。"""
+    """当前洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。
+
+    仅单激活源可归属（多源/无备注返回空），作为脚本名与平台未知条目的回退标记。"""
+    entries = _lx_source_entries()
+    active = [e for e in entries if e.get("active")]
+    if active:
+        return str(active[0].get("name") or "").strip() if len(active) == 1 else ""
     url = str(CONF.get("lx_source_url") or "").strip()
     if not url:
         return ""
-    for entry in _lx_source_entries():
+    for entry in entries:
         if str(entry.get("url") or "").strip() == url:
             return str(entry.get("name") or "").strip()
     return ""
 
 
-def source_display_prefix(src: str) -> str:
-    """在线条目来源标记前缀：netease→[music box]，lx→备注名或 [lx]，其余(musicdl 平台)→[dl]。"""
+async def refresh_lx_script_map(client: httpx.AsyncClient) -> dict[str, str]:
+    """构建 平台→激活脚本名 映射并刷新缓存；返回该映射（TTL 内直接复用缓存）。
+
+    归属规则：仅 1 个激活脚本 → 全平台归属它；多脚本时仅"该平台的声明脚本唯一"
+    才归属（A 声明 kg、B 声明 wy → kg→A、wy→B；A/B 都声明 kg → kg 不归属）。
+    描述接口不可用（lxmusic 未启用/超时）时回退 LX_SOURCE_LIST 单激活备注。"""
+    if _LX_SCRIPT_MAP_CACHE["ts"] >= 0 and time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] < _LX_SCRIPT_MAP_TTL:
+        return dict(_LX_SCRIPT_MAP_CACHE["by_platform"])
+    by_platform: dict[str, str] = {}
+    sources: "list[dict] | None" = None
+    try:
+        r = await client.get("/api/v1/source", timeout=5.0)
+        if r.status_code == 200:
+            data = r.json()
+            raw = data.get("data") if isinstance(data, dict) else None
+            raw = raw.get("sources") if isinstance(raw, dict) else None
+            if isinstance(raw, list):
+                sources = [s for s in raw if isinstance(s, dict)]
+    except Exception:
+        sources = None
+    if sources is None:
+        remark = _lx_source_remark()
+        if remark:
+            by_platform = dict.fromkeys(_LX_PLATFORMS, remark)
+    else:
+        # 脚本名优先用管理台备注名（按 URL 对齐），无匹配再用脚本自带名
+        remarks_by_url = {
+            str(e.get("url") or "").strip(): str(e.get("name") or "").strip()
+            for e in _lx_source_entries()
+        }
+        scripts: list[tuple[str, set[str]]] = []
+        for s in sources:
+            name = remarks_by_url.get(str(s.get("url") or "").strip()) or str(s.get("name") or "").strip()
+            raw_platforms = s.get("platforms")
+            platforms = {
+                p for p in raw_platforms if isinstance(p, str) and p in _LX_PLATFORMS
+            } if isinstance(raw_platforms, list) else set()
+            # 未声明/畸形平台按全平台处理；无名脚本也计入归属，不能让另一源冒领。
+            scripts.append((name, platforms or set(_LX_PLATFORMS)))
+        if len(scripts) == 1 and scripts[0][0]:
+            by_platform = dict.fromkeys(_LX_PLATFORMS, scripts[0][0])
+        else:
+            for p in _LX_PLATFORMS:
+                owners = [n for n, ps in scripts if p in ps]
+                if len(owners) == 1 and owners[0]:
+                    by_platform[p] = owners[0]
+    _LX_SCRIPT_MAP_CACHE["ts"] = time.monotonic()
+    _LX_SCRIPT_MAP_CACHE["by_platform"] = by_platform
+    return by_platform
+
+
+def _schedule_lx_script_map_refresh(client: httpx.AsyncClient) -> None:
+    global _LX_SCRIPT_MAP_TASK
+    if _LX_SCRIPT_MAP_CACHE["ts"] >= 0 and time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] < _LX_SCRIPT_MAP_TTL:
+        return
+    loop = asyncio.get_running_loop()
+    if (_LX_SCRIPT_MAP_TASK is not None and not _LX_SCRIPT_MAP_TASK.done()
+            and _LX_SCRIPT_MAP_TASK.get_loop() is loop):
+        return
+    _LX_SCRIPT_MAP_TASK = loop.create_task(refresh_lx_script_map(client))
+    _LX_SCRIPT_MAP_TASK.add_done_callback(_finish_lx_script_map_refresh)
+
+
+def _finish_lx_script_map_refresh(task: asyncio.Task) -> None:
+    """回收 single-flight 引用并取出异常，后台标签刷新失败不影响搜索。"""
+    global _LX_SCRIPT_MAP_TASK
+    if _LX_SCRIPT_MAP_TASK is task:
+        _LX_SCRIPT_MAP_TASK = None
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("lx script map refresh failed: %s", type(exc).__name__)
+
+
+def _lx_script_for_platform(platform: str) -> str:
+    """同步侧解析脚本名：条目未注记 lx_script 时用映射缓存（容忍过期）→ 单激活备注。"""
+    if time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] <= _LX_SCRIPT_MAP_STALE_S:
+        name = _LX_SCRIPT_MAP_CACHE["by_platform"].get(platform)
+        if name:
+            return name
+    return _lx_source_remark()
+
+
+def source_display_prefix(src: str, item: dict | None = None) -> str:
+    """在线条目来源标记前缀：netease→[music box]，lx→逐曲 [脚本名-平台]
+    （如 [墨澜-kg]；脚本无法归属落 lx，平台未知回退备注名或 [lx]），其余→[dl]。"""
     s = str(src or "").strip()
     if s == "netease":
         return _SOURCE_TAG_NETEASE
     if s == "lx":
+        platform = lx_platform_from_item(item)
+        if platform:
+            script = ""
+            if isinstance(item, dict):
+                script = str(item.get("lx_script") or "").strip()
+            script = script or _lx_script_for_platform(platform)
+            return f"[{script or 'lx'}-{platform}] "
         remark = _lx_source_remark()
         return f"[{remark}] " if remark else _SOURCE_TAG_LX_FALLBACK
     if s:
@@ -966,14 +1172,18 @@ def source_display_prefix(src: str) -> str:
 
 
 def strip_source_tag(title: str) -> str:
-    """剥离来源标记前缀。仅精确匹配已知标记（含列表里全部洛雪备注名），
-    不用泛化正则，避免误伤本身以方括号开头的歌名。"""
+    """剥离来源标记前缀。仅精确匹配已知标记（含 [脚本名-平台] 全部变体与
+    列表里全部洛雪备注名），不用泛化正则，避免误伤本身以方括号开头的歌名。"""
     t = str(title or "")
-    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK]
+    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK, *_LX_DISPLAY_TAGS]
+    script_parts = {"lx", *_LX_SCRIPT_MAP_CACHE["by_platform"].values()}
     for entry in _lx_source_entries():
         name = str(entry.get("name") or "").strip()
         if name:
             candidates.append(f"[{name}] ")
+            script_parts.add(name)
+    for name in script_parts:
+        candidates.extend(f"[{name}-{p}] " for p in _LX_PLATFORMS)
     # 优先匹配最长标记，避免前缀部分命中短备注名
     candidates.sort(key=len, reverse=True)
     for tag in candidates:
@@ -992,8 +1202,12 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
     if mark_source and title:
-        prefix = source_display_prefix(src)
+        prefix = source_display_prefix(src, item)
         if prefix:
+            if src == "lx":
+                _LX_DISPLAY_TAGS[prefix] = None
+                if len(_LX_DISPLAY_TAGS) > 4096:
+                    _LX_DISPLAY_TAGS.pop(next(iter(_LX_DISPLAY_TAGS)))
             title = prefix + title
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
@@ -2017,7 +2231,8 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                 "album": album,
                 "duration_s": duration_s,
                 "ext": ext,
-                "cover_url": "",
+                # 主接口被风控走 web 兜底时行内自带封面；正常路径仍由 /songs/detail 补全覆盖
+                "cover_url": str(it.get("album_pic_url") or it.get("cover_url") or ""),
                 "lyric": "",
             })
             song_ids.append(sid)
@@ -2145,6 +2360,8 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
                 "lyric": "",
                 "verified": it.get("verified") is True,
             })
+        # 显示标签刷新不能占用搜索预算；响应渲染时读取最新映射。
+        _schedule_lx_script_map_refresh(client)
         return _SearchItems([it for it in items if is_playable_online_track(it, allow_paywall=allow_paywall)], partial=bool(data.get("errors")))
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
@@ -2180,8 +2397,18 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
-    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False) -> "dict | None":
+    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
+
+    fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
+    重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。"""
+    key = str(song_id)
+    if not fresh:
+        pin = _LX_URL_PIN.get(key)
+        if pin:
+            if time.monotonic() < pin[1]:
+                return dict(pin[0])
+            _LX_URL_PIN.pop(key, None)
     primary = str(CONF.get("lx_quality") or "lossless").strip()
     qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2189,9 +2416,12 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
 
     for q in qualities:
         try:
+            params = {"id": song_id, "quality": q}
+            if fresh:
+                params["fresh"] = "1"
             r = await client.get(
                 "/api/v1/track/url",
-                params={"id": song_id, "quality": q},
+                params=params,
                 # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 20s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
                 timeout=22.0,
@@ -2201,13 +2431,116 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
                 if isinstance(data, dict) and data.get("ok") is not False:
                     inner = data.get("data")
                     if isinstance(inner, dict) and inner.get("url"):
-                        return inner
+                        _lx_url_pin_store(key, inner)
+                        return dict(inner)
         except Exception as e:
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
     return None
 
 
-async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
+# 洛雪直链钉住（2.8.0j）：与网易钉链同构。窗口型播放内核按 1MB 窗口续拉，
+# 每个窗口各自重解析；lxmusic 虽有 600s 成功缓存 + 到期探活续期，但缓存边界
+# 后旧链失效重解析时，同曲可能换 rendition（实测同曲 lossless 档可从 320k MP3
+# 换成 48k AAC，字节布局完全不同），带偏移的续拉即错位断流，表象仍为"播到
+# 一半跳歌"。有效期内钉住同一条解析结果，取流/续传/转码各调用点自动一致。
+_LX_URL_PIN: "dict[str, tuple[dict, float]]" = {}
+_LX_URL_PIN_MAX = 1024
+# 与 lxmusic LX_URL_CACHE_TTL 默认值对齐：钉链到期时 lxmusic 缓存同样到期，
+# 由其探活续期保持同链或重解析，proxy 侧不自行强制 fresh
+_LX_URL_PIN_TTL_S = 600.0
+
+
+def _lx_url_pin_drop(song_id: str) -> None:
+    """直链打不开/首字节失败即弃钉：后续解析重新出链，不再撞同一条死链。"""
+    _LX_URL_PIN.pop(str(song_id), None)
+
+
+def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
+    """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
+    now = time.monotonic()
+    if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
+        for k in [k for k, v in _LX_URL_PIN.items() if v[1] <= now]:
+            _LX_URL_PIN.pop(k, None)
+        if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
+            oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
+            _LX_URL_PIN.pop(oldest, None)
+    _LX_URL_PIN[str(song_id)] = (resolved, now + _LX_URL_PIN_TTL_S)
+
+
+# 网易直链钉住（2.8.0）：song_id -> (url, 过期时刻单调钟)。窗口型播放内核
+# seek/暂停续播、后台整轨、断点续传、转码会各自重新解析；musicbox 对取链结果
+# 缓存 600s，缓存边界后重解析可能因音质阶梯降档拿到不同 rendition——新旧文件
+# 字节布局不同，带偏移的续拉会 416/错位断流，表象即"播到一半跳歌"。同一首歌
+# 在直链有效期内钉住同一条 CDN URL，全部调用点自动一致。
+_NETEASE_URL_PIN: "dict[str, tuple[str, float]]" = {}
+# 钉链表容量上限：过期是惰性清理（同 key 再查才剔），必须配硬顶防进程
+# 生命周期内无限增长（与洛雪取链缓存同思路）
+_NETEASE_URL_PIN_MAX = 1024
+# 同键解析串行化；状态仅在调用者/等待者存活期间保留，并按事件循环隔离。
+# 不启动脱离调用者的后台解析任务：取消 leader 后，等待者使用自己的 client 接管。
+_NETEASE_URL_INFLIGHT: dict = {}
+
+
+def _netease_url_pin_drop(song_id: str) -> None:
+    key = str(song_id)
+    pin = _NETEASE_URL_PIN.get(key)
+    if pin:
+        # 保留有界的失效标记，让后台普通调用也旁路旧成功缓存；不是负缓存。
+        _NETEASE_URL_PIN[key] = (pin[0], 0.0)
+
+
+def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
+    """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
+    now = time.monotonic()
+    if len(_NETEASE_URL_PIN) >= _NETEASE_URL_PIN_MAX:
+        for k in [k for k, v in _NETEASE_URL_PIN.items() if v[1] <= now]:
+            _NETEASE_URL_PIN.pop(k, None)
+        if len(_NETEASE_URL_PIN) >= _NETEASE_URL_PIN_MAX:
+            oldest = min(_NETEASE_URL_PIN, key=lambda k: _NETEASE_URL_PIN[k][1])
+            _NETEASE_URL_PIN.pop(oldest, None)
+    _NETEASE_URL_PIN[str(song_id)] = (url, now + ttl)
+
+
+async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: bool = False) -> str | None:
+    key = str(song_id)
+    observed_pin = _NETEASE_URL_PIN.get(key)
+    if not refresh and observed_pin and time.monotonic() < observed_pin[1]:
+        return observed_pin[0]
+    gate_key = (asyncio.get_running_loop(), key)
+    state = _NETEASE_URL_INFLIGHT.get(gate_key)
+    if state is None:
+        state = {"lock": asyncio.Lock(), "users": 0, "completed": False, "result": None}
+        _NETEASE_URL_INFLIGHT[gate_key] = state
+    state["users"] += 1
+    try:
+        async with state["lock"]:
+            if state["completed"] and state["result"] is None:
+                # 同一批失败请求也共享结果，避免 refresh 等待者重复出网。
+                return None
+            pin = _NETEASE_URL_PIN.get(key)
+            if pin and time.monotonic() < pin[1] and (not refresh or pin is not observed_pin):
+                # 等待期间已完成刷新：全部调用者沿用该 rendition，不再次覆盖。
+                return pin[0]
+            fresh = refresh or pin is not None or observed_pin is not None
+            if pin:
+                _NETEASE_URL_PIN.pop(key, None)
+            try:
+                result = await _resolve_netease_url_uncached(client, key, fresh)
+                state["result"], state["completed"] = result, True
+                return result
+            except asyncio.CancelledError:
+                # 取消不能消费掉过期/死链标记：下一位 caller 仍须旁路旧成功缓存。
+                if pin and key not in _NETEASE_URL_PIN:
+                    _netease_url_pin_store(key, pin[0], -1.0)
+                raise
+    finally:
+        state["users"] -= 1
+        if not state["users"]:
+            _NETEASE_URL_INFLIGHT.pop(gate_key, None)
+
+
+async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str, fresh: bool) -> str | None:
+    key = str(song_id)
     primary = str(CONF.get("netease_quality") or "lossless").strip()
     qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2215,7 +2548,11 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
 
     for q in qualities:
         try:
-            r = await client.get(f"/api/v1/song/{song_id}/url", params={"quality": q}, timeout=10.0)
+            params = {"quality": q}
+            if fresh:
+                # 仅明确刷新、过期/失效钉链旁路；普通冷请求保留 musicbox 负缓存。
+                params["fresh"] = "1"
+            r = await client.get(f"/api/v1/song/{song_id}/url", params=params, timeout=10.0)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, dict) and data.get("ok") is not False:
@@ -2224,7 +2561,16 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
                         code = inner.get("code")
                         url = inner.get("url")
                         if code == 200 and url:
-                            return str(url)
+                            url = str(url)
+                            # TTL 以服务端 expi（秒）为准，预留 60s 网络余量；上限 30min，
+                            # 无 expi 时保守 5min。失败重解析由调用方 refresh=True 触发。
+                            try:
+                                expi = float(inner.get("expi") or 0)
+                            except (TypeError, ValueError):
+                                expi = 0.0
+                            ttl = min(max(expi - 60.0, 60.0), 1800.0) if expi > 60.0 else 300.0
+                            _netease_url_pin_store(key, url, ttl)
+                            return url
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s", song_id, q, e)
     return None
@@ -2846,13 +3192,19 @@ async def _lyric_orphan_sweeper() -> None:
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
+    global _LX_SCRIPT_MAP_TASK
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
     logger.info("==================================")
+    # 运行环境快照（issue 诊断 + 日志导出）：宿主视角落 proxy.log 与 env_snapshot.txt
+    for line in env_snapshot_lines("host"):
+        logger.info(line)
+    write_env_snapshot("host")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
+    log_task = asyncio.create_task(_log_retention_loop()) if _background_jobs_enabled() else None
     env_task = asyncio.create_task(_env_watch_loop()) if (
         _background_jobs_enabled() and CONF.get("env_watch", True)
     ) else None
@@ -2891,6 +3243,15 @@ async def lifespan(fastapi_app: FastAPI):
         )
         created_lx = True
 
+    # 预热 平台→激活脚本名 映射：首次搜索的标记渲染是同步读缓存，映射刷新又是
+    # 搜索触发的后台任务，冷启动时来不及完成，第一屏会全部退回 [lx-平台]。
+    # 启动即拉一次（失败静默，搜索路径自带兜底与 TTL 重试）。
+    if CONF.get("lx_enabled"):
+        _LX_SCRIPT_MAP_TASK = asyncio.create_task(
+            refresh_lx_script_map(get_lx_client(fastapi_app))
+        )
+        _LX_SCRIPT_MAP_TASK.add_done_callback(_finish_lx_script_map_refresh)
+
     if getattr(fastapi_app.state, "llm_client", None) is None:
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
@@ -2909,6 +3270,14 @@ async def lifespan(fastapi_app: FastAPI):
         if env_task:
             env_task.cancel()
             await asyncio.gather(env_task, return_exceptions=True)
+        if log_task:
+            log_task.cancel()
+            await asyncio.gather(log_task, return_exceptions=True)
+        map_task = _LX_SCRIPT_MAP_TASK
+        _LX_SCRIPT_MAP_TASK = None
+        if map_task is not None and map_task.get_loop() is asyncio.get_running_loop():
+            map_task.cancel()
+            await asyncio.gather(map_task, return_exceptions=True)
         try:
             await tc.shutdown_all()
         except Exception:  # noqa: BLE001
@@ -2935,19 +3304,26 @@ app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
 
 @app.middleware("http")
 async def log_client_requests(request: Request, call_next):
-    """记录 /music/ 请求的方法/路径/状态/UA，供 App 端兼容问题远程定位。
+    """记录 /music/ 请求的方法/路径/状态/UA/耗时/Host/XFF，供 App 端兼容问题远程定位。
 
-    不记 query（guid 无必要），UA 折叠空白并截断，配合 takeover 日志白名单的固定格式。
+    不记 query（guid 无必要），UA 折叠空白并截断；host/xff 用于反代场景诊断
+    （issue #49 外网反代后不能播/无封面），格式与 takeover 日志白名单对齐。
     """
+    started = time.monotonic()
     response = await call_next(request)
     if request.url.path.startswith("/music/"):
         ua = re.sub(r"\s+", " ", request.headers.get("user-agent") or "-")[:100]
+        host = re.sub(r"\s+", " ", request.headers.get("host") or "-")[:80]
+        xff = "yes" if request.headers.get("x-forwarded-for") else "no"
         logger.info(
-            "client request %s %s status=%s ua=%s",
+            "client request %s %s status=%s ua=%s ms=%d host=%s xff=%s",
             request.method,
             request.url.path,
             response.status_code,
             ua,
+            (time.monotonic() - started) * 1000,
+            host,
+            xff,
         )
     return response
 
@@ -3637,6 +4013,10 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
         os.replace(part, dest)
     logger.info("tee finalize done for %s: dest=%s", guid, dest)
+    # issue #52 重复曲目/未知歌手-未知曲目：留档标题/歌手/格式，配合 missing metadata
+    # 告警可定位重复文件对与元数据缺失来源
+    fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+            ext=ext or "?", tee=tee_enabled)
     # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
     # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
     if tee_enabled and CONF.get("lyric_auto_dl"):
@@ -3764,27 +4144,73 @@ def stream_tee_response(
         info_task = None
         tee_active_token = False
         upstream_aborted = False
+
+        def _close_tee_file() -> None:
+            nonlocal fp, part
+            if fp is None:
+                return
+            closing, fp = fp, None
+            try:
+                closing.close()
+            except OSError as disk_exc:
+                # buffered write 可能到 close/flush 才报磁盘满；弃件但继续清理连接。
+                logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                _remove_quiet(part)
+                part = None
+
         try:
             tee_enabled = bool(CONF.get("tee_save_enabled"))
             if should_cache(range_header) and full_resource:
-                directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
-                os.makedirs(directory, exist_ok=True)
-                part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
-                fp = open(part, "wb")
-                tee_active_token = _tee_active_acquire(guid)
-                if pre_info is None and coro_factory:
-                    info_task = asyncio.create_task(coro_factory())
+                try:
+                    directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
+                    os.makedirs(directory, exist_ok=True)
+                    part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
+                    fp = open(part, "wb")
+                except OSError as disk_exc:
+                    # 建目录/开文件失败（磁盘满/权限）：放弃落库照常播放
+                    logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                    part = None
+                if fp:
+                    tee_active_token = _tee_active_acquire(guid)
+                    if pre_info is None and coro_factory:
+                        info_task = asyncio.create_task(coro_factory())
+
+            def _abandon_tee_part() -> None:
+                # 本地写盘失败（磁盘满/IO 错）只放弃边听边存，绝不上抛掐断播放流：
+                # 上游是好的，客户端不能为落库买单。弃件清走，handoff 条件随之失效。
+                nonlocal fp, part
+                if fp:
+                    try:
+                        fp.close()
+                    except OSError:
+                        pass
+                    fp = None
+                if part and os.path.exists(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
+                part = None
+
             iterator = chunks if chunks is not None else resp.aiter_bytes()
             if first_chunk:
                 if fp:
-                    fp.write(first_chunk)
+                    try:
+                        fp.write(first_chunk)
+                    except OSError as disk_exc:
+                        logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                        _abandon_tee_part()
                 written += len(first_chunk)
                 yield first_chunk
             try:
                 async for chunk in iterator:
                     if chunk:
                         if fp:
-                            fp.write(chunk)
+                            try:
+                                fp.write(chunk)
+                            except OSError as disk_exc:
+                                logger.warning("tee disk write failed for %s: %s", guid, type(disk_exc).__name__)
+                                _abandon_tee_part()
                         written += len(chunk)
                         yield chunk
             except Exception as exc:
@@ -3794,11 +4220,12 @@ def stream_tee_response(
                 # here) and stay silent on purpose.
                 upstream_aborted = True
                 logger.warning("Stream aborted mid-way for %s: %s", guid, type(exc).__name__)
+                # issue #48/#50 播放中途断流：补齐断点细节（已发字节 vs 期望总长）
+                fn_diag(logger, "stream_abort_detail", guid=guid, written=written,
+                        expected=expected if expected is not None else -1, range=range_header or "-")
                 raise
             eof = True
-            if fp:
-                fp.close()
-                fp = None
+            _close_tee_file()
             if part and eof and written >= 1024 and (expected is None or written == expected):
                 # 无论客户端连接此时是否已关闭（curl 接收完直接 EOF 退出，Starlette 会 aclose 生成器），
                 # 完整的音频已全部接收完毕，落盘与标签写入必须受 shield 保护完整执行完毕，
@@ -3831,9 +4258,7 @@ def stream_tee_response(
                             except OSError:
                                 pass
         finally:
-            if fp:
-                fp.close()
-                fp = None
+            _close_tee_file()
             resume_part = None
             if part and os.path.exists(part):
                 # 切歌/客户端退出不中断下载：未写完的 part 交接给后台续传任务完成
@@ -3922,8 +4347,11 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
 
 
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
-                              force_mp3: bool = False):
-    """Resolve and read first bytes before committing HTTP headers to the client."""
+                              force_mp3: bool = False, fresh_url: bool = False, refresh: bool = False):
+    """Resolve and read first bytes before committing HTTP headers to the client.
+
+    fresh_url：lx 直链解析旁路 lxmusic 成功缓存强制刷新（仅重试路径使用）。
+    refresh：网易钉住直链弃钉强制重解析（仅重试路径使用）。"""
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
     headers = {"Accept-Encoding": "identity"}
@@ -3936,11 +4364,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     try:
         if source in ("netease", "lx"):
             if source == "netease":
-                url = await resolve_netease_url(get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+                song_id = song_id_from_online_guid(guid).split(":")[-1]
+                url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh)
                 if not url:
                     return None
             else:
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+                song_id = song_id_from_online_guid(guid)
+                resolved = await resolve_lx_url(get_lx_client(request.app), song_id, fresh=fresh_url)
                 if not resolved:
                     return None
                 url = resolved["url"]
@@ -3972,17 +4402,35 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             if (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
                 params["quality"] = "mp3"
             req = client.build_request("GET", "/stream", params=params, headers=headers)
-        resp = await client.send(req, stream=True)
-        content_type = resp.headers.get("content-type", "").lower()
-        if (resp.status_code not in (200, 206)
-                or any(x in content_type for x in ("text/", "json"))
-                or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
-            # Reject servers ignoring identity: decoded bytes cannot use encoded
-            # Content-Length/Range offsets, and must not enter the audio cache.
-            return None
-        chunks = resp.aiter_bytes()
-        first = await anext(chunks, b"")
+        try:
+            resp = await client.send(req, stream=True)
+            content_type = resp.headers.get("content-type", "").lower()
+            if (resp.status_code not in (200, 206)
+                    or any(x in content_type for x in ("text/", "json"))
+                    or resp.headers.get("content-encoding", "identity").strip().lower() not in ("", "identity")):
+                # Reject servers ignoring identity: decoded bytes cannot use encoded
+                # Content-Length/Range offsets, and must not enter the audio cache.
+                if source == "netease":
+                    # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
+                    _netease_url_pin_drop(song_id)
+                elif source == "lx":
+                    _lx_url_pin_drop(song_id)
+                return None
+            chunks = resp.aiter_bytes()
+            first = await anext(chunks, b"")
+        except Exception:
+            # 网易钉链在连接/首字节阶段就失败（超时/重置）：同样弃钉——后台取流
+            # 路径不携带 refresh=True，否则会在 TTL 内反复撞同一条死链
+            if source == "netease":
+                _netease_url_pin_drop(song_id)
+            elif source == "lx":
+                _lx_url_pin_drop(song_id)
+            raise
         if not first:
+            if source == "netease":
+                _netease_url_pin_drop(song_id)
+            elif source == "lx":
+                _lx_url_pin_drop(song_id)
             return None
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
@@ -4132,12 +4580,14 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
     return base
 
 
-async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False) -> None:
+async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False,
+                               fresh_url: bool = False) -> None:
     """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。
 
     无损档解码校验失败时按 guid 拉黑并自动以 mp3 档重试一次（服务端
     quality=mp3），两次都坏才宣告失败——坏字节绝不入库。
-    """
+    fresh_url：解析直链时旁路 lxmusic 成功缓存（续传回退/坏流重试等确认旧链
+    不可信的路径使用，force_mp3 重试同样强制刷新）。"""
     part = None
     resp = None
     owned = None
@@ -4145,7 +4595,8 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         # 合成最小 Request scope（触发请求的凭证头 + app 实例），完整复用在线取
         # 流的解析/元数据/首字节校验逻辑；Range 传 None 保证拿到完整资源。
         fake_request = _synth_request(cred_headers)
-        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3)
+        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3,
+                                           fresh_url=fresh_url or force_mp3)
         if not opened:
             raise RuntimeError("open failed")
         resp, owned, ext, info, chunks, first = opened
@@ -4299,7 +4750,9 @@ async def _tee_handoff_download(guid: str, part: str, written: int, expected: in
     if resumed:
         return
     _remove_quiet(part)
-    await _full_fetch_download(guid, cred_headers)
+    # 续传失败（打开失败/非 206/长度不符）大概率是解析直链已失效：整轨重下时
+    # 旁路 lxmusic 成功缓存强制刷新，避免拿同一条死链再失败一轮
+    await _full_fetch_download(guid, cred_headers, fresh_url=True)
 
 
 async def _resume_part_download(guid: str, part: str, written: int, expected: int | None,
@@ -4959,8 +5412,14 @@ async def stream_track(request: Request, subpath: str = ""):
             if remaining <= 0:
                 break
             try:
-                # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(6.0, remaining))
+                # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐；
+                # 重试（首次打开失败后）旁路 lxmusic 成功缓存并弃用网易钉住直链
+                # 强制重解析——首轮打不开的链不值得再试
+                opened = await asyncio.wait_for(
+                    _open_online_stream(request, candidate, range_header,
+                                        fresh_url=attempt > 0, refresh=attempt > 0),
+                    timeout=min(6.0, remaining),
+                )
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None
@@ -4995,8 +5454,14 @@ async def stream_track(request: Request, subpath: str = ""):
                     post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta))
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
-            if not await _recover_source(request, candidate, entry):
-                break
+            if source_from_online_guid(candidate) not in ("netease", "lx"):
+                if not await _recover_source(request, candidate, entry):
+                    break
+            # 直链源的 URL 刷新不依赖搜索缓存；收藏/重启/缓存过期也可有界重试。
+    # issue #51/#52：搜到但不能播的最终结局留档（候选源、启用状态）
+    fn_diag(logger, "stream_unresolved", guid=guid,
+            candidates=",".join(list(dict.fromkeys(candidates))[:3]),
+            enabled=",".join(c for c in list(dict.fromkeys(candidates))[:3] if _source_enabled(c)) or "none")
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
@@ -5012,7 +5477,11 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
         if source == "netease":
             url = await resolve_netease_url(
                 get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
-            return (url or None, None)
+            if not url:
+                return None, None
+            # 与播放路径对齐：ffmpeg 拉网易 CDN 也带 UA，降低源站拒无头客户端导致的
+            # 转码中途退出（表现为标准音质下播一半分片 404 跳歌）
+            return url, {"User-Agent": "Mozilla/5.0"}
         if source == "lx":
             resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
             if not resolved or not resolved.get("url"):
@@ -5022,6 +5491,8 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             return str(resolved["url"]), headers or None
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
+            # issue #46 音质降级：无损流损坏拉黑后降级 mp3，留档实际交付格式
+            fn_diag(logger, "lossless_downgrade", guid=guid, path="transcode_source", tier="mp3")
             url += "&quality=mp3"
         return url, None
     except Exception as e:  # noqa: BLE001
@@ -5153,11 +5624,13 @@ async def track_transcode(request: Request):
 #   prepare POST {trackGUID, quality}  → data{status:"success", errno, errmsg, downloadId}
 #   status  GET ?downloadId=           → data{status:"waiting|transcoding|ready|failed",
 #                                             errno, errmsg, downloadId, percent}
-#   file    GET ?downloadId=           → 音频字节（audio/mpeg，支持断点）
+#   file    GET ?downloadId=           → 音频字节（支持断点，Content-Type 按扩展名）
 #   delete  POST {downloadId}          → data{downloadId, deleted:true}
-# 官方"标准"档 = MP3 320kbps（FLAC 源实测 320067bps）；源已是 mp3 时直接供原文件
-# 不做无意义重编码。官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当
-# guid 是在线曲目才接管，本地曲目与未知 downloadId 一律透传官方。
+# 档位（2.8.0 修复"FLAC 下载变 MP3"）：只有 App 显式请求"标准"档（standard 词表）
+# 才交 MP3 320k；未知档位词与缺省一律交付原文件——2.6.3-2.7.0 缺省=standard，
+# App 无损偏好下发的 quality 值落到缺省被擅自转码。dl_quality 可整体强制覆盖。
+# 官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当 guid 是在线曲目才接管，
+# 本地曲目与未知 downloadId 一律透传官方。
 _DL_TASKS: dict[str, dict] = {}
 _DL_TASK_TTL_S = 3600.0
 _DL_TRANSCODE_SUBDIR = "dltrans"
@@ -5165,6 +5638,28 @@ _DL_TRANSCODE_SUBDIR = "dltrans"
 
 def _dl_transcode_path(guid: str) -> str:
     return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.mp3")
+
+
+# App 请求词命中才算显式要"标准"档（MP3 320k）；其余一律按原始档交付
+_DL_STANDARD_WORDS = ("standard", "std", "mp3", "标准")
+
+
+def _dl_effective_quality(raw_quality: str, is_original: bool) -> str:
+    """下载交付档位：original=原文件，standard=MP3 320k。
+
+    2.6.3-2.7.0 的词表只认 ("original","standard") 且缺省=standard，App 无损
+    偏好下发的 quality 值落到缺省，FLAC 被擅自转成 MP3（用户反馈的下载变
+    MP3）。现缺省跟随 App：standard 词表命中才转码，未知/缺省一律原文件；
+    dl_quality=original|standard 可整体强制覆盖（热重载）。
+    """
+    mode = str(CONF.get("dl_quality") or "app").strip().lower()
+    if mode in ("original", "standard"):
+        return mode
+    if is_original:
+        return "original"
+    if str(raw_quality or "").strip().lower() in _DL_STANDARD_WORDS:
+        return "standard"
+    return "original"
 
 
 def _dl_sweep() -> None:
@@ -5291,14 +5786,16 @@ async def dl_transcode_prepare(request: Request):
     guid = resolve_real_guid(raw_guid)
     if not is_online_guid(guid):
         return await _dl_forward(request)
-    quality = "standard"
+    quality = ""
     for key in ("quality", "qualityType"):
-        value = str(body.get(key) or request.query_params.get(key) or "").lower()
-        if value in ("original", "standard"):
+        value = str(body.get(key) or request.query_params.get(key) or "").strip()
+        if value:
             quality = value
             break
-    if body.get("isOriginal") is True:
-        quality = "original"
+    is_original = str(body.get("isOriginal") or "").strip().lower() in ("true", "1")
+    effective = _dl_effective_quality(quality, is_original)
+    logger.info("[dl] prepare guid=%s q=%s -> %s", raw_guid or guid, (quality or "-")[:40], effective)
+    quality = effective
     _dl_sweep()
     download_id = uuid4().hex
     task = {"guid": guid, "quality": quality, "state": "waiting", "percent": 0,
@@ -5334,7 +5831,8 @@ async def dl_transcode_file(request: Request):
     path = task.get("path")
     if task["state"] != "completed" or not path or not os.path.isfile(path):
         return JSONResponse(content={"code": 404, "msg": "not ready", "data": None}, status_code=404)
-    media = "audio/mpeg" if os.path.splitext(path)[1].lower() == ".mp3" else "audio/mp4"
+    # 转码产物固定 .mp3；原始档按真实扩展名交付（flac 不再错标 audio/mp4）
+    media = media_type_for_ext(os.path.splitext(path)[1].lstrip("."))
     fname = os.path.basename(path)
     fn_ext = os.path.splitext(fname)[1]
     quoted = quote(fname, encoding="utf-8")
@@ -5893,12 +6391,32 @@ async def static_cover(request: Request, subpath: str = ""):
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
-        cover = str((album_entry.get("item") or {}).get("cover_url") or "")
+        item = album_entry.get("item") if isinstance(album_entry.get("item"), dict) else {}
+        cover = str(item.get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
             return RedirectResponse(cover, status_code=302)
+        # 登记封面缺失（如网易锚点行本就不带封面字段）不再直接占位：借登记的
+        # 所属曲目走在线信息兜底（netease 由 al.picUrl 出链），再试直构，最后占位
+        track_guid = str(album_entry.get("track_guid") or "")
+        if track_guid and _source_enabled(track_guid):
+            data = await _online_info(request, track_guid, include_lyric=False)
+            cover = str((data or {}).get("cover_url") or "")
+            if cover and _KW_TEXT_COVER_HOST not in cover:
+                return RedirectResponse(cover, status_code=302)
+        direct = ""
+        kw_rid = _kw_rid_from_guid(track_guid or guid)
+        if kw_rid:
+            direct = await _kw_cover_by_rid(kw_rid)
+        if not direct:
+            direct = _qq_cover_by_albummid(str(item.get("albummid") or ""))
+        if direct:
+            return RedirectResponse(direct, status_code=302)
+        # issue #48 封面缺失：专辑锚点全链路未取到封面，留档各环节结果
+        fn_diag(logger, "cover_miss_album_anchor", guid=guid, anchor_cover=bool(cover),
+                kw=bool(kw_rid), qq=bool(item.get("albummid")))
         return _placeholder_cover_response(guid)
 
-    data = await _online_info(request, guid)
+    data = await _online_info(request, guid, include_lyric=False)
     cover = str((data or {}).get("cover_url") or "")
     # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
@@ -5926,6 +6444,9 @@ async def static_cover(request: Request, subpath: str = ""):
         return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
     # ⑤ 本地占位图池：在线曲目封面永不 404
+    # issue #48 封面缺失：四级回退全部落空才走到占位图，留档各环节结果
+    fn_diag(logger, "cover_miss", guid=guid, info=bool(data), cover_url=bool(cover),
+            kw_qq=bool(direct), enrich=bool(enriched), embedded=bool(embedded))
     return _placeholder_cover_response(guid)
 
 

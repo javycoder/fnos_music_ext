@@ -579,8 +579,9 @@ def test_lx_url_required_and_webui_choice_wiring():
     assert 'file:///data/lxmusic/uploads/' in text
     assert '洛雪源文件必须是 .js 后缀' in text
     assert '洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径' in text
-    # 容器内校验必须 --json，安装脚本才能按 category 分类提示
-    assert 'verify_source.py --json' in text
+    # 校验必须走 lxmusic HTTP 端点（verify_source.py --json 已无 CLI 入口，属死路径）
+    assert '/api/v1/source/verify' in text
+    assert 'verify_source.py --json' not in text
     # WebUI：CLI 双向开关 + 向导询问 + 非交互默认不装 + 写入 .env
     assert '--webui) WEBUI_CHOICE="yes"' in text
     assert '--no-webui) WEBUI_CHOICE="no"' in text
@@ -596,7 +597,8 @@ def test_env_flags_written_before_container_up():
     """先写 .env 三源开关再 compose up：entrypoint 首启即按需加载正确进程集。"""
     text = (BASE/'install.sh').read_text(encoding='utf-8')
     env_write = text.index('env_merge.py')
-    up_call = text.index('\ninstall_sources_container\n')
+    # v2.8.0a 起主流程经形态分派调用（缩进的 install_sources_container / install_sources_native）
+    up_call = text.index('\n    install_sources_container\n')
     assert env_write < up_call, '.env 开关必须先于单容器 up -d 写入'
 
 
@@ -664,10 +666,11 @@ def test_extend_lx_user_source_probe_states():
 
 def test_extend_docker_only_and_single_container_probe():
     text = (BASE/'extend.sh').read_text(encoding='utf-8')
-    # 仅 Docker 路径：无 host 分支，容器名固定 fnmusic-sources
-    assert '仅支持 Docker 部署' in text
+    # v2.8.0a 双形态分派：native 走宿主机 unit；docker 分支保持单容器 fnmusic-sources
+    assert 'DEPLOY_MODE="${FNMUSIC_DEPLOY_MODE:-docker}"' in text
+    assert 'ensure_native_sources' in text
+    assert 'NATIVE_UNIT_NAME' in text
     assert 'CONTAINER_NAME="fnmusic-sources"' in text
-    assert 'DEPLOY_MODE' not in text
     assert 'ensure_source ' not in text.replace('source_healthy ', '')
     # 全就绪时校验容器归属，防止借用其他 checkout 的容器
     assert 'reclaim_container "${CONTAINER_NAME}"' in text

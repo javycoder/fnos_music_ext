@@ -34,15 +34,17 @@ class FakeLxServerClient:
     """替身 LxServerClient，供离线单元测试使用。
 
     自定义源管理方法按 lxserver 真实契约模拟：上传以脚本 @name 派生唯一 id、
-    重复上传报"已存在"、toggle 以 enabled 键生效、activate 单源互斥。
+    重复上传报"已存在"、toggle 以 enabled 键生效、启用态可多源并存（set_source_enabled 只动目标）。
     """
 
     def __init__(self):
         self.alive = True
-        # 模拟 lxserver users/source/_open/sources.json 的列表项字段
+        # 模拟 lxserver users/source/_open/sources.json 的列表项字段（默认两个源、其一启用）
         self.sources = [
             {"id": "source1", "name": "test-src", "enabled": True, "version": "1.0.0",
-             "supportedSources": ["kw", "kg", "wy"]}
+             "supportedSources": ["kw", "kg", "wy"]},
+            {"id": "source2", "name": "test-src-2", "enabled": False, "version": "1.0.0",
+             "supportedSources": ["kw", "wy"]},
         ]
         self.search_results = [
             {
@@ -63,6 +65,14 @@ class FakeLxServerClient:
         self.upload_calls: list[tuple[str, str]] = []
         self.import_calls: list[str] = []
         self.deleted_ids: list[str] = []
+        # get_music_url 调用记录 (songmid, quality)：缓存/在途合并测试统计实际解析次数用
+        self.url_calls: list[tuple[str, str]] = []
+        # 同步记录每次调用的 excludeApiSources（换源轮换测试断言用）
+        self.url_excludes: list[list[str] | None] = []
+        # 非空时按序弹出作为 get_music_url 返回值（先于 url_result 判定），耗尽后返回 None
+        self.url_script: list[dict | None] = []
+        # 非空时 get_music_url 等待该事件（同测试循环内使用）：并发时序控制
+        self.url_gate: asyncio.Event | None = None
 
     @staticmethod
     def _derive_source_id(filename: str, script: str) -> str:
@@ -101,7 +111,14 @@ class FakeLxServerClient:
             res.append(item)
         return res
 
-    async def get_music_url(self, song_info: dict, quality: str = "128k") -> dict | None:
+    async def get_music_url(self, song_info: dict, quality: str = "128k",
+                            exclude_api_sources: list[str] | None = None) -> dict | None:
+        self.url_calls.append((str(song_info.get("songmid") or ""), quality))
+        self.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
+        if self.url_gate is not None:
+            await self.url_gate.wait()
+        if self.url_script:
+            return self.url_script.pop(0)
         if self.url_result:
             return dict(self.url_result)
         return None
@@ -166,14 +183,13 @@ class FakeLxServerClient:
             "supportedSources": ["kw", "wy"],
         }
 
-    async def activate_single_source(self, target_id_or_name: str) -> bool:
+    async def set_source_enabled(self, target_id_or_name: str, enabled: bool) -> bool:
+        """多源叠加语义：只改目标源启用态，不动其他源。目标不存在返回 False。"""
         target = self._find(target_id_or_name)
         if not target:
             return False
-        for s in self.sources:
-            enable = s is target
-            s["enabled"] = enable
-            self.toggle_calls.append((s["id"], enable))
+        target["enabled"] = bool(enabled)
+        self.toggle_calls.append((target["id"], bool(enabled)))
         return True
 
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:

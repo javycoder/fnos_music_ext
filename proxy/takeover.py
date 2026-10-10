@@ -506,6 +506,7 @@ def diagnostic(text):
 # allowlist covers source/search/stream/auth/recommend failures in the current app.
 _SAFE_OUTCOME = re.compile(
     r'(?:\[dl-capture\] [ -~]{0,600}|'
+    r'\[dl\] prepare [ -~]{0,300}|'
     r'audio decode check failed for [!-~]{1,120} \(ext=[a-z0-9]{1,8} bytes=[0-9]{1,12}\)|'
     r'retrying [!-~]{1,120} with mp3 tier after corrupt lossless stream|'
     r'tee finalize rejected corrupt lossless for [!-~]{1,120}|'
@@ -514,6 +515,7 @@ _SAFE_OUTCOME = re.compile(
     r'Failed to fetch musicbox search|musicdl search partial errors|'
     r'Suggest musicdl error|Stream startup failed|'
     r'Stream aborted mid-way for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'
+    r'tee disk write failed for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'
     r'stream probe: (?:GET|HEAD) [!-~]{1,140} range=[!-~]{0,80} '
     r'cached=(?:True|False) tee_eligible=(?:True|False)|'
     r'tee (?:diag|finalize|metadata) [ -~]{0,400}|'
@@ -525,7 +527,11 @@ _SAFE_OUTCOME = re.compile(
     r'llm call failed|daily recommend (?:peek|list inject|llm branch|fallback branch) failed|'
     r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge)|'
     r'(?:favorite|play history) list degraded to official-only|'
-    r'client request (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,180} status=[1-5][0-9]{2} ua=[ -~]{1,100})',
+    r'\[diag\] [ -~]{0,300}|'
+    r'\[cfg\] [ -~]{0,200}|'
+    r'\[env\] [ -~]{0,300}|'
+    r'client request (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,180} status=[1-5][0-9]{2} ua=[ -~]{1,100}'
+    r'(?: ms=[0-9]{1,7} host=[ -~]{1,80} xff=(?:yes|no))?)',
     re.I,
 )
 
@@ -770,10 +776,13 @@ def lock_holders(path='/run/fnmusic-ext-install/operation.lock'):
 DEPLOYMENT_FILE = Path('/var/lib/fnmusic-ext/deployment')
 
 
-def deployment_remember(base):
+def deployment_remember(base, deploy_mode=None):
     """Record this checkout as the active deployment (requires root)."""
     record = {'base': str(Path(base).resolve()),
               'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    if deploy_mode:
+        # docker | native（v2.8.0a+ 原生形态）；旧记录无此字段，按 docker 理解
+        record['deploy_mode'] = deploy_mode
     DEPLOYMENT_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     # Explicit chmod: the install chain may run under `umask 077` (install.sh
     # protects .env writes), which would silently tighten a fresh mkdir to
@@ -836,6 +845,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=30)
     parser.add_argument('--lock-file', default='/run/fnmusic-ext-install/operation.lock',
                         help='lock path for lock-holders (testing)')
+    parser.add_argument('--deploy-mode', choices=['docker', 'native'], default=None,
+                        help='deployment form recorded by deployment-remember')
     args = parser.parse_args()
     state = State(args.target, args.upstream, args.state_dir)
     try:
@@ -844,7 +855,7 @@ def main():
         elif args.command == 'lock-holders':
             lock_holders(args.lock_file)
         elif args.command == 'deployment-remember':
-            deployment_remember(args.base)
+            deployment_remember(args.base, args.deploy_mode)
         elif args.command == 'deployment-check':
             conflict = deployment_conflict(args.base)
             if conflict:

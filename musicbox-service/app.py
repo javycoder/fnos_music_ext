@@ -18,13 +18,26 @@ from netease_ext import (
     playlist_track_ids,
     reset_api,
     search_web_fallback,
+    song_detail_raw,
     song_lyric_pair,
     user_playlists as fetch_user_playlists,
 )
 import runner
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
+# 与其他服务对齐：不配 handler 时 INFO 会被丢弃（只剩 lastResort 的 WARNING+）
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("musicbox_service.app")
+try:  # 本地文件日志（logs/musicbox.log，按天滚动保留 3 天）；失败静默降级
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    from proxy.fnlog import setup_logging as _setup_logging
+
+    _setup_logging("musicbox_service.app", "musicbox")
+except Exception:  # noqa: BLE001  无 proxy/ 上下文（如独立调试）时仅 stdout
+    pass
 
 ensure_xdg_dirs()
 
@@ -191,12 +204,13 @@ def search(
 
 
 @app.get("/api/v1/song/{song_id}/url")
-def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh")):
+def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0)):
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
     # 进程内复用常驻实例解析（毫秒级，免 CLI 子进程冷启动）；失败再降级 CLI
-    # 兜底，保留 not_logged_in 等结构化错误语义
-    item = get_song_url(song_id, quality)
+    # 兜底，保留 not_logged_in 等结构化错误语义。fresh=1 旁路进程内取链缓存：
+    # 代理确认钉链失效后的强制重解析必须拿到新链，不能命中同一条死链
+    item = get_song_url(song_id, quality, fresh=bool(fresh))
     if item is not None:
         return {"ok": True, "data": item}
     return exec_musicbox(["song", "url", str(song_id), "--quality", quality, "--json"])
@@ -204,6 +218,11 @@ def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh")):
 
 @app.get("/api/v1/song/{song_id}/info")
 def song_info(song_id: int = Path(..., ge=1)):
+    # 进程内直取优先（毫秒级）：CLI 子进程冷启动常超代理侧 4s 预算，导致
+    # 封面/时长主路径超时回落。异常或空结果再降级 CLI 兜底。
+    raw = song_detail_raw(song_id)
+    if raw is not None:
+        return {"ok": True, "data": raw}
     return exec_musicbox(["song", "info", str(song_id), "--json"])
 
 
@@ -269,7 +288,11 @@ def _cli_error_or_raise(exc: UpstreamException) -> Any:
 
 
 def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
-    """CLI 推荐输出 -> 批量详情 + 可播过滤（未登录剔除 VIP/试听片段）。"""
+    """CLI 推荐输出 -> 批量详情 + 可播过滤（未登录剔除 VIP/试听片段）。
+
+    2.8.0 起批量详情不再内联可播过滤（封面与可播性解耦），推荐行的可播
+    过滤在此显式执行——推荐是可播列表用途，与纯展示封面不同。
+    """
     ids: list[int] = []
     if isinstance(rows, list):
         for it in rows:
@@ -281,7 +304,9 @@ def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
                 sid = 0
             if sid > 0:
                 ids.append(sid)
-    return batch_song_details(ids[:100])[:limit]
+    hydrated = batch_song_details(ids[:100])
+    playable = filter_playable_song_ids([int(row["song_id"]) for row in hydrated])
+    return [row for row in hydrated if int(row["song_id"]) in playable][:limit]
 
 
 @app.get("/api/v1/recommend/songs")

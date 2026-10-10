@@ -15,7 +15,7 @@
   ```
 - **管理员权限**：具备 `sudo` 执行权限的管理员账号（非交互安装需免密 sudo）；
 - **官方音乐应用**：必须先在 fnOS「应用中心」安装并启动「飞牛音乐」（确保存在 `/var/run/trim_music.socket`）；
-- **Docker（必需）**：v2.0.0 起**仅支持 Docker 部署**，必须先在 fnOS「应用中心」安装 Docker。未安装 Docker 的机器执行 `install.sh` 会直接报错退出；**脚本绝不会擅自安装 Docker 引擎**。
+- **Docker（默认形态需要）**：默认部署形态为 Docker 单容器，需先在 fnOS「应用中心」安装 Docker，脚本绝不会擅自安装 Docker 引擎。无 Docker 的机器可改用**原生部署**（`./install.sh --deploy native`，见下文「方式 C」），功能与 Docker 形态完全一致。
 
 克隆项目并进入根目录赋予执行权限（**仅脚本安装需要**，fpk 安装可跳过）：
 
@@ -29,10 +29,13 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 ## 1. 部署形态说明
 
-v2.0.0 起部署形态固定为两部分：
+v2.8.0 起支持两种音源部署形态（`.env` 的 `FNMUSIC_DEPLOY_MODE`），核心代理始终在宿主机 systemd 运行：
 
-1. **核心代理（宿主机 systemd）**：`fnmusic-ext.service` 运行在项目内独立虚拟环境 `.venv-proxy`，负责零侵入接管 `/var/run/trim_music.socket`。核心代理必须在宿主机运行——塞入容器会面临跨容器 socket 权限穿透问题。
-2. **音源单容器（Docker）**：`fnmusic-sources` 一个容器内含 musicdl / musicbox / lxmusic / WebUI 四个程序（supervisor 管理），**按 `.env` 只启动当前所选音源进程**，其余不驻留内存。运行期切源在 WebUI 内完成（写配置 + 同容器秒级 stop/start），无需重建容器。
+1. **核心代理（宿主机 systemd，两形态相同）**：`fnmusic-ext.service` 运行在项目内独立虚拟环境 `.venv-proxy`，负责零侵入接管 `/var/run/trim_music.socket`。核心代理必须在宿主机运行——塞入容器会面临跨容器 socket 权限穿透问题。
+2. **音源 · Docker 单容器（默认）**：`fnmusic-sources` 一个容器内含 musicdl / musicbox / lxmusic / WebUI 四个程序（supervisor 管理），**按 `.env` 只启动当前所选音源进程**，其余不驻留内存。运行期切源在 WebUI 内完成（写配置 + 同容器秒级 stop/start），无需重建容器。
+3. **音源 · 原生宿主机（无 Docker）**：同四个程序由宿主机 systemd unit `fnmusic-sources.service` 内的 supervisord 按需拉起，代码直接运行在仓库目录，Python 依赖装在 `.venv-sources`，lxserver 预编译包落位 `.lxserver/`，进程套接字与日志在 `sources-native/`。音源直接监听与容器发布一致的 `127.0.0.1` 端口，对外契约（端口/接口/`.env`/数据目录）与 Docker 形态完全一致。
+
+两种形态共用同一份 `.env` 与 `sources-data/` 数据目录；**同机互斥**，切换形态用 `./install.sh --deploy docker|native`（跨目录追加 `--adopt`）。
 
 | 端口 | 绑定地址 | 用途 |
 | :--- | :--- | :--- |
@@ -112,8 +115,41 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 常用参数：`--sources`（音源三选一）、`--lx-source-url`（可选：http(s) URL 或
 宿主机 `.js` 路径，路径会自动复制进数据卷）、`--lx-skip-verify`
 （跳过洛雪源可用性校验直接激活，源是否可用装好后在管理页 WebUI 查看）、
-`--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--adopt`（迁移部署登记）、
+`--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--deploy docker|native`
+（部署形态，缺省 docker）、`--adopt`（迁移部署登记）、
 `--qr`（仅扫码登录）。`--mode` 参数已随 host 模式移除。
+
+### 方式 C：原生部署（无 Docker）
+
+机器上没有 Docker（或不想依赖它）时，音源四程序以宿主机 systemd + supervisord
+直接运行，功能与 Docker 形态完全一致：
+
+```bash
+# 交互安装（Docker 不可用时会主动询问是否改用原生模式）
+./install.sh --deploy native
+
+# 非交互原生部署（网易云 + WebUI）
+./install.sh --non-interactive --deploy native --sources musicbox --webui --extend
+```
+
+原生形态前置要求与自动处理：
+
+- **Python 3.10+** 与 `python3-venv`（fnOS 自带 3.11 满足）；
+- **nodejs ≥ 16 / ffmpeg**：缺失时安装阶段自动 `sudo apt-get` 补装（失败会给出手动命令）；
+- **supervisor**：经 pip 装进 `.venv-sources`（无需系统包）；
+- **lxserver**：从 `container/lxserver-artifact/` 预置包或镜像加速链下载，sha256 校验后落位 `.lxserver/`，与 Docker 镜像同版本同补丁。
+
+常用运维（原生形态）：
+
+```bash
+sudo systemctl status fnmusic-sources        # 音源服务状态（supervisord 按需加载）
+sudo systemctl restart fnmusic-sources       # 手动改 .env 后重启对齐进程集
+sudo journalctl -u fnmusic-sources -f        # 日志
+ls sources-native/                           # supervisor 套接字与各程序日志
+```
+
+从 Docker 切换到原生（或反向）：同一目录直接 `./install.sh --deploy native` 即可，
+`.env` 与 `sources-data/` 数据原样共用，洛雪源 `file://` 路径自动迁移；跨目录切换追加 `--adopt`。
 
 ---
 
@@ -135,7 +171,8 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 **运行期换源/调参**：用飞牛管理员打开桌面「fnMusic 扩展管理」（若已装 WebUI），
 在「音乐源」分区单选切换——写配置与容器内进程切换一步完成，代理侧由热重载
-同步，全程无需命令行。音质偏好、推荐开关、边听边存、LLM 同理。
+同步，全程无需命令行。音质偏好、推荐开关、边听边存、储存目录（「储存 → 目录
+设置」：歌曲缓存目录/下载目录，支持飞牛文件选择器选目录或粘贴路径）、LLM 同理。
 
 ### 单机多副本约束与部署迁移（--adopt）
 
@@ -185,11 +222,14 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
      `pickUserFile` 文件选择器；直连 8774 的浏览器环境自动隐藏该按钮），
      选中 NAS 上的 `.js` 后由宿主侧网关代读内容，等效于上传。
   任一方式选定后点「测试」（下载→初始化→内置搜索→128k 解析→Range 探活），
-  通过后保存即热切换；
+  确认可用后点「添加」加入列表；列表支持**多源同时激活**——点各源的
+  「激活」/「取消激活」做好标记，点「保存并生效」统一校验并应用（新激活的源
+  会先自动校验，每个约需 1 分钟）。多个源同时启用时，解析失败会自动在启用的
+  源之间接力切换；
 - **安装时配置（可选）**：非交互 `--lx-source-url` 接受 `http(s)` URL 或宿主机
-  `.js` 文件路径（自动复制进数据卷并转 `file://`）；安装器在容器内运行
-  `verify_source.py` 做全链路校验，失败按分类提示。不提供则无源安装，
-  装好后在管理页配置；fpk 安装向导不再出现任何洛雪源输入项；
+  `.js` 文件路径（自动复制进数据卷并转 `file://`），逗号分隔可一次配置多个源
+  同时激活；安装器走 lxmusic 校验端点做全链路校验，失败按分类提示。不提供则
+  无源安装，装好后在管理页配置；fpk 安装向导不再出现任何洛雪源输入项；
 - **生效范围**：源脚本只在容器内 Node 沙箱中运行、仅可发起 HTTP 请求；
   搜索/歌词/热门榜单始终走内置平台接口，不依赖源脚本；
 - 未配置源时 lxmusic 的播放解析不可用（搜索/榜单不受影响），`/healthz` 的

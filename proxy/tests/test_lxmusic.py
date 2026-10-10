@@ -10,6 +10,7 @@ from proxy.app import (
     app,
     CONF,
     _SEARCH_CACHE,
+    _LX_URL_PIN,
     fetch_lx_search,
     resolve_lx_url,
     get_version,
@@ -21,6 +22,7 @@ from proxy.app import (
 @pytest.fixture(autouse=True)
 def setup_lx_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
+    _LX_URL_PIN.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -291,6 +293,182 @@ async def test_resolve_lx_url_all_fail():
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
     assert await resolve_lx_url(client, "lx:mg:600902") is None
     await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_fresh_param_passthrough():
+    """fresh=True 时请求带 fresh=1 旁路 lxmusic 缓存；默认不带该参数（issue #45）。"""
+    seen: "list[dict]" = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({
+            "id": request.url.params.get("id"),
+            "quality": request.url.params.get("quality"),
+            "fresh": request.url.params.get("fresh"),
+        })
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "x", "url": "http://audio.test/a.flac", "ext": "flac"}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    res = await resolve_lx_url(client, "lx:kg:ABCDEF1234567890", fresh=True)
+    assert res and res["url"] == "http://audio.test/a.flac"
+    n_fresh = len(seen)
+    # 首次解析已落钉链，清掉后才能再次打到 lxmusic 验证默认不带 fresh=1
+    _LX_URL_PIN.pop("lx:kg:ABCDEF1234567890", None)
+    res2 = await resolve_lx_url(client, "lx:kg:ABCDEF1234567890")
+    assert res2 and res2["url"] == "http://audio.test/a.flac"
+    assert n_fresh >= 1
+    assert all(p["fresh"] == "1" for p in seen[:n_fresh])
+    assert all(p["fresh"] is None for p in seen[n_fresh:])
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_pin_consistent_within_ttl():
+    """钉链（2.8.0i）：TTL 内重复解析零出网且 rendition 一致。
+
+    窗口型播放内核按 1MB 窗口各自重解析；同曲换 rendition（如 320k MP3 换
+    48k AAC）会让带偏移的续拉错位断流，表象即"播到一半跳歌"。"""
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "x", "url": f"http://audio.test/v{hits['n']}.flac", "ext": "flac"}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    first = await resolve_lx_url(client, "lx:kg:PINTEST1")
+    second = await resolve_lx_url(client, "lx:kg:PINTEST1")
+    third = await resolve_lx_url(client, "lx:kg:PINTEST1")
+    assert first and second and third
+    assert second["url"] == third["url"] == first["url"] == "http://audio.test/v1.flac"
+    assert hits["n"] == 1
+    # 钉链返回副本：调用方改动不得污染钉链
+    second["url"] = "mutated"
+    assert (await resolve_lx_url(client, "lx:kg:PINTEST1"))["url"] == "http://audio.test/v1.flac"
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_pin_expiry_re_resolves():
+    """钉链过期：下一次解析重新出链并续钉（lxmusic 探活续期/重解析的入口）。"""
+    import time as _time
+
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "x", "url": f"http://audio.test/v{hits['n']}.flac", "ext": "flac"}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    assert await resolve_lx_url(client, "lx:kg:PINTEST2")
+    assert hits["n"] == 1
+    _LX_URL_PIN["lx:kg:PINTEST2"] = (_LX_URL_PIN["lx:kg:PINTEST2"][0], _time.monotonic() - 1)
+    refreshed = await resolve_lx_url(client, "lx:kg:PINTEST2")
+    assert hits["n"] == 2
+    assert refreshed["url"] == "http://audio.test/v2.flac"
+    # 过期后重解析的结果已续钉
+    again = await resolve_lx_url(client, "lx:kg:PINTEST2")
+    assert again["url"] == "http://audio.test/v2.flac" and hits["n"] == 2
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_lx_pin_drop_and_fresh_bypass():
+    """弃钉后重新出链；fresh=True 始终旁路钉链强制重解析。"""
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "x", "url": f"http://audio.test/v{hits['n']}.flac", "ext": "flac"}},
+        )
+
+    from proxy.app import _lx_url_pin_drop
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    assert await resolve_lx_url(client, "lx:kg:PINTEST3")
+    _lx_url_pin_drop("lx:kg:PINTEST3")
+    after = await resolve_lx_url(client, "lx:kg:PINTEST3")
+    assert hits["n"] == 2 and after["url"] == "http://audio.test/v2.flac"
+    forced = await resolve_lx_url(client, "lx:kg:PINTEST3", fresh=True)
+    assert hits["n"] == 3 and forced["url"] == "http://audio.test/v3.flac"
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_stream_open_failure_drops_lx_pin(monkeypatch):
+    """取流打不开钉住的直链（连接拒绝）→ 弃钉，重试旁路缓存重新出链。"""
+    import proxy.app as proxy_app
+
+    resolve_hits = {"n": 0}
+
+    def lx_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/track/url":
+            resolve_hits["n"] += 1
+            return httpx.Response(
+                200,
+                json={"ok": True, "data": {"id": "x", "url": "http://127.0.0.1:1/dead.flac", "ext": "flac"}},
+            )
+        return httpx.Response(404)
+
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772"
+    )
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:lx:kg:PINDEAD1")
+    assert resp.status_code == 404
+    # 首轮钉链打开失败弃钉 + fresh 重试解析：至少两次出链；终态钉链已清
+    assert resolve_hits["n"] >= 2
+    assert "lx:kg:PINDEAD1" not in _LX_URL_PIN
+
+
+def test_stream_track_lx_retry_passes_fresh_url(monkeypatch):
+    """取流重试（首次打开失败后）必须旁路 lxmusic 缓存：fresh_url 依次为 False、True。"""
+    import proxy.app as proxy_app
+
+    opened_fresh: "list[bool]" = []
+
+    async def fake_open(request, guid, range_header, force_mp3=False, fresh_url=False, refresh=False):
+        opened_fresh.append(fresh_url)
+        return None
+
+    async def fake_recover(request, guid, entry):
+        return True
+
+    monkeypatch.setattr(proxy_app, "_open_online_stream", fake_open)
+    monkeypatch.setattr(proxy_app, "_recover_source", fake_recover)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_lx_handler_factory()), base_url="http://127.0.0.1:8772"
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:lx:kg:ABCDEF1234567890")
+    assert resp.status_code == 404
+    assert opened_fresh == [False, True]
 
 
 # =========================================================================

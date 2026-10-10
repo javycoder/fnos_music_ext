@@ -21,6 +21,8 @@ jobs:
     env:
       # secrets 不能用于 steps.if，先映射到 job 级 env 供条件判断与脚本共用
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      # 打赏收款链接（可选）：配置后发布包内自动生成支付宝二维码
+      ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
       # push 触发时为被推的 tag；dispatch 补发时为输入的 tag
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
@@ -49,6 +51,19 @@ jobs:
           chmod +x fnpack && sudo mv fnpack /usr/local/bin/fnpack
         env:
           FNPACK_VERSION: "1.2.3"
+
+      # 打赏二维码不入库：配置了 ALIPAY_QRCODE secret（收款链接）时现场生成
+      # PNG 打进发布包（二维码中心叠加支付宝徽标，scripts/gen_alipay_qr.py）；
+      # 未配置则跳过（开源发布形态，运行时自动隐藏打赏卡片）
+      - name: Install CJK font for QR badge (best-effort)
+        if: env.ALIPAY_QRCODE != ''
+        run: sudo apt-get install -y --no-install-recommends fonts-noto-cjk || true
+
+      - name: Generate Alipay QR code (optional)
+        if: env.ALIPAY_QRCODE != ''
+        run: |
+          python3 -m pip install --quiet qrcode pillow
+          python3 scripts/gen_alipay_qr.py
 
       - name: Build fpk package
         run: |

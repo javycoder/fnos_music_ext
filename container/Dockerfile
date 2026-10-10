@@ -14,7 +14,8 @@ ENV PYTHONUNBUFFERED=1 \
     XDG_CACHE_HOME=/data/cache \
     XDG_CONFIG_HOME=/data/config \
     LX_DATA_DIR=/data/lxmusic \
-    WEBUI_REPO_DIR=/repo
+    WEBUI_REPO_DIR=/repo \
+    FNMUSIC_LOG_DIR=/repo/logs
 
 WORKDIR /srv
 
@@ -83,7 +84,8 @@ RUN set -eu; \
             -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
-RUN useradd -m -u 1000 appuser \
+RUN groupadd -g 1000 appuser \
+    && useradd -m -u 1000 -g 1000 appuser \
     && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
     && chown -R appuser:appuser /data
 
@@ -91,6 +93,7 @@ RUN useradd -m -u 1000 appuser \
 ARG LXSERVER_MIRROR="https://ghfast.top"
 COPY container/lxserver.version /srv/lxserver.version
 COPY container/lxserver-artifact/ /srv/lxserver-artifact/
+COPY container/lxserver_compat.py /srv/lxserver_compat.py
 RUN set -eu; \
     . /srv/lxserver.version; \
     TARGET_ZIP="/srv/lxserver-artifact/${LXSERVER_ZIP_NAME}"; \
@@ -133,7 +136,10 @@ RUN set -eu; \
     if [ -f /srv/lxserver/server/server.js ]; then \
         sed -i 's/const result = await musicSdk\[source\]\.getLyric(songInfo);/const _res = musicSdk[source].getLyric(songInfo); const result = await (_res \&\& _res.promise ? _res.promise : _res);/g' /srv/lxserver/server/server.js; \
     fi; \
-    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact; \
+    if [ -f /srv/lxserver/server/server/userApi.js ]; then \
+        python3 /srv/lxserver_compat.py /srv/lxserver/server/server/userApi.js; \
+    fi; \
+    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact /srv/lxserver_compat.py; \
     chown -R appuser:appuser /srv/lxserver
 
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
@@ -142,8 +148,8 @@ COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py 
 COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
-# webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/
+# webui/lxmusic/musicbox 复用 proxy 模块（.env 安全合并 + 统一日志 fnlog），必须随镜像分发
+COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py proxy/fnlog.py proxy/version.py /srv/proxy/
 RUN find /srv -name "*.py" -exec chmod 0644 {} + \
     && mkdir -p /repo \
     && chmod 0755 /repo /data

@@ -133,7 +133,21 @@ same_dir() {
 
 unit_working_dir() {
     # WorkingDirectory as recorded in a unit file (no systemd interaction needed).
-    sed -n 's/^[[:space:]]*WorkingDirectory=//p' "$1" 2>/dev/null | head -n1
+    python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+try:
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("WorkingDirectory="):
+            value = line.partition("=")[2].strip()
+            if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+                value = value[1:-1]
+            print(value.replace("%%", "%"))
+            break
+except OSError:
+    pass
+PY
 }
 
 check_proxy_unit_owner() {
@@ -268,6 +282,11 @@ diagnose_sources_container() {
 owned_source_unit() {
     local unit="$1" file="/etc/systemd/system/${1}.service"
     [ -f "${file}" ] || return 1
+    # 原生音源 unit（v2.8.0a+）：WorkingDirectory 即仓库目录本身。
+    # 容器形态下同名 unit 从不存在，此分支不影响 Docker 链路判定。
+    if [ "${unit}" = "${NATIVE_UNIT_NAME}" ] && same_dir "$(unit_working_dir "${file}")" "${BASE_DIR}"; then
+        return 0
+    fi
     same_dir "$(unit_working_dir "${file}")" "${BASE_DIR}/${unit#fnmusic-}-service"
 }
 
@@ -287,4 +306,127 @@ stop_owned_source_unit() {
                 ;;
         esac
     fi
+}
+
+# ============================================================================
+# 原生（无 Docker）音源部署共享函数（v2.8.0a+，FNMUSIC_DEPLOY_MODE=native）。
+# 与容器形态的对应关系见 container/supervisord-native.conf.in 头注；
+# 仅在 native 分支被调用，Docker 链路不经过这里。
+# ============================================================================
+NATIVE_UNIT_NAME="fnmusic-sources"
+
+native_venv_dir() {
+    printf '%s' "${FNMUSIC_VENV_SOURCES_DIR:-${BASE_DIR}/.venv-sources}"
+}
+
+native_run_dir() {
+    printf '%s' "${BASE_DIR}/sources-native"
+}
+
+native_sup_conf() {
+    printf '%s/%s' "$(native_run_dir)" "supervisord.conf"
+}
+
+render_native_placeholders() {
+    # $1 = 模板文件，渲染结果输出到 stdout（@REPO@/@VENV@/@DATA@/@RUN@ 四占位符）
+    python3 - "$1" "${BASE_DIR}" "$(native_venv_dir)" \
+        "${BASE_DIR}/sources-data" "$(native_run_dir)" <<'PY'
+import pathlib
+import sys
+
+template, *paths = sys.argv[1:]
+# These paths cross INI environment, shell argv and systemd parsers. Fail clearly
+# on ambiguous quoting rather than install a malformed unit or command.
+if any(any(c in path for c in "\n\r\"'\\") for path in paths):
+    raise SystemExit("原生部署路径不能包含换行、引号或反斜杠")
+text = pathlib.Path(template).read_text(encoding="utf-8")
+for key, value in zip(("REPO", "VENV", "DATA", "RUN"), paths):
+    # Both supervisor's interpolation and systemd's specifiers use percent.
+    text = text.replace("@" + key + "@", value.replace("%", "%%"))
+if pathlib.Path(template).name == "supervisord-native.conf.in":
+    text = text.replace('WEBUI_SUPERVISORCTL="supervisorctl -c ',
+                        'WEBUI_SUPERVISORCTL="supervisorctl -c \'')
+    text = text.replace('/supervisord.conf"', '/supervisord.conf\'"')
+sys.stdout.write(text)
+PY
+}
+
+render_native_supervisor_conf() {
+    mkdir -p "$(native_run_dir)"
+    render_native_placeholders "${BASE_DIR}/container/supervisord-native.conf.in" \
+        > "$(native_sup_conf)"
+    chmod 0644 "$(native_sup_conf)"
+}
+
+native_unit_installed_owned() {
+    local file="/etc/systemd/system/${NATIVE_UNIT_NAME}.service"
+    [ -f "${file}" ] && same_dir "$(unit_working_dir "${file}")" "${BASE_DIR}"
+}
+
+native_unit_started_epoch() {
+    local started epoch
+    started="$(systemctl show "${NATIVE_UNIT_NAME}.service" -p ActiveEnterTimestamp --value 2>/dev/null)" || return 1
+    [ -n "${started}" ] || return 1
+    epoch="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
+    printf '%s' "${epoch}"
+}
+
+env_newer_than_native_unit() {
+    # .env 比原生 unit 最近一次启动新（安装/切源/升级改了开关）：entrypoint 只在
+    # 启动读一次 .env，需要显式重启让音源开关生效（等价 docker restart 语义）。
+    local epoch_start epoch_env
+    epoch_start="$(native_unit_started_epoch)" || return 1
+    epoch_env="$(stat -c %Y "${BASE_DIR}/.env" 2>/dev/null)" || return 1
+    [ "${epoch_env}" -gt "${epoch_start}" ]
+}
+
+native_code_or_env_newer() {
+    # 代码或配置比原生 unit 启动新（git pull 升级后服务代码原地生效需重启进程，
+    # 对应 Docker 形态的 ensure_image_current 镜像重建触发器）。
+    local epoch_start target
+    epoch_start="$(native_unit_started_epoch)" || return 1
+    for target in "${BASE_DIR}/.env" \
+                  "${BASE_DIR}/musicdl-service" "${BASE_DIR}/musicbox-service" \
+                  "${BASE_DIR}/lxmusic-service" "${BASE_DIR}/webui-service" \
+                  "${BASE_DIR}/.lxserver"; do
+        [ -e "${target}" ] || continue
+        if [ -f "${target}" ]; then
+            [ "$(stat -c %Y "${target}")" -gt "${epoch_start}" ] && return 0
+        else
+            find "${target}" -type f \( -name '*.py' -o -name '*.js' -o -name '*.json' \
+                -o -name '*.html' -o -name '*.css' -o -name '*.txt' \) \
+                -not -path '*/__pycache__/*' -newermt "@${epoch_start}" \
+                -print -quit 2>/dev/null | grep -q . && return 0
+        fi
+    done
+    return 1
+}
+
+diagnose_native() {
+    # healthz 超时取证（原生形态对应 diagnose_sources_container）：
+    # supervisor 进程状态 + unit journal 尾部随安装日志落盘。
+    local line
+    log_warn "采集原生音源服务诊断信息（supervisorctl status / journalctl 尾部）..."
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "  [supervisor] ${line}"
+    done < <("$(native_venv_dir)/bin/supervisorctl" -c "$(native_sup_conf)" status 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "  [journal] ${line}"
+    done < <(sudo journalctl -u "${NATIVE_UNIT_NAME}.service" -n 25 --no-pager -o cat 2>/dev/null || true)
+}
+
+remove_conflicting_native_unit() {
+    # 形态互斥：Docker 安装遇到原生音源 unit 时让路（native→docker 切换）。
+    # 本目录的 unit 直接停用移除；其他目录的拒绝（走 --adopt 迁移或先还原）。
+    local file="/etc/systemd/system/${NATIVE_UNIT_NAME}.service"
+    [ -f "${file}" ] || return 0
+    if ! native_unit_installed_owned && [ "${ADOPT:-0}" -ne 1 ]; then
+        log_err "检测到属于其他目录的原生音源 unit ${file}；与 Docker 部署互斥。"
+        log_err "请先在原目录执行 ./restore.sh，或追加 --adopt 把部署迁移到当前目录。"
+        return 1
+    fi
+    log_info "移除原生音源 unit（切换为 Docker 部署，数据目录原样共用）..."
+    sudo systemctl disable --now "${NATIVE_UNIT_NAME}.service" 2>/dev/null || true
+    sudo rm -f "${file}"
+    sudo systemctl daemon-reload 2>/dev/null || true
 }

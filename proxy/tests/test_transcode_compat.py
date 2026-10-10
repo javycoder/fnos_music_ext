@@ -87,6 +87,30 @@ def fake_ffmpeg(tmp_path, monkeypatch):
     return _install
 
 
+# 假 ffprobe：按探测目标（http 源 / 本地产出 playlist）回放环境变量时长
+FAKE_FFPROBE_SRC = '''#!/usr/bin/env python3
+import os, sys
+target = sys.argv[-1]
+if target.startswith(("http://", "https://")):
+    print(os.environ.get("FAKE_FFPROBE_SRC_DUR", "0"))
+else:
+    print(os.environ.get("FAKE_FFPROBE_LOCAL_DUR", "0"))
+'''
+
+
+@pytest.fixture
+def fake_ffprobe(tmp_path, monkeypatch):
+    def _install(local_dur: float, src_dur: float):
+        script = tmp_path / "fake_ffprobe"
+        script.write_text(FAKE_FFPROBE_SRC)
+        script.chmod(0o755)
+        monkeypatch.setattr(tc, "FFPROBE_BIN", str(script))
+        monkeypatch.setenv("FAKE_FFPROBE_LOCAL_DUR", str(local_dur))
+        monkeypatch.setenv("FAKE_FFPROBE_SRC_DUR", str(src_dur))
+        return str(script)
+    return _install
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """隔离目录 + 各源 mock 上游；upstream 记录往返供透传断言。"""
@@ -128,6 +152,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "transcode_ttl_s", 90.0)
     monkeypatch.setitem(CONF, "transcode_cache_max_mb", 512)
     monkeypatch.setitem(CONF, "transcode_dl_bitrate", "320k")
+    monkeypatch.setitem(CONF, "dl_quality", "app")
     monkeypatch.setitem(CONF, "fav_auto_bind", False)
     monkeypatch.setitem(CONF, "trace_forward", False)
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", dirs["play_history"])
@@ -279,6 +304,102 @@ def test_ensure_session_without_ffmpeg_returns_none(tmp_path):
     assert asyncio.run(tc.ensure_session(FAKE_KUWO, src, 100.0, root=str(tmp_path))) is None
 
 
+# === issue #50：源站断流时 ffmpeg rc=0 的半成品不得转正 ===
+
+def test_truncated_stream_discards_cache(tmp_path, fake_ffmpeg, fake_ffprobe):
+    """传输中途截断（音源时长≈元数据、产出不足）：半成品绝不转正，清目录。
+
+    复现链路：源站谎报 Content-Length 半途断连 → ffmpeg "Stream ends
+    prematurely" 仍 rc=0 → 产出 12/26 片。旧逻辑转正后 playlist 仍声明 26
+    片，客户端播到 120s 起分片 404 跳歌、seek 到结尾必 404，且残缺缓存被
+    永久复用（每次播放都在同一位置断）。
+    """
+    fake_ffmpeg("ok", segments=12)
+    fake_ffprobe(local_dur=120.0, src_dur=269.0)   # 音源其实是全长的 → 判定传输截断
+    src = "http://127.0.0.1:19999/full.mp3"
+    root = str(tmp_path / "cache")
+
+    async def flow():
+        sess = await tc.ensure_session(FAKE_KUWO, src, 269.0, root=root)
+        assert sess is not None
+        assert await _wait_event(sess)
+        return sess.status, sess.directory
+
+    status, directory = asyncio.run(flow())
+    assert status == "failed"
+    assert not os.path.exists(directory)
+    assert tc._usable_cache(directory) is None
+
+
+def test_inflated_metadata_patches_declared_count(tmp_path, fake_ffmpeg, fake_ffprobe):
+    """元数据时长虚高（音源真实≈产出）：按真实时长修正常量后转正。
+
+    修正后重播的 playlist 只声明真实存在的分片，客户端自然播完跳下一首，
+    不再吃到永不存在的尾部分片 404。
+    """
+    fake_ffmpeg("ok", segments=12)
+    fake_ffprobe(local_dur=118.0, src_dur=119.0)   # 音源本来就只有 ~2 分钟
+    src = "http://127.0.0.1:19999/short.mp3"
+    root = str(tmp_path / "cache")
+
+    async def flow():
+        sess = await tc.ensure_session(FAKE_KUWO, src, 269.0, root=root)
+        assert sess is not None
+        assert await _wait_event(sess)
+        assert sess.status == "done"
+        # 磁盘 state 已按真实时长修正
+        state = json.load(open(os.path.join(sess.directory, tc.STATE_NAME)))
+        assert state["duration_s"] == 118.0
+        assert state["declared_count"] == 11
+        # 转正缓存可复用，且 playlist 声明与产出一致
+        cached = tc.peek_cached(FAKE_KUWO, root)
+        assert cached is not None and cached.declared_count == 11
+        text = tc.playlist_text(cached)
+        assert text.count("#EXTINF:") == 11
+        assert "00010.m4s" in text and "00011.m4s" not in text
+
+    asyncio.run(flow())
+
+
+def test_truncated_without_ffprobe_discards(tmp_path, fake_ffmpeg):
+    """ffprobe 不可用时无从仲裁：产出不足一律弃件（宁可重转不可带毒缓存）。"""
+    fake_ffmpeg("ok", segments=12)
+    src = str(tmp_path / "in.mp3")
+    with open(src, "wb") as f:
+        f.write(b"x" * 64)
+    root = str(tmp_path / "cache")
+
+    async def flow():
+        sess = await tc.ensure_session(FAKE_KUWO, src, 269.0, root=root)
+        assert await _wait_event(sess)
+        return sess.status, sess.directory
+
+    status, directory = asyncio.run(flow())
+    assert status == "failed"
+    assert not os.path.exists(directory)
+
+
+def test_usable_cache_rejects_short_segment_dir(tmp_path):
+    """存量带毒缓存自愈：done 但分片不足的目录拒用，且被 reap 清扫。"""
+    root = str(tmp_path / "cache")
+    directory = tc.session_dir(root, FAKE_KUWO)
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
+        f.write(b"ftypinit")
+    for i in range(3):
+        with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
+            f.write(b"moofseg")
+    with open(os.path.join(directory, tc.STATE_NAME), "w") as f:
+        json.dump({"guid": FAKE_KUWO, "status": "done", "duration_s": 269,
+                   "hls_time": 10, "declared_count": 26, "bitrate": "128k",
+                   "started_ts": 0, "done_ts": 0}, f)
+
+    assert tc._usable_cache(directory) is None          # 分片 3 < 声明 26：拒用
+    assert tc.peek_cached(FAKE_KUWO, root) is None
+    assert tc._reap_expired(root=root, ttl_s=90) == 1   # 无主半成品被清走
+    assert not os.path.exists(directory)
+
+
 def test_wait_file_returns_path_and_none_on_failure(tmp_path, fake_ffmpeg):
     fake_ffmpeg("fail")
     src = str(tmp_path / "in.mp3")
@@ -350,8 +471,10 @@ def _mk_done_cache(root: str, guid: str, size: int, age_s: float) -> str:
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
         f.write(b"i" * min(size, 16))
-    with open(os.path.join(directory, "00000.m4s"), "wb") as f:
-        f.write(b"s" * max(0, size - 16))
+    # 与 state 声明数一致：usable 校验要求分片覆盖声明清单
+    for i in range(10):
+        with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
+            f.write(b"s" * max(0, (size - 16) // 10))
     state = {"guid": guid, "status": "done", "duration_s": 100, "hls_time": 10,
              "declared_count": 10, "bitrate": "128k", "started_ts": 0, "done_ts": 0}
     spath = os.path.join(directory, tc.STATE_NAME)
@@ -506,21 +629,108 @@ def test_download_original_serves_cached_file(env, fake_ffmpeg):
         assert file_resp.content == payload      # 原始档：不转码，直接供原文件
 
 
-def test_download_standard_fails_without_ffmpeg(env):
-    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 100, ext="flac")
+def test_download_missing_quality_serves_original(env):
+    """缺省 quality 一律交付原文件：有损转码必须 App 显式请求"标准"档（2.8.0 修复）。
+
+    2.6.3-2.7.0 缺省=standard，App 无损偏好下发的值落到缺省被转成 MP3；
+    现在缺省走 original，无 ffmpeg 也能直接交付已落库文件。
+    """
+    payload = b"FLACDATA" * 500
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
     with TestClient(app) as client:
         did = client.post("/music/api/v1/download/track/transcode/prepare",
                           json={"guid": FAKE_KUWO}).json()["data"]["downloadId"]
 
-        def _failed():
+        def _ready():
             st = client.get("/music/api/v1/download/track/transcode/status",
                             params={"downloadId": did}).json()["data"]
-            return st if st["status"] == "failed" else None
-        st = wait_for(_failed)
-        assert st is not None and st["errmsg"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None and st["percent"] == 100
         file_resp = client.get("/music/api/v1/download/track/transcode/file",
                                params={"downloadId": did})
-        assert file_resp.status_code == 404
+        assert file_resp.content == payload
+        # 原始档按真实扩展名交付：flac 不再错标 audio/mp4
+        assert file_resp.headers["content-type"].startswith("audio/flac")
+
+
+def test_download_unknown_quality_word_serves_original(env, fake_ffmpeg):
+    """App 无损偏好下发的未知档位词（lossless 等）不再落缺省转码：交付原文件。"""
+    fake_ffmpeg("fail")   # 一旦走到转码即失败——原文件路径不应碰 ffmpeg
+    payload = b"FLACDATA" * 300
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "lossless"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+
+
+def test_download_is_original_truthy_string(env):
+    """isOriginal 兼容字符串 "true"/"1"（官方请求体可能不传布尔）。"""
+    payload = b"ORIGINALBYTES" * 100
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "standard",
+                                "isOriginal": "true"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready)
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+
+
+def test_download_dl_quality_force_original_overrides_standard(monkeypatch, env):
+    """dl_quality=original：App 显式要"标准"档也交付原文件（整体强制覆盖）。"""
+    monkeypatch.setitem(CONF, "dl_quality", "original")
+    payload = b"FLACDATA" * 200
+    seed_cached_audio(FAKE_KUWO, payload, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO, "quality": "standard"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready)
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content == payload
+        assert file_resp.headers["content-type"].startswith("audio/flac")
+
+
+def test_download_dl_quality_standard_missing_quality_transcodes(monkeypatch, env, fake_ffmpeg):
+    """dl_quality=standard：缺省 quality 也按官方"标准"档转码 MP3 320k（回归 2.6.3 行为）。"""
+    monkeypatch.setitem(CONF, "dl_quality", "standard")
+    fake_ffmpeg("ok")
+    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 500, ext="flac")
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": FAKE_KUWO}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.headers["content-type"].startswith("audio/mpeg")
 
 
 def test_download_fails_when_source_dead_and_no_cache(env, fake_ffmpeg):
@@ -746,8 +956,8 @@ async def test_full_fetch_corrupt_lossless_retries_mp3(env, fake_ffmpeg, monkeyp
     flac, mp3 = b"fLaC" + b"F" * 9000, b"ID3" + b"M" * 8000
     opens = []
 
-    async def fake_open(request, g, range_header, force_mp3=False):
-        opens.append(force_mp3)
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
+        opens.append((force_mp3, fresh_url))
         data = mp3 if force_mp3 else flac
         info = {"title": "测试曲", "artist": "测试人",
                 "ext": "mp3" if force_mp3 else "flac"}
@@ -758,7 +968,7 @@ async def test_full_fetch_corrupt_lossless_retries_mp3(env, fake_ffmpeg, monkeyp
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
     appmod._LOSSLESS_BAD.clear()
     await appmod._full_fetch_download(guid, {"cookie": "sid=t"})
-    assert opens == [False, True]                       # 先无损后 mp3
+    assert opens == [(False, False), (True, True)]      # 先无损后 mp3；坏流重试旁路 lx 直链缓存
     assert appmod._lossless_is_blacklisted(guid)        # 无损档已拉黑
     dest = os.path.join(env["dirs"]["library"], "测试人 - 测试曲.mp3")
     assert os.path.isfile(dest)                         # mp3 档入库
@@ -775,8 +985,8 @@ async def test_full_fetch_corrupt_even_at_mp3_fails_clean(env, fake_ffmpeg, monk
     guid = "online:kuwo:99002"
     opens = []
 
-    async def fake_open(request, g, range_header, force_mp3=False):
-        opens.append(force_mp3)
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
+        opens.append((force_mp3, fresh_url))
         data = b"fLaC" + b"F" * 9000
         resp = httpx.Response(200, stream=_Whole(data),
                               headers={"content-length": str(len(data))})
@@ -785,7 +995,7 @@ async def test_full_fetch_corrupt_even_at_mp3_fails_clean(env, fake_ffmpeg, monk
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
     appmod._LOSSLESS_BAD.clear()
     await appmod._full_fetch_download(guid, {"cookie": "sid=t"})
-    assert opens == [False, True]
+    assert opens == [(False, False), (True, True)]      # 两次尝试均记录；重试旁路 lx 直链缓存
     assert guid in appmod._full_fetch_failed             # 明确失败
     assert os.listdir(env["dirs"]["library"]) == []      # 曲库零写入
 

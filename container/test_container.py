@@ -115,19 +115,23 @@ def test_export_source_env_from_env_file(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(
         "LX_SOURCE_URL='https://example.com/lx.js'\n"
+        "LX_SOURCE_LIST='[{\"name\":\"a\",\"url\":\"https://example.com/lx.js\",\"active\":true}]'\n"
         "LX_SOURCES=kw,kg\n"
         "MUSICDL_SOURCES=kugou,netease\n",
         encoding="utf-8",
     )
     lib = CONTAINER_DIR / "env_flag.sh"
-    script = f'. "{lib}"; export_source_env; printenv LX_SOURCE_URL; printenv LX_SOURCES; printenv MUSICDL_SOURCES\n'
+    script = (f'. "{lib}"; export_source_env; printenv LX_SOURCE_URL; printenv LX_SOURCE_LIST; '
+              'printenv LX_SOURCES; printenv MUSICDL_SOURCES\n')
     out = subprocess.run(
         ["sh", "-c", script], capture_output=True, text=True,
         env={"PATH": os.environ["PATH"], "FNMUSIC_ENV_FILE": str(env_file)}, timeout=15,
     )
     assert out.returncode == 0, out.stderr
     lines = out.stdout.strip().splitlines()
-    assert lines == ["https://example.com/lx.js", "kw,kg", "kugou,netease"]
+    assert lines == ["https://example.com/lx.js",
+                     "[{\"name\":\"a\",\"url\":\"https://example.com/lx.js\",\"active\":true}]",
+                     "kw,kg", "kugou,netease"]
 
 
 # ---------------------------------------------------------------- entrypoint.sh
@@ -275,6 +279,25 @@ def test_dockerfile_assembly():
     # COPY 保留上下文 mode：umask 077 检出下 supervisord.conf 会以 600 进镜像，
     # appuser 读不了配置导致容器起不来；必须显式规范化权限
     assert "chmod 0644 /etc/supervisor/supervisord.conf" in text
+
+
+def test_container_logging_root_contract():
+    text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    env_block = text.split("ENV ", 1)[1].split("\n\n", 1)[0]
+    assert "FNMUSIC_LOG_DIR=/repo/logs" in env_block
+    assert "groupadd -g 1000 appuser" in text
+    assert "useradd -m -u 1000 -g 1000 appuser" in text
+    assert "USER appuser" in text
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+    service = compose["services"]["fnmusic-sources"]
+    assert ".:/repo" in service["volumes"]
+    # Host .env values must not replace the image's container-only log root.
+    assert "env_file" not in service
+    assert "FNMUSIC_LOG_DIR" not in service.get("environment", {})
+    env_lib = (CONTAINER_DIR / "env_flag.sh").read_text()
+    exports = env_lib.split("export_source_env()", 1)[1]
+    assert "FNMUSIC_LOG_DIR" not in exports
+    assert "FNMUSIC_HOME" not in exports
 
 
 def test_dockerfile_network_fallback_resilience():

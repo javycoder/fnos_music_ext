@@ -15,6 +15,7 @@ const vm = require("node:vm");
 /* ------------------------------------------------ 最小 DOM/浏览器桩 -------- */
 function stubEl() {
   const classes = new Set();
+  const listeners = {};
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
     checked: false, disabled: false, src: "", dataset: {}, _t: null,
@@ -28,7 +29,20 @@ function stubEl() {
       },
       contains(c) { return classes.has(c); },
     },
-    addEventListener() {},
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    appendChild(child) { (this._children = this._children || []).push(child); return child; },
+    removeChild(child) { return child; },
+    remove() {},
+    // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
+    dispatch(type) { (listeners[type] || []).slice().forEach((fn) => fn({ type })); },
+    // 测试用：重置标量状态但保留元素身份与监听器——app.js 在加载期把监听器
+    // 绑到元素上，元素必须终身同一个对象（真实 DOM 亦如此），不能整体换新
+    _resetState() {
+      classes.clear();
+      this.hidden = false; this.textContent = ""; this.innerHTML = "";
+      this.className = ""; this.value = ""; this.checked = false;
+      this.disabled = false; this.src = ""; this.dataset = {}; this._t = null;
+    },
     querySelectorAll() { return []; },
   };
 }
@@ -41,8 +55,21 @@ global.document = {
     return els.get(sel);
   },
   querySelectorAll() { return []; },
+  createElement() {
+    // 关于页日志导出用的 <a download> 桩：记录点击与 download 文件名
+    const el = stubEl();
+    el._clicked = 0;
+    el.click = () => { el._clicked += 1; };
+    return el;
+  },
+  body: stubEl(),
 };
 global.window = { addEventListener() {} };
+// 日志导出的 blob 下载链路（URL.createObjectURL + a[download]）
+const createdUrls = [];
+global.URL.createObjectURL = (blob) => { createdUrls.push(blob); return `blob:fake-${createdUrls.length}`; };
+global.URL.revokeObjectURL = () => {};
+global.createdUrls = createdUrls;
 
 // 定时器：unref 避免挡住进程退出；记录句柄开关状态供停表断言
 let openIntervals = 0;
@@ -73,16 +100,20 @@ const defaults = new Map([
   ["/app/fnmusic-ext/api/platforms", { ok: true, enabled: [], registered: [] }],
 ]);
 let routes = new Map(); // path -> bodies 队列（Error 表示 HTTP 非 2xx）
+const fetchCalls = [];  // 断言用：{path, method, body}
+global.fetchCalls = fetchCalls;
 
 function enqueue(p, ...bodies) {
   if (!routes.has(p)) routes.set(p, []);
   routes.get(p).push(...bodies);
 }
 
-global.fetch = async (url) => {
+global.fetch = async (url, options = {}) => {
   const p = String(url).split("?")[0];
+  fetchCalls.push({ path: p, method: (options.method || "GET").toUpperCase(), body: options.body });
   if (routes.has(p) && routes.get(p).length) {
     const body = routes.get(p).shift();
+    if (body && body.__rawResponse) { return body.resp; }
     if (body instanceof Error) {
       return { ok: false, status: 502, json: async () => ({ detail: body.message }) };
     }
@@ -92,8 +123,9 @@ global.fetch = async (url) => {
 };
 
 function reset() {
-  els.clear();
+  els.forEach((el) => el._resetState && el._resetState());
   routes = new Map();
+  fetchCalls.length = 0;
 }
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
@@ -198,7 +230,7 @@ test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () =
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
-test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入框并标脏", async () => {
+test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入框（上传本身不改配置不标脏）", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/lx/upload", {
     ok: true,
@@ -209,7 +241,85 @@ test("lxUploadScript→lxAfterUpload：上传成功后 file:// URL 填入输入�
   await global.lxAfterUpload(r);
   assert.strictEqual(els.get("#lx-url").value, "file:///data/lxmusic/uploads/mine.js");
   assert.strictEqual(els.get("#lx-upload-note").textContent, "已上传：上传源");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  // 添加进列表后才标脏（桩元素常驻以保留加载期监听器绑定，改查 save-bar 的 show 类）
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
+test("洛雪源列表：旧数据（无 active 标记）按 LX_SOURCE_URL 推导激活态", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_URL: "file:///a.js",
+      LX_SOURCE_LIST: '[{"name":"甲","url":"file:///a.js"},{"name":"乙","url":"file:///b.js"}]',
+    },
+  });
+  await global.loadConfig();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.ok(html.includes("已激活"), "匹配 LX_SOURCE_URL 的项应显示已激活徽标");
+  assert.ok(html.includes("取消激活"), "激活项应有取消激活按钮");
+  assert.ok(html.includes("激活"), "未激活项应有激活按钮");
+  // 恰好一处已激活
+  assert.strictEqual((html.match(/lx-badge/g) || []).length, 1);
+});
+
+test("洛雪源列表：多源同时激活共存渲染", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_LIST: JSON.stringify([
+        { name: "甲", url: "file:///a.js", active: true },
+        { name: "乙", url: "file:///b.js", active: true },
+        { name: "丙", url: "file:///c.js", active: false },
+      ]),
+    },
+  });
+  await global.loadConfig();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.strictEqual((html.match(/lx-badge/g) || []).length, 2, "两个已激活徽标");
+  assert.strictEqual((html.match(/lx-btn-deactivate/g) || []).length, 2, "两个取消激活按钮");
+  assert.strictEqual((html.match(/lx-btn-activate/g) || []).length, 1, "一个激活按钮");
+});
+
+test("collectConfig：lxmusic 下无激活源时拒绝提交", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { LX_SOURCE_LIST: '[{"name":"甲","url":"file:///a.js","active":false}]' },
+  });
+  await global.loadConfig();
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    assert.throws(() => global.collectConfig(), /请至少激活一个洛雪源/);
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+});
+
+test("collectConfig：有激活源时提交列表且不提交 LX_SOURCE_URL（后端派生）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_LIST: JSON.stringify([
+        { name: "甲", url: "file:///a.js", active: true },
+        { name: "乙", url: "file:///b.js", active: false },
+      ]),
+    },
+  });
+  await global.loadConfig();
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    const values = global.collectConfig();
+    assert.strictEqual(values.LX_SOURCE_URL, undefined);
+    assert.deepStrictEqual(JSON.parse(values.LX_SOURCE_LIST), [
+      { name: "甲", url: "file:///a.js", active: true },
+      { name: "乙", url: "file:///b.js", active: false },
+    ]);
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
 });
 
 test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {
@@ -251,6 +361,149 @@ test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", asyn
   enqueue("/app/fnmusic-ext/api/config", { values: {} });
   await global.loadConfig();
   assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
+});
+
+test("储存目录：loadConfig 回填 + collectConfig 收集 + 格式/互斥校验", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_CACHE_DIR: "/vol2/cache", FNMUSIC_TEE_SAVE_DIR: "/vol1/music" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#dir-cache").value, "/vol2/cache");
+  assert.strictEqual(els.get("#dir-download").value, "/vol1/music");
+  const values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_CACHE_DIR, "/vol2/cache");
+  assert.strictEqual(values.FNMUSIC_TEE_SAVE_DIR, "/vol1/music");
+  // 互为父子 → 拒绝
+  els.get("#dir-cache").value = "/vol1/music/sub";
+  assert.throws(() => global.collectConfig(), /父子/);
+  // 相对路径 / .. → 拒绝
+  els.get("#dir-cache").value = "vol2/cache";
+  assert.throws(() => global.collectConfig(), /绝对路径/);
+  els.get("#dir-cache").value = "/vol1/../etc";
+  assert.throws(() => global.collectConfig(), /\.\./);
+  // 恢复合法值 → 通过
+  els.get("#dir-cache").value = "/vol2/cache";
+  assert.strictEqual(global.collectConfig().FNMUSIC_CACHE_DIR, "/vol2/cache");
+});
+
+test("下载目录输入即标脏（保存路径已在边听边存页移除，此处为唯一入口）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-download").value = "/vol1/new";
+  els.get("#dir-download").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+});
+
+test("目录输入防抖 fs-check：目录不存在但父目录可写 → warn 提示", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/fs-check", { ok: true, path: "/vol1/new", exists: false, writable: true });
+  els.get("#dir-download").value = "/vol1/new";
+  els.get("#dir-download").dispatch("input");
+  await tick(560); // 防抖 500ms 后校验
+  assert.strictEqual(els.get("#dir-download-check").hidden, false);
+  assert.ok(els.get("#dir-download-check").textContent.includes("自动创建"));
+  assert.strictEqual(els.get("#dir-download-check").className.includes("warn"), true);
+});
+
+test("目录输入防抖 fs-check：清空输入隐藏状态行", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-cache").value = "";
+  els.get("#dir-cache").dispatch("input");
+  await tick(560);
+  assert.strictEqual(els.get("#dir-cache-check").hidden, true);
+});
+
+test("saveConfig：fs-check 目录不可写 → 阻断保存（不发 PUT）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-cache").value = "/vol2/ro";
+  enqueue("/app/fnmusic-ext/api/fs-check", { ok: true, path: "/vol2/ro", exists: true, writable: false });
+  await global.saveConfig();
+  assert.ok(!fetchCalls.some((c) => c.method === "PUT"), "不可写时不得发 PUT /api/config");
+  assert.ok(els.get("#toast").textContent.includes("不可用"));
+});
+
+test("saveConfig：fs-check 不可用（直连 501/网络错误）→ 降级放行保存", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#dir-cache").value = "/vol2/ok";
+  enqueue("/app/fnmusic-ext/api/fs-check", new Error("直连模式不支持目录权限校验"));
+  await global.saveConfig();
+  assert.ok(fetchCalls.some((c) => c.method === "PUT" && c.path === "/app/fnmusic-ext/api/config"));
+});
+
+/* ------------------------------------------------ 关于页 ------------------- */
+test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=false 隐藏打赏", async () => {
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    author: "javycoder", author_url: "https://github.com/javycoder",
+                repo_url: "https://github.com/javycoder/fnos_music_ext",
+    issues_url: "https://github.com/javycoder/fnos_music_ext/issues",
+    disclaimer: [
+      { title: "本项目基于 MIT 许可证开源", text: "仅限个人技术研究" },
+      { title: "不托管受版权保护的音频", text: "" },
+    ],
+    donate: false,
+    logs: [{ name: "proxy.log", size: 2048, mtime: 1 }, { name: "webui.log", size: 512, mtime: 1 }],
+    log_retention_days: 3,
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-version").textContent, "v2.8.0e");
+  assert.strictEqual(global.document.querySelector("#about-deploy").textContent, "Docker 部署");
+  const html = global.document.querySelector("#about-disclaimer").innerHTML;
+  assert.ok(html.includes("本项目基于 MIT 许可证开源") && html.includes("仅限个人技术研究"));
+  assert.ok(global.document.querySelector("#about-logs").innerHTML.includes("proxy.log"));
+  assert.ok(global.document.querySelector("#about-logs").innerHTML.includes("2.0 KB"));
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-disclaimer-card").hidden, false);
+});
+
+test("loadAbout：donate=true 展示打赏卡片并指向静态二维码", async () => {
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "native",
+    disclaimer: [], donate: true, logs: [], log_retention_days: 3,
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, false);
+  assert.strictEqual(
+    global.document.querySelector("#about-donate-img").src,
+    "/app/fnmusic-ext/static/alipay.png",
+  );
+  // 解析不到免责声明时隐藏该卡片
+  assert.strictEqual(global.document.querySelector("#about-disclaimer-card").hidden, true);
+});
+
+test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async () => {
+  enqueue("/app/fnmusic-ext/api/logs/export", {
+    __rawResponse: true,
+    resp: {
+      ok: true, status: 200,
+      headers: { get: (n) => (String(n).toLowerCase() === "content-disposition"
+        ? 'attachment; filename="20261010220000.logzip"' : null) },
+      blob: async () => ({ __blob: true }),
+    },
+  });
+  await global.exportLogs();
+  assert.ok(fetchCalls.some((c) => c.method === "GET" && c.path === "/app/fnmusic-ext/api/logs/export"));
+  assert.strictEqual(createdUrls.length, 1);  // blob → objectURL
+  // 下载文件名取自 Content-Disposition 并展示在导出备注
+  assert.ok(global.document.querySelector("#log-export-note").textContent.includes("20261010220000.logzip"));
+});
+
+test("switchPage('about') 懒加载关于数据", async () => {
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: false, logs: [], log_retention_days: 3,
+  });
+  global.switchPage("about");
+  await new Promise((r) => realSetTimeout(r, 0));  // 等 fetch 微任务
+  assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/about"));
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

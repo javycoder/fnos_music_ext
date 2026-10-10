@@ -340,7 +340,9 @@ class LxServerClient:
 
         返回格式:
         {"url": "...", "type": "128k", "sourceName": "...", "sourceId": "...", ...}
-        若解析失败返回 None。
+        200 但无 url（脚本"成功"却拿不出直链，如平台未激活的静默空返回）时同样
+        返回完整响应（url 为空串/缺失，含 attempts 供换源排除）；非 200 或解析
+        异常才返回 None。
         """
         client = await self.get_client()
         body = {
@@ -355,7 +357,7 @@ class LxServerClient:
             logger.warning("lxserver get_music_url error %s: %.150s", resp.status_code, resp.text)
             return None
         data = resp.json()
-        if isinstance(data, dict) and data.get("url"):
+        if isinstance(data, dict):
             return data
         return None
 
@@ -449,18 +451,30 @@ class LxServerClient:
         return []
 
     async def import_custom_source(self, url: str) -> dict:
-        """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。"""
+        """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。
+
+        allowUnsafeVM=True 代答 lxserver 的"原生 VM 模式"确认（pdone/lx-music-source
+        等聚合类脚本需要原生 VM 才能运行；部署侧已由 entrypoint 将
+        system.allowUnsafeVM 置 true，服务端全局开关仍兜底）。"""
         client = await self.get_client()
-        resp = await client.post("/api/custom-source/import", json={"url": url}, timeout=self.timeout)
+        resp = await client.post(
+            "/api/custom-source/import",
+            json={"url": url, "allowUnsafeVM": True},
+            timeout=self.timeout,
+        )
         data = self._parse_admin_resp(resp, "导入自定义源")
         return data
 
     async def upload_custom_source(self, filename: str, script_content: str) -> dict:
-        """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。"""
+        """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。
+
+        allowUnsafeVM=True 代答"原生 VM 模式"确认，否则需要 VM 的脚本（如聚合
+        API 类）上传永远收到 requireUnsafe 确认文案而被 500 挡下（2026-10-11
+        pdone/lx-music-source 聚合API接口 实测）。"""
         client = await self.get_client()
         resp = await client.post(
             "/api/custom-source/upload",
-            json={"filename": filename, "content": script_content},
+            json={"filename": filename, "content": script_content, "allowUnsafeVM": True},
             timeout=self.timeout,
         )
         return self._parse_admin_resp(resp, "上传自定义源")
@@ -496,8 +510,8 @@ class LxServerClient:
         message = data.get("error") or data.get("message") or f"{action}失败 (HTTP {resp.status_code})"
         raise RuntimeError(message)
 
-    async def activate_single_source(self, target_id_or_name: str) -> bool:
-        """单源激活语义：只启用 target，禁用其余所有源。若 target 不存在则直接返回 False，不触碰任何源。"""
+    async def set_source_enabled(self, target_id_or_name: str, enabled: bool) -> bool:
+        """设置单个源的启用状态（多源可同时启用）。若 target 不存在则直接返回 False，不触碰任何源。"""
         async with self.mgmt_lock:
             sources = await self.list_custom_sources()
             target = next(
@@ -513,12 +527,7 @@ class LxServerClient:
                 return False
 
             target_id = str(target.get("id") or "")
-            for s in sources:
-                sid = str(s.get("id") or "")
-                if not sid:
-                    continue
-                if sid == target_id:
-                    await self.toggle_custom_source(sid, True)
-                else:
-                    await self.toggle_custom_source(sid, False)
+            if not target_id:
+                return False
+            await self.toggle_custom_source(target_id, enabled)
             return True
