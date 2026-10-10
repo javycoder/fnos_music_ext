@@ -352,7 +352,6 @@ test("储存目录：loadConfig 回填 + collectConfig 收集 + 格式/互斥校
   await global.loadConfig();
   assert.strictEqual(els.get("#dir-cache").value, "/vol2/cache");
   assert.strictEqual(els.get("#dir-download").value, "/vol1/music");
-  assert.strictEqual(els.get("#tee-dir").value, "/vol1/music"); // 与目录设置页同一配置
   const values = global.collectConfig();
   assert.strictEqual(values.FNMUSIC_CACHE_DIR, "/vol2/cache");
   assert.strictEqual(values.FNMUSIC_TEE_SAVE_DIR, "/vol1/music");
@@ -369,17 +368,13 @@ test("储存目录：loadConfig 回填 + collectConfig 收集 + 格式/互斥校
   assert.strictEqual(global.collectConfig().FNMUSIC_CACHE_DIR, "/vol2/cache");
 });
 
-test("下载目录与边听边存保存路径镜像同步（input 事件互写）", async () => {
+test("下载目录输入即标脏（保存路径已在边听边存页移除，此处为唯一入口）", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: {} });
   await global.loadConfig();
   els.get("#dir-download").value = "/vol1/new";
   els.get("#dir-download").dispatch("input");
-  assert.strictEqual(els.get("#tee-dir").value, "/vol1/new");
-  els.get("#tee-dir").value = "/vol1/back";
-  els.get("#tee-dir").dispatch("input");
-  assert.strictEqual(els.get("#dir-download").value, "/vol1/back");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true); // 输入即标脏
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
 });
 
 test("目录输入防抖 fs-check：目录不存在但父目录可写 → warn 提示", async () => {

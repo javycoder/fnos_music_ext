@@ -192,9 +192,6 @@
           <label class="switch-row"><span>边听边存<div class="sub">完整试听在线歌后自动保存到本地曲库</div></span><input type="checkbox" id="tee-enabled"></label>
           <label class="switch-row"><span>自动下载封面<div class="sub">自动保存到本地的歌曲会顺带把封面一起下回来，直接嵌进音频文件里；飞牛音乐认的就是内嵌封面，这样官方 App 里下载的歌就有图。歌曲保存成功后才会去下封面，不会出现只有封面没有歌的垃圾文件。默认开启。</div></span><input type="checkbox" id="auto-cover"></label>
           <label class="switch-row"><span>自动下载歌词<div class="sub">自动保存到本地的歌曲在完整下载成功后，自动下载同名 .lrc 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放就能显示歌词。歌曲下载成功后才会去下歌词，不会出现只有歌词没有歌的垃圾文件。酷我源的歌词接口已失效，暂无歌词。默认关闭。</div></span><input type="checkbox" id="lyric-auto-dl"></label>
-          <label class="field"><span>保存路径</span>
-            <input class="input" id="tee-dir" placeholder="留空自动探测共享曲库目录">
-          </label>
           <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
             <input class="input" id="tee-max" type="number" min="1" max="100">
           </label>
@@ -231,8 +228,8 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-title">下载目录（边听边存保存位置）</div>
-          <p class="hint">边听边存、收藏自动绑定下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库目录。建议选择官方共享曲库目录，官方 App 扫描入库后即可在本地列表播放。与「边听边存」页的保存路径是同一项配置，两处修改会自动同步。</p>
+          <div class="card-title">下载目录</div>
+          <p class="hint">边听边存、收藏/加入歌单自动下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库目录。建议选择官方共享曲库目录，官方 App 扫描入库后即可在本地列表播放。</p>
           <label class="field"><span>下载目录</span>
             <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
           </label>
