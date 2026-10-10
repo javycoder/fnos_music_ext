@@ -109,10 +109,13 @@ try:
         device = os.fstat(logs).st_dev
 
         def repair(fd):
-            if os.geteuid() == 0:
-                os.fchown(fd, 0, 1000)
-            else:
-                os.fchown(fd, -1, 1000)
+            try:
+                if os.geteuid() == 0:
+                    os.fchown(fd, 0, 1000)
+                else:
+                    os.fchown(fd, -1, 1000)
+            except (PermissionError, OSError):
+                pass
             os.fchmod(fd, 0o2770)
             for name in os.listdir(fd):
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -131,7 +134,10 @@ try:
                         actual = os.fstat(child)
                         if (stat.S_ISREG(actual.st_mode) and actual.st_nlink == 1
                                 and actual.st_dev == device):
-                            os.fchown(child, -1, 1000)
+                            try:
+                                os.fchown(child, -1, 1000)
+                            except (PermissionError, OSError):
+                                pass
                             os.fchmod(child, 0o640)
                     finally:
                         os.close(child)
@@ -144,7 +150,10 @@ try:
                 info = os.fstat(out)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise ValueError("install.log must be an unlinked regular file")
-                os.fchown(out, -1, 1000)
+                try:
+                    os.fchown(out, -1, 1000)
+                except (PermissionError, OSError):
+                    pass
                 os.fchmod(out, 0o640)
                 stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 os.write(out, f"[{stamp}] [install] {sys.argv[2]}\n".encode("utf-8"))
