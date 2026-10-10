@@ -93,6 +93,7 @@ RUN groupadd -g 1000 appuser \
 ARG LXSERVER_MIRROR="https://ghfast.top"
 COPY container/lxserver.version /srv/lxserver.version
 COPY container/lxserver-artifact/ /srv/lxserver-artifact/
+COPY container/lxserver_compat.py /srv/lxserver_compat.py
 RUN set -eu; \
     . /srv/lxserver.version; \
     TARGET_ZIP="/srv/lxserver-artifact/${LXSERVER_ZIP_NAME}"; \
@@ -135,7 +136,10 @@ RUN set -eu; \
     if [ -f /srv/lxserver/server/server.js ]; then \
         sed -i 's/const result = await musicSdk\[source\]\.getLyric(songInfo);/const _res = musicSdk[source].getLyric(songInfo); const result = await (_res \&\& _res.promise ? _res.promise : _res);/g' /srv/lxserver/server/server.js; \
     fi; \
-    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact; \
+    if [ -f /srv/lxserver/server/server/userApi.js ]; then \
+        python3 /srv/lxserver_compat.py /srv/lxserver/server/server/userApi.js; \
+    fi; \
+    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact /srv/lxserver_compat.py; \
     chown -R appuser:appuser /srv/lxserver
 
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主

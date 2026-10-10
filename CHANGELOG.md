@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+## [2.8.0j] - 2026-10-10
+
+### 修复
+
+- **lxserver 用户源沙箱兼容补丁**（构建期应用，`container/lxserver_compat.py`，幂等且锚点失配即中止构建）：按 pdone/lx-music-source 等按 lx-music 桌面端契约编写的第三方源脚本逐平台实测，修复上游 lx-music-sync-server v2.1.2 沙箱的三处协议/环境差异——沙箱缺 `fetch`/`performance`/`queueMicrotask`/`setImmediate` 现代全局（混淆脚本的特性检测直接抛「xxx is not a function」，整个平台分支瘫痪）；`request` 事件载荷未按桌面端协议携带 `callback`（回调式脚本静默返回 undefined，表现为「成功」却拿不到直链）；`lx.utils.crypto.aesEncrypt` 只认裸模式名（脚本传 `aes-128-ecb` 完整算法名时被拼成非法算法名报 Unknown cipher，且 ECB 无 IV 场景未放行）。实测六音音源 wy/kg 平台由全线失败恢复出链。
+- **洛雪空直链换源轮换**：脚本「成功」却拿不出直链（HTTP 200 无 url，如平台未在脚本侧激活的静默空返回）时，与坏链探活失败同等按 `excludeApiSources` 排除已试脚本、同音质档换下一个激活源重试，不再直接放弃整档。
+- **测试隔离**：bootstrap 迁移用例显式隔离仓库根目录可能存在的 `.env`（`_persisted_source_targets` 磁盘优先读取会让用例命中真实安装配置而测不到环境变量回退路径），修复在有安装残留的开发机上 `lxmusic-service` 套件 2 个用例误报失败。
+- 经 pdone/lx-music-source（全豆要 9.3 与 GitHub 最新版字节一致、六音、独家、ikun 等源）逐平台验证：kw/kg/wy 全部恢复出链；tx（脚本仅产出加密 mflac/mgg 直链）与 mg（全部脚本后端死链）为第三方脚本侧问题，现按平台独立熔断快速失败且不拖累其他平台。
+
+版本仍属 2.8.0 系列：应用 VERSION 与 FPK manifest 基础版本保持 `2.8.0`，自动迭代 Release 标识为 `2.8.0j`。
+
 ## [2.8.0] - 2026-10-10
 
 ### 修复

@@ -547,6 +547,9 @@ def test_bootstrap_migration_restores_multi_active_sources(tmp_path, monkeypatch
     orig_lx = lxapp.LXSERVER
     monkeypatch.setattr(lxapp, "LXSERVER", fake)
     monkeypatch.setenv("LX_DATA_DIR", str(tmp_path))  # 无历史 uploads/state.json
+    # 隔离仓库根目录可能存在的 .env（_persisted_source_targets 磁盘优先，
+    # 命中真实安装配置会让用例测不到环境变量回退路径）
+    monkeypatch.setenv("LX_ENV_PATH", str(tmp_path / "absent.env"))
     monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
         {"name": "a", "url": "https://s/a.js", "active": True},
         {"name": "b", "url": "https://s/b.js", "active": False},
@@ -572,6 +575,7 @@ def test_bootstrap_migration_falls_back_to_single_url(tmp_path, monkeypatch):
     orig_lx = lxapp.LXSERVER
     monkeypatch.setattr(lxapp, "LXSERVER", fake)
     monkeypatch.setenv("LX_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LX_ENV_PATH", str(tmp_path / "absent.env"))
     monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
         {"name": "a", "url": "https://s/a.js", "active": False},
     ]))
@@ -782,6 +786,24 @@ async def test_probe_reject_no_more_sources_falls_to_next_tier(fake_lx, fresh_ur
         assert r and r["url"] == "https://media.test/song.flac"
         # lossless 档 1 次调用后即降档（无轮换），high 档成功：共 2 次
         assert [q for _, q in fake_lx.url_calls] == ["flac", "320k"]
+    finally:
+        await probe_client.aclose()
+        fake_lx.url_script.clear()
+
+
+@pytest.mark.asyncio
+async def test_empty_url_response_rotates_to_next_source(fake_lx, fresh_url_cache):
+    """脚本"成功"却拿不出直链（200 无 url，如平台未激活的静默空返回）：同档换源重试。"""
+    probe_client = mock_client(_flac_probe_handler)
+    fake_lx.url_script = [
+        {"type": "flac", "sourceName": "空手源", "sourceId": "empty.js", "hasMoreSources": True},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "好链源"},
+    ]
+    try:
+        r = await lxapp._resolve_url_cached(
+            probe_client, "kg", {"id": "lx:kg:abc123", "lx_source": "kg"}, "lossless", 20.0)
+        assert r and r["url"] == "https://media.test/song.flac"
+        assert fake_lx.url_excludes == [None, ["empty.js", "空手源"]]
     finally:
         await probe_client.aclose()
         fake_lx.url_script.clear()
