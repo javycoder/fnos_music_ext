@@ -1001,14 +1001,17 @@ def source_from_online_guid(guid: str) -> str:
 
 
 # 搜索结果在线条目的来源标记（仅显示，不入库不影响业务逻辑）：
-# 网易盒子→[music box]，musicdl→[dl]，洛雪→逐曲平台 [lx·酷我]（平台未知时回退备注名/[lx]）
+# 网易盒子→[music box]，musicdl→[dl]，洛雪→逐曲 [脚本名-平台]（如 [墨澜-kg]）；
+# 多源同时激活且平台无法唯一归属某脚本时脚本名退 "lx"；平台未知回退备注名/[lx]
 _SOURCE_TAG_NETEASE = "[music box] "
 _SOURCE_TAG_MUSICDL = "[dl] "
 _SOURCE_TAG_LX_FALLBACK = "[lx] "
 
 # lx 搜索固定走平台官方接口（lxserver 内置 musicSdk），自定义源脚本仅参与播放链接解析，
-# 因此 lx 条目唯一可逐曲归属的维度是平台（item["lx_source"] / id "lx:<平台>:"）。
-_LX_PLATFORM_NAMES = {"kw": "酷我", "kg": "酷狗", "tx": "QQ", "wy": "网易", "mg": "咪咕"}
+# 故逐曲归属 = 平台（item["lx_source"] / id "lx:<平台>:"）+ 脚本名（该平台唯一归属的
+# 激活脚本，按 lxmusic /api/v1/source 的 sources[].platforms 声明判定；多个脚本声明
+# 同一平台时无法归属，脚本名落 "lx"）。
+_LX_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
 
 
 def lx_platform_from_item(item: dict | None) -> str:
@@ -1018,7 +1021,7 @@ def lx_platform_from_item(item: dict | None) -> str:
     if not isinstance(item, dict):
         return ""
     platform = str(item.get("lx_source") or "").strip().lower()
-    if platform in _LX_PLATFORM_NAMES:
+    if platform in _LX_PLATFORMS:
         return platform
     raw_id = str(item.get("id") or "")
     if raw_id.startswith("online:"):
@@ -1026,14 +1029,16 @@ def lx_platform_from_item(item: dict | None) -> str:
     parts = raw_id.split(":")
     if len(parts) >= 2 and parts[0] == "lx":
         platform = parts[1].strip().lower()
-        if platform in _LX_PLATFORM_NAMES:
+        if platform in _LX_PLATFORMS:
             return platform
     return ""
 
 
-def _lx_platform_tag(platform: str) -> str:
-    name = _LX_PLATFORM_NAMES.get(str(platform or "").strip().lower())
-    return f"[lx·{name}] " if name else ""
+# 平台→激活脚本名 映射缓存：lx 搜索时异步刷新（TTL 内复用），同步标记路径只读；
+# 条目自带 lx_script（搜索时已注记）时无需查缓存
+_LX_SCRIPT_MAP_CACHE: dict = {"ts": -1.0, "by_platform": {}}
+_LX_SCRIPT_MAP_TTL = 60.0
+_LX_SCRIPT_MAP_STALE_S = 300.0
 
 
 def _lx_source_entries() -> list[dict]:
@@ -1047,7 +1052,7 @@ def _lx_source_entries() -> list[dict]:
 def _lx_source_remark() -> str:
     """当前洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。
 
-    仅作为 lx 条目平台未知时的回退标记（逐曲优先显示 [lx·平台名]）。"""
+    仅单激活源可归属（多源/无备注返回空），作为脚本名与平台未知条目的回退标记。"""
     entries = _lx_source_entries()
     active = [e for e in entries if e.get("active")]
     if active:
@@ -1061,16 +1066,77 @@ def _lx_source_remark() -> str:
     return ""
 
 
+async def refresh_lx_script_map(client: httpx.AsyncClient) -> dict[str, str]:
+    """构建 平台→激活脚本名 映射并刷新缓存；返回该映射（TTL 内直接复用缓存）。
+
+    归属规则：仅 1 个激活脚本 → 全平台归属它；多脚本时仅"该平台的声明脚本唯一"
+    才归属（A 声明 kg、B 声明 wy → kg→A、wy→B；A/B 都声明 kg → kg 不归属）。
+    描述接口不可用（lxmusic 未启用/超时）时回退 LX_SOURCE_LIST 单激活备注。"""
+    if time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] < _LX_SCRIPT_MAP_TTL:
+        return dict(_LX_SCRIPT_MAP_CACHE["by_platform"])
+    by_platform: dict[str, str] = {}
+    sources: "list[dict] | None" = None
+    try:
+        r = await client.get("/api/v1/source", timeout=5.0)
+        if r.status_code == 200:
+            data = r.json()
+            raw = data.get("data") if isinstance(data, dict) else None
+            raw = raw.get("sources") if isinstance(raw, dict) else None
+            if isinstance(raw, list):
+                sources = [s for s in raw if isinstance(s, dict)]
+    except Exception:
+        sources = None
+    if sources is None:
+        remark = _lx_source_remark()
+        if remark:
+            by_platform = dict.fromkeys(_LX_PLATFORMS, remark)
+    else:
+        # 脚本名优先用管理台备注名（按 URL 对齐），无匹配再用脚本自带名
+        remarks_by_url = {
+            str(e.get("url") or "").strip(): str(e.get("name") or "").strip()
+            for e in _lx_source_entries()
+        }
+        scripts: list[tuple[str, set[str]]] = []
+        for s in sources:
+            name = remarks_by_url.get(str(s.get("url") or "").strip()) or str(s.get("name") or "").strip()
+            platforms = {p for p in (s.get("platforms") or []) if p in _LX_PLATFORMS}
+            if name:
+                scripts.append((name, platforms or set(_LX_PLATFORMS)))
+        if len(scripts) == 1:
+            by_platform = dict.fromkeys(_LX_PLATFORMS, scripts[0][0])
+        else:
+            for p in _LX_PLATFORMS:
+                names = {n for n, ps in scripts if p in ps}
+                if len(names) == 1:
+                    by_platform[p] = next(iter(names))
+    _LX_SCRIPT_MAP_CACHE["ts"] = time.monotonic()
+    _LX_SCRIPT_MAP_CACHE["by_platform"] = by_platform
+    return by_platform
+
+
+def _lx_script_for_platform(platform: str) -> str:
+    """同步侧解析脚本名：条目未注记 lx_script 时用映射缓存（容忍过期）→ 单激活备注。"""
+    if time.monotonic() - _LX_SCRIPT_MAP_CACHE["ts"] <= _LX_SCRIPT_MAP_STALE_S:
+        name = _LX_SCRIPT_MAP_CACHE["by_platform"].get(platform)
+        if name:
+            return name
+    return _lx_source_remark()
+
+
 def source_display_prefix(src: str, item: dict | None = None) -> str:
-    """在线条目来源标记前缀：netease→[music box]，lx→逐曲平台 [lx·酷我]
-    （平台未知回退备注名或 [lx]），其余(musicdl 平台)→[dl]。"""
+    """在线条目来源标记前缀：netease→[music box]，lx→逐曲 [脚本名-平台]
+    （如 [墨澜-kg]；脚本无法归属落 lx，平台未知回退备注名或 [lx]），其余→[dl]。"""
     s = str(src or "").strip()
     if s == "netease":
         return _SOURCE_TAG_NETEASE
     if s == "lx":
-        tag = _lx_platform_tag(lx_platform_from_item(item))
-        if tag:
-            return tag
+        platform = lx_platform_from_item(item)
+        if platform:
+            script = ""
+            if isinstance(item, dict):
+                script = str(item.get("lx_script") or "").strip()
+            script = script or _lx_script_for_platform(platform)
+            return f"[{script or 'lx'}-{platform}] "
         remark = _lx_source_remark()
         return f"[{remark}] " if remark else _SOURCE_TAG_LX_FALLBACK
     if s:
@@ -1079,15 +1145,18 @@ def source_display_prefix(src: str, item: dict | None = None) -> str:
 
 
 def strip_source_tag(title: str) -> str:
-    """剥离来源标记前缀。仅精确匹配已知标记（含 [lx·平台名] 全部变体与
+    """剥离来源标记前缀。仅精确匹配已知标记（含 [脚本名-平台] 全部变体与
     列表里全部洛雪备注名），不用泛化正则，避免误伤本身以方括号开头的歌名。"""
     t = str(title or "")
     candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK]
-    candidates.extend(_lx_platform_tag(p) for p in _LX_PLATFORM_NAMES)
+    script_parts = {"lx"}
     for entry in _lx_source_entries():
         name = str(entry.get("name") or "").strip()
         if name:
             candidates.append(f"[{name}] ")
+            script_parts.add(name)
+    for name in script_parts:
+        candidates.extend(f"[{name}-{p}] " for p in _LX_PLATFORMS)
     # 优先匹配最长标记，避免前缀部分命中短备注名
     candidates.sort(key=len, reverse=True)
     for tag in candidates:
@@ -2260,6 +2329,12 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
                 "lyric": "",
                 "verified": it.get("verified") is True,
             })
+        # 逐曲注记归属脚本名（平台→唯一激活脚本；无法归属留空，标记时落 lx），随搜索缓存落盘
+        script_map = await refresh_lx_script_map(client)
+        for it in items:
+            platform = lx_platform_from_item(it)
+            if platform:
+                it["lx_script"] = script_map.get(platform, "")
         return _SearchItems([it for it in items if is_playable_online_track(it, allow_paywall=allow_paywall)], partial=bool(data.get("errors")))
     except Exception as e:
         logger.warning("Failed to fetch online search from lxmusic: %s", e)
