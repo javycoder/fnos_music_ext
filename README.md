@@ -17,6 +17,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
   - [musicbox](https://github.com/darknessomi/musicbox)：网易云高品质解析，支持扫码登录 VIP/无损曲库与原生每日推荐；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)：酷我/咪咕等 57 个平台聚合，可按平台粒度勾选（编号见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）。部分音乐源歌曲少，或返回的音乐不可播放，请自行测试并使用可靠音乐源；
   - **lxmusic**：洛雪音乐自定义源运行时——搜索/歌词/榜单走内置平台接口，播放解析由你提供的洛雪自定义源脚本（在容器内执行）完成。源脚本支持三种配置方式：**粘贴 URL**、**上传电脑上的 `.js` 文件**、**从 NAS 选择 `.js`**（飞牛桌面内）。支持**多源同时激活**（v2.8.0 起）：列表里可勾选多个源一起生效，解析失败自动在启用的源之间接力切换；`install.sh --lx-source-url` 也支持逗号分隔一次配置多个。导入 URL 或 `.js` 前必须自行确认来源安全，不要导入来历不明的脚本；脚本在容器内执行。搜索结果以及能否播放视源脚本而定；
+    本项目的洛雪音乐源解析来自 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)。本项目仅使用 [pdone/lx-music-source](https://github.com/pdone/lx-music-source) 里的源进行验证；如果你使用的源不可用，可以联系作者尝试进行适配。
 - **管理 WebUI**（可选，仅本机 8774）：在已登录的飞牛管理员页面打开。浏览器里完成音源切换、musicdl 平台勾选、网易扫码、洛雪源配置（URL/上传/NAS 选择）与测试保存、音质偏好、储存（边听边存/目录设置）、推荐开关与 LLM 配置，全部热生效；
 - **运行日志与「关于」页**（v2.8.0e 起）：关键链路（运行环境、请求、安装/升级、切源与开关、播放诊断）记入安装目录 `logs/`，本地滚动保留 3 天、秘密值打码；WebUI「关于」页可一键导出近 3 天日志为 `.logzip`（反馈问题时附上），并展示作者、版本、开源地址与免责声明；卸载时日志一并删除；
 - **音质偏好**：`高音质`（从高到低）/ `平衡`（取中间档）/ `流畅`（优先最低）三种模式，覆盖全部音源；只影响在线播放/搜索取源档位；
