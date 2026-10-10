@@ -451,18 +451,30 @@ class LxServerClient:
         return []
 
     async def import_custom_source(self, url: str) -> dict:
-        """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。"""
+        """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。
+
+        allowUnsafeVM=True 代答 lxserver 的"原生 VM 模式"确认（pdone/lx-music-source
+        等聚合类脚本需要原生 VM 才能运行；部署侧已由 entrypoint 将
+        system.allowUnsafeVM 置 true，服务端全局开关仍兜底）。"""
         client = await self.get_client()
-        resp = await client.post("/api/custom-source/import", json={"url": url}, timeout=self.timeout)
+        resp = await client.post(
+            "/api/custom-source/import",
+            json={"url": url, "allowUnsafeVM": True},
+            timeout=self.timeout,
+        )
         data = self._parse_admin_resp(resp, "导入自定义源")
         return data
 
     async def upload_custom_source(self, filename: str, script_content: str) -> dict:
-        """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。"""
+        """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。
+
+        allowUnsafeVM=True 代答"原生 VM 模式"确认，否则需要 VM 的脚本（如聚合
+        API 类）上传永远收到 requireUnsafe 确认文案而被 500 挡下（2026-10-11
+        pdone/lx-music-source 聚合API接口 实测）。"""
         client = await self.get_client()
         resp = await client.post(
             "/api/custom-source/upload",
-            json={"filename": filename, "content": script_content},
+            json={"filename": filename, "content": script_content, "allowUnsafeVM": True},
             timeout=self.timeout,
         )
         return self._parse_admin_resp(resp, "上传自定义源")

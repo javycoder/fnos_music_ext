@@ -3243,6 +3243,15 @@ async def lifespan(fastapi_app: FastAPI):
         )
         created_lx = True
 
+    # 预热 平台→激活脚本名 映射：首次搜索的标记渲染是同步读缓存，映射刷新又是
+    # 搜索触发的后台任务，冷启动时来不及完成，第一屏会全部退回 [lx-平台]。
+    # 启动即拉一次（失败静默，搜索路径自带兜底与 TTL 重试）。
+    if CONF.get("lx_enabled"):
+        _LX_SCRIPT_MAP_TASK = asyncio.create_task(
+            refresh_lx_script_map(get_lx_client(fastapi_app))
+        )
+        _LX_SCRIPT_MAP_TASK.add_done_callback(_finish_lx_script_map_refresh)
+
     if getattr(fastapi_app.state, "llm_client", None) is None:
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
