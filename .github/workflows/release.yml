@@ -41,7 +41,7 @@ jobs:
 
       - name: Run packaging tests
         run: |
-          python -m pip install pytest
+          python -m pip install pytest qrcode pillow
           python -m pytest packaging/tests/
 
       - name: Download fnpack
