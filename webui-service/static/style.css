@@ -215,6 +215,13 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   width: 300px; max-width: 82vw; height: auto; display: block; margin: 8px auto 0;
   border: 1px solid var(--line); border-radius: 8px; background: #fff;
 }
+/* 收款渠道标注：裸二维码曾被反馈无法辨认是支付宝（徽标配色随支付宝品牌蓝） */
+.about-donate-note { margin: 10px 0 2px; color: var(--muted); font-size: 13px; }
+.about-donate-badge {
+  display: inline-block; padding: 2px 12px; margin-right: 8px;
+  border-radius: 999px; background: #1677ff; color: #fff;
+  font-size: 13px; font-weight: 600; line-height: 20px; vertical-align: 1px;
+}
 
 /* -------------------------------------------------- 保存条/Toast */
 .save-bar {

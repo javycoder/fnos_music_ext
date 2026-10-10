@@ -687,6 +687,50 @@ def test_lifespan_cancels_pending_descriptor(monkeypatch):
     asyncio.run(run())
 
 
+def test_lifespan_prewarms_script_map_when_lx_enabled(monkeypatch):
+    """启用 lx 时 lifespan 预热 平台→脚本名 映射：冷启动首次搜索不再退 [lx-平台]。
+
+    标记渲染是搜索请求内的同步读，映射此前只能靠搜索触发的后台刷新，首屏必回退；
+    2026-10-11 pdone/lx-music-source 沙盒实测单源首搜出 [lx-kg]，预热后出 [脚本名-kg]。"""
+    async def run():
+        async def handler(request):
+            assert request.url.path == "/api/v1/source"
+            return httpx.Response(200, json={"data": {"sources": [
+                {"url": "https://s/one.js", "name": "预热源", "platforms": ["kg", "wy"]},
+            ]}})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lx") as lx:
+            monkeypatch.setitem(CONF, "lx_enabled", True)
+            monkeypatch.setattr(app.state, "lx_client", lx, raising=False)
+            _LX_SCRIPT_MAP_CACHE.update(ts=-1.0, by_platform={})
+            async with pa.lifespan(app):
+                for _ in range(100):
+                    if _LX_SCRIPT_MAP_CACHE["ts"] >= 0:
+                        break
+                    await asyncio.sleep(0.02)
+            assert _LX_SCRIPT_MAP_CACHE["ts"] >= 0
+            # 仅 1 个激活脚本：按归属规则全平台都归它（与声明平台无关）
+            assert _LX_SCRIPT_MAP_CACHE["by_platform"] == dict.fromkeys(pa._LX_PLATFORMS, "预热源")
+    asyncio.run(run())
+
+
+def test_lifespan_skips_script_map_prewarm_when_lx_disabled(monkeypatch):
+    """未启用 lx 时不预热（不产生后台请求与任务句柄）。"""
+    async def run():
+        async def handler(request):
+            raise AssertionError("lx disabled 时不应请求 lxmusic")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lx") as lx:
+            monkeypatch.setitem(CONF, "lx_enabled", False)
+            monkeypatch.setattr(app.state, "lx_client", lx, raising=False)
+            _LX_SCRIPT_MAP_CACHE.update(ts=-1.0, by_platform={})
+            async with pa.lifespan(app):
+                await asyncio.sleep(0.05)
+            assert _LX_SCRIPT_MAP_CACHE["ts"] < 0
+            assert pa._LX_SCRIPT_MAP_TASK is None
+    asyncio.run(run())
+
+
 def test_lx_display_tags_are_bounded_and_only_track_displayed_labels():
     _LX_SCRIPT_MAP_CACHE.update(ts=time.monotonic(), by_platform={"kg": "当前映射"})
     assert strip_source_tag("[当前映射-kg] 歌名") == "歌名"

@@ -87,18 +87,17 @@ jobs:
           FNPACK_VERSION: "1.2.3"
 
       # 打赏二维码不入库：配置了 ALIPAY_QRCODE secret（收款链接）时现场生成
-      # PNG 打进包里；未配置则跳过，运行时 WebUI 自动隐藏打赏卡片
+      # PNG 打进包里（二维码中心叠加支付宝徽标，scripts/gen_alipay_qr.py）；
+      # 未配置则跳过，运行时 WebUI 自动隐藏打赏卡片
+      - name: Install CJK font for QR badge (best-effort)
+        if: env.ALIPAY_QRCODE != ''
+        run: sudo apt-get install -y --no-install-recommends fonts-noto-cjk || true
+
       - name: Generate Alipay QR code (optional)
         if: env.ALIPAY_QRCODE != ''
         run: |
           python3 -m pip install --quiet qrcode pillow
-          python3 - <<'EOF'
-          import os
-          import qrcode
-          img = qrcode.make(os.environ["ALIPAY_QRCODE"])
-          img.save("webui-service/static/alipay.png")
-          print("alipay.png generated:", os.path.getsize("webui-service/static/alipay.png"), "bytes")
-          EOF
+          python3 scripts/gen_alipay_qr.py
 
       - name: Build fpk package
         run: |

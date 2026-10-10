@@ -266,7 +266,10 @@ def test_source_set_rejects_missing_source(test_app_client):
 
 
 def test_lxserver_upload_sends_json_contract():
-    """上传必须发 JSON {filename, content}（lxserver 端点 JSON.parse，multipart 会被拒）。"""
+    """上传必须发 JSON {filename, content, allowUnsafeVM}（lxserver 端点 JSON.parse，multipart 会被拒）。
+
+    allowUnsafeVM=True 代答"原生 VM 模式"确认：聚合类脚本（pdone/lx-music-source
+    聚合API接口等）需要原生 VM，缺省确认文案会被服务端按 requireUnsafe 拒绝。"""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -280,8 +283,25 @@ def test_lxserver_upload_sends_json_contract():
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     res = asyncio.run(client.upload_custom_source("x.js", "console.log(1)"))
     assert captured["content_type"].startswith("application/json")
-    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)"}
+    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)", "allowUnsafeVM": True}
     assert res["id"] == "x.js"
+
+
+def test_lxserver_import_sends_allow_unsafe_vm():
+    """URL 导入同样携带 allowUnsafeVM=True（lxserver import 端点同款确认语义）。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"success": True, "id": "imp.js", "metadata": {"name": "imp"}})
+
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test", admin_password="pw")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    res = asyncio.run(client.import_custom_source("https://example.com/src.js"))
+    assert captured["body"] == {"url": "https://example.com/src.js", "allowUnsafeVM": True}
+    assert res["id"] == "imp.js"
 
 
 def test_lxserver_admin_resp_semantics():
