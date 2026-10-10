@@ -87,6 +87,30 @@ def fake_ffmpeg(tmp_path, monkeypatch):
     return _install
 
 
+# 假 ffprobe：按探测目标（http 源 / 本地产出 playlist）回放环境变量时长
+FAKE_FFPROBE_SRC = '''#!/usr/bin/env python3
+import os, sys
+target = sys.argv[-1]
+if target.startswith(("http://", "https://")):
+    print(os.environ.get("FAKE_FFPROBE_SRC_DUR", "0"))
+else:
+    print(os.environ.get("FAKE_FFPROBE_LOCAL_DUR", "0"))
+'''
+
+
+@pytest.fixture
+def fake_ffprobe(tmp_path, monkeypatch):
+    def _install(local_dur: float, src_dur: float):
+        script = tmp_path / "fake_ffprobe"
+        script.write_text(FAKE_FFPROBE_SRC)
+        script.chmod(0o755)
+        monkeypatch.setattr(tc, "FFPROBE_BIN", str(script))
+        monkeypatch.setenv("FAKE_FFPROBE_LOCAL_DUR", str(local_dur))
+        monkeypatch.setenv("FAKE_FFPROBE_SRC_DUR", str(src_dur))
+        return str(script)
+    return _install
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """隔离目录 + 各源 mock 上游；upstream 记录往返供透传断言。"""
@@ -280,6 +304,102 @@ def test_ensure_session_without_ffmpeg_returns_none(tmp_path):
     assert asyncio.run(tc.ensure_session(FAKE_KUWO, src, 100.0, root=str(tmp_path))) is None
 
 
+# === issue #50：源站断流时 ffmpeg rc=0 的半成品不得转正 ===
+
+def test_truncated_stream_discards_cache(tmp_path, fake_ffmpeg, fake_ffprobe):
+    """传输中途截断（音源时长≈元数据、产出不足）：半成品绝不转正，清目录。
+
+    复现链路：源站谎报 Content-Length 半途断连 → ffmpeg "Stream ends
+    prematurely" 仍 rc=0 → 产出 12/26 片。旧逻辑转正后 playlist 仍声明 26
+    片，客户端播到 120s 起分片 404 跳歌、seek 到结尾必 404，且残缺缓存被
+    永久复用（每次播放都在同一位置断）。
+    """
+    fake_ffmpeg("ok", segments=12)
+    fake_ffprobe(local_dur=120.0, src_dur=269.0)   # 音源其实是全长的 → 判定传输截断
+    src = "http://127.0.0.1:19999/full.mp3"
+    root = str(tmp_path / "cache")
+
+    async def flow():
+        sess = await tc.ensure_session(FAKE_KUWO, src, 269.0, root=root)
+        assert sess is not None
+        assert await _wait_event(sess)
+        return sess.status, sess.directory
+
+    status, directory = asyncio.run(flow())
+    assert status == "failed"
+    assert not os.path.exists(directory)
+    assert tc._usable_cache(directory) is None
+
+
+def test_inflated_metadata_patches_declared_count(tmp_path, fake_ffmpeg, fake_ffprobe):
+    """元数据时长虚高（音源真实≈产出）：按真实时长修正常量后转正。
+
+    修正后重播的 playlist 只声明真实存在的分片，客户端自然播完跳下一首，
+    不再吃到永不存在的尾部分片 404。
+    """
+    fake_ffmpeg("ok", segments=12)
+    fake_ffprobe(local_dur=118.0, src_dur=119.0)   # 音源本来就只有 ~2 分钟
+    src = "http://127.0.0.1:19999/short.mp3"
+    root = str(tmp_path / "cache")
+
+    async def flow():
+        sess = await tc.ensure_session(FAKE_KUWO, src, 269.0, root=root)
+        assert sess is not None
+        assert await _wait_event(sess)
+        assert sess.status == "done"
+        # 磁盘 state 已按真实时长修正
+        state = json.load(open(os.path.join(sess.directory, tc.STATE_NAME)))
+        assert state["duration_s"] == 118.0
+        assert state["declared_count"] == 11
+        # 转正缓存可复用，且 playlist 声明与产出一致
+        cached = tc.peek_cached(FAKE_KUWO, root)
+        assert cached is not None and cached.declared_count == 11
+        text = tc.playlist_text(cached)
+        assert text.count("#EXTINF:") == 11
+        assert "00010.m4s" in text and "00011.m4s" not in text
+
+    asyncio.run(flow())
+
+
+def test_truncated_without_ffprobe_discards(tmp_path, fake_ffmpeg):
+    """ffprobe 不可用时无从仲裁：产出不足一律弃件（宁可重转不可带毒缓存）。"""
+    fake_ffmpeg("ok", segments=12)
+    src = str(tmp_path / "in.mp3")
+    with open(src, "wb") as f:
+        f.write(b"x" * 64)
+    root = str(tmp_path / "cache")
+
+    async def flow():
+        sess = await tc.ensure_session(FAKE_KUWO, src, 269.0, root=root)
+        assert await _wait_event(sess)
+        return sess.status, sess.directory
+
+    status, directory = asyncio.run(flow())
+    assert status == "failed"
+    assert not os.path.exists(directory)
+
+
+def test_usable_cache_rejects_short_segment_dir(tmp_path):
+    """存量带毒缓存自愈：done 但分片不足的目录拒用，且被 reap 清扫。"""
+    root = str(tmp_path / "cache")
+    directory = tc.session_dir(root, FAKE_KUWO)
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
+        f.write(b"ftypinit")
+    for i in range(3):
+        with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
+            f.write(b"moofseg")
+    with open(os.path.join(directory, tc.STATE_NAME), "w") as f:
+        json.dump({"guid": FAKE_KUWO, "status": "done", "duration_s": 269,
+                   "hls_time": 10, "declared_count": 26, "bitrate": "128k",
+                   "started_ts": 0, "done_ts": 0}, f)
+
+    assert tc._usable_cache(directory) is None          # 分片 3 < 声明 26：拒用
+    assert tc.peek_cached(FAKE_KUWO, root) is None
+    assert tc._reap_expired(root=root, ttl_s=90) == 1   # 无主半成品被清走
+    assert not os.path.exists(directory)
+
+
 def test_wait_file_returns_path_and_none_on_failure(tmp_path, fake_ffmpeg):
     fake_ffmpeg("fail")
     src = str(tmp_path / "in.mp3")
@@ -351,8 +471,10 @@ def _mk_done_cache(root: str, guid: str, size: int, age_s: float) -> str:
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
         f.write(b"i" * min(size, 16))
-    with open(os.path.join(directory, "00000.m4s"), "wb") as f:
-        f.write(b"s" * max(0, size - 16))
+    # 与 state 声明数一致：usable 校验要求分片覆盖声明清单
+    for i in range(10):
+        with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
+            f.write(b"s" * max(0, (size - 16) // 10))
     state = {"guid": guid, "status": "done", "duration_s": 100, "hls_time": 10,
              "declared_count": 10, "bitrate": "128k", "started_ts": 0, "done_ts": 0}
     spath = os.path.join(directory, tc.STATE_NAME)

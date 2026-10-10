@@ -2402,6 +2402,13 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
 
     fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
     重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。"""
+    key = str(song_id)
+    if not fresh:
+        pin = _LX_URL_PIN.get(key)
+        if pin:
+            if time.monotonic() < pin[1]:
+                return dict(pin[0])
+            _LX_URL_PIN.pop(key, None)
     primary = str(CONF.get("lx_quality") or "lossless").strip()
     qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
     if primary and primary not in qualities:
@@ -2424,10 +2431,40 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                 if isinstance(data, dict) and data.get("ok") is not False:
                     inner = data.get("data")
                     if isinstance(inner, dict) and inner.get("url"):
-                        return inner
+                        _lx_url_pin_store(key, inner)
+                        return dict(inner)
         except Exception as e:
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
     return None
+
+
+# 洛雪直链钉住（2.8.0j）：与网易钉链同构。窗口型播放内核按 1MB 窗口续拉，
+# 每个窗口各自重解析；lxmusic 虽有 600s 成功缓存 + 到期探活续期，但缓存边界
+# 后旧链失效重解析时，同曲可能换 rendition（实测同曲 lossless 档可从 320k MP3
+# 换成 48k AAC，字节布局完全不同），带偏移的续拉即错位断流，表象仍为"播到
+# 一半跳歌"。有效期内钉住同一条解析结果，取流/续传/转码各调用点自动一致。
+_LX_URL_PIN: "dict[str, tuple[dict, float]]" = {}
+_LX_URL_PIN_MAX = 1024
+# 与 lxmusic LX_URL_CACHE_TTL 默认值对齐：钉链到期时 lxmusic 缓存同样到期，
+# 由其探活续期保持同链或重解析，proxy 侧不自行强制 fresh
+_LX_URL_PIN_TTL_S = 600.0
+
+
+def _lx_url_pin_drop(song_id: str) -> None:
+    """直链打不开/首字节失败即弃钉：后续解析重新出链，不再撞同一条死链。"""
+    _LX_URL_PIN.pop(str(song_id), None)
+
+
+def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
+    """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
+    now = time.monotonic()
+    if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
+        for k in [k for k, v in _LX_URL_PIN.items() if v[1] <= now]:
+            _LX_URL_PIN.pop(k, None)
+        if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
+            oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
+            _LX_URL_PIN.pop(oldest, None)
+    _LX_URL_PIN[str(song_id)] = (resolved, now + _LX_URL_PIN_TTL_S)
 
 
 # 网易直链钉住（2.8.0）：song_id -> (url, 过期时刻单调钟)。窗口型播放内核
@@ -4323,7 +4360,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not url:
                     return None
             else:
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid), fresh=fresh_url)
+                song_id = song_id_from_online_guid(guid)
+                resolved = await resolve_lx_url(get_lx_client(request.app), song_id, fresh=fresh_url)
                 if not resolved:
                     return None
                 url = resolved["url"]
@@ -4366,6 +4404,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if source == "netease":
                     # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
                     _netease_url_pin_drop(song_id)
+                elif source == "lx":
+                    _lx_url_pin_drop(song_id)
                 return None
             chunks = resp.aiter_bytes()
             first = await anext(chunks, b"")
@@ -4374,10 +4414,14 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             # 路径不携带 refresh=True，否则会在 TTL 内反复撞同一条死链
             if source == "netease":
                 _netease_url_pin_drop(song_id)
+            elif source == "lx":
+                _lx_url_pin_drop(song_id)
             raise
         if not first:
             if source == "netease":
                 _netease_url_pin_drop(song_id)
+            elif source == "lx":
+                _lx_url_pin_drop(song_id)
             return None
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。

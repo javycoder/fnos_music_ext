@@ -11,8 +11,14 @@ ffmpeg 输出 fMP4 分片到 cache/hls/{safe_guid}/，playlist 由服务端按�
   服务端无需猜测分片是否写完。
 - 合成分片数取 floor(duration/hls_time)：ffmpeg 实际产出 ceil ≥ floor，
   App 多要一片会 404、少要一片只是末尾 <1s 尾差，取 floor 永不越界。
+  不设 -hls_init_time：ffmpeg 8 实测它会拖累全部分片按 init 时长切割
+  （issue #50：~4s 分片 + 10s 声明清单 → 客户端只播 ~40% 就到清单末尾
+  跳歌、seek 到结尾落在媒体时间线外必跳歌）。
 - 会话 heartbeat 续期；超时 / quit 杀进程；完整缓存在配额内 LRU 复用，
   半成品目录（running 中被杀 / failed）直接清理不残留。
+- rc==0 不等于产出完整（issue #50）：源站半途断连时 ffmpeg 照样以 0 退出，
+  转正前必须校验产出覆盖声明时长；不足的按"元数据虚高/传输截断"分别
+  修正常量或弃件重转，磁盘 done 缓存复用同样要求分片数覆盖声明清单。
 """
 from __future__ import annotations
 
@@ -52,6 +58,8 @@ class Session:
     done_ts: float = 0.0
     exit_event: asyncio.Event = field(default_factory=asyncio.Event)
     watcher: asyncio.Task | None = None
+    src: str = ""                     # 转码输入源；产出不足时探测音源真实时长用
+    headers: dict | None = None
 
 
 # guid → Session；仅存活进程在内，done 会话按磁盘 state.json 复用
@@ -101,12 +109,30 @@ def _remove_dir(directory: str) -> None:
     shutil.rmtree(directory, ignore_errors=True)
 
 
+def _produced_count(directory: str) -> int:
+    """目录里已成形的分片数（temp_file 改名后出现即完整）。"""
+    try:
+        return sum(1 for name in os.listdir(directory) if _SEGMENT_RE.match(name))
+    except OSError:
+        return 0
+
+
 def _usable_cache(directory: str) -> dict | None:
-    """磁盘上已完整（done + init 存在）的转码缓存，返回 state。"""
+    """磁盘上已完整（done + init 存在 + 分片覆盖声明清单）的转码缓存，返回 state。
+
+    分片数不足的 done 目录一律拒用：历史版本把半途断流的半成品转正成
+    "完整"缓存（issue #50：播一半分片 404 跳歌），此校验让带毒缓存自愈。
+    """
     state = _read_state(directory)
     if state.get("status") != "done":
         return None
     if not os.path.isfile(os.path.join(directory, INIT_NAME)):
+        return None
+    try:
+        declared = int(state.get("declared_count") or 1)
+    except (TypeError, ValueError):
+        declared = 1
+    if _produced_count(directory) < declared:
         return None
     return state
 
@@ -155,7 +181,6 @@ def _ffmpeg_argv(src: str, headers: dict | None, sess: Session, directory: str) 
         "-hls_playlist_type", "event",
         "-hls_flags", "temp_file+independent_segments",
         "-hls_time", str(sess.hls_time),
-        "-hls_init_time", str(min(4, int(sess.hls_time) or 4)),
         "-hls_segment_filename", os.path.join(directory, "%05d.m4s"),
         os.path.join(directory, PLAYLIST_NAME),
     ]
@@ -175,18 +200,58 @@ async def _watch(sess: Session) -> None:
     if sess.status in ("aborted",):
         _remove_dir(sess.directory)
     elif rc == 0 and os.path.isfile(os.path.join(sess.directory, INIT_NAME)):
-        sess.status = "done"
-        sess.done_ts = time.time()
-        # 转正：LRU 访问时间 = 完成时间
-        _write_state(sess)
-        _SESSIONS.pop(sess.guid, None)
-        _touch_state(sess.directory)
+        await _finalize_complete_output(sess)
     else:
         logger.warning("transcode failed rc=%s guid=%s", rc, sess.guid)
         sess.status = "failed"
         _remove_dir(sess.directory)
         _SESSIONS.pop(sess.guid, None)
     sess.exit_event.set()
+
+
+async def _finalize_complete_output(sess: Session) -> None:
+    """rc==0 只是 ffmpeg 的意见，不是产出完整的证明（issue #50）。
+
+    源站谎报 Content-Length 半途断连时，ffmpeg 报 "Stream ends prematurely"
+    仍以 0 退出；若按旧逻辑直接转正，playlist 还按元数据时长声明着全量分片，
+    客户端播到断点后首个缺失分片 404 跳歌、快进到结尾必 404，且残缺缓存被
+    永久复用（每次播放都在同一位置断）。此处按产出覆盖度裁决：
+    - 产出时长覆盖声明时长（ffprobe 本地产出，探针误差内）→ 转正；
+    - 无 ffprobe 时退化为分片数覆盖声明清单（floor，完整转码必满足）；
+    - 音源真实时长 ≈ 产出时长（元数据虚高）→ 按真实时长修正常量后转正，
+      重播自然播完，不再向客户端声明永不存在的分片；
+    - 其余（传输中途截断）→ 不转正、清目录，下次播放整轨重转。
+    """
+    produced = _produced_count(sess.directory)
+    real = await probe_duration(os.path.join(sess.directory, PLAYLIST_NAME)) \
+        if FFPROBE_BIN else 0.0
+    covered = (real + 2.0 >= sess.duration_s) if real > 0 \
+        else (produced >= sess.declared_count)
+    if not covered:
+        src_dur = await probe_duration(sess.src, sess.headers) \
+            if (FFPROBE_BIN and sess.src) else 0.0
+        if src_dur > 0 and src_dur <= real + 3.0:
+            logger.warning(
+                "transcode metadata duration inflated: guid=%s declared=%.1fs real=%.1fs",
+                sess.guid, sess.duration_s, real)
+            sess.duration_s = real
+            sess.declared_count = max(1, _declared_count(real, sess.hls_time))
+        else:
+            logger.warning(
+                "transcode output truncated, cache discarded: guid=%s "
+                "produced=%d segs (%.1fs) declared=%d segs (%.1fs) src_probe=%.1fs",
+                sess.guid, produced, real, sess.declared_count,
+                sess.duration_s, src_dur)
+            sess.status = "failed"
+            _remove_dir(sess.directory)
+            _SESSIONS.pop(sess.guid, None)
+            return
+    sess.status = "done"
+    sess.done_ts = time.time()
+    # 转正：LRU 访问时间 = 完成时间
+    _write_state(sess)
+    _SESSIONS.pop(sess.guid, None)
+    _touch_state(sess.directory)
 
 
 def _touch_state(directory: str) -> None:
@@ -255,7 +320,7 @@ async def ensure_session(
     sess = Session(
         guid=guid, directory=directory, duration_s=duration_s,
         hls_time=hls_time, declared_count=_declared_count(duration_s, hls_time),
-        bitrate=bitrate,
+        bitrate=bitrate, src=src, headers=headers,
     )
     _write_state(sess)
     try:
