@@ -67,6 +67,10 @@ class FakeLxServerClient:
         self.deleted_ids: list[str] = []
         # get_music_url 调用记录 (songmid, quality)：缓存/在途合并测试统计实际解析次数用
         self.url_calls: list[tuple[str, str]] = []
+        # 同步记录每次调用的 excludeApiSources（换源轮换测试断言用）
+        self.url_excludes: list[list[str] | None] = []
+        # 非空时按序弹出作为 get_music_url 返回值（先于 url_result 判定），耗尽后返回 None
+        self.url_script: list[dict | None] = []
         # 非空时 get_music_url 等待该事件（同测试循环内使用）：并发时序控制
         self.url_gate: asyncio.Event | None = None
 
@@ -107,10 +111,14 @@ class FakeLxServerClient:
             res.append(item)
         return res
 
-    async def get_music_url(self, song_info: dict, quality: str = "128k") -> dict | None:
+    async def get_music_url(self, song_info: dict, quality: str = "128k",
+                            exclude_api_sources: list[str] | None = None) -> dict | None:
         self.url_calls.append((str(song_info.get("songmid") or ""), quality))
+        self.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         if self.url_gate is not None:
             await self.url_gate.wait()
+        if self.url_script:
+            return self.url_script.pop(0)
         if self.url_result:
             return dict(self.url_result)
         return None

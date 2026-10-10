@@ -396,14 +396,20 @@ def _chain_available(name: str) -> bool:
     h = _CHAIN_HEALTH.get(name)
     if not h:
         return True
-    if h.get("half_open"):
-        return False
-    open_until = h.get("open_until", 0)
     now = time.time()
+    if h.get("half_open"):
+        # 半开试探在途：超过一个试探周期仍未回填（解析任务被取消等）自动放行
+        # 新试探，避免熔断器被一次未落地的试探永久卡死
+        if now - h.get("half_open_since", now) > _CHAIN_RETRY_SECONDS:
+            h["half_open"] = False
+        else:
+            return False
+    open_until = h.get("open_until", 0)
     if open_until and now < open_until:
         # half-open 试探
         if now >= h.get("next_try", 0):
             h["half_open"] = True
+            h["half_open_since"] = now
             return True
         return False
     return True
@@ -435,6 +441,7 @@ def chain_health_snapshot() -> dict[str, dict]:
         result[k] = {
             "fails": v.get("fails", 0),
             "state": "open" if open_until > now else "closed",
+            "half_open": bool(v.get("half_open")),
             "open_seconds_left": max(0, int(open_until - now)),
         }
     return result
@@ -563,6 +570,28 @@ _SEARCH_GATE = LxSearchGate()
 
 # ------------------------------------------------------------- 核心解析逻辑 --
 
+# 同档位探活失败后的换源上限：多源同时激活时逐个排除已产出坏链的脚本再试，
+# 超出按音源脚本数量上限直接降档（每轮仍受 resolver_timeout 与总预算约束）
+_MAX_SOURCE_ROUNDS = 3
+
+
+def _scripts_tried(res: dict) -> list[str]:
+    """解析结果里实际参与过的脚本标识（attempts 全部 + 最终产出者），供同档换源排除。
+
+    lxserver 的 excludeApiSources 按脚本 name 或 id（不区分大小写）过滤，二者都传。"""
+    names: list[str] = []
+    for a in (res.get("attempts") or []):
+        if isinstance(a, dict):
+            name = str(a.get("name") or "").strip()
+            if name:
+                names.append(name)
+    for key in ("sourceId", "sourceName"):
+        name = str(res.get(key) or "").strip()
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
 async def resolve_and_probe(
     client: httpx.AsyncClient,
     source: str,
@@ -570,12 +599,17 @@ async def resolve_and_probe(
     quality: str = "lossless",
     budget: float = 20.0,
 ) -> dict | None:
-    """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。"""
+    """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。
+
+    熔断按平台独立计数：某一平台（如 tx 只产出加密 mflac、mg 后端全挂）连续失败
+    只熔断该平台，不再拖垮其他健康平台的解析（2026-10-10 全局熔断误伤全平台故障）。
+    同档位直链探活失败时按 excludeApiSources 排除已试脚本换下一个激活源重试。"""
     src = normalize_source(source)
     track_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
+    chain_key = f"user_source:{src}" if src else "user_source"
 
-    if not _chain_available("user_source"):
-        logger.warning("lx resolve skipped: user_source circuit is open")
+    if not _chain_available(chain_key):
+        logger.warning("lx resolve skipped: %s circuit is open", chain_key)
         return None
 
     # 反查或合成 songInfo
@@ -593,52 +627,65 @@ async def resolve_and_probe(
             break
         lx_q = _tier_to_lx_quality(tier)
         attempted_tiers.append(tier)
-        try:
-            async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
-                res = await LXSERVER.get_music_url(song_info, lx_q)
-        except Exception as exc:
-            logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
-            res = None
+        excluded: list[str] = []
+        for _round in range(_MAX_SOURCE_ROUNDS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
+                    res = await LXSERVER.get_music_url(song_info, lx_q,
+                                                       exclude_api_sources=excluded or None)
+            except Exception as exc:
+                logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
+                res = None
 
-        if not res or not res.get("url"):
-            continue
+            if not res or not res.get("url"):
+                break  # 服务端无可用源/调用出错：降档
 
-        raw_url = res["url"]
-        headers = {}
-        # 酷狗或特殊源防盗链头
-        if src == "kg":
-            headers["Referer"] = "https://www.kugou.com/"
-        elif src == "tx":
-            headers["Referer"] = "https://y.qq.com/"
+            raw_url = res["url"]
+            headers = {}
+            # 酷狗或特殊源防盗链头
+            if src == "kg":
+                headers["Referer"] = "https://www.kugou.com/"
+            elif src == "tx":
+                headers["Referer"] = "https://y.qq.com/"
 
-        # 媒体魔数探活（共用同一总预算）
-        remaining_probe = deadline - time.monotonic()
-        if remaining_probe <= 0:
-            break
-        try:
-            async with asyncio.timeout(remaining_probe):
-                ok, final_url, ct, size = await probe_url(client, raw_url, headers)
-        except Exception:
-            ok = False
+            # 媒体魔数探活（共用同一总预算）
+            remaining_probe = deadline - time.monotonic()
+            if remaining_probe <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining_probe):
+                    ok, final_url, ct, size = await probe_url(client, raw_url, headers)
+            except Exception:
+                ok = False
 
-        if ok:
-            _chain_record_success("user_source")
-            ext = "flac" if "flac" in ct else ("mp3" if "mp3" in ct else "mp3")
-            return {
-                "id": track_id,
-                "url": final_url,
-                "ext": ext,
-                "file_size": size,
-                "actual_tier": tier,
-                "resolver": "lxserver",
-                "headers": headers,
-                "br": 320000 if tier == "high" else (960000 if tier == "lossless" else 128000),
-                "attempted_tiers": attempted_tiers,
-            }
-        else:
-            logger.debug("probe_url rejected stream for %s at tier %s: ct=%s", track_id, tier, ct)
+            if ok:
+                _chain_record_success(chain_key)
+                ext = "flac" if "flac" in ct else ("mp3" if "mp3" in ct else "mp3")
+                return {
+                    "id": track_id,
+                    "url": final_url,
+                    "ext": ext,
+                    "file_size": size,
+                    "actual_tier": tier,
+                    "resolver": "lxserver",
+                    "headers": headers,
+                    "br": 320000 if tier == "high" else (960000 if tier == "lossless" else 128000),
+                    "attempted_tiers": attempted_tiers,
+                }
 
-    _chain_record_failure("user_source")
+            # 直链探活失败（过期/加密/HTML 错误页）：排除产出该链的脚本同档换源重试；
+            # 服务端确认已无更多候选源时不再轮换，直接降档
+            logger.info("probe rejected %s tier=%s ct=%s source=%s url=%.120s", track_id, tier,
+                        ct or "", res.get("sourceName") or "", raw_url)
+            tried = [n for n in _scripts_tried(res) if n not in excluded]
+            excluded.extend(tried)
+            if res.get("hasMoreSources") is False or not tried:
+                break
+
+    _chain_record_failure(chain_key)
     return None
 
 
@@ -1354,7 +1401,7 @@ async def source_set(body: SourceBody):
             status_code=500,
         )
 
-    _CHAIN_HEALTH.pop("user_source", None)
+    _CHAIN_HEALTH.clear()
     _url_cache_reset()
     user_src = await describe_user_source()
     return {"ok": True, "data": user_src}
@@ -1373,6 +1420,6 @@ async def source_clear():
         logger.warning("source_clear error: %s", exc)
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=500)
 
-    _CHAIN_HEALTH.pop("user_source", None)
+    _CHAIN_HEALTH.clear()
     _url_cache_reset()
     return {"ok": True, "data": None}
