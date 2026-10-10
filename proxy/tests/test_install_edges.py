@@ -92,35 +92,43 @@ def test_installer_logs_private_shared_permissions(tmp_path, as_root):
     write_stub(bindir, "sudo", "exit 1\n")
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
     script = logs_script(repo) + 'configure_app_logs\nlog_install "shared install event"\n'
-    if as_root and os.geteuid() != 0:
-        sudo = shutil.which("sudo")
-        if not sudo or subprocess.run([sudo, "-n", "true"], capture_output=True).returncode:
-            pytest.skip("root permission regression requires passwordless sudo")
-        result = subprocess.run([sudo, "-n", BASH, "-c", script], env=env,
-                                capture_output=True, text=True, timeout=30)
-    else:
-        if os.geteuid() != 0 and 1000 not in os.getgroups() and os.getgid() != 1000:
-            pytest.skip("non-root sharing requires membership in group 1000")
-        result = run_bash(script, env=env)
-    assert result.returncode == 0, result.stderr
-    for path in (logs, nested):
-        assert path.stat().st_mode & 0o7777 == 0o2770
-        assert path.stat().st_gid == 1000
-        if as_root or os.geteuid() == 0:
-            assert path.stat().st_uid == 0
-    for path in (existing, snapshot, export, logs / "install.log"):
-        assert path.stat().st_mode & 0o777 == 0o640
-        assert path.stat().st_gid == 1000
-    assert "shared install event" in (logs / "install.log").read_text()
-    assert unrelated.stat().st_mode == unrelated_before.st_mode
-    assert unrelated.stat().st_gid == unrelated_before.st_gid
-    assert unrelated.read_text() == "outside\n"
-    assert (logs / "linked-file").is_symlink()
-    assert (logs / "linked-dir").is_symlink()
-    # The setgid directory, not caller umask/gid, defines new runtime groups.
-    created = logs / "new-runtime.log"
-    created.write_text("runtime\n")
-    assert created.stat().st_gid == 1000
+    ran_with_sudo = False
+    try:
+        if as_root and os.geteuid() != 0:
+            sudo = shutil.which("sudo")
+            if not sudo or subprocess.run([sudo, "-n", "true"], capture_output=True).returncode:
+                pytest.skip("root permission regression requires passwordless sudo")
+            if os.geteuid() != 0 and 1000 not in os.getgroups() and os.getgid() != 1000:
+                pytest.skip('root permission regression requires membership in group 1000')
+            result = subprocess.run([sudo, "-n", BASH, "-c", script], env=env,
+                                    capture_output=True, text=True, timeout=30)
+            ran_with_sudo = True
+        else:
+            if os.geteuid() != 0 and 1000 not in os.getgroups() and os.getgid() != 1000:
+                pytest.skip("non-root sharing requires membership in group 1000")
+            result = run_bash(script, env=env)
+        assert result.returncode == 0, result.stderr
+        for path in (logs, nested):
+            assert path.stat().st_mode & 0o7777 == 0o2770
+            assert path.stat().st_gid == 1000
+            if as_root or os.geteuid() == 0:
+                assert path.stat().st_uid == 0
+        for path in (existing, snapshot, export, logs / "install.log"):
+            assert path.stat().st_mode & 0o777 == 0o640
+            assert path.stat().st_gid == 1000
+        assert "shared install event" in (logs / "install.log").read_text()
+        assert unrelated.stat().st_mode == unrelated_before.st_mode
+        assert unrelated.stat().st_gid == unrelated_before.st_gid
+        assert unrelated.read_text() == "outside\n"
+        assert (logs / "linked-file").is_symlink()
+        assert (logs / "linked-dir").is_symlink()
+        # The setgid directory, not caller umask/gid, defines new runtime groups.
+        created = logs / "new-runtime.log"
+        created.write_text("runtime\n")
+        assert created.stat().st_gid == 1000
+    finally:
+        if ran_with_sudo:
+            subprocess.run(["sudo", "-n", "rm", "-rf", str(repo)], check=False)
 
 
 def test_installer_logs_supports_symlink_checkout_path(tmp_path):
@@ -131,7 +139,8 @@ def test_installer_logs_supports_symlink_checkout_path(tmp_path):
     result = run_bash(logs_script(alias) + 'configure_app_logs "symlink checkout"\n')
     assert result.returncode == 0, result.stderr
     assert "symlink checkout" in (repo / "logs" / "install.log").read_text()
-    assert (repo / "logs").stat().st_gid == 1000
+    if os.geteuid() == 0 or 1000 in os.getgroups() or os.getgid() == 1000:
+        assert (repo / "logs").stat().st_gid == 1000
 
 
 @pytest.mark.parametrize("symlink_target", ["directory", "install-file", "install-hardlink"])
