@@ -136,7 +136,11 @@ def test_installer_logs_supports_symlink_checkout_path(tmp_path):
     repo.mkdir()
     alias = tmp_path / "checkout"
     alias.symlink_to(repo, target_is_directory=True)
-    result = run_bash(logs_script(alias) + 'configure_app_logs "symlink checkout"\n')
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    write_stub(bindir, "sudo", "exit 1\n")
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    result = run_bash(logs_script(alias) + 'configure_app_logs "symlink checkout"\n', env=env)
     assert result.returncode == 0, result.stderr
     assert "symlink checkout" in (repo / "logs" / "install.log").read_text()
     if os.geteuid() == 0 or 1000 in os.getgroups() or os.getgid() == 1000:
@@ -161,7 +165,11 @@ def test_installer_logs_refuses_symlink_targets(tmp_path, symlink_target):
             os.link(marker, repo / "logs" / "install.log")
         else:
             (repo / "logs" / "install.log").symlink_to(marker)
-    result = run_bash(logs_script(repo) + 'configure_app_logs "unsafe append"\n')
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    write_stub(bindir, "sudo", "exit 1\n")
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    result = run_bash(logs_script(repo) + 'configure_app_logs "unsafe append"\n', env=env)
     assert result.returncode != 0
     assert marker.read_text() == "untouched"
     assert marker.stat().st_mode == before.st_mode
