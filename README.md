@@ -12,7 +12,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ## 功能特性
 
-- **在线聚合搜播**：在官方搜索框输入歌名，聚合三大音源之一的曲库（见下），在线歌曲即点即播，自动补齐滚动歌词与高清封面。搜索结果严格**本地优先**：本地曲库条目始终排在前面，在线音源结果（网易 > musicdl > 洛雪）紧随其后；翻页时若在线结果不够填满一页，自动向音源继续取下一页补齐（**深分页**，可关；musicdl 仅参与首屏），详见 [docs/SEARCH_PAGINATION.md](docs/SEARCH_PAGINATION.md)；
+- **在线聚合搜播**：在官方搜索框输入歌名，聚合三大音源之一的曲库（见下），在线歌曲即点即播，自动补齐滚动歌词与高清封面。搜索结果严格**本地优先**：本地曲库条目始终排在前面，在线音源结果（网易 > musicdl > 洛雪，洛雪条目逐曲标注 `[脚本名-平台]` 来源，一眼可辨出自哪个脚本与平台）紧随其后；翻页时若在线结果不够填满一页，自动向音源继续取下一页补齐（**深分页**，可关；musicdl 仅参与首屏），详见 [docs/SEARCH_PAGINATION.md](docs/SEARCH_PAGINATION.md)；
 - **三音源单选**（v2.0.0 起互斥，可在 WebUI 秒级切换）：
   - [musicbox](https://github.com/darknessomi/musicbox)：网易云高品质解析，支持扫码登录 VIP/无损曲库与原生每日推荐；
   - [musicdl](https://github.com/CharlesPikachu/musicdl)：酷我/咪咕等 57 个平台聚合，可按平台粒度勾选（编号见 [musicdl-service/PLATFORMS.md](musicdl-service/PLATFORMS.md)）。部分音乐源歌曲少，或返回的音乐不可播放，请自行测试并使用可靠音乐源；
@@ -188,7 +188,7 @@ git pull
 
 - **WebUI 打不开**：确认安装时选择了 WebUI，或 `.env` 中 `FNMUSIC_WEBUI_ENABLED=true` 后运行 `./extend.sh`。用飞牛管理员打开桌面「fnMusic 扩展管理」或 `/app/fnmusic-ext`，不要直接访问 8774。
 - **洛雪源播放失败**：源脚本由第三方提供，在容器内执行。导入前必须自行确认来源安全，不要导入来历不明的脚本。可在 WebUI 中用「测试」按钮验证源可用性，失败时更换源 URL 或重新上传脚本文件。
-- **musicdl 某平台搜索为空**：上游接口变化所致，不影响其他平台；可升级 musicdl（`>=2.13.11`）后重建镜像。
+- **musicdl 某平台搜索为空**：上游接口变化所致，不影响其他平台；可升级 musicdl（`>=2.14.0`）后重建镜像。
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/储存目录/LLM 等）；端口、`MUSICDL_SOURCES` 等其余改动需执行 `./extend.sh` 重启容器。
 - **日志在哪、怎么导出**：运行日志在安装目录 `logs/`（`proxy.log` / `webui.log` / `lxmusic.log` / `install.log`），按天滚动保留 3 天后自动清理；WebUI「关于 → 导出日志」可打包近 3 天日志与环境快照为 `.logzip` 下载，反馈 issue 时建议附上；卸载应用时日志目录会一并删除。
@@ -208,7 +208,7 @@ python3 -m pytest        # 全量测试（无需 Docker/飞牛环境）
 ```
 
 - 版本号唯一来源为根目录 `VERSION`，打包时注入 manifest；
-- CI 在每次 push/PR 都会构建一次 fpk 防止结构回归；推送 `v<版本>` tag 会自动构建并把 `.fpk` 与校验和发布到 GitHub Release（tag 需与 `VERSION` 一致）；
+- CI 在每次 push/PR 都会构建一次 fpk 防止结构回归；推送 `v<版本>` tag 会自动构建并把 `.fpk` 与校验和发布到 GitHub Release，并同步发布到 Gitee 镜像仓库的发行版（tag 需与 `VERSION` 一致）；
 - 打包结构由 `packaging/tests/test_fpk_pack.py` 离线校验（含 fnpack 实测校验规则）；
 - 实机安装/卸载自动测试（需在飞牛设备上以 root 运行）：
 
