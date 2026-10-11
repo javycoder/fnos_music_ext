@@ -41,6 +41,7 @@ body {
 
 .nav { display: flex; flex-direction: column; gap: 4px; }
 .nav-item {
+  position: relative; /* 承载"关于"入口的新版本红点角标 */
   text-align: left; padding: 10px 12px; border: 0; border-radius: 8px;
   background: transparent; color: var(--text); font-size: 15px; cursor: pointer;
 }
@@ -223,6 +224,39 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   font-size: 13px; font-weight: 600; line-height: 20px; vertical-align: 1px;
 }
 
+/* -------------------------------------------------- 新版本提示/弹窗 */
+/* 有新版本时"关于"入口红点常亮，不因查看而清除 */
+.nav-dot {
+  position: absolute; top: 7px; right: 7px;
+  width: 8px; height: 8px; border-radius: 50%; background: var(--err);
+}
+.badge.new {
+  border: 0; cursor: pointer; font-family: inherit;
+  background: var(--err); color: #fff;
+}
+.badge.new:hover { opacity: .88; }
+#about-new[hidden], .nav-dot[hidden] { display: none; }
+.modal-mask {
+  position: fixed; inset: 0; z-index: 50;  /* 低于 toast(60)，报错可见 */
+  background: rgba(16, 30, 54, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.modal-card {
+  background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow);
+  width: 100%; max-width: 560px; max-height: 82vh; overflow: auto;
+  padding: 20px 22px;
+}
+.modal-title { font-size: 17px; font-weight: 700; margin-bottom: 12px; }
+.modal-section { font-weight: 600; font-size: 14px; color: var(--muted); margin: 14px 0 8px; }
+.update-changelog {
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: #fafbfd; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px; font-size: 13px; line-height: 1.7;
+  max-height: 40vh; overflow: auto;
+}
+.modal-actions { justify-content: flex-end; margin-bottom: 0; }
+
 /* -------------------------------------------------- 保存条/Toast */
 .save-bar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
@@ -275,6 +309,9 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
     border-radius: 0; white-space: nowrap;
   }
   .bottom-nav .nav-item.active { background: transparent; color: var(--accent); font-weight: 700; }
+  /* 底栏红点锚在文字（"关于"两字居中）右上角 */
+  .bottom-nav .nav-dot { top: 9px; right: calc(50% - 24px); }
+  .modal-card { padding: 16px 16px; }
   .save-bar {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px));
     z-index: 46;

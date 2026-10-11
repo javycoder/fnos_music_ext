@@ -1593,3 +1593,164 @@ def test_config_put_logs_cfg_lines(env_file, svctl, caplog):
     assert r.json()["changed"] == ["FNMUSIC_QUALITY_MODE"]
     joined = "\n".join(rec.getMessage() for rec in caplog.records)
     assert "[cfg] FNMUSIC_QUALITY_MODE high -> balanced" in joined
+
+
+# ------------------------------------------------------------------ 检查更新 ---
+
+GH_RELEASE = {
+    "tag_name": "v2.9.0",
+    "name": "fnmusic-ext 2.9.0",
+    "published_at": "2026-10-11T08:00:00Z",
+    "body": "### 修复\n\n- **热门推荐播放失败**：详见 [issue #49](https://github.com/javycoder/fnos_music_ext/issues/49)",
+    "html_url": "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0",
+}
+GT_RELEASE = {
+    "tag_name": "v2.9.0",
+    "name": "fnmusic-ext 2.9.0",
+    "created_at": "2026-10-11T08:00:00+08:00",
+    "body": GH_RELEASE["body"],
+}
+
+
+@pytest.fixture
+def update_cache_clean():
+    webui._update_cache.clear()  # 模块级缓存跨用例共享，先清空
+    yield
+    webui._update_cache.clear()
+
+
+def test_version_newer():
+    assert webui._version_newer("2.9.0", "2.8.3")
+    assert not webui._version_newer("2.8.3", "2.9.0")
+    assert not webui._version_newer("2.8.3", "2.8.3")
+    assert not webui._version_newer("2.8", "2.8.3")     # 缺位补零，2.8 ≡ 2.8.0
+    assert webui._version_newer("2.10.0", "2.9.0")      # 数值比较而非字典序
+    assert not webui._version_newer("2.9.0", "2.10.0")
+    assert webui._version_newer("v2.9.0", "2.8.3")      # tag 的 v 前缀
+    assert webui._version_newer("2.8.0a", "2.8.0")      # 预发布尾巴视为更新
+    assert not webui._version_newer("", "2.8.3")        # 非法版本号一律不更新
+    assert not webui._version_newer("abc", "2.8.3")
+
+
+def test_update_check_github_first(env_file, update_cache_clean):
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(str(request.url))
+        return httpx.Response(200, json=GH_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        r = client.get("/api/update-check")
+    assert r.status_code == 200
+    rj = r.json()
+    assert rj["ok"] is True
+    assert rj["source"] == "github"
+    assert rj["current_version"] == "2.0.0"
+    assert rj["has_update"] is True
+    assert rj["latest"]["version"] == "2.9.0"
+    assert rj["latest"]["html_url"] == GH_RELEASE["html_url"]
+    # changelog 清洗：标题标记/加粗/链接语法剥离，链接取文字
+    assert "###" not in rj["latest"]["changelog"]
+    assert "热门推荐播放失败" in rj["latest"]["changelog"]
+    assert "[issue #49]" not in rj["latest"]["changelog"]
+    assert "issue #49" in rj["latest"]["changelog"]
+    # GitHub 命中即不再请求 Gitee
+    assert paths == [webui.UPDATE_SOURCES[0]["api"]]
+
+
+def test_update_check_gitee_fallback_on_403(env_file, update_cache_clean):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "api.github.com" in str(request.url):
+            return httpx.Response(403, json={"message": "rate limit"})
+        return httpx.Response(200, json=GT_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["source"] == "gitee"
+    assert rj["has_update"] is True
+    assert rj["latest"]["version"] == "2.9.0"
+    # gitee 响应无 html_url/published_at：按 tag 构造发行版页，时间取 created_at
+    assert rj["latest"]["html_url"] == "https://gitee.com/javycoder/fnos_music_ext/releases/tag/v2.9.0"
+    assert rj["latest"]["published_at"] == "2026-10-11T08:00:00+08:00"
+    assert calls == [webui.UPDATE_SOURCES[0]["api"], webui.UPDATE_SOURCES[1]["api"]]
+
+
+def test_update_check_gitee_fallback_on_network_error(env_file, update_cache_clean):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(request.url):
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(200, json=GT_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["source"] == "gitee"
+    assert rj["has_update"] is True
+
+
+def test_update_check_both_fail_degrades(env_file, update_cache_clean):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        raise httpx.ConnectError("timeout")
+
+    with authed_client() as client:
+        _mock_http(handler)
+        r = client.get("/api/update-check")
+    assert r.status_code == 200  # 双源皆败不报 500，前端静默降级
+    rj = r.json()
+    assert rj["ok"] is True
+    assert rj["has_update"] is False
+    assert "github" in rj["error"] and "gitee" in rj["error"]
+    # 失败负缓存生效：缓存期内重复请求不再出网
+    client.get("/api/update-check")
+    assert len(calls) == 2
+
+
+def test_update_check_success_cached_no_refetch(env_file, update_cache_clean):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=GH_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        client.get("/api/update-check")
+        client.get("/api/update-check")
+    assert len(calls) == 1  # 成功缓存 6h，第二次命中不出网
+
+
+def test_update_check_no_update_when_same_version(env_file, update_cache_clean):
+    release = dict(GH_RELEASE, tag_name="v2.0.0")
+    with authed_client() as client:
+        _mock_http(lambda request: httpx.Response(200, json=release))
+        rj = client.get("/api/update-check").json()
+    assert rj["has_update"] is False
+
+
+def test_update_check_gitee_null_body_degrades(env_file, update_cache_clean):
+    """gitee 对"无发行版"返回 200 + null body（release.yml 实测），按无数据处理。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(request.url):
+            return httpx.Response(500)
+        return httpx.Response(200, json=None)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["ok"] is True
+    assert rj["has_update"] is False
+
+
+def test_update_check_requires_admin(env_file, update_cache_clean):
+    with TestClient(webui.app) as client:
+        r = client.get("/api/update-check")
+    assert r.status_code == 403

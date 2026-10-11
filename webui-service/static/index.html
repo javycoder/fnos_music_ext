@@ -28,7 +28,7 @@
           <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
         </div>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
-        <button class="nav-item" data-page="about">关于</button>
+        <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -261,6 +261,7 @@
             <div class="about-badges">
               <span class="badge" id="about-version">v-</span>
               <span class="badge dim" id="about-deploy">-</span>
+              <button class="badge new" id="about-new" hidden title="发现新版本，点击查看详情">NEW</button>
             </div>
             <div class="about-author">作者 <a href="https://github.com/javycoder" target="_blank" rel="noopener">javycoder</a></div>
             <div class="about-links">
@@ -304,13 +305,28 @@
     <button class="nav-item" data-page="tee">边听</button>
     <button class="nav-item" data-page="dirs">目录</button>
     <button class="nav-item" data-page="llm">高级</button>
-    <button class="nav-item" data-page="about">关于</button>
+    <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
   </nav>
 
   <!-- 保存条 -->
   <div class="save-bar" id="save-bar">
     <span id="save-note" class="muted"></span>
     <button class="btn primary" id="save-btn">保存并生效</button>
+  </div>
+
+  <!-- 新版本详情弹窗 -->
+  <div class="modal-mask" id="update-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="update-modal-title">
+      <div class="modal-title" id="update-modal-title">发现新版本</div>
+      <div class="kv"><b>最新版本</b><span id="update-modal-version">-</span></div>
+      <div class="kv"><b>发布日期</b><span id="update-modal-date">-</span></div>
+      <div class="modal-section">更新内容</div>
+      <div class="update-changelog" id="update-modal-changelog"></div>
+      <div class="btn-row modal-actions">
+        <button class="btn" id="update-cancel-btn">取消</button>
+        <a class="btn primary" id="update-upgrade-btn" target="_blank" rel="noopener">升级</a>
+      </div>
+    </div>
   </div>
 
   <div class="toast" id="toast" hidden></div>

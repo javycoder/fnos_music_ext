@@ -69,6 +69,29 @@ ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# ------------------------------------------------------------------ 检查更新 --
+# 双源顺序即回退顺序：优先 GitHub Releases，被墙/限流/超时等失败时回退 Gitee。
+# 命中哪个源，前端"升级"按钮就跳哪个源的 release 页。
+UPDATE_SOURCES = (
+    {
+        "name": "github",
+        "api": "https://api.github.com/repos/javycoder/fnos_music_ext/releases/latest",
+        "page": "https://github.com/javycoder/fnos_music_ext/releases",
+    },
+    {
+        "name": "gitee",
+        "api": "https://gitee.com/api/v5/repos/javycoder/fnos_music_ext/releases/latest",
+        "page": "https://gitee.com/javycoder/fnos_music_ext/releases",
+    },
+)
+# 成功缓存 6 小时（GitHub 匿名限额 60 次/小时），双源皆败负缓存 10 分钟——
+# 前端进页面即查但不轮询，命中缓存不出网
+_UPDATE_OK_TTL = 6 * 3600.0
+_UPDATE_FAIL_TTL = 600.0
+_UPDATE_HEADERS = {"User-Agent": f"fnmusic-ext/{SERVICE_VERSION}"}
+# {"ts": float, "data": dict}：ts 为写入时间，data 为最终响应体（失败结果无 source 键）
+_update_cache: dict = {}
+
 # 音源进程 ↔ 启用开关（三选一互斥）
 PROVIDERS = {
     "musicdl": "FNMUSIC_MUSICDL_ENABLED",
@@ -556,6 +579,85 @@ def _read_version() -> str:
         return VERSION_PATH.read_text(encoding="utf-8").strip()
     except OSError:
         return SERVICE_VERSION
+
+
+def _version_key(v: str) -> "tuple[list[int], str]":
+    """版本号 → (前导数字段列表, 剩余尾巴)。"v2.8.3" → ([2, 8, 3], "")；
+    "2.8.0a" → ([2, 8, 0], "a")；首个非数字段起的剩余内容全归尾巴。"""
+    v = (v or "").strip().lstrip("vV")
+    segs = v.split(".")
+    nums: list[int] = []
+    for i, seg in enumerate(segs):
+        m = re.match(r"(\d+)(.*)$", seg)
+        if not m:
+            return nums, ".".join(segs[i:])
+        nums.append(int(m.group(1)))
+        if m.group(2):  # 数字段带尾巴（如 2.8.0a 的 "0a"）：尾巴连同后续段一并截断
+            rest = m.group(2)
+            return nums, rest if i + 1 == len(segs) else f"{rest}.{'.'.join(segs[i + 1:])}"
+    return nums, ""
+
+
+def _version_newer(latest: str, current: str) -> bool:
+    """latest 是否比 current 新：数字段逐位补零比较（2.9 ≡ 2.9.0，2.10 > 2.9），
+    数字位一致时尾巴字符串兜底（2.8.0a > 2.8.0）。任一侧解析不出数字视为不更新。"""
+    lnums, lrest = _version_key(latest)
+    cnums, crest = _version_key(current)
+    if not lnums or not cnums:
+        return False
+    size = max(len(lnums), len(cnums))
+    lnums += [0] * (size - len(lnums))
+    cnums += [0] * (size - len(cnums))
+    if lnums != cnums:
+        return lnums > cnums
+    return lrest > crest
+
+
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s*")
+
+
+def _strip_release_body(body: str) -> str:
+    """release 说明（= CHANGELOG 段落）清洗为纯文本：去行首标题标记与行内
+    markdown 语法（链接取文字、加粗/斜体/代码去符号），连续空行收敛为一个。"""
+    if not body:
+        return ""
+    out: list[str] = []
+    for raw in body.splitlines():
+        line = _strip_md_inline(_MD_HEADING_RE.sub("", raw.strip()))
+        if line:
+            out.append(line)
+        elif out and out[-1] != "":
+            out.append("")
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+async def _fetch_release(request: Request, source: dict) -> "tuple[bool, dict | str]":
+    """拉取单个源的 latest release。成功返回 (True, 规范化后的发行版信息)，
+    失败返回 (False, 错误描述)。"""
+    client = get_http(request)
+    try:
+        resp = await client.get(source["api"], timeout=5.0, headers=_UPDATE_HEADERS)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{source['name']} {exc}"
+    if resp.status_code != 200:
+        return False, f"{source['name']} HTTP {resp.status_code}"
+    try:
+        data = resp.json() if resp.content else None
+    except Exception:  # noqa: BLE001
+        return False, f"{source['name']} 响应非 JSON"
+    if not isinstance(data, dict) or not data.get("tag_name"):
+        # gitee 对"无发行版"返回 200 + null body（release.yml 实测），不能只看 HTTP 码
+        return False, f"{source['name']} 无发行版数据"
+    return True, {
+        "version": str(data["tag_name"]).strip().lstrip("vV"),
+        "name": str(data.get("name") or "").strip(),
+        "published_at": str(data.get("published_at") or data.get("created_at") or ""),
+        "changelog": _strip_release_body(str(data.get("body") or "")),
+        # tag 页 URL 缺失时按 tag 名兜底构造（两边仓库发行版页同构 /releases/tag/<tag>）
+        "html_url": str(data.get("html_url") or f"{source['page']}/tag/{data['tag_name']}"),
+    }
 
 
 # ------------------------------------------------------------------ API --
@@ -1096,6 +1198,47 @@ async def api_about():
         "logs": _log_files_info(),
         "log_retention_days": RETENTION_DAYS,
     }
+
+
+@app.get("/api/update-check")
+async def api_update_check(request: Request):
+    """检查更新：GitHub Releases 优先，不可达（被墙/限流）回退 Gitee。
+
+    结果缓存（成功 6h / 双源皆败 10min，按响应里有无 source 键区分）：
+    前端进页面即查但不轮询，命中缓存不出网。双源皆败不报 500——前端静默降级，
+    红点只是锦上添花，不能因检查失败打扰用户。"""
+    now = time.time()
+    cached = _update_cache.get("data")
+    if cached and now - _update_cache.get("ts", 0.0) < (
+            _UPDATE_OK_TTL if "source" in cached else _UPDATE_FAIL_TTL):
+        return cached
+    current = _read_version()
+    errors: list[str] = []
+    for source in UPDATE_SOURCES:
+        ok, payload = await _fetch_release(request, source)
+        if not ok:
+            errors.append(str(payload))
+            continue
+        result = {
+            "ok": True,
+            "current_version": current,
+            "has_update": _version_newer(str(payload["version"]), current),
+            "source": source["name"],
+            "checked_at": int(now),
+            "latest": payload,
+        }
+        _update_cache.clear()
+        _update_cache.update({"ts": now, "data": result})
+        return result
+    result = {
+        "ok": True,
+        "current_version": current,
+        "has_update": False,
+        "error": "；".join(errors) or "所有更新源均不可达",
+    }
+    _update_cache.clear()
+    _update_cache.update({"ts": now, "data": result})
+    return result
 
 
 @app.get("/api/logs/export")

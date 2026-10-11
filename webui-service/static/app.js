@@ -17,6 +17,7 @@ let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 let lxSourceList = [];    // 洛雪源列表 [{ name, url, active }]，active 可多开
+let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
@@ -885,6 +886,8 @@ async function loadAbout() {
   } else {
     donate.hidden = true;
   }
+  // 进入关于页顺带刷新检查更新（后端有 TTL 缓存，命中不出网）
+  checkUpdate();
 }
 
 async function exportLogs() {
@@ -921,10 +924,53 @@ async function exportLogs() {
 }
 $("#log-export-btn").addEventListener("click", () => { exportLogs().catch(() => {}); });
 
+/* -------------------------------------------------------------- 检查更新 */
+async function checkUpdate() {
+  try {
+    updateInfo = await api("/api/update-check");
+    renderUpdateBadge();
+  } catch (_) { /* 检查失败静默：红点只是提示，不打扰用户 */ }
+}
+
+// 有新版本则红点常亮（两处"关于"入口 + 关于页 NEW 标记），不因查看而清除
+function renderUpdateBadge() {
+  const has = !!(updateInfo && updateInfo.has_update);
+  $$(".nav-dot").forEach((el) => { el.hidden = !has; });
+  $("#about-new").hidden = !has;
+}
+
+function fmtDate(iso) {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(iso || ""));
+  return m ? m[1] : "-";
+}
+
+function openUpdateModal() {
+  if (!updateInfo || !updateInfo.has_update) return;
+  const latest = updateInfo.latest || {};
+  $("#update-modal-version").textContent = `v${latest.version || updateInfo.current_version}`;
+  $("#update-modal-date").textContent = fmtDate(latest.published_at);
+  // release 说明来自外部仓库，textContent 注入防 XSS
+  $("#update-modal-changelog").textContent = latest.changelog || "暂无更新说明";
+  // 升级跳转跟随检查源：GitHub 查到跳 GitHub release 页，Gitee 查到跳 Gitee 发行版页
+  $("#update-upgrade-btn").href = latest.html_url || "#";
+  $("#update-modal").hidden = false;
+}
+
+function closeUpdateModal() {
+  $("#update-modal").hidden = true;
+}
+
+$("#about-new").addEventListener("click", openUpdateModal);
+$("#update-cancel-btn").addEventListener("click", closeUpdateModal);
+$("#update-modal").addEventListener("click", (ev) => {
+  if (ev.target === ev.currentTarget) closeUpdateModal();  // 点遮罩空白处关闭
+});
+
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {
   await loadConfig();
   await loadStatus();
+  checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   setInterval(loadStatus, 15000);
 })();

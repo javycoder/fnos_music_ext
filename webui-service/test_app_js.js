@@ -48,13 +48,16 @@ function stubEl() {
 }
 
 const els = new Map();
+// querySelectorAll 注册表：app.js 的 $$ 只在个别选择器上需要多元素（如 .nav-dot），
+// 未注册的选择器返回 []（保持既有用例行为）
+const qsaRegistry = new Map();
 
 global.document = {
   querySelector(sel) {
     if (!els.has(sel)) els.set(sel, stubEl());
     return els.get(sel);
   },
-  querySelectorAll() { return []; },
+  querySelectorAll(sel) { return qsaRegistry.get(sel) || []; },
   createElement() {
     // 关于页日志导出用的 <a download> 桩：记录点击与 download 文件名
     const el = stubEl();
@@ -504,6 +507,84 @@ test("switchPage('about') 懒加载关于数据", async () => {
   global.switchPage("about");
   await new Promise((r) => realSetTimeout(r, 0));  // 等 fetch 微任务
   assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/about"));
+});
+
+/* ------------------------------------------------ 检查更新 ------------------ */
+// 真实 DOM 有两处"关于"入口（桌面侧栏 + 移动底栏），红点必须两处同时显隐；
+// 元素须经 document.querySelector 创建后登记（els.get 不会自动建桩）
+qsaRegistry.set(".nav-dot", [
+  global.document.querySelector("#nav-dot-desktop"),
+  global.document.querySelector("#nav-dot-mobile"),
+]);
+const UPDATE_PAYLOAD = {
+  ok: true, current_version: "2.8.3", has_update: true, source: "github", checked_at: 1,
+  latest: {
+    version: "2.9.0", name: "fnmusic-ext 2.9.0", published_at: "2026-10-11T08:00:00Z",
+    changelog: "关于页新增检查更新", html_url: "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0",
+  },
+};
+
+test("检查更新：has_update → 两处红点与 NEW 常亮；无更新 → 全部隐藏", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", { ok: true, current_version: "2.8.3", has_update: false });
+  await global.checkUpdate();
+  assert.strictEqual(els.get("#nav-dot-desktop").hidden, true);
+  assert.strictEqual(els.get("#nav-dot-mobile").hidden, true);
+  assert.strictEqual(els.get("#about-new").hidden, true);
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  await global.checkUpdate();
+  assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
+  assert.strictEqual(els.get("#nav-dot-mobile").hidden, false);
+  assert.strictEqual(els.get("#about-new").hidden, false);
+});
+
+test("检查更新：接口失败静默，不炸不弹错", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", new Error("服务器失联"));
+  await global.checkUpdate();  // 不应抛出
+  assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/update-check"));
+  assert.strictEqual(els.get("#toast").textContent, "");  // 没有弹错误提示
+});
+
+test("openUpdateModal：填充版本/日期/changelog/升级链接（跟随检查源）", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  await global.checkUpdate();
+  global.openUpdateModal();
+  assert.strictEqual(els.get("#update-modal").hidden, false);
+  assert.strictEqual(els.get("#update-modal-version").textContent, "v2.9.0");
+  assert.strictEqual(els.get("#update-modal-date").textContent, "2026-10-11");
+  assert.strictEqual(els.get("#update-modal-changelog").textContent, "关于页新增检查更新");
+  assert.strictEqual(els.get("#update-upgrade-btn").href, "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0");
+});
+
+test("updateModal：取消按钮与遮罩空白点击均可关闭", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  await global.checkUpdate();
+  global.openUpdateModal();
+  els.get("#update-cancel-btn").dispatch("click");
+  assert.strictEqual(els.get("#update-modal").hidden, true);
+  global.openUpdateModal();
+  els.get("#update-modal").dispatch("click");  // 桩上 target/currentTarget 均为 undefined，等价点空白处
+  assert.strictEqual(els.get("#update-modal").hidden, true);
+});
+
+test("openUpdateModal：无更新信息时不弹窗（守卫）", async () => {
+  // 先覆盖上一用例可能遗留的 has_update 状态
+  enqueue("/app/fnmusic-ext/api/update-check", { ok: true, current_version: "2.8.3", has_update: false });
+  await global.checkUpdate();
+  els.get("#update-modal").hidden = true;
+  global.openUpdateModal();
+  assert.strictEqual(els.get("#update-modal").hidden, true);
+});
+
+test("switchPage('about') 顺带触发检查更新", async () => {
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: false, logs: [], log_retention_days: 3,
+  });
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  global.switchPage("about");
+  await new Promise((r) => realSetTimeout(r, 0));
+  assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/update-check"));
+  assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */
