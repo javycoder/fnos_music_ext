@@ -214,14 +214,18 @@ def test_detail_batch_and_track_list_flow():
         assert len(resp.json()["data"]["list"]) == 2
 
 
-def test_cover_redirect():
+def test_cover_redirect(monkeypatch):
     _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    # 封面同源直出（issue #48）：App 不跟随跨域 302
+    monkeypatch.setattr(proxy_app, "_COVER_FETCH_ASYNC_TRANSPORT", httpx.MockTransport(
+        lambda r: httpx.Response(200, content=b"\xFF\xD8\xFFnm", headers={"content-type": "image/jpeg"})))
     with TestClient(app) as client:
         client.get("/music/api/v1/playlist/list")
         fake = fake_official_guid("online:playlist:nm:111")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake}"}, follow_redirects=False)
-        assert resp.status_code == 302
-        assert resp.headers["location"] == "http://img/111.jpg"
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/jpeg")
+        assert resp.content == b"\xFF\xD8\xFFnm"
         # 无封面直链的私歌单：404（客户端回落默认样式）
         fake333 = fake_official_guid("online:playlist:nm:333")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake333}"}, follow_redirects=False)

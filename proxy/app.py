@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import contextlib
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -188,6 +189,9 @@ CONF = {
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
+    # 在线封面出口（issue #48）：proxy=同源直出字节（官方手机 App 不跟随跨域
+    # 302，直出是它在 App 内显示的唯一可靠形态）；redirect=保留旧 302 外链行为
+    "cover_mode": (os.environ.get("FNMUSIC_COVER_MODE") or "proxy").strip().lower(),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
     # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
     # =detail 时逐条记录。官方 App 更新引入新端点时（如 2.5.0 前的 download/*），
@@ -516,6 +520,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
+    "FNMUSIC_COVER_MODE": ("cover_mode", "str"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
     "FNMUSIC_TRANSCODE_BITRATE": ("transcode_bitrate", "str"),
@@ -1490,6 +1495,225 @@ def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
         return None
 
 
+_COVER_FETCH_ASYNC_TRANSPORT: "httpx.AsyncBaseTransport | None" = None
+
+
+async def _fetch_cover_bytes_async(url: str) -> "tuple[bytes, str] | None":
+    """异步下载封面图字节（代理直出用，issue #48）。失败/非图片一律 None。"""
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    if _KW_TEXT_COVER_HOST in url:
+        return None
+    try:
+        kwargs: dict = {"timeout": 8.0, "follow_redirects": True}
+        if _COVER_FETCH_ASYNC_TRANSPORT is not None:
+            kwargs["transport"] = _COVER_FETCH_ASYNC_TRANSPORT
+        async with httpx.AsyncClient(**kwargs) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return None
+        mime = _sniff_image_mime(data)
+        if not mime:
+            return None
+        return data, mime
+    except Exception as e:
+        logger.debug("cover proxy fetch failed for %s: %s", url, type(e).__name__)
+        return None
+
+
+_COVER_DISK_DIR = "covers"
+_COVER_DISK_TTL_S = 7 * 86400
+_COVER_DISK_MAX_FILES = 2000
+_COVER_DISK_MAX_BYTES = 256 * 1024 * 1024
+_COVER_DISK_CLEAN_MIN_INTERVAL_S = 300.0
+_cover_disk_last_clean = 0.0
+_COVER_DISK_EXT_BY_MIME = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _cover_disk_path(url: str, mime: str = "") -> str:
+    digest = hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()
+    ext = _COVER_DISK_EXT_BY_MIME.get(mime, ".jpg")
+    return os.path.join(CONF["cache_dir"], _COVER_DISK_DIR, f"{digest}{ext}")
+
+
+def _cover_disk_gc() -> None:
+    """封面磁盘缓存惰性清理：TTL 过期剔除；总量超限按最旧删除（进程级节流）。"""
+    global _cover_disk_last_clean
+    now = time.time()
+    if now - _cover_disk_last_clean < _COVER_DISK_CLEAN_MIN_INTERVAL_S:
+        return
+    _cover_disk_last_clean = now
+    d = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR)
+    try:
+        entries: list[tuple[float, float, str]] = []
+        total = 0
+        for fname in os.listdir(d):
+            fpath = os.path.join(d, fname)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            if not os.path.isfile(fpath):
+                continue
+            total += st.st_size
+            if now - st.st_mtime > _COVER_DISK_TTL_S:
+                with contextlib.suppress(OSError):
+                    os.unlink(fpath)
+                total -= st.st_size
+                continue
+            entries.append((st.st_mtime, st.st_size, fpath))
+        if total <= _COVER_DISK_MAX_BYTES and len(entries) <= _COVER_DISK_MAX_FILES:
+            return
+        entries.sort()
+        removed_bytes = 0
+        target = max(total - _COVER_DISK_MAX_BYTES, 0)
+        removed = 0
+        for mtime, size, fpath in entries:
+            if removed_bytes >= target and len(entries) - removed <= _COVER_DISK_MAX_FILES:
+                break
+            with contextlib.suppress(OSError):
+                os.unlink(fpath)
+            removed_bytes += size
+            removed += 1
+    except OSError as e:
+        logger.debug("cover disk gc failed: %s", type(e).__name__)
+
+
+def _cover_disk_read(url: str) -> "tuple[bytes, str] | None":
+    fpath = ""
+    for mime, ext in _COVER_DISK_EXT_BY_MIME.items():
+        cand = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR, f"{hashlib.sha1(url.encode('utf-8', 'replace')).hexdigest()}{ext}")
+        try:
+            if os.path.isfile(cand) and time.time() - os.stat(cand).st_mtime <= _COVER_DISK_TTL_S:
+                fpath = cand
+                break
+        except OSError:
+            continue
+    if not fpath:
+        return None
+    try:
+        with open(fpath, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    mime = _sniff_image_mime(data[:16])
+    return (data, mime or "image/jpeg")
+
+
+def _cover_disk_write(url: str, data: bytes, mime: str) -> None:
+    d = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR)
+    fpath = _cover_disk_path(url, mime)
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, fpath)
+    except OSError as e:
+        logger.debug("cover disk write failed: %s", type(e).__name__)
+        with contextlib.suppress(OSError):
+            if os.path.exists(fpath + ".tmp"):
+                os.unlink(fpath + ".tmp")
+        return
+    _cover_disk_gc()
+
+
+async def _proxied_cover_response(url: str) -> Response | None:
+    """封面同源直出（issue #48）：官方手机 App 不跟随跨域 302，直接返回图片字节。
+
+    磁盘缓存命中优先，未命中代拉源站 CDN 后落盘；失败返回 None 由调用方走
+    既有回退链（网易补全/内嵌图/占位图），行为不劣于原 302 外链。
+    """
+    url = str(url or "").strip()
+    if not url or _KW_TEXT_COVER_HOST in url:
+        return None
+    cached = await asyncio.to_thread(_cover_disk_read, url)
+    if cached:
+        data, mime = cached
+    else:
+        fetched = await _fetch_cover_bytes_async(url)
+        if not fetched:
+            return None
+        data, mime = fetched
+        await asyncio.to_thread(_cover_disk_write, url, data, mime)
+    digest = hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "ETag": f'"{digest}"',
+        },
+    )
+
+
+# guid → 封面直链映射（issue #48）：info 接口受网易登录态/风控抖动影响，
+# App 每次刷列表都重查 info 会在抖动窗口整屏落占位图。成功直出过的封面
+# 记住直链，后续请求直接走字节缓存出图，info 抖动不再影响已成功过的封面。
+_COVER_GUID_URL_TTL_S = 14 * 86400
+_COVER_GUID_URL_MEM: dict[str, tuple[float, str]] = {}
+_COVER_GUID_URL_MEM_MAX = 8192
+
+
+def _cover_guid_url_file(guid: str) -> str:
+    digest = hashlib.sha1(str(guid or "").encode("utf-8", "replace")).hexdigest()
+    return os.path.join(CONF["cache_dir"], _COVER_DISK_DIR, f"g_{digest}.url")
+
+
+def _cover_guid_url_remember(guid: str, url: str) -> None:
+    guid = str(guid or "").strip()
+    url = str(url or "").strip()
+    if not guid or not url.startswith(("http://", "https://")):
+        return
+    _COVER_GUID_URL_MEM[guid] = (time.time(), url)
+    if len(_COVER_GUID_URL_MEM) > _COVER_GUID_URL_MEM_MAX:
+        for k in sorted(_COVER_GUID_URL_MEM, key=lambda k: _COVER_GUID_URL_MEM[k][0])[:1024]:
+            _COVER_GUID_URL_MEM.pop(k, None)
+
+
+def _cover_guid_url_lookup(guid: str) -> str:
+    guid = str(guid or "").strip()
+    if not guid:
+        return ""
+    hit = _COVER_GUID_URL_MEM.get(guid)
+    if hit and time.time() - hit[0] <= _COVER_GUID_URL_TTL_S:
+        return hit[1]
+    try:
+        fpath = _cover_guid_url_file(guid)
+        if time.time() - os.stat(fpath).st_mtime > _COVER_GUID_URL_TTL_S:
+            return ""
+        with open(fpath, "r", encoding="utf-8") as f:
+            url = f.read().strip()
+    except OSError:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        return ""
+    _COVER_GUID_URL_MEM[guid] = (time.time(), url)
+    return url
+
+
+def _cover_guid_url_persist(guid: str, url: str) -> None:
+    _cover_guid_url_remember(guid, url)
+    fpath = _cover_guid_url_file(guid)
+    try:
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(fpath), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(url)
+        os.replace(tmp, fpath)
+    except OSError as e:
+        logger.debug("cover guid-url persist failed: %s", type(e).__name__)
+
+
 def _has_embedded_cover(path: str) -> bool:
     try:
         from mutagen import File as MutagenFile
@@ -1708,6 +1932,15 @@ def _is_rolling_cache_stem(path: str, guid: str) -> bool:
         return False
 
 
+def _existing_library_file(directory: str, basename: str) -> str | None:
+    """同名（跨扩展名）曲库文件：同曲二次落盘时复用已有文件，不产生重复。"""
+    for ext in CACHE_EXTS:
+        candidate = os.path.join(directory, f"{basename}.{ext}")
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
+
+
 def library_media_path(guid: str, title: str, ext: str, artist: str = "", directory: str | None = None) -> str:
     lib = directory or detect_library_dir()
     recalled = recalled_media_path(guid)
@@ -1715,9 +1948,24 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "", direct
         return recalled
     stem = recalled_media_stem(guid)
     if stem and not _is_rolling_cache_stem(stem, guid):
-        return f"{stem}.{ext}"
+        dest = f"{stem}.{ext}"
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return dest
+        # 同 guid 换档位重落盘（扩展名变化）：曲库已有该词干音频则复用，
+        # 避免 mp3/flac 两个同名词干并存成重复曲目
+        existing = _existing_library_file(os.path.dirname(stem), os.path.basename(stem))
+        if existing:
+            return existing
+        return dest
     os.makedirs(lib, exist_ok=True)
-    return unique_library_path(lib, library_basename(title, artist), ext)
+    basename = library_basename(title, artist)
+    if basename.lower() != "unknown":
+        # issue #52 重复曲目：同曲（同"歌手 - 歌名"）跨 guid 二次落盘直接复用
+        # 已有文件，聚合搜索多源条目/跨平台候选切换不再各存一份
+        existing = _existing_library_file(lib, basename)
+        if existing:
+            return existing
+    return unique_library_path(lib, basename, ext)
 
 
 def find_lyric_file(guid: str) -> str | None:
@@ -3938,17 +4186,19 @@ def _merge_missing_tags(title: str, artist: str, album: str, snap: dict) -> tupl
 
 def _tee_metadata_fallback(
     guid: str, title: str, artist: str, album: str, dest_info: dict | None = None,
+    retained: dict | None = None,
 ) -> tuple[str, str, str]:
     """tee 落盘元数据缺失时的回查兜底，避免以 unknown 进曲库。
 
-    顺序：推荐/网易账号歌单缓存（首播时历史往往还没写）→ 播放历史/收藏/自建歌单。
+    顺序：内存搜索会话（播放时会话必在、零 IO，首播时历史往往还没写）→
+    推荐/网易账号歌单缓存 → 播放历史/收藏/自建歌单。
     缺哪个字段补哪个；已有的纯字符串专辑保持不变。封面 URL 只在调用方还没有时写入 dest_info。
     """
     title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
     need_cover = not _cover_url_of(dest_info)
     if not (title and artist and album and not need_cover):
         filled = False
-        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
+        for snap in ((retained,) if retained else ()) + (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
             if not snap:
                 continue
             title, artist, album = _merge_missing_tags(title, artist, album, snap)
@@ -3970,29 +4220,28 @@ def _tee_metadata_fallback(
     return title, artist, album
 
 
-def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool) -> dict | None:
-    """落盘转正：边听边存开→进曲库（定名/权限/标签，歌词仅在 FNMUSIC_LYRIC_AUTO_DL
-    开启时随迁），关→进滚动缓存（不写歌词）。
+def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: str,
+                           album: str, src: dict) -> "tuple[str, bool]":
+    """把已校验完整的音频转正进曲库：定名/落位/权限/标签/封面/影子歌词随迁。
 
-    part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
-    无损档解码校验不过直接丢弃（上游损坏流绝不入库）并拉黑该 guid。
-    返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
+    目标文件已存在（同 guid 重复落盘或同曲跨 guid，issue #52）一律复用已有文件：
+    丢弃本次字节绝不覆盖（用户自有文件与已有标签都不动），只刷新 guid 引用让
+    后续播放命中本地。跨文件系统（缓存目录与曲库不同挂载点）退化为复制+删除。
+    返回 (dest, reused)。
     """
-    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
-        _lossless_blacklist(guid)
-        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+    reused = os.path.exists(dest)
+    if reused:
+        _remove_quiet(part)
+        logger.info("library file already exists for %s, reuse %s", guid, dest)
+    else:
         try:
-            os.remove(part)
+            os.replace(part, dest)
         except OSError:
-            pass
-        return None
-    src = dict(info or {})
-    title, artist, album = _tag_fields(src)
-    if tee_enabled:
-        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src)
-        dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-        os.replace(part, dest)
-        remember_media_path(guid, dest)
+            tmp = f"{dest}.{uuid4().hex[:8]}.part"
+            shutil.copyfile(part, tmp)
+            os.replace(tmp, dest)
+            _remove_quiet(part)
         adopt_library_perms(dest)
         write_audio_tags(dest, title, artist, album)
         # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
@@ -4005,18 +4254,73 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
                     logger.info("cover embedded for %s: %s", guid, dest)
             except Exception as e:
                 logger.debug("cover embed step skipped for %s: %s", guid, e)
-        # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-        if CONF.get("lyric_auto_dl"):
-            promote_shadow_lyric(guid, dest)
+    remember_media_path(guid, dest)
+    # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+    if CONF.get("lyric_auto_dl"):
+        promote_shadow_lyric(guid, dest)
+    return dest, reused
+
+
+def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool,
+                  retained: dict | None = None) -> dict | None:
+    """落盘转正：边听边存开→进曲库（定名/权限/标签，歌词仅在 FNMUSIC_LYRIC_AUTO_DL
+    开启时随迁），关→进滚动缓存（不写歌词）。
+
+    part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
+    无损档解码校验不过直接丢弃（上游损坏流绝不入库）并拉黑该 guid。
+    retained：内存搜索会话条目（播放时会话必在），元数据兜底链最前面的一环。
+    返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
+    """
+    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
+        _lossless_blacklist(guid)
+        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return None
+    src = dict(info or {})
+    title, artist, album = _tag_fields(src)
+    reused = False
+    if tee_enabled:
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src, retained=retained)
+        title = strip_source_tag(title)
+        if not (title and artist):
+            # issue #52 未知歌手-未知曲目：元数据全缺绝不以 unknown 进曲库（官方
+            # 扫描后 App 显示为未知歌手/未知曲目），暂以滚动缓存形态落 cache；
+            # 重播时元数据可补齐则由 _promote_deferred_cache 转正进曲库。
+            # find_cache_file 精确名可命中，缓存秒开不受影响。
+            dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
+            try:
+                os.makedirs(CONF["cache_dir"], exist_ok=True)
+                os.replace(part, dest)
+            except OSError:
+                tmp = f"{dest}.{uuid4().hex[:8]}.part"
+                shutil.copyfile(part, tmp)
+                os.replace(tmp, dest)
+                _remove_quiet(part)
+            remember_media_path(guid, dest)
+            fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+                    ext=ext or "?", tee=True, deferred=1)
+            logger.warning(
+                "tee finalize deferred to rolling cache for %s (title=%r artist=%r)："
+                "元数据缺失暂存 cache，重播补齐后转正", guid, title, artist,
+            )
+            return {"dest": dest, "title": title, "artist": artist, "album": album, "deferred": True}
+        dest, reused = _install_library_audio(part, guid, ext, title, artist, album, src)
     else:
         # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
         os.replace(part, dest)
     logger.info("tee finalize done for %s: dest=%s", guid, dest)
     # issue #52 重复曲目/未知歌手-未知曲目：留档标题/歌手/格式，配合 missing metadata
-    # 告警可定位重复文件对与元数据缺失来源
-    fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
-            ext=ext or "?", tee=tee_enabled)
+    # 告警可定位重复文件对与元数据缺失来源；reused=1 表示复用已有文件未重复落盘
+    if reused:
+        fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+                ext=ext or "?", tee=tee_enabled, reused=1)
+    else:
+        fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+                ext=ext or "?", tee=tee_enabled)
     # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
     # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
     if tee_enabled and CONF.get("lyric_auto_dl"):
@@ -4029,6 +4333,52 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         except Exception as e:
             logger.warning("Rolling cache purge failed: %s", e)
     return {"dest": dest, "title": title, "artist": artist, "album": album}
+
+
+def _is_deferred_cache_file(guid: str, path: str) -> bool:
+    """识别"元数据缺失暂存"形态：cache 目录 guid 命名音频且 .ref 指向它。
+
+    .ref 是暂存与"边听边存关闭的滚动缓存"的唯一区别（后者不写 .ref），
+    借此保证开关关闭的缓存永远不会被误转正进曲库。
+    """
+    if not _is_rolling_cache_stem(path, guid):
+        return False
+    recalled = recalled_media_path(guid)
+    if not recalled:
+        return False
+    try:
+        return os.path.samefile(recalled, path)
+    except OSError:
+        return False
+
+
+async def _promote_deferred_cache(headers: dict, guid: str, cached: str,
+                                  retained: dict | None = None) -> None:
+    """元数据缺失暂存 cache 的曲目（issue #52）：重播时元数据可补齐则转正进曲库。
+
+    补齐来源与落盘兜底同链（内存会话 → 歌单缓存 → 历史/收藏快照）；仍缺则保持
+    暂存等下次重播。文件转正前已完成解码校验，此处直接走曲库安装，不再重复校验。
+    """
+    try:
+        src = dict(retained or {})
+        title, artist, album = _tag_fields(src)
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src, retained=retained)
+        title = strip_source_tag(title)
+        if not (title and artist):
+            return
+        ext = os.path.splitext(cached)[1].lstrip(".").lower() or "mp3"
+        dest, _reused = await asyncio.to_thread(
+            _install_library_audio, cached, guid, ext, title, artist, album, src)
+        meta = {"dest": dest, "title": title, "artist": artist, "album": album}
+        await _auto_lyric_after_finalize(_synth_request(headers), guid, meta)
+        _schedule_library_scan(headers)
+        _dispatch_official_binding(guid, headers, meta)
+        fn_diag(logger, "tee_saved", guid=guid, title=title, artist=artist, ext=ext, tee=True, promoted=1)
+        logger.info("deferred cache promoted into library for %s: %s", guid, dest)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("deferred cache promote failed for %s: %s", guid, type(e).__name__)
 
 
 async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | None) -> None:
@@ -4114,6 +4464,7 @@ def stream_tee_response(
     first_chunk: bytes = b"",
     scan_headers_factory: Callable[[], dict] | None = None,
     post_finalize: Callable[[dict | None], Coroutine[Any, Any, None]] | None = None,
+    retained_factory: Callable[[], "dict | None"] | None = None,
 ) -> Response:
     headers = {"Accept-Ranges": "bytes"}
     for key in ("content-type", "content-length", "content-range"):
@@ -4239,15 +4590,26 @@ def stream_tee_response(
                             info = await asyncio.wait_for(info_task, timeout=8.0)
                         except Exception:
                             info = None
+                    if info is None or not _tag_fields(info)[0]:
+                        # issue #52：源站 info 缺失/残缺时，内存搜索会话是零 IO 兜底
+                        # （播放时会话必在），作为元数据回查链最前面的一环传入
+                        try:
+                            retained = retained_factory() if retained_factory else None
+                        except Exception:
+                            retained = None
+                    else:
+                        retained = None
                     try:
-                        meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled)
+                        meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled, retained)
                         # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
                         if post_finalize is not None and meta:
                             await post_finalize(meta)
                         scan_headers = scan_headers_factory() if scan_headers_factory is not None else None
-                        if scan_headers:
+                        if scan_headers and not (meta or {}).get("deferred"):
+                            # 元数据缺失暂存 cache 的曲目不触发曲库扫描/官方绑定，
+                            # 待转正后由 _promote_deferred_cache 统一调度
                             _schedule_library_scan(scan_headers)
-                        if meta and tee_enabled:
+                        if meta and tee_enabled and not meta.get("deferred"):
                             # 官方绑定意图（收藏/歌单）统一在下载落库完成后调度
                             _dispatch_official_binding(guid, scan_headers, meta)
                     except Exception as exc:
@@ -4639,8 +5001,9 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         part = None
         logger.info("Background full fetch saved %s (%d bytes)", guid, written)
         await _auto_lyric_after_finalize(fake_request, guid, meta)
-        _schedule_library_scan(cred_headers)
-        _dispatch_official_binding(guid, cred_headers, meta)
+        if not (meta or {}).get("deferred"):
+            _schedule_library_scan(cred_headers)
+            _dispatch_official_binding(guid, cred_headers, meta)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -4792,8 +5155,9 @@ async def _resume_part_download(guid: str, part: str, written: int, expected: in
         meta = await asyncio.to_thread(_tee_finalize, part, guid, resolved_ext, info or {}, True)
         logger.info("Tee handoff resumed %s (+%d bytes, total %d)", guid, append_written, final_size)
         await _auto_lyric_after_finalize(fake_request, guid, meta)
-        _schedule_library_scan(cred_headers)
-        _dispatch_official_binding(guid, cred_headers, meta)
+        if not (meta or {}).get("deferred"):
+            _schedule_library_scan(cred_headers)
+            _dispatch_official_binding(guid, cred_headers, meta)
         return True
     finally:
         with anyio.CancelScope(shield=True):
@@ -5396,6 +5760,12 @@ async def stream_track(request: Request, subpath: str = ""):
     if request.method == "HEAD":
         return await _stream_head_response(request, guid, cached, range_header)
     if cached:
+        if request.method != "HEAD" and _is_deferred_cache_file(guid, cached):
+            # 元数据缺失暂存 cache 的曲目（issue #52）：重播时补齐元数据转正进曲库。
+            # retained/headers 在请求上下文内先取好，重活放后台任务不阻塞出流。
+            promote_headers = copy_incoming_headers(request)
+            promote_retained, _promote_entry = _retained_track(request, guid)
+            asyncio.create_task(_promote_deferred_cache(promote_headers, guid, cached, promote_retained))
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
     item, entry = _retained_track(request, guid)
@@ -5451,7 +5821,8 @@ async def stream_track(request: Request, subpath: str = ""):
                     client_to_close=owned,
                     resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
                     scan_headers_factory=lambda: copy_incoming_headers(request),
-                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta))
+                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta),
+                    retained_factory=lambda: _retained_track(request, candidate)[0])
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
             if source_from_online_guid(candidate) not in ("netease", "lx"):
@@ -6241,10 +6612,12 @@ def _placeholder_cover_response(guid: str) -> Response:
         except OSError:
             logger.warning("占位图缺失: %s", os.path.join(_PLACEHOLDER_DIR, name))
             content = _TINY_GRAY_PNG
+    # no-store：占位图是"这次没取到"的兜底而非稳定内容，必须不被客户端磁盘
+    # 缓存粘住——升级/自愈后 App 重新拉取才能立即换上真封面（issue #48）
     return Response(
         content=content,
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -6323,6 +6696,27 @@ def _official_cover_file_response(cover_id: str, size: str | None = None) -> Res
     return None
 
 
+async def _online_cover_delivery(cover: str, guid: str = "") -> Response | None:
+    """在线封面出口（issue #48）：官方手机 App 不跟随跨域 302，默认代理同源
+    直出图片字节；FNMUSIC_COVER_MODE=redirect 保留旧 302 行为。直出失败
+    返回 None，调用方继续既有回退链（不劣于原 302 外链在 App 上的表现）。
+    成功出图时把 guid→直链 记入映射（内存+磁盘），info 抖动时已成功封面不塌。"""
+    cover = str(cover or "").strip()
+    if not cover or _KW_TEXT_COVER_HOST in cover:
+        return None
+    if str(CONF.get("cover_mode") or "proxy").lower() == "redirect":
+        if guid:
+            _cover_guid_url_remember(guid, cover)
+        return RedirectResponse(cover, status_code=302)
+    resp = await _proxied_cover_response(cover)
+    if resp is not None and guid:
+        await asyncio.to_thread(_cover_guid_url_persist, guid, cover)
+    return resp
+
+
+_COVER_UNRESOLVED_SEEN: set[str] = set()
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
@@ -6331,6 +6725,10 @@ async def static_cover(request: Request, subpath: str = ""):
         guid = subpath
     if not guid and subpath:
         cand = subpath.strip("/").split("/")[-1]
+        # 客户端可能按真实文件形态请求封面（<id>.jpg / <id>_w120.jpg）：
+        # 剥掉扩展名与缩略图变体尾缀再反解（仅此处局部剥离）
+        cand = re.sub(r"\.(jpg|jpeg|png|webp|gif)$", "", cand, flags=re.IGNORECASE)
+        cand = re.sub(r"_w\d+$", "", cand)
         if cand:
             guid = resolve_real_guid(cand)
     playlist_kind = dailyrec.online_playlist_kind(guid)
@@ -6375,34 +6773,56 @@ async def static_cover(request: Request, subpath: str = ""):
             # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
             return Response(status_code=404)
         guid = picked_guid
-    # 网易账号歌单封面：登记的封面直链直接 302（兼容重启后反查表未重建的裸假 id）
+    # 网易账号歌单封面：登记的封面直链同源直出（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
         cover = nmpl.cover_url_for(nm_pl_id)
         if cover:
-            return RedirectResponse(cover, status_code=302)
+            resp = await _online_cover_delivery(cover, guid)
+            if resp is not None:
+                return resp
+            # 直出失败（拉图异常）：回落 404，客户端显示自带默认样式
+            return Response(status_code=404)
         return Response(status_code=404)
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
             return local_resp
+        # 32hex 且不在伪装反查表、官方封面文件也未命中：伪装 id 反解失败取证
+        # （典型：代理重启后反查表未热身，App 持有的 coverId 查不到在线曲目）
+        raw = str(guid or "")
+        stripped = raw[6:] if raw.startswith("track_") else raw
+        if (re.fullmatch(r"[0-9a-f]{32}", stripped, re.IGNORECASE)
+                and resolve_real_guid(raw) == raw and stripped not in _COVER_UNRESOLVED_SEEN):
+            _COVER_UNRESOLVED_SEEN.add(stripped)
+            if len(_COVER_UNRESOLVED_SEEN) > 4096:
+                _COVER_UNRESOLVED_SEEN.clear()
+            ua = re.sub(r"\s+", " ", request.headers.get("user-agent") or "-")[:30]
+            fn_diag(logger, "cover_id_unresolved", raw=raw[:48], ua=ua)
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
-    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
+    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，同源直出
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
         item = album_entry.get("item") if isinstance(album_entry.get("item"), dict) else {}
         cover = str(item.get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
-            return RedirectResponse(cover, status_code=302)
+            resp = await _online_cover_delivery(cover, guid)
+            if resp is not None:
+                return resp
         # 登记封面缺失（如网易锚点行本就不带封面字段）不再直接占位：借登记的
         # 所属曲目走在线信息兜底（netease 由 al.picUrl 出链），再试直构，最后占位
         track_guid = str(album_entry.get("track_guid") or "")
-        if track_guid and _source_enabled(track_guid):
+        mapped = _cover_guid_url_lookup(track_guid) or _cover_guid_url_lookup(guid)
+        if not mapped and track_guid and _source_enabled(track_guid):
             data = await _online_info(request, track_guid, include_lyric=False)
             cover = str((data or {}).get("cover_url") or "")
-            if cover and _KW_TEXT_COVER_HOST not in cover:
-                return RedirectResponse(cover, status_code=302)
+        else:
+            cover = mapped
+        if cover and _KW_TEXT_COVER_HOST not in cover:
+            resp = await _online_cover_delivery(cover, track_guid or guid)
+            if resp is not None:
+                return resp
         direct = ""
         kw_rid = _kw_rid_from_guid(track_guid or guid)
         if kw_rid:
@@ -6410,17 +6830,28 @@ async def static_cover(request: Request, subpath: str = ""):
         if not direct:
             direct = _qq_cover_by_albummid(str(item.get("albummid") or ""))
         if direct:
-            return RedirectResponse(direct, status_code=302)
+            resp = await _online_cover_delivery(direct, track_guid or guid)
+            if resp is not None:
+                return resp
         # issue #48 封面缺失：专辑锚点全链路未取到封面，留档各环节结果
         fn_diag(logger, "cover_miss_album_anchor", guid=guid, anchor_cover=bool(cover),
                 kw=bool(kw_rid), qq=bool(item.get("albummid")))
         return _placeholder_cover_response(guid)
 
+    # ⓪ 成功出图过的封面直链映射（info 抖动/风控窗口不塌，App 高频刷列表免查 info）
+    mapped = _cover_guid_url_lookup(guid)
+    if mapped and _KW_TEXT_COVER_HOST not in mapped:
+        resp = await _online_cover_delivery(mapped, guid)
+        if resp is not None:
+            return resp
+
     data = await _online_info(request, guid, include_lyric=False)
     cover = str((data or {}).get("cover_url") or "")
-    # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    # ① 已知直链封面同源直出；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
-        return RedirectResponse(cover, status_code=302)
+        resp = await _online_cover_delivery(cover, guid)
+        if resp is not None:
+            return resp
 
     # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
     direct = ""
@@ -6430,12 +6861,16 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
-        return RedirectResponse(direct, status_code=302)
+        resp = await _online_cover_delivery(direct, guid)
+        if resp is not None:
+            return resp
 
     # ③ 网易 cloudsearch 同名曲补全
     enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
-        return RedirectResponse(enriched, status_code=302)
+        resp = await _online_cover_delivery(enriched, guid)
+        if resp is not None:
+            return resp
 
     # ④ 本地边听边存文件的内嵌专辑图
     embedded = _embedded_cover_bytes(guid)
@@ -8375,6 +8810,17 @@ async def play_history_list(request: Request):
                     "album": r_album,
                     "duration_s": retained.get("duration_s") or 0,
                     "ext": retained.get("ext") or "",
+                }
+        if not (info or {}).get("title"):
+            # 内存会话过期（重启后）时与写入路径对齐：再从推荐/网易歌单缓存补齐
+            served = _lookup_playlist_cache_track(guid)
+            if served:
+                s_title, s_artist, s_album = _tag_fields(served)
+                info = {
+                    **(info or {}),
+                    "title": s_title,
+                    "artist": s_artist,
+                    "album": s_album,
                 }
         obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
         obj["isFavorite"] = guid in fav_set

@@ -16,3 +16,13 @@ def _no_real_ffmpeg(monkeypatch):
     monkeypatch.setattr(tc, "_SESSIONS", {})
     monkeypatch.setattr(tc, "_ACTIVE", 0)
     monkeypatch.setattr(tc, "_SLOT_COND", None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cover_state(monkeypatch):
+    """隔离封面 guid→直链 映射与 32hex 反解取证去重表（模块级内存状态，
+    不隔离会让先跑用例的映射让后续用例跳过 mock 音源、甚至真实出网）。"""
+    from proxy import app as pa
+
+    monkeypatch.setattr(pa, "_COVER_GUID_URL_MEM", {})
+    monkeypatch.setattr(pa, "_COVER_UNRESOLVED_SEEN", set())

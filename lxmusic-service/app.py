@@ -1129,6 +1129,43 @@ async def search_tracks(
         _SEARCH_PROBE_ENABLED.reset(probe_token)
 
 
+# 免登录榜单目标：平台 -> (榜单名, bangid 内置回退值)。
+# bangid 优先按榜单名从 lxserver boards 接口动态解析（上游换榜 id 不再静默失效），
+# boards 不可用或未命中时回退内置值；解析结果缓存 10 分钟（上游 boards 本就 max-age=600）。
+_CHART_TARGETS: dict[str, tuple[str, str]] = {
+    "kg": ("TOP500", "8888"),
+    "kw": ("飙升榜", "93"),
+    "wy": ("新歌榜", "3779629"),
+}
+_CHART_ID_TTL_S = 600.0
+_CHART_ID_CACHE: dict[str, tuple[float, str]] = {}
+
+
+async def _resolve_chart_id(src: str) -> str:
+    target, default = _CHART_TARGETS[src]
+    now = time.monotonic()
+    hit = _CHART_ID_CACHE.get(src)
+    if hit and now - hit[0] < _CHART_ID_TTL_S:
+        return hit[1]
+    bid = default
+    try:
+        boards = await LXSERVER.get_leaderboard_boards(src)
+        for b in boards:
+            if not isinstance(b, dict):
+                continue
+            if target in str(b.get("name") or ""):
+                bid = str(b.get("bangid") or b.get("id") or default).strip()
+                if "__" in bid:
+                    bid = bid.split("__", 1)[1]
+                if not bid:
+                    bid = default
+                break
+    except Exception as e:
+        logger.debug("leaderboard boards resolve failed for %s: %s", src, e)
+    _CHART_ID_CACHE[src] = (now, bid)
+    return bid
+
+
 @app.get("/api/v1/recommend")
 async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     """免登录榜单推荐 (kg TOP500 / kw 飙升榜 / wy 新歌榜)。"""
@@ -1142,15 +1179,8 @@ async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     items: list[dict] = []
     errors: dict[str, str] = {}
 
-    # 榜单映射
-    chart_ids = {
-        "kg": "8888",   # TOP500
-        "kw": "93",     # 飙升榜
-        "wy": "3779629",# 新歌榜
-    }
-
     for src in wanted:
-        bid = chart_ids.get(src, "")
+        bid = await _resolve_chart_id(src)
         try:
             sub = await LXSERVER.get_leaderboard_list(src, bid, page=1)
             for it in sub:

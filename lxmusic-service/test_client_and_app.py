@@ -12,6 +12,7 @@ import pytest
 
 from conftest import lxapp, mock_client
 from lxserver_client import (
+    LxServerClient,
     extract_track_identifier,
     map_lxserver_song,
     normalize_source,
@@ -173,6 +174,71 @@ def test_recommend_endpoint(test_app_client):
     data = res.json()
     assert data["ok"] is True
     assert isinstance(data["items"], list)
+    # issue #47 回归：bangid 契约修复后榜单不得再静默返回空
+    assert data["items"], "recommend 榜单为空：get_leaderboard_list 参数契约或 boards 解析回归"
+
+
+def test_leaderboard_list_sends_bangid_param():
+    """issue #47：lxserver 榜单歌曲接口的参数名是 bangid，发 id 会被上游 400 拒绝
+    （"Missing bangid"）且曾被静默吞掉导致榜单全空。用 MockTransport 锁定参数契约。"""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json={
+            "total": 1,
+            "list": [{
+                "name": "真的爱你", "singer": "Beyond", "albumName": "秘密警察",
+                "songmid": "346075", "source": "wy", "interval": "04:45", "img": "",
+                "types": [{"type": "128k", "size": "4.5 MB"}],
+            }],
+        })
+
+    client = LxServerClient(base_url="http://lxserver-test")
+
+    async def _run():
+        client._client = httpx.AsyncClient(
+            base_url=client.base_url,
+            transport=httpx.MockTransport(handler),
+            timeout=5.0,
+        )
+        try:
+            return await client.get_leaderboard_list("wy", "3779629", page=1)
+        finally:
+            await client.close()
+
+    items = asyncio.run(_run())
+    assert seen["params"].get("bangid") == "3779629"
+    assert "id" not in seen["params"]
+    assert seen["params"].get("source") == "wy"
+    assert seen["params"].get("page") == "1"
+    assert len(items) == 1
+    assert items[0]["id"] == "lx:wy:346075"
+    assert items[0]["title"] == "真的爱你"
+    assert items[0]["duration_s"] == 285
+
+
+def test_leaderboard_list_non200_returns_empty():
+    """issue #47：非 200 响应（如上游 400/500）返回空列表且不抛异常——
+    修复前该路径无日志静默吞错，如今失败至少可见（client 侧有 warning）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="Missing bangid")
+
+    client = LxServerClient(base_url="http://lxserver-test")
+
+    async def _run():
+        client._client = httpx.AsyncClient(
+            base_url=client.base_url,
+            transport=httpx.MockTransport(handler),
+            timeout=5.0,
+        )
+        try:
+            return await client.get_leaderboard_list("kg", "8888", page=1)
+        finally:
+            await client.close()
+
+    assert asyncio.run(_run()) == []
 
 
 def test_track_info_endpoint(test_app_client):

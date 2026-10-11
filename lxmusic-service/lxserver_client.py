@@ -404,6 +404,9 @@ class LxServerClient:
         client = await self.get_client()
         resp = await client.get("/api/music/leaderboard/boards", params={"source": src}, timeout=self.timeout)
         if resp.status_code != 200:
+            logger.warning(
+                "lxserver leaderboard boards error %s for %s: %.150s", resp.status_code, src, resp.text,
+            )
             return []
         data = resp.json()
         if isinstance(data, dict) and isinstance(data.get("list"), list):
@@ -416,9 +419,14 @@ class LxServerClient:
         """获取指定榜单内的歌曲列表并做数据映射。"""
         src = normalize_source(source)
         client = await self.get_client()
-        params = {"source": src, "id": board_id, "page": page}
+        # lxserver 契约：榜单歌曲接口的参数名是 bangid（不是 id），缺失直接 400
+        params = {"source": src, "bangid": board_id, "page": page}
         resp = await client.get("/api/music/leaderboard/list", params=params, timeout=self.timeout)
         if resp.status_code != 200:
+            logger.warning(
+                "lxserver leaderboard list error %s for %s/%s: %.150s",
+                resp.status_code, src, board_id, resp.text,
+            )
             return []
         data = resp.json()
         raw_list = []

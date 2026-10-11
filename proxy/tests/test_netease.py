@@ -400,8 +400,8 @@ async def test_transcode_source_netease_returns_ua():
     assert calls["n"] == 1
 
 
-def test_static_cover_album_anchor_falls_back_to_track_cover():
-    """网易专辑锚点行无封面字段时：借登记曲目 al.picUrl 出链，不再直接占位图。"""
+def test_static_cover_album_anchor_falls_back_to_track_cover(monkeypatch):
+    """网易专辑锚点行无封面字段时：借登记曲目 al.picUrl 同源直出，不再直接占位图。"""
     def musicbox_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/song/186016/info":
             return httpx.Response(200, json={"ok": True, "data": {
@@ -411,9 +411,14 @@ def test_static_cover_album_anchor_falls_back_to_track_cover():
             }})
         return httpx.Response(404)
 
+    def img_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "http://img.test/yhm.jpg"
+        return httpx.Response(200, content=b"\xFF\xD8\xFFyhm", headers={"content-type": "image/jpeg"})
+
     app.state.musicbox_client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
     )
+    monkeypatch.setattr("proxy.app._COVER_FETCH_ASYNC_TRANSPORT", httpx.MockTransport(img_handler))
     register_fake_album(
         "online:netease:186016", "叶惠美",
         item={"title": "晴天", "artist": "周杰伦", "cover_url": ""},
@@ -423,8 +428,9 @@ def test_static_cover_album_anchor_falls_back_to_track_cover():
         with TestClient(app) as client:
             resp = client.get(f"/music/api/v1/static/cover?coverId=track_{fake_album}",
                               follow_redirects=False)
-        assert resp.status_code == 302
-        assert resp.headers["location"] == "http://img.test/yhm.jpg"
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/jpeg")
+        assert resp.content == b"\xFF\xD8\xFFyhm"
     finally:
         _FAKE_ALBUM_REGISTRY.pop(fake_album, None)
 
@@ -1505,10 +1511,12 @@ async def test_cover_does_not_fetch_slow_lyrics(monkeypatch, album):
     monkeypatch.setattr(p, "album_entry_from_real_guid", lambda g: {"item": {}, "track_guid": guid} if album else None)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://mb.test") as client:
         monkeypatch.setattr(p, "get_musicbox_client", lambda a: client)
+        monkeypatch.setattr(p, "_COVER_FETCH_ASYNC_TRANSPORT", httpx.MockTransport(
+            lambda r: httpx.Response(200, content=b"\xFF\xD8\xFFok", headers={"content-type": "image/jpeg"})))
         req = Request({"type": "http", "app": app, "path": "/music/api/v1/static/cover", "query_string": f"guid={guid}".encode(), "headers": []})
         response = await asyncio.wait_for(p.static_cover(req), timeout=0.5)
-        assert response.status_code == 302
-        assert response.headers["location"] == "http://img.test/real.jpg"
+        assert response.status_code == 200
+        assert response.media_type.startswith("image/jpeg")
     assert calls == ["/api/v1/song/123/info"]
 
 
