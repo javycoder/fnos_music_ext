@@ -1767,3 +1767,50 @@ def test_update_check_requires_admin(env_file, update_cache_clean):
     with TestClient(webui.app) as client:
         r = client.get("/api/update-check")
     assert r.status_code == 403
+
+
+def test_hidden_toggled_elements_not_defeated_by_display():
+    """靠 hidden 属性切换显隐的元素，其类规则不得缺 [hidden] 兜底。
+
+    作者样式里的 display 声明（如 .modal-mask{display:flex}、.badge{display:
+    inline-block}）会压过 UA 样式表的 [hidden]{display:none}——检查更新弹窗
+    曾因此打开页面即常显、遮罩盖住整页且点取消也关不掉。用静态 HTML+CSS 交叉
+    断言锁死该类别回归（渲染级验证需真实浏览器，以规则存在性代理）。"""
+    import re as _re
+
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    css = (HERE / "static" / "style.css").read_text(encoding="utf-8")
+    # 初始带 hidden 属性的元素：<tag ... id/class/hidden 属性顺序不定>
+    # aria-hidden="true" 的装饰元素不属于显隐切换，正则要求 hidden 是独立属性
+    entries = []
+    for m in _re.finditer(r"<\w+[^>]*?\shidden(?:\s|>|[^\w-])", html):
+        tag_html = m.group(0)
+        el_id = _re.search(r'\bid="([\w-]+)"', tag_html)
+        classes = _re.search(r'\bclass="([^"]*)"', tag_html)
+        if el_id and classes:
+            entries.append((el_id.group(1), classes.group(1)))
+    # CSS 里声明了 display:（值非 none）且选择器不带 [hidden] 的块
+    visible_decl: list[tuple[str, str]] = []  # (选择器, display 值)
+    for block in css.split("}"):
+        sel, sep, body = block.partition("{")
+        if not sep or "[hidden]" in sel:
+            continue
+        m = _re.search(r"display\s*:\s*([^;]+)", body)
+        if m and m.group(1).strip() != "none":
+            visible_decl.append((sel, m.group(1)))
+    assert visible_decl, "CSS 解析异常：未提取到任何 display 声明"
+
+    for el_id, classes in entries:
+        for cls in classes.split():
+            # (?![\w-]) 精确到类名边界：.btn 不匹配 .btn-row / .lx-item-btns
+            defeats_hidden = any(
+                _re.search(rf"\.{_re.escape(cls)}(?![\w-])", sel) for sel, _ in visible_decl)
+            if not defeats_hidden:
+                continue
+            has_fallback = (
+                _re.search(rf"#{_re.escape(el_id)}\[hidden\][^{{]*{{[^}}]*display\s*:\s*none", css)
+                or _re.search(rf"\.{_re.escape(cls)}\[hidden\][^{{]*{{[^}}]*display\s*:\s*none", css))
+            assert has_fallback, (
+                f"#{el_id} 靠 hidden 属性切换，但 .{cls} 的 display 声明会压过 UA 的 "
+                f"[hidden] 规则导致常显——需补 .{cls}[hidden] 或 #{el_id}[hidden] "
+                f"{{ display: none; }} 兜底")

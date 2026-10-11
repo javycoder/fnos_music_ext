@@ -235,7 +235,10 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   background: var(--err); color: #fff;
 }
 .badge.new:hover { opacity: .88; }
-#about-new[hidden], .nav-dot[hidden] { display: none; }
+/* 这些元素靠 hidden 属性切换显隐：类规则里的 display 声明会压过 UA 样式表的
+   [hidden]{display:none}（作者样式优先于 UA 样式），必须显式补回，否则弹窗常显
+   遮罩盖住整页、点取消也关不掉。 */
+#about-new[hidden], .nav-dot[hidden], .modal-mask[hidden] { display: none; }
 .modal-mask {
   position: fixed; inset: 0; z-index: 50;  /* 低于 toast(60)，报错可见 */
   background: rgba(16, 30, 54, 0.45);
