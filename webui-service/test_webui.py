@@ -80,6 +80,7 @@ def svctl(monkeypatch):
 
     monkeypatch.setattr(webui, "supervisorctl", fake)
     fake.calls = calls
+    fake.status_output = status_output
     return fake
 
 
@@ -804,6 +805,42 @@ def test_netease_qr_svg(env_file):
     with authed_client() as client:
         r = client.get("/api/netease/qr", params={"unikey": "KEY1"})
         assert r.status_code == 200
+
+
+def test_qr_login_803_promotes_resident_musicbox(env_file, svctl, resident_state, monkeypatch):
+    """扫码成功（803）：登录缓存/未登录防抖立即失效，常驻期望下预览进程即时转常驻。"""
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    _musicdl_env(env_file)
+    # 模拟此前的未登录结论仍占着缓存与防抖窗口
+    webui._resident_login_cache.update(ts=time.monotonic(), value=False)
+    webui._resident_start_block.update(until=time.monotonic() + 300.0, reason="stale")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/auth/login/check":
+            return httpx.Response(200, json={"ok": True, "data": {"code": 803}})
+        if path == "/api/v1/auth/status":
+            return httpx.Response(200, json={"ok": True, "data": {"logged_in": True, "nickname": "t"}})
+        if path == "/healthz":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404)
+
+    _mock_http(handler)
+    with authed_client() as client:
+        r = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
+        assert r.status_code == 200 and r.json()["data"]["code"] == 803
+    assert webui._resident_state["active"] is True
+    assert webui._resident_start_block["until"] == 0.0
+    # 旧缓存失效后被权威校验结果回填（不再是此前占位的 False）
+    assert webui._resident_login_cache["value"] is True
+    assert ("stop", "musicbox") not in svctl.calls
+
+
+def test_netease_qr_svg_content(env_file):
+    qrcode = pytest.importorskip("qrcode")
+    with authed_client() as client:
+        r = client.get("/api/netease/qr", params={"unikey": "KEY1"})
+        assert r.status_code == 200
         assert r.headers["content-type"].startswith("image/svg+xml")
         assert b"svg" in r.content
         assert client.get("/api/netease/qr").status_code == 422  # 缺 unikey
@@ -844,6 +881,157 @@ def test_netease_my_playlists_defaults_and_saves(env_file):
     with authed_client() as client:
         again = client.get("/api/config")
         assert again.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "true"
+
+
+# ------------------------------------------------------------- 网易云歌单常驻 ---
+
+def _musicdl_env(env_file) -> None:
+    """把测试 .env 改成 musicdl 为当前音源且常驻/账号歌单已勾选（常驻对账在非
+    musicbox 音源下才有戏；具体用例的 PUT 会按需覆盖这些键）。"""
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+                .replace("FNMUSIC_MUSICDL_ENABLED='false'", "FNMUSIC_MUSICDL_ENABLED='true'")
+        + "FNMUSIC_NETEASE_PLAYLIST_RESIDENT='true'\nFNMUSIC_NETEASE_MY_PLAYLISTS='true'\n",
+        encoding="utf-8",
+    )
+
+
+def _resident_http(logged_in: bool):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/auth/status":
+            return httpx.Response(200, json={
+                "ok": True, "data": {"logged_in": logged_in, "nickname": "tester" if logged_in else ""},
+            })
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404)
+    return handler
+
+
+@pytest.fixture
+def resident_state():
+    """常驻模块级内存状态用例间隔离（登录缓存/生效态/启动防抖）。"""
+    webui._resident_login_cache.update(ts=0.0, value=None)
+    webui._resident_state.update(active=False)
+    webui._resident_start_block.update(until=0.0, reason="")
+    yield
+    webui._resident_login_cache.update(ts=0.0, value=None)
+    webui._resident_state.update(active=False)
+    webui._resident_start_block.update(until=0.0, reason="")
+
+
+def test_netease_playlist_resident_defaults_and_saves(env_file, svctl):
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_NETEASE_PLAYLIST_RESIDENT"] == "false"
+        meta = view.json()["schema"]["FNMUSIC_NETEASE_PLAYLIST_RESIDENT"]
+        assert meta["kind"] == "bool" and meta["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_PLAYLIST_RESIDENT": True}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_NETEASE_PLAYLIST_RESIDENT" in saved.json()["changed"]
+    assert "FNMUSIC_NETEASE_PLAYLIST_RESIDENT='true'" in env_file.read_text(encoding="utf-8")
+
+
+def test_resident_switch_away_keeps_musicbox_running(env_file, svctl, resident_state):
+    """常驻生效时切走音源：musicbox 不被 stop（需求 1/3），新音源正常启动。"""
+    _mock_http(_resident_http(logged_in=True))
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": False,
+            "FNMUSIC_MUSICDL_ENABLED": True,
+            "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": True,
+            "FNMUSIC_NETEASE_MY_PLAYLISTS": True,
+        }})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+    assert ("stop", "musicbox") not in svctl.calls
+    assert ("start", "musicdl") in svctl.calls
+    assert webui._resident_state["active"] is True
+
+
+def test_switch_without_resident_stops_musicbox(env_file, svctl, resident_state):
+    """未勾选常驻：切走音源仍停掉 musicbox（既有行为不回退）。"""
+    _mock_http(_resident_http(logged_in=True))
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": False,
+            "FNMUSIC_MUSICDL_ENABLED": True,
+        }})
+        assert r.status_code == 200
+    assert ("stop", "musicbox") in svctl.calls
+    assert webui._resident_state["active"] is False
+
+
+def test_resident_enable_starts_musicbox_when_stopped(env_file, svctl, resident_state):
+    """非 musicbox 音源下开启常驻（已登录）：musicbox 进程被拉起并标记生效。"""
+    _musicdl_env(env_file)
+    svctl.status_output["musicbox"] = "musicbox                       STOPPED   Not started"
+    _mock_http(_resident_http(logged_in=True))
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": True,
+            "FNMUSIC_NETEASE_MY_PLAYLISTS": True,
+        }})
+        assert r.status_code == 200
+        starts = [a for a in r.json()["actions"] if a["kind"] == "resident" and a["op"] == "start"]
+        assert starts and starts[0]["ok"] is True
+    assert ("start", "musicbox") in svctl.calls
+    assert webui._resident_state["active"] is True
+
+
+def test_resident_without_login_reclaims_process(env_file, svctl, resident_state):
+    """常驻开启但未登录（需求 2）：拉起校验后回收进程并告警，5 分钟内不再反复拉起。"""
+    _musicdl_env(env_file)
+    svctl.status_output["musicbox"] = "musicbox                       STOPPED   Not started"
+    _mock_http(_resident_http(logged_in=False))
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": True,
+            "FNMUSIC_NETEASE_MY_PLAYLISTS": True,
+        }})
+        assert r.status_code == 200
+        rj = r.json()
+    # 权威校验需要可达进程：start → auth/status=False → stop 回收
+    assert ("start", "musicbox") in svctl.calls
+    assert ("stop", "musicbox") in svctl.calls
+    warns = [a for a in rj["actions"] if a["kind"] == "resident" and a["op"] == "deactivate"]
+    assert warns and warns[0]["ok"] is False and "未登录" in warns[0]["error"]
+    assert webui._resident_state["active"] is False
+    assert webui._resident_start_block["until"] > 0.0
+    # 防抖窗口内再次保存（无关配置）：不 start/stop 空转，也不重复告警
+    svctl.calls.clear()
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "balanced"}})
+        assert r.status_code == 200
+        assert not [a for a in r.json()["actions"] if a["kind"] == "resident"]
+    assert ("start", "musicbox") not in svctl.calls
+    assert ("stop", "musicbox") not in svctl.calls
+
+
+def test_resident_disable_stops_musicbox_for_memory(env_file, svctl, resident_state):
+    """取消勾选常驻且当前音源非 musicbox（需求 4）：musicbox 进程被关闭释放内存。"""
+    _musicdl_env(env_file)
+    webui._resident_state["active"] = True  # 模拟此前常驻生效中
+    _mock_http(_resident_http(logged_in=True))
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_PLAYLIST_RESIDENT": False}})
+        assert r.status_code == 200
+        stops = [a for a in r.json()["actions"] if a["kind"] == "resident" and a["op"] == "stop"]
+        assert stops and stops[0]["ok"] is True
+    assert ("stop", "musicbox") in svctl.calls
+    assert webui._resident_state["active"] is False
+
+
+def test_preview_reap_spares_resident_musicbox(env_file, svctl, resident_state):
+    """预览到期的 musicbox 在常驻生效时转常驻保活而非清退。"""
+    _musicdl_env(env_file)
+    webui._resident_state["active"] = True
+    webui._preview_until["musicbox"] = time.monotonic() - 1.0
+    stopped = webui.preview_reap()
+    assert "musicbox" not in stopped
+    assert ("stop", "musicbox") not in svctl.calls
+    assert "musicbox" not in webui._preview_until
 
 
 def test_lx_source_list_schema_and_roundtrip(env_file):

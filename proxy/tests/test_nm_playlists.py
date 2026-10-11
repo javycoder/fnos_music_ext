@@ -153,6 +153,35 @@ def test_source_disabled_no_injection():
         CONF["netease_enabled"] = True
 
 
+def test_resident_keeps_injection_and_runtime_without_netease_enabled():
+    """网易云歌单常驻（issue #38）：当前音源非网易盒子（netease_enabled=False）
+    但常驻开启时，账号歌单仍注入，网易曲目播放门槛放行。"""
+    mb = _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    CONF["netease_enabled"] = False
+    CONF["netease_playlist_resident"] = True
+    try:
+        with TestClient(app) as client:
+            resp = client.get("/music/api/v1/playlist/list")
+            lst = resp.json()["data"]["list"]
+        assert [it["guid"] for it in lst][:2] == ["online:playlist:nm:111", "online:playlist:nm:333"]
+        assert mb.state["calls"] == 1
+        # 运行期链路（播放/歌词/取链共用 _source_enabled）随常驻放行
+        assert proxy_app._source_enabled("online:netease:123") is True
+    finally:
+        CONF["netease_enabled"] = True
+        CONF["netease_playlist_resident"] = False
+
+
+def test_resident_off_keeps_netease_runtime_blocked():
+    """常驻与启用均关：网易 guid 运行期门槛拒绝（切源后不可播的既有行为）。"""
+    CONF["netease_enabled"] = False
+    CONF["netease_playlist_resident"] = False
+    try:
+        assert proxy_app._source_enabled("online:netease:123") is False
+    finally:
+        CONF["netease_enabled"] = True
+
+
 def test_musicbox_down_silent_and_cooldown():
     mb = _wire(_musicbox_handler(mode="down"))
     with TestClient(app) as client:

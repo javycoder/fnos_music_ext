@@ -189,6 +189,10 @@ CONF = {
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
+    # 网易云歌单常驻（issue #38）：默认关；勾选后即使当前音源不是网易盒子，
+    # 网易账号歌单仍注入且其曲目可播放（musicbox 进程由 webui 对账常驻保活）。
+    # 只放宽歌单/播放链路；搜索仍仅在网易盒子为当前音源时使用网易结果
+    "netease_playlist_resident": os.environ.get("FNMUSIC_NETEASE_PLAYLIST_RESIDENT", "false").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
     # 在线封面出口（issue #48）：proxy=同源直出字节（官方手机 App 不跟随跨域
     # 302，直出是它在 App 内显示的唯一可靠形态）；redirect=保留旧 302 外链行为
@@ -519,6 +523,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
+    "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": ("netease_playlist_resident", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_COVER_MODE": ("cover_mode", "str"),
@@ -754,9 +759,22 @@ def _search_scope(request: Request) -> str:
     return hashlib.sha256(json.dumps([auth, config, filters, request.url.path], sort_keys=True).encode()).hexdigest()
 
 
+def _netease_runtime_usable() -> bool:
+    """网易盒子歌单/播放运行期链路可用性：当前音源是网易盒子，或网易云歌单常驻生效。
+
+    只覆盖歌单注入与已登记网易曲目（播放/歌词/取链等）的放行口径；
+    搜索聚合（_aggregate_search/深分页/专辑搜索）仍只看 netease_enabled——
+    常驻模式下搜索结果不聚合网易（issue #38 需求 1）。
+    """
+    return bool(CONF.get("netease_enabled")) or bool(CONF.get("netease_playlist_resident"))
+
+
 def _source_enabled(guid: str) -> bool:
     source = source_from_online_guid(guid)
-    if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled")):
+    if source == "netease":
+        if not _netease_runtime_usable():
+            return False
+    elif not CONF.get({"lx": "lx_enabled"}.get(source, "musicdl_enabled")):
         return False
     if source == "lx":
         # lx 平台白名单（online:lx:<platform>:<id>）；未配置 = 跟随 lx 服务全部已启用平台
@@ -3772,7 +3790,8 @@ async def ext_healthz(request: Request):
 
     checks = [("upstream", True, get_upstream_client, "/music/api/v1/search/track?keyword=healthz_probe"),
               ("musicdl", CONF.get("musicdl_enabled"), get_musicdl_client, "/healthz"),
-              ("musicbox", CONF.get("netease_enabled"), get_musicbox_client, "/healthz"),
+              # 网易云歌单常驻：musicbox 非当前音源时仍是健康检查的一部分（issue #38）
+              ("musicbox", _netease_runtime_usable(), get_musicbox_client, "/healthz"),
               ("lxmusic", CONF.get("lx_enabled"), get_lx_client, "/healthz")]
     enabled = [(name, getter, path) for name, on, getter, path in checks if on]
     results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
@@ -3785,7 +3804,7 @@ async def ext_healthz(request: Request):
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
                 "mode": "per-user: source-slot -> llm -> local-random",
-                "netease": bool(CONF.get("netease_enabled")),
+                "netease": _netease_runtime_usable(),
                 "lx": bool(CONF.get("lx_enabled")),
                 "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
                 "source_slot_claimed": dailyrec.source_slot_claimed(),
@@ -8036,8 +8055,9 @@ async def playlist_list(request: Request):
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
     kinds = _recommend_injectable_kinds(user_guid)
-    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
-    nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
+    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见；
+    # 网易云歌单常驻生效时即使当前音源不是网易盒子也注入（issue #38）
+    nm_on = bool(CONF.get("netease_my_playlists")) and _netease_runtime_usable()
     if not kinds and not nm_on:
         # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
         return JSONResponse(content=envelope, headers=headers)

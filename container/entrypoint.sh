@@ -92,6 +92,28 @@ else
     log "未配置任何音源（FNMUSIC_MUSICDL_ENABLED/FNMUSIC_NETEASE_ENABLED/FNMUSIC_LX_ENABLED 均未启用）"
 fi
 
+# 网易云歌单常驻（issue #38）：当前音源不是 musicbox 但勾选常驻（含账号歌单开关）
+# 且盘上有网易 cookie（登录启发；权威校验由 webui 开机对账完成）时，拉起
+# musicbox 为网易账号歌单供数。原生形态 entrypoint 无 XDG 环境变量，可能
+# 找不到 cookie 而跳过——由 webui 开机对账兜底拉起。
+musicbox_cookie_present() {
+    for _f in "${XDG_DATA_HOME:-/nonexistent}/netease-musicbox/cookie.txt" \
+              "${HOME:-/root}/.netease-musicbox/cookie.txt" \
+              "${XDG_CONFIG_HOME:-/nonexistent}/netease-musicbox/cookie.txt"; do
+        if [ -s "$_f" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
+   && [ "$(env_flag FNMUSIC_NETEASE_PLAYLIST_RESIDENT)" = "true" ] \
+   && [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ] \
+   && musicbox_cookie_present; then
+    start_prog musicbox
+fi
+
 # WebUI 默认随容器启动（--no-webui 安装会写 FNMUSIC_WEBUI_ENABLED=false）
 if [ "$(env_flag FNMUSIC_WEBUI_ENABLED)" = "true" ]; then
     start_prog webui

@@ -178,6 +178,8 @@ def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path, tmp_path: Path | 
         data_dir = tmp_path / "data"
         env["DATA_PATH"] = str(data_dir / "lxserver")
         env["LX_DATA_DIR"] = str(data_dir / "lxmusic")
+        # 镜像容器形态的 XDG_DATA_HOME=/data：musicbox cookie 启发判断用
+        env["XDG_DATA_HOME"] = str(data_dir)
     proc = subprocess.run(
         ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
         capture_output=True, text=True, timeout=30,
@@ -222,6 +224,47 @@ def entrypoint_env(tmp_path):
 ])
 def test_entrypoint_starts_selected_programs(entrypoint_env, env_text, expected):
     assert entrypoint_env(env_text) == expected
+
+
+# ---------------------------------------------------------------- 网易云歌单常驻
+
+def _seed_musicbox_cookie(tmp_path) -> None:
+    cookie = tmp_path / "data" / "netease-musicbox" / "cookie.txt"
+    cookie.parent.mkdir(parents=True, exist_ok=True)
+    cookie.write_text("MUSIC_U=stub;", encoding="utf-8")
+
+
+def test_entrypoint_resident_starts_musicbox_with_cookie(entrypoint_env, tmp_path):
+    """非 musicbox 音源 + 常驻开启 + 盘上有 cookie：拉起 musicbox 供网易账号歌单。"""
+    _seed_musicbox_cookie(tmp_path)
+    env_text = ("FNMUSIC_MUSICDL_ENABLED=true\n"
+                "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+                "FNMUSIC_NETEASE_MY_PLAYLISTS=true\n")
+    assert entrypoint_env(env_text) == ["start musicdl", "start musicbox"]
+
+
+def test_entrypoint_resident_skips_without_cookie(entrypoint_env, tmp_path):
+    """常驻开启但盘上无 cookie（未登录）：不拉起，登录后由 webui 对账兜底。"""
+    env_text = ("FNMUSIC_MUSICDL_ENABLED=true\n"
+                "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+                "FNMUSIC_NETEASE_MY_PLAYLISTS=true\n")
+    assert entrypoint_env(env_text) == ["start musicdl"]
+
+
+def test_entrypoint_resident_requires_my_playlists_flag(entrypoint_env, tmp_path):
+    """常驻为账号歌单供数：账号歌单开关未开时不空跑 musicbox。"""
+    _seed_musicbox_cookie(tmp_path)
+    env_text = "FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+    assert entrypoint_env(env_text) == ["start musicdl"]
+
+
+def test_entrypoint_musicbox_provider_not_duplicated_by_resident(entrypoint_env, tmp_path):
+    """musicbox 本就是当前音源：常驻分支不重复 start。"""
+    _seed_musicbox_cookie(tmp_path)
+    env_text = ("FNMUSIC_NETEASE_ENABLED=true\n"
+                "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+                "FNMUSIC_NETEASE_MY_PLAYLISTS=true\n")
+    assert entrypoint_env(env_text) == ["start musicbox"]
 
 
 # ---------------------------------------------------------------- compose / Dockerfile

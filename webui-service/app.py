@@ -132,6 +132,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
+    "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易云歌单常驻"},
 }
 
 _PROVIDER_KEYS = set(PROVIDERS.values())
@@ -225,13 +226,19 @@ PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lx
 PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
 
 
-def switch_provider_process(old: str, new: str) -> list[dict]:
-    """切源进程：先停旧再起新；失败逐项记录，不抛出。"""
+def switch_provider_process(old: str, new: str, keep_musicbox: bool = False) -> list[dict]:
+    """切源进程：先停旧再起新；失败逐项记录，不抛出。
+
+    keep_musicbox=True（网易云歌单常驻生效）时切离 musicbox 不停其进程，
+    由常驻对账负责后续保活/回收。
+    """
     actions: list[dict] = []
     if old and old != new:
         # 停旧：按逆序停止（例如先停 lxmusic 再停 lxserver）
         old_progs = reversed(PROVIDER_PROGRAMS.get(old, [old]))
         for prog in old_progs:
+            if keep_musicbox and old == "musicbox" and prog == "musicbox":
+                continue
             code, out = supervisorctl("stop", prog)
             actions.append({"kind": "process", "program": prog, "op": "stop",
                             "ok": code == 0, "error": "" if code == 0 else out})
@@ -275,6 +282,9 @@ def preview_reap() -> list[str]:
     for provider, deadline in list(_preview_until.items()):
         if provider == enabled:
             _preview_until.pop(provider, None)
+        elif provider == "musicbox" and _resident_state["active"]:
+            # 网易云歌单常驻：musicbox 进程转常驻保活，仅移出预览表不停进程
+            _preview_until.pop(provider, None)
         elif deadline <= time.monotonic():
             all_ok = True
             for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
@@ -289,12 +299,16 @@ def preview_reap() -> list[str]:
     return stopped
 
 
-def preview_reconcile_after_save() -> list[dict]:
+def preview_reconcile_after_save(keep_musicbox: bool = False) -> list[dict]:
     """保存成功后的收尾：预览转正的进程保留，其余预览进程立即停止。"""
     enabled = current_provider(read_env())
     actions: list[dict] = []
     for provider in list(_preview_until):
         if provider == enabled:
+            _preview_until.pop(provider, None)
+            continue
+        if provider == "musicbox" and keep_musicbox:
+            # 网易云歌单常驻：musicbox 预览进程不清退，转由常驻对账接管
             _preview_until.pop(provider, None)
             continue
         _preview_until.pop(provider, None)
@@ -303,6 +317,129 @@ def preview_reconcile_after_save() -> list[dict]:
             actions.append({"kind": "process", "program": prog, "op": "stop",
                             "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
     return actions
+
+
+# ------------------------------------------------------------------ 网易云歌单常驻 --
+# 勾选后即使当前音源不是 musicbox，musicbox 进程也保持常驻，为音乐页的网易账号
+# 歌单（注入/取曲目/播放/歌词）供数；生效前提是已扫码登录。取消勾选且当前音源
+# 非 musicbox 时关闭 musicbox 进程以释放内存（cookie/数据卷保留，切回不丢登录态）。
+# webui 是常驻对账的单一事实来源：保存配置时收口 + 进程启动后开机自愈。
+_RESIDENT_FLAG = "FNMUSIC_NETEASE_PLAYLIST_RESIDENT"
+_RESIDENT_LOGIN_TTL = 60.0
+_RESIDENT_RETRY_BLOCK_S = 300.0
+_RESIDENT_NOT_LOGGED_IN = "未登录网易账号，网易云歌单常驻未生效（请先在音乐源页扫码登录）"
+# {"ts": float, "value": bool|None}：登录态短缓存（True/False 确定值；None=不可达）。
+# auth/status 首查会 spawn CLI 子进程（秒级），缓存避免一次保存流程内反复打
+_resident_login_cache: dict = {"ts": 0.0, "value": None}
+# 常驻当前是否生效（musicbox 进程由常驻逻辑保活），供 preview_reap 同步查询
+_resident_state = {"active": False}
+# 确认未登录后短时间内不再尝试拉起（否则每次保存都 start→校验→stop 空转一轮）
+_resident_start_block: dict = {"until": 0.0, "reason": ""}
+
+
+def _resident_flag(values: dict[str, str]) -> bool:
+    return str(values.get(_RESIDENT_FLAG, "")).strip().lower() in ("true", "1", "yes")
+
+
+def _resident_active(values: dict[str, str]) -> bool:
+    """常驻生效判定：勾选常驻 + 账号歌单开关（常驻为其供数，关闭时空跑无意义）。"""
+    return _resident_flag(values) and str(
+        values.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "")).strip().lower() in ("true", "1", "yes")
+
+
+def _musicbox_proc_running() -> bool:
+    return supervisor_status().get("musicbox", {}).get("state") == "RUNNING"
+
+
+async def _musicbox_login_state(client: "httpx.AsyncClient") -> "bool | None":
+    """musicbox 登录态三态：True/False 为 auth/status 的确定结论，None=不可达。"""
+    now = time.monotonic()
+    if now - _resident_login_cache["ts"] < _RESIDENT_LOGIN_TTL:
+        return _resident_login_cache["value"]
+    value: "bool | None" = None
+    try:
+        resp = await client.get(f"{CONF['musicbox_url']}/api/v1/auth/status", timeout=25.0)
+        data = _resp_json(resp)
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(payload, dict) and "logged_in" in payload:
+            value = bool(payload.get("logged_in"))
+    except Exception:  # noqa: BLE001  # musicbox 未启动/网络抖动：结论未知
+        value = None
+    _resident_login_cache["ts"] = now
+    _resident_login_cache["value"] = value
+    return value
+
+
+async def _musicbox_wait_healthy(client: "httpx.AsyncClient", timeout_s: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            resp = await client.get(f"{CONF['musicbox_url']}/healthz", timeout=2.0)
+            if resp.status_code == 200:
+                return True
+        except Exception:  # noqa: BLE001  # uvicorn 尚未监听：按间隔重试到超时
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict[str, str],
+                                       actions: list[dict], warn: bool = False) -> None:
+    """按常驻期望对账 musicbox 进程（幂等；provider=musicbox 时进程归音源切换管，跳过）。
+
+    - 常驻生效（勾选常驻+账号歌单+已登录）：进程未运行则拉起并等 healthz。
+    - 确认未登录（auth/status 明确 False）：不生效并回收进程，5 分钟内不再反复拉起；
+      不可达（None）视为未知，保守保留运行中的进程。
+    - 常驻不生效且进程在跑：停止释放内存（需求：取消勾选后节省内存）。
+    warn=True 时（本次保存涉及常驻/切源）把未登录告警写进响应 actions。
+    """
+    provider = current_provider(values)
+    if provider == "musicbox":
+        _resident_state["active"] = False
+        return
+    want = _resident_active(values)
+    _resident_state["active"] = False
+    running = _musicbox_proc_running()
+    if not want:
+        if running:
+            code, out = supervisorctl("stop", "musicbox")
+            actions.append({"kind": "resident", "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out})
+            logger.info("[resident] 网易云歌单常驻未勾选，停止 musicbox 进程")
+        return
+    if not running:
+        if time.monotonic() < _resident_start_block["until"]:
+            if warn:
+                actions.append({"kind": "resident", "op": "deactivate", "ok": False,
+                                "error": _resident_start_block["reason"]})
+            return
+        code, out = supervisorctl("start", "musicbox")
+        if code != 0:
+            actions.append({"kind": "resident", "op": "start", "ok": False, "error": out})
+            logger.warning("[resident] musicbox 常驻启动失败: %s", out)
+            return
+        if not await _musicbox_wait_healthy(client):
+            actions.append({"kind": "resident", "op": "start", "ok": False,
+                            "error": "启动后未通过健康检查"})
+            logger.warning("[resident] musicbox 常驻启动后未通过健康检查")
+            return
+        actions.append({"kind": "resident", "op": "start", "ok": True, "error": ""})
+        logger.info("[resident] musicbox 已为网易云歌单常驻启动")
+        running = True
+    logged = await _musicbox_login_state(client)
+    if logged is False:
+        # 进程可达且明确未登录：常驻前提不成立，回收进程释放内存
+        _resident_start_block.update(until=time.monotonic() + _RESIDENT_RETRY_BLOCK_S,
+                                     reason=_RESIDENT_NOT_LOGGED_IN)
+        code, out = supervisorctl("stop", "musicbox")
+        actions.append({"kind": "resident", "op": "stop",
+                        "ok": code == 0, "error": "" if code == 0 else out})
+        if warn:
+            actions.append({"kind": "resident", "op": "deactivate", "ok": False,
+                            "error": _RESIDENT_NOT_LOGGED_IN})
+        logger.info("[resident] musicbox 未登录，网易云歌单常驻未生效，已停止进程")
+        return
+    _resident_state["active"] = True
 
 
 # ------------------------------------------------------------------ 校验 --
@@ -534,10 +671,25 @@ async def _lifespan(_app: FastAPI):
                 day = today
                 purge_stale()
     reaper = asyncio.create_task(_preview_reaper())
+
+    async def _resident_boot():
+        # 开机自愈：常驻开启且非 musicbox 音源时拉起 musicbox（entrypoint 只认
+        # 三选一开关，容器/原生重启后由这里兜底；先等 supervisor 就绪再跑）
+        await asyncio.sleep(5.0)
+        try:
+            values = read_env()
+            if _resident_active(values) and current_provider(values) != "musicbox":
+                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=3.0)) as bclient:
+                    await _reconcile_musicbox_resident(bclient, values, [])
+        except Exception:  # noqa: BLE001  # 开机对账失败不影响 WebUI，下次保存再收口
+            logger.exception("网易云歌单常驻开机对账异常")
+
+    resident_task = asyncio.create_task(_resident_boot())
     try:
         yield
     finally:
         reaper.cancel()
+        resident_task.cancel()
         client = getattr(_app.state, "http", None)
         if client is not None:
             await client.aclose()
@@ -686,6 +838,12 @@ async def api_status(request: Request):
     for name, base in (("musicdl", CONF["musicdl_url"]), ("musicbox", CONF["musicbox_url"]),
                        ("lxmusic", CONF["lx_url"])):
         if name in PROVIDERS and name != provider:
+            if name == "musicbox" and _resident_flag(values):
+                # 网易云歌单常驻：musicbox 非当前音源但应常驻运行，照常探活
+                ok, data = await _fetch_json(request, f"{base}/healthz")
+                services[name] = {"reachable": ok,
+                                  "note": "网易云歌单常驻" if ok else "网易云歌单常驻（进程未运行）"}
+                continue
             services[name] = {"reachable": False, "note": "未启用（按需未启动）"}
             continue
         ok, data = await _fetch_json(request, f"{base}/healthz")
@@ -740,6 +898,9 @@ async def api_preview(body: PreviewBody, request: Request):
         raise HTTPException(status_code=400, detail="provider 必须是 musicdl/musicbox/lxmusic 之一")
     if current_provider(read_env()) == provider:
         return {"ok": True, "preview": False, "note": "该音源已启用，进程常驻"}
+    if provider == "musicbox" and _resident_state["active"]:
+        # 常驻进程已在跑：不再走预览拉起（对 RUNNING 进程 start 会报已启动错误）
+        return {"ok": True, "preview": False, "note": "网易云歌单常驻运行中"}
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
@@ -854,6 +1015,8 @@ async def api_config_put(body: ConfigBody, request: Request):
     changed = write_env(updates)
     after = read_env()
     new_provider = current_provider(after)
+    # 网易云歌单常驻：切源 musicbox→其它时保留其进程，交由收尾对账校验登录并保活
+    resident_keep = _resident_active(after)
     # 功能开关/配置变更留档（[cfg] 行进 webui.log；secret 类只记键名不打值）
     for key in changed:
         if SCHEMA.get(key, {}).get("kind") == "secret":
@@ -874,12 +1037,16 @@ async def api_config_put(body: ConfigBody, request: Request):
         and bool(after.get("LX_SOURCE_URL") or after.get("LX_SOURCE_LIST"))
     )
 
-    if not changed and not force_lx_activate and not _preview_until:
+    # 常驻开启（非 musicbox 音源）时每次保存都过一遍对账：顺带自愈被手动
+    # 停掉/意外退出的 musicbox 进程
+    resident_bypass = resident_keep and new_provider != "musicbox"
+    if not changed and not force_lx_activate and not _preview_until and not resident_bypass:
         return {"ok": True, "changed": [], "actions": [], "note": "配置无变化"}
 
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
-        actions.extend(switch_provider_process(old_provider, new_provider))
+        actions.extend(switch_provider_process(old_provider, new_provider,
+                                               keep_musicbox=resident_keep))
 
     async def _lx_source_post(payload: dict, source: str, op: str) -> str:
         api_payload: dict = {}
@@ -934,8 +1101,16 @@ async def api_config_put(body: ConfigBody, request: Request):
         actions.append({"kind": "process", "program": "musicdl", "op": "restart",
                         "ok": code == 0, "error": "" if code == 0 else out})
 
-    # 预览收尾：保存启用的转正常驻，其余预览进程立即停止
-    actions.extend(preview_reconcile_after_save())
+    # 预览收尾：保存启用的转正常驻，其余预览进程立即停止（常驻生效时保留 musicbox）
+    actions.extend(preview_reconcile_after_save(keep_musicbox=resident_keep))
+
+    # 网易云歌单常驻对账收口：切源保留的进程验证登录、开启/关闭/自愈拉起
+    if new_provider != "musicbox":
+        await _reconcile_musicbox_resident(
+            client, after, actions,
+            warn=bool({_RESIDENT_FLAG, "FNMUSIC_NETEASE_MY_PLAYLISTS"} & set(updates)
+                      or old_provider != new_provider),
+        )
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
     return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys}
@@ -1043,6 +1218,21 @@ async def netease_auth_proxy(path: str, request: Request):
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"musicbox 服务不可达: {exc}") from exc
+    if path == "login/check" and resp.status_code == 200:
+        # 扫码成功（803）：登录态缓存/未登录防抖立即失效，且常驻期望下把
+        # 扫码用的 musicbox 预览进程即时转常驻保活（否则预览到期会被清退，
+        # 要等下次保存才恢复）。803 每次登录只出现一次，内联对账可接受。
+        try:
+            payload = resp.json()
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            if isinstance(data, dict) and data.get("code") == 803:
+                _resident_login_cache.update(ts=0.0, value=None)
+                _resident_start_block.update(until=0.0, reason="")
+                values = read_env()
+                if _resident_active(values) and current_provider(values) != "musicbox":
+                    await _reconcile_musicbox_resident(client, values, [])
+        except Exception:  # noqa: BLE001  # 钩子失败不影响登录轮询本身
+            pass
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type=resp.headers.get("content-type", "application/json"))
 

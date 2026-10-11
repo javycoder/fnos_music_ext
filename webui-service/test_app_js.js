@@ -352,6 +352,43 @@ test("网易账号歌单开关：loadConfig 回填 + collectConfig 收集", asyn
   assert.strictEqual(els.get("#netease-my-playlists").checked, false);
 });
 
+test("网易云歌单常驻开关：loadConfig 回填 + collectConfig 收集", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_NETEASE_PLAYLIST_RESIDENT: "true" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-playlist-resident").checked, true);
+  els.get("#netease-playlist-resident").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_RESIDENT, false);
+  // 回填 false：缺省/关闭都表现为未勾选
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_NETEASE_PLAYLIST_RESIDENT: "false" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-playlist-resident").checked, false);
+});
+
+test("网易云歌单常驻：勾选时自动带出账号歌单开关", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  const resident = els.get("#netease-playlist-resident");
+  const myPlaylists = els.get("#netease-my-playlists");
+  assert.strictEqual(myPlaylists.checked, false);
+  resident.checked = true;
+  resident.dispatch("change");
+  assert.strictEqual(myPlaylists.checked, true);
+});
+
+test("网易云歌单常驻：未登录置灰 / 登录恢复可用", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: false } });
+  await global.syncNeteaseAccount();
+  assert.strictEqual(els.get("#netease-playlist-resident").disabled, true);
+  reset();
+  enqueue("/app/fnmusic-ext/api/netease/auth/status", { ok: true, data: { logged_in: true, nickname: "小明" } });
+  await global.syncNeteaseAccount();
+  assert.strictEqual(els.get("#netease-playlist-resident").disabled, false);
+});
+
 test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LYRIC_AUTO_DL: "true" } });

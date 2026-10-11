@@ -151,6 +151,7 @@ function applyConfigToForm() {
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
+  $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
   $("#lx-url").value = "";
   lxVerifiedUrl = null;
   try {
@@ -202,6 +203,7 @@ function collectConfig() {
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
+    FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
   const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
@@ -257,6 +259,9 @@ async function saveConfig() {
     if (result.changed && result.changed.length) parts.push(`已保存 ${result.changed.length} 项`);
     (result.actions || []).forEach((a) => {
       if (a.kind === "process") parts.push(`进程 ${a.program} ${a.op} ${a.ok ? "成功" : "失败"}`);
+      if (a.kind === "resident" && a.ok) {
+        parts.push(a.op === "start" ? "网易云歌单常驻进程已启动" : "网易云歌单常驻进程已停止");
+      }
       if (a.kind === "lx_activate") {
         const label = a.source ? `「${a.source}」` : "";
         const op = a.op === "deactivate" ? "取消激活" : "激活";
@@ -371,20 +376,32 @@ $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
 
 /* -------------------------------------------------------------- 网易扫码 */
+let neteaseLoggedIn = false;
+
+function updateResidentAvailability() {
+  // 网易云歌单常驻生效前提是已登录 musicbox：未登录时置灰（已勾选的保留显示）
+  $("#netease-playlist-resident").disabled = !neteaseLoggedIn;
+}
+
 async function syncNeteaseAccount(retries = 0) {
-  // 把网易账号态同步到 #qr-check（已登录显示昵称；未登录/失败清空）
+  // 把网易账号态同步到 #qr-check（已登录显示昵称；未登录/失败清空），
+  // 同时驱动「网易云歌单常驻」复选框的可用态
+  neteaseLoggedIn = false;
+  updateResidentAvailability();
   for (let i = 0; ; i++) {
     try {
       const st = await api("/api/netease/auth/status");
       const d = st.data || st;
       if (d.logged_in) {
+        neteaseLoggedIn = true;
         $("#qr-check").textContent = `当前登录：${d.nickname || d.user_id || "已登录用户"}`;
-        return;
+        break;
       }
     } catch (_) { /* status 不可达视为未登录 */ }
-    if (i >= retries) { $("#qr-check").textContent = ""; return; }
+    if (i >= retries) break;
     await new Promise((r) => setTimeout(r, 1500));
   }
+  updateResidentAvailability();
 }
 
 async function startQrLogin() {
@@ -441,6 +458,13 @@ function stopQrPolling() {
   if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
 }
 $("#qr-btn").addEventListener("click", startQrLogin);
+
+$("#netease-playlist-resident").addEventListener("change", () => {
+  // 常驻为账号歌单供数：勾选常驻时自动带出「音乐页显示网易账号歌单」
+  if ($("#netease-playlist-resident").checked && !$("#netease-my-playlists").checked) {
+    $("#netease-my-playlists").checked = true;
+  }
+});
 
 /* -------------------------------------------------------------- lx 源测试 */
 function escapeHtml(str) {
@@ -831,7 +855,7 @@ if ($("#lx-name")) {
 }
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
 $$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("下载音质需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {
