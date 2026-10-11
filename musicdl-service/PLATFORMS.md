@@ -77,12 +77,9 @@
 | 47 | musicdl | fivesong | FiveSongMusicClient | FiveSong | 下载站/抓取 | |
 | 48 | musicdl | kkws | KKWSMusicClient | KKWS | 下载站/抓取 | |
 | 49 | musicdl | gequhai | GequhaiMusicClient | Gequhai | 下载站/抓取 | |
-| 50 | musicdl | livepoo | LivePOOMusicClient | LivePOO | 下载站/抓取 | |
 | 51 | musicdl | htqyy | HTQYYMusicClient | HTQYY | 下载站/抓取 | |
 | 52 | musicdl | twot58 | TwoT58MusicClient | TwoT58 | 下载站/抓取 | |
-| 54 | musicdl | liziyy | LiziYYMusicClient | LiziYY | 下载站/抓取 | |
 | 55 | musicdl | mgmp3 | MGMP3MusicClient | MGMP3 | 下载站/抓取 | |
-| 56 | musicdl | itingwa | ITingWaMusicClient | ITingWa | 下载站/抓取 | |
 | 57 | musicdl | sgogo | SgogoMusicClient | Sgogo | 下载站/抓取 | |
 | 58 | musicdl | xmfwav | XMFWAVMusicClient | XMFWAV | 下载站/抓取 | |
 | 59 | lx | kg | kg | 酷狗 | 洛雪免登录 | ★ |
@@ -91,6 +88,9 @@
 | 62 | lx | kw | kw | 酷我 | 洛雪免登录 | ★ |
 | 63 | lx | tx | tx | QQ(仅搜索) | 洛雪免登录 | |
 | 64 | musicdl | yinyueku | YinyuekuMusicClient | Yinyueku | 下载站/抓取 | |
+| 65 | musicdl | gequke | GequkeMusicClient | Gequke | 下载站/抓取 | |
+| 66 | musicdl | leedodo | LeedodoMusicClient | Leedodo | 下载站/抓取 | |
+| 67 | musicdl | heishan | HeishanMusicClient | Heishan | 下载站/抓取 | |
 
-> 编号 53（zhuolin）已随上游 musicdl 2.13.11 移除而退役：编号永久空缺、不复用。
-> 此后新增平台一律从表末最大编号 +1 追加（如 64 = yinyueku）。
+> 编号 50（LivePOO）、53（zhuolin）、54（LiziYY）、56（ITingWa）已随上游 musicdl 2.13.11 / 2.14.1 移除而退役：编号永久空缺、不复用。
+> 此后新增平台一律从表末最大编号 +1 追加（如 64 = yinyueku、65–67 = gequke/leedodo/heishan）。

@@ -85,7 +85,8 @@ def test_table_invariants():
     assert [n for n, *_r in lx] == list(range(59, 64))
     mdl_ids = [n for n, *_r in mdl]
     assert all(2 <= n <= 58 or n >= 64 for n in mdl_ids), 'musicdl 编号须落在 2–58 或 ≥64 追加区段'
-    assert 53 not in mdl_ids, '编号 53 已随上游下线退役，不得复用'
+    # 50/53/54/56 = livepoo/zhuolin/liziyy/itingwa 已随上游 musicdl 2.13.11 / 2.14.1 下线退役，编号空缺不复用
+    assert not {50, 53, 54, 56} & set(mdl_ids), '退役编号不得复用'
 
 
 def test_menu_curated_matches_md_star_rows():

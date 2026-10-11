@@ -182,13 +182,13 @@ git pull
 1. **三音源互斥**：旧版多音源并存的 `.env` 会被要求重新单选（想换源时在 WebUI 里秒切）；
 2. **`LX_THIRD_PARTY` 移除**：lxmusic 不再内置第三方聚合解析链，播放解析完全由你的洛雪自定义源脚本提供（安装或 WebUI 中配置）。
 
-平台编号变化：`53`（zhuolin）已随上游 musicdl 2.13.11 下线退役，编号永久空缺；新增 `64`（yinyueku）。
+平台编号变化：`50`（LivePOO）、`53`（zhuolin）、`54`（LiziYY）、`56`（ITingWa）已随上游 musicdl 2.13.11 / 2.14.1 下线退役，编号永久空缺；新增 `64`（yinyueku）、`65–67`（gequke/leedodo/heishan）。
 
 ## 常见问题
 
 - **WebUI 打不开**：确认安装时选择了 WebUI，或 `.env` 中 `FNMUSIC_WEBUI_ENABLED=true` 后运行 `./extend.sh`。用飞牛管理员打开桌面「fnMusic 扩展管理」或 `/app/fnmusic-ext`，不要直接访问 8774。
 - **洛雪源播放失败**：源脚本由第三方提供，在容器内执行。导入前必须自行确认来源安全，不要导入来历不明的脚本。可在 WebUI 中用「测试」按钮验证源可用性，失败时更换源 URL 或重新上传脚本文件。
-- **musicdl 某平台搜索为空**：上游接口变化所致，不影响其他平台；可升级 musicdl（`>=2.14.0`）后重建镜像。
+- **musicdl 某平台搜索为空**：上游接口变化所致，不影响其他平台；可升级 musicdl（`>=2.14.1`）后重建镜像。
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/储存目录/LLM 等）；端口、`MUSICDL_SOURCES` 等其余改动需执行 `./extend.sh` 重启容器。
 - **日志在哪、怎么导出**：运行日志在安装目录 `logs/`（`proxy.log` / `webui.log` / `lxmusic.log` / `install.log`），按天滚动保留 3 天后自动清理；WebUI「关于 → 导出日志」可打包近 3 天日志与环境快照为 `.logzip` 下载，反馈 issue 时建议附上；卸载应用时日志目录会一并删除。

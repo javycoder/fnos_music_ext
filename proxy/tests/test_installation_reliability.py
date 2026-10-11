@@ -505,13 +505,18 @@ def test_parse_sources_rejects_unknown_platforms():
     assert result.returncode != 0 and '未知音源' in result.stderr
     result = run_install_bash(block + 'parse_sources "0"')
     assert result.returncode != 0 and '未知音源' in result.stderr
-    result = run_install_bash(block + 'parse_sources "65"')
+    result = run_install_bash(block + 'parse_sources "68"')
     assert result.returncode != 0 and '未知音源' in result.stderr
-    # 53 = zhuolin 已随上游 musicdl 2.13.11 下线退役，编号空缺不复用
-    result = run_install_bash(block + 'parse_sources "53"')
-    assert result.returncode != 0 and '未知音源' in result.stderr
+    # 50/53/54/56 = livepoo/zhuolin/liziyy/itingwa 已随上游 musicdl 2.13.11 / 2.14.1 下线退役，编号空缺不复用
+    for retired in ('50', '53', '54', '56'):
+        result = run_install_bash(block + f'parse_sources "{retired}"')
+        assert result.returncode != 0 and '未知音源' in result.stderr, retired
     result = run_install_bash(block + 'parse_sources "64"')
     assert result.returncode == 0, result.stderr
+    # 65–67 = gequke/leedodo/heishan（musicdl 2.14.1 新增，表末追加）
+    for added in ('65', '66', '67'):
+        result = run_install_bash(block + f'parse_sources "{added}"')
+        assert result.returncode == 0, (added, result.stderr)
     result = run_install_bash(block + 'parse_sources "mdl-1"')
     assert result.returncode != 0 and '未知 musicdl 平台' in result.stderr
     result = run_install_bash(block + 'parse_sources "15"')

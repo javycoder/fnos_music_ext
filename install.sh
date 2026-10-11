@@ -271,12 +271,9 @@ SOURCE_PLATFORM_TABLE='
 47|musicdl|fivesong|FiveSongMusicClient|FiveSong|0
 48|musicdl|kkws|KKWSMusicClient|KKWS|0
 49|musicdl|gequhai|GequhaiMusicClient|Gequhai|0
-50|musicdl|livepoo|LivePOOMusicClient|LivePOO|0
 51|musicdl|htqyy|HTQYYMusicClient|HTQYY|0
 52|musicdl|twot58|TwoT58MusicClient|TwoT58|0
-54|musicdl|liziyy|LiziYYMusicClient|LiziYY|0
 55|musicdl|mgmp3|MGMP3MusicClient|MGMP3|0
-56|musicdl|itingwa|ITingWaMusicClient|ITingWa|0
 57|musicdl|sgogo|SgogoMusicClient|Sgogo|0
 58|musicdl|xmfwav|XMFWAVMusicClient|XMFWAV|0
 59|lx|kg|kg|酷狗|1
@@ -285,6 +282,9 @@ SOURCE_PLATFORM_TABLE='
 62|lx|kw|kw|酷我|1
 63|lx|tx|tx|QQ(仅搜索)|0
 64|musicdl|yinyueku|YinyuekuMusicClient|Yinyueku|0
+65|musicdl|gequke|GequkeMusicClient|Gequke|0
+66|musicdl|leedodo|LeedodoMusicClient|Leedodo|0
+67|musicdl|heishan|HeishanMusicClient|Heishan|0
 '
 
 # lx 平台别名 → 规范代码（与 lxmusic-service/app.py 的 _SOURCE_ALIASES 一致）
