@@ -1175,3 +1175,164 @@ def test_bootstrap_failed_new_target_keeps_old_available_source(tmp_path, monkey
     asyncio.run(lxapp._bootstrap_migration())
     assert fake.sources[0]["enabled"] is True
     assert not fake.toggle_calls
+
+
+# =========================================================================
+# issue #49：songInfo 磁盘持久化 + 播放元数据透传
+# =========================================================================
+
+def test_songinfo_store_roundtrip_across_restart(tmp_path):
+    """存储启用时 cache_song_info 落盘；新实例（模拟重启）加载后反查命中。"""
+    store = str(tmp_path / "songinfo_store.json")
+    raw = {"name": "海阔天空", "singer": "Beyond", "source": "kw",
+           "songmid": "5886682", "albumName": "乐与怒", "interval": "05:24", "img": ""}
+
+    client = LxServerClient(base_url="http://lxserver-test", store_path=store)
+    client.cache_song_info("lx:kw:5886682", raw)
+    assert client._store_dirty
+    client.flush_song_info_store()
+    assert client._store_dirty is False
+
+    restarted = LxServerClient(base_url="http://lxserver-test", store_path=store)
+    assert restarted.get_cached_song_info("lx:kw:5886682") == raw
+
+
+def test_songinfo_store_corrupt_file_resets(tmp_path):
+    """存储文件损坏：启动重置为空，服务照常起，不抛异常。"""
+    store = str(tmp_path / "songinfo_store.json")
+    with open(store, "w", encoding="utf-8") as f:
+        f.write("{corrupted json!")
+    client = LxServerClient(base_url="http://lxserver-test", store_path=store)
+    assert client.get_cached_song_info("lx:kw:whatever") is None
+
+
+def test_songinfo_store_capacity_eviction(tmp_path):
+    """容量上限：超限淘汰最旧条目，落盘文件同步收缩。"""
+    store = str(tmp_path / "songinfo_store.json")
+    client = LxServerClient(base_url="http://lxserver-test", store_path=store)
+    client._cache_max = 4
+    for i in range(6):
+        client.cache_song_info(f"lx:kw:{i}", {"name": f"s{i}", "songmid": str(i), "source": "kw"})
+    assert "lx:kw:0" not in client._song_info_cache
+    assert "lx:kw:5" in client._song_info_cache
+    client.flush_song_info_store()
+    restarted = LxServerClient(base_url="http://lxserver-test", store_path=store)
+    restarted._cache_max = 4
+    assert restarted.get_cached_song_info("lx:kw:0") is None
+    assert restarted.get_cached_song_info("lx:kw:5") is not None
+
+
+def _install_probe_client():
+    """替换探活 client 为 Range 206 fLaC 应答（与 test_track_url_resolution 同款）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            206,
+            headers={"Content-Type": "audio/flac", "Content-Range": "bytes 0-4095/30000000"},
+            content=b"fLaC" + b"\x00" * 4092,
+        )
+    had_client = "client" in lxapp.app.state._state
+    orig_client = lxapp.app.state._state.get("client")
+    lxapp.app.state.client = mock_client(handler)
+
+    def restore():
+        lxapp.app.state._state.pop("client", None)
+        if had_client:
+            lxapp.app.state.client = orig_client
+
+    return restore
+
+
+def _spy_get_music_url(fake_lx, seen):
+    original = fake_lx.get_music_url
+
+    async def spy(song_info, quality="128k", exclude_api_sources=None):
+        seen.append(dict(song_info))
+        return await original(song_info, quality, exclude_api_sources)
+
+    fake_lx.get_music_url = spy
+
+
+def test_track_url_meta_params_synthesize_and_writeback(test_app_client, fake_lx):
+    """反查全冷 + 代理透传真实标签：合成 songInfo 用传入值并写回反查缓存，
+    关键词型源脚本拿到的是真实歌名歌手而非"未知曲目/未知歌手"。"""
+    seen: "list[dict]" = []
+    _spy_get_music_url(fake_lx, seen)
+    restore_client = _install_probe_client()
+    try:
+        res = test_app_client.get(
+            "/api/v1/track/url",
+            params={"id": "lx:kw:999001", "quality": "standard",
+                    "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                    "duration": 269.3, "cover": "https://img.test/x.jpg"},
+        )
+    finally:
+        restore_client()
+    assert res.status_code == 200
+    assert seen, "get_music_url 未被调用"
+    assert seen[0]["name"] == "晴天"
+    assert seen[0]["singer"] == "周杰伦"
+    assert seen[0]["albumName"] == "叶惠美"
+    assert seen[0]["rid"] == "999001"
+    # 写回反查缓存：同曲后续解析零成本命中真实标签
+    assert fake_lx.get_cached_song_info("lx:kw:999001")["name"] == "晴天"
+
+
+def test_track_url_cold_without_meta_falls_back_unknown(test_app_client, fake_lx):
+    """无元数据透传且反查全冷：维持原有兜底语义（桩合成"测试曲目"），不崩。"""
+    seen: "list[dict]" = []
+    _spy_get_music_url(fake_lx, seen)
+    restore_client = _install_probe_client()
+    try:
+        res = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:999002", "quality": "standard"})
+    finally:
+        restore_client()
+    assert res.status_code == 200
+    assert seen and seen[0]["name"] == "测试曲目"
+
+
+def test_track_url_cached_songinfo_not_overridden_by_meta(test_app_client, fake_lx):
+    """反查已有真实条目时元数据参数不覆盖既有 songInfo。"""
+    fake_lx.cache_song_info("lx:kw:999003", {
+        "name": "真名", "singer": "真歌手", "source": "kw", "songmid": "999003",
+    })
+    seen: "list[dict]" = []
+    _spy_get_music_url(fake_lx, seen)
+    restore_client = _install_probe_client()
+    try:
+        res = test_app_client.get(
+            "/api/v1/track/url",
+            params={"id": "lx:kw:999003", "quality": "standard", "title": "假名", "artist": "假歌手"},
+        )
+    finally:
+        restore_client()
+    assert res.status_code == 200
+    assert seen and seen[0]["name"] == "真名" and seen[0]["singer"] == "真歌手"
+
+
+def test_track_info_rebuilds_from_songinfo_cache(test_app_client, fake_lx):
+    """映射缓存冷但 songInfo 反查在（重启后磁盘持久层加载）：/track/info 重建
+    映射条目返回真实标题，不再合成"未知曲目"。"""
+    fake_lx.cache_song_info("lx:wy:346075", {
+        "name": "真的爱你", "singer": "Beyond", "source": "wy", "songmid": "346075",
+        "albumName": "秘密警察", "interval": "04:45", "img": "https://img.test/y.jpg",
+    })
+    res = test_app_client.get("/api/v1/track/info", params={"id": "lx:wy:346075"})
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert data["title"] == "真的爱你"
+    assert data["artist"] == "Beyond"
+    assert data["duration_s"] == 285
+
+
+def test_track_info_meta_params_synthesize(test_app_client, fake_lx):
+    """映射与 songInfo 反查全冷 + 元数据参数：详情直接返回传入标签并写回。"""
+    res = test_app_client.get(
+        "/api/v1/track/info",
+        params={"id": "lx:kw:999004", "title": "晴天", "artist": "周杰伦", "duration": 269},
+    )
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert data["title"] == "晴天"
+    assert data["artist"] == "周杰伦"
+    cached = fake_lx.get_cached_song_info("lx:kw:999004")
+    assert cached and cached["name"] == "晴天"

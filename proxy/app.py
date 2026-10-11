@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import time
 import contextlib
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -2645,11 +2646,15 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False) -> "dict | None":
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
+                         meta: "dict | None" = None) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
 
     fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
-    重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。"""
+    重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。
+    meta（issue #49）：曲目真实标签（title/artist/album/duration_s/cover_url），
+    songInfo 反查缓存全冷（重启后点播存量歌单/收藏/历史）时透传给 lxmusic
+    兜底合成——关键词型源脚本按歌名歌手取链，"未知曲目"必然解析失败。"""
     key = str(song_id)
     # issue #54：fresh 冷却窗内快速失败——刚确认打不开的直链短时间重试 fresh
     # 只会重复消耗音源解析额度；非 fresh 路径不受影响
@@ -2667,11 +2672,30 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
     if primary and primary not in qualities:
         qualities.insert(0, primary)
 
+    extra: dict[str, str] = {}
+    if meta:
+        duration = meta.get("duration_s") or meta.get("duration") or 0
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            duration = 0
+        for k, v in (("title", meta.get("title")), ("artist", meta.get("artist")),
+                     ("album", meta.get("album")), ("duration", duration),
+                     ("cover", meta.get("cover_url") or meta.get("cover"))):
+            if isinstance(v, str):
+                v = v.strip()
+                if v:
+                    extra[k] = v
+            elif isinstance(v, (int, float)) and v:
+                extra[k] = f"{v:g}"
+
     for q in qualities:
         try:
             params = {"id": song_id, "quality": q}
             if fresh:
                 params["fresh"] = "1"
+            if extra:
+                params.update(extra)
             r = await client.get(
                 "/api/v1/track/url",
                 params=params,
@@ -2768,6 +2792,90 @@ def _lx_fresh_cooldown_active(song_id: str) -> bool:
         _LX_FRESH_COOLDOWN.pop(str(song_id), None)
         return False
     return True
+
+
+# --- 在线曲目元数据 LRU（issue #49）----------------------------------------
+# 搜索会话（_SEARCH_CACHE）只覆盖"搜索结果点播"；热门/每日推荐歌单、收藏、
+# 播放历史没有搜索会话，重启后洛雪曲目在 lxmusic 侧 songInfo 反查全冷时只能
+# 合成"未知曲目/未知歌手"，关键词型源脚本按歌名歌手取链必然解析失败。App 点播
+# 前必先拉列表，所有批量下发在线曲目的出口把标题/歌手登记进本 LRU，播放与
+# 转码取流时随解析请求透传，兜底合成拿到真实标签。
+_ONLINE_META_MAX = 2048
+_ONLINE_META: "OrderedDict[str, dict]" = OrderedDict()
+_ONLINE_META_UNKNOWN_TITLES = {"未知曲目", "未知歌曲", "未知音乐"}
+
+
+def _online_meta_worthy(guid: str, title: str, artist: str) -> bool:
+    return bool(
+        guid.startswith("online:")
+        and str(title or "").strip()
+        and str(title).strip() not in _ONLINE_META_UNKNOWN_TITLES
+    )
+
+
+def register_online_meta(items) -> int:
+    """批量登记下发条目的 guid→元数据（返回新增数）；非在线/无标题条目跳过。
+
+    条目可能是统一 item（album 为字符串）也可能是 track/favorite VO（album 为
+    对象），统一走 _tag_fields 提取；VO 的 duration 字段是毫秒，仅在没有
+    duration_s 时换算兜底。"""
+    added = 0
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        guid = online_guid_from_item(it)
+        title, artist, album = _tag_fields(it)
+        if not _online_meta_worthy(guid, title, artist):
+            continue
+        duration_s = it.get("duration_s")
+        if not duration_s:
+            ms = it.get("duration")
+            if isinstance(ms, (int, float)) and ms > 1000:
+                duration_s = ms / 1000.0
+        register_online_meta_one(guid, title, artist, album, duration_s,
+                                 it.get("cover_url") or it.get("coverUrl") or it.get("coverURL"))
+        added += 1
+    return added
+
+
+def register_online_meta_one(guid: str, title: str, artist: str, album: str = "",
+                             duration_s=None, cover: str = "") -> None:
+    try:
+        duration = float(duration_s or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    _ONLINE_META.pop(guid, None)  # move-to-end 语义：重新登记视为最新
+    _ONLINE_META[guid] = {
+        "title": str(title).strip(),
+        "artist": str(artist).strip(),
+        "album": str(album or "").strip(),
+        "duration_s": duration,
+        "cover_url": str(cover or "").strip(),
+    }
+    while len(_ONLINE_META) > _ONLINE_META_MAX:
+        _ONLINE_META.popitem(last=False)
+
+
+def _online_meta_get(guid: str) -> "dict | None":
+    meta = _ONLINE_META.get(str(guid))
+    if meta is None:
+        return None
+    _ONLINE_META.move_to_end(str(guid))
+    return dict(meta)
+
+
+def _online_meta_for_request(request: Request, guid: str) -> "dict | None":
+    """播放元数据兜底链：内存搜索会话在前（数据最新），LRU 在后（覆盖无会话场景）。"""
+    retained, _entry = _retained_track(request, guid)
+    if retained is not None:
+        title, artist, album = _tag_fields(retained)
+        if _online_meta_worthy(str(guid), title, artist):
+            return {
+                "title": title, "artist": artist, "album": album,
+                "duration_s": retained.get("duration_s") or 0,
+                "cover_url": str(retained.get("cover_url") or ""),
+            }
+    return _online_meta_get(guid)
 
 
 # 网易直链钉住（2.8.0）：song_id -> (url, 过期时刻单调钟)。窗口型播放内核
@@ -3505,6 +3613,9 @@ async def lifespan(fastapi_app: FastAPI):
     for line in env_snapshot_lines("host"):
         logger.info(line)
     write_env_snapshot("host")
+    # 版本变化失效当日推荐缓存（issue #49）：升级重启后旧歌单曲目的音源侧
+    # songInfo 反查全冷，重建才能进持久层，不留"第二天才好"的空窗
+    _sync_recommend_version_marker()
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
     log_task = asyncio.create_task(_log_retention_loop()) if _background_jobs_enabled() else None
@@ -4792,7 +4903,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     return None
             else:
                 song_id = song_id_from_online_guid(guid)
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id, fresh=fresh_url)
+                resolved = await resolve_lx_url(
+                    get_lx_client(request.app), song_id, fresh=fresh_url,
+                    meta=_online_meta_for_request(request, guid))
                 if not resolved:
                     return None
                 url = resolved["url"]
@@ -5887,7 +6000,7 @@ async def stream_track(request: Request, subpath: str = ""):
                     resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
                     scan_headers_factory=lambda: copy_incoming_headers(request),
                     post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta),
-                    retained_factory=lambda: _retained_track(request, candidate)[0])
+                    retained_factory=lambda: _retained_track(request, candidate)[0] or _online_meta_get(candidate))
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
             if source_from_online_guid(candidate) not in ("netease", "lx"):
@@ -5919,7 +6032,9 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             # 转码中途退出（表现为标准音质下播一半分片 404 跳歌）
             return url, {"User-Agent": "Mozilla/5.0"}
         if source == "lx":
-            resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+            resolved = await resolve_lx_url(
+                get_lx_client(request.app), song_id_from_online_guid(guid),
+                meta=_online_meta_for_request(request, guid))
             if not resolved or not resolved.get("url"):
                 return None, None
             return str(resolved["url"]), _lx_media_headers(resolved)
@@ -6398,7 +6513,7 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                                         lyric_text = str((l_res.get("data") or {}).get("lyric") or "").strip()
                             except Exception as l_err:
                                 logger.warning("lxmusic lyric fetch failed for %s: %s", guid, l_err)
-                        return {
+                        info = {
                             "id": song_id,
                             "source": "lx",
                             "lx_source": str(inner.get("lx_source") or ""),
@@ -6411,6 +6526,19 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                             "file_size": int(inner.get("file_size") or 0),
                             "lyric": lyric_text,
                         }
+                        # issue #49：lxmusic 反查全冷返回"未知曲目"时用下发 LRU 兜底，
+                        # 播放中详情与边听边存落盘不再以未知命名
+                        info_title = str(info.get("title") or "").strip()
+                        if not info_title or info_title in _ONLINE_META_UNKNOWN_TITLES:
+                            meta = _online_meta_get(guid)
+                            if meta:
+                                info["title"] = meta["title"] or info_title
+                                for k in ("artist", "album"):
+                                    if not str(info.get(k) or "").strip() and meta.get(k):
+                                        info[k] = meta[k]
+                                if not str(info.get("cover_url") or "").strip() and meta.get("cover_url"):
+                                    info["cover_url"] = meta["cover_url"]
+                        return info
         except Exception as e:
             logger.warning("lxmusic /info failed for %s: %s", guid, e)
         return None
@@ -7390,6 +7518,7 @@ async def favorite_track_list(request: Request):
         obj = build_favorite_track_obj(g, _snapshot_to_info(snapshot) if snapshot else None, created_at=it.get("createdAt"), template=template)
         obj["isFavorite"] = True
         online_tracks.append(disguise_client_json(obj))
+    register_online_meta(online_tracks)
 
     data["list"] = official_list + online_tracks
     data["total"] = official_total + len(online_tracks)
@@ -7414,6 +7543,41 @@ def _prune_stale_daily_tasks(day: str) -> None:
             old.cancel()
     for k in [k for k in _EMPTY_BUILD_COOLDOWN if not str(k).endswith(f":{day}")]:
         _EMPTY_BUILD_COOLDOWN.pop(k, None)
+
+
+def _sync_recommend_version_marker() -> None:
+    """版本变化失效当日推荐缓存（issue #49 升级过渡）。
+
+    推荐歌单按天落盘而 lxmusic 的 songInfo 反查缓存只在内存/持久层：升级重启后，
+    旧版本构建的当日歌单里的曲目在音源侧 songInfo 全冷（持久层启用前拉取的没有
+    存档），点播只能合成"未知曲目"。版本一变即失效当日 daily/hot 缓存，下次打开
+    歌单按新版重建、榜单重拉，songInfo 立即进持久层。首次运行（无标记）只落标记
+    不失效——全新安装本就没有当日缓存。"""
+    ver = get_version()
+    path = os.path.join(dailyrec.recommend_cache_dir(), ".last-version")
+    prev = ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = f.read().strip()
+    except OSError:
+        pass
+    if prev == ver:
+        return
+    removed = 0
+    if prev:
+        removed = dailyrec.invalidate_today_cache_all_users()
+        _cancel_daily_tasks()
+    try:
+        os.makedirs(dailyrec.recommend_cache_dir(), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(ver)
+    except OSError as e:
+        logger.warning("failed to write recommend version marker: %s", e)
+    if prev:
+        logger.info(
+            "版本变化(%s → %s)：已失效当日推荐缓存 %d 个，推荐歌单将按新版本重建",
+            prev, ver, removed,
+        )
 
 
 def _recommend_kind_enabled(kind: str) -> bool:
@@ -8061,6 +8225,7 @@ async def playlist_track_list(request: Request):
         tracks = dailyrec.stamp_playlist_tracks(
             await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
         )
+        register_online_meta(tracks)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
@@ -8128,6 +8293,7 @@ async def playlist_track_list(request: Request):
             )
             obj["isFavorite"] = g in fav_guids
             online_objs.append(obj)
+        register_online_meta(online_objs)
 
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
@@ -8158,6 +8324,7 @@ async def playlist_track_list(request: Request):
         return auth_resp
     bundle = await _load_daily_bundle(request, user_guid, kind)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    register_online_meta(tracks)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
@@ -8891,6 +9058,7 @@ async def play_history_list(request: Request):
 
     seen = {str(x.get("guid")) for x in official if isinstance(x, dict)}
     merged_online = [t for t in online_tracks if t.get("guid") not in seen]
+    register_online_meta(merged_online)
     data["list"] = merged_online + official
     official_total = data.get("total")
     if not isinstance(official_total, int):

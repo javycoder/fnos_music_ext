@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
+import tempfile
 from pathlib import Path
 import re
 import sys
@@ -13,6 +15,10 @@ from typing import Any
 
 import httpx
 import pytest
+
+# songInfo 磁盘存储（issue #49）路径在 app 导入时定格：先指向临时目录，
+# 测试既不读写真实数据目录，也能覆盖加载/落盘行为
+os.environ.setdefault("LX_DATA_DIR", tempfile.mkdtemp(prefix="lxmusic-test-data-"))
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -137,16 +143,29 @@ class FakeLxServerClient:
     def get_cached_song_info(self, track_id: str) -> dict | None:
         return self._song_info_cache.get(track_id)
 
+    def cache_song_info(self, track_id: str, song_info: dict) -> None:
+        if track_id and song_info:
+            self._song_info_cache[track_id] = song_info
+
+    def flush_song_info_store(self) -> None:
+        pass
+
     def synthesize_song_info(self, track_id: str, fallback_meta: dict | None = None) -> dict:
-        return {
-            "name": "测试曲目",
-            "singer": "测试歌手",
+        # 与真实契约对齐：优先消费 fallback_meta 的真实标签，songmid 从 track_id 反解
+        meta = fallback_meta or {}
+        identifier = track_id.split(":")[-1] if ":" in track_id else track_id
+        info = {
+            "name": meta.get("title") or meta.get("name") or "测试曲目",
+            "singer": meta.get("artist") or meta.get("singer") or "测试歌手",
             "source": "kw",
-            "songmid": "5886682",
-            "albumName": "测试专辑",
-            "interval": 200,
-            "img": "",
+            "songmid": identifier or "5886682",
+            "albumName": meta.get("album") or meta.get("albumName") or "测试专辑",
+            "interval": meta.get("duration_s") or 200,
+            "img": meta.get("cover_url") or "",
         }
+        if info["source"] == "kw":
+            info["rid"] = info["songmid"]
+        return info
 
     async def upload_custom_source(self, filename: str, script_content: str) -> dict:
         self.upload_calls.append((filename, script_content))
