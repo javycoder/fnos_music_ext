@@ -1627,7 +1627,10 @@ def test_version_newer():
     assert webui._version_newer("2.10.0", "2.9.0")      # 数值比较而非字典序
     assert not webui._version_newer("2.9.0", "2.10.0")
     assert webui._version_newer("v2.9.0", "2.8.3")      # tag 的 v 前缀
-    assert webui._version_newer("2.8.0a", "2.8.0")      # 预发布尾巴视为更新
+    assert webui._version_newer("2.9.0", "2.8.0e")      # 存量迭代安装可被正式版命中
+    # 正式发布只有纯数字版本号：带字母尾巴的迭代预发布不检测
+    assert not webui._version_newer("2.8.0a", "2.8.0")
+    assert not webui._version_newer("2.9.0-rc1", "2.8.3")
     assert not webui._version_newer("", "2.8.3")        # 非法版本号一律不更新
     assert not webui._version_newer("abc", "2.8.3")
 
@@ -1732,6 +1735,16 @@ def test_update_check_no_update_when_same_version(env_file, update_cache_clean):
     with authed_client() as client:
         _mock_http(lambda request: httpx.Response(200, json=release))
         rj = client.get("/api/update-check").json()
+    assert rj["has_update"] is False
+
+
+def test_update_check_prerelease_latest_not_detected(env_file, update_cache_clean):
+    """latest 是迭代预发布号（带字母尾巴）时不视为更新——检查更新只认正式版。"""
+    release = dict(GH_RELEASE, tag_name="v2.8.0e")
+    with authed_client() as client:
+        _mock_http(lambda request: httpx.Response(200, json=release))
+        rj = client.get("/api/update-check").json()
+    assert rj["source"] == "github"
     assert rj["has_update"] is False
 
 

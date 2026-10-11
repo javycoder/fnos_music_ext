@@ -581,36 +581,35 @@ def _read_version() -> str:
         return SERVICE_VERSION
 
 
-def _version_key(v: str) -> "tuple[list[int], str]":
-    """版本号 → (前导数字段列表, 剩余尾巴)。"v2.8.3" → ([2, 8, 3], "")；
-    "2.8.0a" → ([2, 8, 0], "a")；首个非数字段起的剩余内容全归尾巴。"""
-    v = (v or "").strip().lstrip("vV")
-    segs = v.split(".")
+def _version_nums(v: str) -> "list[int]":
+    """版本号的前导数字段列表："v2.8.3" → [2, 8, 3]，"2.8.0a" → [2, 8, 0]。"""
     nums: list[int] = []
-    for i, seg in enumerate(segs):
-        m = re.match(r"(\d+)(.*)$", seg)
+    for seg in (v or "").strip().lstrip("vV").split("."):
+        m = re.match(r"(\d+)", seg)
         if not m:
-            return nums, ".".join(segs[i:])
+            break
         nums.append(int(m.group(1)))
-        if m.group(2):  # 数字段带尾巴（如 2.8.0a 的 "0a"）：尾巴连同后续段一并截断
-            rest = m.group(2)
-            return nums, rest if i + 1 == len(segs) else f"{rest}.{'.'.join(segs[i + 1:])}"
-    return nums, ""
+    return nums
 
 
 def _version_newer(latest: str, current: str) -> bool:
-    """latest 是否比 current 新：数字段逐位补零比较（2.9 ≡ 2.9.0，2.10 > 2.9），
-    数字位一致时尾巴字符串兜底（2.8.0a > 2.8.0）。任一侧解析不出数字视为不更新。"""
-    lnums, lrest = _version_key(latest)
-    cnums, crest = _version_key(current)
+    """latest 是否比 current 新：数字段逐位补零比较（2.9 ≡ 2.9.0，2.10 > 2.9）。
+
+    正式发布只有纯数字版本号（如 2.9.0）：latest 带字母等尾巴（如 2.8.0a
+    迭代预发布）一律不视为更新——检查更新不检测非正式版本。current 侧尾巴
+    仅截断参与数值比较（存量迭代安装也能被更新的正式版命中）。任一侧解析
+    不出数字视为不更新。"""
+    latest = (latest or "").strip().lstrip("vV")
+    if not re.fullmatch(r"\d+(?:\.\d+)*", latest):
+        return False
+    lnums = _version_nums(latest)
+    cnums = _version_nums(current)
     if not lnums or not cnums:
         return False
     size = max(len(lnums), len(cnums))
     lnums += [0] * (size - len(lnums))
     cnums += [0] * (size - len(cnums))
-    if lnums != cnums:
-        return lnums > cnums
-    return lrest > crest
+    return lnums > cnums
 
 
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s*")
