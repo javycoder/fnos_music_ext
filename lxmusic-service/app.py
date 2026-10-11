@@ -72,6 +72,9 @@ LXSERVER = LxServerClient(
     base_url=os.environ.get("LXSERVER_URL", DEFAULT_LXSERVER_URL),
     admin_password=os.environ.get("LXSERVER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
     timeout=CONF["resolver_timeout"],
+    # songInfo 磁盘持久化（issue #49）：重启后榜单/搜索反查缓存不丢，
+    # 关键词型源脚本冷启动仍能按真实歌名歌手取链
+    store_path=os.path.join(CONF["data_dir"], "songinfo_store.json"),
 )
 
 # 内存曲目缓存: id -> {"item": dict, "ts": float}
@@ -147,13 +150,18 @@ async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | N
     url = data.get("url")
     if not url:
         return None
+    # issue #54：续期探活与续期结果共用同一 UA；空 headers 的旧缓存条目借续期
+    # 补上探活 UA，避免续期成功后播放仍拿不到 UA 被拒 403
+    headers = dict(data.get("headers") or {})
+    headers.setdefault("User-Agent", UA_PC)
     try:
-        ok, final_url, _ct, size = await probe_url(client, url, data.get("headers") or {})
+        ok, final_url, _ct, size = await probe_url(client, url, headers)
     except Exception:
         return None
     if not ok:
         return None
     refreshed = dict(data)
+    refreshed["headers"] = headers
     if final_url and final_url != url:
         refreshed["url"] = final_url
     if size:
@@ -664,7 +672,10 @@ async def resolve_and_probe(
                 continue
 
             raw_url = res["url"]
-            headers = {}
+            # issue #54：UA 敏感 CDN（如酷我）按 User-Agent 差异放行/拒绝，探活与
+            # 实际播放必须同一 UA。探活 UA 直接进返回 headers 交给代理复用，
+            # 杜绝「探活 Chrome UA 通过、代理 httpx 默认 UA 被 403」的错位
+            headers = {"User-Agent": UA_PC}
             # 酷狗或特殊源防盗链头
             if src == "kg":
                 headers["Referer"] = "https://www.kugou.com/"
@@ -1193,16 +1204,62 @@ async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     return {"ok": True, "items": items[:limit], "errors": errors, "charts": ["kg", "kw", "wy"]}
 
 
+def _meta_query(title: str, artist: str, album: str, duration: float, cover: str) -> dict:
+    """代理透传的曲目元数据查询参数 → synthesize 元数据字典；无有效字段返回 {}。"""
+    meta: dict[str, Any] = {}
+    if str(title or "").strip():
+        meta["title"] = str(title).strip()
+    if str(artist or "").strip():
+        meta["artist"] = str(artist).strip()
+    if str(album or "").strip():
+        meta["album"] = str(album).strip()
+    try:
+        if float(duration) > 0:
+            meta["duration_s"] = float(duration)
+    except (TypeError, ValueError):
+        pass
+    if str(cover or "").strip():
+        meta["cover_url"] = str(cover).strip()
+    return meta
+
+
+def _ensure_song_info(track_id: str, meta: dict) -> None:
+    """播放/详情前的反查兜底（issue #49）：songInfo 反查缺失时代理透传的真实
+    标签立即合成并写回存储——关键词型源脚本按歌名歌手取链，冷启动合成"未知
+    曲目/未知歌手"必然失败；写回后同曲后续解析/详情零成本命中。已有条目不覆盖。"""
+    if not meta or LXSERVER.get_cached_song_info(track_id):
+        return
+    LXSERVER.cache_song_info(track_id, LXSERVER.synthesize_song_info(track_id, meta))
+
+
+def _item_from_song_info(track_id: str, src: str) -> "dict | None":
+    """songInfo 反查缓存（含磁盘持久层）→ 映射条目，用于映射缓存全冷时重建。"""
+    raw = LXSERVER.get_cached_song_info(track_id)
+    if not raw:
+        return None
+    item = map_lxserver_song(raw, fallback_source=src)
+    item["id"] = track_id
+    return item
+
+
 @app.get("/api/v1/track/url")
 async def track_url(
     id: str = Query("", alias="id"),
     guid: str = Query("", alias="guid"),
     quality: str = Query("lossless"),
     fresh: int = Query(0),
+    title: str = Query(""),
+    artist: str = Query(""),
+    album: str = Query(""),
+    duration: float = Query(0),
+    cover: str = Query(""),
 ):
     """解析单曲播放直链。支持音质阶梯降级、媒体魔数探活与成功结果缓存/同键并发合并。
 
-    fresh=1 旁路缓存强制重新解析：代理重试路径确认缓存直链失效后的有界刷新入口。"""
+    fresh=1 旁路缓存强制重新解析：代理重试路径确认缓存直链失效后的有界刷新入口。
+    title/artist/album/duration/cover（issue #49）：代理在 songInfo 反查缓存
+    全冷（重启后点播存量歌单/收藏/历史）时透传曲目真实标签，兜底合成不再产出
+    "未知曲目/未知歌手"，关键词型源脚本照常按歌名歌手取链。"""
     track_id = (id or guid or "").strip()
     src, identifier = parse_track_id(track_id)
     if not src or not identifier:
@@ -1210,7 +1267,9 @@ async def track_url(
 
     _STATS["url_resolutions"] += 1
     canonical_id = f"lx:{src}:{identifier}"
-    cached = _cache_get(canonical_id) or {"id": canonical_id, "lx_source": src}
+    _ensure_song_info(canonical_id, _meta_query(title, artist, album, duration, cover))
+    cached = _cache_get(canonical_id) or _item_from_song_info(canonical_id, src) \
+        or {"id": canonical_id, "lx_source": src}
     client = get_http(app)
 
     try:
@@ -1236,14 +1295,28 @@ async def track_url(
 
 
 @app.get("/api/v1/track/info")
-async def track_info(id: str = Query("", alias="id"), guid: str = Query("", alias="guid")):
+async def track_info(
+    id: str = Query("", alias="id"),
+    guid: str = Query("", alias="guid"),
+    title: str = Query(""),
+    artist: str = Query(""),
+    album: str = Query(""),
+    duration: float = Query(0),
+    cover: str = Query(""),
+):
     track_id = (id or guid or "").strip()
     src, identifier = parse_track_id(track_id)
     if not src:
         return _err(f"invalid track id: {track_id}", 400)
 
     canonical_id = f"lx:{src}:{identifier}"
+    _ensure_song_info(canonical_id, _meta_query(title, artist, album, duration, cover))
     cached = _cache_get(canonical_id)
+    if not cached:
+        # 映射缓存冷但 songInfo 反查在（含磁盘持久层，重启后）：重建映射条目
+        cached = _item_from_song_info(canonical_id, src)
+        if cached:
+            _cache_put(cached)
     if cached:
         return {"ok": True, "data": cached}
 

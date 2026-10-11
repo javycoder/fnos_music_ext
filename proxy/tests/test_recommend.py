@@ -1623,3 +1623,71 @@ def test_playlist_list_serves_partial_checkpoint_progressively(tmp_path, monkeyp
         assert first["trackCount"] >= 1
         # 未等完整构建（完整结束需 ~2.1s，peek 窗口 2s；命中 checkpoint 应明显更早）
         assert elapsed < 1.8, f"应命中渐进 checkpoint 提前返回，实际等了 {elapsed:.2f}s"
+
+
+# =========================================================================
+# issue #49：版本变化失效当日推荐缓存
+# =========================================================================
+def _seed_day_caches(rec_dir: str, day: str) -> None:
+    for user in ("u1", "u2"):
+        for kind in ("hot", "daily"):
+            path = os.path.join(rec_dir, user, f"{kind}-{day}.json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"day": day, "status": "ready", "tracks": [{"guid": f"g-{user}-{kind}"}]}, f)
+
+
+def test_sync_recommend_version_marker_invalidates_on_change(tmp_path, monkeypatch):
+    """版本变化：当日 daily/hot 缓存全部失效，标记更新为新版本。"""
+    import proxy.app as proxy_app
+
+    rec_dir = os.environ["FNMUSIC_RECOMMEND_DIR"]
+    day = dailyrec.today_key()
+    _seed_day_caches(rec_dir, day)
+    marker = os.path.join(rec_dir, ".last-version")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("2.8.2")
+    monkeypatch.setattr(proxy_app, "get_version", lambda: "2.8.3")
+
+    proxy_app._sync_recommend_version_marker()
+
+    remaining = [name for _, _, files in os.walk(rec_dir) for name in files if name.endswith(".json")]
+    assert remaining == [], f"当日缓存未失效: {remaining}"
+    with open(marker, encoding="utf-8") as f:
+        assert f.read() == "2.8.3"
+
+
+def test_sync_recommend_version_marker_noop_same_version(tmp_path, monkeypatch):
+    """版本未变：缓存与标记都不动。"""
+    import proxy.app as proxy_app
+
+    rec_dir = os.environ["FNMUSIC_RECOMMEND_DIR"]
+    day = dailyrec.today_key()
+    _seed_day_caches(rec_dir, day)
+    marker = os.path.join(rec_dir, ".last-version")
+    monkeypatch.setattr(proxy_app, "get_version", lambda: "2.8.3")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("2.8.3")
+
+    proxy_app._sync_recommend_version_marker()
+
+    remaining = [name for _, _, files in os.walk(rec_dir) for name in files if name.endswith(".json")]
+    assert len(remaining) == 4
+
+
+def test_sync_recommend_version_marker_first_run_writes_only(tmp_path, monkeypatch):
+    """首次运行（无标记）：只落标记不失效——全新安装没有旧版本构建的缓存。"""
+    import proxy.app as proxy_app
+
+    rec_dir = os.environ["FNMUSIC_RECOMMEND_DIR"]
+    day = dailyrec.today_key()
+    _seed_day_caches(rec_dir, day)
+    marker = os.path.join(rec_dir, ".last-version")
+    monkeypatch.setattr(proxy_app, "get_version", lambda: "2.8.3")
+
+    proxy_app._sync_recommend_version_marker()
+
+    remaining = [name for _, _, files in os.walk(rec_dir) for name in files if name.endswith(".json")]
+    assert len(remaining) == 4
+    with open(marker, encoding="utf-8") as f:
+        assert f.read() == "2.8.3"

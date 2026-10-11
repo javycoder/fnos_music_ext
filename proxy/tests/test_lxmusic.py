@@ -11,6 +11,10 @@ from proxy.app import (
     CONF,
     _SEARCH_CACHE,
     _LX_URL_PIN,
+    _LX_MEDIA_UA,
+    _LX_FRESH_COOLDOWN,
+    _lx_media_headers,
+    _lx_fresh_cooldown_mark,
     fetch_lx_search,
     resolve_lx_url,
     get_version,
@@ -23,6 +27,7 @@ from proxy.app import (
 def setup_lx_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
     _LX_URL_PIN.clear()
+    _LX_FRESH_COOLDOWN.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -771,3 +776,144 @@ def test_search_track_deep_pagination_lx_page_passthrough():
     g2 = {str(i["guid"]) for i in p2["list"]}
     g3 = {str(i["guid"]) for i in p3["list"]}
     assert not (g1 & g2) and not (g1 & g3) and not (g2 & g3)
+
+
+# ----------------------------------------------------- issue #54：UA 一致与刷新有界 --
+
+def test_lx_media_headers_ua_fallback():
+    """issue #54：解析结果 headers 为空时兜底探活同款 UA；自带 UA 不被覆盖，
+    非 Referer/UA 的头不透传。出流/转码各调用点共用该构建。"""
+    assert _lx_media_headers(None) == {"User-Agent": _LX_MEDIA_UA}
+    assert _lx_media_headers({"headers": {}}) == {"User-Agent": _LX_MEDIA_UA}
+    assert _lx_media_headers({"headers": {"User-Agent": "Custom/1.0",
+                                          "Referer": "https://x/",
+                                          "Range": "bytes=0-"}}) == {
+        "User-Agent": "Custom/1.0", "Referer": "https://x/"}
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_fresh_cooldown_bounds_reparse():
+    """issue #54：fresh 冷却窗内的强制刷新不出网快速失败（额度有界化），
+    冷却到期恢复出网；非 fresh 路径不受冷却影响。"""
+    import time as _time
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={
+            "ok": True,
+            "data": {"id": "lx:kw:CD54", "url": "https://audio.test/cd54.flac",
+                     "ext": "flac", "headers": {}},
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lxmusic-test")
+    try:
+        ok = await resolve_lx_url(client, "lx:kw:CD54", fresh=True)
+        assert ok is not None and calls["n"] == 1
+
+        _lx_fresh_cooldown_mark("lx:kw:CD54")
+        blocked = await resolve_lx_url(client, "lx:kw:CD54", fresh=True)
+        assert blocked is None
+        assert calls["n"] == 1  # 冷却窗内未出网
+
+        # 非 fresh 路径不受冷却影响（钉链/成功缓存照常）
+        non_fresh = await resolve_lx_url(client, "lx:kw:CD54", fresh=False)
+        assert non_fresh is not None  # 命中钉链或重新出网均可，但不能被冷却拦截
+        pre = calls["n"]
+
+        _LX_FRESH_COOLDOWN["lx:kw:CD54"] = _time.monotonic() - 1.0
+        recovered = await resolve_lx_url(client, "lx:kw:CD54", fresh=True)
+        assert recovered is not None and calls["n"] > pre  # 冷却到期恢复出网
+    finally:
+        await client.aclose()
+
+
+# =========================================================================
+# issue #49：播放元数据透传 + 在线曲目元数据 LRU
+# =========================================================================
+@pytest.mark.anyio
+async def test_resolve_lx_url_meta_passthrough():
+    """meta 元数据透传：songInfo 反查全冷（重启后点播存量歌单）时把真实标签
+    带给 lxmusic 兜底合成，关键词型源脚本按歌名歌手取链不再拿到"未知曲目"。"""
+    seen: "list[dict]" = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "x", "url": "http://audio.test/a.flac", "ext": "flac"}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    meta = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+            "duration_s": 269.3, "cover_url": "https://img.test/x.jpg"}
+    res = await resolve_lx_url(client, "lx:kw:COLDMETA1", meta=meta)
+    assert res and res["url"] == "http://audio.test/a.flac"
+    p = seen[0]
+    assert p.get("title") == "晴天"
+    assert p.get("artist") == "周杰伦"
+    assert p.get("album") == "叶惠美"
+    assert p.get("cover") == "https://img.test/x.jpg"
+    assert p.get("duration") == "269.3"
+    # 不带 meta 的解析不追加任何标签参数
+    _LX_URL_PIN.pop("lx:kw:COLDMETA1", None)
+    seen.clear()
+    await resolve_lx_url(client, "lx:kw:COLDMETA1")
+    assert "title" not in seen[0]
+    _LX_URL_PIN.pop("lx:kw:COLDMETA1", None)
+    await client.aclose()
+
+
+def test_register_online_meta_lru_and_play_fallback(monkeypatch):
+    """下发出口登记 guid→元数据；播放兜底链先内存搜索会话、miss 后 LRU。"""
+    import proxy.app as proxy_app
+    from proxy.app import _ONLINE_META, _online_meta_get, register_online_meta
+
+    _ONLINE_META.clear()
+    items = [
+        {"id": "lx:kg:HASH1", "source": "lx", "title": "自由的你",
+         "artist": "G.E.M.邓紫棋", "album": "新专辑", "duration_s": 296,
+         "cover_url": "https://img.test/1.jpg"},
+        {"id": "wy:186016", "source": "lx", "title": "未知曲目", "artist": "未知歌手"},
+    ]
+    added = register_online_meta(items)
+    assert added == 1  # 未知标题条目跳过
+    meta = _online_meta_get("online:lx:kg:HASH1")
+    assert meta["title"] == "自由的你"
+    assert meta["duration_s"] == 296
+
+    # LRU 兜底：内存搜索会话 miss 时用 LRU（歌单/收藏/历史播放场景）
+    monkeypatch.setattr(proxy_app, "_retained_track", lambda request, guid: (None, None))
+    got = proxy_app._online_meta_for_request(object(), "online:lx:kg:HASH1")
+    assert got and got["title"] == "自由的你"
+    # 未登记的 guid 无兜底
+    assert proxy_app._online_meta_for_request(object(), "online:lx:kg:ABSENT") is None
+
+    # 内存会话命中优先于 LRU（数据更新）
+    monkeypatch.setattr(
+        proxy_app, "_retained_track",
+        lambda request, guid: ({"title": "会话名", "artist": "会话歌手", "duration_s": 10}, None),
+    )
+    got2 = proxy_app._online_meta_for_request(object(), "online:lx:kg:HASH1")
+    assert got2["title"] == "会话名"
+    _ONLINE_META.clear()
+
+
+def test_register_online_meta_capacity_eviction(monkeypatch):
+    """LRU 容量上限：超限淘汰最旧，重新登记视为最新。"""
+    import proxy.app as proxy_app
+    from proxy.app import _ONLINE_META, register_online_meta_one
+
+    _ONLINE_META.clear()
+    monkeypatch.setattr(proxy_app, "_ONLINE_META_MAX", 3)
+    for i in range(5):
+        register_online_meta_one(f"online:lx:kw:{i}", f"t{i}", "a")
+    assert len(_ONLINE_META) == 3
+    assert "online:lx:kw:0" not in _ONLINE_META
+    assert _ONLINE_META["online:lx:kw:4"]["title"] == "t4"
+    # 重新登记视为最新，不挤掉自己也不淘汰错位
+    register_online_meta_one("online:lx:kw:2", "t2-new", "a")
+    assert _ONLINE_META["online:lx:kw:2"]["title"] == "t2-new"
+    assert "online:lx:kw:1" not in _ONLINE_META  # 2 移到末尾后 1 成为最旧被淘汰
+    _ONLINE_META.clear()

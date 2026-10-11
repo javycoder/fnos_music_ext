@@ -12,9 +12,11 @@ lxserver (XCQ0607/lxserver) HTTP API 客户端与数据映射层。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any
 
@@ -181,6 +183,7 @@ class LxServerClient:
         base_url: str = DEFAULT_LXSERVER_URL,
         admin_password: str = DEFAULT_ADMIN_PASSWORD,
         timeout: float = 20.0,
+        store_path: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.admin_password = admin_password
@@ -190,6 +193,90 @@ class LxServerClient:
         # songInfo 反查缓存: track_id -> songInfo dict
         self._song_info_cache: dict[str, dict] = {}
         self._cache_max = 2000
+        # songInfo 磁盘持久化（issue #49）：热门歌单按天落盘而 songInfo 只在内存，
+        # 服务重启后榜单曲目反查只能合成"未知曲目/未知歌手"，关键词型源脚本按
+        # 歌名歌手取链必然失败——榜单播不了、搜索后能播。存储启用时启动加载、
+        # 写入脏标记 + 短延迟合并落盘，条目顺序即新旧顺序（淘汰与落盘共用）。
+        self._store_path = str(store_path or "").strip()
+        self._store_dirty = False
+        self._store_flush_task: asyncio.Task | None = None
+        self._store_load()
+
+    # ---------------------------------------------------------- songInfo 存储 --
+    def _store_load(self) -> None:
+        """启动时把磁盘 songInfo 载入内存缓存（文件序 = 最旧在前）。损坏/缺失静默重置。"""
+        if not self._store_path:
+            return
+        try:
+            with open(self._store_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("items") if isinstance(data, dict) else None
+            if not isinstance(items, dict):
+                return
+            loaded = 0
+            for track_id, raw in items.items():
+                if not isinstance(track_id, str) or not isinstance(raw, dict) or loaded >= self._cache_max:
+                    break
+                self._song_info_cache[track_id] = raw
+                loaded += 1
+            if loaded:
+                logger.info("songInfo store loaded %d entries from %s", loaded, self._store_path)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("songInfo store load failed (%s): reset to empty", exc)
+            self._song_info_cache.clear()
+
+    def _store_flush_now(self) -> None:
+        """同步落盘：tmp + rename 原子替换；目录缺失自动创建；失败仅留脏标记。"""
+        if not self._store_path:
+            return
+        path = self._store_path
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            payload = {"version": 1, "items": self._song_info_cache}
+            fd, tmp = tempfile.mkstemp(prefix=".songinfo-", dir=os.path.dirname(path) or ".")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            self._store_dirty = False
+        except Exception as exc:
+            logger.warning("songInfo store flush failed: %s", exc)
+
+    def _store_schedule_flush(self) -> None:
+        """脏标记 + 短延迟合并落盘：榜单/搜索单次批量写入几十条，避免逐条 fsync。
+        无运行事件循环（同步上下文）时只留脏标记，下次写入或 close 时补写。"""
+        if not self._store_path or self._store_flush_task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _flush():
+            try:
+                await asyncio.sleep(2.0)
+                self._store_flush_now()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            finally:
+                self._store_flush_task = None
+
+        self._store_flush_task = loop.create_task(_flush())
+
+    def _store_trim(self) -> None:
+        if len(self._song_info_cache) >= self._cache_max:
+            for k in list(self._song_info_cache.keys())[: self._cache_max // 4]:
+                self._song_info_cache.pop(k, None)
 
     @property
     def mgmt_lock(self) -> asyncio.Lock:
@@ -210,6 +297,10 @@ class LxServerClient:
         return self._client
 
     async def close(self) -> None:
+        if self._store_flush_task is not None:
+            self._store_flush_task.cancel()
+            self._store_flush_task = None
+        self.flush_song_info_store()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
@@ -217,15 +308,19 @@ class LxServerClient:
     def cache_song_info(self, track_id: str, song_info: dict) -> None:
         if not track_id or not song_info:
             return
-        if len(self._song_info_cache) >= self._cache_max:
-            # 清理前 25% 的旧条目
-            keys = list(self._song_info_cache.keys())[: self._cache_max // 4]
-            for k in keys:
-                self._song_info_cache.pop(k, None)
+        self._store_trim()
         self._song_info_cache[track_id] = song_info
+        if self._store_path:
+            self._store_dirty = True
+            self._store_schedule_flush()
 
     def get_cached_song_info(self, track_id: str) -> dict | None:
         return self._song_info_cache.get(track_id)
+
+    def flush_song_info_store(self) -> None:
+        """对外同步落盘入口（close 与测试用）：有脏数据才写。"""
+        if self._store_path and self._store_dirty:
+            self._store_flush_now()
 
     def synthesize_song_info(self, track_id: str, fallback_meta: dict | None = None) -> dict:
         """从 track_id 及元数据合成一个合法的洛雪 songInfo 对象。"""
