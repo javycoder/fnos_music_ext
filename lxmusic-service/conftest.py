@@ -129,6 +129,11 @@ class FakeLxServerClient:
     async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1) -> list[dict]:
         return await self.search("榜单", source=source)
 
+    async def get_leaderboard_boards(self, source: str = "kg") -> list[dict]:
+        # 与 app._CHART_TARGETS 同名对齐，让动态 bangid 解析在测试里走通 boards 路径
+        target, bid = lxapp._CHART_TARGETS.get(source, ("榜单", "1"))
+        return [{"id": f"{source}__{bid}", "name": target, "bangid": bid}]
+
     def get_cached_song_info(self, track_id: str) -> dict | None:
         return self._song_info_cache.get(track_id)
 
