@@ -3804,7 +3804,9 @@ async def ext_healthz(request: Request):
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
                 "mode": "per-user: source-slot -> llm -> local-random",
-                "netease": _netease_runtime_usable(),
+                # 推荐口径：每日/热门仍只随当前音源构建（常驻不并入网易），
+                # 与上方 musicbox 探活口径（_netease_runtime_usable）区分
+                "netease": bool(CONF.get("netease_enabled")),
                 "lx": bool(CONF.get("lx_enabled")),
                 "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
                 "source_slot_claimed": dailyrec.source_slot_claimed(),

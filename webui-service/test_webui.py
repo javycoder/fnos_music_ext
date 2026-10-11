@@ -1034,6 +1034,22 @@ def test_preview_reap_spares_resident_musicbox(env_file, svctl, resident_state):
     assert "musicbox" not in webui._preview_until
 
 
+def test_preview_musicbox_skips_start_when_resident_process_running(env_file, svctl, resident_state):
+    """常驻开关勾选且 musicbox 进程实跑、但内存标记未置位（如开机对账前的
+    5 秒窗口 / 对账健康检查超时而进程仍活）：点卡不再 supervisorctl start——
+    对 RUNNING 进程 start 会报 "already started"，预览接口凭空 500。"""
+    _musicdl_env(env_file)  # musicdl 为当前音源 + 常驻/账号歌单已勾选
+    svctl.calls.clear()     # 夹具默认 status：musicbox RUNNING
+    with authed_client() as client:
+        r = client.post("/api/preview", json={"provider": "musicbox"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True and body["preview"] is False
+        assert "常驻" in body["note"]
+    assert ("start", "musicbox") not in svctl.calls
+    assert "musicbox" not in webui._preview_until
+
+
 def test_lx_source_list_schema_and_roundtrip(env_file):
     with authed_client() as client:
         view = client.get("/api/config")

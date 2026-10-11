@@ -898,8 +898,12 @@ async def api_preview(body: PreviewBody, request: Request):
         raise HTTPException(status_code=400, detail="provider 必须是 musicdl/musicbox/lxmusic 之一")
     if current_provider(read_env()) == provider:
         return {"ok": True, "preview": False, "note": "该音源已启用，进程常驻"}
-    if provider == "musicbox" and _resident_state["active"]:
-        # 常驻进程已在跑：不再走预览拉起（对 RUNNING 进程 start 会报已启动错误）
+    if provider == "musicbox" and (
+            _resident_state["active"]
+            or (_resident_flag(read_env()) and _musicbox_proc_running())):
+        # 常驻进程已在跑：不再走预览拉起（对 RUNNING 进程 start 会报已启动错误）。
+        # 内存标记外再兜一层「开关勾选 + 进程实跑」：开机对账未跑的 5 秒窗口、
+        # 对账时健康检查超时但进程仍活等场景，点卡也不会 start 撞"already started"
         return {"ok": True, "preview": False, "note": "网易云歌单常驻运行中"}
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)

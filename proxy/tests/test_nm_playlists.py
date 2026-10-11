@@ -182,6 +182,30 @@ def test_resident_off_keeps_netease_runtime_blocked():
         CONF["netease_enabled"] = True
 
 
+def test_resident_healthz_probes_musicbox_but_recommend_follows_source():
+    """网易云歌单常驻（issue #38）：musicbox 纳入 /_ext/healthz 探活，但推荐
+    口径仍只随当前音源——netease_enabled=False 时 recommend.netease 不因
+    常驻误报为 True（每日/热门推荐构建不并入网易）。"""
+    def mb_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404)
+
+    _wire(mb_handler)
+    CONF["netease_enabled"] = False
+    CONF["netease_playlist_resident"] = True
+    try:
+        with TestClient(app) as client:
+            rj = client.get("/_ext/healthz").json()
+        # 常驻生效：musicbox 照常探活且健康
+        assert rj["musicbox"] == "ok"
+        # 推荐构建口径不随常驻放宽
+        assert rj["recommend"]["netease"] is False
+    finally:
+        CONF["netease_enabled"] = True
+        CONF["netease_playlist_resident"] = False
+
+
 def test_musicbox_down_silent_and_cooldown():
     mb = _wire(_musicbox_handler(mode="down"))
     with TestClient(app) as client:
