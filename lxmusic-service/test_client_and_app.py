@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -799,6 +800,52 @@ def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_ca
     finally:
         lxapp.app.state.client = orig_client
     assert len(fake_lx.url_calls) == 7  # 成功解析在首档即命中，仅 +1
+
+
+def _ua_gated_cdn_handler(request: httpx.Request) -> httpx.Response:
+    """issue #54：模拟只认探活 UA 的 CDN——UA 不符直接 403（真实酷我行为）。"""
+    if request.headers.get("user-agent") != lxapp.UA_PC:
+        return httpx.Response(403, content=b"")
+    return httpx.Response(
+        206,
+        headers={"Content-Type": "audio/flac", "Content-Range": "bytes 0-4095/30000000"},
+        content=b"fLaC" + b"\x00" * 4092,
+    )
+
+
+def test_track_url_resolution_ua_gated_cdn(test_app_client, fresh_url_cache):
+    """issue #54：UA 敏感 CDN（如酷我）探活成功后，解析结果 headers 必须携带与
+    探活一致的 User-Agent——代理实际播放复用它，不再回退 httpx 默认 UA 被 403。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_ua_gated_cdn_handler)
+    try:
+        res = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    finally:
+        lxapp.app.state.client = orig_client
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert data["headers"].get("User-Agent") == lxapp.UA_PC
+
+
+@pytest.mark.asyncio
+async def test_track_url_refresh_backfills_ua(fake_lx, fresh_url_cache):
+    """issue #54：空 headers 的旧缓存条目经探活续期后补上探活 UA——续期与播放
+    共用同一请求上下文，续期不再延续无 UA 的结果。"""
+    probe_client = mock_client(_ua_gated_cdn_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    key = ("lx:kw:5886682", "lossless")
+    lxapp._URL_CACHE[key] = {
+        "data": {"id": "lx:kw:5886682", "url": "https://media.test/song.flac",
+                 "ext": "flac", "file_size": 30000000, "headers": {}},
+        "ts": time.monotonic() - lxapp.CONF["url_cache_ttl"] - 1.0,
+    }
+    try:
+        r = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    finally:
+        await probe_client.aclose()
+    assert r is not None
+    assert len(fake_lx.url_calls) == 0  # 探活续期成功，不消耗解析额度
+    assert r["headers"].get("User-Agent") == lxapp.UA_PC
 
 
 @pytest.mark.asyncio

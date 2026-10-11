@@ -147,13 +147,18 @@ async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | N
     url = data.get("url")
     if not url:
         return None
+    # issue #54：续期探活与续期结果共用同一 UA；空 headers 的旧缓存条目借续期
+    # 补上探活 UA，避免续期成功后播放仍拿不到 UA 被拒 403
+    headers = dict(data.get("headers") or {})
+    headers.setdefault("User-Agent", UA_PC)
     try:
-        ok, final_url, _ct, size = await probe_url(client, url, data.get("headers") or {})
+        ok, final_url, _ct, size = await probe_url(client, url, headers)
     except Exception:
         return None
     if not ok:
         return None
     refreshed = dict(data)
+    refreshed["headers"] = headers
     if final_url and final_url != url:
         refreshed["url"] = final_url
     if size:
@@ -664,7 +669,10 @@ async def resolve_and_probe(
                 continue
 
             raw_url = res["url"]
-            headers = {}
+            # issue #54：UA 敏感 CDN（如酷我）按 User-Agent 差异放行/拒绝，探活与
+            # 实际播放必须同一 UA。探活 UA 直接进返回 headers 交给代理复用，
+            # 杜绝「探活 Chrome UA 通过、代理 httpx 默认 UA 被 403」的错位
+            headers = {"User-Agent": UA_PC}
             # 酷狗或特殊源防盗链头
             if src == "kg":
                 headers["Referer"] = "https://www.kugou.com/"

@@ -11,6 +11,10 @@ from proxy.app import (
     CONF,
     _SEARCH_CACHE,
     _LX_URL_PIN,
+    _LX_MEDIA_UA,
+    _LX_FRESH_COOLDOWN,
+    _lx_media_headers,
+    _lx_fresh_cooldown_mark,
     fetch_lx_search,
     resolve_lx_url,
     get_version,
@@ -23,6 +27,7 @@ from proxy.app import (
 def setup_lx_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
     _LX_URL_PIN.clear()
+    _LX_FRESH_COOLDOWN.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -771,3 +776,54 @@ def test_search_track_deep_pagination_lx_page_passthrough():
     g2 = {str(i["guid"]) for i in p2["list"]}
     g3 = {str(i["guid"]) for i in p3["list"]}
     assert not (g1 & g2) and not (g1 & g3) and not (g2 & g3)
+
+
+# ----------------------------------------------------- issue #54：UA 一致与刷新有界 --
+
+def test_lx_media_headers_ua_fallback():
+    """issue #54：解析结果 headers 为空时兜底探活同款 UA；自带 UA 不被覆盖，
+    非 Referer/UA 的头不透传。出流/转码各调用点共用该构建。"""
+    assert _lx_media_headers(None) == {"User-Agent": _LX_MEDIA_UA}
+    assert _lx_media_headers({"headers": {}}) == {"User-Agent": _LX_MEDIA_UA}
+    assert _lx_media_headers({"headers": {"User-Agent": "Custom/1.0",
+                                          "Referer": "https://x/",
+                                          "Range": "bytes=0-"}}) == {
+        "User-Agent": "Custom/1.0", "Referer": "https://x/"}
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_fresh_cooldown_bounds_reparse():
+    """issue #54：fresh 冷却窗内的强制刷新不出网快速失败（额度有界化），
+    冷却到期恢复出网；非 fresh 路径不受冷却影响。"""
+    import time as _time
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={
+            "ok": True,
+            "data": {"id": "lx:kw:CD54", "url": "https://audio.test/cd54.flac",
+                     "ext": "flac", "headers": {}},
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lxmusic-test")
+    try:
+        ok = await resolve_lx_url(client, "lx:kw:CD54", fresh=True)
+        assert ok is not None and calls["n"] == 1
+
+        _lx_fresh_cooldown_mark("lx:kw:CD54")
+        blocked = await resolve_lx_url(client, "lx:kw:CD54", fresh=True)
+        assert blocked is None
+        assert calls["n"] == 1  # 冷却窗内未出网
+
+        # 非 fresh 路径不受冷却影响（钉链/成功缓存照常）
+        non_fresh = await resolve_lx_url(client, "lx:kw:CD54", fresh=False)
+        assert non_fresh is not None  # 命中钉链或重新出网均可，但不能被冷却拦截
+        pre = calls["n"]
+
+        _LX_FRESH_COOLDOWN["lx:kw:CD54"] = _time.monotonic() - 1.0
+        recovered = await resolve_lx_url(client, "lx:kw:CD54", fresh=True)
+        assert recovered is not None and calls["n"] > pre  # 冷却到期恢复出网
+    finally:
+        await client.aclose()

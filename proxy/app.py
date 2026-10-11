@@ -2651,6 +2651,11 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
     fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
     重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。"""
     key = str(song_id)
+    # issue #54：fresh 冷却窗内快速失败——刚确认打不开的直链短时间重试 fresh
+    # 只会重复消耗音源解析额度；非 fresh 路径不受影响
+    if fresh and _lx_fresh_cooldown_active(key):
+        fn_diag(logger, "lx_fresh_cooldown", guid=key[:80])
+        return None
     if not fresh:
         pin = _LX_URL_PIN.get(key)
         if pin:
@@ -2713,6 +2718,56 @@ def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
             oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
             _LX_URL_PIN.pop(oldest, None)
     _LX_URL_PIN[str(song_id)] = (resolved, now + _LX_URL_PIN_TTL_S)
+
+
+# issue #54：UA 敏感 CDN（如酷我）按 User-Agent 放行/拒绝——lxmusic 探活统一用
+# Chrome PC UA 验链，实际取流必须带同一 UA，否则探活通过、播放 403。与
+# lxmusic-service 的 UA_PC 保持一致；旧版解析结果 headers 可能为空，统一兜底。
+_LX_MEDIA_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+
+def _lx_media_headers(resolved: "dict | None") -> dict[str, str]:
+    """洛雪直链取流请求头：白名单透传解析结果 Referer/UA 并兜底探活同款 UA。
+
+    出流/后台整轨下载/断点续传/转码各调用点共用，保证与探活一致的请求上下文。"""
+    headers: dict[str, str] = {}
+    for key, value in ((resolved or {}).get("headers") or {}).items():
+        if key.lower() in ("referer", "user-agent"):
+            headers[key] = str(value)
+    headers.setdefault("User-Agent", _LX_MEDIA_UA)
+    return headers
+
+
+# issue #54：fresh 强制刷新冷却。UA 敏感 CDN 拒掉的实际播放会被重试路径当作
+# 直链失效反复 fresh 重解析，而 lxmusic 端 fresh 不与其成功缓存合并，每次都
+# 真实出网消耗解析额度。同曲 fresh 冷却窗内快速失败，额度消耗有界化；
+# 非 fresh 路径（钉链/成功缓存）不受影响，网络抖动恢复后照常播出。
+_LX_FRESH_COOLDOWN: "dict[str, float]" = {}
+_LX_FRESH_COOLDOWN_S = 60.0
+_LX_FRESH_COOLDOWN_MAX = 1024
+
+
+def _lx_fresh_cooldown_mark(song_id: str) -> None:
+    """fresh 取到的直链仍打不开时标记冷却：额度有限，冷却窗内不再重复重解析。"""
+    now = time.monotonic()
+    if len(_LX_FRESH_COOLDOWN) >= _LX_FRESH_COOLDOWN_MAX:
+        for k in [k for k, v in _LX_FRESH_COOLDOWN.items() if v <= now]:
+            _LX_FRESH_COOLDOWN.pop(k, None)
+        if len(_LX_FRESH_COOLDOWN) >= _LX_FRESH_COOLDOWN_MAX:
+            oldest = min(_LX_FRESH_COOLDOWN, key=lambda k: _LX_FRESH_COOLDOWN[k])
+            _LX_FRESH_COOLDOWN.pop(oldest, None)
+    _LX_FRESH_COOLDOWN[str(song_id)] = now + _LX_FRESH_COOLDOWN_S
+
+
+def _lx_fresh_cooldown_active(song_id: str) -> bool:
+    until = _LX_FRESH_COOLDOWN.get(str(song_id))
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        _LX_FRESH_COOLDOWN.pop(str(song_id), None)
+        return False
+    return True
 
 
 # 网易直链钉住（2.8.0）：song_id -> (url, 过期时刻单调钟)。窗口型播放内核
@@ -4742,9 +4797,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     return None
                 url = resolved["url"]
                 ext = resolved.get("ext")
-                for key, value in (resolved.get("headers") or {}).items():
-                    if key.lower() in ("referer", "user-agent"):
-                        headers[key] = str(value)
+                headers.update(_lx_media_headers(resolved))
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
@@ -4782,6 +4835,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     _netease_url_pin_drop(song_id)
                 elif source == "lx":
                     _lx_url_pin_drop(song_id)
+                    # issue #54：fresh 强刷出的直链也打不开，冷却窗内不再重复重解析
+                    if fresh_url:
+                        _lx_fresh_cooldown_mark(song_id)
                 return None
             chunks = resp.aiter_bytes()
             first = await anext(chunks, b"")
@@ -4792,12 +4848,16 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 _netease_url_pin_drop(song_id)
             elif source == "lx":
                 _lx_url_pin_drop(song_id)
+                if fresh_url:
+                    _lx_fresh_cooldown_mark(song_id)
             raise
         if not first:
             if source == "netease":
                 _netease_url_pin_drop(song_id)
             elif source == "lx":
                 _lx_url_pin_drop(song_id)
+                if fresh_url:
+                    _lx_fresh_cooldown_mark(song_id)
             return None
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
@@ -5862,9 +5922,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
             if not resolved or not resolved.get("url"):
                 return None, None
-            headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()
-                       if k.lower() in ("referer", "user-agent")}
-            return str(resolved["url"]), headers or None
+            return str(resolved["url"]), _lx_media_headers(resolved)
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
             # issue #46 音质降级：无损流损坏拉黑后降级 mp3，留档实际交付格式
