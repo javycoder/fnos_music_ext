@@ -3,6 +3,7 @@ import asyncio
 import importlib
 import logging
 import os
+import time
 
 import httpx
 import pytest
@@ -602,3 +603,38 @@ async def test_deferred_cache_promotion_skipped_while_metadata_missing(monkeypat
     assert audio_files(p.CONF["library_dir"]) == []
     assert os.path.isfile(cached)
     assert p._is_deferred_cache_file(guid, cached)
+
+
+@pytest.mark.anyio
+async def test_deferred_promotion_yields_before_moving_file(monkeypatch):
+    """转正任务先让渡再动文件（issue #52 出流竞态回归锁）。
+
+    stream_track 缓存命中出流时，响应体生成器在本任务启动之后才 open(cached)。
+    _promote_deferred_cache 必须先让出事件循环（等待窗口）再 os.replace，保证
+    open 抢在文件移动之前完成（fd 打开后 replace 不影响已打开句柄）。
+    """
+    guid = "online:netease:186016"
+    await listen(guid, info={})
+    cached = os.path.join(p.CONF["cache_dir"], "online_netease_186016.flac")
+    assert p._is_deferred_cache_file(guid, cached)
+
+    install_at: list[float] = []
+    real_install = p._install_library_audio
+
+    def spy_install(*args, **kwargs):
+        install_at.append(time.monotonic())
+        return real_install(*args, **kwargs)
+
+    monkeypatch.setattr(p, "_install_library_audio", spy_install)
+    t0 = time.monotonic()
+    task = asyncio.create_task(p._promote_deferred_cache(
+        {"cookie": "sid=x"}, guid, cached,
+        retained={"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}))
+    # 首个事件循环切片内文件必须原位（等价于保障出流 open 的机会窗口）
+    await asyncio.sleep(0)
+    assert os.path.isfile(cached)
+    await task
+    assert install_at, "promotion should have installed the audio"
+    assert install_at[0] - t0 >= 0.4, "promotion must yield to serving before touching files"
+    assert not os.path.exists(cached)
+    assert audio_files(p.CONF["library_dir"]) == ["周杰伦 - 晴天.flac"]
