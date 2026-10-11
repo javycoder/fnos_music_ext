@@ -50,7 +50,7 @@ class Audio(httpx.AsyncByteStream):
 
 
 async def listen(guid, title="晴天", artist="周杰伦", ext="flac", range_header=None,
-                 info=None, post_finalize=None, response=None):
+                 info=None, post_finalize=None, response=None, retained_factory=None):
     """完整试听一首歌并消费完整个响应体，触发 stream_tee_response 落盘转正。"""
     if info is None:
         info = {"title": title, "artist": artist, "album": "叶惠美", "lyric": "[00:00.00]测试歌词"}
@@ -59,9 +59,10 @@ async def listen(guid, title="晴天", artist="周杰伦", ext="flac", range_hea
     tee_response = p.stream_tee_response(
         response, guid, range_header,
         pre_info=info, resolved_ext=ext, post_finalize=post_finalize,
+        retained_factory=retained_factory,
     )
     body = b"".join([chunk async for chunk in tee_response.body_iterator])
-    assert body == b"A" * 4096
+    assert body == getattr(response.stream, "payload", b"A" * 4096)
 
 
 def audio_files(directory):
@@ -485,3 +486,119 @@ async def test_library_scan_debounce_and_ttl(monkeypatch):
         assert posts == [("POST", "/music/api/v1/shared-library/scan")]
     finally:
         await client.aclose()
+
+
+# === issue #52：重复曲目与「未知歌手-未知曲目」 ===
+
+
+@pytest.mark.anyio
+async def test_tee_metadata_fallback_from_retained_session(monkeypatch):
+    """源站 info 缺失/残缺时，内存搜索会话（retained_factory）兜底命名落库，
+    不再以 unknown 进曲库；标签照常写入。"""
+    tag_calls = []
+    monkeypatch.setattr(p, "write_audio_tags", lambda *a, **k: tag_calls.append(a[1:4]))
+    await listen("online:netease:186016", info={},
+                 retained_factory=lambda: {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"})
+    library_dir = p.CONF["library_dir"]
+    dest = os.path.join(library_dir, "周杰伦 - 晴天.flac")
+    assert os.path.isfile(dest)
+    assert audio_files(library_dir) == ["周杰伦 - 晴天.flac"]
+    assert tag_calls == [("晴天", "周杰伦", "叶惠美")]
+    with open(p.media_ref_path("online:netease:186016"), encoding="utf-8") as f:
+        assert os.path.dirname(f.read().strip()) == library_dir
+
+
+@pytest.mark.anyio
+async def test_tee_all_metadata_missing_stays_out_of_library(monkeypatch, caplog):
+    """元数据全缺（无 info、无会话、无快照）：绝不以 unknown 进曲库，
+    暂存 cache 可秒开重播（.ref 指向暂存文件），并留档告警。"""
+    with caplog.at_level(logging.WARNING, logger="fnmusic_proxy"):
+        await listen("online:netease:186016", info={})
+    library_dir = p.CONF["library_dir"]
+    assert audio_files(library_dir) == []
+    assert not os.path.exists(os.path.join(library_dir, "unknown.flac"))
+    cached = os.path.join(p.CONF["cache_dir"], "online_netease_186016.flac")
+    assert os.path.isfile(cached)
+    assert p.find_cache_file("online:netease:186016") == cached
+    assert p._is_deferred_cache_file("online:netease:186016", cached)
+    assert any("暂存" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_cross_guid_same_song_reuses_existing_file(monkeypatch):
+    """issue #52 重复曲目：同曲跨 guid（聚合多源条目）二次落盘复用已有文件，
+    不产生「歌手 - 歌名 (2)」或跨格式重复，两个 guid 都命中本地同一文件。"""
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    library_dir = p.CONF["library_dir"]
+    await listen("online:netease:1", title="万疆", artist="李玉刚",
+                 response=httpx.Response(200, stream=Audio(b"F" * 4096)))
+    await listen("online:kuwo:2", title="万疆", artist="李玉刚", ext="mp3",
+                 response=httpx.Response(200, stream=Audio(b"K" * 4096)))
+    assert audio_files(library_dir) == ["李玉刚 - 万疆.flac"]
+    dest = os.path.join(library_dir, "李玉刚 - 万疆.flac")
+    with open(dest, "rb") as f:
+        assert f.read() == b"F" * 4096  # 已有文件绝不被第二次落盘覆盖
+    assert sorted(f for f in os.listdir(library_dir) if f.endswith(".lrc")) == ["李玉刚 - 万疆.lrc"]
+    assert p.find_cache_file("online:netease:1") == dest
+    assert p.find_cache_file("online:kuwo:2") == dest
+
+
+@pytest.mark.anyio
+async def test_finalize_reused_skips_tag_rewrite(monkeypatch):
+    """复用已有曲库文件（含用户自有同名文件）时不改写标签/封面，字节不动。"""
+    library_dir = p.CONF["library_dir"]
+    dest = os.path.join(library_dir, "周杰伦 - 晴天.flac")
+    with open(dest, "wb") as f:
+        f.write(b"USER" * 64)
+    calls = []
+    monkeypatch.setattr(p, "write_audio_tags", lambda *a, **k: calls.append("tags"))
+    monkeypatch.setattr(p, "embed_audio_cover", lambda *a, **k: calls.append("embed"))
+    await listen("online:kuwo:2", response=httpx.Response(200, stream=Audio(b"K" * 4096)))
+    assert calls == []
+    with open(dest, "rb") as f:
+        assert f.read() == b"USER" * 64
+    assert audio_files(library_dir) == ["周杰伦 - 晴天.flac"]
+    assert p.find_cache_file("online:kuwo:2") == dest
+
+
+@pytest.mark.anyio
+async def test_deferred_cache_promoted_on_replay(monkeypatch):
+    """暂存的元数据缺失曲目：重播时元数据可补齐（内存会话/快照）即转正进曲库，
+    cache 暂存文件移走、.ref 改指曲库、歌词随迁、不再识别为暂存形态。"""
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+
+    async def fake_resolve(request, g):
+        p.write_lyric_cache(g, "[00:00.00]补拉歌词", title="晴天", artist="周杰伦")
+        return "[00:00.00]补拉歌词"
+
+    monkeypatch.setattr(p, "resolve_online_lyric", fake_resolve)
+    guid = "online:netease:186016"
+    await listen(guid, info={})  # 首播元数据全缺 → 暂存
+    library_dir = p.CONF["library_dir"]
+    cached = os.path.join(p.CONF["cache_dir"], "online_netease_186016.flac")
+    assert audio_files(library_dir) == []
+    assert p._is_deferred_cache_file(guid, cached)
+
+    await p._promote_deferred_cache(
+        {"cookie": "sid=x"}, guid, cached,
+        retained={"title": "晴天", "artist": "周杰伦", "album": "叶惠美"})
+    dest = os.path.join(library_dir, "周杰伦 - 晴天.flac")
+    assert audio_files(library_dir) == ["周杰伦 - 晴天.flac"]
+    assert os.path.isfile(os.path.join(library_dir, "周杰伦 - 晴天.lrc"))
+    assert not os.path.exists(cached)
+    assert not p._is_deferred_cache_file(guid, cached)
+    assert p.find_cache_file(guid) == dest
+    with open(p.media_ref_path(guid), encoding="utf-8") as f:
+        assert os.path.dirname(f.read().strip()) == library_dir
+
+
+@pytest.mark.anyio
+async def test_deferred_cache_promotion_skipped_while_metadata_missing(monkeypatch):
+    """重播时元数据仍缺：保持暂存原样（文件留在 cache、不进曲库）。"""
+    guid = "online:netease:186016"
+    await listen(guid, info={})
+    cached = os.path.join(p.CONF["cache_dir"], "online_netease_186016.flac")
+    await p._promote_deferred_cache({"cookie": "sid=x"}, guid, cached, retained={"album": "叶惠美"})
+    assert audio_files(p.CONF["library_dir"]) == []
+    assert os.path.isfile(cached)
+    assert p._is_deferred_cache_file(guid, cached)

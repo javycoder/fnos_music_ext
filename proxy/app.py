@@ -1932,6 +1932,15 @@ def _is_rolling_cache_stem(path: str, guid: str) -> bool:
         return False
 
 
+def _existing_library_file(directory: str, basename: str) -> str | None:
+    """同名（跨扩展名）曲库文件：同曲二次落盘时复用已有文件，不产生重复。"""
+    for ext in CACHE_EXTS:
+        candidate = os.path.join(directory, f"{basename}.{ext}")
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
+
+
 def library_media_path(guid: str, title: str, ext: str, artist: str = "", directory: str | None = None) -> str:
     lib = directory or detect_library_dir()
     recalled = recalled_media_path(guid)
@@ -1939,9 +1948,24 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "", direct
         return recalled
     stem = recalled_media_stem(guid)
     if stem and not _is_rolling_cache_stem(stem, guid):
-        return f"{stem}.{ext}"
+        dest = f"{stem}.{ext}"
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return dest
+        # 同 guid 换档位重落盘（扩展名变化）：曲库已有该词干音频则复用，
+        # 避免 mp3/flac 两个同名词干并存成重复曲目
+        existing = _existing_library_file(os.path.dirname(stem), os.path.basename(stem))
+        if existing:
+            return existing
+        return dest
     os.makedirs(lib, exist_ok=True)
-    return unique_library_path(lib, library_basename(title, artist), ext)
+    basename = library_basename(title, artist)
+    if basename.lower() != "unknown":
+        # issue #52 重复曲目：同曲（同"歌手 - 歌名"）跨 guid 二次落盘直接复用
+        # 已有文件，聚合搜索多源条目/跨平台候选切换不再各存一份
+        existing = _existing_library_file(lib, basename)
+        if existing:
+            return existing
+    return unique_library_path(lib, basename, ext)
 
 
 def find_lyric_file(guid: str) -> str | None:
@@ -4162,17 +4186,19 @@ def _merge_missing_tags(title: str, artist: str, album: str, snap: dict) -> tupl
 
 def _tee_metadata_fallback(
     guid: str, title: str, artist: str, album: str, dest_info: dict | None = None,
+    retained: dict | None = None,
 ) -> tuple[str, str, str]:
     """tee 落盘元数据缺失时的回查兜底，避免以 unknown 进曲库。
 
-    顺序：推荐/网易账号歌单缓存（首播时历史往往还没写）→ 播放历史/收藏/自建歌单。
+    顺序：内存搜索会话（播放时会话必在、零 IO，首播时历史往往还没写）→
+    推荐/网易账号歌单缓存 → 播放历史/收藏/自建歌单。
     缺哪个字段补哪个；已有的纯字符串专辑保持不变。封面 URL 只在调用方还没有时写入 dest_info。
     """
     title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
     need_cover = not _cover_url_of(dest_info)
     if not (title and artist and album and not need_cover):
         filled = False
-        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
+        for snap in ((retained,) if retained else ()) + (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
             if not snap:
                 continue
             title, artist, album = _merge_missing_tags(title, artist, album, snap)
@@ -4194,29 +4220,28 @@ def _tee_metadata_fallback(
     return title, artist, album
 
 
-def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool) -> dict | None:
-    """落盘转正：边听边存开→进曲库（定名/权限/标签，歌词仅在 FNMUSIC_LYRIC_AUTO_DL
-    开启时随迁），关→进滚动缓存（不写歌词）。
+def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: str,
+                           album: str, src: dict) -> "tuple[str, bool]":
+    """把已校验完整的音频转正进曲库：定名/落位/权限/标签/封面/影子歌词随迁。
 
-    part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
-    无损档解码校验不过直接丢弃（上游损坏流绝不入库）并拉黑该 guid。
-    返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
+    目标文件已存在（同 guid 重复落盘或同曲跨 guid，issue #52）一律复用已有文件：
+    丢弃本次字节绝不覆盖（用户自有文件与已有标签都不动），只刷新 guid 引用让
+    后续播放命中本地。跨文件系统（缓存目录与曲库不同挂载点）退化为复制+删除。
+    返回 (dest, reused)。
     """
-    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
-        _lossless_blacklist(guid)
-        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+    reused = os.path.exists(dest)
+    if reused:
+        _remove_quiet(part)
+        logger.info("library file already exists for %s, reuse %s", guid, dest)
+    else:
         try:
-            os.remove(part)
+            os.replace(part, dest)
         except OSError:
-            pass
-        return None
-    src = dict(info or {})
-    title, artist, album = _tag_fields(src)
-    if tee_enabled:
-        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src)
-        dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-        os.replace(part, dest)
-        remember_media_path(guid, dest)
+            tmp = f"{dest}.{uuid4().hex[:8]}.part"
+            shutil.copyfile(part, tmp)
+            os.replace(tmp, dest)
+            _remove_quiet(part)
         adopt_library_perms(dest)
         write_audio_tags(dest, title, artist, album)
         # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
@@ -4229,18 +4254,73 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
                     logger.info("cover embedded for %s: %s", guid, dest)
             except Exception as e:
                 logger.debug("cover embed step skipped for %s: %s", guid, e)
-        # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-        if CONF.get("lyric_auto_dl"):
-            promote_shadow_lyric(guid, dest)
+    remember_media_path(guid, dest)
+    # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+    if CONF.get("lyric_auto_dl"):
+        promote_shadow_lyric(guid, dest)
+    return dest, reused
+
+
+def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool,
+                  retained: dict | None = None) -> dict | None:
+    """落盘转正：边听边存开→进曲库（定名/权限/标签，歌词仅在 FNMUSIC_LYRIC_AUTO_DL
+    开启时随迁），关→进滚动缓存（不写歌词）。
+
+    part 必须已完整写好且长度校验通过；成功后由调用方触发曲库扫描通知。
+    无损档解码校验不过直接丢弃（上游损坏流绝不入库）并拉黑该 guid。
+    retained：内存搜索会话条目（播放时会话必在），元数据兜底链最前面的一环。
+    返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
+    """
+    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
+        _lossless_blacklist(guid)
+        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return None
+    src = dict(info or {})
+    title, artist, album = _tag_fields(src)
+    reused = False
+    if tee_enabled:
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src, retained=retained)
+        title = strip_source_tag(title)
+        if not (title and artist):
+            # issue #52 未知歌手-未知曲目：元数据全缺绝不以 unknown 进曲库（官方
+            # 扫描后 App 显示为未知歌手/未知曲目），暂以滚动缓存形态落 cache；
+            # 重播时元数据可补齐则由 _promote_deferred_cache 转正进曲库。
+            # find_cache_file 精确名可命中，缓存秒开不受影响。
+            dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
+            try:
+                os.makedirs(CONF["cache_dir"], exist_ok=True)
+                os.replace(part, dest)
+            except OSError:
+                tmp = f"{dest}.{uuid4().hex[:8]}.part"
+                shutil.copyfile(part, tmp)
+                os.replace(tmp, dest)
+                _remove_quiet(part)
+            remember_media_path(guid, dest)
+            fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+                    ext=ext or "?", tee=True, deferred=1)
+            logger.warning(
+                "tee finalize deferred to rolling cache for %s (title=%r artist=%r)："
+                "元数据缺失暂存 cache，重播补齐后转正", guid, title, artist,
+            )
+            return {"dest": dest, "title": title, "artist": artist, "album": album, "deferred": True}
+        dest, reused = _install_library_audio(part, guid, ext, title, artist, album, src)
     else:
         # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
         os.replace(part, dest)
     logger.info("tee finalize done for %s: dest=%s", guid, dest)
     # issue #52 重复曲目/未知歌手-未知曲目：留档标题/歌手/格式，配合 missing metadata
-    # 告警可定位重复文件对与元数据缺失来源
-    fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
-            ext=ext or "?", tee=tee_enabled)
+    # 告警可定位重复文件对与元数据缺失来源；reused=1 表示复用已有文件未重复落盘
+    if reused:
+        fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+                ext=ext or "?", tee=tee_enabled, reused=1)
+    else:
+        fn_diag(logger, "tee_saved", guid=guid, title=title or "?", artist=artist or "?",
+                ext=ext or "?", tee=tee_enabled)
     # 歌词只随"音乐完整落库成功"写入（tee 转正即到此处），且仅在自动下载歌词
     # 开启时；下载失败根本进不了 finalize，绝不产生先落歌词的孤儿文件
     if tee_enabled and CONF.get("lyric_auto_dl"):
@@ -4253,6 +4333,52 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         except Exception as e:
             logger.warning("Rolling cache purge failed: %s", e)
     return {"dest": dest, "title": title, "artist": artist, "album": album}
+
+
+def _is_deferred_cache_file(guid: str, path: str) -> bool:
+    """识别"元数据缺失暂存"形态：cache 目录 guid 命名音频且 .ref 指向它。
+
+    .ref 是暂存与"边听边存关闭的滚动缓存"的唯一区别（后者不写 .ref），
+    借此保证开关关闭的缓存永远不会被误转正进曲库。
+    """
+    if not _is_rolling_cache_stem(path, guid):
+        return False
+    recalled = recalled_media_path(guid)
+    if not recalled:
+        return False
+    try:
+        return os.path.samefile(recalled, path)
+    except OSError:
+        return False
+
+
+async def _promote_deferred_cache(headers: dict, guid: str, cached: str,
+                                  retained: dict | None = None) -> None:
+    """元数据缺失暂存 cache 的曲目（issue #52）：重播时元数据可补齐则转正进曲库。
+
+    补齐来源与落盘兜底同链（内存会话 → 歌单缓存 → 历史/收藏快照）；仍缺则保持
+    暂存等下次重播。文件转正前已完成解码校验，此处直接走曲库安装，不再重复校验。
+    """
+    try:
+        src = dict(retained or {})
+        title, artist, album = _tag_fields(src)
+        title, artist, album = _tee_metadata_fallback(guid, title, artist, album, src, retained=retained)
+        title = strip_source_tag(title)
+        if not (title and artist):
+            return
+        ext = os.path.splitext(cached)[1].lstrip(".").lower() or "mp3"
+        dest, _reused = await asyncio.to_thread(
+            _install_library_audio, cached, guid, ext, title, artist, album, src)
+        meta = {"dest": dest, "title": title, "artist": artist, "album": album}
+        await _auto_lyric_after_finalize(_synth_request(headers), guid, meta)
+        _schedule_library_scan(headers)
+        _dispatch_official_binding(guid, headers, meta)
+        fn_diag(logger, "tee_saved", guid=guid, title=title, artist=artist, ext=ext, tee=True, promoted=1)
+        logger.info("deferred cache promoted into library for %s: %s", guid, dest)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("deferred cache promote failed for %s: %s", guid, type(e).__name__)
 
 
 async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | None) -> None:
@@ -4338,6 +4464,7 @@ def stream_tee_response(
     first_chunk: bytes = b"",
     scan_headers_factory: Callable[[], dict] | None = None,
     post_finalize: Callable[[dict | None], Coroutine[Any, Any, None]] | None = None,
+    retained_factory: Callable[[], "dict | None"] | None = None,
 ) -> Response:
     headers = {"Accept-Ranges": "bytes"}
     for key in ("content-type", "content-length", "content-range"):
@@ -4463,15 +4590,26 @@ def stream_tee_response(
                             info = await asyncio.wait_for(info_task, timeout=8.0)
                         except Exception:
                             info = None
+                    if info is None or not _tag_fields(info)[0]:
+                        # issue #52：源站 info 缺失/残缺时，内存搜索会话是零 IO 兜底
+                        # （播放时会话必在），作为元数据回查链最前面的一环传入
+                        try:
+                            retained = retained_factory() if retained_factory else None
+                        except Exception:
+                            retained = None
+                    else:
+                        retained = None
                     try:
-                        meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled)
+                        meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled, retained)
                         # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
                         if post_finalize is not None and meta:
                             await post_finalize(meta)
                         scan_headers = scan_headers_factory() if scan_headers_factory is not None else None
-                        if scan_headers:
+                        if scan_headers and not (meta or {}).get("deferred"):
+                            # 元数据缺失暂存 cache 的曲目不触发曲库扫描/官方绑定，
+                            # 待转正后由 _promote_deferred_cache 统一调度
                             _schedule_library_scan(scan_headers)
-                        if meta and tee_enabled:
+                        if meta and tee_enabled and not meta.get("deferred"):
                             # 官方绑定意图（收藏/歌单）统一在下载落库完成后调度
                             _dispatch_official_binding(guid, scan_headers, meta)
                     except Exception as exc:
@@ -4863,8 +5001,9 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         part = None
         logger.info("Background full fetch saved %s (%d bytes)", guid, written)
         await _auto_lyric_after_finalize(fake_request, guid, meta)
-        _schedule_library_scan(cred_headers)
-        _dispatch_official_binding(guid, cred_headers, meta)
+        if not (meta or {}).get("deferred"):
+            _schedule_library_scan(cred_headers)
+            _dispatch_official_binding(guid, cred_headers, meta)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -5016,8 +5155,9 @@ async def _resume_part_download(guid: str, part: str, written: int, expected: in
         meta = await asyncio.to_thread(_tee_finalize, part, guid, resolved_ext, info or {}, True)
         logger.info("Tee handoff resumed %s (+%d bytes, total %d)", guid, append_written, final_size)
         await _auto_lyric_after_finalize(fake_request, guid, meta)
-        _schedule_library_scan(cred_headers)
-        _dispatch_official_binding(guid, cred_headers, meta)
+        if not (meta or {}).get("deferred"):
+            _schedule_library_scan(cred_headers)
+            _dispatch_official_binding(guid, cred_headers, meta)
         return True
     finally:
         with anyio.CancelScope(shield=True):
@@ -5620,6 +5760,12 @@ async def stream_track(request: Request, subpath: str = ""):
     if request.method == "HEAD":
         return await _stream_head_response(request, guid, cached, range_header)
     if cached:
+        if request.method != "HEAD" and _is_deferred_cache_file(guid, cached):
+            # 元数据缺失暂存 cache 的曲目（issue #52）：重播时补齐元数据转正进曲库。
+            # retained/headers 在请求上下文内先取好，重活放后台任务不阻塞出流。
+            promote_headers = copy_incoming_headers(request)
+            promote_retained, _promote_entry = _retained_track(request, guid)
+            asyncio.create_task(_promote_deferred_cache(promote_headers, guid, cached, promote_retained))
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
     item, entry = _retained_track(request, guid)
@@ -5675,7 +5821,8 @@ async def stream_track(request: Request, subpath: str = ""):
                     client_to_close=owned,
                     resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
                     scan_headers_factory=lambda: copy_incoming_headers(request),
-                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta))
+                    post_finalize=lambda meta: _auto_lyric_after_finalize(request, candidate, meta),
+                    retained_factory=lambda: _retained_track(request, candidate)[0])
             if attempt or deadline - asyncio.get_running_loop().time() <= 3:
                 break
             if source_from_online_guid(candidate) not in ("netease", "lx"):
@@ -8663,6 +8810,17 @@ async def play_history_list(request: Request):
                     "album": r_album,
                     "duration_s": retained.get("duration_s") or 0,
                     "ext": retained.get("ext") or "",
+                }
+        if not (info or {}).get("title"):
+            # 内存会话过期（重启后）时与写入路径对齐：再从推荐/网易歌单缓存补齐
+            served = _lookup_playlist_cache_track(guid)
+            if served:
+                s_title, s_artist, s_album = _tag_fields(served)
+                info = {
+                    **(info or {}),
+                    "title": s_title,
+                    "artist": s_artist,
+                    "album": s_album,
                 }
         obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
         obj["isFavorite"] = guid in fav_set
