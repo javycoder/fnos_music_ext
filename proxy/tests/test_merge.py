@@ -1968,8 +1968,9 @@ def test_user_guid_sanitization():
     assert sanitize_user_guid(None) == "shared"
 
 
-def test_static_cover_online_coverid_redirect():
-    """测试 1: mock musicdl /info 返回 cover_url，GET /static/cover?coverId=online:migu:123&size=120 → 302 且 Location == cover_url。"""
+def test_static_cover_online_coverid_redirect(monkeypatch):
+    """测试 1: mock musicdl /info 返回 cover_url，GET /static/cover?coverId=online:migu:123&size=120
+    → 同源直出图片字节（issue #48：App 不跟随跨域 302），不再 302 外链。"""
     cover_target = "http://img.music.migu.cn/cover123.jpg"
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -1989,20 +1990,26 @@ def test_static_cover_online_coverid_redirect():
             },
         )
 
+    def img_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == cover_target
+        return httpx.Response(200, content=b"\xFF\xD8\xFFmigu", headers={"content-type": "image/jpeg"})
+
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
     )
     app.state.musicdl_client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
     )
+    monkeypatch.setattr("proxy.app._COVER_FETCH_ASYNC_TRANSPORT", httpx.MockTransport(img_handler))
 
     with TestClient(app) as client:
         resp = client.get(
             "/music/api/v1/static/cover?coverId=online:migu:123&size=120",
             follow_redirects=False,
         )
-        assert resp.status_code == 302
-        assert resp.headers.get("location") == cover_target
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/jpeg")
+        assert resp.content == b"\xFF\xD8\xFFmigu"
 
 
 def test_static_cover_local_coverid_passthrough():

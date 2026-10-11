@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import contextlib
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -188,6 +189,9 @@ CONF = {
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
+    # 在线封面出口（issue #48）：proxy=同源直出字节（官方手机 App 不跟随跨域
+    # 302，直出是它在 App 内显示的唯一可靠形态）；redirect=保留旧 302 外链行为
+    "cover_mode": (os.environ.get("FNMUSIC_COVER_MODE") or "proxy").strip().lower(),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
     # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
     # =detail 时逐条记录。官方 App 更新引入新端点时（如 2.5.0 前的 download/*），
@@ -516,6 +520,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
+    "FNMUSIC_COVER_MODE": ("cover_mode", "str"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
     "FNMUSIC_TRANSCODE_BITRATE": ("transcode_bitrate", "str"),
@@ -1488,6 +1493,225 @@ def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
     except Exception as e:
         logger.debug("cover fetch failed for %s: %s", url, type(e).__name__)
         return None
+
+
+_COVER_FETCH_ASYNC_TRANSPORT: "httpx.AsyncBaseTransport | None" = None
+
+
+async def _fetch_cover_bytes_async(url: str) -> "tuple[bytes, str] | None":
+    """异步下载封面图字节（代理直出用，issue #48）。失败/非图片一律 None。"""
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    if _KW_TEXT_COVER_HOST in url:
+        return None
+    try:
+        kwargs: dict = {"timeout": 8.0, "follow_redirects": True}
+        if _COVER_FETCH_ASYNC_TRANSPORT is not None:
+            kwargs["transport"] = _COVER_FETCH_ASYNC_TRANSPORT
+        async with httpx.AsyncClient(**kwargs) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return None
+        mime = _sniff_image_mime(data)
+        if not mime:
+            return None
+        return data, mime
+    except Exception as e:
+        logger.debug("cover proxy fetch failed for %s: %s", url, type(e).__name__)
+        return None
+
+
+_COVER_DISK_DIR = "covers"
+_COVER_DISK_TTL_S = 7 * 86400
+_COVER_DISK_MAX_FILES = 2000
+_COVER_DISK_MAX_BYTES = 256 * 1024 * 1024
+_COVER_DISK_CLEAN_MIN_INTERVAL_S = 300.0
+_cover_disk_last_clean = 0.0
+_COVER_DISK_EXT_BY_MIME = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _cover_disk_path(url: str, mime: str = "") -> str:
+    digest = hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()
+    ext = _COVER_DISK_EXT_BY_MIME.get(mime, ".jpg")
+    return os.path.join(CONF["cache_dir"], _COVER_DISK_DIR, f"{digest}{ext}")
+
+
+def _cover_disk_gc() -> None:
+    """封面磁盘缓存惰性清理：TTL 过期剔除；总量超限按最旧删除（进程级节流）。"""
+    global _cover_disk_last_clean
+    now = time.time()
+    if now - _cover_disk_last_clean < _COVER_DISK_CLEAN_MIN_INTERVAL_S:
+        return
+    _cover_disk_last_clean = now
+    d = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR)
+    try:
+        entries: list[tuple[float, float, str]] = []
+        total = 0
+        for fname in os.listdir(d):
+            fpath = os.path.join(d, fname)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            if not os.path.isfile(fpath):
+                continue
+            total += st.st_size
+            if now - st.st_mtime > _COVER_DISK_TTL_S:
+                with contextlib.suppress(OSError):
+                    os.unlink(fpath)
+                total -= st.st_size
+                continue
+            entries.append((st.st_mtime, st.st_size, fpath))
+        if total <= _COVER_DISK_MAX_BYTES and len(entries) <= _COVER_DISK_MAX_FILES:
+            return
+        entries.sort()
+        removed_bytes = 0
+        target = max(total - _COVER_DISK_MAX_BYTES, 0)
+        removed = 0
+        for mtime, size, fpath in entries:
+            if removed_bytes >= target and len(entries) - removed <= _COVER_DISK_MAX_FILES:
+                break
+            with contextlib.suppress(OSError):
+                os.unlink(fpath)
+            removed_bytes += size
+            removed += 1
+    except OSError as e:
+        logger.debug("cover disk gc failed: %s", type(e).__name__)
+
+
+def _cover_disk_read(url: str) -> "tuple[bytes, str] | None":
+    fpath = ""
+    for mime, ext in _COVER_DISK_EXT_BY_MIME.items():
+        cand = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR, f"{hashlib.sha1(url.encode('utf-8', 'replace')).hexdigest()}{ext}")
+        try:
+            if os.path.isfile(cand) and time.time() - os.stat(cand).st_mtime <= _COVER_DISK_TTL_S:
+                fpath = cand
+                break
+        except OSError:
+            continue
+    if not fpath:
+        return None
+    try:
+        with open(fpath, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    mime = _sniff_image_mime(data[:16])
+    return (data, mime or "image/jpeg")
+
+
+def _cover_disk_write(url: str, data: bytes, mime: str) -> None:
+    d = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR)
+    fpath = _cover_disk_path(url, mime)
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, fpath)
+    except OSError as e:
+        logger.debug("cover disk write failed: %s", type(e).__name__)
+        with contextlib.suppress(OSError):
+            if os.path.exists(fpath + ".tmp"):
+                os.unlink(fpath + ".tmp")
+        return
+    _cover_disk_gc()
+
+
+async def _proxied_cover_response(url: str) -> Response | None:
+    """封面同源直出（issue #48）：官方手机 App 不跟随跨域 302，直接返回图片字节。
+
+    磁盘缓存命中优先，未命中代拉源站 CDN 后落盘；失败返回 None 由调用方走
+    既有回退链（网易补全/内嵌图/占位图），行为不劣于原 302 外链。
+    """
+    url = str(url or "").strip()
+    if not url or _KW_TEXT_COVER_HOST in url:
+        return None
+    cached = await asyncio.to_thread(_cover_disk_read, url)
+    if cached:
+        data, mime = cached
+    else:
+        fetched = await _fetch_cover_bytes_async(url)
+        if not fetched:
+            return None
+        data, mime = fetched
+        await asyncio.to_thread(_cover_disk_write, url, data, mime)
+    digest = hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "ETag": f'"{digest}"',
+        },
+    )
+
+
+# guid → 封面直链映射（issue #48）：info 接口受网易登录态/风控抖动影响，
+# App 每次刷列表都重查 info 会在抖动窗口整屏落占位图。成功直出过的封面
+# 记住直链，后续请求直接走字节缓存出图，info 抖动不再影响已成功过的封面。
+_COVER_GUID_URL_TTL_S = 14 * 86400
+_COVER_GUID_URL_MEM: dict[str, tuple[float, str]] = {}
+_COVER_GUID_URL_MEM_MAX = 8192
+
+
+def _cover_guid_url_file(guid: str) -> str:
+    digest = hashlib.sha1(str(guid or "").encode("utf-8", "replace")).hexdigest()
+    return os.path.join(CONF["cache_dir"], _COVER_DISK_DIR, f"g_{digest}.url")
+
+
+def _cover_guid_url_remember(guid: str, url: str) -> None:
+    guid = str(guid or "").strip()
+    url = str(url or "").strip()
+    if not guid or not url.startswith(("http://", "https://")):
+        return
+    _COVER_GUID_URL_MEM[guid] = (time.time(), url)
+    if len(_COVER_GUID_URL_MEM) > _COVER_GUID_URL_MEM_MAX:
+        for k in sorted(_COVER_GUID_URL_MEM, key=lambda k: _COVER_GUID_URL_MEM[k][0])[:1024]:
+            _COVER_GUID_URL_MEM.pop(k, None)
+
+
+def _cover_guid_url_lookup(guid: str) -> str:
+    guid = str(guid or "").strip()
+    if not guid:
+        return ""
+    hit = _COVER_GUID_URL_MEM.get(guid)
+    if hit and time.time() - hit[0] <= _COVER_GUID_URL_TTL_S:
+        return hit[1]
+    try:
+        fpath = _cover_guid_url_file(guid)
+        if time.time() - os.stat(fpath).st_mtime > _COVER_GUID_URL_TTL_S:
+            return ""
+        with open(fpath, "r", encoding="utf-8") as f:
+            url = f.read().strip()
+    except OSError:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        return ""
+    _COVER_GUID_URL_MEM[guid] = (time.time(), url)
+    return url
+
+
+def _cover_guid_url_persist(guid: str, url: str) -> None:
+    _cover_guid_url_remember(guid, url)
+    fpath = _cover_guid_url_file(guid)
+    try:
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(fpath), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(url)
+        os.replace(tmp, fpath)
+    except OSError as e:
+        logger.debug("cover guid-url persist failed: %s", type(e).__name__)
 
 
 def _has_embedded_cover(path: str) -> bool:
@@ -6241,10 +6465,12 @@ def _placeholder_cover_response(guid: str) -> Response:
         except OSError:
             logger.warning("占位图缺失: %s", os.path.join(_PLACEHOLDER_DIR, name))
             content = _TINY_GRAY_PNG
+    # no-store：占位图是"这次没取到"的兜底而非稳定内容，必须不被客户端磁盘
+    # 缓存粘住——升级/自愈后 App 重新拉取才能立即换上真封面（issue #48）
     return Response(
         content=content,
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -6323,6 +6549,27 @@ def _official_cover_file_response(cover_id: str, size: str | None = None) -> Res
     return None
 
 
+async def _online_cover_delivery(cover: str, guid: str = "") -> Response | None:
+    """在线封面出口（issue #48）：官方手机 App 不跟随跨域 302，默认代理同源
+    直出图片字节；FNMUSIC_COVER_MODE=redirect 保留旧 302 行为。直出失败
+    返回 None，调用方继续既有回退链（不劣于原 302 外链在 App 上的表现）。
+    成功出图时把 guid→直链 记入映射（内存+磁盘），info 抖动时已成功封面不塌。"""
+    cover = str(cover or "").strip()
+    if not cover or _KW_TEXT_COVER_HOST in cover:
+        return None
+    if str(CONF.get("cover_mode") or "proxy").lower() == "redirect":
+        if guid:
+            _cover_guid_url_remember(guid, cover)
+        return RedirectResponse(cover, status_code=302)
+    resp = await _proxied_cover_response(cover)
+    if resp is not None and guid:
+        await asyncio.to_thread(_cover_guid_url_persist, guid, cover)
+    return resp
+
+
+_COVER_UNRESOLVED_SEEN: set[str] = set()
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
@@ -6331,6 +6578,10 @@ async def static_cover(request: Request, subpath: str = ""):
         guid = subpath
     if not guid and subpath:
         cand = subpath.strip("/").split("/")[-1]
+        # 客户端可能按真实文件形态请求封面（<id>.jpg / <id>_w120.jpg）：
+        # 剥掉扩展名与缩略图变体尾缀再反解（仅此处局部剥离）
+        cand = re.sub(r"\.(jpg|jpeg|png|webp|gif)$", "", cand, flags=re.IGNORECASE)
+        cand = re.sub(r"_w\d+$", "", cand)
         if cand:
             guid = resolve_real_guid(cand)
     playlist_kind = dailyrec.online_playlist_kind(guid)
@@ -6375,34 +6626,56 @@ async def static_cover(request: Request, subpath: str = ""):
             # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
             return Response(status_code=404)
         guid = picked_guid
-    # 网易账号歌单封面：登记的封面直链直接 302（兼容重启后反查表未重建的裸假 id）
+    # 网易账号歌单封面：登记的封面直链同源直出（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
         cover = nmpl.cover_url_for(nm_pl_id)
         if cover:
-            return RedirectResponse(cover, status_code=302)
+            resp = await _online_cover_delivery(cover, guid)
+            if resp is not None:
+                return resp
+            # 直出失败（拉图异常）：回落 404，客户端显示自带默认样式
+            return Response(status_code=404)
         return Response(status_code=404)
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
             return local_resp
+        # 32hex 且不在伪装反查表、官方封面文件也未命中：伪装 id 反解失败取证
+        # （典型：代理重启后反查表未热身，App 持有的 coverId 查不到在线曲目）
+        raw = str(guid or "")
+        stripped = raw[6:] if raw.startswith("track_") else raw
+        if (re.fullmatch(r"[0-9a-f]{32}", stripped, re.IGNORECASE)
+                and resolve_real_guid(raw) == raw and stripped not in _COVER_UNRESOLVED_SEEN):
+            _COVER_UNRESOLVED_SEEN.add(stripped)
+            if len(_COVER_UNRESOLVED_SEEN) > 4096:
+                _COVER_UNRESOLVED_SEEN.clear()
+            ua = re.sub(r"\s+", " ", request.headers.get("user-agent") or "-")[:30]
+            fn_diag(logger, "cover_id_unresolved", raw=raw[:48], ua=ua)
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
-    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
+    # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，同源直出
     album_entry = album_entry_from_real_guid(guid)
     if album_entry is not None:
         item = album_entry.get("item") if isinstance(album_entry.get("item"), dict) else {}
         cover = str(item.get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
-            return RedirectResponse(cover, status_code=302)
+            resp = await _online_cover_delivery(cover, guid)
+            if resp is not None:
+                return resp
         # 登记封面缺失（如网易锚点行本就不带封面字段）不再直接占位：借登记的
         # 所属曲目走在线信息兜底（netease 由 al.picUrl 出链），再试直构，最后占位
         track_guid = str(album_entry.get("track_guid") or "")
-        if track_guid and _source_enabled(track_guid):
+        mapped = _cover_guid_url_lookup(track_guid) or _cover_guid_url_lookup(guid)
+        if not mapped and track_guid and _source_enabled(track_guid):
             data = await _online_info(request, track_guid, include_lyric=False)
             cover = str((data or {}).get("cover_url") or "")
-            if cover and _KW_TEXT_COVER_HOST not in cover:
-                return RedirectResponse(cover, status_code=302)
+        else:
+            cover = mapped
+        if cover and _KW_TEXT_COVER_HOST not in cover:
+            resp = await _online_cover_delivery(cover, track_guid or guid)
+            if resp is not None:
+                return resp
         direct = ""
         kw_rid = _kw_rid_from_guid(track_guid or guid)
         if kw_rid:
@@ -6410,17 +6683,28 @@ async def static_cover(request: Request, subpath: str = ""):
         if not direct:
             direct = _qq_cover_by_albummid(str(item.get("albummid") or ""))
         if direct:
-            return RedirectResponse(direct, status_code=302)
+            resp = await _online_cover_delivery(direct, track_guid or guid)
+            if resp is not None:
+                return resp
         # issue #48 封面缺失：专辑锚点全链路未取到封面，留档各环节结果
         fn_diag(logger, "cover_miss_album_anchor", guid=guid, anchor_cover=bool(cover),
                 kw=bool(kw_rid), qq=bool(item.get("albummid")))
         return _placeholder_cover_response(guid)
 
+    # ⓪ 成功出图过的封面直链映射（info 抖动/风控窗口不塌，App 高频刷列表免查 info）
+    mapped = _cover_guid_url_lookup(guid)
+    if mapped and _KW_TEXT_COVER_HOST not in mapped:
+        resp = await _online_cover_delivery(mapped, guid)
+        if resp is not None:
+            return resp
+
     data = await _online_info(request, guid, include_lyric=False)
     cover = str((data or {}).get("cover_url") or "")
-    # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    # ① 已知直链封面同源直出；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
-        return RedirectResponse(cover, status_code=302)
+        resp = await _online_cover_delivery(cover, guid)
+        if resp is not None:
+            return resp
 
     # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
     direct = ""
@@ -6430,12 +6714,16 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
-        return RedirectResponse(direct, status_code=302)
+        resp = await _online_cover_delivery(direct, guid)
+        if resp is not None:
+            return resp
 
     # ③ 网易 cloudsearch 同名曲补全
     enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
-        return RedirectResponse(enriched, status_code=302)
+        resp = await _online_cover_delivery(enriched, guid)
+        if resp is not None:
+            return resp
 
     # ④ 本地边听边存文件的内嵌专辑图
     embedded = _embedded_cover_bytes(guid)
