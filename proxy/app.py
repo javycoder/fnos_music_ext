@@ -4359,6 +4359,11 @@ async def _promote_deferred_cache(headers: dict, guid: str, cached: str,
     补齐来源与落盘兜底同链（内存会话 → 歌单缓存 → 历史/收藏快照）；仍缺则保持
     暂存等下次重播。文件转正前已完成解码校验，此处直接走曲库安装，不再重复校验。
     """
+    # 调用方（stream_track 缓存命中出流）先返回 StreamingResponse 再由响应体生成
+    # 器 open(cached)——本任务与那次 open 并发。先让出事件循环一段，确保 open 已
+    # 完成（fd 打开后 os.replace 不影响已打开句柄），再动文件；否则极端调度顺序
+    # 下 replace 先于 open，当次响应体拿不到文件（重试可自愈，但没必要让它发生）。
+    await asyncio.sleep(0.5)
     try:
         src = dict(retained or {})
         title, artist, album = _tag_fields(src)
