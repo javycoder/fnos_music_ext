@@ -392,6 +392,10 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
+            # 测试文件（test_*/conftest）不进镜像、不随服务运行：其跨目录 import
+            # （如 lxmusic 测试比对 proxy 的 UA 常量）不构成镜像依赖
+            if py.name.startswith("test_") or py.name == "conftest.py":
+                continue
             for m in re.finditer(r"^\s*from proxy\.([A-Za-z_][\w]*)", py.read_text(encoding="utf-8"), re.M):
                 mod = f"proxy/{m.group(1)}.py"
                 assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"
