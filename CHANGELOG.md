@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### 测试
+
+- **跨服务 UA 一致性门禁（issue #54 收尾）**：代理兜底 UA `_LX_MEDIA_UA` 与 lxmusic 探活 UA `UA_PC` 是分属两个服务的两份拷贝，此前无任何断言锁定一致——新增跨服务测试逐字符比对，单边改动会在 CI 直接失败，杜绝"探活通过、播放 403"因 UA 漂移复发。
+
 ### 新增
 
 - **曲库文件命名规则可自定义（issue #47 建议 2）**：新增 `FNMUSIC_LIBRARY_NAME_PATTERN` 模板（默认 `{artist} - {title}`，与历史行为完全一致），占位符 `{artist}/{title}/{source}`，例：`{title} [{source}]` → `晴天 [netease].flac`。无可用歌手（缺失/unknown/与歌名相同）时占位符连同相邻分隔符一并去除退化为仅歌名，模板字面量中的路径分隔符统一清洗绝不产生子目录，改后对新落盘歌曲生效。

@@ -1348,3 +1348,17 @@ def test_failure_path_timeouts_tightened():
     assert lxapp.CONF["resolver_timeout"] == 8.0
     assert lxapp.CONF["probe_timeout"] == 3.0
     assert lxapp.CONF["url_timeout"] == 15.0
+
+
+def test_proxy_media_ua_matches_lx_probe_ua():
+    """issue #54 收尾：代理出流兜底 UA 与 lxmusic 探活 UA 必须逐字符一致。
+
+    两份常量分属 proxy / lxmusic-service 两个服务无法共享 import，单边改动会
+    再次造成"探活通过、实际播放 403"——此处跨服务断言锁死一致性。"""
+    import sys
+    from pathlib import Path
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from proxy.app import _LX_MEDIA_UA
+    assert _LX_MEDIA_UA == lxapp.UA_PC
