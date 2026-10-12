@@ -89,14 +89,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
-          title="fnmusic-ext ${TAG#v}"
+          ver="${TAG#v}"
+          title="fnmusic-ext ${ver}"
+          # 字母后缀 = 自动迭代预发布：标记 Pre-release（/releases/latest 与应用内
+          # 检查更新都会跳过它，最新正式版不受影响），标题明示未经完整测试
+          pre_flags=""
+          case "$ver" in
+            *[a-z])
+              pre_flags="--prerelease"
+              title="fnmusic-ext ${ver}（预发布，未经完整测试）"
+              ;;
+          esac
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release edit "${TAG}" --draft=false --title "$title" --notes-file /tmp/release-notes.md
+            gh release edit "${TAG}" --draft=false --title "$title" --notes-file /tmp/release-notes.md $pre_flags
             gh release upload "${TAG}" "$fpk_file" "$fpk_file.sha256" --clobber
           else
             gh release create "${TAG}" \
               --title "$title" \
               --notes-file /tmp/release-notes.md \
+              $pre_flags \
               "$fpk_file" "$fpk_file.sha256"
           fi
 
@@ -111,6 +122,13 @@ jobs:
         run: |
           set -euo pipefail
           tag="${TAG}"
+          # 迭代预发布只在 GitHub 提供：Gitee 镜像面向稳定用户，不追尝鲜构建
+          case "${tag#v}" in
+            *[a-z])
+              echo "[gitee] 迭代预发布（${tag}）跳过 Gitee 镜像发布"
+              exit 0
+              ;;
+          esac
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
           api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
 
@@ -228,7 +246,13 @@ jobs:
       - name: Update moo.json from latest formal release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 tools/update_moo_index.py
+        run: |
+          # main 尚未合入本分支的脚本时（如预发布 tag 抢跑），安静跳过不强失败
+          if [ ! -f tools/update_moo_index.py ]; then
+            echo "main 上暂无 moo 索引脚本（未合入），跳过回填"
+            exit 0
+          fi
+          python3 tools/update_moo_index.py
 
       - name: Commit index update
         run: |
