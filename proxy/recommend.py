@@ -860,7 +860,7 @@ def _musicbox_recommend_item(it: dict) -> dict:
     if not sid:
         return {}
     dur_ms = int(it.get("duration_ms") or 0)
-    return {
+    item = {
         "id": f"netease:{sid}",
         "source": "netease",
         "title": str(it.get("name") or it.get("song_name") or ""),
@@ -870,6 +870,10 @@ def _musicbox_recommend_item(it: dict) -> dict:
         "ext": "flac" if (it.get("has_sq") or it.get("has_hr")) else "mp3",
         "cover_url": str(it.get("album_pic_url") or ""),
     }
+    # issue #57：无 VIP 权益账号的 VIP 曲目行级标记（展示 [VIP] 前缀用）
+    if it.get("needs_vip") is True:
+        item["needs_vip"] = True
+    return item
 
 
 def _lx_recommend_item(it: dict) -> dict:

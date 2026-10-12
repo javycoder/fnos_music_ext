@@ -772,3 +772,35 @@ def test_favorite_and_metadata_vo_not_marked():
 
     meta = build_metadata_payload(guid, info)
     assert meta["data"]["track"]["title"] == "晴天"
+
+
+# ---------------------------------------------------------------- VIP 曲目标记（issue #57）
+
+def test_vip_track_marked_in_vo_and_stripped_for_business():
+    """issue #57：无 VIP 权益账号的网易 VIP 曲目 VO 标题带 [VIP] 前缀（所有出口
+    可见），业务命名/上报归一前由 strip_source_tag 剥离；普通条目不受影响。"""
+    vo = build_online_track({
+        "id": "netease:102", "source": "netease", "title": "新歌 VIP",
+        "artist": "歌手", "duration_s": 200, "ext": "flac", "needs_vip": True,
+    })
+    assert vo["title"] == "[VIP] 新歌 VIP"
+    assert vo["name"] == "[VIP] 新歌 VIP"
+    assert strip_source_tag(vo["title"]) == "新歌 VIP"
+
+    vo_free = build_online_track({
+        "id": "netease:101", "source": "netease", "title": "免费歌",
+        "artist": "歌手", "duration_s": 200, "ext": "flac",
+    })
+    assert vo_free["title"] == "免费歌"
+    assert "needs_vip" not in vo_free
+
+
+def test_vip_tag_stacks_with_source_tag_and_strips_clean():
+    """[VIP] 与来源标记叠加时先 VIP 后来源；strip 连续剥离两种前缀。"""
+    vo = build_online_track({
+        "id": "netease:102", "source": "netease", "title": "新歌",
+        "artist": "歌手", "duration_s": 200, "needs_vip": True,
+    }, mark_source=True)
+    assert vo["title"] == "[music box] [VIP] 新歌"
+    # 一次调用剥净全部前缀（业务命名直接可用）
+    assert strip_source_tag(vo["title"]) == "新歌"

@@ -20,6 +20,7 @@ from netease_ext import (
     search_web_fallback,
     song_detail_raw,
     song_lyric_pair,
+    vip_entitled,
     user_playlists as fetch_user_playlists,
 )
 import runner
@@ -269,11 +270,11 @@ def user_playlists(limit: int = Query(100, ge=1, le=100)):
 
 @app.get("/api/v1/user/playlists/{playlist_id}/tracks")
 def user_playlist_tracks(playlist_id: int = Path(..., ge=1)):
-    """网易歌单曲目：trackIds -> 批量详情 + 可播过滤（形状对齐 recommend rows）。"""
+    """网易歌单曲目：trackIds -> 批量详情（不做可播过滤，VIP 曲目带 needs_vip 标记）。"""
     ids = playlist_track_ids(playlist_id)
     if ids is None:
         return {"ok": False, "error": "not_logged_in", "logged_in": False}
-    return {"ok": True, "data": batch_song_details(ids[:1000])}
+    return {"ok": True, "data": _mark_needs_vip(batch_song_details(ids[:1000]))}
 
 
 def _cli_error_or_raise(exc: UpstreamException) -> Any:
@@ -285,6 +286,19 @@ def _cli_error_or_raise(exc: UpstreamException) -> Any:
     if isinstance(parsed, dict) and parsed.get("ok") is False:
         return parsed
     return None
+
+
+def _mark_needs_vip(rows: list[dict]) -> list[dict]:
+    """issue #57：VIP 歌曲行级标记——无 VIP 权益的账号遇到 fee==1（VIP 曲目）
+    时附 needs_vip=True，代理据此在歌名前展示 [VIP] 前缀（用户点播即知只有试听）。
+
+    有 VIP 权益的账号可完整播放，不打标。"""
+    if vip_entitled():
+        return rows
+    for row in rows:
+        if isinstance(row, dict) and row.get("fee") == 1:
+            row["needs_vip"] = True
+    return rows
 
 
 def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
@@ -304,7 +318,7 @@ def _playable_recommendation_rows(rows: Any, limit: int) -> list[dict]:
                 sid = 0
             if sid > 0:
                 ids.append(sid)
-    hydrated = batch_song_details(ids[:100])
+    hydrated = _mark_needs_vip(batch_song_details(ids[:100]))
     playable = filter_playable_song_ids([int(row["song_id"]) for row in hydrated])
     return [row for row in hydrated if int(row["song_id"]) in playable][:limit]
 

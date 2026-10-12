@@ -1029,6 +1029,9 @@ def source_from_online_guid(guid: str) -> str:
 _SOURCE_TAG_NETEASE = "[music box] "
 _SOURCE_TAG_MUSICDL = "[dl] "
 _SOURCE_TAG_LX_FALLBACK = "[lx] "
+# issue #57：无 VIP 权益账号的网易 VIP 曲目展示标记（点播只有试听，给用户预期）。
+# 独立于来源标记：所有出口的 VO 都可携带；入库/收藏命名前经 strip_source_tag 剥离。
+_SOURCE_TAG_VIP = "[VIP] "
 
 # lx 搜索固定走平台官方接口（lxserver 内置 musicSdk），自定义源脚本仅参与播放链接解析，
 # 故逐曲归属 = 平台（item["lx_source"] / id "lx:<平台>:"）+ 脚本名（该平台唯一归属的
@@ -1196,10 +1199,14 @@ def source_display_prefix(src: str, item: dict | None = None) -> str:
 
 
 def strip_source_tag(title: str) -> str:
-    """剥离来源标记前缀。仅精确匹配已知标记（含 [脚本名-平台] 全部变体与
-    列表里全部洛雪备注名），不用泛化正则，避免误伤本身以方括号开头的歌名。"""
+    """剥离来源/VIP 标记前缀。仅精确匹配已知标记（含 [脚本名-平台] 全部变体与
+    列表里全部洛雪备注名），不用泛化正则，避免误伤本身以方括号开头的歌名。
+
+    有界循环剥离（最多 3 层）：[VIP] 与来源标记可叠加（如 "[music box] [VIP] x"），
+    业务命名前必须剥净。"""
     t = str(title or "")
-    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK, *_LX_DISPLAY_TAGS]
+    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK,
+                  _SOURCE_TAG_VIP, *_LX_DISPLAY_TAGS]
     script_parts = {"lx", *_LX_SCRIPT_MAP_CACHE["by_platform"].values()}
     for entry in _lx_source_entries():
         name = str(entry.get("name") or "").strip()
@@ -1210,9 +1217,15 @@ def strip_source_tag(title: str) -> str:
         candidates.extend(f"[{name}-{p}] " for p in _LX_PLATFORMS)
     # 优先匹配最长标记，避免前缀部分命中短备注名
     candidates.sort(key=len, reverse=True)
-    for tag in candidates:
-        if t.startswith(tag):
-            return t[len(tag):]
+    for _ in range(3):
+        stripped = t
+        for tag in candidates:
+            if t.startswith(tag):
+                stripped = t[len(tag):]
+                break
+        if stripped == t:
+            break
+        t = stripped
     return t
 
 
@@ -1225,6 +1238,10 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
     guid = online_guid_from_item(item)
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
+    if item.get("needs_vip") is True and title and not title.startswith(_SOURCE_TAG_VIP):
+        # issue #57：无 VIP 权益账号的 VIP 曲目展示标记（与来源标记独立，所有出口
+        # 可见；曲库命名/客户端上报归一前由 strip_source_tag 剥离，业务不受影响）
+        title = _SOURCE_TAG_VIP + title
     if mark_source and title:
         prefix = source_display_prefix(src, item)
         if prefix:

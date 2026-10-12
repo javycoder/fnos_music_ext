@@ -987,3 +987,82 @@ def test_search_offset_zero_keeps_cli_path():
     # CLI 路径失败会自动降级 web fallback，两条路径都返回 200 信封；断言不炸即可
     assert r.status_code == 200
     assert isinstance(r.json().get("data"), list)
+
+
+def test_map_song_detail_maps_fee():
+    row = netease_ext._map_song_detail({"id": 1, "name": "x", "dt": 1000, "fee": 1})
+    assert row["fee"] == 1
+    assert netease_ext._map_song_detail({"id": 2, "name": "y"})["fee"] == 0
+    assert netease_ext._map_song_detail({"id": 3, "name": "z", "fee": "1"})["fee"] == 1
+
+
+def test_user_playlist_tracks_marks_needs_vip(monkeypatch):
+    """issue #57：无 VIP 权益账号的歌单曲目 fee==1（VIP 曲）带 needs_vip 标记；
+    fee 0/8 不标记——点播即知只有试听。"""
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 200, "account": {"id": 1}, "profile": {"vipType": 0}}
+
+        def playlist_songlist(self, playlist_id):
+            return [101, 102, 103]
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_vip_state", None)
+    monkeypatch.setattr(musicbox_app, "batch_song_details", lambda ids: [
+        {"song_id": 101, "name": "free", "fee": 0},
+        {"song_id": 102, "name": "vip song", "fee": 1},
+        {"song_id": 103, "name": "free-lq", "fee": 8},
+    ])
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/user/playlists/111/tracks")
+        data = resp.json()
+    assert data["ok"] is True
+    by_id = {r["song_id"]: r for r in data["data"]}
+    assert "needs_vip" not in by_id[101]
+    assert by_id[102].get("needs_vip") is True
+    assert "needs_vip" not in by_id[103]
+
+
+def test_user_playlist_tracks_no_mark_for_vip_account(monkeypatch):
+    """VIP 权益账号可完整播放，不打标。"""
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 200, "account": {"id": 1}, "profile": {"vipType": 11}}
+
+        def playlist_songlist(self, playlist_id):
+            return [102]
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_vip_state", None)
+    monkeypatch.setattr(musicbox_app, "batch_song_details", lambda ids: [
+        {"song_id": 102, "name": "vip song", "fee": 1},
+    ])
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/user/playlists/111/tracks")
+        data = resp.json()
+    assert data["ok"] is True
+    assert "needs_vip" not in data["data"][0]
+
+
+def test_playable_recommendation_rows_marks_vip(monkeypatch):
+    """issue #57：推荐/榜单行同样在可播过滤后带 needs_vip（无 VIP 权益账号）。"""
+    class MockApi:
+        def get_account_info(self):
+            return {"code": 200, "account": {"id": 1}, "profile": {"vipType": 0}}
+
+        def songs_url(self, ids):
+            return [
+                {"id": i, "url": f"http://audio.126.net/{i}.mp3", "code": 200, "fee": 0, "freeTrialInfo": None}
+                for i in ids
+            ]
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "_vip_state", None)
+    monkeypatch.setattr(musicbox_app, "batch_song_details", lambda ids: [
+        {"song_id": 101, "name": "free", "fee": 0},
+        {"song_id": 102, "name": "vip", "fee": 1},
+    ])
+    rows = musicbox_app._playable_recommendation_rows([{"song_id": 101}, {"song_id": 102}], 10)
+    by_id = {r["song_id"]: r for r in rows}
+    assert by_id[102].get("needs_vip") is True
+    assert "needs_vip" not in by_id[101]
