@@ -210,3 +210,34 @@ jobs:
             exit 1
           fi
           echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
+
+  # issue #36：moo 商店协议源索引自动回填。从 GitHub Release API 取真实资产
+  # （download_url/size/sha256 digest）与发行说明，生成/更新仓库根 moo.json 并
+  # 提交到 main；迭代预发布（2.9.0a 等字母尾巴）不改写索引——索引始终指向最新
+  # 正式版，与应用内"检查更新"口径一致。moo 商店按本文件溯源收录（issue #47）。
+  update-moo-index:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update moo.json from latest formal release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/update_moo_index.py
+
+      - name: Commit index update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add moo.json
+          if git diff --cached --quiet; then
+            echo "moo.json 无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore(ci): 自动更新 moo 商店协议源索引 [skip ci]"
+          git push

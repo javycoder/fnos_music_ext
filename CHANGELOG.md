@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **moo 商店协议源索引（issue #36 / #47 商店收录要求）**：新增仓库根 `moo.json`（moo 协议，`schema_version: "moo"`）——按 Blue-Mink/moo 参考样例的结构，`apps.fnmusic-ext` 携带展示字段（图标/说明走 raw.githubusercontent 直链）与多版本 `releases` 字典（download_url 指向 GitHub Release 真实资产、sha256/size 取自资产 digest、changelog 取自发行说明，x86/arm 双架构指向同一 FPK——manifest platform=all）。配套 `tools/update_moo_index.py` 生成/更新脚本 + release 工作流新增 `update-moo-index` job 在发行后自动回填提交；只收录正式版本号（2.9.0a 等迭代预发布不改写索引，与应用内检查更新同口径），幂等可重跑。新增离线结构自校验测试（schema/必填字段/版本降序/顶层最新一致/sha256 格式）。
+
 ### 测试
 
 - **跨服务 UA 一致性门禁（issue #54 收尾）**：代理兜底 UA `_LX_MEDIA_UA` 与 lxmusic 探活 UA `UA_PC` 是分属两个服务的两份拷贝，此前无任何断言锁定一致——新增跨服务测试逐字符比对，单边改动会在 CI 直接失败，杜绝"探活通过、播放 403"因 UA 漂移复发。
