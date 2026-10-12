@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import time
+import zlib
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -55,7 +56,8 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
 
 # issue #29：预算/候选数/超时全部可配（.env 热重载白名单同步放开）。
 LLM_CANDIDATE_COUNT = _env_int("FNMUSIC_RECOMMEND_CANDIDATES", 36, 10, 60)
-PLAYLIST_SIZE = 20
+# issue #55：歌单曲目数可配（每日推荐/热门推荐两链同口径）
+PLAYLIST_SIZE = _env_int("FNMUSIC_RECOMMEND_SIZE", 20, 5, 100)
 RECOMMEND_COUNT = PLAYLIST_SIZE  # 兼容旧引用
 LLM_TIMEOUT_S = _env_float("FNMUSIC_LLM_TIMEOUT_S", 20.0, 5.0, 60.0)
 BUILD_BUDGET_S = _env_float("FNMUSIC_RECOMMEND_BUDGET_S", 40.0, 10.0, 180.0)
@@ -68,8 +70,34 @@ VERIFY_PLAYABLE = (os.environ.get("FNMUSIC_RECOMMEND_VERIFY_PLAYABLE", "true").s
 VERIFY_TIMEOUT_S = _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", 8.0, 2.0, 20.0)
 # 音源原生推荐抓取量（过滤已收藏/最近播放与不可播曲目后仍有余量）
 NETEASE_DAILY_LIMIT = 40
-NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜
+NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜（主榜：轮换榜拉取失败时的回退）
+# issue #55：热门推荐网易榜单按日轮换——榜单自身不换血的日子里热门推荐也有
+# 每日差异；轮换序号拉空（接口抖动/序号不存在）自动回退主榜热歌。
+NETEASE_TOPLIST_ROTATION = (3, 1, 2)
 CHART_FETCH_COUNT = 40
+
+
+def _day_rotation_offset(day: str, salt: str, length: int) -> int:
+    """按日确定性轮换偏移：同日同结果、跨日变化（crc32 离散），池长<=1 时为 0。"""
+    if length <= 1:
+        return 0
+    return zlib.crc32(f"{salt}:{day}".encode("utf-8")) % length
+
+
+def netease_chart_index_for_day(day: str) -> int:
+    return NETEASE_TOPLIST_ROTATION[
+        _day_rotation_offset(day, "nm-toplist", len(NETEASE_TOPLIST_ROTATION))
+    ]
+
+
+def day_shifted(items: list, day: str, salt: str) -> list:
+    """候选池按日确定性轮转（采样窗口平移）：40 条候选每天取到不同子集。
+
+    issue #55：上游榜单不变时，热门推荐 40 抽 20 的窗口每天平移，
+    连续两天内容不再逐字相同。"""
+    n = len(items)
+    off = _day_rotation_offset(day, salt, n)
+    return items[off:] + items[:off]
 RECOMMEND_SEARCH_CONCURRENCY = _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", 2, 1, 6)
 RECOMMEND_SEARCH_INTERVAL = _env_float("FNMUSIC_REC_SEARCH_INTERVAL", 0.15, 0.0, 5.0)
 
@@ -1737,13 +1765,21 @@ async def get_or_build_daily(
     async def from_netease_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and netease_enabled and musicbox_client):
             return []
+        # issue #55：网易榜单按日轮换（热歌/新歌/飙升），拉空回退主榜热歌
+        idx = netease_chart_index_for_day(day)
         items = await fetch_musicbox_recommend(
             musicbox_client, "/api/v1/toplist",
-            {"index": NETEASE_TOPLIST_INDEX, "limit": CHART_FETCH_COUNT},
+            {"index": idx, "limit": CHART_FETCH_COUNT},
         )
+        if not items and idx != NETEASE_TOPLIST_INDEX:
+            items = await fetch_musicbox_recommend(
+                musicbox_client, "/api/v1/toplist",
+                {"index": NETEASE_TOPLIST_INDEX, "limit": CHART_FETCH_COUNT},
+            )
         if not items:
             return []
-        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+        return resolve_source_candidates(
+            day_shifted(items, day, "nm-charts"), build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_lx_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and lx_enabled and lx_client):
@@ -1751,7 +1787,8 @@ async def get_or_build_daily(
         items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT, sources=lx_sources)
         if not items:
             return []
-        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+        return resolve_source_candidates(
+            day_shifted(items, day, "lx-charts"), build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
         # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源

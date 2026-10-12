@@ -2740,9 +2740,9 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
             r = await client.get(
                 "/api/v1/track/url",
                 params=params,
-                # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 20s）：让端点自己
+                # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 15s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
-                timeout=22.0,
+                timeout=16.0,
             )
             if r.status_code == 200:
                 data = r.json()
@@ -4952,27 +4952,34 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     ext = None
     try:
         if source in ("netease", "lx"):
-            if source == "netease":
-                song_id = song_id_from_online_guid(guid).split(":")[-1]
-                url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh)
-                if not url:
-                    return None
-                headers["User-Agent"] = _MEDIA_UA_PC
-            else:
-                song_id = song_id_from_online_guid(guid)
-                resolved = await resolve_lx_url(
-                    get_lx_client(request.app), song_id, fresh=fresh_url,
-                    meta=_online_meta_for_request(request, guid))
-                if not resolved:
-                    return None
-                url = resolved["url"]
-                ext = resolved.get("ext")
-                headers.update(_lx_media_headers(resolved))
-            if info is None:
-                try:
-                    info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
-                except Exception as exc:
-                    logger.info("online info fast-path missed for %s: %s", guid, type(exc).__name__)
+            # issue #55：元数据快路径与取链解析并行发起（此前解析完再串行等
+            # 0.75s），成功路径省一整段 info 快路径耗时；解析失败则取消不悬挂
+            info_task = asyncio.ensure_future(_fetch_online_info(request, guid)) if info is None else None
+            try:
+                if source == "netease":
+                    song_id = song_id_from_online_guid(guid).split(":")[-1]
+                    url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh)
+                    if not url:
+                        return None
+                    headers["User-Agent"] = _MEDIA_UA_PC
+                else:
+                    song_id = song_id_from_online_guid(guid)
+                    resolved = await resolve_lx_url(
+                        get_lx_client(request.app), song_id, fresh=fresh_url,
+                        meta=_online_meta_for_request(request, guid))
+                    if not resolved:
+                        return None
+                    url = resolved["url"]
+                    ext = resolved.get("ext")
+                    headers.update(_lx_media_headers(resolved))
+                if info_task is not None:
+                    try:
+                        info = await asyncio.wait_for(info_task, timeout=0.75)
+                    except Exception as exc:
+                        logger.info("online info fast-path missed for %s: %s", guid, type(exc).__name__)
+            finally:
+                if info_task is not None and not info_task.done():
+                    info_task.cancel()
             ext = ext or (info or {}).get("ext")
             # Read timeout must tolerate CDN throttling mid-file: a flat 10s
             # timeout kills long pauses between chunks and surfaces as playback

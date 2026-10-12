@@ -817,7 +817,12 @@ async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
                 json={"ok": False, "error": {"type": "not_logged_in", "message": "未登录或登录已过期"}},
             )
         if request.url.path == "/api/v1/toplist":
-            assert request.url.params.get("index") == str(dailyrec.NETEASE_TOPLIST_INDEX)
+            # issue #55：榜单按日轮换（拉空回退主榜）——请求的 index 必须是
+            # 当日轮换序号或回退主榜之一
+            requested_idx = request.url.params.get("index")
+            allowed = {str(dailyrec.netease_chart_index_for_day(dailyrec.today_key())),
+                       str(dailyrec.NETEASE_TOPLIST_INDEX)}
+            assert requested_idx in allowed
             return httpx.Response(200, json={"ok": True, "data": _mb_detail_rows(25, "热歌榜", sid_base=70000), "index": 3})
         return httpx.Response(404, json={"ok": False})
 
@@ -839,9 +844,14 @@ async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
     assert payload["playlist"]["name"] == "热门推荐"
     assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
     assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
-    # 封面 = 第一个有 cover_url 的歌（第一首在列）
+    # 封面 = 第一个有 cover_url 的歌（第一首在列）；issue #55 后首曲随当日
+    # 采样窗口平移，按 day_shifted 的当日首行计算预期
     assert payload["playlist"]["coverId"] == payload["tracks"][0]["guid"]
-    assert str(payload["tracks"][0].get("cover_url") or "").startswith("http://img/70000")
+    first_sid = dailyrec.day_shifted(
+        _mb_detail_rows(25, "热歌榜", sid_base=70000),
+        dailyrec.today_key(), "nm-charts",
+    )[0]["song_id"]
+    assert str(payload["tracks"][0].get("cover_url") or "").startswith(f"http://img/{first_sid}")
 
 
 @pytest.mark.anyio
@@ -1738,3 +1748,36 @@ def test_sync_recommend_version_marker_first_run_writes_only(tmp_path, monkeypat
     assert len(remaining) == 4
     with open(marker, encoding="utf-8") as f:
         assert f.read() == "2.8.3"
+
+
+# =========================================================================
+# issue #55：热门推荐多样性（按日轮换/采样）与 PLAYLIST_SIZE 可配
+# =========================================================================
+def test_day_rotation_deterministic_and_varied():
+    """同日同结果、跨日集合有差异（连续多日里轮换序号/采样窗口不止一种）。"""
+    idx_day1 = dailyrec.netease_chart_index_for_day("20261001")
+    assert dailyrec.netease_chart_index_for_day("20261001") == idx_day1  # 确定性
+    indices = {dailyrec.netease_chart_index_for_day(f"2026100{d}") for d in range(1, 8)}
+    assert len(indices) >= 2, "一周内榜单序号应有轮换"
+
+    items = [f"t{i}" for i in range(40)]
+    shifted_a = dailyrec.day_shifted(items, "20261001", "nm-charts")
+    assert sorted(shifted_a) == sorted(items)  # 轮转不丢不重
+    assert dailyrec.day_shifted(items, "20261001", "nm-charts") == shifted_a  # 确定性
+    windows = {tuple(dailyrec.day_shifted(items, f"2026100{d}", "nm-charts")[:20]) for d in range(1, 8)}
+    assert len(windows) >= 2, "一周内 40 抽 20 的采样窗口应有差异"
+    assert dailyrec.day_shifted(items[:1], "20261001", "nm-charts") == items[:1]
+
+
+def test_playlist_size_env_configurable(monkeypatch):
+    """issue #55：FNMUSIC_RECOMMEND_SIZE 可配（改后需重启进程生效）。"""
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_SIZE", "30")
+    import importlib
+    from proxy import recommend as rec_mod
+    importlib.reload(rec_mod)
+    try:
+        assert rec_mod.PLAYLIST_SIZE == 30
+    finally:
+        monkeypatch.delenv("FNMUSIC_RECOMMEND_SIZE")
+        importlib.reload(rec_mod)
+    assert rec_mod.PLAYLIST_SIZE == 20

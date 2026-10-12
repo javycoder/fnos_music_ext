@@ -1336,3 +1336,15 @@ def test_track_info_meta_params_synthesize(test_app_client, fake_lx):
     assert data["artist"] == "周杰伦"
     cached = fake_lx.get_cached_song_info("lx:kw:999004")
     assert cached and cached["name"] == "晴天"
+
+
+def test_failure_path_timeouts_tightened():
+    """issue #55：失败路径预算收紧——单轮解析 8s、探活 3s、端点总预算 15s。
+
+    成功路径 1-3s 内返回不受影响；收紧的是坏链/慢源的失败上限，避免点播
+    空等 5-7s 后跳歌。env（LX_URL_TIMEOUT/LX_RESOLVER_TIMEOUT/LX_PROBE_TIMEOUT）
+    仍可覆盖。"""
+    import app as lxapp
+    assert lxapp.CONF["resolver_timeout"] == 8.0
+    assert lxapp.CONF["probe_timeout"] == 3.0
+    assert lxapp.CONF["url_timeout"] == 15.0

@@ -55,14 +55,17 @@ CONF: dict[str, Any] = {
     "sources": [s.strip() for s in os.environ.get("LX_SOURCES", "kg,wy,mg,kw,tx").split(",") if s.strip()],
     "search_timeout": float(os.environ.get("LX_SEARCH_TIMEOUT", "12.0")),
     "limit_per_source": int(os.environ.get("LX_LIMIT_PER_SOURCE", "20")),
-    "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "20.0")),
-    "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "12.0")),
+    # issue #55：失败路径预算收紧——首播点播 5-7s 才出声的主因是解析失败吃满
+    # 大预算才降档/换源（单轮 resolver 12s + 探活 5s 叠加远超播放器起播耐心）。
+    # 成功路径本就在 1-3s 内返回，不受影响；收紧的是"坏链/慢源"的失败上限。
+    "url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "15.0")),
+    "resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "8.0")),
     "cache_max": int(os.environ.get("LX_CACHE_MAX", "2000")),
     "cache_ttl": float(os.environ.get("LX_CACHE_TTL", "604800.0")),
     "url_cache_ttl": float(os.environ.get("LX_URL_CACHE_TTL", "600.0")),
     "url_cache_neg_ttl": float(os.environ.get("LX_URL_CACHE_NEG_TTL", "60.0")),
     "url_cache_max": int(os.environ.get("LX_URL_CACHE_MAX", "512")),
-    "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
+    "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "search_probe": bool(os.environ.get("FNMUSIC_SEARCH_PROBE", "").lower() in ("1", "true", "yes", "on")),
     "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
