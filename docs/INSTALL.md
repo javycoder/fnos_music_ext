@@ -280,6 +280,43 @@ python3 -m pytest
 
 ## 8. 常见问题排查
 
+### 外网反向代理访问（issue #49）
+
+通过域名把飞牛反代到公网/外网时，扩展下发的播放直链、HLS 分片与封面全部是**同源相对路径**（客户端用访问域名自己拼 URL），代理层不需要配置任何"外部地址"。外网"搜得到歌但播不出/一直转圈"基本都出在**反代层对流式响应不友好**，按下面核对：
+
+```nginx
+# nginx 反代关键配置（location 段）
+location / {
+    proxy_pass http://127.0.0.1:<飞牛端口>;
+    proxy_http_version 1.1;
+
+    # 1) 关闭响应缓冲：音频是流式传输，缓冲会导致"转圈很久才出声/超时失败"。
+    #    扩展所有流式响应已自带 X-Accel-Buffering: no，nginx 默认会尊重该头；
+    #    若你配置过 proxy_buffering on 且忽略该头，请显式改回 off。
+    proxy_buffering off;
+
+    # 2) 放大读超时：转码分片在 ffmpeg 起动时最长等待 30 秒
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+
+    # 3) 透传必要请求头（Range 是拖动进度条/断点续传的关键，Cookie/Authorization 是鉴权）
+    proxy_set_header Range $http_range;
+    proxy_set_header If-Range $http_if_range;
+    proxy_set_header Host $host;
+    proxy_set_header Cookie $http_cookie;
+    proxy_set_header Authorization $http_authorization;
+
+    # 4) 不要改写 Location 响应头（切源换曲 307 跳转是相对地址，改写会破坏跳转）
+    # proxy_redirect off;
+}
+```
+
+其他排查要点：
+
+- **封面看不到**：封面默认由代理同源直出字节（`FNMUSIC_COVER_MODE=proxy`），无需外链可达；若反代后仍看不到，检查反代是否剥离了 query 参数（`?coverId=`）。
+- **"第二天才好"**：多为客户端缓存（封面缓存 1 天）或老版本历史问题（≤1.6.2 的 307 绝对地址、≤2.8.0 的封面 302 外链），先升级到最新版。
+- **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可直接定位环节。
+
 ### 安装报「未检测到 docker」
 
 v2.0.0 起仅支持 Docker 部署。请先在 fnOS「应用中心」安装 Docker 后重试；

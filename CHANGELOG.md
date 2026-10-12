@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **外网反向代理场景流式播放被反代层整段缓冲（issue #49 排查收尾）**：扩展下发的播放/HLS/封面地址本就全部是同源相对路径（新版本下代理无需配置外部地址），但流式音频响应此前不带 `X-Accel-Buffering: no`——用户自建 nginx 反代默认 `proxy_buffering on` 会把音频整段缓冲完才向客户端出字节，外网点播表现为长时间转圈后失败。现在在线出流、Range 文件响应、HLS 播放列表全部携带该头；并在 README 常见问题与 docs/INSTALL.md 新增「外网反向代理访问」完整指引（关缓冲、放大读超时、透传 Range/Cookie/Authorization、勿改写 Location、封面 query 剥离排查、logzip 定位）。
+
 ### 新增
 
 - **网易 VIP 曲目行级标记 `[VIP]`（issue #57）**：无 VIP 权益的账号点 VIP 歌只有 30-60 秒试听、播完即跳（"新歌播到中途跳下一首"的一部分成因）——现在 musicbox 详情行携带 fee（0=免费/1=VIP/4=购买专辑/8=非会员免费低音质），无 VIP 权益（profile.vipType=0，5 分钟缓存）时 fee==1 的曲目行附 `needs_vip` 标记（网易账号歌单、每日推荐、热门榜单全部覆盖，有 VIP 权益不打标），代理在歌名前展示 `[VIP] ` 前缀让用户点播前有预期。标记仅影响显示：曲库命名、客户端上报归一前由 `strip_source_tag` 剥离（升级为有界循环剥离，`[music box] [VIP] x` 一并剥净），播放/收藏/边听边存业务逻辑不受影响。

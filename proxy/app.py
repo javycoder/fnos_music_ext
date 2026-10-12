@@ -2260,6 +2260,8 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str,
             "Content-Type": media_type,
             "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
+            # issue #49：外网反代透传流式文件响应，不被 proxy_buffering 整段缓冲
+            "X-Accel-Buffering": "no",
         }
         headers.update(extra)
         return StreamingResponse(
@@ -2275,6 +2277,7 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str,
         "Content-Length": str(length),
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
+        "X-Accel-Buffering": "no",
     }
     headers.update(extra)
     return StreamingResponse(
@@ -4687,7 +4690,10 @@ def stream_tee_response(
     post_finalize: Callable[[dict | None], Coroutine[Any, Any, None]] | None = None,
     retained_factory: Callable[[], "dict | None"] | None = None,
 ) -> Response:
-    headers = {"Accept-Ranges": "bytes"}
+    # issue #49：流式音频经用户自建 nginx 系反代时，默认 proxy_buffering on 会把
+    # 整段缓冲完才开始向客户端出字节（表现为外网点播长时间转圈后失败）——
+    # X-Accel-Buffering: no 让反代透传流式响应。
+    headers = {"Accept-Ranges": "bytes", "X-Accel-Buffering": "no"}
     for key in ("content-type", "content-length", "content-range"):
         if resp.headers.get(key):
             headers[key] = resp.headers[key]
@@ -6166,7 +6172,8 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
 
     if sess is not None:
         if filename == "preset.m3u8":
-            return Response(content=tc.playlist_text(sess), media_type="application/vnd.apple.mpegurl")
+            return Response(content=tc.playlist_text(sess), media_type="application/vnd.apple.mpegurl",
+                            headers={"X-Accel-Buffering": "no"})
         path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
         if path:
             media = "audio/mp4" if filename == tc.INIT_NAME else "video/iso.segment"

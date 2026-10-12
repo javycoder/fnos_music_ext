@@ -552,6 +552,8 @@ def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
         assert resp.status_code == 200
         assert resp.content == audio_content
         assert resp.headers.get("content-type") == "audio/flac"
+        # issue #49：流式响应带 X-Accel-Buffering: no，外网反代不整段缓冲
+        assert resp.headers.get("x-accel-buffering") == "no"
 
         # 检查曲库落盘
         saved_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
