@@ -22,6 +22,7 @@ from proxy.app import (
     register_fake_album,
     _FAKE_ALBUM_REGISTRY,
     _transcode_source,
+    _MEDIA_UA_PC,
 )
 
 
@@ -338,6 +339,23 @@ async def test_resolve_netease_url_all_fail():
 
 
 @pytest.mark.anyio
+async def test_resolve_netease_url_ladder_hop_timeout_bounded():
+    """issue #56：阶梯逐档串行解析，单档超时必须收紧（≤5s）——冷 musicbox
+    每档 1-3s、旧 10s 超时会叠加吃满 App 起播耐心导致首播跳歌。"""
+    recorded: "list[float]" = []
+
+    class RecordingClient:
+        async def get(self, url, params=None, timeout=None):
+            recorded.append(float(timeout))
+            return httpx.Response(200, json={"ok": True, "data": {"code": 404, "url": None}})
+
+    url = await resolve_netease_url(RecordingClient(), "186016")
+    assert url is None
+    assert len(recorded) >= 1
+    assert all(t <= 5.0 for t in recorded)
+
+
+@pytest.mark.anyio
 async def test_resolve_netease_url_pin_reuse_refresh_drop():
     """直链钉住：有效期内同一首歌复用同一条 CDN URL；refresh=True 强制重解析。
 
@@ -393,7 +411,8 @@ async def test_transcode_source_netease_returns_ua():
     req_obj = StarletteRequest({"type": "http", "app": app})
     url, headers = await _transcode_source(req_obj, "online:netease:186016")
     assert url == "http://audio.test/tc1.flac"
-    assert headers == {"User-Agent": "Mozilla/5.0"}
+    # issue #56：播放/转码统一同款 Chrome PC UA（不再是裸 Mozilla/5.0）
+    assert headers == {"User-Agent": _MEDIA_UA_PC}
     # 与播放共用同一条钉住直链：第二次转码解析不再打取链接口（rendition 一致）
     url2, headers2 = await _transcode_source(req_obj, "online:netease:186016")
     assert url2 == url and headers2 == headers
@@ -497,6 +516,9 @@ def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
 
     def direct_stream_handler(request: httpx.Request) -> httpx.Response:
         if "audio.test" in str(request.url):
+            # issue #56：网易 CDN 对无 UA 请求 403——播放请求必须带 UA（首播跳歌根因）
+            if request.headers.get("user-agent") != _MEDIA_UA_PC:
+                return httpx.Response(403)
             return httpx.Response(
                 200,
                 content=audio_content,

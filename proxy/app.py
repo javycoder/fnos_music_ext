@@ -2781,6 +2781,12 @@ def _lx_media_headers(resolved: "dict | None") -> dict[str, str]:
     return headers
 
 
+# issue #56：网易 CDN 同样存在无 UA 间歇拒绝——转码路径此前已单独补过 UA，
+# 播放出流路径缺失导致首播被 CDN 拒掉、App 数秒后自动跳歌。播放/转码/下载
+# 统一带同款 Chrome PC UA，与 lx 取流口径一致。
+_MEDIA_UA_PC = _LX_MEDIA_UA
+
+
 # issue #54：fresh 强制刷新冷却。UA 敏感 CDN 拒掉的实际播放会被重试路径当作
 # 直链失效反复 fresh 重解析，而 lxmusic 端 fresh 不与其成功缓存合并，每次都
 # 真实出网消耗解析额度。同曲 fresh 冷却窗内快速失败，额度消耗有界化；
@@ -2981,7 +2987,10 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
             if fresh:
                 # 仅明确刷新、过期/失效钉链旁路；普通冷请求保留 musicbox 负缓存。
                 params["fresh"] = "1"
-            r = await client.get(f"/api/v1/song/{song_id}/url", params=params, timeout=10.0)
+            # issue #56：阶梯逐档串行解析，单档 10s 超时会吃满 App 的起播耐心
+            # （首播跳歌的主因之一）——收紧到 5s，失败档快速降档；musicbox 端
+            # 命中档位缓存时毫秒级返回，不受影响。
+            r = await client.get(f"/api/v1/song/{song_id}/url", params=params, timeout=5.0)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, dict) and data.get("ok") is not False:
@@ -4922,6 +4931,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh)
                 if not url:
                     return None
+                headers["User-Agent"] = _MEDIA_UA_PC
             else:
                 song_id = song_id_from_online_guid(guid)
                 resolved = await resolve_lx_url(
@@ -6051,7 +6061,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
                 return None, None
             # 与播放路径对齐：ffmpeg 拉网易 CDN 也带 UA，降低源站拒无头客户端导致的
             # 转码中途退出（表现为标准音质下播一半分片 404 跳歌）
-            return url, {"User-Agent": "Mozilla/5.0"}
+            return url, {"User-Agent": _MEDIA_UA_PC}
         if source == "lx":
             resolved = await resolve_lx_url(
                 get_lx_client(request.app), song_id_from_online_guid(guid),
