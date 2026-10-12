@@ -2654,3 +2654,25 @@ def test_search_track_single_page_under_size():
     assert p1["total"] == 50
     assert p2["list"] == []
     assert p2["total"] == 50
+
+
+def test_library_basename_custom_pattern(monkeypatch):
+    """issue #47：命名模板 FNMUSIC_LIBRARY_NAME_PATTERN——占位符 {artist}/{title}/{source}，
+    无歌手退化为仅歌名，默认模板行为不变。"""
+    from proxy.app import CONF
+    monkeypatch.setitem(CONF, "library_name_pattern", "{title} [{source}]")
+    assert library_basename("晴天", "周杰伦", "netease") == "晴天 [netease]"
+    # 无歌手：{source} 保留、无悬空分隔符
+    assert library_basename("晴天", "", "netease") == "晴天 [netease]"
+    # 未知歌手同样退化
+    assert library_basename("晴天", "unknown", "netease") == "晴天 [netease]"
+
+    monkeypatch.setitem(CONF, "library_name_pattern", "{source}/{artist} - {title}")
+    name = library_basename("晴天", "周杰伦", "netease")
+    assert "/" not in name  # 路径分隔符被清洗，不产生子目录
+    assert "周杰伦" in name and "晴天" in name
+
+    # 空模板回退默认
+    monkeypatch.setitem(CONF, "library_name_pattern", "")
+    assert library_basename("晴天", "周杰伦") == "周杰伦 - 晴天"
+    assert library_basename("晴天", "") == "晴天"

@@ -131,6 +131,9 @@ CONF = {
     "official_bind_timeout_s": float(os.environ.get("FNMUSIC_OFFICIAL_BIND_TIMEOUT_S", "120")),
     # 边听边存切歌续传：允许并行完成的续传任务上限（防快速跳歌时的下载洪泛；0=关闭续传）
     "tee_handoff_max": int(os.environ.get("FNMUSIC_TEE_HANDOFF_MAX", "3")),
+    # 曲库文件命名模板（issue #47）：占位符 {artist}/{title}/{source}，
+    # 默认"歌手 - 歌名"（与历史行为一致）；非法路径字符逐段清洗
+    "library_name_pattern": os.environ.get("FNMUSIC_LIBRARY_NAME_PATTERN", "{artist} - {title}"),
     # 自动下载封面：自动下载的音乐完整落库后，把源站封面内嵌进音频文件。
     # 飞牛扫描器只认内嵌图（dhowden/tag，无外置 cover.jpg 能力），这是官方
     # App 显示下载歌曲封面的唯一途径；封面在音乐落库成功后才处理，不存在
@@ -1388,13 +1391,28 @@ def safe_basename_title(title: str) -> str:
     return t[:120]
 
 
-def library_basename(title: str, artist: str = "") -> str:
-    """曲库文件名：歌手 - 歌名（无源站 id）。飞牛无标签时会用文件名当标题。"""
+def library_basename(title: str, artist: str = "", source: str = "") -> str:
+    """曲库文件名：默认"歌手 - 歌名"（无源站 id）。飞牛无标签时会用文件名当标题。
+
+    issue #47：命名规则可经 FNMUSIC_LIBRARY_NAME_PATTERN 自定义，占位符
+    {artist}/{title}/{source}；无可用歌手（缺失/unknown/与歌名相同）时占位符
+    与相邻分隔符一并去除，退化为仅歌名——与默认行为一致，不出悬空" - 歌名"。"""
     title_s = safe_basename_title(title)
     artist_s = safe_basename_title(artist) if (artist or "").strip() else ""
-    if artist_s and artist_s.lower() != title_s.lower() and artist_s != "unknown":
-        return f"{artist_s} - {title_s}"
-    return title_s
+    usable_artist = bool(artist_s and artist_s.lower() != title_s.lower() and artist_s != "unknown")
+    pattern = str(CONF.get("library_name_pattern") or "").strip() or "{artist} - {title}"
+    if "{artist}" in pattern and not usable_artist:
+        pattern = pattern.replace("{artist}", "")
+        pattern = re.sub(r"^[\s\-—|,.·]+", "", pattern)
+        pattern = re.sub(r"[\s\-—|,.·]+$", "", pattern)
+    name = (pattern
+            .replace("{artist}", artist_s if usable_artist else "")
+            .replace("{title}", title_s)
+            .replace("{source}", safe_basename_title(source) if (source or "").strip() else "online"))
+    # 模板字面量里的路径分隔符/控制字符统一清洗，绝不产生子目录或异常文件名
+    name = re.sub(r"[/\\:\0]", "_", name)
+    name = re.sub(r"\s+", " ", name).strip().strip(" .")
+    return name[:200] or title_s or "unknown"
 
 
 def media_ref_path(guid: str) -> str:
@@ -1997,7 +2015,7 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "", direct
             return existing
         return dest
     os.makedirs(lib, exist_ok=True)
-    basename = library_basename(title, artist)
+    basename = library_basename(title, artist, source_from_online_guid(guid) or "")
     if basename.lower() != "unknown":
         # issue #52 重复曲目：同曲（同"歌手 - 歌名"）跨 guid 二次落盘直接复用
         # 已有文件，聚合搜索多源条目/跨平台候选切换不再各存一份
