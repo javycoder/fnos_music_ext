@@ -1638,7 +1638,7 @@ def _seed_day_caches(rec_dir: str, day: str) -> None:
 
 
 def test_sync_recommend_version_marker_invalidates_on_change(tmp_path, monkeypatch):
-    """版本变化：当日 daily/hot 缓存全部失效，标记更新为新版本。"""
+    """版本变化：当日 daily/hot 缓存失效为 .fallback.json 兜底（issue #57），标记更新。"""
     import proxy.app as proxy_app
 
     rec_dir = os.environ["FNMUSIC_RECOMMEND_DIR"]
@@ -1651,10 +1651,57 @@ def test_sync_recommend_version_marker_invalidates_on_change(tmp_path, monkeypat
 
     proxy_app._sync_recommend_version_marker()
 
-    remaining = [name for _, _, files in os.walk(rec_dir) for name in files if name.endswith(".json")]
-    assert remaining == [], f"当日缓存未失效: {remaining}"
+    # 当日缓存不再原地存在，但以 fallback 形态保留（升级过渡兜底可读取）
+    remaining = sorted(name for _, _, files in os.walk(rec_dir) for name in files if name.endswith(".json"))
+    assert remaining == [
+        "daily-{}.fallback.json".format(day), "daily-{}.fallback.json".format(day),
+        "hot-{}.fallback.json".format(day), "hot-{}.fallback.json".format(day),
+    ], f"当日缓存未按 fallback 保留: {remaining}"
+    fb = dailyrec.load_fallback_daily_cache("u1", day)
+    assert fb is not None and fb["tracks"], "fallback bundle 必须可读且有曲目"
+    assert dailyrec.load_daily_cache("u1", day) is None
     with open(marker, encoding="utf-8") as f:
         assert f.read() == "2.8.3"
+
+
+@pytest.mark.anyio
+async def test_wait_progressive_bundle_falls_back_to_pre_upgrade_cache(tmp_path, monkeypatch):
+    """issue #57：升级日新歌单尚未建成（构建空结果）时回退旧 bundle，不下发空歌单。"""
+    import proxy.app as proxy_app
+
+    rec_dir = os.environ["FNMUSIC_RECOMMEND_DIR"]
+    day = dailyrec.today_key()
+    user = "u-fb"
+    folder = os.path.join(rec_dir, dailyrec._safe_user_name(user))
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, f"hot-{day}.fallback.json"), "w") as f:
+        json.dump({"day": day, "status": "ready", "tracks": [{"guid": "old-1"}, {"guid": "old-2"}]}, f)
+
+    async def fake_ensure(request, user_guid, kind="daily"):
+        return asyncio.get_running_loop().create_future()  # 永不完成的构建任务
+
+    monkeypatch.setattr(proxy_app, "_ensure_daily_task", fake_ensure)
+    bundle = await proxy_app._wait_progressive_bundle(None, user, "hot", timeout_s=0.3)
+    assert [t["guid"] for t in bundle["tracks"]] == ["old-1", "old-2"]
+
+
+def test_purge_keeps_fallback_until_fresh_exists(tmp_path):
+    """issue #57：当日 fallback 在新版当日缓存建成前不清理；建成后一并清掉。"""
+    day = dailyrec.today_key()
+    user = "u-purge"
+    folder = os.path.join(dailyrec.recommend_cache_dir(), dailyrec._safe_user_name(user))
+    os.makedirs(folder, exist_ok=True)
+    fb_path = os.path.join(folder, f"hot-{day}.fallback.json")
+    with open(fb_path, "w") as f:
+        f.write('{"tracks": [1]}')
+
+    dailyrec.purge_stale_daily_cache(user, day)
+    assert os.path.exists(fb_path), "新缓存未建成时 fallback 必须保留"
+
+    with open(os.path.join(folder, f"hot-{day}.json"), "w") as f:
+        f.write('{"tracks": [1, 2]}')
+    dailyrec.purge_stale_daily_cache(user, day)
+    assert not os.path.exists(fb_path), "新缓存建成后 fallback 应清理"
 
 
 def test_sync_recommend_version_marker_noop_same_version(tmp_path, monkeypatch):

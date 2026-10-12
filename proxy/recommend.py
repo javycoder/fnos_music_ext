@@ -1391,8 +1391,12 @@ def cache_path(user_guid: str, day: str, kind: str = "daily") -> str:
     return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"{kind}-{day}.json")
 
 
-def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
-    path = cache_path(user_guid, day, kind)
+def fallback_cache_path(user_guid: str, day: str, kind: str = "daily") -> str:
+    """issue #57 升级过渡兜底：版本变化失效当日缓存时重命名保留的旧 bundle。"""
+    return cache_path(user_guid, day, kind)[:-len(".json")] + ".fallback.json"
+
+
+def _load_bundle_file(path: str, day: str) -> dict | None:
     if not os.path.exists(path):
         return None
     try:
@@ -1413,6 +1417,15 @@ def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | No
     return None
 
 
+def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
+    return _load_bundle_file(cache_path(user_guid, day, kind), day)
+
+
+def load_fallback_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
+    """读取升级过渡兜底 bundle（新版当日缓存建成前的新旧衔接数据源）。"""
+    return _load_bundle_file(fallback_cache_path(user_guid, day, kind), day)
+
+
 def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily") -> None:
     _atomic_write_json(cache_path(user_guid, day, kind), payload)
 
@@ -1422,10 +1435,17 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
     if not os.path.isdir(folder):
         return
     keep = {f"daily-{keep_day}.json", f"hot-{keep_day}.json"}
+    fallback_keep = {f"daily-{keep_day}.fallback.json", f"hot-{keep_day}.fallback.json"}
     for name in os.listdir(folder):
         if not name.endswith(".json") or name in keep:
             continue
         path = os.path.join(folder, name)
+        # issue #57：当日 fallback 只在新版当日缓存已建成时清理（升级过渡兜底），
+        # 否则保留——新 bundle 建成前它是推荐歌单不缺席的唯一数据源。
+        if name in fallback_keep:
+            fresh = name[: -len(".fallback.json")] + ".json"
+            if not os.path.exists(os.path.join(folder, fresh)):
+                continue
         try:
             os.remove(path)
             logger.info("purged stale daily recommend %s", path)
@@ -1433,11 +1453,14 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
             logger.warning("failed to purge %s: %s", path, e)
 
 
-def invalidate_today_cache_all_users() -> int:
+def invalidate_today_cache_all_users(keep_fallback: bool = False) -> int:
     """issue #22：音源集合变化后，清掉所有用户当日 daily/hot 推荐缓存。
 
     切换音源（网易↔洛雪等）后旧缓存里的曲目可能已不可播（音源禁用/白名单
     变化），当日缓存必须失效，下次打开歌单按新音源重建。返回删除的文件数。
+    keep_fallback=True（issue #57 版本变化失效专用）：当日缓存不删除而是重命名
+    为 .fallback.json 保留——升级重启后新歌单重建期间推荐歌单回退旧 bundle 过渡，
+    不再空等空窗（曲目可播性不受版本影响，且下发时会重新登记标签焐热 songInfo）。
     """
     root = recommend_cache_dir()
     try:
@@ -1453,9 +1476,22 @@ def invalidate_today_cache_all_users() -> int:
         except OSError:
             continue
         for name in names:
-            if name not in (f"daily-{day}.json", f"hot-{day}.json"):
+            targets = (f"daily-{day}.json", f"hot-{day}.json")
+            if not keep_fallback:
+                # 切源失效：同日升级 fallback 一并删除（旧曲目可能已不可播）
+                targets = targets + (f"daily-{day}.fallback.json", f"hot-{day}.fallback.json")
+            if name not in targets:
                 continue
             path = os.path.join(folder, name)
+            if keep_fallback:
+                fallback = path[: -len(".json")] + ".fallback.json"
+                try:
+                    os.replace(path, fallback)
+                    removed += 1
+                    logger.info("invalidated recommend cache (kept as upgrade fallback): %s", fallback)
+                    continue
+                except OSError as e:
+                    logger.warning("failed to keep fallback %s: %s", fallback, e)
             try:
                 os.remove(path)
                 removed += 1

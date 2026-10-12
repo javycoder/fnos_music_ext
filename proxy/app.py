@@ -7586,7 +7586,11 @@ def _sync_recommend_version_marker() -> None:
     旧版本构建的当日歌单里的曲目在音源侧 songInfo 全冷（持久层启用前拉取的没有
     存档），点播只能合成"未知曲目"。版本一变即失效当日 daily/hot 缓存，下次打开
     歌单按新版重建、榜单重拉，songInfo 立即进持久层。首次运行（无标记）只落标记
-    不失效——全新安装本就没有当日缓存。"""
+    不失效——全新安装本就没有当日缓存。
+
+    issue #57：失效改为重命名保留 .fallback.json——升级重启后新歌单重建的空窗期
+    （构建中/音源抖动/空结果 5 分钟冷却）推荐歌单不再消失，回退旧 bundle 过渡；
+    曲目可播性不受版本影响，下发时照常重新登记标签，反而加速焐热 songInfo。"""
     ver = get_version()
     path = os.path.join(dailyrec.recommend_cache_dir(), ".last-version")
     prev = ""
@@ -7599,7 +7603,7 @@ def _sync_recommend_version_marker() -> None:
         return
     removed = 0
     if prev:
-        removed = dailyrec.invalidate_today_cache_all_users()
+        removed = dailyrec.invalidate_today_cache_all_users(keep_fallback=True)
         _cancel_daily_tasks()
     try:
         os.makedirs(dailyrec.recommend_cache_dir(), exist_ok=True)
@@ -7736,6 +7740,16 @@ async def _wait_progressive_bundle(
     cached = dailyrec.load_daily_cache(user_guid, day, kind)
     if cached and cached.get("tracks"):
         return cached
+    # issue #57：升级日版本失效后新歌单尚未建成（构建中/音源抖动/空结果冷却）时，
+    # 回退旧版当日 bundle 过渡，不再下发空歌单——热门卡片空曲目不会注入，
+    # 表现为升级当天"推荐歌单页面不显示"。
+    fallback = dailyrec.load_fallback_daily_cache(user_guid, day, kind)
+    if fallback and fallback.get("tracks"):
+        logger.info(
+            "recommend bundle fallback to pre-upgrade %s cache for %s (%d tracks)",
+            kind, user_guid, len(fallback.get("tracks") or []),
+        )
+        return fallback
     return dailyrec.empty_daily_bundle(user_guid, kind)
 
 
