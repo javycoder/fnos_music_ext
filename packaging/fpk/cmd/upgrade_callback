@@ -1,0 +1,44 @@
+#!/bin/bash
+# Restore the pre-upgrade data backup, then re-run the installer against the
+# saved .env so the container and proxy unit come back up on the new files.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+[ -n "${FNMUSIC_REPO_DIR}" ] || fnmusic_fail "应用文件缺失（install.sh 不存在）"
+
+BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/upgrade-backup"
+if [ -f "${BACKUP_DIR}/data.tar.gz" ]; then
+    if ! tar -xzf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" >> "${FNMUSIC_LOG}" 2>&1; then
+        fnmusic_fail "恢复用户数据失败：备份保留在 ${BACKUP_DIR}/data.tar.gz"
+    fi
+fi
+
+SOURCES="$(fnmusic_saved_source)"
+[ -n "${SOURCES}" ] || SOURCES="musicdl"
+
+ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend --adopt)
+if [ "${SOURCES}" = "lxmusic" ]; then
+    LX_URL="$(fnmusic_saved_lx_url)"
+    # 洛雪源 URL 可能为空（v2.2.7+ 支持无源安装、装后在管理页配置）：
+    # 有值才透传；无值不阻塞升级，升级后照旧到管理页配置。
+    [ -n "${LX_URL}" ] && ARGS+=(--lx-source-url "${LX_URL}")
+    # 源是用户装机时已确认过的：升级不得因源服务器临时故障（校验不过）而卡死，
+    # 跳过可用性校验，只做激活；源状态装好后在管理页 WebUI 查看
+    ARGS+=(--lx-skip-verify)
+fi
+
+cd "${FNMUSIC_REPO_DIR}"
+if ! fnmusic_run_logged bash ./install.sh "${ARGS[@]}"; then
+    # 升级失败后应用中心回滚 target：repo 目录会被原地重建（inode 更换），运行中
+    # 的容器仍绑着旧 inode（/repo 变空、healthcheck 持续失败且占用端口/容器名）。
+    # 先移除让下次 start/升级重试干净重建，与 install_callback 失败路径对称。
+    fnmusic_cleanup_sources_container
+    # 升级失败弹窗要能看到真实错误行（回滚会带走 TRIM_PKGVAR 里的日志）
+    fnmusic_fail_from_log "升级失败（数据备份保留在 ${BACKUP_DIR}）"
+fi
+
+rm -rf "${BACKUP_DIR}"
+
+exit 0

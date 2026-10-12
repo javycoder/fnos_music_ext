@@ -1,0 +1,51 @@
+name: Publish reviewed FPK
+
+on:
+  push:
+    branches: ['release/2.9.0a']
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pinned release artifact
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum -c fnmusic-ext-2.9.0a.fpk.sha256)
+          python3 - <<'PY'
+          import io, json, re, tarfile
+          from pathlib import Path, PurePosixPath
+          metadata = json.loads(Path('release.json').read_text())
+          assert re.fullmatch(r'[0-9a-f]{40}', metadata['source_commit'])
+          assert metadata['version'] == '2.9.0a'
+          with tarfile.open('artifacts/fnmusic-ext-2.9.0a.fpk', 'r:gz') as package:
+              assert {'manifest', 'app.tgz', 'cmd/main', 'ICON.PNG'} <= set(package.getnames())
+              manifest = package.extractfile('manifest').read().decode()
+              assert any(line.split('=', 1)[0].strip() == 'version' and line.split('=', 1)[1].strip() == '2.9.0'
+                         for line in manifest.splitlines() if '=' in line)
+              with tarfile.open(fileobj=io.BytesIO(package.extractfile('app.tgz').read()), mode='r:gz') as payload:
+                  names = payload.getnames()
+                  assert any(n.endswith('/container/lxserver-artifact/lx-music-sync-server-v2.1.2-server.zip') for n in names)
+                  assert any(n.endswith('/container/lxserver_compat.py') for n in names)
+                  version = next(n for n in names if n.removeprefix('./') == 'repo/VERSION')
+                  assert payload.extractfile(version).read().decode().strip() == '2.9.0a'
+                  for name in names:
+                      parts = PurePosixPath(name).parts
+                      assert '.env' not in parts and 'logs' not in parts and 'sources-data' not in parts, name
+          PY
+      - name: Upload Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: javycoder/fnos_music_ext_automatic_iteration
+        run: |
+          set -euo pipefail
+          gh release create '2.9.0a' \
+            --target '${{ github.sha }}' \
+            --title 'fnmusic-ext 2.9.0a — 网易首播跳歌/专辑页/推荐空窗/反代缓冲修复与出声提速（应用版本 2.9.0，含 2.9.0 全部内容）' \
+            --notes-file release-notes.md \
+            artifacts/fnmusic-ext-2.9.0a.fpk \
+            artifacts/fnmusic-ext-2.9.0a.fpk.sha256

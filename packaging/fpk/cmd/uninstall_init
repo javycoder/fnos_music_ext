@@ -1,0 +1,97 @@
+#!/bin/bash
+# Restore the official music app first (socket, systemd unit, containers),
+# then always archive user data to the storage volume root before removal
+# (uninstall deletes the app directory; the archive is the user's escape hatch).
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/restore.sh" ]; then
+    if ! bash "${FNMUSIC_REPO_DIR}/restore.sh" >> "${FNMUSIC_LOG}" 2>&1 \
+       && ! bash "${FNMUSIC_REPO_DIR}/restore.sh" --adopt >> "${FNMUSIC_LOG}" 2>&1; then
+        # 常规还原与 --adopt 均失败（如 unit 指向已删除的目录）时降级为无条件
+        # 清理，保证卸载永远可以完成。官方 socket 由 unit 停止时的 ExecStopPost
+        # 尽力恢复；若官方音乐异常，重装本扩展后再卸载一次即可修复。
+        # FNMUSIC_UNIT_FILE 仅供测试注入；生产路径固定为 /etc/systemd/system。
+        FNMUSIC_UNIT_FILE="${FNMUSIC_UNIT_FILE:-/etc/systemd/system/fnmusic-ext.service}"
+        FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
+        echo "[fnmusic-ext] 常规还原失败，降级为强制清理继续卸载" >> "${FNMUSIC_LOG}" 2>&1
+        systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+        systemctl disable fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+        rm -f "${FNMUSIC_UNIT_FILE}"
+        systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
+        docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+        rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
+    fi
+fi
+
+# 运行日志（logs/，含导出的 .logzip）不属于需备份的用户数据：卸载即删。
+# 应用中心随后会删整个应用目录，这里先删一次确保降级/异常路径下也不残留。
+# _common leaves the repo empty when the payload has already disappeared.
+# Require a canonical, non-root repo with its installer marker before cleanup;
+# never let an empty/root/invalid repo turn this into rm -rf /logs.
+if [[ "${FNMUSIC_REPO_DIR}" = /* ]] && [ "${FNMUSIC_REPO_DIR}" != "/" ] \
+   && [ -d "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/install.sh" ]; then
+    LOG_REPO="$(cd "${FNMUSIC_REPO_DIR}" && pwd -P)"
+    if [ -n "${LOG_REPO}" ] && [ "${LOG_REPO}" != "/" ] \
+       && [ -f "${LOG_REPO}/install.sh" ]; then
+        rm -rf -- "${LOG_REPO}/logs" >> "${FNMUSIC_LOG}" 2>&1 || true
+    fi
+fi
+
+# 兼容旧的向导开关（历史版本安装时可能记录）：显式 false 才跳过备份
+KEEP="${wizard_keep_data:-true}"
+case "${KEEP}" in
+    false|False|FALSE|0|no) exit 0 ;;
+esac
+
+if [ -z "${FNMUSIC_REPO_DIR}" ]; then
+    exit 0
+fi
+
+ITEMS="$(fnmusic_data_items)"
+[ -n "${ITEMS}" ] || exit 0
+
+# target symlink looks like /vol{n}/@appcenter/fnmusic-ext；解析失败时依次从
+# repo 路径推导（同为 /vol{n}/@appcenter/... 形态），仍失败才落到固定卷根。
+# 缺斜杠会变成 /vol1fnmusic-ext-backup-… 写到文件系统根上。
+VOL="$(readlink -f "${FNMUSIC_APP_ROOT}/target" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
+[ -n "${VOL}" ] || VOL="$(readlink -f "${FNMUSIC_REPO_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
+VOL="${VOL:-/vol1/}"
+case "${VOL}" in
+    */) ;;
+    *) VOL="${VOL}/" ;;
+esac
+ARCHIVE="${VOL}fnmusic-ext-backup-$(date +%Y%m%d%H%M%S).tar.gz"
+# --ignore-failed-read：播放历史等文件在归档读取中途消失（服务残余进程仍在写）
+# 不再中止卸载，缺失项仅记录 warning。
+# shellcheck disable=SC2086
+if ! tar --ignore-failed-read -czf "${ARCHIVE}" -C "${FNMUSIC_REPO_DIR}" ${ITEMS} >> "${FNMUSIC_LOG}" 2>&1; then
+    fnmusic_fail "备份数据到 ${ARCHIVE} 失败，已中止卸载（可重试或手动备份）"
+fi
+echo "[fnmusic-ext] 卸载前已备份配置与数据到 ${ARCHIVE}" >> "${FNMUSIC_LOG}"
+
+# 默认保留音乐源与配置数据至持久目录（重装时自动检测并恢复）
+KEEP_DIR="${FNMUSIC_KEEP_DIR:-${VOL}fnmusic-ext-data}"
+mkdir -p "${KEEP_DIR}" 2>/dev/null || true
+if [ -d "${KEEP_DIR}" ]; then
+    # shellcheck disable=SC2086
+    for item in ${ITEMS}; do
+        src="${FNMUSIC_REPO_DIR}/${item}"
+        [ -e "${src}" ] || continue
+        if ! cp -a "${src}" "${KEEP_DIR}/" 2>> "${FNMUSIC_LOG}"; then
+            echo "[fnmusic-ext] WARN: 保留项 ${item} 复制到 ${KEEP_DIR} 失败" >> "${FNMUSIC_LOG}"
+        fi
+    done
+    cat > "${KEEP_DIR}/README.txt" << 'EOF' 2>/dev/null || true
+此目录为 fnmusic-ext 卸载时保留的音乐源与配置数据。
+重新安装 fnmusic-ext 时将自动检测并恢复此目录下的配置与音乐源。
+如需彻底清除所有历史数据，可手动删除此目录。
+EOF
+    echo "[fnmusic-ext] 音乐源数据已保留至 ${KEEP_DIR}" >> "${FNMUSIC_LOG}"
+fi
+
+echo "${ARCHIVE}"
+
+exit 0

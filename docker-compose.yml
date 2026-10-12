@@ -1,0 +1,40 @@
+# fnmusic-ext v2.0.0：三音源 + WebUI 合并为单容器 fnmusic-sources（supervisor 按需加载）。
+# 音源三选一：FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED
+# 只写一个 true；entrypoint.sh 按 /repo/.env 只启动所选音源进程，未启用的不驻留内存。
+# 运行期切源在 WebUI（8774）内完成：写 .env + 同容器 supervisorctl stop/start，秒级生效。
+#
+# 基础镜像 / pip / apt 源可由根目录 .env 覆盖（FNMUSIC_BASE_IMAGE / FNMUSIC_PIP_INDEX /
+# FNMUSIC_APT_MIRROR），其中基础镜像由 ensure_base_image.sh 自动探测维护：
+# 国内镜像优先直连（绕开 daemon 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）。
+#
+# 数据卷 ./sources-data:/data：网易登录态（XDG 目录）+ 洛雪源脚本缓存与 state.json。
+# 升级自 v1.x（musicbox-data 目录）：首次安装时 install.sh 自动迁移为 sources-data。
+# 仓库目录挂到 /repo：entrypoint / healthcheck 读 .env，WebUI 写 .env。
+# --no-webui 仍挂此卷（否则按需启动读不到开关）；不挂 docker.sock。
+services:
+  fnmusic-sources:
+    build:
+      context: .
+      dockerfile: container/Dockerfile
+      network: host
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}
+        APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tencent.com}
+    image: fnmusic-sources:latest
+    container_name: fnmusic-sources
+    ports:
+      - "127.0.0.1:8768:8001"  # musicdl（代理访问）
+      - "127.0.0.1:8770:8002"  # musicbox（仅本机；扫码走已登录的 WebUI）
+      - "127.0.0.1:8772:8003"  # lxmusic（代理访问）
+      - "127.0.0.1:8774:8004"  # WebUI（仅本机；浏览器走飞牛网关）
+    volumes:
+      - ./sources-data:/data
+      - .:/repo
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

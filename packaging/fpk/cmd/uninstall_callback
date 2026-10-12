@@ -1,0 +1,19 @@
+#!/bin/bash
+# Belt-and-braces cleanup after the repo payload is gone; never fails uninstall.
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SELF_DIR}/_common"
+
+systemctl stop fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+systemctl disable fnmusic-ext.service >> "${FNMUSIC_LOG}" 2>&1 || true
+rm -f /etc/systemd/system/fnmusic-ext.service
+systemctl daemon-reload >> "${FNMUSIC_LOG}" 2>&1 || true
+
+docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
+FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
+rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
+
+# 兜底清理运行日志目录（正常路径应用中心已随应用目录整体删除）
+[ -n "${FNMUSIC_REPO_DIR}" ] && rm -rf "${FNMUSIC_REPO_DIR}/logs" >> "${FNMUSIC_LOG}" 2>&1
+
+exit 0

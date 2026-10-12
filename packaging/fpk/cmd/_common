@@ -1,0 +1,138 @@
+#!/bin/bash
+# Shared helpers for fnmusic-ext App Center lifecycle scripts (sourced, not run).
+# The sourcing script must set SELF_DIR to its own directory first.
+
+FNMUSIC_APP_ROOT="$(cd "${SELF_DIR}/.." && pwd)"
+# cmd/ lives at /var/apps/fnmusic-ext/cmd; the repo payload lands at target/repo
+# (TRIM_APPDEST may point at either root depending on fnOS version).
+FNMUSIC_REPO_DIR=""
+for _cand in "${TRIM_APPDEST:-}/repo" "${FNMUSIC_APP_ROOT}/target/repo" "${FNMUSIC_APP_ROOT}/repo"; do
+    if [ -n "${_cand}" ] && [ -f "${_cand}/install.sh" ]; then
+        FNMUSIC_REPO_DIR="$(cd "${_cand}" && pwd)"
+        break
+    fi
+done
+unset _cand
+
+FNMUSIC_LOG="${TRIM_PKGVAR:-/tmp}/fnmusic-app.log"
+mkdir -p "$(dirname "${FNMUSIC_LOG}")" 2>/dev/null || true
+
+# 应用中心安装失败会回滚删除 TRIM_PKGVAR，fnmusic-app.log 会一起消失。
+# 过程输出同时追加到这份不随回滚删除的日志。测试用 FNMUSIC_DURABLE_LOG 覆盖。
+if [ -z "${FNMUSIC_DURABLE_LOG:-}" ]; then
+    FNMUSIC_DURABLE_LOG="/var/log/apps/fnmusic-ext-install.log"
+    if ! { mkdir -p /var/log/apps && touch "${FNMUSIC_DURABLE_LOG}"; } 2>/dev/null; then
+        FNMUSIC_DURABLE_LOG="/tmp/fnmusic-ext-install.log"
+    fi
+fi
+mkdir -p "$(dirname "${FNMUSIC_DURABLE_LOG}")" 2>/dev/null || true
+touch "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+chmod a+r "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+
+fnmusic_fail() {
+    # Short, actionable message surfaced in the App Center progress UI.
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "$1" > "${TRIM_TEMP_LOGFILE}" || true
+    fi
+    echo "[fnmusic-ext] $1" >&2
+    exit 1
+}
+
+fnmusic_error_brief() {
+    # Installer [ERROR] lines for the App Center popup. BuildKit prints the
+    # whole RUN script as a step title; if that script contains echo "[ERROR]",
+    # a naive grep matches the title and the 300-char popup becomes fix_dns.
+    local log="${1:-${FNMUSIC_LOG}}"
+    [ -f "${log}" ] || return 0
+    sed $'s/\x1b\\[[0-9;]*m//g' "${log}" 2>/dev/null \
+        | grep -a '\[ERROR\]' \
+        | grep -avE '\[ [0-9]+/[0-9]+\] RUN ' \
+        | tail -n 5 \
+        | tr '\n' ' ' \
+        | { python3 -c 'import sys; sys.stdout.write(sys.stdin.read()[:400])' 2>/dev/null || cut -c1-400; }
+}
+
+fnmusic_log_tail_brief() {
+    # Last lines when the installer exited without an [ERROR] marker
+    # (for example set -e on a command that prints nothing).
+    local log="${1:-${FNMUSIC_LOG}}"
+    [ -f "${log}" ] || return 0
+    sed $'s/\x1b\\[[0-9;]*m//g' "${log}" 2>/dev/null \
+        | tail -n 5 \
+        | tr '\n' ' ' \
+        | { python3 -c 'import sys; sys.stdout.write(sys.stdin.read()[:300])' 2>/dev/null || cut -c1-300; }
+}
+
+fnmusic_run_logged() {
+    # Run a command, appending a timestamped copy of its combined output to
+    # FNMUSIC_DURABLE_LOG. The return status is the command's, not tee's.
+    local stamp rc pipefail_on=0
+    stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)"
+    printf '\n===== %s %s =====\n' "${stamp}" "$*" >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+    if set -o | grep -q 'pipefail[[:space:]]*on'; then
+        pipefail_on=1
+    fi
+    set +o pipefail
+    "$@" 2>&1 | tee -a "${FNMUSIC_DURABLE_LOG}" >> "${FNMUSIC_LOG}"
+    rc=${PIPESTATUS[0]}
+    if [ "${pipefail_on}" -eq 1 ]; then
+        set -o pipefail
+    fi
+    return "${rc}"
+}
+
+fnmusic_fail_from_log() {
+    # $1 is the short prefix ("安装失败" / "升级失败……"). Popup keeps the
+    # durable path first so rollback of TRIM_PKGVAR cannot hide the log.
+    local prefix="$1" err_brief
+    err_brief="$(fnmusic_error_brief)"
+    if [ -z "${err_brief}" ]; then
+        err_brief="$(fnmusic_log_tail_brief)"
+    fi
+    tail -n 5 "${FNMUSIC_LOG}" >&2 || true
+    fnmusic_fail "${prefix}。日志：${FNMUSIC_DURABLE_LOG}。${err_brief:-未捕获到错误行}"
+}
+
+fnmusic_cleanup_sources_container() {
+    # App Center rolls back TRIM_PKGVAR / target on install failure but does
+    # not remove the compose container; an empty-mount orphan then occupies
+    # the global name fnmusic-sources.
+    docker rm -f fnmusic-sources >/dev/null 2>&1 || true
+}
+
+fnmusic_env_source() {
+    # 0 when the selected audio source recorded in .env matches $1.
+    [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
+    local key="$1"
+    grep -q "^${key}=true" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
+}
+
+fnmusic_saved_source() {
+    # Map the flags written by install.sh back to a --sources value.
+    if fnmusic_env_source FNMUSIC_NETEASE_ENABLED; then echo musicbox
+    elif fnmusic_env_source FNMUSIC_LX_ENABLED; then echo lxmusic
+    elif fnmusic_env_source FNMUSIC_MUSICDL_ENABLED; then echo musicdl
+    else echo ""; fi
+}
+
+fnmusic_saved_lx_url() {
+    [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
+    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+}
+
+fnmusic_data_items() {
+    # User data living inside the repo dir (relative paths, existing ones only).
+    # 在仓库目录内展开通配：调用方 cwd 若也有 .env.bak*，tar -C repo ${ITEMS}
+    # 会按 cwd 展开，把不存在于 repo 的文件名传给 tar 导致备份失败。
+    local p f rel items=""
+    [ -n "${FNMUSIC_REPO_DIR}" ] || return 0
+    for p in ".env" ".env.bak*" "sources-data" "online_favorites" "online_favorites.json" "play_history"; do
+        # shellcheck disable=SC2086
+        for f in "${FNMUSIC_REPO_DIR}"/${p}; do
+            [ -e "${f}" ] || continue
+            rel="${f#"${FNMUSIC_REPO_DIR}"/}"
+            items="${items} ${rel}"
+        done
+    done
+    echo "${items# }"
+}

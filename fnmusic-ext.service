@@ -1,0 +1,22 @@
+# Canonical template; rendered by proxy/takeover.py render-unit.
+[Unit]
+Description=fnmusic-ext Proxy Service (Socket Takeover)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@BASE_DIR@
+ExecStart=/bin/bash "@BASE_DIR@/proxy/run_proxy.sh"
+ExecStartPost=/usr/bin/python3 "@BASE_DIR@/proxy/takeover.py" ready --timeout 65
+ExecStartPost=/usr/bin/python3 "@BASE_DIR@/proxy/webui_gateway.py" "@BASE_DIR@"
+ExecStopPost=/usr/bin/python3 "@BASE_DIR@/proxy/takeover.py" restore
+TimeoutStartSec=75
+TimeoutStopSec=20
+KillMode=mixed
+Restart=no
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

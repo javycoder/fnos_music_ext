@@ -1,0 +1,532 @@
+import asyncio
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+# 确保能 import 同目录下的 hardening
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy
+
+
+class TestSourceBulkhead:
+    def test_exhaustion_isolated_until_workers_really_exit(self):
+        slow_sources = [f"slow{i}" for i in range(6)]
+        pool = SourceBulkhead([*slow_sources, "fast"])
+        release = threading.Event()
+        started = {source: threading.Event() for source in slow_sources}
+        futures = []
+
+        def slow(source):
+            started[source].set()
+            assert release.wait(5), "test must release workers"
+            return source
+
+        async def main():
+            # Fill all six slots that formerly exhausted the shared executor.
+            for source in slow_sources:
+                futures.append(pool.submit(source, slow, source))
+            assert all(event.wait(1) for event in started.values())
+            for future in futures:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.wrap_future(future), 0.01)
+            for _ in range(20):
+                for source in slow_sources:
+                    with pytest.raises(SourceBusy):
+                        pool.submit(source, slow, source)
+            assert await pool.run("fast", lambda: "ok", timeout=1) == "ok"
+            assert len(pool._executors) == 7
+            assert all(len(ex._threads) <= 1 for ex in pool._executors.values())
+            assert all(ex._work_queue.qsize() == 0 for ex in pool._executors.values())
+            with pytest.raises(ValueError):
+                pool.submit("unregistered", lambda: None)
+            release.set()
+            for future in futures:
+                await asyncio.wrap_future(future)
+            # Worker completion, unlike waiter cancellation, permits reuse.
+            assert await pool.run("slow0", lambda: "recovered", timeout=1) == "recovered"
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+        assert all(not t.is_alive() for ex in pool._executors.values() for t in ex._threads)
+        with pytest.raises(SourceBusy):
+            pool.submit("fast", lambda: None)
+
+    def test_cancelled_waiter_keeps_admission(self):
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+        def slow():
+            started.set()
+            assert release.wait(5)
+            raise RuntimeError("late failure")
+        async def main():
+            task = asyncio.create_task(pool.run("source", slow, timeout=2))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            with pytest.raises(SourceBusy):
+                await pool.run("source", lambda: None, timeout=1)
+            release.set()
+            while pool._busy:
+                await asyncio.sleep(0.001)
+            assert await pool.run("source", lambda: "ok", timeout=1) == "ok"
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+    def test_exception_releases_slot(self):
+        pool = SourceBulkhead(["source"])
+        def fail():
+            raise RuntimeError("failed")
+        try:
+            with pytest.raises(RuntimeError, match="failed"):
+                pool.submit("source", fail).result(1)
+            assert pool.submit("source", lambda: 1).result(1) == 1
+        finally:
+            pool.shutdown()
+
+    def test_run_waits_for_busy_source_within_budget(self):
+        """busy 的源在 timeout 预算内等坑释放后执行，而不是立即交白卷。"""
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+
+        def slow():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        async def main():
+            first = asyncio.create_task(pool.run("source", slow, timeout=5))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            # 上一个关键词的 worker 还占着坑：第二次调用在预算内排队
+            second = asyncio.create_task(pool.run("source", lambda: "second", timeout=5))
+            await asyncio.sleep(0.3)
+            assert not second.done(), "second call should still wait for admission"
+            release.set()
+            assert await first == "first"
+            assert await second == "second"
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+    def test_run_busy_budget_exhausted_stays_busy(self):
+        """预算耗尽仍抢不到坑：保持 SourceBusy 语义，让调用方拿到明确失败。"""
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+
+        def slow():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        async def main():
+            first = asyncio.create_task(pool.run("source", slow, timeout=5))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            with pytest.raises(SourceBusy):
+                await pool.run("source", lambda: "second", timeout=0.4)
+            release.set()
+            assert await first == "first"
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+    def test_run_queue_wait_counts_against_budget(self):
+        """排队耗时计入总预算：等坑用掉的时间会压缩实际执行的超时。"""
+        release = threading.Event()
+        started = threading.Event()
+        pool = SourceBulkhead(["source"])
+
+        def slow():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        def would_be_slow():
+            time.sleep(0.6)
+            return "second"
+
+        async def main():
+            first = asyncio.create_task(pool.run("source", slow, timeout=5))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            second = asyncio.create_task(pool.run("source", would_be_slow, timeout=1.0))
+            await asyncio.sleep(0.8)  # 让排队吃掉大部分预算
+            release.set()
+            assert await first == "first"
+            with pytest.raises(asyncio.TimeoutError):
+                await second
+
+        try:
+            asyncio.run(main())
+        finally:
+            release.set()
+            pool.shutdown()
+
+
+class TestSearchCache:
+    def test_cache_put_and_get_hit(self):
+        cache = SearchCache(ttl=60, max_entries=10)
+        items = [{"id": "migu:123", "title": "Song A"}]
+        cache.put("周杰伦", "migu,bilibili", items)
+
+        cached = cache.get("周杰伦", "migu,bilibili")
+        assert cached == items
+        # 确保返回的是独立列表副本
+        assert cached is not items
+
+    def test_cache_miss_and_key_isolation(self):
+        cache = SearchCache(ttl=60, max_entries=10)
+        items = [{"id": "migu:123", "title": "Song A"}]
+        cache.put("周杰伦", "migu,bilibili", items)
+
+        # 关键词不同
+        assert cache.get("林俊杰", "migu,bilibili") is None
+        # 源组合不同
+        assert cache.get("周杰伦", "migu") is None
+
+    def test_cache_ttl_expiration(self, monkeypatch):
+        current_time = 1000.0
+        monkeypatch.setattr(time, "time", lambda: current_time)
+
+        cache = SearchCache(ttl=10, max_entries=10)
+        items = [{"id": "1", "title": "Song 1"}]
+        cache.put("keyword", "src", items)
+
+        # 5 秒后未过期
+        current_time = 1005.0
+        assert cache.get("keyword", "src") == items
+        assert len(cache) == 1
+
+        # 11 秒后已过期
+        current_time = 1011.0
+        assert cache.get("keyword", "src") is None
+        assert len(cache) == 0
+
+    def test_cache_custom_ttl(self):
+        cache = SearchCache(ttl=300, max_entries=10)
+        cache.put("normal_key", "src", [{"id": "1"}])  # 默认 ttl 300 对照
+        cache.put("short_key", "src", [], ttl=1)       # 自定义 ttl 1
+
+        assert cache.get("short_key", "src") == []
+        assert cache.get("normal_key", "src") == [{"id": "1"}]
+
+        time.sleep(1.2)
+
+        assert cache.get("short_key", "src") is None
+        assert cache.get("normal_key", "src") == [{"id": "1"}]
+
+    def test_cache_max_entries_eviction(self):
+        cache = SearchCache(ttl=60, max_entries=3)
+        cache.put("k1", "src", [{"id": "1"}])
+        cache.put("k2", "src", [{"id": "2"}])
+        cache.put("k3", "src", [{"id": "3"}])
+
+        assert len(cache) == 3
+
+        # 写入第 4 个，最旧的 k1 应该被淘汰
+        cache.put("k4", "src", [{"id": "4"}])
+        assert len(cache) == 3
+        assert cache.get("k1", "src") is None
+        assert cache.get("k2", "src") == [{"id": "2"}]
+        assert cache.get("k3", "src") == [{"id": "3"}]
+        assert cache.get("k4", "src") == [{"id": "4"}]
+
+    def test_cache_lru_access_order(self):
+        cache = SearchCache(ttl=60, max_entries=3)
+        cache.put("k1", "src", [{"id": "1"}])
+        cache.put("k2", "src", [{"id": "2"}])
+        cache.put("k3", "src", [{"id": "3"}])
+
+        # 访问 k1，使 k1 成为最新访问，k2 变成最旧
+        assert cache.get("k1", "src") == [{"id": "1"}]
+
+        # 插入 k4，k2 应该被淘汰
+        cache.put("k4", "src", [{"id": "4"}])
+        assert cache.get("k2", "src") is None
+        assert cache.get("k1", "src") == [{"id": "1"}]
+        assert cache.get("k3", "src") == [{"id": "3"}]
+        assert cache.get("k4", "src") == [{"id": "4"}]
+
+    def test_cache_clear(self):
+        cache = SearchCache(ttl=60, max_entries=10)
+        cache.put("k1", "src", [{"id": "1"}])
+        cache.put("k2", "src", [{"id": "2"}])
+        assert len(cache) == 2
+        cache.clear()
+        assert len(cache) == 0
+        assert cache.get("k1", "src") is None
+
+    def test_cache_thread_safety(self):
+        cache = SearchCache(ttl=60, max_entries=50)
+        errors = []
+
+        def worker(w_id: int):
+            try:
+                for i in range(100):
+                    key = f"key_{w_id}_{i % 10}"
+                    cache.put(key, "src", [{"id": f"{w_id}_{i}"}])
+                    res = cache.get(key, "src")
+                    if res is not None and not isinstance(res, list):
+                        errors.append("Invalid result type")
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert len(cache) <= 50
+
+
+class TestSourceBreaker:
+    def test_breaker_initial_state(self):
+        breaker = SourceBreaker(failure_threshold=4, cooldown=120)
+        assert not breaker.is_open("migu")
+        assert breaker.get_open_sources() == []
+
+    def test_breaker_threshold_trigger(self):
+        breaker = SourceBreaker(failure_threshold=4, cooldown=120)
+        for _ in range(3):
+            breaker.record_failure("migu")
+            assert not breaker.is_open("migu")
+
+        # 第 4 次失败，触发熔断
+        breaker.record_failure("migu")
+        assert breaker.is_open("migu")
+        assert breaker.get_open_sources() == ["migu"]
+
+    def test_breaker_cooldown_recovery(self, monkeypatch):
+        current_time = 1000.0
+        monkeypatch.setattr(time, "time", lambda: current_time)
+
+        breaker = SourceBreaker(failure_threshold=3, cooldown=60)
+        for _ in range(3):
+            breaker.record_failure("kuwo")
+        assert breaker.is_open("kuwo")
+        assert breaker.get_open_sources() == ["kuwo"]
+
+        # 冷却时间内依然处于熔断状态
+        current_time = 1030.0
+        assert breaker.is_open("kuwo")
+        assert breaker.get_open_sources() == ["kuwo"]
+
+        # 冷却时间后自动恢复
+        current_time = 1061.0
+        assert not breaker.is_open("kuwo")
+        assert breaker.get_open_sources() == []
+
+        # 恢复后失败计数已重置，单次失败不会立即熔断
+        breaker.record_failure("kuwo")
+        assert not breaker.is_open("kuwo")
+
+    def test_breaker_record_success_resets(self):
+        breaker = SourceBreaker(failure_threshold=3, cooldown=60)
+        breaker.record_failure("migu")
+        breaker.record_failure("migu")
+        # 成功后重置计数
+        breaker.record_success("migu")
+        # 再失败两次仍不到 3 次
+        breaker.record_failure("migu")
+        breaker.record_failure("migu")
+        assert not breaker.is_open("migu")
+
+        # 达到 3 次熔断后，成功也能立即重置
+        breaker.record_failure("migu")
+        assert breaker.is_open("migu")
+        breaker.record_success("migu")
+        assert not breaker.is_open("migu")
+        assert breaker.get_open_sources() == []
+
+    def test_breaker_multiple_sources_isolation(self):
+        breaker = SourceBreaker(failure_threshold=2, cooldown=60)
+        breaker.record_failure("src_a")
+        breaker.record_failure("src_a")
+
+        assert breaker.is_open("src_a")
+        assert not breaker.is_open("src_b")
+        assert breaker.get_open_sources() == ["src_a"]
+
+        breaker.record_failure("src_b")
+        breaker.record_failure("src_b")
+        assert breaker.get_open_sources() == ["src_a", "src_b"]
+
+    def test_breaker_thread_safety(self):
+        breaker = SourceBreaker(failure_threshold=10, cooldown=60)
+        errors = []
+
+        def worker(source: str):
+            try:
+                for _ in range(50):
+                    breaker.record_failure(source)
+                    _ = breaker.is_open(source)
+                    breaker.record_success(source)
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=worker, args=(f"src_{i}",)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+
+    def test_breaker_slow_success_degradation(self):
+        """慢成功（超过 slow_threshold_s）计入失败，持续慢源被熔断。"""
+        breaker = SourceBreaker(failure_threshold=3, cooldown=60, slow_threshold_s=5.0)
+        breaker.record_success("kuwo", latency=6.0)
+        breaker.record_success("kuwo", latency=7.0)
+        assert not breaker.is_open("kuwo")
+
+        # 第 3 次慢成功触发熔断
+        breaker.record_success("kuwo", latency=6.5)
+        assert breaker.is_open("kuwo")
+
+        # 其他源不受影响
+        assert not breaker.is_open("migu")
+
+    def test_breaker_fast_success_resets_slow_streak(self):
+        breaker = SourceBreaker(failure_threshold=3, cooldown=60, slow_threshold_s=5.0)
+        breaker.record_success("kuwo", latency=6.0)
+        breaker.record_success("kuwo", latency=6.0)
+        # 一次快速成功重置计数
+        breaker.record_success("kuwo", latency=1.0)
+        breaker.record_success("kuwo", latency=6.0)
+        assert not breaker.is_open("kuwo")
+
+    def test_breaker_slow_degradation_disabled_by_default(self):
+        """未配置 slow_threshold_s 时，慢成功依旧重置计数（向后兼容）。"""
+        breaker = SourceBreaker(failure_threshold=2, cooldown=60)
+        for _ in range(10):
+            breaker.record_success("kuwo", latency=999.0)
+        assert not breaker.is_open("kuwo")
+
+
+class TestAdaptiveTimeout:
+    def test_initial_timeout_is_base(self):
+        at = AdaptiveTimeout(base_timeout=12.0, min_timeout=3.0)
+        assert at.timeout_for("kuwo") == 12.0
+        assert at.stats() == {}
+
+    def test_timeout_shrinks_on_failures(self):
+        at = AdaptiveTimeout(base_timeout=12.0, min_timeout=3.0, shrink_factor=0.6)
+        at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(12.0 * 0.6)
+        at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(12.0 * 0.36)
+
+    def test_timeout_has_floor(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=3.0, shrink_factor=0.5)
+        for _ in range(10):
+            at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(3.0)
+
+    def test_timeout_recovers_after_successes(self):
+        at = AdaptiveTimeout(
+            base_timeout=10.0, min_timeout=2.0, shrink_factor=0.5, recover_factor=2.0
+        )
+        at.record_failure("migu")
+        assert at.timeout_for("migu") == pytest.approx(5.0)
+        at.record_success("migu", latency=0.5)
+        assert at.timeout_for("migu") == pytest.approx(10.0)
+
+    def test_slow_success_shrinks_timeout(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=2.0, slow_latency=5.0, shrink_factor=0.5)
+        at.record_success("kuwo", latency=6.0)
+        assert at.timeout_for("kuwo") == pytest.approx(5.0)
+        # 快速成功不影响未降级的源
+        at.record_success("migu", latency=0.5)
+        assert at.timeout_for("migu") == pytest.approx(10.0)
+
+    def test_sources_are_isolated(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=2.0, shrink_factor=0.5)
+        at.record_failure("kuwo")
+        at.record_failure("kuwo")
+        assert at.timeout_for("migu") == pytest.approx(10.0)
+
+    def test_stats_reflects_penalty(self):
+        at = AdaptiveTimeout(base_timeout=10.0, min_timeout=2.0, shrink_factor=0.5)
+        at.record_failure("kuwo")
+        stats = at.stats()
+        assert stats["kuwo"]["timeout"] == pytest.approx(5.0)
+        assert stats["kuwo"]["penalty"] == pytest.approx(0.5)
+
+
+class TestSingleFlight:
+    def test_single_flight_dedup(self):
+        async def main():
+            sf = SingleFlight()
+            call_count = 0
+
+            async def mock_fn():
+                nonlocal call_count
+                call_count += 1
+                await asyncio.sleep(0.05)
+                return {"result": "ok"}
+
+            t1 = asyncio.create_task(sf.run("k1", mock_fn))
+            t2 = asyncio.create_task(sf.run("k1", mock_fn))
+
+            res1, res2 = await asyncio.gather(t1, t2)
+            assert res1 == {"result": "ok"}
+            assert res2 == {"result": "ok"}
+            assert call_count == 1
+
+        asyncio.run(main())
+
+    def test_single_flight_exception_cleanup(self):
+        async def main():
+            sf = SingleFlight()
+            call_count = 0
+
+            async def mock_fail():
+                nonlocal call_count
+                call_count += 1
+                await asyncio.sleep(0.05)
+                raise RuntimeError("something went wrong")
+
+            t1 = asyncio.create_task(sf.run("k_fail", mock_fail))
+            t2 = asyncio.create_task(sf.run("k_fail", mock_fail))
+
+            res1 = await asyncio.gather(t1, t2, return_exceptions=True)
+            assert isinstance(res1[0], RuntimeError)
+            assert str(res1[0]) == "something went wrong"
+            assert isinstance(res1[1], RuntimeError)
+            assert str(res1[1]) == "something went wrong"
+            assert call_count == 1
+
+            # 验证 in-flight 已被清理，再次调用能够重新执行
+            async def mock_success():
+                nonlocal call_count
+                call_count += 1
+                return {"result": "recovered"}
+
+            res3 = await sf.run("k_fail", mock_success)
+            assert res3 == {"result": "recovered"}
+            assert call_count == 2
+
+        asyncio.run(main())

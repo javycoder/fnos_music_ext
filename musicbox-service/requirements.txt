@@ -1,0 +1,6 @@
+# https://github.com/darknessomi/musicbox (PyPI: NetEase-MusicBox)
+NetEase-MusicBox>=0.5.3
+fastapi>=0.110
+uvicorn>=0.29
+qrcode>=7.4
+pillow>=10.0
