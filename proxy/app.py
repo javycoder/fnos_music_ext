@@ -1303,7 +1303,10 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
         "is_online": True,
         "isFavorite": False,
         "isCue": False,
-        "hasLyric": bool(item.get("lyric")),
+        # issue #57：在线曲目歌词按需可拉（resolve_online_lyric 会兜底请求源站并
+        # 落盘缓存），快照/推荐行没有 lyric 字段也默认展示歌词入口——否则推荐、
+        # 收藏、最近播放里的在线新歌一律显示"无歌词"。真无词时端点返回空串。
+        "hasLyric": True,
         "genres": [],
         "accessStatus": 0,
     }
@@ -8435,7 +8438,9 @@ async def _netease_album_detail_payload(request: Request, entry: dict) -> dict |
 
     entry 带 album_id（/search/album 在线专辑登记）时跳过 song/info 二跳直达。
     """
-    if not CONF.get("netease_enabled"):
+    # issue #57：网易云歌单常驻模式下播放/歌词已按 _netease_runtime_usable 放行，
+    # 专辑详情若仍只看 netease_enabled，常驻用户点网易曲目专辑页必然打不开。
+    if not _netease_runtime_usable():
         return None
     musicbox_client = get_musicbox_client(request.app)
     track_guid = str(entry.get("track_guid") or "")
@@ -8499,6 +8504,9 @@ async def _netease_album_detail_payload(request: Request, entry: dict) -> dict |
     if not items:
         return None
     tracks = [build_online_track(it) for it in items]
+    # issue #57：专辑页曲目同样登记 guid→真实标签，从专辑页点播的关键词型曲目
+    # 解析时才有 songInfo 兜底（与收藏/推荐/历史出口对齐，防 #49 型重启丢映射）
+    register_online_meta(tracks)
     return _album_detail_payload(f"{track_guid}:album", album_name, str(tracks[0].get("artist") or ""), tracks)
 
 

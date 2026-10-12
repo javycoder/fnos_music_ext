@@ -136,6 +136,44 @@ def test_netease_album_detail_real_api_and_track_list(monkeypatch):
         assert "online:" not in str(tracks["data"]["list"][0].get("guid"))
 
 
+def test_netease_album_detail_resident_mode_and_meta_registration(monkeypatch):
+    """issue #57：网易云歌单常驻（切走音源）时网易专辑详情必须照常出，
+    且专辑页曲目登记 guid→真实标签（关键词型解析的 songInfo 兜底）。"""
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "netease_playlist_resident", True)
+    item = {"id": "netease:123", "source": "netease", "title": "晴天", "artist": "周杰伦", "album": "叶惠美", "duration_s": 269, "ext": "flac"}
+    vo = build_online_track(item)
+    fake = fake_official_guid(f"{vo['guid']}:album")
+
+    from proxy import app as app_mod
+    app_mod._ONLINE_META.clear()
+    app_mod._ALBUM_PAYLOAD_CACHE.clear()  # 前序测试的 120s 详情缓存会跳过重新合成
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_upstream_official_handler), base_url="http://unix")
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_musicbox_album_handler), base_url="http://127.0.0.1:8770")
+    try:
+        with TestClient(app) as client:
+            detail = client.get("/music/api/v1/album/detail", params={"guid": fake}).json()
+            assert detail["code"] == 0
+            assert detail["data"]["name"] == "叶惠美"
+            assert detail["data"]["trackCount"] == 2
+            # 专辑页下发曲目已登记真实标签：从专辑页点播不再合成"未知曲目/未知歌手"
+            assert "online:netease:123" in app_mod._ONLINE_META
+            assert "online:netease:124" in app_mod._ONLINE_META
+            assert app_mod._ONLINE_META["online:netease:124"]["title"] == "懦夫"
+    finally:
+        app_mod._ONLINE_META.clear()
+        monkeypatch.setitem(CONF, "netease_playlist_resident", False)
+
+
+def test_build_online_track_has_lyric_default_true():
+    """issue #57：在线曲目 VO 默认展示歌词入口（无 lyric 快照字段也不再显示无歌词）。"""
+    item = {"id": "netease:123", "source": "netease", "title": "晴天", "artist": "周杰伦", "album": "叶惠美", "duration_s": 269, "ext": "flac"}
+    vo = build_online_track(item)
+    assert vo["hasLyric"] is True
+
+
 def test_official_album_forwards_untouched():
     """官方专辑（非伪装 guid）的详情与曲目列表原样透传，不受拦截影响。"""
     app.state.upstream_client = httpx.AsyncClient(
