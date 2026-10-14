@@ -325,6 +325,63 @@ test("collectConfig：有激活源时提交列表且不提交 LX_SOURCE_URL（�
   }
 });
 
+test("saveConfig：自动取消失效源后提示保存成功并刷新激活状态", async () => {
+  reset();
+  const items = [
+    { name: "失效源", url: "file:///bad.js", active: true },
+    { name: "可用源", url: "file:///good.js", active: true },
+  ];
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_LIST: JSON.stringify(items),
+  } });
+  await global.loadConfig();
+  global.markDirty();
+  enqueue("/app/fnmusic-ext/api/config", {
+    ok: true, changed: ["LX_SOURCE_LIST"],
+    actions: [
+      { kind: "lx_activate", op: "activate", source: "失效源", ok: false, error: "源错误", auto_disabled: true },
+      { kind: "lx_activate", op: "activate", source: "可用源", ok: true },
+    ],
+    warnings: [{ source: "失效源", url: "file:///bad.js", message: "源错误" }],
+  }, { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_URL: "file:///good.js",
+    LX_SOURCE_LIST: JSON.stringify(items.map((i, index) => ({ ...i, active: index === 1 }))),
+  } });
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    await global.saveConfig();
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+  const message = els.get("#toast").textContent;
+  assert.ok(message.includes("已保存"));
+  assert.ok(message.includes("「失效源」失效，无法激活，已自动取消激活（源错误）"));
+  assert.strictEqual(els.get("#toast").className, "toast ok");
+  assert.strictEqual((els.get("#lx-source-list").innerHTML.match(/lx-badge/g) || []).length, 1);
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+  assert.strictEqual(els.get("#save-btn").disabled, false);
+});
+
+test("collectConfig：全部源自动停用后仍可保存其它设置且不恢复旧激活标记", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_URL: "",
+    LX_SOURCE_LIST: '[{"name":"失效源","url":"file:///bad.js","active":false}]',
+  } });
+  await global.loadConfig();
+  assert.strictEqual((els.get("#lx-source-list").innerHTML.match(/lx-badge/g) || []).length, 0);
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    assert.strictEqual(JSON.parse(global.collectConfig().LX_SOURCE_LIST)[0].active, false);
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+});
+
 test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {
   reset();
   // 第一次 upload 502（进程未起），预览成功后重试成功

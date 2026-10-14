@@ -163,7 +163,7 @@ function applyConfigToForm() {
   }
   // 兼容旧数据：列表无任何 active 标记时按 LX_SOURCE_URL 推导
   const savedUrl = (v.LX_SOURCE_URL || "").trim();
-  if (lxSourceList.length && !lxSourceList.some((item) => item.active)) {
+  if (lxSourceList.length && !lxSourceList.some((item) => "active" in item)) {
     lxSourceList.forEach((item) => { item.active = !!(savedUrl && item.url === savedUrl); });
   }
   // .env 里有激活地址但不在列表中（异常状态）：补进列表展示真实激活态
@@ -221,7 +221,14 @@ function collectConfig() {
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
   }
   if (provider === "lxmusic") {
-    if (!lxSourceList.some((item) => item.active)) {
+    let savedAllInactive = false;
+    try {
+      const saved = JSON.parse(configValues.LX_SOURCE_LIST || "[]");
+      savedAllInactive = configValues.FNMUSIC_LX_ENABLED === "true"
+        && saved.length > 0 && saved.every((i) => i.active === false)
+        && !(configValues.LX_SOURCE_URL || "").trim();
+    } catch (_) { /* 忽略 */ }
+    if (!lxSourceList.some((item) => item.active) && !savedAllInactive) {
       throw new Error("请至少激活一个洛雪源");
     }
     // LX_SOURCE_URL 由后端按第一个激活项派生写入
@@ -254,19 +261,24 @@ async function saveConfig() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ values }),
     });
-    const failed = (result.actions || []).filter((a) => !a.ok);
+    const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
+    const warnings = result.warnings || [];
     const parts = [];
     if (result.changed && result.changed.length) parts.push(`已保存 ${result.changed.length} 项`);
+    else if (warnings.length) parts.push("配置已保存");
     (result.actions || []).forEach((a) => {
       if (a.kind === "process") parts.push(`进程 ${a.program} ${a.op} ${a.ok ? "成功" : "失败"}`);
       if (a.kind === "resident" && a.ok) {
         parts.push(a.op === "start" ? "网易云歌单常驻进程已启动" : "网易云歌单常驻进程已停止");
       }
-      if (a.kind === "lx_activate") {
+      if (a.kind === "lx_activate" && !a.auto_disabled) {
         const label = a.source ? `「${a.source}」` : "";
         const op = a.op === "deactivate" ? "取消激活" : "激活";
         parts.push(`洛雪源${label}${op}${a.ok ? "成功" : "失败"}`);
       }
+    });
+    warnings.forEach((w) => {
+      parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
     });
     if (failed.length) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
@@ -496,11 +508,15 @@ function syncLxAddButton() {
 // 已保存的激活 URL 集合（旧数据无 active 标记时回退 LX_SOURCE_URL 单值）
 function lxSavedActiveUrls() {
   const saved = new Set();
+  let explicitActives = false;
   try {
     const items = JSON.parse(configValues.LX_SOURCE_LIST || "[]");
-    if (Array.isArray(items)) items.forEach((i) => { if (i && i.active && i.url) saved.add(i.url); });
+    if (Array.isArray(items)) items.forEach((i) => {
+      if (i && "active" in i) explicitActives = true;
+      if (i && i.active && i.url) saved.add(i.url);
+    });
   } catch (_) { /* 忽略 */ }
-  if (!saved.size) {
+  if (!saved.size && !explicitActives) {
     const u = (configValues.LX_SOURCE_URL || "").trim();
     if (u) saved.add(u);
   }

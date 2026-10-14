@@ -502,12 +502,13 @@ def _lx_list_items(raw) -> list[dict]:
 def _list_active_urls(values: dict) -> set[str]:
     """从 .env 值推导激活 URL 集合：优先列表 active 标记；无标记回退 LX_SOURCE_URL 单值（旧数据）。"""
     urls: set[str] = set()
-    for item in _lx_list_items(values.get("LX_SOURCE_LIST")):
+    items = _lx_list_items(values.get("LX_SOURCE_LIST"))
+    for item in items:
         if item.get("active"):
             url = str(item.get("url") or "").strip()
             if url:
                 urls.add(url)
-    if not urls:
+    if not urls and not any("active" in i for i in items):
         url = str(values.get("LX_SOURCE_URL") or "").strip()
         if url:
             urls.add(url)
@@ -516,7 +517,7 @@ def _list_active_urls(values: dict) -> set[str]:
 
 def _derive_lx_list_actives(items: list[dict], ref_url: str) -> list[dict]:
     """兼容升级：列表无任何 active 标记时按 LX_SOURCE_URL 推导（全部项显式落布尔）。"""
-    if items and not any(i.get("active") for i in items):
+    if items and not any("active" in i for i in items):
         for item in items:
             item["active"] = bool(ref_url) and str(item.get("url") or "").strip() == ref_url
     return items
@@ -534,7 +535,7 @@ async def _lx_enabled_sources(request: Request) -> list[dict]:
     return ((data.get("data") or {}).get("sources") or [])
 
 
-async def _lx_enabled_platforms(request: Request) -> list[str]:
+async def _lx_enabled_platforms(request: Request, excluded_urls: set[str] | None = None) -> list[str]:
     """读取 lxmusic 当前全部启用源的声明平台并集（保持出现顺序）；不可达返回空列表。"""
     try:
         resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
@@ -542,6 +543,8 @@ async def _lx_enabled_platforms(request: Request) -> list[str]:
         sources = ((data or {}).get("data") or {}).get("sources") or []
         platforms: list[str] = []
         for s in sources:
+            if str(s.get("url") or "").strip() in (excluded_urls or set()):
+                continue
             for p in (s or {}).get("platforms") or []:
                 p = str(p).strip()
                 if p and p not in platforms:
@@ -951,21 +954,46 @@ async def api_config_put(body: ConfigBody, request: Request):
     active_items: list[dict] = []
     to_activate: list[dict] = []
     to_deactivate: list[dict] = []
+    items: list[dict] = []
     lx_reconcile = False
+    warnings: list[dict] = []
+    failed_urls: set[str] = set()
+    verified_platforms: dict[str, list[str]] = {}
+
+    def disable_failed_source(url: str, message: str) -> None:
+        failed_urls.add(url)
+        for item in items:
+            if str(item.get("url") or "").strip() == url:
+                item["active"] = False
+                warnings.append({"source": str(item.get("name") or "") or url,
+                                 "url": url, "message": message})
+
+    def sync_lx_updates() -> None:
+        active_items[:] = [i for i in items if i.get("active")]
+        updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
+        updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip() if active_items else ""
+
     if lx_provider and "LX_SOURCE_LIST" in updates:
         items = _derive_lx_list_actives(
             _lx_list_items(updates["LX_SOURCE_LIST"]),
             str(updates.get("LX_SOURCE_URL") or after_preview.get("LX_SOURCE_URL") or "").strip(),
         )
         active_items = [i for i in items if i.get("active") and str(i.get("url") or "").strip()]
-        if not active_items:
+        # 自动停用全部失效源后，后续仍可保存其它设置；首次配置仍需选择源。
+        saved_items = _lx_list_items(before.get("LX_SOURCE_LIST"))
+        saved_all_inactive = (
+            current_provider(before) == "lxmusic" and bool(saved_items)
+            and all(i.get("active") is False for i in saved_items)
+            and not before.get("LX_SOURCE_URL")
+        )
+        if not active_items and not saved_all_inactive:
             return JSONResponse(
                 content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
             )
-        if active_items:
+        if active_items or saved_all_inactive:
             lx_reconcile = True
             # LX_SOURCE_URL 退化为派生兼容字段 = 第一个激活项
-            updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip()
+            updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip() if active_items else ""
             after_preview["LX_SOURCE_URL"] = updates["LX_SOURCE_URL"]
             before_active = _list_active_urls(before)
             to_activate = [i for i in active_items
@@ -976,7 +1004,7 @@ async def api_config_put(body: ConfigBody, request: Request):
                              for url in before_active if url not in new_active]
             updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
 
-    # lx 换源前置校验：新激活的源必须先通过 lxmusic verify 才写入
+    # lx 换源前置校验：列表中失效的新源自动取消激活，其余配置继续保存。
     lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
     verify_urls: list[str] = []
     if lx_provider:
@@ -989,31 +1017,41 @@ async def api_config_put(body: ConfigBody, request: Request):
     for url in verify_urls:
         if not url:
             continue
+        verify_ok = False
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
                                      json={"url": url}, timeout=130.0)
             report = _resp_json(resp)
+            verify_ok = resp.status_code == 200 and bool(report.get("ok"))
         except Exception as exc:  # noqa: BLE001
             report = {"ok": False, "data": {"message": str(exc)}}
-        if not report.get("ok"):
+        if not verify_ok:
             message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
+            if lx_reconcile:
+                disable_failed_source(url, message)
+                continue
             return JSONResponse(
                 content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
             )
         # LX_SOURCES 推导累计各新激活源声明平台
+        verified_platforms[url] = (report.get("data") or {}).get("platforms") or []
         for p in (report.get("data") or {}).get("platforms") or []:
             p = str(p).strip()
             if p and p not in union_acc:
                 union_acc.append(p)
 
     if lx_reconcile:
+        sync_lx_updates()
+        new_active = {str(i["url"]).strip() for i in active_items}
         # 并入现有启用源声明平台（激活前读取，保持出现顺序）
-        for p in await _lx_enabled_platforms(request):
+        for p in await _lx_enabled_platforms(request, failed_urls):
             p = str(p).strip()
             if p and p not in union_acc:
                 union_acc.append(p)
     if union_acc:
         updates.setdefault("LX_SOURCES", ",".join(union_acc))
+    elif lx_reconcile and not active_items:
+        updates["LX_SOURCES"] = ""
 
     old_provider = current_provider(before)
     changed = write_env(updates)
@@ -1060,6 +1098,14 @@ async def api_config_put(body: ConfigBody, request: Request):
             api_payload = _resp_json(resp)
             ok = resp.status_code == 200 and api_payload.get("ok", False)
             err = "" if ok else (api_payload.get("error") or f"HTTP {resp.status_code}")
+            if ok and op == "activate":
+                sid = str(api_payload.get("source_id") or "")
+                for entry in (api_payload.get("data") or {}).get("sources") or []:
+                    if (sid and str(entry.get("id") or "") == sid) or entry.get("url") == payload.get("url"):
+                        if entry.get("initialized") is False or entry.get("status") == "failed":
+                            ok = False
+                            err = entry.get("error") or "源初始化失败"
+                        break
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
         actions.append({"kind": "lx_activate", "op": op, "source": source,
@@ -1080,22 +1126,42 @@ async def api_config_put(body: ConfigBody, request: Request):
                                             str(item.get("name") or "") or url, "activate")
                 if sid:
                     target_ids.add(sid)
+                if not actions[-1]["ok"]:
+                    disable_failed_source(url, actions[-1]["error"])
+                    actions[-1]["auto_disabled"] = True
+            # 激活失败也写回取消激活状态，避免重开页面仍显示已激活。
+            sync_lx_updates()
+            new_active = {str(i["url"]).strip() for i in active_items}
             # 不仅比较已写入的 .env：失败的停用仍会出现在实际启用集合中。
-            # 只有所有目标激活成功才清理额外脚本，避免失败时误停旧的可用源。
-            if not any(not a["ok"] for a in actions if a.get("op") == "activate"):
-                try:
-                    actual = await _lx_enabled_sources(request)
-                    for s in actual:
-                        sid = str(s.get("id") or "")
-                        url = str(s.get("url") or "")
-                        if sid in target_ids or url in new_active:
-                            continue
-                        if sid or url:
-                            await _lx_source_post({"url": sid or url, "enabled": False},
-                                                  str(s.get("name") or sid or url), "deactivate")
-                except Exception as exc:
-                    actions.append({"kind": "lx_activate", "op": "reconcile", "source": "",
-                                    "ok": False, "error": str(exc)})
+            # 已自动停用失败项，按最终激活集合清理实际仍启用的脚本。
+            try:
+                actual = await _lx_enabled_sources(request)
+                for s in actual:
+                    sid = str(s.get("id") or "")
+                    url = str(s.get("url") or "")
+                    if sid in target_ids or url in new_active:
+                        continue
+                    if sid or url:
+                        await _lx_source_post({"url": sid or url, "enabled": False},
+                                              str(s.get("name") or sid or url), "deactivate")
+            except Exception as exc:
+                actions.append({"kind": "lx_activate", "op": "reconcile", "source": "",
+                                "ok": False, "error": str(exc)})
+            if failed_urls:
+                remaining_platforms: list[str] = []
+                for item in active_items:
+                    url = str(item["url"]).strip()
+                    for p in verified_platforms.get(url, []):
+                        p = str(p).strip()
+                        if p and p not in remaining_platforms:
+                            remaining_platforms.append(p)
+                for p in await _lx_enabled_platforms(request, failed_urls):
+                    if p not in remaining_platforms:
+                        remaining_platforms.append(p)
+                updates["LX_SOURCES"] = ",".join(remaining_platforms) if active_items else ""
+                corrections = write_env({k: updates[k] for k in ("LX_SOURCE_LIST", "LX_SOURCE_URL", "LX_SOURCES")})
+                changed.extend(k for k in corrections if k not in changed)
+                after = read_env()
         else:
             await _lx_source_post({"url": after["LX_SOURCE_URL"]}, "", "activate")
     elif new_provider == "musicdl" and (
@@ -1117,7 +1183,8 @@ async def api_config_put(body: ConfigBody, request: Request):
         )
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
-    return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys}
+    return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys,
+            "warnings": warnings}
 
 
 @app.post("/api/lx/verify")

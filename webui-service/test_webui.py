@@ -464,6 +464,118 @@ def test_lx_multi_source_save_blocked_when_no_active(env_file, svctl, monkeypatc
     assert "LX_SOURCE_LIST" not in env_file.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("failure", ["verify", "verify_http", "verify_timeout", "activate", "activate_timeout", "runtime_failed"])
+@pytest.mark.parametrize("already_active", [False, True])
+def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, monkeypatch, failure, already_active):
+    """失效项自动停用；健康项、其它设置和提示都保留，重新加载不恢复失效项。"""
+    import json
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    bad, good = "https://s/bad.js", "https://s/good.js"
+    items = [{"name": "失效源", "url": bad, "active": True},
+             {"name": "可用源", "url": good, "active": True}]
+    if already_active:
+        env_file.write_text("FNMUSIC_LX_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=false\n"
+                            f"LX_SOURCE_URL='{bad}'\nLX_SOURCE_LIST='{json.dumps(items)}'\n")
+    enabled = {bad: already_active, good: already_active}
+    calls = []
+
+    def handler(req):
+        if req.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": url.rsplit("/", 1)[-1], "url": url,
+                 "platforms": ["wy" if url == bad else "kw"]}
+                for url, active in enabled.items() if active
+            ]}})
+        body = json.loads(req.content)
+        url = body["url"]
+        calls.append((req.url.path, body))
+        is_bad = url in (bad, "bad.js")
+        if req.url.path.endswith("/verify"):
+            if is_bad and failure == "verify_timeout":
+                raise httpx.ReadTimeout("校验超时", request=req)
+            if is_bad and failure == "verify_http":
+                return httpx.Response(503, json={"ok": True})
+            if is_bad and failure == "verify":
+                return httpx.Response(200, json={"ok": False, "data": {"message": "下载失败: 404"}})
+            return httpx.Response(200, json={"ok": True, "data": {
+                "platforms": ["wy" if is_bad else "kw"]}})
+        if body.get("enabled") is False:
+            enabled[bad if is_bad else good] = False
+            return httpx.Response(200, json={"ok": True})
+        # 已激活项不重复 verify，但实际激活失败仍应取消。
+        if is_bad:
+            if failure == "activate_timeout":
+                raise httpx.ReadTimeout("激活超时", request=req)
+            if failure == "runtime_failed":
+                enabled[bad] = True
+                return httpx.Response(200, json={"ok": True, "source_id": "bad.js", "data": {
+                    "sources": [{"id": "bad.js", "url": bad, "initialized": False,
+                                 "status": "failed", "error": "脚本初始化失败"}]}})
+            return httpx.Response(500, text="Internal Server Error")
+        enabled[good] = True
+        return httpx.Response(200, json={"ok": True, "source_id": "good.js"})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false", "FNMUSIC_LX_ENABLED": "true",
+            "FNMUSIC_QUALITY_MODE": "balanced", "LX_SOURCE_LIST": json.dumps(items),
+        }})
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is True
+        assert len(result["warnings"]) == 1
+        assert result["warnings"][0]["source"] == "失效源"
+        assert result["warnings"][0]["message"]
+        saved = client.get("/api/config").json()["values"]
+        assert [i["active"] for i in json.loads(saved["LX_SOURCE_LIST"])] == [False, True]
+        assert saved["LX_SOURCE_URL"] == good
+        assert saved["LX_SOURCES"] == "kw"
+        assert saved["FNMUSIC_QUALITY_MODE"] == "balanced"
+        retry = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": saved["LX_SOURCE_LIST"]}})
+        assert retry.status_code == 200
+        assert retry.json()["warnings"] == []
+    assert enabled == {bad: False, good: True}
+    if not already_active and failure.startswith("verify"):
+        assert not any(path == "/api/v1/source" and body == {"url": bad} for path, body in calls)
+    else:
+        assert any(a.get("auto_disabled") for a in result["actions"])
+
+
+@pytest.mark.parametrize("failure", ["verify", "activate"])
+def test_lx_all_failed_sources_save_inactive_and_allow_future_saves(env_file, svctl, monkeypatch, failure):
+    import json
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    items = [{"name": "失效甲", "url": "https://s/a.js", "active": True},
+             {"name": "失效乙", "url": "https://s/b.js", "active": True}]
+
+    def handler(req):
+        if req.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        if req.url.path.endswith("/verify") and failure == "activate":
+            return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
+        return httpx.Response(200, json={"ok": False, "error": "源已失效"})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false", "FNMUSIC_LX_ENABLED": "true",
+            "LX_SOURCE_LIST": json.dumps(items),
+        }})
+        assert response.status_code == 200
+        assert len(response.json()["warnings"]) == 2
+        saved = client.get("/api/config").json()["values"]
+        assert all(i["active"] is False for i in json.loads(saved["LX_SOURCE_LIST"]))
+        assert saved["LX_SOURCE_URL"] == saved["LX_SOURCES"] == ""
+        assert webui._list_active_urls(saved) == set()
+        response = client.put("/api/config", json={"values": {
+            "LX_SOURCE_LIST": saved["LX_SOURCE_LIST"], "FNMUSIC_QUALITY_MODE": "balanced",
+        }})
+        assert response.status_code == 200
+        assert not response.json()["warnings"]
+        assert client.get("/api/config").json()["values"]["FNMUSIC_QUALITY_MODE"] == "balanced"
+
+
 def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
     """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
     import json as _json
