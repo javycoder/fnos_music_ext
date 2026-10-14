@@ -340,8 +340,7 @@ async def test_resolve_netease_url_all_fail():
 
 @pytest.mark.anyio
 async def test_resolve_netease_url_ladder_hop_timeout_bounded():
-    """issue #56：阶梯逐档串行解析，单档超时必须收紧（≤5s）——冷 musicbox
-    每档 1-3s、旧 10s 超时会叠加吃满 App 起播耐心导致首播跳歌。"""
+    """单档端点等待覆盖 musicbox 12s 总预算；行为边界由 test_issue56 验证。"""
     recorded: "list[float]" = []
 
     class RecordingClient:
@@ -352,7 +351,7 @@ async def test_resolve_netease_url_ladder_hop_timeout_bounded():
     url = await resolve_netease_url(RecordingClient(), "186016")
     assert url is None
     assert len(recorded) >= 1
-    assert all(t <= 5.0 for t in recorded)
+    assert all(t == 13.0 for t in recorded)
 
 
 @pytest.mark.anyio
@@ -1389,7 +1388,7 @@ async def test_netease_concurrent_resolution_shares_rendition(refresh, failure):
 @pytest.mark.anyio
 @pytest.mark.parametrize("cancel_leader", [False, True])
 @pytest.mark.parametrize("expired_pin", [False, True])
-async def test_netease_inflight_cancellation_uses_live_callers_client(cancel_leader, expired_pin):
+async def test_netease_inflight_cancellation_keeps_application_client(cancel_leader, expired_pin):
     import importlib
     p = importlib.import_module("proxy.app")
     entered, release = asyncio.Event(), asyncio.Event()
@@ -1421,9 +1420,9 @@ async def test_netease_inflight_cancellation_uses_live_callers_client(cancel_lea
             with pytest.raises(asyncio.CancelledError):
                 await cancelled
             if cancel_leader:
-                await a.aclose()
-                assert await waiter == "http://cdn.test/B.flac"
-                assert calls == ["leader", "waiter"]
+                release.set()
+                assert await waiter == "http://cdn.test/A.flac"
+                assert calls == ["leader"]
             else:
                 await b.aclose()
                 release.set()

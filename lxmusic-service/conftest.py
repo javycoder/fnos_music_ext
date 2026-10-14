@@ -132,7 +132,7 @@ class FakeLxServerClient:
     async def get_lyric(self, song_info: dict) -> dict | None:
         return self.lyric_result
 
-    async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1) -> list[dict]:
+    async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1, *, strict: bool = False) -> list[dict]:
         return await self.search("榜单", source=source)
 
     async def get_leaderboard_boards(self, source: str = "kg") -> list[dict]:

@@ -93,7 +93,7 @@
           <div class="card">
             <div class="card-title">网易账号歌单</div>
             <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
-            <label class="switch-row"><span>网易云歌单常驻<div class="sub">勾选后即使切换到其它音乐源，网易账号歌单仍显示在音乐页并可正常播放，网易盒子进程保持常驻运行（未登录网易账号时不会生效）。搜索结果仍仅在选中「网易云音乐盒子」音源时使用网易，不与其它音源聚合。取消勾选并保存后，若当前音源不是网易盒子，会关闭网易盒子进程以节省内存。</div></span><input type="checkbox" id="netease-playlist-resident"></label>
+            <label class="switch-row"><span>网易云歌单常驻<div class="sub">勾选后即使切换到其它音乐源，网易账号歌单和网易公共歌单仍可显示播放，网易盒子进程保持常驻运行。账号歌单仍需扫码登录；公共歌单可匿名常驻。搜索结果仍仅在选中「网易云音乐盒子」音源时使用网易，不与其它音源聚合。</div></span><input type="checkbox" id="netease-playlist-resident"></label>
           </div>
         </div>
 
@@ -165,6 +165,30 @@
           <div class="card-title">推荐</div>
           <label class="switch-row"><span>热门榜单推荐<div class="sub">独立「热门推荐」歌单：热歌榜/飙升榜原味</div></span><input type="checkbox" id="recommend-hot"></label>
           <label class="switch-row"><span>每日推荐<div class="sub">独立「每日推荐」歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
+          <label class="switch-row"><span>公共歌单<div class="sub">浏览并勾选网易/洛雪的原生推荐、分类歌单和榜单；勾选后作为独立只读歌单显示。musicdl 没有统一的推荐歌单发现接口。</div></span><input type="checkbox" id="public-playlists-enabled"></label>
+          <div id="public-playlists-browser" class="stack" hidden>
+            <div class="btn-row">
+              <select class="input" id="public-provider" aria-label="歌单音源"></select>
+              <select class="input" id="public-channel" aria-label="歌单入口"></select>
+              <select class="input" id="public-source" aria-label="洛雪平台" hidden></select>
+              <select class="input" id="public-sort" aria-label="排序" hidden></select>
+            </div>
+            <div class="btn-row">
+              <select class="input grow" id="public-category" aria-label="分类"></select>
+              <button class="btn" id="public-refresh">刷新</button>
+            </div>
+            <p class="hint" id="public-note">选择音源后加载歌单。</p>
+            <div id="public-list" class="public-list"></div>
+            <div class="btn-row">
+              <button class="btn small" id="public-prev">上一页</button>
+              <span id="public-page" class="muted">1 / 1</span>
+              <button class="btn small" id="public-next">下一页</button>
+            </div>
+            <div>
+              <div class="card-title">已选歌单（音乐页展示顺序）</div>
+              <div id="public-selected" class="stack"></div>
+            </div>
+          </div>
         </div>
       </section>
 

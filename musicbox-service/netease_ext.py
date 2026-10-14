@@ -62,6 +62,9 @@ def reset_api(reason: str = "") -> None:
     磁盘 cookie 变化（扫码成功等）后不重建实例，服务进程内就永远是旧登录态。
     """
     global _api_instance, _login_state
+    import playback
+
+    playback.reset()
     with _api_lock:
         if _api_instance is not None:
             try:
@@ -501,3 +504,202 @@ def playlist_track_ids(playlist_id: int) -> "list[int] | None":
         if sid > 0:
             ids.append(sid)
     return ids
+
+
+def _public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    from NEMbox.api import BASE_URL
+
+    with _api_lock:
+        api = _get_api_locked()
+        resp = api._raw_request("GET", f"{BASE_URL}{path}", params or {})
+        resp.raise_for_status()
+        return _validate_public_response(resp.json())
+
+
+def _validate_public_response(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get("code", 200) != 200:
+        raise RuntimeError(f"netease public request failed: code={data.get('code') if isinstance(data, dict) else 'invalid'}")
+    return data
+
+
+def _public_post(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    with _api_lock:
+        api = _get_api_locked()
+        return _validate_public_response(api.request("POST", path, params))
+
+
+def public_playlist_categories(kind: str = "playlist") -> dict[str, Any]:
+    highquality_tags: list[dict[str, str]] = []
+    if kind == "highquality":
+        data = _public_get("/api/playlist/highquality/tags")
+        tags = data.get("tags") if isinstance(data, dict) else []
+        rows = []
+        for item in tags if isinstance(tags, list) else []:
+            tag = (item.get("playlistTag") or item) if isinstance(item, dict) else None
+            if isinstance(tag, dict) and tag.get("name"):
+                rows.append({"id": str(tag.get("name")), "name": str(tag.get("name"))})
+        return {"ok": True, "categories": [{"id": "", "name": "全部"}], "tags": rows}
+
+    data = _public_post("/weapi/playlist/catalogue", {})
+    if not isinstance(data, dict) or data.get("code") != 200:
+        raise RuntimeError(f"netease catalogue failed: code={data.get('code') if isinstance(data, dict) else 'invalid'}")
+    names = data.get("categories") or {}
+    grouped: dict[str, list[dict]] = {}
+    for raw in data.get("sub") or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        group = str(names.get(str(raw.get("category")), "其他"))
+        grouped.setdefault(group, []).append({"id": str(raw["name"]), "name": str(raw["name"])})
+    categories = [{"id": "", "name": "全部"}]
+    categories.extend({"id": name, "name": name} for name in grouped)
+    try:
+        high_rows = public_playlist_categories("highquality").get("tags") or []
+        highquality_tags.extend(high_rows)
+    except Exception:
+        pass
+    return {"ok": True, "categories": categories, "tags": grouped, "highquality_tags": highquality_tags}
+
+
+def _public_summary(item: dict[str, Any], kind: str = "playlist") -> dict[str, Any]:
+    creator = item.get("creator") if isinstance(item.get("creator"), dict) else {}
+    cover = str(
+        item.get("coverImgUrl") or item.get("cover_url")
+        or item.get("picUrl") or item.get("cover") or ""
+    )
+    try:
+        updated = int(item.get("updateTime") or item.get("trackNumberUpdateTime") or 0) // 1000
+    except (TypeError, ValueError):
+        updated = 0
+    return {
+        "id": str(item.get("id") or ""),
+        "kind": kind,
+        "source": "netease",
+        "name": str(item.get("name") or ""),
+        "cover_url": cover,
+        "track_count": _int_or_zero(item.get("trackCount") or item.get("trackcount")),
+        "author": str(item.get("nickname") or creator.get("nickname") or ""),
+        "description": str(item.get("description") or item.get("copywriter") or ""),
+        "updated_at": updated,
+    }
+
+
+def public_playlists(
+    channel: str,
+    category: str = "",
+    sort: str = "hot",
+    page: int = 1,
+    limit: int = 30,
+    cursor: str = "",
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 30), 50))
+    if channel == "charts":
+        data = _public_get("/api/toplist")
+        rows = data.get("list") if isinstance(data, dict) else []
+        items = [_public_summary(row, "chart") for row in rows or [] if isinstance(row, dict) and row.get("id")]
+        return {"ok": True, "items": items, "total": len(items), "has_more": False}
+
+    if channel == "recommend":
+        data = _public_get("/api/personalized/playlist", {"limit": min(limit, 30)})
+        rows = data.get("result") if isinstance(data, dict) else []
+        return {"ok": True, "items": [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")], "has_more": False}
+
+    if channel == "account_recommend":
+        with _api_lock:
+            api = _get_api_locked()
+            raw = api.request("POST", "/weapi/v1/discovery/recommend/resource", {})
+            if isinstance(raw, dict) and raw.get("code") == 301:
+                return {"ok": False, "error": "not_logged_in", "logged_in": False}
+            _validate_public_response(raw)
+            rows = raw.get("recommend") or []
+        if not isinstance(rows, list):
+            raise RuntimeError("netease account recommend returned invalid payload")
+        return {"ok": True, "items": [_public_summary(row) for row in rows if isinstance(row, dict) and row.get("id")], "has_more": False}
+
+    if channel == "highquality":
+        params: dict[str, Any] = {"limit": limit}
+        if category:
+            params["cat"] = category
+        if cursor:
+            params["before"] = cursor
+        data = _public_get("/api/playlist/highquality/list", params)
+        rows = data.get("playlists") if isinstance(data, dict) else []
+        next_cursor = ""
+        if rows:
+            last = rows[-1] if isinstance(rows[-1], dict) else {}
+            next_cursor = str(last.get("updateTime") or "")
+        return {
+            "ok": True,
+            "items": [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")],
+            "total": _int_or_zero(data.get("total")),
+            "has_more": bool(data.get("more")) if isinstance(data, dict) else bool(rows),
+            "next_cursor": next_cursor,
+        }
+
+    data = _public_post("/weapi/playlist/list", {
+        "cat": category or "全部",
+        "order": sort if sort in ("hot", "new") else "hot",
+        "offset": (page - 1) * limit,
+        "total": "true",
+        "limit": limit,
+    })
+    if not isinstance(data, dict) or data.get("code") != 200:
+        raise RuntimeError(f"netease playlists failed: code={data.get('code') if isinstance(data, dict) else 'invalid'}")
+    rows = data.get("playlists") or []
+    total = _int_or_zero(data.get("total"))
+    return {
+        "ok": True,
+        "items": [_public_summary(row) for row in rows if isinstance(row, dict) and row.get("id")],
+        "total": total,
+        "has_more": bool(data.get("more")) or (page * limit < total if total else bool(rows)),
+    }
+
+
+def public_playlist(playlist_id: int, kind: str = "playlist") -> dict[str, Any]:
+    if kind == "chart":
+        rows = public_playlists("charts").get("items") or []
+        for row in rows:
+            if row.get("id") == str(playlist_id):
+                return {"ok": True, "data": row}
+    with _api_lock:
+        api = _get_api_locked()
+        raw = api.eapi_request("/api/v6/playlist/detail", {
+            "id": int(playlist_id), "n": 0, "s": 0,
+        })
+    playlist = raw.get("playlist") if isinstance(raw, dict) else None
+    if not isinstance(playlist, dict) or not playlist.get("id"):
+        raise RuntimeError(f"playlist {playlist_id} not found")
+    return {"ok": True, "data": _public_summary(playlist, "chart" if kind == "chart" else "playlist")}
+
+
+def public_playlist_tracks(playlist_id: int, kind: str = "playlist") -> dict[str, Any]:
+    with _api_lock:
+        api = _get_api_locked()
+        raw = api.eapi_request("/api/v6/playlist/detail", {
+            "id": int(playlist_id), "n": 1000, "s": 0,
+        })
+    playlist = raw.get("playlist") if isinstance(raw, dict) else None
+    if not isinstance(playlist, dict) or not isinstance(playlist.get("trackIds"), list):
+        raise RuntimeError(f"playlist {playlist_id} tracks unavailable")
+    track_ids_raw = playlist["trackIds"]
+    ids: list[int] = []
+    seen: set[int] = set()
+    truncated = False
+    for item in track_ids_raw or []:
+        sid = item if isinstance(item, int) else (item.get("id") if isinstance(item, dict) else 0)
+        sid = _int_or_zero(sid)
+        if sid <= 0 or sid in seen:
+            continue
+        if len(ids) >= 1000:
+            truncated = True
+            break
+        seen.add(sid)
+        ids.append(sid)
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(ids), 100):
+        rows.extend(batch_song_details(ids[start:start + 100]))
+    by_id = {int(row["song_id"]): row for row in rows}
+    if any(sid not in by_id for sid in ids):
+        raise RuntimeError("netease playlist song details incomplete")
+    total = max(len(track_ids_raw), _int_or_zero(playlist.get("trackCount")))
+    return {"ok": True, "data": [by_id[sid] for sid in ids], "total": total, "truncated": truncated or total > 1000}

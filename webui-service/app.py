@@ -114,6 +114,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
+    "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
+    "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
     "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
@@ -342,9 +344,38 @@ def _resident_flag(values: dict[str, str]) -> bool:
 
 
 def _resident_active(values: dict[str, str]) -> bool:
-    """常驻生效判定：勾选常驻 + 账号歌单开关（常驻为其供数，关闭时空跑无意义）。"""
-    return _resident_flag(values) and str(
-        values.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "")).strip().lower() in ("true", "1", "yes")
+    """常驻生效判定：账号歌单或至少一份网易公共歌单需要 musicbox 供数。"""
+    if not _resident_flag(values):
+        return False
+    account = str(values.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "")).strip().lower() in ("true", "1", "yes")
+    if account:
+        return True
+    public = str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "")).strip().lower() in ("true", "1", "yes")
+    if not public:
+        return False
+    return any(
+        isinstance(item, dict) and item.get("provider") == "musicbox"
+        and str(item.get("id") or "").strip()
+        for item in _public_selection_rows(values)
+    )
+
+
+def _public_selection_rows(values: dict[str, str]) -> list:
+    if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" not in values:
+        return [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
+    try:
+        selection = json.loads(str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION") or "[]"))
+    except Exception:
+        return []
+    return selection if isinstance(selection, list) else []
+
+def _public_musicbox_needed(values: dict[str, str]) -> bool:
+    if not str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "")).strip().lower() in ("true", "1", "yes"):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("provider") == "musicbox" and str(item.get("id") or "").strip()
+        for item in _public_selection_rows(values)
+    )
 
 
 def _musicbox_proc_running() -> bool:
@@ -387,9 +418,8 @@ async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict
                                        actions: list[dict], warn: bool = False) -> None:
     """按常驻期望对账 musicbox 进程（幂等；provider=musicbox 时进程归音源切换管，跳过）。
 
-    - 常驻生效（勾选常驻+账号歌单+已登录）：进程未运行则拉起并等 healthz。
-    - 确认未登录（auth/status 明确 False）：不生效并回收进程，5 分钟内不再反复拉起；
-      不可达（None）视为未知，保守保留运行中的进程。
+    - 常驻生效：进程未运行则拉起并等 healthz；公共歌单可匿名保活。
+    - 账号歌单确认未登录但无公共歌单：回收进程；仍有公共歌单则保留进程并提示账号部分不可用。
     - 常驻不生效且进程在跑：停止释放内存（需求：取消勾选后节省内存）。
     warn=True 时（本次保存涉及常驻/切源）把未登录告警写进响应 actions。
     """
@@ -400,6 +430,8 @@ async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict
     want = _resident_active(values)
     _resident_state["active"] = False
     running = _musicbox_proc_running()
+    if want and _public_musicbox_needed(values) and time.monotonic() < _resident_start_block["until"]:
+        _resident_start_block.update(until=0.0, reason="")
     if not want:
         if running:
             code, out = supervisorctl("stop", "musicbox")
@@ -428,12 +460,21 @@ async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict
         running = True
     logged = await _musicbox_login_state(client)
     if logged is False:
-        # 进程可达且明确未登录：常驻前提不成立，回收进程释放内存
+        public_only = not str(values.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "")).strip().lower() in ("true", "1", "yes")
+        if public_only:
+            _resident_state["active"] = True
+            return
+        public_needed = _public_musicbox_needed(values)
+        if public_needed:
+            _resident_state["active"] = True
+            if warn:
+                actions.append({"kind": "resident", "op": "account_deactivate", "ok": False,
+                                "error": _RESIDENT_NOT_LOGGED_IN})
+            return
         _resident_start_block.update(until=time.monotonic() + _RESIDENT_RETRY_BLOCK_S,
                                      reason=_RESIDENT_NOT_LOGGED_IN)
         code, out = supervisorctl("stop", "musicbox")
-        actions.append({"kind": "resident", "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        actions.append({"kind": "resident", "op": "stop", "ok": code == 0, "error": "" if code == 0 else out})
         if warn:
             actions.append({"kind": "resident", "op": "deactivate", "ok": False,
                             "error": _RESIDENT_NOT_LOGGED_IN})
@@ -647,6 +688,23 @@ def validate_updates(values: dict) -> dict[str, str]:
         raise ValueError(f"音源三选一：{'、'.join(enabled)} 同时启用，请只保留一个")
     if updates.keys() & _PROVIDER_KEYS and not enabled:
         raise ValueError("至少需要启用一个音源")
+    if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" in updates:
+        try:
+            selection = json.loads(str(updates["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] or "[]"))
+        except Exception as exc:
+            raise ValueError(f"公共歌单选择不是合法 JSON: {exc}") from exc
+        if not isinstance(selection, list):
+            raise ValueError("公共歌单选择必须是 JSON 数组")
+        if len(selection) > 50:
+            raise ValueError("公共歌单最多选择 50 份")
+        allowed = {"musicbox", "lx"}
+        for item in selection:
+            if not isinstance(item, dict) or item.get("provider") not in allowed:
+                raise ValueError("公共歌单条目无效")
+            if item.get("kind") not in {"playlist", "chart"}:
+                raise ValueError("公共歌单类型无效")
+            if not str(item.get("source") or "").strip() or not str(item.get("id") or "").strip():
+                raise ValueError("公共歌单条目缺少平台或 ID")
     return updates
 
 
@@ -880,6 +938,7 @@ async def api_config():
     return {
         "ok": True,
         "values": {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()},
+        "presence": dict.fromkeys(values.keys(), True),
         "schema": SCHEMA,
         "env_path": str(ENV_PATH),
     }
@@ -1270,6 +1329,68 @@ async def api_platforms(request: Request):
     return {"ok": True, "enabled": data.get("enabled") or [], "registered": data.get("registered") or []}
 
 
+_public_discovery_cache: dict[tuple, tuple[float, bytes, str]] = {}
+_public_discovery_locks: dict[tuple, asyncio.Lock] = {}
+
+
+@app.api_route("/api/public-playlists", methods=["GET"])
+@app.api_route("/api/public-playlists/{target:path}", methods=["GET"])
+async def api_public_playlists(target: str = "", request: Request = None):
+    """公共歌单浏览代理：provider 选择 musicbox/lxmusic，固定白名单目标路径。"""
+    provider = str(request.query_params.get("provider") or "").strip()
+    if provider not in ("musicbox", "lxmusic"):
+        return JSONResponse(content={"ok": False, "error": "provider 必须是 musicbox 或 lxmusic"}, status_code=400)
+    allowed = (
+        "capabilities", "categories",
+    )
+    if target and target not in allowed and not re.fullmatch(r"[^/]+(/tracks)?", target):
+        return JSONResponse(content={"ok": False, "error": "unknown public playlist endpoint"}, status_code=404)
+    if provider == "musicbox":
+        preview_renew("musicbox")
+        base = CONF["musicbox_url"]
+    else:
+        preview_renew("lxmusic")
+        base = CONF["lx_url"]
+    params = {key: value for key, value in request.query_params.items() if key != "provider"}
+    if target in {".", ".."}:
+        return JSONResponse(content={"ok": False, "error": "invalid playlist ID"}, status_code=400)
+    upstream_path = "/api/v1/public-playlists" + (f"/{target}" if target else "")
+    cacheable = target != "capabilities" and not target.endswith("/tracks") and params.get("channel") != "account_recommend"
+    cache_key = (provider, target, tuple(sorted(params.items())))
+    if len(_public_discovery_locks) > 512:
+        for key, existing_lock in list(_public_discovery_locks.items()):
+            if not existing_lock.locked():
+                _public_discovery_locks.pop(key, None)
+    cached = _public_discovery_cache.get(cache_key)
+    if cacheable and cached and cached[0] > time.monotonic():
+        return Response(content=cached[1], media_type=cached[2])
+    try:
+        lock = _public_discovery_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            cached = _public_discovery_cache.get(cache_key)
+            if cacheable and cached and cached[0] > time.monotonic():
+                return Response(content=cached[1], media_type=cached[2])
+            resp = await get_http(request).get(
+                f"{base}{upstream_path}", params=params,
+                timeout=httpx.Timeout(65.0, connect=3.0),
+            )
+            if cacheable and resp.status_code == 200 and _resp_json(resp).get("ok") is True:
+                ttl = 86400 if target == "categories" or params.get("channel") == "charts" else 1800
+                if len(_public_discovery_cache) >= 256:
+                    _public_discovery_cache.pop(next(iter(_public_discovery_cache)))
+                _public_discovery_cache[cache_key] = (time.monotonic() + ttl, resp.content, resp.headers.get("content-type", "application/json"))
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": f"音源服务不可达: {exc}", "hint": "请先在管理页预览或启用该音源"},
+            status_code=503,
+        )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
+
+
 # ------------------------------------------------- 网易扫码（反代 musicbox） --
 
 @app.api_route("/api/netease/auth/{path:path}", methods=["GET", "POST"])
@@ -1297,6 +1418,7 @@ async def netease_auth_proxy(path: str, request: Request):
             payload = resp.json()
             data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
             if isinstance(data, dict) and data.get("code") == 803:
+                _public_discovery_cache.clear()
                 _resident_login_cache.update(ts=0.0, value=None)
                 _resident_start_block.update(until=0.0, reason="")
                 values = read_env()

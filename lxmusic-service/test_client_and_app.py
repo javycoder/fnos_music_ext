@@ -242,6 +242,134 @@ def test_leaderboard_list_non200_returns_empty():
     assert asyncio.run(_run()) == []
 
 
+def test_public_leaderboard_error_is_not_an_empty_page():
+    client = LxServerClient(base_url="http://lxserver-test")
+    async def run():
+        client._client = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(lambda request: httpx.Response(500)))
+        try:
+            with pytest.raises(RuntimeError, match="500"):
+                await client.get_leaderboard_list("kg", "8888", strict=True)
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
+def test_song_list_client_contracts_preserve_raw_ids():
+    """歌单广场：tag/list/detail 契约与原始 ID（含非数字形态）保持不变。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({"path": request.url.path, "params": dict(request.url.params)})
+        path = request.url.path
+        if path == "/api/music/songList/tags":
+            return httpx.Response(200, json={
+                "tags": [{"name": "分类", "list": [{"id": "id_abc", "name": "推荐"}]}],
+                "hotTag": [{"id": "hot", "name": "热门"}],
+                "sortList": [{"id": "5", "name": "推荐"}], "source": "kg",
+            })
+        if path == "/api/music/songList/list":
+            return httpx.Response(200, json={
+                "list": [{"id": "id_abc", "name": "精选歌单", "img": "http://img/kg.jpg",
+                          "total": 20, "author": "酷狗"}],
+                "total": 1, "limit": 30, "source": "kg",
+            })
+        if path == "/api/music/songList/detail":
+            return httpx.Response(200, json={
+                "list": [{"name": "晴天", "singer": "周杰伦", "songmid": "ABC",
+                          "source": "kg", "hash": "ABC", "interval": "04:29"}],
+                "total": 1, "limit": 1000,
+                "info": {"name": "精选歌单", "img": "http://img/kg.jpg", "desc": "", "author": "酷狗"},
+            })
+        return httpx.Response(404)
+
+    client = LxServerClient(base_url="http://lxserver-test")
+
+    async def _run():
+        client._client = httpx.AsyncClient(
+            base_url=client.base_url, transport=httpx.MockTransport(handler), timeout=5.0,
+        )
+        try:
+            tags = await client.get_song_list_tags("kg")
+            rows = await client.get_song_lists("kg", "id_abc", "5", 1)
+            detail = await client.get_song_list_detail("kg", "id_abc", 1)
+            return tags, rows, detail
+        finally:
+            await client.close()
+
+    tags, rows, detail = asyncio.run(_run())
+    assert seen[1]["params"] == {"source": "kg", "tagId": "id_abc", "sortId": "5", "page": "1"}
+    assert seen[2]["params"] == {"source": "kg", "id": "id_abc", "page": "1"}
+    summary = client.normalize_public_playlist(rows["list"][0], "kg")
+    assert summary["id"] == "id_abc" and summary["track_count"] == 20
+    assert detail["info"]["name"] == "精选歌单"
+    chart = client.normalize_public_playlist({"id": "kg__8888", "bangid": "8888", "name": "TOP500"}, "kg", "chart")
+    assert chart["id"] == "8888"
+
+
+def test_public_chart_tracks_follow_native_pages(test_app_client, fake_lx):
+    calls: list[int] = []
+
+    async def paged(source, board_id, page=1, *, strict=False):
+        assert strict is True
+        assert source == "kg" and board_id == "8888"
+        calls.append(page)
+        if page > 2:
+            return []
+        return [{"id": f"lx:kg:song-{page}", "title": f"歌曲{page}", "lx_source": "kg"}]
+
+    fake_lx.get_leaderboard_list = paged
+    res = test_app_client.get(
+        "/api/v1/public-playlists/8888/tracks",
+        params={"source": "kg", "kind": "chart"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is True and data["total"] == 2 and data["truncated"] is False
+    assert [item["title"] for item in data["data"]] == ["歌曲1", "歌曲2"]
+    assert calls == [1, 2, 3]
+
+
+def test_public_chart_stops_when_platform_repeats_page(test_app_client, fake_lx):
+    calls = []
+    async def repeated(source, board_id, page=1, *, strict=False):
+        calls.append(page)
+        return [{"id": "lx:wy:101", "title": "同一首歌", "lx_source": "wy"}]
+    fake_lx.get_leaderboard_list = repeated
+    result = test_app_client.get("/api/v1/public-playlists/3779629/tracks", params={"source": "wy", "kind": "chart"}).json()
+    assert result["total"] == 1 and result["truncated"] is False
+    assert calls == [1, 2]
+
+
+def test_same_source_discovery_requests_are_serialized():
+    active = 0
+    overlapped = False
+
+    class GatedTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            nonlocal active, overlapped
+            active += 1
+            if active > 1:
+                overlapped = True
+            await asyncio.sleep(0)
+            active -= 1
+            return httpx.Response(200, json={"list": [], "info": {}, "total": 0, "limit": 30})
+
+    client = LxServerClient(base_url="http://lxserver-test")
+
+    async def run():
+        client._client = httpx.AsyncClient(base_url=client.base_url, transport=GatedTransport(), timeout=5.0)
+        try:
+            await asyncio.gather(
+                client.get_song_list_detail("kg", "id_abc", 1),
+                client.get_song_list_detail("kg", "id_def", 2),
+            )
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert overlapped is False
+
+
 def test_track_info_endpoint(test_app_client):
     # 未缓存条目返回合成数据
     res = test_app_client.get("/api/v1/track/info?id=lx:kw:5886682")

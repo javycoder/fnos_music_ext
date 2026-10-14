@@ -390,6 +390,9 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
     copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
     ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
+    assert "proxy/publicplaylists.py" in copied
+    assert "!proxy/publicplaylists.py" in ignore
     for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
             # 测试文件（test_*/conftest）不进镜像、不随服务运行：其跨目录 import

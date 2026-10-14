@@ -441,23 +441,21 @@ def test_song_url_invalid_quality_rejected():
     assert "Invalid quality" in resp.json()["detail"]
 
 
-def test_song_url_passes_quality_to_cli(monkeypatch):
+def test_song_url_forwards_quality_and_fresh_to_async_resolver(monkeypatch):
     captured = {}
 
-    def mock_run(args, timeout=30.0):
-        captured["args"] = args
-        return 0, '{"ok": true, "data": {"code": 200, "url": "http://m.test/a.flac"}}', ""
+    async def resolve(sid, quality, fresh=False):
+        captured["args"] = (sid, quality, fresh)
+        return {"code": 200, "url": "http://m.test/a.flac"}
 
-    # 本测试校验 CLI 参数透传：进程内路径置为失败，强制走 CLI 兜底
-    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q, fresh=False: None)
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "get_song_url_async", resolve)
     with TestClient(app) as client:
-        resp = client.get("/api/v1/song/123/url", params={"quality": "lossless"})
+        resp = client.get("/api/v1/song/123/url", params={"quality": "lossless", "fresh": 1})
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
     assert resp.json()["data"]["code"] == 200
     assert resp.json()["data"]["url"].endswith(".flac")
-    assert captured["args"] == ["song", "url", "123", "--quality", "lossless", "--json"]
+    assert captured["args"] == (123, "lossless", True)
 
 
 def test_song_info_artist_album_playlist_cli_args(monkeypatch):
@@ -851,26 +849,14 @@ def test_get_song_url_inproc_with_quality_and_cache(monkeypatch):
     assert len(netease_ext._url_cache) == 2
 
 
-def test_song_url_prefers_inproc_falls_back_to_cli(monkeypatch):
-    """进程内解析失败时降级 CLI 子进程（保留结构化错误语义）。"""
-    cli_calls = []
-
-    def mock_run_musicbox(args, timeout=30.0):
-        cli_calls.append(args)
-        return 0, json.dumps({"ok": True, "data": {"url": "http://cli/1.mp3", "code": 200}}), ""
-
-    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q, fresh=False: None)
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
-    with TestClient(app) as client:
-        r = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
-        assert r.json()["data"]["url"] == "http://cli/1.mp3"
-    assert cli_calls == [["song", "url", "42", "--quality", "exhigh", "--json"]]
-
-    # 进程内成功：不再起 CLI 子进程
+def test_song_url_async_success_preserves_response_without_sync_cli(monkeypatch):
     def boom(args, timeout=30.0):
         raise AssertionError("CLI 不应被调用")
 
-    monkeypatch.setattr(musicbox_app, "get_song_url", lambda sid, q, fresh=False: {"url": "http://inproc/1.flac", "code": 200})
+    async def inproc(sid, quality, fresh=False):
+        return {"url": "http://inproc/1.flac", "code": 200}
+
+    monkeypatch.setattr(musicbox_app, "get_song_url_async", inproc)
     monkeypatch.setattr(runner, "run_musicbox", boom)
     with TestClient(app) as client:
         r2 = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
@@ -956,6 +942,83 @@ def test_user_playlist_tracks_endpoint_not_logged_in(monkeypatch):
         resp = client.get("/api/v1/user/playlists/111/tracks")
         data = resp.json()
     assert data["ok"] is False and data["error"] == "not_logged_in"
+
+
+def test_public_playlist_tracks_preserves_order_and_marks_vip(monkeypatch):
+    class MockApi:
+        def eapi_request(self, path, params):
+            assert path == "/api/v6/playlist/detail"
+            assert params["id"] == 111
+            return {"playlist": {"id": 111, "trackCount": 2, "trackIds": [{"id": 101}, {"id": 102}]}}
+
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    monkeypatch.setattr(netease_ext, "batch_song_details", lambda ids: [
+        {"song_id": i, "name": f"s{i}", "artist": "a", "album_name": "al",
+         "album_pic_url": "", "duration_ms": 1000, "fee": 1 if i == 101 else 0}
+        for i in ids
+    ])
+    monkeypatch.setattr(musicbox_app, "vip_entitled", lambda: False)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/public-playlists/111/tracks", params={"source": "netease", "kind": "playlist"})
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["ok"] is True and data["total"] == 2 and data["truncated"] is False
+    assert [row["song_id"] for row in data["data"]] == [101, 102]
+    assert data["data"][0]["needs_vip"] is True
+    assert "needs_vip" not in data["data"][1]
+
+
+def test_public_playlist_categories_contract_groups_tags_and_specializes_chart(monkeypatch):
+    grouped = {"语种": [{"id": "华语", "name": "华语"}]}
+    high_tags = [{"id": "精品", "name": "精品"}]
+
+    def fake_categories(kind):
+        assert kind == "playlist"
+        return {
+            "ok": True,
+            "categories": [{"id": "", "name": "全部"}, {"id": "语种", "name": "语种"}],
+            "tags": grouped,
+            "highquality_tags": high_tags,
+        }
+
+    monkeypatch.setattr(musicbox_app, "public_playlist_categories", fake_categories)
+    with TestClient(app) as client:
+        playlist = client.get("/api/v1/public-playlists/categories", params={"source": "netease", "kind": "playlist"})
+        chart = client.get("/api/v1/public-playlists/categories", params={"source": "netease", "kind": "chart"})
+
+    assert playlist.status_code == 200
+    payload = playlist.json()
+    assert payload["categories"][0] == {"id": "", "name": "全部"}
+    assert payload["categories"][1]["list"] == grouped["语种"]
+    assert payload["highquality_tags"] == high_tags
+    assert chart.status_code == 200
+    assert chart.json()["categories"] == [{"id": "", "name": "全部"}]
+
+
+def test_missing_public_tracks_is_error_not_empty(monkeypatch):
+    class MockApi:
+        def eapi_request(self, path, params):
+            return {"code": 500}
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    with pytest.raises(RuntimeError, match="unavailable"):
+        netease_ext.public_playlist_tracks(111)
+
+
+def test_highquality_tags_accept_direct_and_nested_samples(monkeypatch):
+    monkeypatch.setattr(netease_ext, "_public_get", lambda *args: {
+        "code": 200, "tags": [{"name": "华语"}, {"playlistTag": {"name": "摇滚"}}],
+    })
+    result = netease_ext.public_playlist_categories("highquality")
+    assert result["tags"] == [{"id": "华语", "name": "华语"}, {"id": "摇滚", "name": "摇滚"}]
+
+
+def test_public_business_failure_is_not_successful_empty_list(monkeypatch):
+    class MockApi:
+        def request(self, method, path, params):
+            return {"code": 503}
+    monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
+    with pytest.raises(RuntimeError, match="503"):
+        netease_ext.public_playlists("top")
 
 
 def test_search_offset_routes_to_web_fallback(monkeypatch):

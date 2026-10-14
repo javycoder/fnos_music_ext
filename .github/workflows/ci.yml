@@ -46,10 +46,10 @@ jobs:
 
       - name: Python compile check
         run: >
-          python -m py_compile proxy/app.py proxy/recommend.py proxy/env_merge.py proxy/version.py
+          python -m py_compile proxy/app.py proxy/recommend.py proxy/publicplaylists.py proxy/env_merge.py proxy/version.py
           lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py
           musicdl-service/app.py musicdl-service/hardening.py
-          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py
+          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py
           webui-service/app.py
 
       # 覆盖率仅作摘要展示（不设门槛）；cov 参数只出现在 CI，本地 pytest 无需装 pytest-cov

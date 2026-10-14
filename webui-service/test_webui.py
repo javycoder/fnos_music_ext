@@ -5,6 +5,7 @@ supervisorctl 与音源 HTTP 均离线：前者 monkeypatch，后者 MockTranspo
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import time
 from contextlib import contextmanager
@@ -51,6 +52,8 @@ def env_file(tmp_path, monkeypatch):
     monkeypatch.setattr(webui, "ENV_PATH", env)
     monkeypatch.setattr(webui, "VERSION_PATH", tmp_path / "VERSION")
     webui._preview_until.clear()  # 预览状态是模块级全局，用例间隔离
+    webui._public_discovery_cache.clear()
+    webui._public_discovery_locks.clear()
     return env
 
 
@@ -859,6 +862,30 @@ def test_platforms_unreachable_503(env_file):
 
 # ------------------------------------------------------------------ 网易反代/二维码 ---
 
+def test_public_playlist_proxy_routes_and_strips_provider(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"ok": True, "items": []})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        resp = client.get("/api/public-playlists", params={"provider": "musicbox", "channel": "charts"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert captured["path"] == "/api/v1/public-playlists"
+        assert captured["params"] == {"channel": "charts"}
+        # 公共目录缓存不应在同一入口连续浏览时重复请求上游。
+        captured.clear()
+        again = client.get("/api/public-playlists", params={"provider": "musicbox", "channel": "charts"})
+        assert again.status_code == 200
+        assert captured == {}
+    key = next(iter(webui._public_discovery_cache))
+    assert key == ("musicbox", "", (("channel", "charts"),))
+
 # musicbox CLI（auth ... --json）的真实输出契约：{ok, data:{...}} 信封结构。
 # 前端 static/app.js pollQr/checkQrStatus 与 netease_login.sh 均按此解析（code 在 data 里），
 # 与 proxy/tests/test_musicbox_service.py 的 CLI mock 保持一致。
@@ -1119,6 +1146,51 @@ def test_resident_without_login_reclaims_process(env_file, svctl, resident_state
         assert not [a for a in r.json()["actions"] if a["kind"] == "resident"]
     assert ("start", "musicbox") not in svctl.calls
     assert ("stop", "musicbox") not in svctl.calls
+
+
+def test_public_playlists_allow_anonymous_resident(env_file, svctl, resident_state):
+    """网易公共歌单复用常驻开关：未登录也保活 musicbox，账号歌单提示不可用。"""
+    selection = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+                .replace("FNMUSIC_MUSICDL_ENABLED='false'", "FNMUSIC_MUSICDL_ENABLED='true'")
+        + "FNMUSIC_NETEASE_PLAYLIST_RESIDENT='true'\nFNMUSIC_NETEASE_MY_PLAYLISTS='false'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_ENABLED='true'\nFNMUSIC_PUBLIC_PLAYLISTS_SELECTION={json.dumps(selection)}\n",
+        encoding="utf-8",
+    )
+    svctl.status_output["musicbox"] = "musicbox                       STOPPED   Not started"
+    webui._resident_start_block.update(until=time.monotonic() + 300.0, reason="旧账号未登录防抖")
+    _mock_http(_resident_http(logged_in=False))
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": True,
+            "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(selection),
+        }})
+        assert saved.status_code == 200, saved.text
+        actions = saved.json()["actions"]
+    assert ("start", "musicbox") in svctl.calls
+    assert ("stop", "musicbox") not in svctl.calls
+    assert webui._resident_state["active"] is True
+    assert webui._resident_start_block["until"] == 0.0
+    assert not [a for a in actions if a.get("kind") == "resident" and a.get("op") == "stop"]
+
+
+def test_public_playlist_selection_rejects_invalid_payload(env_file, svctl):
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": True,
+            "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps([{"provider": "unknown"}]),
+        }})
+        assert saved.status_code == 400
+        assert "公共歌单" in saved.json()["error"]
+
+
+def test_public_playlist_save_contract_strips_display_only_fields():
+    """管理页内部可保留展示字段，但写入配置必须只保存稳定身份四字段。"""
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    needle = "publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))"
+    assert needle in js
+    assert "_name: item.name" in js and "_cover_url: item.cover_url" in js
 
 
 def test_resident_disable_stops_musicbox_for_memory(env_file, svctl, resident_state):

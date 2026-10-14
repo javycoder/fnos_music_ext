@@ -1,5 +1,6 @@
 """Offline checks run with each service's real production dependencies installed."""
 import argparse
+import asyncio
 import contextlib
 import importlib
 import io
@@ -45,6 +46,49 @@ def check_musicbox():
     result = subprocess.run([str(executable), "song", "url", "--help"], capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert b"--quality" in result.stdout
+    import playback
+    import netease_ext
+    import httpx
+    from urllib.parse import parse_qs
+    from NEMbox.encrypt import AES, EAPI_KEY
+
+    client_type = httpx.AsyncClient
+    captured = []
+
+    def handler(request):
+        form = parse_qs(request.content.decode())
+        if request.url.path.endswith("/url/v1"):
+            decoded = AES.new(EAPI_KEY, AES.MODE_ECB).decrypt(bytes.fromhex(form["params"][0]))
+            decoded = decoded[:-decoded[-1]].decode().split("-36cd479b6b5-")
+            body = json.loads(decoded[1])
+            assert decoded[0] == "/api/song/enhance/player/url/v1"
+            assert body["ids"] == "[123]" and body["level"] == "lossless"
+            assert body["encodeType"] == "flac" and body["header"]["deviceId"]
+            captured.append("eapi")
+            plain = json.dumps({"code": 200, "data": []}).encode()
+            padding = 16 - len(plain) % 16
+            encrypted = AES.new(EAPI_KEY, AES.MODE_ECB).encrypt(plain + bytes([padding]) * padding)
+            return httpx.Response(200, content=encrypted)
+        assert "params" in form and "encSecKey" in form
+        assert request.headers["host"] == request.url.host
+        captured.append("weapi")
+        return httpx.Response(200, json={"code": 200, "data": [{
+            "id": 123, "code": 200, "url": "https://audio.invalid/fixture.flac",
+        }]})
+
+    async def verify():
+        original_client = playback.httpx.AsyncClient
+        playback.httpx.AsyncClient = lambda **kwargs: client_type(transport=httpx.MockTransport(handler), **kwargs)
+        try:
+            playback.reset()
+            with netease_ext._api_lock:
+                item = await asyncio.wait_for(playback.get_song_url_async(123, "lossless"), 5)
+            assert item["url"].endswith(".flac") and captured == ["eapi", "weapi"]
+            await playback.shutdown()
+        finally:
+            playback.httpx.AsyncClient = original_client
+
+    asyncio.run(verify())
 
 
 def main():

@@ -2,5 +2,6 @@
 NetEase-MusicBox>=0.5.3
 fastapi>=0.110
 uvicorn>=0.29
+httpx>=0.27
 qrcode>=7.4
 pillow>=10.0

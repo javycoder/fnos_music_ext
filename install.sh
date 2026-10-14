@@ -1162,6 +1162,7 @@ chmod 0644 \
     "${BASE_DIR}/musicdl-service/app.py" "${BASE_DIR}/musicdl-service/hardening.py" \
     "${BASE_DIR}/musicbox-service/app.py" "${BASE_DIR}/musicbox-service/runner.py" \
     "${BASE_DIR}/musicbox-service/netease_ext.py" \
+    "${BASE_DIR}/musicbox-service/playback.py" \
     "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
     "${BASE_DIR}/lxmusic-service/verify_source.py" "${BASE_DIR}/lxmusic-service/js/bridge.js" \
     "${BASE_DIR}/webui-service/app.py" "${BASE_DIR}/webui-service/static/index.html" \

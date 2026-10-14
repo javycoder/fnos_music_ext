@@ -1021,6 +1021,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="fnmusic-lxmusic", version=SERVICE_VERSION, lifespan=lifespan)
 
 
+@app.exception_handler(ValueError)
+async def value_error_handler(_request: Request, exc: ValueError):
+    return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+
+
 def get_http(request_or_app=None) -> httpx.AsyncClient:
     state = getattr(request_or_app, "state", None) or getattr(app, "state", None)
     if state is not None:
@@ -1205,6 +1210,186 @@ async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
 
     _STATS["errors"] += len(errors)
     return {"ok": True, "items": items[:limit], "errors": errors, "charts": ["kg", "kw", "wy"]}
+
+
+def _public_source(source: str) -> str:
+    src = normalize_source(source)
+    if not src or src not in SUPPORTED_PLATFORMS:
+        raise ValueError(f"unsupported source {source!r}")
+    return src
+
+
+@app.get("/api/v1/public-playlists/capabilities")
+async def public_playlist_capabilities():
+    caps = await source_capabilities()
+    return {
+        "ok": True,
+        "provider": "lx",
+        "sources": [{
+            "id": src,
+            "name": {"kw": "酷我", "kg": "酷狗", "tx": "QQ", "wy": "网易", "mg": "咪咕"}.get(src, src.upper()),
+            "playback_available": bool(caps.get(src, {}).get("playback_available")),
+            "reason": caps.get(src, {}).get("reason") or "",
+            "channels": [
+                {"id": "top", "name": "热门与分类", "login_required": False},
+                {"id": "charts", "name": "排行榜", "login_required": False},
+            ],
+            "logged_in": False,
+        } for src in SUPPORTED_PLATFORMS],
+    }
+
+
+@app.get("/api/v1/public-playlists/categories")
+async def public_playlist_categories(source: str = Query(...), kind: str = Query("playlist")):
+    src = _public_source(source)
+    if kind not in ("playlist", "chart"):
+        raise ValueError("kind must be playlist or chart")
+    if kind == "chart":
+        boards = await LXSERVER.get_leaderboard_boards(src)
+        return {"ok": True, "categories": [{"id": "", "name": "全部"}], "tags": boards, "sorts": []}
+    data = await LXSERVER.get_song_list_tags(src)
+    tags = data.get("tags")
+    if isinstance(tags, list):
+        data["tags"] = [
+            {**tag, "id": str(tag.get("id") or tag.get("name") or ""), "name": str(tag.get("name") or tag.get("id") or "")}
+            if isinstance(tag, dict) else {"id": str(tag), "name": str(tag)}
+            for tag in tags
+        ]
+    return {
+        "ok": True,
+        "categories": data.get("tags") or [],
+        "tags": data.get("hotTag") or data.get("hotTags") or [],
+        "sorts": data.get("sortList") or [],
+    }
+
+
+@app.get("/api/v1/public-playlists")
+async def public_playlists(
+    source: str = Query(...),
+    channel: str = Query("top"),
+    category: str = Query(""),
+    sort: str = Query(""),
+    page: int = Query(1, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=50),
+    cursor: str = Query(""),
+):
+    src = _public_source(source)
+    if channel == "charts":
+        rows = await LXSERVER.get_leaderboard_boards(src)
+        items = [LXSERVER.normalize_public_playlist(row, src, "chart") for row in rows if isinstance(row, dict)]
+        return {"ok": True, "items": [it for it in items if it["id"]], "total": len(items), "has_more": False}
+    if channel != "top":
+        raise ValueError(f"unsupported channel {channel!r}")
+    if not sort:
+        tags = await LXSERVER.get_song_list_tags(src)
+        sorts = tags.get("sortList") or []
+        if sorts:
+            sort = str(sorts[0].get("id") or "")
+    data = await LXSERVER.get_song_lists(src, category, sort, page)
+    raw_items = data.get("list") or []
+    items = [LXSERVER.normalize_public_playlist(row, src) for row in raw_items if isinstance(row, dict)]
+    try:
+        total = int(data.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        page_limit = max(1, int(data.get("limit") or 30))
+    except (TypeError, ValueError):
+        page_limit = 30
+    return {
+        "ok": True,
+        "items": [it for it in items if it["id"]],
+        "total": total,
+        "has_more": bool(data.get("has_more")) or (page * page_limit < total if total else bool(raw_items)),
+    }
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}/tracks")
+async def public_playlist_tracks(
+    playlist_id: str,
+    source: str = Query(...),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    async with asyncio.timeout(60):
+        return await _public_playlist_tracks(playlist_id, source, kind)
+
+
+async def _public_playlist_tracks(playlist_id: str, source: str, kind: str):
+    src = _public_source(source)
+    raw_id = urllib.parse.unquote(playlist_id)
+    items: list[dict] = []
+    truncated = False
+    if kind == "chart":
+        page = 1
+        seen_ids: set[str] = set()
+        while len(items) < 1000 and page <= 100:
+            rows = await LXSERVER.get_leaderboard_list(src, raw_id, page=page, strict=True)
+            fresh = []
+            for row in rows:
+                identifier = str(row.get("id") or "")
+                if identifier and identifier not in seen_ids:
+                    seen_ids.add(identifier)
+                    fresh.append(row)
+            for row in fresh:
+                items.append(row)
+            # 部分平台忽略 page 并重复返回整榜，此时重复页就是结束条件。
+            if not fresh:
+                break
+            page += 1
+        if page > 100 and len(items) < 1000:
+            raise RuntimeError("lxserver leaderboard pagination did not finish")
+        if len(items) >= 1000:
+            truncated = True
+            items = items[:1000]
+    else:
+        page = 1
+        hit_limit = False
+        while len(items) < 1000:
+            data = await LXSERVER.get_song_list_detail(src, raw_id, page=page)
+            rows = data.get("list") or []
+            for raw in rows:
+                item = map_lxserver_song(raw, fallback_source=src)
+                LXSERVER.cache_song_info(item["id"], raw)
+                _cache_put(item)
+                items.append(item)
+                if len(items) >= 1000:
+                    hit_limit = True
+                    break
+            try:
+                total = int(data["total"]) if data.get("total") is not None else None
+                page_limit = max(1, int(data.get("limit") or len(rows) or 1))
+            except (TypeError, ValueError):
+                total, page_limit = None, max(1, len(rows))
+            if not rows and total is not None and len(items) < min(total, 1000):
+                raise RuntimeError("lxserver playlist ended before reported total")
+            if not rows or (total is not None and len(items) >= total) or (total is None and len(rows) < page_limit):
+                break
+            page += 1
+        truncated = hit_limit and (total is None or total > 1000)
+    for item in items:
+        _cache_put(item)
+    return {"ok": True, "data": items[:1000], "total": len(items), "truncated": truncated}
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}")
+async def public_playlist(playlist_id: str, source: str = Query(...), kind: str = Query("playlist", pattern="^(playlist|chart)$")):
+    src = _public_source(source)
+    raw_id = urllib.parse.unquote(playlist_id)
+    if kind == "chart":
+        boards = await LXSERVER.get_leaderboard_boards(src)
+        for row in boards:
+            if not isinstance(row, dict):
+                continue
+            summary = LXSERVER.normalize_public_playlist(row, src, "chart")
+            if summary["id"] == raw_id:
+                return {"ok": True, "data": summary}
+        raise ValueError(f"chart {raw_id} not found")
+    data = await LXSERVER.get_song_list_detail(src, raw_id, page=1)
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    summary = LXSERVER.normalize_public_playlist({**info, "id": raw_id}, src)
+    if not summary["name"]:
+        summary["name"] = raw_id
+    return {"ok": True, "data": summary}
 
 
 def _meta_query(title: str, artist: str, album: str, duration: float, cover: str) -> dict:

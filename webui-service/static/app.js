@@ -12,12 +12,16 @@ const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云�
 const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxmusic: "lxmusic", webui: "WebUI" };
 
 let configValues = {};   // GET /api/config 的 values
+let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 let lxSourceList = [];    // 洛雪源列表 [{ name, url, active }]，active 可多开
 let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
+let publicSelection = [];
+let publicCapabilities = null;
+let publicState = { provider: "musicbox", channel: "charts", source: "netease", category: "", sort: "", page: 1, items: [], hasMore: false, total: 0, cursor: "" };
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
@@ -113,6 +117,7 @@ async function loadStatus() {
 async function loadConfig() {
   const cfg = await api("/api/config");
   configValues = cfg.values;
+  configPresence = cfg.presence || {};
   applyConfigToForm();
   clearDirty();
 }
@@ -131,6 +136,13 @@ function applyConfigToForm() {
   $$("input[name=dl-quality]").forEach((el) => { el.checked = el.value === dlQuality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
+  $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
+  try {
+    publicSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
+    if (!Array.isArray(publicSelection)) publicSelection = [];
+  } catch (_) { publicSelection = []; }
+  $("#public-playlists-browser").hidden = !$("#public-playlists-enabled").checked;
+  renderPublicSelected();
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
@@ -185,6 +197,7 @@ function collectConfig() {
     FNMUSIC_DL_QUALITY: ($$("input[name=dl-quality]").find((el) => el.checked) || {}).value || "app",
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
+    FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: $("#public-playlists-enabled").checked,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
@@ -206,6 +219,11 @@ function collectConfig() {
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
+  if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
+    values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
+      publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))
+    );
+  }
   const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
   const cacheDir = values.FNMUSIC_CACHE_DIR;
   for (const [label, p] of [["下载目录", dlDir], ["歌曲缓存目录", cacheDir]]) {
@@ -387,12 +405,341 @@ function renderPlatformChips() {
 $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
 
+/* -------------------------------------------------------------- 公共歌单 */
+const PUBLIC_PROVIDER_OPTIONS = [
+  { value: "musicbox", label: "网易云音乐" },
+  { value: "lxmusic", label: "洛雪内置歌单" },
+];
+const PUBLIC_SOURCE_LABEL = { netease: "网易", wy: "网易", kw: "酷我", kg: "酷狗", tx: "QQ", mg: "咪咕" };
+
+function publicEntryKey(item) {
+  return [item.provider, item.source, item.provider === "musicbox" ? "playlist" : item.kind, item.id].join("|");
+}
+
+function selectedPublicEntry(item) {
+  return publicSelection.find((it) => publicEntryKey(it) === publicEntryKey(item));
+}
+
+function setPublicSelection(item, selected) {
+  if (selected) {
+    if (selectedPublicEntry(item)) return true;
+    if (publicSelection.length >= 50) {
+      toast("公共歌单最多选择 50 份", "fail");
+      return false;
+    }
+    publicSelection.push({
+      provider: item.provider, source: item.source, kind: item.kind, id: String(item.id),
+      _name: item.name || "", _cover_url: item.cover_url || "", _track_count: item.track_count || 0,
+    });
+  } else {
+    publicSelection = publicSelection.filter((it) => publicEntryKey(it) !== publicEntryKey(item));
+  }
+  renderPublicSelected();
+  updateResidentAvailability();
+  markDirty("公共歌单选择已修改");
+  renderPublicList();
+  return true;
+}
+
+function movePublicSelection(index, delta) {
+  const next = index + delta;
+  if (next < 0 || next >= publicSelection.length) return;
+  const items = publicSelection.splice(index, 1);
+  publicSelection.splice(next, 0, items[0]);
+  renderPublicSelected();
+  markDirty("公共歌单顺序已修改");
+}
+
+function renderPublicSelected() {
+  const box = $("#public-selected");
+  if (!box) return;
+  box.innerHTML = publicSelection.length ? publicSelection.map((item, index) => `
+    <div class="public-selected">
+      <img src="${escapeHtml(item._cover_url || "")}" alt="" ${item._cover_url ? "" : "hidden"}>
+      <div class="min">
+        <b>${escapeHtml(item._name || item.id)}</b>
+        <span>${escapeHtml(PUBLIC_SOURCE_LABEL[item.source] || item.source)} · ${item.kind === "chart" ? "榜单" : "歌单"} · ${item.id}</span>
+        ${item._reason ? `<small>${escapeHtml(item._reason)}</small>` : ""}
+        ${Number(item._track_count || 0) > 1000 ? '<small>超过 1,000 首，仅载入前 1,000 首。</small>' : ""}
+      </div>
+      <div class="btn-row">
+        <button class="btn small" data-public-up="${index}" ${index === 0 ? "disabled" : ""}>↑</button>
+        <button class="btn small" data-public-down="${index}" ${index === publicSelection.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="btn small danger" data-public-remove="${index}">移除</button>
+      </div>
+    </div>
+  `).join("") : '<p class="hint">尚未选择歌单。</p>';
+  box.querySelectorAll("[data-public-up]").forEach((btn) =>
+    btn.addEventListener("click", () => movePublicSelection(Number(btn.dataset.publicUp), -1)));
+  box.querySelectorAll("[data-public-down]").forEach((btn) =>
+    btn.addEventListener("click", () => movePublicSelection(Number(btn.dataset.publicDown), 1)));
+  box.querySelectorAll("[data-public-remove]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      publicSelection.splice(Number(btn.dataset.publicRemove), 1);
+      updateResidentAvailability();
+      renderPublicSelected(); renderPublicList(); markDirty("公共歌单选择已修改");
+    }));
+}
+
+function renderPublicList() {
+  const box = $("#public-list");
+  if (!box) return;
+  box.innerHTML = publicState.items.length ? publicState.items.map((item) => {
+    const checked = !!selectedPublicEntry(item);
+    return `
+      <label class="public-item">
+        <input type="checkbox" data-public-id="${escapeHtml(String(item.id))}" ${checked ? "checked" : ""}>
+        <img src="${escapeHtml(item.cover_url || "")}" alt="" ${item.cover_url ? "" : "hidden"}>
+        <span class="min">
+          <b>${escapeHtml(item.name || item.id)}</b>
+          <small>${escapeHtml(item.author || PUBLIC_SOURCE_LABEL[item.source] || item.source)} · ${Number(item.track_count || 0)} 首</small>
+        </span>
+      </label>`;
+  }).join("") : '<p class="hint">当前入口没有返回歌单。</p>';
+  box.querySelectorAll("input[data-public-id]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const item = publicState.items.find((it) => String(it.id) === input.dataset.publicId);
+      if (item) setPublicSelection(item, input.checked);
+    });
+  });
+}
+
+async function publicApi(target, params = {}, retry = true) {
+  const query = new URLSearchParams({ provider: publicState.provider, ...params });
+  try {
+    const data = await api(`/api/public-playlists/${target}?${query.toString()}`);
+    if (data.ok === false) throw new Error(data.error || "歌单请求失败");
+    return data;
+  } catch (exc) {
+    if (!retry) throw exc;
+    if (!await startPreview(publicState.provider)) throw exc;
+    return await publicApi(target, params, false);
+  }
+}
+
+function currentUiProvider() {
+  return ($$("input[name=provider]").find((el) => el.checked) || {}).value || savedProvider();
+}
+
+async function loadPublicCapabilities(retry = true) {
+  try {
+    publicCapabilities = await publicApi("capabilities");
+  } catch (exc) {
+    publicCapabilities = null;
+    $("#public-note").textContent = "音源不可达：" + exc.message;
+  }
+  renderPublicControls();
+  return publicCapabilities;
+}
+
+function renderPublicControls() {
+  const providerSelect = $("#public-provider");
+  const channelSelect = $("#public-channel");
+  const sourceSelect = $("#public-source");
+  providerSelect.innerHTML = PUBLIC_PROVIDER_OPTIONS.map((item) =>
+    `<option value="${item.value}">${item.label}</option>`).join("");
+  providerSelect.value = publicState.provider;
+
+  const channels = publicState.provider === "musicbox" ? [
+    { id: "charts", name: "排行榜" }, { id: "recommend", name: "推荐歌单" },
+    { id: "top", name: "热门与分类" }, { id: "highquality", name: "精品歌单" },
+    { id: "account_recommend", name: "账号推荐歌单" },
+  ] : [{ id: "top", name: "热门与分类" }, { id: "charts", name: "排行榜" }];
+  const logged = !!(((publicCapabilities || {}).sources || []).find((item) => item.id === "netease") || {}).logged_in;
+  channelSelect.innerHTML = channels.filter((item) =>
+    item.id !== "account_recommend" || logged).map((item) =>
+    `<option value="${item.id}">${item.name}</option>`).join("");
+  if (![...channelSelect.options].some((opt) => opt.value === publicState.channel)) {
+    publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
+  }
+  channelSelect.value = publicState.channel;
+
+  sourceSelect.hidden = publicState.provider !== "lxmusic";
+  const sources = ((publicCapabilities || {}).sources || []).filter((item) =>
+    publicState.provider !== "lxmusic" || item.playback_available);
+  sourceSelect.innerHTML = sources.map((item) =>
+    `<option value="${item.id}">${item.playback_available ? "" : "⚠ "}${escapeHtml(item.name)}</option>`).join("");
+  if (!sources.some((item) => item.id === publicState.source)) publicState.source = sources[0]?.id || "";
+  sourceSelect.value = publicState.source;
+}
+
+function fillPublicCategories(data) {
+  publicState.cursor = "";
+  publicState.cursors = { 1: "" };
+  const select = $("#public-category");
+  const groups = Array.isArray(data.categories) ? data.categories : [];
+  select.innerHTML = '<option value="">全部分类</option>' + groups.map((group) => {
+    const list = Array.isArray(group.list) ? group.list : [group];
+    return `<optgroup label="${escapeHtml(group.name || "分类")}">${list.map((tag) =>
+      `<option value="${escapeHtml(String(tag.id ?? tag.name ?? ""))}">${escapeHtml(tag.name || tag.id)}</option>`).join("")}</optgroup>`;
+  }).join("");
+  publicState.category = "";
+  const sorts = Array.isArray(data.sorts) ? data.sorts : [];
+  $("#public-sort").hidden = !sorts.length;
+  $("#public-sort").innerHTML = sorts.map((item) =>
+    `<option value="${escapeHtml(String(item.id))}">${escapeHtml(item.name || item.id)}</option>`).join("");
+  publicState.sort = sorts[0]?.id || "";
+}
+
+async function loadPublicCategories() {
+  if (publicState.channel === "recommend" || publicState.channel === "account_recommend") {
+    fillPublicCategories({ categories: [] });
+    return;
+  }
+  try {
+    const highquality = publicState.provider === "musicbox" && publicState.channel === "highquality";
+    const data = await publicApi("categories", {
+      source: publicState.source, kind: publicState.channel === "charts" ? "chart" : "playlist",
+    });
+    fillPublicCategories(highquality ? { categories: data.highquality_tags || data.tags || [] } : data);
+  } catch (exc) {
+    fillPublicCategories({ categories: [] });
+    $("#public-note").textContent = "分类加载失败：" + exc.message;
+  }
+}
+
+async function loadPublicList() {
+  $("#public-note").textContent = "正在加载歌单…";
+  try {
+    const params = {
+      source: publicState.source, channel: publicState.channel,
+      category: publicState.category, sort: publicState.sort, page: publicState.page,
+    };
+    if (publicState.channel === "highquality") params.cursor = (publicState.cursors || {})[publicState.page] || "";
+    const data = await publicApi("", params);
+    publicState.items = (data.items || []).map((item) => ({
+      ...item, provider: publicState.provider === "musicbox" ? "musicbox" : "lx", source: publicState.source,
+      kind: publicState.channel === "charts" ? "chart" : "playlist",
+    }));
+    publicState.hasMore = !!data.has_more;
+    publicState.total = Number(data.total || 0);
+    publicState.cursor = data.next_cursor || publicState.cursor;
+    if (publicState.channel === "highquality") {
+      publicState.cursors = publicState.cursors || { 1: "" };
+      publicState.cursors[publicState.page + 1] = data.next_cursor || "";
+    }
+    const suffix = publicState.total ? `，接口报告 ${publicState.total} 份` : "";
+    $("#public-note").textContent = `返回 ${publicState.items.length} 份${suffix}；勾选后保存生效。`;
+  } catch (exc) {
+    publicState.items = []; publicState.hasMore = false;
+    $("#public-note").textContent = "歌单加载失败：" + exc.message;
+  }
+  renderPublicList();
+  renderPublicPage();
+}
+
+function renderPublicPage() {
+  $("#public-page").textContent = String(publicState.page);
+  $("#public-prev").disabled = publicState.page <= 1;
+  $("#public-next").disabled = !publicState.hasMore;
+}
+
+async function initPublicDefaults() {
+  const provider = currentUiProvider() === "lxmusic" ? "lx" : "musicbox";
+  if (provider === "musicbox") {
+    publicSelection = [
+      { provider: "musicbox", source: "netease", kind: "chart", id: "3778678", _name: "热歌榜" },
+      { provider: "musicbox", source: "netease", kind: "chart", id: "3779629", _name: "新歌榜" },
+      { provider: "musicbox", source: "netease", kind: "chart", id: "19723756", _name: "飙升榜" },
+      { provider: "musicbox", source: "netease", kind: "chart", id: "2884035", _name: "原创榜" },
+    ];
+    renderPublicSelected();
+    markDirty("已填入默认网易榜单");
+    return;
+  }
+  publicState.provider = "lxmusic";
+  await loadPublicCapabilities();
+  const caps = publicCapabilities || {};
+  const wanted = [
+    { source: "kg", label: "TOP500" }, { source: "kw", label: "飙升榜" }, { source: "wy", label: "新歌榜" },
+  ];
+  publicSelection = [];
+  for (const target of wanted) {
+    const cap = (caps.sources || []).find((item) => item.id === target.source && item.playback_available);
+    if (!cap) continue;
+    publicState.source = target.source; publicState.channel = "charts";
+    try {
+      const data = await publicApi("", { source: target.source, channel: "charts" });
+      const row = (data.items || []).find((item) => String(item.name || "").includes(target.label));
+      if (row) publicSelection.push({ ...row, provider: "lx", source: target.source, kind: "chart", id: String(row.id) });
+    } catch (_) { /* 平台不可用则跳过 */ }
+  }
+  renderPublicSelected();
+  markDirty("已按可用平台填入默认洛雪榜单");
+}
+
+async function showPublicBrowser() {
+  $("#public-playlists-browser").hidden = false;
+  const saved = savedProvider();
+  publicState.provider = currentUiProvider() === "lxmusic" ? "lxmusic" : "musicbox";
+  await loadPublicCapabilities();
+  await loadPublicCategories();
+  await loadPublicList();
+  const browsingProvider = publicState.provider;
+  for (const item of publicSelection) {
+    const uiProvider = item.provider === "lx" ? "lxmusic" : "musicbox";
+    if (uiProvider !== browsingProvider) continue;
+    const cap = ((publicCapabilities || {}).sources || []).find((source) => source.id === item.source);
+    item._reason = cap && !cap.playback_available ? cap.reason || "当前平台没有播放能力" : "";
+    try {
+      const response = await publicApi(encodeURIComponent(item.id), { source: item.source, kind: item.kind });
+      item._name = response.data.name;
+      item._cover_url = response.data.cover_url;
+      item._track_count = response.data.track_count;
+    } catch (exc) { item._reason = item._reason || exc.message; }
+  }
+  renderPublicSelected();
+  if (saved === "musicdl") $("#public-note").textContent = "当前音源是 musicdl：它没有统一推荐歌单接口；可浏览网易/洛雪，保存后按常驻规则展示网易公共歌单。";
+}
+
+$("#public-playlists-enabled").addEventListener("change", async () => {
+  const enabled = $("#public-playlists-enabled").checked;
+  updateResidentAvailability();
+  markDirty(enabled ? "公共歌单已开启" : "公共歌单已关闭");
+  if (!enabled) { $("#public-playlists-browser").hidden = true; return; }
+  if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
+  await showPublicBrowser();
+});
+$("#public-provider").addEventListener("change", async () => {
+  publicState.provider = $("#public-provider").value;
+  publicState.page = 1; publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
+  markDirty(); await loadPublicCapabilities(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-channel").addEventListener("change", async () => {
+  publicState.channel = $("#public-channel").value; publicState.page = 1;
+  markDirty(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-source").addEventListener("change", async () => {
+  publicState.source = $("#public-source").value; publicState.page = 1;
+  markDirty(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-category").addEventListener("change", async () => {
+  publicState.category = $("#public-category").value; publicState.page = 1;
+  publicState.cursors = { 1: "" }; publicState.cursor = "";
+  markDirty(); await loadPublicList();
+});
+$("#public-sort").addEventListener("change", async () => {
+  publicState.sort = $("#public-sort").value; publicState.page = 1;
+  markDirty(); await loadPublicList();
+});
+$("#public-refresh").addEventListener("click", async () => {
+  await loadPublicCapabilities(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-prev").addEventListener("click", async () => {
+  if (publicState.page > 1) { publicState.page--; await loadPublicList(); }
+});
+$("#public-next").addEventListener("click", async () => {
+  if (publicState.hasMore) { publicState.page++; await loadPublicList(); }
+});
+
 /* -------------------------------------------------------------- 网易扫码 */
 let neteaseLoggedIn = false;
 
 function updateResidentAvailability() {
-  // 网易云歌单常驻生效前提是已登录 musicbox：未登录时置灰（已勾选的保留显示）
-  $("#netease-playlist-resident").disabled = !neteaseLoggedIn;
+  // 账号歌单仍需登录；公共网易歌单可匿名常驻，因此仅在两者都无需求时置灰。
+  const publicNeedsMusicbox = $("#public-playlists-enabled").checked
+    && publicSelection.some((item) => item.provider === "musicbox");
+  $("#netease-playlist-resident").disabled = !neteaseLoggedIn && !publicNeedsMusicbox;
 }
 
 async function syncNeteaseAccount(retries = 0) {
@@ -472,8 +819,9 @@ function stopQrPolling() {
 $("#qr-btn").addEventListener("click", startQrLogin);
 
 $("#netease-playlist-resident").addEventListener("change", () => {
-  // 常驻为账号歌单供数：勾选常驻时自动带出「音乐页显示网易账号歌单」
-  if ($("#netease-playlist-resident").checked && !$("#netease-my-playlists").checked) {
+  // 常驻为账号/公共歌单供数；仅在没有公共选择时自动带出账号歌单开关。
+  const publicNeedsMusicbox = publicSelection.some((item) => item.provider === "musicbox");
+  if ($("#netease-playlist-resident").checked && !$("#netease-my-playlists").checked && !publicNeedsMusicbox) {
     $("#netease-my-playlists").checked = true;
   }
 });
@@ -1012,5 +1360,6 @@ $("#update-modal").addEventListener("click", (ev) => {
   await loadStatus();
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
+  if ($("#public-playlists-enabled").checked) await showPublicBrowser();
   setInterval(loadStatus, 15000);
 })();

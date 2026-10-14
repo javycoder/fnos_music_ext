@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Path, Query, Response, status
@@ -14,8 +15,11 @@ from netease_ext import (
     batch_song_details,
     check_is_logged_in,
     filter_playable_song_ids,
-    get_song_url,
     playlist_track_ids,
+    public_playlist,
+    public_playlist_categories,
+    public_playlist_tracks,
+    public_playlists,
     reset_api,
     search_web_fallback,
     song_detail_raw,
@@ -24,10 +28,13 @@ from netease_ext import (
     user_playlists as fetch_user_playlists,
 )
 import runner
+import playback
+from playback import get_song_url_async
 from runner import MusicboxTimeoutError, ensure_xdg_dirs
 
 # 与其他服务对齐：不配 handler 时 INFO 会被丢弃（只剩 lastResort 的 WARNING+）
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("musicbox_service.app")
 try:  # 本地文件日志（logs/musicbox.log，按天滚动保留 3 天）；失败静默降级
     import sys as _sys
@@ -52,7 +59,15 @@ class UpstreamException(Exception):
         self.stderr = (stderr or "")[:2000]
 
 
-app = FastAPI(title="fnmusic-musicbox", version="1.0.0")
+@asynccontextmanager
+async def lifespan(application):
+    try:
+        yield
+    finally:
+        await playback.shutdown()
+
+
+app = FastAPI(title="fnmusic-musicbox", version="1.0.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -205,16 +220,16 @@ def search(
 
 
 @app.get("/api/v1/song/{song_id}/url")
-def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0)):
+async def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0)):
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
-    # 进程内复用常驻实例解析（毫秒级，免 CLI 子进程冷启动）；失败再降级 CLI
-    # 兜底，保留 not_logged_in 等结构化错误语义。fresh=1 旁路进程内取链缓存：
-    # 代理确认钉链失效后的强制重解析必须拿到新链，不能命中同一条死链
-    item = get_song_url(song_id, quality, fresh=bool(fresh))
-    if item is not None:
+    try:
+        item = await get_song_url_async(song_id, quality, fresh=bool(fresh))
         return {"ok": True, "data": item}
-    return exec_musicbox(["song", "url", str(song_id), "--quality", quality, "--json"])
+    except playback.ResolutionTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except playback.UpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/song/{song_id}/info")
@@ -351,6 +366,110 @@ def toplist(index: int = Query(-1), limit: int = Query(60, ge=1, le=100)):
         raise
     rows = _playable_recommendation_rows(_extract_payload(data), limit)
     return {"ok": True, "data": rows, "index": index}
+
+
+@app.get("/api/v1/public-playlists/capabilities")
+def public_playlist_capabilities():
+    logged_in = False
+    try:
+        logged_in = check_is_logged_in()
+    except Exception:
+        logged_in = False
+    return {
+        "ok": True,
+        "provider": "musicbox",
+        "sources": [{
+            "id": "netease",
+            "name": "网易云音乐",
+            "playback_available": True,
+            "channels": [
+                {"id": "recommend", "name": "推荐歌单", "login_required": False},
+                {"id": "top", "name": "热门与分类", "login_required": False},
+                {"id": "highquality", "name": "精品歌单", "login_required": False},
+                {"id": "charts", "name": "排行榜", "login_required": False},
+                {"id": "account_recommend", "name": "账号推荐歌单", "login_required": True},
+            ],
+            "logged_in": logged_in,
+        }],
+    }
+
+
+@app.get("/api/v1/public-playlists/categories")
+def public_playlist_categories_api(
+    source: str = Query("netease"),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    try:
+        if kind == "chart":
+            return {
+                "ok": True,
+                "categories": [{"id": "", "name": "全部"}],
+                "tags": [],
+                "sorts": [],
+            }
+        data = public_playlist_categories("playlist")
+        grouped = data.get("tags") if isinstance(data.get("tags"), dict) else {}
+        data["categories"] = [{"id": "", "name": "全部"}] + [
+            {"id": name, "name": name, "list": rows}
+            for name, rows in grouped.items()
+            if isinstance(rows, list)
+        ]
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease categories failed: {exc}") from exc
+
+
+@app.get("/api/v1/public-playlists")
+def public_playlists_api(
+    source: str = Query("netease"),
+    channel: str = Query("top"),
+    category: str = Query(""),
+    sort: str = Query("hot"),
+    page: int = Query(1, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=50),
+    cursor: str = Query(""),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    channels = {"recommend", "top", "highquality", "charts", "account_recommend"}
+    if channel not in channels:
+        raise HTTPException(status_code=400, detail=f"unsupported channel {channel}")
+    try:
+        return public_playlists(channel, category, sort, page, limit, cursor)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease playlists failed: {exc}") from exc
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}")
+def public_playlist_api(
+    playlist_id: int = Path(..., ge=1),
+    source: str = Query("netease"),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    try:
+        return public_playlist(playlist_id, kind)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease playlist failed: {exc}") from exc
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}/tracks")
+def public_playlist_tracks_api(
+    playlist_id: int = Path(..., ge=1),
+    source: str = Query("netease"),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    try:
+        result = public_playlist_tracks(playlist_id, kind)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease playlist tracks failed: {exc}") from exc
+    result["data"] = _mark_needs_vip(result.get("data") or [])
+    return result
 
 
 @app.get("/api/v1/auth/status")

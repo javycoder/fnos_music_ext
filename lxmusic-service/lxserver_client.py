@@ -193,6 +193,7 @@ class LxServerClient:
         # songInfo 反查缓存: track_id -> songInfo dict
         self._song_info_cache: dict[str, dict] = {}
         self._cache_max = 2000
+        self._song_list_locks: dict[str, asyncio.Lock] = {}
         # songInfo 磁盘持久化（issue #49）：热门歌单按天落盘而 songInfo 只在内存，
         # 服务重启后榜单曲目反查只能合成"未知曲目/未知歌手"，关键词型源脚本按
         # 歌名歌手取链必然失败——榜单播不了、搜索后能播。存储启用时启动加载、
@@ -283,6 +284,13 @@ class LxServerClient:
         if self._mgmt_lock is None:
             self._mgmt_lock = asyncio.Lock()
         return self._mgmt_lock
+
+    def song_list_lock(self, source: str) -> asyncio.Lock:
+        src = normalize_source(source)
+        if not src:
+            raise ValueError("unsupported source")
+        lock = self._song_list_locks.setdefault(src, asyncio.Lock())
+        return lock
 
     async def get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -496,8 +504,9 @@ class LxServerClient:
     async def get_leaderboard_boards(self, source: str = "kg") -> list[dict]:
         """获取平台的可用榜单列表。"""
         src = normalize_source(source) or "kg"
-        client = await self.get_client()
-        resp = await client.get("/api/music/leaderboard/boards", params={"source": src}, timeout=self.timeout)
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            resp = await client.get("/api/music/leaderboard/boards", params={"source": src}, timeout=self.timeout)
         if resp.status_code != 200:
             logger.warning(
                 "lxserver leaderboard boards error %s for %s: %.150s", resp.status_code, src, resp.text,
@@ -510,14 +519,89 @@ class LxServerClient:
             return data
         return []
 
-    async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1) -> list[dict]:
+    async def get_song_list_tags(self, source: str) -> dict:
+        src = normalize_source(source)
+        if not src:
+            raise ValueError("unsupported source")
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            resp = await client.get("/api/music/songList/tags", params={"source": src}, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver tags error {resp.status_code}: {resp.text[:160]}")
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("lxserver tags returned invalid payload")
+        return data
+
+    async def get_song_lists(
+        self, source: str, tag_id: str = "", sort_id: str = "", page: int = 1
+    ) -> dict:
+        src = normalize_source(source)
+        if not src:
+            raise ValueError("unsupported source")
+        params = {"source": src, "tagId": tag_id or "", "sortId": sort_id or "", "page": max(1, int(page or 1))}
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            resp = await client.get("/api/music/songList/list", params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver song lists error {resp.status_code}: {resp.text[:160]}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver song lists returned invalid payload")
+        return data
+
+    async def get_song_list_detail(self, source: str, playlist_id: str, page: int = 1) -> dict:
+        src = normalize_source(source)
+        raw_id = str(playlist_id or "")
+        if not src or not raw_id:
+            raise ValueError("invalid source or playlist id")
+        params = {"source": src, "id": raw_id, "page": max(1, int(page or 1))}
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            resp = await client.get("/api/music/songList/detail", params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver song detail error {resp.status_code}: {resp.text[:160]}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver song detail returned invalid payload")
+        return data
+
+    @staticmethod
+    def normalize_public_playlist(row: dict, source: str, kind: str = "playlist") -> dict:
+        src = normalize_source(source)
+        raw_id = str(
+            (row.get("bangid") if kind == "chart" else None) or row.get("id") or row.get("specialId")
+            or row.get("dissid") or row.get("playlist_id") or ""
+        ).strip()
+        name = str(row.get("name") or row.get("title") or "").strip()
+        cover = str(row.get("img") or row.get("image") or row.get("pic") or row.get("cover") or "").strip()
+        try:
+            track_count = int(row.get("total") or row.get("songnum") or row.get("song_count") or 0)
+        except (TypeError, ValueError):
+            track_count = 0
+        return {
+            "id": raw_id,
+            "kind": kind,
+            "source": src,
+            "name": name,
+            "cover_url": cover,
+            "track_count": track_count,
+            "author": str(row.get("author") or row.get("nickname") or "").strip(),
+            "description": str(row.get("desc") or row.get("description") or "").strip(),
+            "updated_at": 0,
+        }
+
+    async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1, *, strict: bool = False) -> list[dict]:
         """获取指定榜单内的歌曲列表并做数据映射。"""
         src = normalize_source(source)
-        client = await self.get_client()
-        # lxserver 契约：榜单歌曲接口的参数名是 bangid（不是 id），缺失直接 400
-        params = {"source": src, "bangid": board_id, "page": page}
-        resp = await client.get("/api/music/leaderboard/list", params=params, timeout=self.timeout)
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            # lxserver 契约：榜单歌曲接口的参数名是 bangid（不是 id），缺失直接 400
+            params = {"source": src, "bangid": board_id, "page": page}
+            resp = await client.get("/api/music/leaderboard/list", params=params, timeout=self.timeout)
         if resp.status_code != 200:
+            if strict:
+                raise RuntimeError(f"lxserver leaderboard list error {resp.status_code}")
             logger.warning(
                 "lxserver leaderboard list error %s for %s/%s: %.150s",
                 resp.status_code, src, board_id, resp.text,
@@ -529,6 +613,8 @@ class LxServerClient:
             raw_list = data["list"]
         elif isinstance(data, list):
             raw_list = data
+        elif strict:
+            raise RuntimeError("lxserver leaderboard returned invalid payload")
 
         items = []
         for raw in raw_list:

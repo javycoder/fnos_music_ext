@@ -92,9 +92,9 @@ else
     log "未配置任何音源（FNMUSIC_MUSICDL_ENABLED/FNMUSIC_NETEASE_ENABLED/FNMUSIC_LX_ENABLED 均未启用）"
 fi
 
-# 网易云歌单常驻（issue #38）：当前音源不是 musicbox 但勾选常驻（含账号歌单开关）
-# 且盘上有网易 cookie（登录启发；权威校验由 webui 开机对账完成）时，拉起
-# musicbox 为网易账号歌单供数。原生形态 entrypoint 无 XDG 环境变量，可能
+# 网易云歌单常驻（issue #38）：当前音源不是 musicbox 但勾选常驻，且有网易
+# 账号歌单（盘上有 cookie，登录启发）或网易公共歌单选择时，拉起 musicbox。
+# 权威校验由 webui 开机对账完成。原生形态 entrypoint 无 XDG 环境变量，可能
 # 找不到 cookie 而跳过——由 webui 开机对账兜底拉起。
 musicbox_cookie_present() {
     for _f in "${XDG_DATA_HOME:-/nonexistent}/netease-musicbox/cookie.txt" \
@@ -107,10 +107,22 @@ musicbox_cookie_present() {
     return 1
 }
 
+public_musicbox_selected() {
+    [ "$(env_flag FNMUSIC_PUBLIC_PLAYLISTS_ENABLED)" = "true" ] || return 1
+    python3 -c 'import json, os, sys
+raw = os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", "")
+try:
+    rows = json.loads(raw) if raw.strip() else [{"provider": "musicbox", "id": "3778678"}]
+    needed = isinstance(rows, list) and any(isinstance(x, dict) and x.get("provider") == "musicbox" and x.get("id") for x in rows)
+except (ValueError, TypeError):
+    needed = False
+sys.exit(0 if needed else 1)'
+}
+
 if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_PLAYLIST_RESIDENT)" = "true" ] \
-   && [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ] \
-   && musicbox_cookie_present; then
+   && { public_musicbox_selected \
+        || { [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ] && musicbox_cookie_present; }; }; then
     start_prog musicbox
 fi
 

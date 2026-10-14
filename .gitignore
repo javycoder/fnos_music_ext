@@ -12,6 +12,7 @@ cache/
 backup/
 musicdl_outputs/
 recommend_cache/
+public_playlists_cache/
 play_history/
 online_favorites/
 online_favorites.json
