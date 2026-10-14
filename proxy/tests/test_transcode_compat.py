@@ -522,10 +522,12 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
         assert init.status_code == 200
         assert init.content.startswith(b"ftypinit")
         assert init.headers["content-type"].startswith("audio/mp4")
+        assert init.headers["x-accel-buffering"] == "no"
 
         seg = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/00000.m4s")
         assert seg.status_code == 200
         assert seg.headers["content-type"].startswith("video/iso.segment")
+        assert seg.headers["x-accel-buffering"] == "no"
 
         assert client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/evil.mp4").status_code == 404
 
@@ -538,8 +540,10 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
 
 def test_hls_stub_fallback_without_ffmpeg(env):
     with TestClient(app) as client:
-        body = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8").text
+        playlist = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8")
+        body = playlist.text
         assert "track/stream" in body and "#EXT-X-ENDLIST" in body
+        assert playlist.headers["x-accel-buffering"] == "no"
         assert client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/00000.m4s").status_code == 404
         resp = client.post("/music/api/v1/track/transcode", json={"guid": FAKE_KUWO})
         assert resp.json()["status"] == "success"

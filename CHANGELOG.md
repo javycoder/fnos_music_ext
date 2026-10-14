@@ -3,6 +3,12 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [未发布]
+
+### 修复
+
+- **公网两层反代下流式播放仍可能被缓冲（issue #49）**：公网访问通常是"用户反代 → 飞牛 nginx → 扩展"。扩展的 `X-Accel-Buffering: no` 可让飞牛内层透传，但 nginx 会把该内部控制头消费掉，不会传给用户外层反代。现在 HEAD、在线流、缓存/Range、正常 HLS 与无 ffmpeg 回退 HLS 全部统一携带禁缓冲头；新增在线/缓存/HLS 交付诊断（`stream_delivery` 记录首块、总耗时、字节数、完成/取消/上游错误，不记录鉴权信息）；文档明确外层反代必须显式 `proxy_buffering off`，并保留 Host/端口、Range、Cookie、Authorization、`authx` 与临时鉴权头。新增两层 nginx 集成回归锁定该行为。
+
 ## [2.9.0a] - 2026-10-12
 
 > **预发布（Pre-release）**：自动迭代测试构建，未经完整人工验证、稳定性不作保证，仅供尝鲜反馈。

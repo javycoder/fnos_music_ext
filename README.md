@@ -194,7 +194,7 @@ git pull
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/储存目录/LLM 等）；端口、`MUSICDL_SOURCES` 等其余改动需执行 `./extend.sh` 重启容器。
 - **日志在哪、怎么导出**：运行日志在安装目录 `logs/`（`proxy.log` / `webui.log` / `lxmusic.log` / `install.log`），按天滚动保留 3 天后自动清理；WebUI「关于 → 导出日志」可打包近 3 天日志与环境快照为 `.logzip` 下载，反馈 issue 时建议附上；卸载应用时日志目录会一并删除。
-- **外网通过域名反代访问时搜得到歌但播不出/无封面（issue #49）**：新版扩展下发的播放与封面地址全部是同源相对路径，反代场景对代理本身无额外配置要求，但**反代层必须对流式响应友好**——详见 [docs/INSTALL.md「外网反向代理访问」](docs/INSTALL.md)。要点：关闭代理缓冲（扩展已带 `X-Accel-Buffering: no`，nginx 需确保未显式关闭对该头的尊重）、放大 `proxy_read_timeout`（转码分片最长等待 30s）、透传 `Range`/`Cookie`/`Authorization` 请求头、不要改写 `Location` 响应头。老版本（≤2.8.x 前的若干历史问题：307 绝对地址、封面跨域 302）请先升级到最新版再排查；若仍异常，用 WebUI「关于 → 导出日志」附 `.logzip` 反馈。
+- **外网通过域名反代访问时搜得到歌但播不出/无封面（issue #49）**：新版扩展下发的播放与封面地址全部是同源相对路径，但公网访问通常是“用户反代 → 飞牛 nginx → 扩展”两层代理；扩展的 `X-Accel-Buffering: no` 会被飞牛 nginx 消费，不能继续指导用户外层反代，因此外层必须显式 `proxy_buffering off`。同时放大 `proxy_read_timeout`（转码分片最长等待 30s）、保留 Host/端口、透传 `Range` 与实际使用的鉴权头、不要改写 `Location`。详见 [docs/INSTALL.md「外网反向代理访问」](docs/INSTALL.md)；若仍异常，用 WebUI「关于 → 导出日志」附 `.logzip` 反馈。
 
 ## 开发与测试
 

@@ -1376,6 +1376,43 @@ def log_stream_probe(method: str, guid: str, range_header: str | None, cached: b
         )
 
 
+def _media_stream_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
+    """Headers shared by proxy-generated streaming media responses."""
+    base = {"Accept-Ranges": "bytes", "X-Accel-Buffering": "no"}
+    base.update(headers or {})
+    return base
+
+
+def _range_kind(range_header: str | None) -> str:
+    if not range_header:
+        return "none"
+    value = range_header.strip().lower()
+    if value == "bytes=0-":
+        return "open"
+    if value.startswith("bytes=-"):
+        return "suffix"
+    if re.fullmatch(r"bytes=\d+-\d*", value):
+        return "partial"
+    return "invalid"
+
+
+def _log_stream_delivery(kind: str, guid: str, range_header: str | None, outcome: str,
+                         sent: int, expected: int | None, first_ms: int | None,
+                         total_ms: int) -> None:
+    fn_diag(
+        logger,
+        "stream_delivery",
+        kind=kind,
+        guid=guid[:80],
+        range=_range_kind(range_header),
+        outcome=outcome,
+        bytes=sent,
+        expected=expected if expected is not None else -1,
+        first_ms=first_ms if first_ms is not None else -1,
+        total_ms=total_ms,
+    )
+
+
 def cache_safe_guid(guid: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", guid)
 
@@ -2254,33 +2291,52 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
 
 
 def serve_file_with_range(path: str, range_header: str | None, media_type: str,
-                          extra_headers: dict | None = None) -> Response:
+                          extra_headers: dict | None = None, delivery_kind: str | None = None,
+                          delivery_guid: str | None = None) -> Response:
     file_size = os.path.getsize(path)
     rng = parse_http_range(range_header, file_size)
 
     def iter_file(offset: int, length: int) -> AsyncGenerator[bytes, None]:
         async def gen() -> AsyncGenerator[bytes, None]:
-            remaining = length
-            with open(path, "rb") as fp:
-                fp.seek(offset)
-                while remaining > 0:
-                    chunk = fp.read(min(64 * 1024, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
+            started = time.monotonic()
+            first_ms = None
+            sent = 0
+            outcome = "complete"
+            try:
+                remaining = length
+                with open(path, "rb") as fp:
+                    fp.seek(offset)
+                    while remaining > 0:
+                        chunk = fp.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        if first_ms is None:
+                            first_ms = int((time.monotonic() - started) * 1000)
+                        sent += len(chunk)
+                        yield chunk
+            except (GeneratorExit, asyncio.CancelledError):
+                outcome = "client_closed"
+                raise
+            except Exception:
+                outcome = "error"
+                raise
+            finally:
+                total_ms = int((time.monotonic() - started) * 1000)
+                if delivery_kind:
+                    _log_stream_delivery(delivery_kind, delivery_guid or "unknown", range_header,
+                                         outcome, sent, length, first_ms, total_ms)
 
         return gen()
 
     extra = extra_headers or {}
     if rng is None:
-        headers = {
-            "Content-Type": media_type,
-            "Content-Length": str(file_size),
-            "Accept-Ranges": "bytes",
-            # issue #49：外网反代透传流式文件响应，不被 proxy_buffering 整段缓冲
-            "X-Accel-Buffering": "no",
-        }
+        headers = _media_stream_headers(
+            {
+                "Content-Type": media_type,
+                "Content-Length": str(file_size),
+            }
+        )
         headers.update(extra)
         return StreamingResponse(
             iter_file(0, file_size),
@@ -2290,13 +2346,13 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str,
 
     start, end = rng
     length = end - start + 1
-    headers = {
-        "Content-Type": media_type,
-        "Content-Length": str(length),
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Accept-Ranges": "bytes",
-        "X-Accel-Buffering": "no",
-    }
+    headers = _media_stream_headers(
+        {
+            "Content-Type": media_type,
+            "Content-Length": str(length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+        }
+    )
     headers.update(extra)
     return StreamingResponse(
         iter_file(start, length),
@@ -4711,7 +4767,7 @@ def stream_tee_response(
     # issue #49：流式音频经用户自建 nginx 系反代时，默认 proxy_buffering on 会把
     # 整段缓冲完才开始向客户端出字节（表现为外网点播长时间转圈后失败）——
     # X-Accel-Buffering: no 让反代透传流式响应。
-    headers = {"Accept-Ranges": "bytes", "X-Accel-Buffering": "no"}
+    headers = _media_stream_headers()
     for key in ("content-type", "content-length", "content-range"):
         if resp.headers.get(key):
             headers[key] = resp.headers[key]
@@ -4731,6 +4787,9 @@ def stream_tee_response(
     ext = resolved_ext or ext_from_content_type(resp.headers.get("content-type", ""))
 
     async def body() -> AsyncGenerator[bytes, None]:
+        started = time.monotonic()
+        first_ms = None
+        delivery_outcome = "complete"
         # Pull-through provides backpressure: no unbounded producer queue and no
         # downloader outliving its consumer. Only a clean EOF may finalize.
         part = None
@@ -4790,6 +4849,8 @@ def stream_tee_response(
 
             iterator = chunks if chunks is not None else resp.aiter_bytes()
             if first_chunk:
+                if first_ms is None:
+                    first_ms = int((time.monotonic() - started) * 1000)
                 if fp:
                     try:
                         fp.write(first_chunk)
@@ -4801,6 +4862,8 @@ def stream_tee_response(
             try:
                 async for chunk in iterator:
                     if chunk:
+                        if first_ms is None:
+                            first_ms = int((time.monotonic() - started) * 1000)
                         if fp:
                             try:
                                 fp.write(chunk)
@@ -4815,6 +4878,7 @@ def stream_tee_response(
                 # journal. Client disconnects raise CancelledError (not caught
                 # here) and stay silent on purpose.
                 upstream_aborted = True
+                delivery_outcome = "upstream_error"
                 logger.warning("Stream aborted mid-way for %s: %s", guid, type(exc).__name__)
                 # issue #48/#50 播放中途断流：补齐断点细节（已发字节 vs 期望总长）
                 fn_diag(logger, "stream_abort_detail", guid=guid, written=written,
@@ -4892,6 +4956,12 @@ def stream_tee_response(
                     await client_to_close.aclose()
                 if resume_part:
                     _register_tee_handoff(guid, resume_part, written, expected, ext, scan_headers_factory)
+            if not eof and delivery_outcome == "complete":
+                delivery_outcome = "client_closed"
+            _log_stream_delivery(
+                "online", guid, range_header, delivery_outcome, written, expected,
+                first_ms, int((time.monotonic() - started) * 1000),
+            )
 
     return StreamingResponse(body(), status_code=resp.status_code, headers=headers)
 
@@ -5959,7 +6029,7 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
     if not opened:
         return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
     resp, owned, _ext, _info, _chunks, _first = opened
-    headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+    headers = _media_stream_headers({"Cache-Control": "no-store"})
     for key in ("content-type", "content-length", "content-range"):
         val = resp.headers.get(key)
         if val:
@@ -6027,7 +6097,8 @@ async def stream_track(request: Request, subpath: str = ""):
             promote_retained, _promote_entry = _retained_track(request, guid)
             asyncio.create_task(_promote_deferred_cache(promote_headers, guid, cached, promote_retained))
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
-        return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
+        return serve_file_with_range(cached, range_header, media_type_for_ext(ext),
+                                     delivery_kind="cached", delivery_guid=guid)
     item, entry = _retained_track(request, guid)
     candidates = [guid]
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
@@ -6177,7 +6248,8 @@ def _legacy_hls_stub(guid: str, info: "dict | None") -> Response:
         f"{stream_url}\n"
         "#EXT-X-ENDLIST\n"
     )
-    return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
+    return Response(content=playlist, media_type="application/vnd.apple.mpegurl",
+                    headers={"X-Accel-Buffering": "no"})
 
 
 @app.api_route("/music/api/v1/track/hls/{guid}/preset.m3u8", methods=["GET", "HEAD"])
@@ -6202,7 +6274,8 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
         path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
         if path:
             media = "audio/mp4" if filename == tc.INIT_NAME else "video/iso.segment"
-            return serve_file_with_range(path, request.headers.get("range"), media)
+            return serve_file_with_range(path, request.headers.get("range"), media,
+                                         delivery_kind="hls", delivery_guid=guid)
         return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
 
     if filename != "preset.m3u8":

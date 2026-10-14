@@ -195,6 +195,7 @@ def test_stream_head_and_path_form_guid():
         head = client.head("/music/api/v1/track/stream/online:kuwo:228908")
         assert head.status_code == 200
         assert head.headers.get("content-length") == str(len(audio))
+        assert head.headers.get("x-accel-buffering") == "no"
         assert head.content == b""
 
         got = client.get("/music/api/v1/track/stream/online:kuwo:228908")

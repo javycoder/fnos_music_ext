@@ -282,40 +282,43 @@ python3 -m pytest
 
 ### 外网反向代理访问（issue #49）
 
-通过域名把飞牛反代到公网/外网时，扩展下发的播放直链、HLS 分片与封面全部是**同源相对路径**（客户端用访问域名自己拼 URL），代理层不需要配置任何"外部地址"。外网"搜得到歌但播不出/一直转圈"基本都出在**反代层对流式响应不友好**，按下面核对：
+通过域名把飞牛反代到公网/外网时，扩展下发的播放直链、HLS 分片与封面全部是**同源相对路径**（客户端用访问域名自己拼 URL），代理层不需要配置任何"外部地址"。实际链路通常是"公网反代 → 飞牛 nginx → 扩展"：扩展返回的 `X-Accel-Buffering: no` 会被飞牛 nginx 作为内部控制头处理，且不会继续传给公网反代，因此**用户自建外层反代必须显式关闭媒体响应缓冲**。
 
 ```nginx
-# nginx 反代关键配置（location 段）
-location / {
+# nginx 自建外层反代关键配置
+location /music/ {
     proxy_pass http://127.0.0.1:<飞牛端口>;
     proxy_http_version 1.1;
 
-    # 1) 关闭响应缓冲：音频是流式传输，缓冲会导致"转圈很久才出声/超时失败"。
-    #    扩展所有流式响应已自带 X-Accel-Buffering: no，nginx 默认会尊重该头；
-    #    若你配置过 proxy_buffering on 且忽略该头，请显式改回 off。
+    # 1) 必须显式关闭响应缓冲。扩展的 X-Accel-Buffering 已让飞牛内层透传，
+    #    但该头到达外层前会被内层 nginx 隐藏，不能依赖它配置外层。
     proxy_buffering off;
+    proxy_cache off;
 
     # 2) 放大读超时：转码分片在 ffmpeg 起动时最长等待 30 秒
     proxy_read_timeout 120s;
     proxy_send_timeout 120s;
 
-    # 3) 透传必要请求头（Range 是拖动进度条/断点续传的关键，Cookie/Authorization 是鉴权）
+    # 3) 透传必要请求头（Range 是拖动进度条/断点续传的关键；鉴权按实际登录方式保留）
     proxy_set_header Range $http_range;
     proxy_set_header If-Range $http_if_range;
-    proxy_set_header Host $host;
+    proxy_set_header Host $http_host;
     proxy_set_header Cookie $http_cookie;
     proxy_set_header Authorization $http_authorization;
+    proxy_set_header authx $http_authx;
+    proxy_set_header X-Trim-Music-Temp-Token $http_x_trim_music_temp_token;
 
     # 4) 不要改写 Location 响应头（切源换曲 307 跳转是相对地址，改写会破坏跳转）
-    # proxy_redirect off;
+    proxy_redirect off;
 }
 ```
 
 其他排查要点：
 
 - **封面看不到**：封面默认由代理同源直出字节（`FNMUSIC_COVER_MODE=proxy`），无需外链可达；若反代后仍看不到，检查反代是否剥离了 query 参数（`?coverId=`）。
-- **"第二天才好"**：多为客户端缓存（封面缓存 1 天）或老版本历史问题（≤1.6.2 的 307 绝对地址、≤2.8.0 的封面 302 外链），先升级到最新版。
-- **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可直接定位环节。
+- **热门推荐重启后不能播、第二天恢复**：先升级到 2.8.3 或更新版本；已修复洛雪 songInfo 只存内存导致重启后推荐曲目被当作“未知曲目”解析失败的问题。封面仍有 1 天客户端缓存，但不要把跨天等待当作处理办法。
+- **入口差异**：自建 nginx/NPM 可按上方配置检查；HTTPS 端口映射保留客户端实际 Host 与端口；fn Connect 没有用户可配置的外层 nginx，遇到失败需结合日志继续定位。
+- **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
 
 ### 安装报「未检测到 docker」
 

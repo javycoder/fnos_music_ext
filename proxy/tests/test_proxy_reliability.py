@@ -283,13 +283,38 @@ async def test_mid_stream_abort_is_logged(tmp_path, caplog):
     response = p.stream_tee_response(
         httpx.Response(200, stream=audio, headers={"content-length": "4096"}),
         "online:kuwo:1", None, pre_info=song("kuwo:1"))
-    with caplog.at_level(logging.WARNING, logger=p.logger.name):
+    with caplog.at_level(logging.INFO, logger=p.logger.name):
         with pytest.raises(httpx.ReadError):
             async for _ in response.body_iterator:
                 pass
     assert any("Stream aborted mid-way for online:kuwo:1" in rec.message
                and "ReadError" in rec.message for rec in caplog.records)
+    assert any(rec.message.startswith("[diag] stream_delivery kind=online guid=online:kuwo:1")
+               and "outcome=upstream_error" in rec.message
+               and "bytes=2048" in rec.message for rec in caplog.records)
     assert not list(tmp_path.rglob("*.part")) and not list(tmp_path.rglob("*.mp3"))
+
+
+@pytest.mark.anyio
+async def test_stream_delivery_completion_and_disconnect_are_logged(tmp_path, caplog):
+    audio = Audio()
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=audio, headers={"content-length": "4096"}),
+        "online:kuwo:2", None, pre_info=song("kuwo:2"))
+    with caplog.at_level(logging.INFO, logger=p.logger.name):
+        chunks = [chunk async for chunk in response.body_iterator]
+    assert chunks == [b"x" * 2048, b"y" * 2048]
+    assert any(rec.message.startswith("[diag] stream_delivery kind=online guid=online:kuwo:2")
+               and "outcome=complete" in rec.message
+               and "first_ms=" in rec.message for rec in caplog.records)
+
+    audio = Audio()
+    response = p.stream_tee_response(httpx.Response(200, stream=audio), "online:kuwo:3", None)
+    assert await anext(response.body_iterator) == b"x" * 2048
+    await response.body_iterator.aclose()
+    assert any(rec.message.startswith("[diag] stream_delivery kind=online guid=online:kuwo:3")
+               and "outcome=client_closed" in rec.message
+               and "bytes=2048" in rec.message for rec in caplog.records)
 
 
 class _EnospcPartFile:

@@ -29,8 +29,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install audio test tools
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install audio and proxy test tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg nginx
 
       - name: Install test dependencies
         run: >
