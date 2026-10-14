@@ -18,6 +18,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      formal: ${{ steps.release-kind.outputs.formal }}
     env:
       # secrets 不能用于 steps.if，先映射到 job 级 env 供条件判断与脚本共用
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -38,6 +40,14 @@ jobs:
             echo "tag ${TAG} 与 VERSION 文件 ${version} 不一致" >&2
             exit 1
           fi
+
+      - name: Classify release
+        id: release-kind
+        run: |
+          case "${TAG#v}" in
+            *[a-z]) echo "formal=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "formal=true" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - name: Run packaging tests
         run: |
@@ -235,6 +245,8 @@ jobs:
   # 正式版，与应用内"检查更新"口径一致。moo 商店按本文件溯源收录（issue #47）。
   update-moo-index:
     needs: release
+    # 字母尾巴预发布不更新 main 的稳定版索引；main 尚无 moo.json 时也不提交。
+    if: ${{ needs.release.outputs.formal == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -256,6 +268,10 @@ jobs:
 
       - name: Commit index update
         run: |
+          if [ ! -f moo.json ]; then
+            echo "main 上暂无 moo.json，跳过提交"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add moo.json
