@@ -61,7 +61,7 @@ def reset_api(reason: str = "") -> None:
     登录由 CLI 子进程完成并写盘，而 NEMbox 的 NetEase 只在构造时读一次盘；
     磁盘 cookie 变化（扫码成功等）后不重建实例，服务进程内就永远是旧登录态。
     """
-    global _api_instance, _login_state
+    global _api_instance, _login_state, _vip_state
     import playback
 
     playback.reset()
@@ -74,6 +74,8 @@ def reset_api(reason: str = "") -> None:
         _api_instance = None
     with _login_state_lock:
         _login_state = None
+    with _vip_state_lock:
+        _vip_state = None
     with _url_cache_lock:
         _url_cache.clear()
     if reason:

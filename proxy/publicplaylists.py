@@ -18,11 +18,6 @@ from uuid import uuid4
 
 import httpx
 
-try:
-    from . import recommend as dailyrec
-except ImportError:  # uvicorn --app-dir proxy
-    import recommend as dailyrec  # type: ignore
-
 logger = logging.getLogger("proxy.publicplaylists")
 
 PUBLIC_GUID_PREFIX = "online:playlist:public:"
@@ -260,7 +255,7 @@ async def _fetch_summary(client: httpx.AsyncClient, entry: dict) -> dict:
         raise RuntimeError(f"summary http {response.status_code}")
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("ok") is not True or not isinstance(payload.get("data"), dict):
-        raise RuntimeError(payload.get("error") or "invalid summary payload")
+        raise RuntimeError("invalid summary payload")
     summary = payload["data"]
     _summary_cache[guid] = (summary, time.monotonic() + _SUMMARY_TTL_S)
     _atomic_write_json(_summary_disk_path(guid), {
@@ -296,10 +291,8 @@ async def load_summary(app_state, entry: dict) -> "dict | None":
 
     task = asyncio.get_running_loop().create_task(run())
     _summary_tasks[guid] = task
-    try:
-        return await asyncio.shield(task)
-    finally:
-        _summary_tasks.pop(guid, None)
+    task.add_done_callback(lambda done: _finish_shared(_summary_tasks, guid, done))
+    return await asyncio.shield(task)
 
 
 async def peek_cards(app_state, conf: dict, build_track) -> list[dict]:
@@ -379,7 +372,7 @@ async def _fetch_tracks(app_state, entry: dict, build_track) -> list:
         raise RuntimeError(f"tracks http {response.status_code}")
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("ok") is not True or not isinstance(payload.get("data"), list):
-        raise RuntimeError(payload.get("error") or "invalid tracks payload")
+        raise RuntimeError("invalid tracks payload")
     tracks: list[dict] = []
     for row in payload["data"][:_MAX_TRACKS]:
         if not isinstance(row, dict):
@@ -433,10 +426,24 @@ async def load_tracks(app_state, entry: dict, build_track) -> list:
 
     task = asyncio.get_running_loop().create_task(run())
     _tracks_tasks[guid] = task
-    try:
-        return await asyncio.shield(task)
-    finally:
-        _tracks_tasks.pop(guid, None)
+    task.add_done_callback(lambda done: _finish_shared(_tracks_tasks, guid, done))
+    return await asyncio.shield(task)
+
+
+def _finish_shared(registry: dict, guid: str, task: asyncio.Task) -> None:
+    if registry.get(guid) is task:
+        registry.pop(guid, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def shutdown() -> None:
+    tasks = set(_summary_tasks.values()) | set(_tracks_tasks.values()) | _prefetch_tasks
+    tasks = {task for task in tasks if task.get_loop() is asyncio.get_running_loop()}
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def cached_tracks(guid: str) -> "list | None":

@@ -332,7 +332,6 @@
   `wizard_lx_skip_verify` 开关（平台向导无文件上传组件），选 lxmusic 直接完成
   安装（无源状态），源脚本装好后在管理页配置；CLI `--lx-source-url` 变为可选。
   升级流程兼容 `.env` 中 `LX_SOURCE_URL` 为空的部署。
-
 ## [2.2.6] - 2026-09-22
 
 ### 修复

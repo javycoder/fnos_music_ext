@@ -434,6 +434,14 @@ def test_healthz_endpoint():
     assert "musicbox" in rj["source"]
 
 
+def test_reset_api_invalidates_vip_entitlement(monkeypatch):
+    import netease_ext
+
+    monkeypatch.setattr(netease_ext, "_vip_state", (True, time.monotonic()))
+    netease_ext.reset_api("test account switch")
+    assert netease_ext._vip_state is None
+
+
 def test_song_url_invalid_quality_rejected():
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/123/url", params={"quality": "ultra"})

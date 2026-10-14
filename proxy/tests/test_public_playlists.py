@@ -96,6 +96,55 @@ def test_explicit_empty_selection_does_not_restore_defaults():
     assert pubpl.parse_selection("[]", {"netease_enabled": True}) == []
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["summary", "tracks"])
+async def test_cancelled_waiter_keeps_shared_public_resolution(monkeypatch, kind):
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def fetch(*args):
+        calls.append(True)
+        entered.set()
+        await release.wait()
+        return SUMMARY if kind == "summary" else []
+
+    monkeypatch.setattr(pubpl, "_fetch_summary" if kind == "summary" else "_fetch_tracks", fetch)
+    monkeypatch.setattr(pubpl, "_provider_client", lambda *args: None)
+    load = (lambda: pubpl.load_summary(app.state, SELECTION[0])) if kind == "summary" else (
+        lambda: pubpl.load_tracks(app.state, SELECTION[0], lambda row: row))
+    first = asyncio.create_task(load())
+    await entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second = asyncio.create_task(load())
+    await asyncio.sleep(0)
+    release.set()
+    await second
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_public_shutdown_cancels_shared_work(monkeypatch):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def fetch(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(pubpl, "_fetch_summary", fetch)
+    monkeypatch.setattr(pubpl, "_provider_client", lambda *args: None)
+    waiter = asyncio.create_task(pubpl.load_summary(app.state, SELECTION[0]))
+    await entered.wait()
+    await pubpl.shutdown()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert cancelled.is_set() and not pubpl._summary_tasks
+
+
 def test_public_detail_requires_finos_authentication():
     handler = _wire()
     app.state.upstream_client = httpx.AsyncClient(

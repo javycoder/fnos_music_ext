@@ -173,6 +173,8 @@ CONF = {
     "lx_source_list": os.environ.get("LX_SOURCE_LIST", "[]"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
+    "search_empty_retry_delay": float(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY_DELAY", "1.2")),
     "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5.0")),
@@ -3910,6 +3912,7 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
+        await pubpl.shutdown()
         netease_tasks = _cancel_netease_resolutions()
         netease_tasks = [task for task in netease_tasks if task.get_loop() is asyncio.get_running_loop()]
         if netease_tasks:
@@ -4201,16 +4204,19 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
         entry["ts"] = 0
         return
     token = _FETCH_SCOPE.set(scope)
-    sources = []
+    factories = []
     if CONF.get("netease_enabled"):
-        sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
+        factories.append(lambda: fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
     if CONF.get("musicdl_enabled"):
-        sources.append(fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
+        factories.append(lambda: fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
     if CONF.get("lx_enabled"):
-        sources.append(fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
-    tasks = [asyncio.create_task(coro) for coro in sources]
+        factories.append(lambda: fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
+    tasks = [asyncio.create_task(factory()) for factory in factories]
+    task_factory = dict(zip(tasks, factories))
     pending = set(tasks)
     partial = False
+    retries = 0
+    failed = []
     results: dict[asyncio.Task, list] = {}
     try:
         deadline = asyncio.get_running_loop().time() + max(0.05, float(CONF["search_timeout"]))
@@ -4232,7 +4238,10 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                     entry["items"] = []
                     results[task] = []
                     continue
-                partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
+                hard_failure = data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
+                partial |= hard_failure
+                if hard_failure:
+                    failed.append(task_factory[task])
                 items = data.get("items", []) if isinstance(data, dict) else (data or [])
                 results[task] = items
                 if not entry["items"]:
@@ -4240,6 +4249,23 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                 else:
                     ordered = entry["items"] + items
                 entry["items"] = deduplicate_online_items(ordered)[:2000]
+            if (not pending and not entry["items"] and failed
+                    and not entry.get("abandoned") and not _user_search_stale(entry, scope)
+                    and retries < max(0, min(2, int(CONF.get("search_empty_retry", 1))))):
+                delay = max(0.0, float(CONF.get("search_empty_retry_delay", 1.2)))
+                if deadline - asyncio.get_running_loop().time() > delay:
+                    logger.info("搜索首屏空结果触发重试: attempt=%d", retries + 1)
+                    await asyncio.sleep(delay)
+                    if _user_search_stale(entry, scope) or entry.get("abandoned"):
+                        break
+                    new_tasks = [asyncio.create_task(factory()) for factory in failed]
+                    task_factory.update(zip(new_tasks, failed))
+                    tasks.extend(new_tasks)
+                    pending = set(new_tasks)
+                    failed = []
+                    retries += 1
+        if retries:
+            logger.info("搜索首屏重试结束: items=%d", len(entry["items"]))
         if entry.get("abandoned") or _user_search_stale(entry, scope):
             entry["items"] = []
             if _user_search_stale(entry, scope):
