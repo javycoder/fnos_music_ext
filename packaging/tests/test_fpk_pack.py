@@ -12,6 +12,7 @@
 """
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -254,6 +255,18 @@ class TestPayload:
             "proxy/app.py", "container/Dockerfile", "webui-service/app.py",
         ):
             assert (repo / rel).is_file(), f"payload 缺少运行所需文件 {rel}"
+
+    def test_arm64_native_binding_is_embedded(self, stage: Path):
+        repo = stage / "app" / "repo"
+        version = {}
+        for line in (repo / "container/lxserver.version").read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key and not key.startswith("#"):
+                version[key] = value
+        expected = f"music-tag-native-linux-arm64-gnu-{version['LXSERVER_NATIVE_VERSION']}.tgz"
+        artifact = repo / "container/lxserver-artifact" / expected
+        assert artifact.is_file(), f"FPK 缺少 ARM64 原生模块 {expected}"
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == version["LXSERVER_NATIVE_ARM64_SHA256"]
 
     def test_no_dev_files_or_secrets(self, stage: Path):
         repo = stage / "app" / "repo"

@@ -16,6 +16,7 @@
 - **管理员权限**：具备 `sudo` 执行权限的管理员账号（非交互安装需免密 sudo）；
 - **官方音乐应用**：必须先在 fnOS「应用中心」安装并启动「飞牛音乐」（确保存在 `/var/run/trim_music.socket`）；
 - **Docker（默认形态需要）**：默认部署形态为 Docker 单容器，需先在 fnOS「应用中心」安装 Docker，脚本绝不会擅自安装 Docker 引擎。无 Docker 的机器可改用**原生部署**（`./install.sh --deploy native`，见下文「方式 C」），功能与 Docker 形态完全一致。
+- **CPU 架构**：支持 `x86_64` 与 `aarch64/ARM64`；ARM32（armv7/armhf）暂不支持。
 
 克隆项目并进入根目录赋予执行权限（**仅脚本安装需要**，fpk 安装可跳过）：
 

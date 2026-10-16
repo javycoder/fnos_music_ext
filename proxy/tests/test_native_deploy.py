@@ -21,6 +21,8 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import hashlib
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -280,6 +282,8 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     (repo / "container" / "lxserver-artifact").mkdir(parents=True)
     # BASE_DIR 取自脚本自身位置：脚本须复制进 tmp 仓库再运行（与真实布局一致）
     shutil.copy(BASE / "ensure_sources_native.sh", repo / "ensure_sources_native.sh")
+    shutil.copy(BASE / "container/ensure_lxserver_native.sh",
+                repo / "container/ensure_lxserver_native.sh")
     for req in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         (repo / req).mkdir()
         (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
@@ -290,10 +294,22 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     with zipfile.ZipFile(artifact, "w") as zf:
         zf.writestr("lx-music-sync-server/index.js", "#!/usr/bin/env node\nrequire('./server/server');\n")
         zf.writestr("lx-music-sync-server/server/server.js", f"#!/usr/bin/env node\n{original_line}\n")
-    import hashlib
     sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    native_tarball = repo / "container/lxserver-artifact/music-tag-native-linux-arm64-gnu-0.2.5.tgz"
+    package_dir = tmp_path / "native-package" / "package"
+    package_dir.mkdir(parents=True)
+    (package_dir / "package.json").write_text(
+        '{"name":"music-tag-native-linux-arm64-gnu"}\n', encoding="utf-8"
+    )
+    (package_dir / "music-tag-native.linux-arm64-gnu.node").write_bytes(b"arm64-native")
+    with tarfile.open(native_tarball, "w:gz") as archive:
+        archive.add(package_dir / "package.json", arcname="package/package.json")
+        archive.add(package_dir / "music-tag-native.linux-arm64-gnu.node",
+                    arcname="package/music-tag-native.linux-arm64-gnu.node")
+    native_sha = hashlib.sha256(native_tarball.read_bytes()).hexdigest()
     (repo / "container" / "lxserver.version").write_text(
-        f"LXSERVER_TAG=vtest\nLXSERVER_ZIP_NAME=lx-test-server.zip\nLXSERVER_SHA256={sha}\n",
+        f"LXSERVER_TAG=vtest\nLXSERVER_ZIP_NAME=lx-test-server.zip\nLXSERVER_SHA256={sha}\n"
+        f"LXSERVER_NATIVE_VERSION=0.2.5\nLXSERVER_NATIVE_ARM64_SHA256={native_sha}\n",
         encoding="utf-8",
     )
     # venv 桩：脚本只探测 python/pip 可执行并调用 pip install（成功即可）
@@ -309,6 +325,7 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     _write_stub(stub_bin, "ffmpeg", 'echo "ffmpeg version 6.0" ; exit 0\n')
     env = {
         "BASE_DIR": str(repo),
+        "FNMUSIC_LXSERVER_ARCH": "arm64",
         "FNMUSIC_VENV_SOURCES_DIR": str(venv),
         "PATH": f"{stub_bin}:{os.environ['PATH']}",
     }

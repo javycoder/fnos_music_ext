@@ -156,6 +156,16 @@ def test_healthz_endpoint(test_app_client):
     assert data["user_source"]["configured"] is True
 
 
+def test_healthz_reports_lxserver_failure(test_app_client, fake_lx):
+    fake_lx.alive = False
+    res = test_app_client.get("/healthz")
+    assert res.status_code == 503
+    data = res.json()
+    assert data["ok"] is False
+    assert data["error"] == "lxserver unreachable"
+    assert data["user_source"]["last_error"] == "lxserver unreachable"
+
+
 def test_search_endpoint(test_app_client):
     res = test_app_client.get("/api/v1/search?q=海阔天空&sources=kw&limit=10")
     assert res.status_code == 200

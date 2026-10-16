@@ -1046,8 +1046,25 @@ def _err(msg: str, code: int = 404) -> JSONResponse:
 
 @app.get("/healthz")
 async def healthz():
+    lxserver_alive = await LXSERVER.is_alive()
     user_src = await describe_user_source()
     caps = await source_capabilities()
+    if not lxserver_alive:
+        user_src["last_error"] = "lxserver unreachable"
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": "lxserver unreachable",
+                "service": "fnmusic-lxmusic",
+                "version": SERVICE_VERSION,
+                "sources": CONF["sources"],
+                "user_source": user_src,
+                "circuit": chain_health_snapshot(),
+                "capabilities": caps,
+                "charts": ["kg", "kw", "wy"],
+            },
+        )
     return {
         "ok": True,
         "service": "fnmusic-lxmusic",

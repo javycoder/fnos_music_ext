@@ -309,6 +309,8 @@ def test_dockerfile_assembly():
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
     assert "container/lxserver.version" in text
+    assert "container/ensure_lxserver_native.sh" in text
+    assert "ensure-lxserver-native" in text
     assert "lxmusic-service/lxserver_client.py" in text
     assert "lxmusic-service/js/bridge.js" not in text
     assert text.count("HEALTHCHECK") >= 1

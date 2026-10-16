@@ -70,6 +70,17 @@ if [ -f "${REPO_ROOT}/scripts/update_lxserver.sh" ]; then
     echo "[fpk] 检查构建缓存中的 lxserver 预编译包..."
     bash "${REPO_ROOT}/scripts/update_lxserver.sh" "" "${BUILD_CACHE}" || echo "[WARN] 缓存预编译包检查失败"
 fi
+echo "[fpk] 检查 lxserver ARM64 原生模块..."
+if ! bash "${REPO_ROOT}/container/ensure_lxserver_native.sh" \
+    --artifact-dir "${BUILD_CACHE}" \
+    --version-file "${REPO_ROOT}/container/lxserver.version" \
+    --required-arch arm64 --download-only; then
+    if [ "${STAGE_ONLY}" -eq 1 ]; then
+        echo "[WARN] 离线组装缺少 ARM64 原生模块；正式打包会强制失败"
+    else
+        exit 1
+    fi
+fi
 
 # ------------------------------------------------------------------------------
 # 1. 组装打包目录
@@ -106,6 +117,16 @@ if [ -f "${REPO_ROOT}/container/lxserver.version" ]; then
         mkdir -p "${STAGE}/app/repo/container/lxserver-artifact"
         cp -p "${CACHED_ZIP}" "${STAGE}/app/repo/container/lxserver-artifact/"
         echo "[fpk] 已将离线预编译包注入至打包目标目录: ${LXSERVER_ZIP_NAME}"
+    fi
+    ARM64_NATIVE="${LXSERVER_NATIVE_VERSION:+music-tag-native-linux-arm64-gnu-${LXSERVER_NATIVE_VERSION}.tgz}"
+    if [ -n "${ARM64_NATIVE}" ] && [ -f "${BUILD_CACHE}/${ARM64_NATIVE}" ]; then
+        cp -p "${BUILD_CACHE}/${ARM64_NATIVE}" "${STAGE}/app/repo/container/lxserver-artifact/"
+        echo "[fpk] 已将 ARM64 原生模块注入至打包目标目录: ${ARM64_NATIVE}"
+    elif [ "${STAGE_ONLY}" -eq 1 ]; then
+        echo "[WARN] 打包目标目录缺少 ARM64 原生模块: ${ARM64_NATIVE:-}"
+    else
+        echo "ERROR: 缺少 ARM64 原生模块 ${ARM64_NATIVE:-}" >&2
+        exit 1
     fi
 fi
 

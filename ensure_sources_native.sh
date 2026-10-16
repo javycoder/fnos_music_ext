@@ -11,7 +11,8 @@ set -euo pipefail
 #      尝试 sudo apt-get 安装，失败给出手动命令
 #   3. lxserver 预编译包落位 .lxserver/：container/lxserver-artifact/ 预置优先
 #      （离线/fpk 场景），缺失走镜像加速下载链；sha256 校验 + 补丁与 Dockerfile
-#      构建层一致，按版本幂等（同版本已就位则跳过）
+#      构建层一致，按版本幂等（同版本已就位则跳过）；ARM64 额外补齐锁定
+#      的 music-tag-native 平台绑定，避免上游 x64 单架构包启动崩溃
 # 本脚本不修改任何系统配置（apt 安装除外，且仅补缺失的两组件）。
 # 可调环境变量: PIP_INDEX / FNMUSIC_VENV_SOURCES_DIR / FNMUSIC_APT_MIRROR /
 #               FNMUSIC_LXSERVER_MIRROR（均默认与 Docker 构建一致）
@@ -208,5 +209,10 @@ else
     printf '%s\n' "${LXSERVER_TAG}" > "${LXSERVER_STAMP}"
     log_info "lxserver ${LXSERVER_TAG} 已落位 ${LXSERVER_DIR}。"
 fi
+
+bash "${BASE_DIR}/container/ensure_lxserver_native.sh" \
+    --artifact-dir "${LXSERVER_ARTIFACT_DIR}" \
+    --lxserver-dir "${LXSERVER_DIR}" \
+    --version-file "${LXSERVER_VERSION_FILE}"
 
 log_info "原生音源运行时就绪。"
