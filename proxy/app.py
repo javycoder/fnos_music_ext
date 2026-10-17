@@ -38,6 +38,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 
 try:
     from . import recommend as dailyrec
+    from . import localrecommend as localrec
     from . import nmplaylists as nmpl
     from . import publicplaylists as pubpl
     from . import transcode as tc
@@ -48,6 +49,7 @@ try:
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    import localrecommend as localrec
     import nmplaylists as nmpl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
@@ -7265,7 +7267,10 @@ async def static_cover(request: Request, subpath: str = ""):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
+        if playlist_kind == "liked":
+            cached = await _load_requested_playlist_bundle(request, user_guid, playlist_kind, guid)
+        else:
+            cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
         picked = dailyrec.pick_playlist_cover_track(tracks)
         picked_guid = str((picked or {}).get("guid") or "")
@@ -7933,6 +7938,8 @@ def _sync_recommend_version_marker() -> None:
 
 
 def _recommend_kind_enabled(kind: str) -> bool:
+    if kind == "liked":
+        return True
     if kind == "hot":
         return bool(CONF.get("recommend_hot", True))
     return bool(CONF.get("recommend_daily", True))
@@ -7940,7 +7947,7 @@ def _recommend_kind_enabled(kind: str) -> bool:
 
 def _recommend_kinds_enabled() -> list[str]:
     """按开关返回要注入的推荐歌单类型（顺序即歌单列表顺序）。"""
-    return [k for k in ("daily", "hot") if _recommend_kind_enabled(k)]
+    return [k for k in ("daily", "liked", "hot") if _recommend_kind_enabled(k)]
 
 
 def _is_shared_user_guid(user_guid: str) -> bool:
@@ -8072,6 +8079,8 @@ async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "dail
     if kind not in _recommend_injectable_kinds(user_guid):
         # 开关关闭或身份探测失败（shared）的个性化 daily：注入与生成一并跳过
         return dailyrec.empty_daily_bundle(user_guid, kind)
+    if kind == "liked":
+        return await localrec.get_bundle(user_guid, str(CONF.get("music_db") or dailyrec.music_db_path()))
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
     cached = dailyrec.load_daily_cache(user_guid, day, kind)
@@ -8081,6 +8090,8 @@ async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "dail
 
 
 async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
+    if kind == "liked":
+        return await _peek_daily_bundle(request, user_guid, kind)
     if kind not in _recommend_injectable_kinds(user_guid):
         # 同 _peek_daily_bundle：shared 会话不构建/不下发个性化 daily（issue #25）
         return dailyrec.empty_daily_bundle(user_guid, kind)
@@ -8090,6 +8101,12 @@ async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "dail
     if cached and cached.get("tracks"):
         return cached
     return await _wait_progressive_bundle(request, user_guid, kind, timeout_s=20.0)
+
+
+async def _load_requested_playlist_bundle(request: Request, user_guid: str, kind: str, guid: str) -> dict:
+    if kind == "liked" and guid != dailyrec.recommend_playlist_guid("liked", user_guid=user_guid):
+        return dailyrec.empty_daily_bundle(user_guid, "liked")
+    return await _load_daily_bundle(request, user_guid, kind)
 
 
 # === playlist tracks（官方歌单内的在线附加条目）===
@@ -8334,6 +8351,8 @@ async def playlist_delete(request: Request):
     _pl_guid = str(_body.get("guid") or "").strip() if isinstance(_body, dict) else ""
     if pubpl.is_public_playlist_guid(resolve_real_guid(_pl_guid)):
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+    if dailyrec.online_playlist_kind(resolve_real_guid(_pl_guid)) == "liked":
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     if nmpl.is_nm_playlist_guid(resolve_real_guid(_pl_guid)):
         # 网易账号歌单只读：吸收删除（不透传官方必被拒的假 id），下次刷新卡片仍在
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
@@ -8428,7 +8447,7 @@ async def playlist_list(request: Request):
             logger.warning("%s recommend list inject failed: %s", kind, e)
             continue
         tracks = bundle.get("tracks") or []
-        if kind == "hot" and not tracks:
+        if kind in ("hot", "liked") and not tracks:
             # 热门歌单构建失败/无可用榜单时不挂空壳（每日推荐保留占位等待后台生成）
             continue
         rec = _playlist_public_fields(bundle.get("playlist") or {}, tracks)
@@ -8479,7 +8498,7 @@ async def playlist_list(request: Request):
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
-    guid = str(request.query_params.get("guid") or "").strip()
+    guid = resolve_real_guid(str(request.query_params.get("guid") or "").strip())
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
     if public_entry:
         is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
@@ -8535,7 +8554,7 @@ async def playlist_detail(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid, kind)
+    bundle = await _load_requested_playlist_bundle(request, user_guid, kind, guid)
     rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
     rec["trackCount"] = len(bundle.get("tracks") or [])
     return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
@@ -8544,7 +8563,7 @@ async def playlist_detail(request: Request):
 @app.get("/music/api/v1/playlist/batch-detail")
 async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
-    guids = [g.strip() for g in raw.split(",") if g.strip()]
+    guids = [resolve_real_guid(g.strip()) for g in raw.split(",") if g.strip()]
     recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
     public_ids = [resolve_real_guid(g) for g in guids if pubpl.is_public_playlist_guid(resolve_real_guid(g))]
     nm_ids = [
@@ -8599,7 +8618,7 @@ async def playlist_batch_detail(request: Request):
     recs: list[dict] = []
     for g in recommend_ids:
         kind = dailyrec.online_playlist_kind(g) or "daily"
-        bundle = await _load_daily_bundle(request, user_guid, kind)
+        bundle = await _load_requested_playlist_bundle(request, user_guid, kind, g)
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
         recs.append(rec)
@@ -8634,6 +8653,7 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
+    guid = resolve_real_guid(guid)
     kind = dailyrec.online_playlist_kind(guid)
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
     if public_entry:
@@ -8775,7 +8795,7 @@ async def playlist_track_list(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid, kind)
+    bundle = await _load_requested_playlist_bundle(request, user_guid, kind, guid)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
     register_online_meta(tracks)
     try:

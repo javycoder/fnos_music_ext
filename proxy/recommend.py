@@ -1,4 +1,4 @@
-"""推荐歌单：采信音源原生推荐生成可播放在线歌单。
+"""推荐歌单：在线推荐与本地猜你喜欢的公共接口。
 
 两个独立歌单，各自受开关门控（见 .env FNMUSIC_RECOMMEND_*）：
   - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：按账户隔离，逐级补齐至 PLAYLIST_SIZE 首：
@@ -10,6 +10,7 @@
   - 热门推荐（hot，FNMUSIC_RECOMMEND_HOT）：榜单原味（不排除已收藏/最近播放）：
       1. netease-charts 网易热歌榜（musicbox toplist，免登录）
       2. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
+猜你喜欢（liked）始终启用，由 localrecommend 独立计算，不参与上述在线构建链。
 歌单封面取曲：第一个带可用封面直链的在线曲目；无在线封面回落第一首带官方
 coverId 的本地曲目（跳过酷我文本页假链接）。
 密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
@@ -17,6 +18,7 @@ coverId 的本地曲目（跳过酷我文本页假链接）。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +36,7 @@ logger = logging.getLogger("fnmusic_proxy.recommend")
 
 DAILY_GUID_PREFIX = "online:playlist:daily:"
 HOT_GUID_PREFIX = "online:playlist:hot:"
+LIKED_GUID_PREFIX = "online:playlist:liked:"
 # 酷我文本封面 host：该“封面 URL”实为含图片链接的文本页，不能当直链用（app.py 引用同一常量）
 KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -185,6 +188,8 @@ def today_key(now: datetime | None = None) -> str:
 
 
 def recommend_playlist_guid(kind: str, day: str | None = None, user_guid: str = "") -> str:
+    if kind == "liked":
+        return LIKED_GUID_PREFIX + hashlib.sha256(user_guid.encode("utf-8")).hexdigest()
     prefix = HOT_GUID_PREFIX if kind == "hot" else DAILY_GUID_PREFIX
     day = day or today_key()
     suffix = re.sub(r"[^A-Za-z0-9]", "", user_guid)[:12]
@@ -202,8 +207,10 @@ def hot_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
 
 
 def online_playlist_kind(guid: str | None) -> str:
-    """解析推荐歌单 guid 的类型：daily / hot，非推荐歌单返回空串。"""
+    """解析推荐歌单 guid 的类型：daily / liked / hot，非推荐歌单返回空串。"""
     s = str(guid or "")
+    if s.startswith(LIKED_GUID_PREFIX):
+        return "liked"
     if s.startswith(DAILY_GUID_PREFIX):
         return "daily"
     if s.startswith(HOT_GUID_PREFIX):
@@ -1469,7 +1476,7 @@ def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
     keep = {f"daily-{keep_day}.json", f"hot-{keep_day}.json"}
     fallback_keep = {f"daily-{keep_day}.fallback.json", f"hot-{keep_day}.fallback.json"}
     for name in os.listdir(folder):
-        if not name.endswith(".json") or name in keep:
+        if not name.endswith(".json") or name in keep or name == "liked.json":
             continue
         path = os.path.join(folder, name)
         # issue #57：当日 fallback 只在新版当日缓存已建成时清理（升级过渡兜底），
@@ -1645,6 +1652,8 @@ def build_playlist_record(
 
 
 def playlist_display_name(kind: str, day: str | None = None) -> str:
+    if kind == "liked":
+        return "猜你喜欢"
     if kind == "hot":
         return "热门推荐"
     day = day or today_key()
@@ -1652,7 +1661,7 @@ def playlist_display_name(kind: str, day: str | None = None) -> str:
 
 
 def empty_daily_bundle(user_guid: str, kind: str = "daily") -> dict:
-    kind = "hot" if kind == "hot" else "daily"
+    kind = kind if kind in ("hot", "liked") else "daily"
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
     playlist = build_playlist_record(
