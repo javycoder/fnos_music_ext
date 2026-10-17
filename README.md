@@ -128,7 +128,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | 每日 / 热门推荐 | `FNMUSIC_RECOMMEND_DAILY` / `FNMUSIC_RECOMMEND_HOT` | 默认开启，可分别关闭 |
 | 公共歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` | 默认关闭，选单在管理页完成 |
 | 网易账号歌单 / 常驻 | `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 默认关闭；账号歌单仍需登录 |
-| 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | 默认关闭，启用后下载并等待官方入库再绑定 |
+| 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | 默认关闭，显式收藏或加入歌单后下载并等待官方入库再绑定；浏览列表不触发音频下载 |
 | 大模型推荐 | `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL` | 可选；接口地址、密钥、模型配齐后生效 |
 
 热重载默认每 2 秒检测 `.env` 白名单配置。端口、部分平台参数等非热重载项修改后，需重新启用服务。

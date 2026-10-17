@@ -11,8 +11,7 @@
       1. netease-charts 网易热歌榜（musicbox toplist，免登录）
       2. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
 猜你喜欢（liked）始终启用，由 localrecommend 独立计算，不参与上述在线构建链。
-歌单封面取曲：第一个带可用封面直链的在线曲目；无在线封面回落第一首带官方
-coverId 的本地曲目（跳过酷我文本页假链接）。
+歌单使用自身 ID 请求封面，封面接口从缓存曲目选取有限候选并提供占位回退。
 密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
 """
 from __future__ import annotations
@@ -231,7 +230,7 @@ def pick_playlist_cover_track(tracks: list[dict] | None) -> dict | None:
     第一首带官方 coverId 的本地曲目（封面端点对真实官方 guid 透传官方）。
 
     跳过 cover_url 为空与酷我文本页假链接（KW_TEXT_COVER_HOST）的曲目；
-    都没有返回 None（封面端点据此 404，客户端显示自带默认样式）。
+    都没有返回 None，由调用方提供占位回退。
     """
     local_fallback = None
     for t in tracks or []:
@@ -1837,8 +1836,7 @@ async def get_or_build_daily(
         if not tracks:
             return
         stamped = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
-        picked = pick_playlist_cover_track(stamped)
-        cover_id = str((picked or {}).get("coverId") or (picked or {}).get("guid") or guid)
+        cover_id = guid
         pl = build_playlist_record(
             guid=guid,
             name=playlist_display_name(kind, day),
@@ -1970,8 +1968,7 @@ async def get_or_build_daily(
                 logger.warning("daily recommend tier local-random failed: %s", e)
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
-    picked = pick_playlist_cover_track(tracks)
-    cover_id = str((picked or {}).get("coverId") or (picked or {}).get("guid") or guid)
+    cover_id = guid
     playlist = build_playlist_record(
         guid=guid,
         name=playlist_display_name(kind, day),

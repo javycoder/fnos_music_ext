@@ -279,10 +279,11 @@ def test_cover_redirect(monkeypatch):
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("image/jpeg")
         assert resp.content == b"\xFF\xD8\xFFnm"
-        # 无封面直链的私歌单：404（客户端回落默认样式）
+        # 无歌单封面直链时仍可使用已缓存的曲目封面
         fake333 = fake_official_guid("online:playlist:nm:333")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake333}"}, follow_redirects=False)
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/")
 
 
 def test_readonly_guards_absorb_writes():

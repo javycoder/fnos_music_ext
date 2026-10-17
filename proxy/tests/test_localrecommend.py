@@ -237,7 +237,7 @@ def client(library, monkeypatch):
         if request.url.path.endswith("/playlist/list"):
             return httpx.Response(200, json={"code": 0, "data": {"list": [{"guid": "official", "name": "官方"}], "total": 1}})
         if request.url.path.endswith("/static/cover"):
-            return httpx.Response(200, content=b"cover", headers={"content-type": "image/jpeg"})
+            return httpx.Response(200, content=b"\xff\xd8\xffcover", headers={"content-type": "image/jpeg"})
         return httpx.Response(200, json={"code": 0, "data": None})
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
@@ -293,15 +293,15 @@ def test_playlist_cover_and_no_cover_fallback(client, library, monkeypatch):
     test_client, state = client
     guid = rec.recommend_playlist_guid("liked", user_guid="u1")
     response = test_client.get("/music/api/v1/static/cover", params={"coverId": guid})
-    assert response.content == b"cover"
+    assert response.content == b"\xff\xd8\xffcover"
     assert response.headers["content-type"] == "image/jpeg"
     state["user"] = "u2"
-    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 404
+    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 200
     state["user"] = "u1"
     edit(library, "UPDATE track SET cover_guid = NULL")
     with open(cache_path(), "w", encoding="utf-8") as cache_file:
         cache_file.write("{}")
-    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 404
+    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 200
 
 
 def test_order_independent_of_other_recommendation_switches(client, monkeypatch):

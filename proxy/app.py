@@ -6130,7 +6130,7 @@ def _lookup_bind_any_user(raw_guid: str) -> "tuple[str, str, dict] | None":
 def _maybe_retry_official_binds(request: Request, user_guid: str,
                                 fav_items: "list[dict] | None" = None,
                                 plt_map: "dict[str, list[dict]] | None" = None) -> None:
-    """列表读取时的自愈：bind=pending 条目补发官方绑定或下载（用户级 60s 节流）。
+    """列表读取只恢复绑定意图及已有文件的绑定（用户级 60s 节流）。
 
     覆盖代理重启丢内存意图、官方迟扫入库、下载中断等场景；凭证头取当前请求，
     绝不持久化。
@@ -6165,8 +6165,6 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
     for guid in uniq[:_BIND_RETRY_BATCH]:
         if find_cache_file(guid):
             _dispatch_official_binding(guid, headers, None)
-        else:
-            _register_background_fetch(request, guid, "fav_auto_bind")
 
 
 async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
@@ -7247,10 +7245,64 @@ async def _online_cover_delivery(cover: str, guid: str = "") -> Response | None:
 _COVER_UNRESOLVED_SEEN: set[str] = set()
 
 
+async def _playlist_cover_response(request: Request, guid: str, tracks: list,
+                                   cover_url: str = "") -> Response:
+    candidates = []
+    seen = set()
+    for track in ([{"cover_url": cover_url}] if cover_url else []) + list(tracks):
+        track_guid = str(track.get("guid") or "")
+        url = _cover_guid_url_lookup(track_guid) or _cover_url_of(track)
+        cover_id = str(track.get("coverId") or "")
+        if url and _KW_TEXT_COVER_HOST not in url:
+            key = ("url", url)
+        elif cover_id and not is_online_guid(cover_id):
+            key = ("local", cover_id)
+        else:
+            continue
+        if key not in seen:
+            seen.add(key)
+            candidates.append(key)
+        if len(candidates) == 3:
+            break
+    deadline = time.monotonic() + 5.0
+    for index, (kind, value) in enumerate(candidates):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            async with asyncio.timeout(remaining / (len(candidates) - index)):
+                if kind == "url":
+                    response = await _proxied_cover_response(value)
+                else:
+                    response = _official_cover_file_response(value, request.query_params.get("size"))
+                    if response is None:
+                        fetched = await get_upstream_client(request.app).get(
+                            "/music/api/v1/static/cover", params={"coverId": value},
+                            headers=copy_incoming_headers(request),
+                        )
+                        mime = _sniff_image_mime(fetched.content)
+                        if fetched.status_code == 200 and mime:
+                            response = Response(content=fetched.content, media_type=mime)
+                if response is not None:
+                    return response
+        except (TimeoutError, httpx.HTTPError):
+            pass
+    if guid not in _COVER_UNRESOLVED_SEEN:
+        if len(_COVER_UNRESOLVED_SEEN) >= 2048:
+            _COVER_UNRESOLVED_SEEN.clear()
+        _COVER_UNRESOLVED_SEEN.add(guid)
+        fn_diag(logger, "playlist_cover_placeholder", guid=guid, candidates=len(candidates))
+    return _placeholder_cover_response(guid)
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    if guid and not is_online_guid(guid):
+        normalized = re.sub(r"\.(jpg|jpeg|png|webp|gif)$", "", guid, flags=re.IGNORECASE)
+        normalized = re.sub(r"_w\d+$", "", normalized)
+        guid = resolve_real_guid(normalized)
     if not guid and subpath.startswith("online:"):
         guid = subpath
     if not guid and subpath:
@@ -7272,62 +7324,23 @@ async def static_cover(request: Request, subpath: str = ""):
         else:
             cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
-        picked = dailyrec.pick_playlist_cover_track(tracks)
-        picked_guid = str((picked or {}).get("guid") or "")
-        if not is_online_guid(picked_guid):
-            cover_id = str((picked or {}).get("coverId") or "")
-            if picked and cover_id and not is_online_guid(cover_id):
-                local_resp = _official_cover_file_response(cover_id, size=request.query_params.get("size"))
-                if local_resp is not None:
-                    return local_resp
-                # 本地曲目封面：coverId 是真实官方封面 guid，透传官方静态封面端点
-                upstream_client = get_upstream_client(request.app)
-                headers = copy_incoming_headers(request)
-                cover_req = upstream_client.build_request(
-                    request.method,
-                    f"/music/api/v1/static/cover?coverId={quote(cover_id, safe='')}",
-                    headers=headers,
-                )
-                cover_resp = await upstream_client.send(cover_req, stream=True)
-                cover_headers = filter_headers(
-                    cover_resp.headers, exclude_keys={"content-length", "content-encoding"}
-                )
-
-                async def _cover_stream():
-                    try:
-                        async for chunk in cover_resp.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await cover_resp.aclose()
-
-                return StreamingResponse(
-                    _cover_stream(), status_code=cover_resp.status_code, headers=cover_headers
-                )
-            # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
-            return Response(status_code=404)
-        guid = picked_guid
+        return await _playlist_cover_response(request, guid, tracks)
     if pubpl.is_public_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
         is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        cover = pubpl.cover_url_for(guid)
-        if cover:
-            resp = await _online_cover_delivery(cover, guid)
-            if resp is not None:
-                return resp
-        return Response(status_code=404)
+        return await _playlist_cover_response(
+            request, guid, pubpl.cached_tracks(guid) or [], pubpl.cover_url_for(guid))
     # 网易账号歌单封面：登记的封面直链同源直出（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
-        cover = nmpl.cover_url_for(nm_pl_id)
-        if cover:
-            resp = await _online_cover_delivery(cover, guid)
-            if resp is not None:
-                return resp
-            # 直出失败（拉图异常）：回落 404，客户端显示自带默认样式
-            return Response(status_code=404)
-        return Response(status_code=404)
+        upstream_client = get_upstream_client(request.app)
+        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        return await _playlist_cover_response(
+            request, guid, nmpl.cached_tracks(nm_pl_id) or [], nmpl.cover_url_for(nm_pl_id))
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
@@ -7386,6 +7399,13 @@ async def static_cover(request: Request, subpath: str = ""):
     mapped = _cover_guid_url_lookup(guid)
     if mapped and _KW_TEXT_COVER_HOST not in mapped:
         resp = await _online_cover_delivery(mapped, guid)
+        if resp is not None:
+            return resp
+
+    snapshot = await asyncio.to_thread(_lookup_playlist_cache_track, guid)
+    snapshot_cover = _cover_url_of(snapshot)
+    if snapshot_cover:
+        resp = await _online_cover_delivery(snapshot_cover, guid)
         if resp is not None:
             return resp
 
@@ -8385,15 +8405,7 @@ async def playlist_delete(request: Request):
 
 
 def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
-    # 封面取曲在下发时重算（兼容当天旧缓存），并伪装成官方 track_+32hex 形态：
-    # 官方 App 按 id 格式过滤，online: 原样下发的 coverId 不会被渲染成图标。
-    # 本地曲目的 coverId 是真实官方封面 guid：原样下发（封面端点透传官方）。
-    cover = ""
-    picked = dailyrec.pick_playlist_cover_track(tracks)
-    if picked:
-        cover = str(picked.get("coverId") or picked.get("guid") or "")
-    if not cover:
-        cover = str(record.get("coverId") or record.get("guid") or "")
+    cover = str(record.get("guid") or record.get("coverId") or "")
     if cover.startswith("online:"):
         cover = "track_" + fake_official_guid(cover)
     return {

@@ -846,7 +846,7 @@ async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
     assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
     # 封面 = 第一个有 cover_url 的歌（第一首在列）；issue #55 后首曲随当日
     # 采样窗口平移，按 day_shifted 的当日首行计算预期
-    assert payload["playlist"]["coverId"] == payload["tracks"][0]["guid"]
+    assert payload["playlist"]["coverId"] == payload["guid"]
     first_sid = dailyrec.day_shifted(
         _mb_detail_rows(25, "热歌榜", sid_base=70000),
         dailyrec.today_key(), "nm-charts",
@@ -997,7 +997,7 @@ async def test_daily_cover_skips_coverless_tracks(tmp_path, monkeypatch):
         )
     assert payload["tracks"][0]["title"] == "无封面歌"
     assert not payload["tracks"][0].get("cover_url")
-    assert payload["playlist"]["coverId"] == payload["tracks"][1]["guid"]
+    assert payload["playlist"]["coverId"] == payload["guid"]
     assert payload["tracks"][1].get("cover_url")
 
 
@@ -1037,7 +1037,7 @@ def test_playlist_list_injects_both_playlists_with_disguised_cover(tmp_path, mon
             cover = str(rec["coverId"])
             assert cover.startswith("track_") and len(cover) == 6 + 32
             resolved = resolve_real_guid(cover)
-            assert str(resolved).startswith("online:netease:")
+            assert resolved == rec["guid"]
 
 
 @pytest.mark.anyio
@@ -1513,7 +1513,7 @@ def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, mon
         if path == "/music/api/v1/static/cover":
             cover_calls["n"] += 1
             cover_calls["id"] = request.url.params.get("coverId")
-            return httpx.Response(200, content=b"\x89PNG-fake", headers={"content-type": "image/png"})
+            return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"fake", headers={"content-type": "image/png"})
         return httpx.Response(200, json={"code": 0, "data": None})
 
     app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
@@ -1529,8 +1529,7 @@ def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, mon
         assert any("每日推荐" in str(n) for n in names)
         daily = resp.json()["data"]["list"][0]
         assert daily["trackCount"] == dailyrec.PLAYLIST_SIZE
-        assert not str(daily["coverId"]).startswith("track_")  # 官方封面 guid 原样下发
-        assert str(daily["coverId"]).startswith("cover")
+        assert resolve_real_guid(daily["coverId"]) == daily["guid"]
 
         tracks_resp = client.get(
             "/music/api/v1/track/playlist-detail/list",
@@ -1550,7 +1549,7 @@ def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, mon
         cover = client.get("/music/api/v1/static/cover", params={"coverId": daily["coverId"]})
         assert cover.status_code == 200
         assert cover_calls["n"] == 1
-        assert cover_calls["id"] == daily["coverId"]  # 官方封面 id 原样透传
+        assert cover_calls["id"] in {track["coverId"] for track in tracks}
 
 
 def test_invalidate_today_cache_all_users(tmp_path):

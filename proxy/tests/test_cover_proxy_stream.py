@@ -51,6 +51,37 @@ def _migu_info_handler(cover_url: str, calls: dict | None = None):
     return handler
 
 
+@pytest.mark.asyncio
+async def test_playlist_cover_candidates_bounded_and_placeholder(monkeypatch):
+    from starlette.requests import Request
+
+    request = Request({"type": "http", "headers": [], "query_string": b""})
+    tried = []
+
+    async def delivery(url):
+        tried.append(url)
+        if url.endswith("good"):
+            return proxy_app.Response(content=IMG_BYTES, media_type="image/jpeg")
+        return None
+
+    monkeypatch.setattr(proxy_app, "_proxied_cover_response", delivery)
+    monkeypatch.setattr(proxy_app, "_cover_guid_url_lookup", lambda guid: "")
+    tracks = [{"cover_url": "https://image.test/" + name} for name in ("bad", "good", "other", "extra")]
+    result = await proxy_app._playlist_cover_response(request, "playlist", tracks)
+    assert result.body == IMG_BYTES
+    assert len(tried) == 2
+    tried.clear()
+    result = await proxy_app._playlist_cover_response(request, "playlist", tracks[2:] * 3)
+    assert result.headers["cache-control"] == "no-store"
+    assert result.body.startswith(b"\x89PNG")
+    assert len(tried) == 2
+    tried.clear()
+    result = await proxy_app._playlist_cover_response(request, "playlist", [
+        {"cover_url": f"https://image.test/bad{number}"} for number in range(10)])
+    assert len(tried) == 3
+    assert result.headers["cache-control"] == "no-store"
+
+
 def test_cover_proxied_bytes_and_disk_cache(tmp_path, monkeypatch):
     """在线封面 200 直出字节；第二次请求命中磁盘缓存，不再打 info/CDN。"""
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
@@ -73,6 +104,8 @@ def test_cover_proxied_bytes_and_disk_cache(tmp_path, monkeypatch):
     assert r1.headers["cache-control"] == "public, max-age=86400"
     assert r1.headers.get("etag")
     assert r2.status_code == 200 and r2.content == IMG_BYTES
+
+
     # info 只打一次（info 自身有进程内缓存），封面 CDN 也只拉一次（第二次走磁盘缓存）
     assert img_calls["n"] == 1
     covers_dir = os.path.join(str(tmp_path / "cache"), "covers")
@@ -81,6 +114,21 @@ def test_cover_proxied_bytes_and_disk_cache(tmp_path, monkeypatch):
     # 1 张封面字节文件 + 1 个 guid→直链 映射文件（.url，info 抖动时已成功封面不塌）
     assert len([f for f in files if not f.endswith(".url")]) == 1
     assert len([f for f in files if f.endswith(".url")]) == 1
+
+
+def test_legacy_track_snapshot_cover_without_info(monkeypatch):
+    _wire_clients(monkeypatch, lambda request: pytest.fail("must not query song info or stream"))
+    monkeypatch.setattr(proxy_app, "_cover_guid_url_lookup", lambda guid: "")
+    monkeypatch.setattr(proxy_app, "_lookup_playlist_cache_track", lambda guid: {
+        "guid": guid, "cover_url": "https://image.test/snapshot.jpg"})
+    monkeypatch.setattr(proxy_app, "_COVER_FETCH_ASYNC_TRANSPORT", httpx.MockTransport(
+        lambda request: httpx.Response(200, content=IMG_BYTES)))
+    with TestClient(app) as client:
+        cover_id = "track_" + proxy_app.fake_official_guid("online:migu:snapshot")
+        response = client.get("/music/api/v1/static/cover/" + cover_id + "_w120.jpg")
+        assert response.status_code == 200 and response.content == IMG_BYTES
+        response = client.head("/music/api/v1/static/cover", params={"coverId": cover_id + ".jpg"})
+        assert response.status_code == 200 and response.content == b""
 
 
 def test_cover_proxied_head(tmp_path, monkeypatch):

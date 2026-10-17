@@ -23,6 +23,31 @@ FAKE_KUWO2 = "online:kuwo:228909"
 PL_CUSTOM = "pl-custom-1"
 
 
+def test_list_retry_never_downloads_across_batches(monkeypatch):
+    from starlette.requests import Request
+
+    monkeypatch.setitem(CONF, "fav_auto_bind", True)
+    request = Request({"type": "http", "headers": []})
+    pending = [{"guid": f"online:kuwo:{number}", "bind": "pending"}
+               for number in range(20)]
+    downloads = []
+    bindings = []
+    monkeypatch.setattr(appmod, "_register_background_fetch", lambda *args: downloads.append(args))
+    monkeypatch.setattr(appmod, "_dispatch_official_binding", lambda *args: bindings.append(args))
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: None)
+    for iteration in range(4):
+        appmod._bind_retry_last.clear()
+        appmod._maybe_retry_official_binds(request, "user-a", pending, {PL_CUSTOM: pending})
+        appmod._maybe_retry_official_binds(request, "user-b", pending)
+    assert downloads == []
+    assert bindings == []
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: "/isolated/existing.mp3")
+    appmod._bind_retry_last.clear()
+    appmod._maybe_retry_official_binds(request, "user-a", pending)
+    assert len(bindings) == appmod._BIND_RETRY_BATCH
+    assert downloads == []
+
+
 @pytest.fixture(autouse=True)
 def setup_fav_autobind_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
