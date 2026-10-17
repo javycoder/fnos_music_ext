@@ -1,0 +1,62 @@
+name: Correct release notes
+
+on:
+  push:
+    branches: [dev]
+    paths: [CHANGELOG.md]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: correct-release-notes
+  cancel-in-progress: false
+
+jobs:
+  notes:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Correct existing release body without changing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(head -n1 VERSION | tr -d '[:space:]')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+[a-z]?$ ]]
+          tag="v${version}"
+          if ! git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} is not published yet; normal release workflow will supply notes."
+            exit 0
+          fi
+          git merge-base --is-ancestor "$tag" HEAD
+          git diff --exit-code "$tag" HEAD -- . \
+            ':!CHANGELOG.md' \
+            ':!.github/workflows/release-notes.yml' \
+            ':!packaging/tests/test_release_notes.py' \
+            ':!CHANGELOG.md' \
+            ':!.zcode/skills/fnmusic-release/SKILL.md'
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          grep -q '[^[:space:]]' /tmp/release-notes.md
+          gh api "repos/${GH_REPO}/releases/tags/${tag}" > /tmp/release-before.json
+          jq -e '.draft == false' /tmp/release-before.json
+          gh release edit "$tag" --notes-file /tmp/release-notes.md
+          gh api "repos/${GH_REPO}/releases/tags/${tag}" > /tmp/release-after.json
+          for phase in before after; do
+            jq -S '{id, tag_name, draft, prerelease,
+              assets: [.assets[] | {id, name, size, digest}] | sort_by(.id)}' \
+              "/tmp/release-${phase}.json" > "/tmp/identity-${phase}.json"
+          done
+          diff -u /tmp/identity-before.json /tmp/identity-after.json
+          jq -r '.body' /tmp/release-after.json > /tmp/published-notes.md
+          diff -u -B --strip-trailing-cr /tmp/release-notes.md /tmp/published-notes.md
