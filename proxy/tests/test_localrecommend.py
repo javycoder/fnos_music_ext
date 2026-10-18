@@ -327,3 +327,50 @@ def test_order_independent_of_other_recommendation_switches(client, monkeypatch)
 def test_async_loader(library):
     result = asyncio.run(localrec.get_bundle("u1", str(library)))
     assert len(result["tracks"]) == 20
+
+
+def test_cache_hit_bypasses_read_library(library, monkeypatch):
+    """缓存有效命中路径只做轻量校验，不触发 read_library 全库扫描。"""
+    first = bundle(library)
+    assert len(first["tracks"]) == 20
+    assert rec.os.path.exists(cache_path())
+
+    calls = []
+    def fail_read_library(*args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("read_library should not be called when cache is valid")
+
+    monkeypatch.setattr(localrec, "read_library", fail_read_library)
+    cached_result = bundle(library)
+    assert len(calls) == 0
+    assert cached_result == first
+
+
+def test_cache_invalidation_on_favorite_and_deletion(library, monkeypatch):
+    """当缓存中某曲目被收藏或删除后，缓存定向校验失效，重新全量构建并剔除失效曲目。"""
+    first = bundle(library)
+    assert len(first["tracks"]) == 20
+
+    target_guid = first["tracks"][0]["guid"]
+    calls = []
+    orig_read_library = localrec.read_library
+    def counted_read_library(*args, **kwargs):
+        calls.append(args)
+        return orig_read_library(*args, **kwargs)
+
+    monkeypatch.setattr(localrec, "read_library", counted_read_library)
+    edit(library, "INSERT INTO favorite_track(user_id, track_id) SELECT 1, id FROM track WHERE guid = ?", (target_guid,))
+
+    second = bundle(library)
+    assert len(calls) == 1
+    assert target_guid not in {t["guid"] for t in second["tracks"]}
+    assert len(second["tracks"]) == 20
+
+    calls.clear()
+    delete_guid = second["tracks"][0]["guid"]
+    edit(library, "UPDATE track SET is_audio_file_deleted = 1 WHERE guid = ?", (delete_guid,))
+
+    third = bundle(library)
+    assert len(calls) == 1
+    assert delete_guid not in {t["guid"] for t in third["tracks"]}
+    assert len(third["tracks"]) == 20

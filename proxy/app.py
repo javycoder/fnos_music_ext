@@ -7274,10 +7274,14 @@ async def _playlist_cover_response(request: Request, guid: str, tracks: list,
                 if kind == "url":
                     response = await _proxied_cover_response(value)
                 else:
-                    response = _official_cover_file_response(value, request.query_params.get("size"))
+                    size = request.query_params.get("size")
+                    response = _official_cover_file_response(value, size)
                     if response is None:
+                        params = {"coverId": value}
+                        if size:
+                            params["size"] = size
                         fetched = await get_upstream_client(request.app).get(
-                            "/music/api/v1/static/cover", params={"coverId": value},
+                            "/music/api/v1/static/cover", params=params,
                             headers=copy_incoming_headers(request),
                         )
                         mime = _sniff_image_mime(fetched.content)

@@ -220,3 +220,49 @@ def test_cover_proxied_rejects_bad_urls():
     assert asyncio.run(proxy_app._proxied_cover_response("ftp://x/y.jpg")) is None
     text_url = f"https://{proxy_app._KW_TEXT_COVER_HOST}/pic?rid=1"
     assert asyncio.run(proxy_app._proxied_cover_response(text_url)) is None
+
+
+def test_playlist_cover_fallback_upstream_carries_size_param(monkeypatch):
+    """歌单封面回退官方上游时携带客户端请求的 size 参数（有才带）。"""
+    import asyncio
+    from starlette.requests import Request
+
+    seen_params = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen_params.update(dict(request.url.params))
+        return httpx.Response(200, content=IMG_BYTES, headers={"content-type": "image/jpeg"})
+
+    upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    monkeypatch.setattr(app.state, "upstream_client", upstream, raising=False)
+    monkeypatch.setattr(proxy_app, "_cover_guid_url_lookup", lambda guid: "")
+    monkeypatch.setattr(proxy_app, "_official_cover_file_response", lambda cover_id, size: None)
+
+    tracks = [{"guid": "t1", "coverId": "official_cover_123"}]
+
+    # 1. 客户端带 size 参数 -> 上游请求必须带 size
+    req_with_size = Request({
+        "type": "http",
+        "app": app,
+        "headers": [],
+        "query_string": b"size=240",
+    })
+    resp = asyncio.run(proxy_app._playlist_cover_response(req_with_size, "test_pl", tracks))
+    assert resp.status_code == 200
+    assert seen_params.get("coverId") == "official_cover_123"
+    assert seen_params.get("size") == "240"
+
+    # 2. 客户端不带 size 参数 -> 上游请求不带 size
+    seen_params.clear()
+    req_without_size = Request({
+        "type": "http",
+        "app": app,
+        "headers": [],
+        "query_string": b"",
+    })
+    resp = asyncio.run(proxy_app._playlist_cover_response(req_without_size, "test_pl", tracks))
+    assert resp.status_code == 200
+    assert seen_params.get("coverId") == "official_cover_123"
+    assert "size" not in seen_params

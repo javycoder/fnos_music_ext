@@ -129,10 +129,17 @@ def build_profile(rows: list[dict], online: list[dict], now: float) -> dict[str,
         row["artist_values"] = row.get("artist", "").replace("/", "\x1f")
         row["genre_values"] = row.get("genre", "").replace("/", "\x1f")
         add(_features(row), _history_weight(1, row.get("playedAt"), now))
-    return {
-        feature: {value: weight / max(values.values()) for value, weight in values.items()}
-        for feature, values in profile.items()
-    }
+    result = {}
+    for feature, values in profile.items():
+        if not values:
+            result[feature] = {}
+            continue
+        max_weight = max(values.values())
+        result[feature] = {
+            value: (weight / max_weight if max_weight > 0 else 0.0)
+            for value, weight in values.items()
+        }
+    return result
 
 
 def score_track(row: dict, profile: dict, user_guid: str, generation: str, now: float) -> float:
@@ -188,6 +195,37 @@ def select_tracks(candidates: list[dict], profile: dict, user_guid: str, generat
     return selected
 
 
+def _validate_cached_tracks(db_path: str, user_guid: str, guids: list[str]) -> bool:
+    if len(guids) != PLAYLIST_SIZE or len(set(guids)) != PLAYLIST_SIZE:
+        return False
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+    try:
+        con.execute("BEGIN")
+        user = con.execute("SELECT id FROM user WHERE guid = ?", (user_guid,)).fetchone()
+        if user is None:
+            return False
+        user_id = user[0]
+        placeholders = ",".join("?" for _ in guids)
+        query = f"""
+            SELECT t.guid
+              FROM track t
+              LEFT JOIN audio_file af ON af.id = t.audio_file_id
+             WHERE t.guid IN ({placeholders})
+               AND t.is_audio_file_deleted = 0
+               AND t.is_admin_deleted = 0
+               AND af.is_physical_file_deleted = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM favorite_track ft
+                    WHERE ft.track_id = t.id AND ft.user_id = ?
+               )
+        """
+        rows = con.execute(query, (*guids, user_id)).fetchall()
+        valid_guids = {row[0] for row in rows}
+        return len(valid_guids) == PLAYLIST_SIZE and valid_guids == set(guids)
+    finally:
+        con.close()
+
+
 def _load_or_build(user_guid: str, db_path: str) -> dict:
     empty = rec.empty_daily_bundle(user_guid, "liked")
     if not user_guid.strip() or user_guid == "shared":
@@ -198,24 +236,26 @@ def _load_or_build(user_guid: str, db_path: str) -> dict:
         lock = _LOCKS.setdefault(path, threading.Lock())
     with lock:
         try:
-            rows = read_library(db_path, user_guid)
-            candidates = [row for row in rows if row["valid"] and not row["favorite"] and row["guid"]]
-            if len(candidates) < PLAYLIST_SIZE:
-                return empty
             now = time.time()
             try:
                 with open(path, encoding="utf-8") as cache_file:
                     cached = json.load(cache_file)
-                tracks = cached["tracks"]
-                eligible = {row["guid"] for row in candidates}
-                if (cached["guid"] == empty["guid"] and cached["user"] == user_guid
-                        and 0 <= now - cached["builtAt"] < CACHE_SECONDS
+                tracks = cached.get("tracks") or []
+                track_guids = [track.get("guid") for track in tracks if isinstance(track, dict) and track.get("guid")]
+                if (cached.get("guid") == empty["guid"] and cached.get("user") == user_guid
+                        and 0 <= now - cached.get("builtAt", 0) < CACHE_SECONDS
                         and len(tracks) == PLAYLIST_SIZE
-                        and len({track["guid"] for track in tracks}) == PLAYLIST_SIZE
-                        and all(track["guid"] in eligible for track in tracks)):
-                    return cached
-            except (OSError, ValueError, KeyError, TypeError):
+                        and len(set(track_guids)) == PLAYLIST_SIZE):
+                    if _validate_cached_tracks(db_path, user_guid, track_guids):
+                        return cached
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
                 pass
+            # 缓存缺失/过期/有曲目失效走全量重建路径
+            # 已知可接受取舍：曲库总量骤降到 20 以下但缓存 20 首仍有效时继续供缓存
+            rows = read_library(db_path, user_guid)
+            candidates = [row for row in rows if row["valid"] and not row["favorite"] and row["guid"]]
+            if len(candidates) < PLAYLIST_SIZE:
+                return empty
             profile = build_profile(rows, rec.seeds_from_online_history(user_guid), now)
             tracks = select_tracks(candidates, profile, user_guid, uuid4().hex, now)
             bundle = {
