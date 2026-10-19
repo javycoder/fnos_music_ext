@@ -379,11 +379,14 @@ class SourceSearchGate:
         running = self._running
         if running and fut in running["waiters"]:
             running["waiters"].remove(fut)
-            if self.cancellable and not running["waiters"]:
+            if not running["waiters"]:
+                # 无等待者的请求不再占预算；重试不复用它，也不等取消收尾。
                 running["superseded"] = True
+                self._running = None
                 task = running.get("task")
                 if task and not task.done():
                     task.cancel()
+                self._pump()
             return
         for slot in list(self._queue):
             if fut in slot["waiters"]:
@@ -2848,16 +2851,9 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
         if selected_sources:
             params["sources"] = selected_sources
         timeout = max(1.0, float(CONF.get("search_timeout") or 15))
-        started = time.monotonic()
+        # 空结果重试统一在聚合层（_aggregate_search，最多一次、计入原搜索预算、
+        # 取消/换词后不重试）；这里不再内嵌第二轮，避免两层重试叠加拖穿预算。
         data = await _fetch_once(params, timeout)
-        # musicdl 快速交回 0 条且带错误（全源 busy/熔断/瞬时失败）时不是
-        # 终态：稍等片刻重试一次，避免把偶发空结果当成真"无结果"。
-        if (isinstance(data, dict) and not data.get("items") and data.get("errors")
-                and time.monotonic() - started < 5.0):
-            await asyncio.sleep(1.5)
-            retry = await _fetch_once(params, timeout)
-            if isinstance(retry, dict) and retry.get("items"):
-                data = retry
         if isinstance(data, dict) and data.get("errors"):
             logger.warning("musicdl search partial errors: %s", data.get("errors"))
         return data
@@ -4735,6 +4731,16 @@ async def search_track(request: Request):
     key = _search_scope(request) + ":" + keyword
     _clean_search_cache()
     entry = _SEARCH_CACHE.get(key)
+    if entry is not None:
+        task = entry.get("task")
+        if (entry.get("abandoned") or entry.get("superseded")
+                or ((not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry))):
+            # 每轮独立：即使旧轮还在取消收尾，也立刻换新 dict；不继承条目、
+            # 分页游标、取尽或失败标记，旧任务迟到写入只会触及旧 dict。
+            ext_task = entry.get("extend_task")
+            if ext_task and not ext_task.done():
+                ext_task.cancel()
+            entry = None
     if entry is None:
         entry = {"items": [], "ts": 0, "keyword": keyword,
                  "scope": _search_scope(request), "credentials": scope, "config": _source_config(), "task": None,
@@ -4747,15 +4753,7 @@ async def search_track(request: Request):
     entry["accessed"] = time.time()
     task = entry.get("task")
     if (not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry):
-        # TTL 到期重新聚合：清理深分页遗留状态，避免继承旧轮次与取尽标记
-        entry.pop("exhausted", None)
-        entry.pop("deep_round", None)
-        entry.pop("deep_cursors", None)
-        entry.pop("source_seen_ids", None)
-        ext_task = entry.get("extend_task")
-        if ext_task and not ext_task.done():
-            ext_task.cancel()
-        entry.pop("extend_task", None)
+        # 走到这里的一定是刚换上的新轮（ts=0 必然过期）或首次创建：启动聚合
         task = asyncio.create_task(_aggregate_search(request, keyword, entry))
         entry["task"] = task
     # 在线搜索只有一个超时。有在线条目就立刻回复（本地在前、在线在后）；
@@ -4763,19 +4761,30 @@ async def search_track(request: Request):
     if task and not task.done():
         budget = max(0.05, float(CONF["search_timeout"])) + max(0.0, float(CONF.get("search_debounce_s") or 0))
         deadline = asyncio.get_running_loop().time() + budget
-        while not task.done() and asyncio.get_running_loop().time() < deadline:
-            if entry.get("items"):
-                break
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                break
-            await asyncio.wait({task}, timeout=min(0.05, remaining))
-        if not entry.get("items") and not task.done():
-            entry["abandoned"] = True
-            entry["items"] = []
-            entry["partial"] = True
-            entry["ts"] = time.time()
-            task.cancel()
+        entry["waiters"] = entry.get("waiters", 0) + 1
+        abandon = False
+        try:
+            while not task.done() and asyncio.get_running_loop().time() < deadline:
+                if entry.get("items"):
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                await asyncio.wait({task}, timeout=min(0.05, remaining))
+            abandon = not entry.get("items") and not task.done()
+        except asyncio.CancelledError:
+            abandon = not entry.get("items")
+            raise
+        finally:
+            entry["waiters"] -= 1
+            if abandon and not entry["waiters"]:
+                entry["abandoned"] = True
+                entry["items"] = []
+                entry["partial"] = True
+                entry["ts"] = 0
+                # Cancellation cleanup is not part of the response budget.
+                # New requests replace this round without awaiting task.done().
+                task.cancel()
     local_list = ensure_search_list(upstream_json)
     local_keys = {(title_from_track(x), artist_from_track(x)) for x in local_list}
     total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
@@ -4878,7 +4887,7 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                 entry["items"] = deduplicate_online_items(ordered)[:2000]
             if (not pending and not entry["items"] and failed
                     and not entry.get("abandoned") and not _user_search_stale(entry, scope)
-                    and retries < max(0, min(2, int(CONF.get("search_empty_retry", 1))))):
+                    and retries < max(0, min(1, int(CONF.get("search_empty_retry", 1))))):
                 delay = max(0.0, float(CONF.get("search_empty_retry_delay", 1.2)))
                 if deadline - asyncio.get_running_loop().time() > delay:
                     logger.info("搜索首屏空结果触发重试: attempt=%d", retries + 1)
@@ -4898,9 +4907,9 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
             if _user_search_stale(entry, scope):
                 entry["superseded"] = True
                 entry["ts"] = 0
-            elif not entry.get("ts"):
+            else:
+                # 放弃轮不落缓存时间戳：保持 ts=0，同词下一次请求立即可重试
                 entry["partial"] = True
-                entry["ts"] = time.time()
             return
         entry["partial"] = partial
         # 全源失败（source busy/熔断/异常）交回的 0 条不是真"无结果"：不落缓存时间戳，
@@ -4916,9 +4925,8 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
         finally:
             if entry.get("abandoned"):
                 entry["items"] = []
+                # 不落缓存时间戳：放弃轮保持立即可重试，旧轮收尾不清空新轮
                 entry["partial"] = True
-                if not entry.get("ts"):
-                    entry["ts"] = time.time()
 
 
 def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[dict]:

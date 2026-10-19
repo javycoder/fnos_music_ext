@@ -840,3 +840,156 @@ async def test_search_waits_until_keyword_is_quiet(monkeypatch):
     assert started_at[0] - origin >= 0.25
     assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("k1"))
     assert all(entry.get("ts") == 0 and not entry.get("items") for entry in _cached("k2"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("through_gate", [False, True])
+async def test_timeout_retry_is_new_round_before_old_cleanup(monkeypatch, through_gate):
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "search_deep_page", False)
+    monkeypatch.setitem(p.CONF, "search_timeout", .08)
+    cleanup = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = []
+
+    async def fetch(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await cleanup.wait()
+                return {"items": [song("kuwo:old", "old")]}
+        return {"items": [song("kuwo:new", "new")]}
+
+    if through_gate:
+        async def gated_fetch(*args):
+            return await p._MUSICDL_SEARCH_GATE.run(p._FETCH_SCOPE.get(), args[1], lambda: fetch(*args))
+        monkeypatch.setattr(p, "fetch_musicdl_search", gated_fetch)
+    else:
+        monkeypatch.setattr(p, "fetch_musicdl_search", fetch)
+    p.app.state.upstream_client = _upstream()
+    try:
+        first = await asyncio.wait_for(p.search_track(request("q=Song")), .3)
+        assert _titles(first) == []
+        old = next(iter(p._SEARCH_CACHE.values()))
+        await cancelled.wait()
+        if not through_gate:
+            assert not old["task"].done()
+        old.update(deep_round=9, exhausted={"lx"}, deep_cursors={"lx": 8}, source_seen_ids={"lx": {"old"}})
+        second = await asyncio.wait_for(p.search_track(request("q=Song")), .3)
+        new = next(iter(p._SEARCH_CACHE.values()))
+        assert new is not old
+        assert _titles(second) == ["new"]
+        assert new["deep_round"] == 1 and new["exhausted"] == set()
+        assert not new.get("deep_cursors") and not new.get("source_seen_ids")
+    finally:
+        cleanup.set()
+        for entry in p._SEARCH_CACHE.values():
+            if entry.get("task"):
+                await asyncio.gather(entry["task"], return_exceptions=True)
+    await asyncio.gather(old["task"], return_exceptions=True)
+    assert old["items"] == []
+    assert [item["title"] for item in new["items"]] == ["new"]
+
+
+@pytest.mark.anyio
+async def test_expired_round_does_not_inherit_old_items(monkeypatch):
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "search_deep_page", False)
+    p.app.state.upstream_client = _upstream()
+    async def fetch(*args):
+        return {"items": [song("kuwo:new", "new")]}
+    monkeypatch.setattr(p, "fetch_musicdl_search", fetch)
+    await p.search_track(request("q=Song"))
+    old = next(iter(p._SEARCH_CACHE.values()))
+    await old["task"]
+    old.update(ts=0, items=[song("kuwo:stale", "stale")], deep_round=7, exhausted={"lx"})
+    response = await p.search_track(request("q=Song"))
+    assert _titles(response) == ["new"]
+    assert next(iter(p._SEARCH_CACHE.values())) is not old
+
+
+@pytest.mark.anyio
+async def test_cancel_one_same_keyword_waiter_keeps_shared_aggregate(monkeypatch):
+    monkeypatch.setitem(p.CONF, "netease_enabled", False)
+    monkeypatch.setitem(p.CONF, "lx_enabled", False)
+    monkeypatch.setitem(p.CONF, "search_deep_page", False)
+    p.app.state.upstream_client = _upstream()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def fetch(*args):
+        calls.append(1)
+        started.set()
+        await release.wait()
+        return {"items": [song("kuwo:shared")]}
+    monkeypatch.setattr(p, "fetch_musicdl_search", fetch)
+    first = asyncio.create_task(p.search_track(request("q=Song")))
+    await started.wait()
+    second = asyncio.create_task(p.search_track(request("q=Song")))
+    await asyncio.sleep(.02)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    entry = next(iter(p._SEARCH_CACHE.values()))
+    assert not entry["task"].cancelled() and not entry.get("abandoned")
+    release.set()
+    assert _titles(await second) == ["Song"]
+    assert calls == [1]
+
+
+@pytest.mark.anyio
+async def test_musicdl_gate_orphan_retry_does_not_join_old_job():
+    gate = p.SourceSearchGate(cancellable=False)
+    started, cancelled, cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def old_fetch():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await cleanup.wait()
+            return "old"
+    first = asyncio.create_task(gate.run("alice", "same", old_fetch))
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    async def fresh_fetch():
+        return "new"
+    try:
+        second = asyncio.create_task(gate.run("alice", "same", fresh_fetch))
+        assert await asyncio.wait_for(second, .2) == "new"
+        assert cancelled.is_set()
+    finally:
+        cleanup.set()
+        await asyncio.sleep(.01)
+        gate.reset()
+
+
+@pytest.mark.anyio
+async def test_gate_cancel_waiter_does_not_cancel_other_user_or_shared_waiter():
+    gate = p.SourceSearchGate(cancellable=False)
+    started, release = asyncio.Event(), asyncio.Event()
+    async def fetch():
+        started.set()
+        await release.wait()
+        return "shared"
+    first = asyncio.create_task(gate.run("alice", "same", fetch))
+    await started.wait()
+    shared = asyncio.create_task(gate.run("alice", "same", fetch))
+    async def other_fetch():
+        return "bob"
+    other = asyncio.create_task(gate.run("bob", "same", other_fetch))
+    await asyncio.sleep(.01)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not gate._running["task"].cancelled()
+    release.set()
+    assert await shared == "shared"
+    assert await other == "bob"
+    gate.reset()
