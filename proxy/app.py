@@ -24,7 +24,7 @@ import tempfile
 import time
 import contextlib
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any, AsyncGenerator, Callable, Coroutine, Mapping
@@ -8662,13 +8662,37 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
         return True, "shared", None
 
 
+def _bound_favorite_guids(user_guid: str, entries: dict) -> set[str]:
+    """Read current official favorites, not historical binding intent (read-only)."""
+    mapped = {guid: row.get("official") for guid, row in entries.items()
+              if isinstance(row, dict) and row.get("official")}
+    if not mapped or not user_guid or user_guid == "shared":
+        return set()
+    db = str(CONF.get("music_db") or dailyrec.music_db_path())
+    try:
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)) as con:
+            favorites = {row[0] for row in con.execute("""
+                SELECT t.guid FROM favorite_track ft
+                JOIN track t ON t.id = ft.track_id
+                JOIN user u ON u.id = ft.user_id WHERE u.guid = ?
+            """, (user_guid,))}
+        return {guid for guid, official in mapped.items() if official in favorites}
+    except sqlite3.Error as error:
+        logger.debug("bound favorite state unavailable: %s", error)
+        return set()
+
+
 async def _online_favorite_set_for_user(user_guid: str) -> set[str]:
-    """读取已鉴权用户的在线收藏 guid 集合，供个性化歌单响应覆盖状态。"""
+    """Merge online favorites and the account's live official binding state."""
     if not user_guid:
         return set()
     try:
         async with _FAV_LOCK:
-            return {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+            favorites = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+        _ensure_bind_registry()
+        entries = deepcopy(_bind_registry.get(user_guid, {}))
+        favorites.update(await asyncio.to_thread(_bound_favorite_guids, user_guid, entries))
+        return favorites
     except Exception:
         return set()
 
@@ -8691,8 +8715,7 @@ async def _online_favorite_set(request: Request) -> set[str]:
         is_authed, user_guid, _resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed:
             return set()
-        async with _FAV_LOCK:
-            return {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+        return await _online_favorite_set_for_user(user_guid)
     except Exception:
         return set()
 
@@ -9841,7 +9864,7 @@ async def playlist_track_list(request: Request):
         # 在线附加条目接在官方条目之后（addedAt 倒序），逻辑区间
         # [official_total, official_total+len)；按请求页窗口切片，翻页不重不漏
         extras_sorted = sorted(extras, key=lambda x: x.get("addedAt", 0), reverse=True)
-        fav_guids = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+        fav_guids = await _online_favorite_set_for_user(user_guid)
         template = official_track_template(official_list)
         online_objs = []
         for it in extras_sorted:

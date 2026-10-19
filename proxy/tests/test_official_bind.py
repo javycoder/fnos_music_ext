@@ -580,3 +580,22 @@ def test_playlist_detail_route_retries_bind_only_for_existing_files(env, monkeyp
     assert downloads == []
     adds = upstream_posts(env["upstream_calls"], "/playlist/add-track")
     assert adds and adds[0]["json"]["trackGUIDs"] == [OFFICIAL_GUID]
+
+
+@pytest.mark.asyncio
+async def test_bound_online_favorite_uses_current_official_state_per_user(env):
+    make_official_db(env["db_path"])
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("INSERT INTO user VALUES (1, 'user-a')")
+        con.execute("INSERT INTO user VALUES (2, 'user-b')")
+        con.execute("INSERT INTO favorite_track VALUES (1, 10, 1)")
+    appmod._bind_registry.update({
+        "user-a": {FAKE_KUWO1: {"official": OFFICIAL_GUID, "fav": True}},
+        "user-b": {FAKE_KUWO1: {"official": OFFICIAL_GUID, "fav": True}},
+    })
+    assert FAKE_KUWO1 in await appmod._online_favorite_set_for_user("user-a")
+    assert FAKE_KUWO1 not in await appmod._online_favorite_set_for_user("user-b")
+    # The binding registry is historical; cancellation through official UI wins.
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("DELETE FROM favorite_track")
+    assert FAKE_KUWO1 not in await appmod._online_favorite_set_for_user("user-a")
