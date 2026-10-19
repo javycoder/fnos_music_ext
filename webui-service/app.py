@@ -12,6 +12,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -129,6 +130,10 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_BASE_URL": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "OpenAI 兼容 Base URL"},
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
+    "FNMUSIC_LLM_LIKED_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于猜你喜欢"},
+    "FNMUSIC_LLM_DAILY_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于每日推荐"},
+    "FNMUSIC_LIKED_REFRESH_HOURS": {"kind": "float", "default": "0.5", "min": 0.5, "step": "any", "group": "llm", "reload": "hot", "label": "猜你喜欢生成间隔（小时）"},
+    "FNMUSIC_LIKED_SIZE": {"kind": "int", "default": "20", "min": 0, "max": 100, "strict": True, "group": "llm", "reload": "hot", "label": "猜你喜欢歌曲数量"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
@@ -637,10 +642,31 @@ def _normalize_value(key: str, raw) -> str:
         raise ValueError(f"{key}: 期望 true/false，收到 {raw!r}")
     if kind == "int":
         try:
-            num = int(str(raw).strip())
+            if spec.get("strict") and type(raw) is float:
+                if not math.isfinite(raw) or not raw.is_integer():
+                    raise ValueError("not a finite integer")
+                num = int(raw)
+            else:
+                num = int(str(raw).strip())
         except ValueError as exc:
             raise ValueError(f"{key}: 期望整数，收到 {raw!r}") from exc
-        num = max(int(spec.get("min", num)), min(int(spec.get("max", num)), num))
+        if spec.get("strict"):
+            if num < spec["min"] or num > spec["max"]:
+                raise ValueError(f"{key}: 超出允许范围 {spec['min']}–{spec['max']}")
+        else:
+            num = max(int(spec.get("min", num)), min(int(spec.get("max", num)), num))
+        return str(num)
+    if kind == "float":
+        if type(raw) not in (str, int, float):
+            raise ValueError(f"{key}: 期望数字，收到 {raw!r}")
+        try:
+            num = float(str(raw).strip())
+        except ValueError as exc:
+            raise ValueError(f"{key}: 期望数字，收到 {raw!r}") from exc
+        if not math.isfinite(num):
+            raise ValueError(f"{key}: 期望有限数字")
+        if num < float(spec.get("min", num)) or num > float(spec.get("max", num)):
+            raise ValueError(f"{key}: 超出允许范围")
         return str(num)
     if kind == "enum":
         text = str(raw).strip()

@@ -4,13 +4,13 @@
   - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：按账户隔离，逐级补齐至 PLAYLIST_SIZE 首：
       1. netease-daily  网易真·每日推荐（musicbox）。音源每天只有一份内容，
                         当天仅第一个构建的用户可用（占用"音源名额"，见 source-slot）
-      2. llm            大模型候选 + 搜索匹配（配置了 FNMUSIC_LLM_* 即启用，种子按用户）
+      2. llm            大模型候选 + 搜索匹配（接口完整且勾选每日推荐用途，种子按用户）
       3. local-random   本地曲库随机兜底（只读官方库；按账户播放历史选
                         "从未听过优先、最久未听补齐"的本地现存曲目，各账户不同）
   - 热门推荐（hot，FNMUSIC_RECOMMEND_HOT）：榜单原味（不排除已收藏/最近播放）：
       1. netease-charts 网易热歌榜（musicbox toplist，免登录）
       2. lx-charts      lxmusic 免登录榜单（kg TOP500 / kw 飙升榜 / wy 新歌速递）
-猜你喜欢（liked）始终启用，由 localrecommend 独立计算，不参与上述在线构建链。
+猜你喜欢（liked）由 localrecommend 独立计算；可显式启用大模型，数量为 0 时隐藏。
 歌单使用自身 ID 请求封面，封面接口从缓存曲目选取有限候选并提供占位回退。
 密钥只从环境变量读取，绝不写入 CONF / 日志 / 缓存。
 """
@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -166,6 +167,38 @@ def llm_model() -> str:
 
 def llm_enabled() -> bool:
     return bool(llm_base_url() and llm_api_key())
+
+
+def llm_daily_enabled() -> bool:
+    return llm_enabled() and (
+        os.environ.get("FNMUSIC_LLM_DAILY_ENABLED", "false").strip().lower()
+        in ("true", "1", "yes")
+    )
+
+
+def llm_liked_selected() -> bool:
+    return (os.environ.get("FNMUSIC_LLM_LIKED_ENABLED", "false").strip().lower()
+            in ("true", "1", "yes"))
+
+
+def llm_liked_enabled() -> bool:
+    return llm_enabled() and llm_liked_selected()
+
+
+def llm_liked_size() -> int:
+    try:
+        value = int(os.environ.get("FNMUSIC_LIKED_SIZE", "20"))
+    except (ValueError, TypeError):
+        return 20
+    return value if 0 <= value <= 100 else 20
+
+
+def llm_liked_refresh_hours() -> float:
+    try:
+        value = float(os.environ.get("FNMUSIC_LIKED_REFRESH_HOURS", "0.5"))
+    except (ValueError, TypeError):
+        return 0.5
+    return value if math.isfinite(value) and value >= 0.5 else 0.5
 
 
 def recommend_cache_dir() -> str:
@@ -884,6 +917,43 @@ async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
     except Exception as e:
         logger.warning("llm call failed: %s", e)
         return []
+
+
+async def call_llm_json(http_client: httpx.AsyncClient, prompt: str) -> list | dict | None:
+    base = llm_base_url()
+    key = llm_api_key()
+    if not base or not key:
+        return None
+    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    payload = {
+        "model": llm_model(),
+        "temperature": 0.2,
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "system", "content": "你只输出合法 JSON，不要 markdown。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    try:
+        response = await http_client.post(
+            url, json=payload,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            timeout=llm_timeout_s(),
+        )
+        if response.status_code >= 400:
+            logger.warning("llm http %s", response.status_code)
+            return None
+        body = response.json()
+        choices = body.get("choices") or [] if isinstance(body, dict) else []
+        message = choices[0].get("message") or {} if choices and isinstance(choices[0], dict) else {}
+        content = str(message.get("content") or "").strip()
+        fenced = _JSON_BLOCK.search(content)
+        if fenced:
+            content = fenced.group(1).strip()
+        return json.loads(content)
+    except Exception as error:
+        logger.warning("llm json call failed: %s", error)
+        return None
 
 
 # ------------------------------------------------------- 音源原生推荐（平台 ID 直连） ---
@@ -1695,10 +1765,17 @@ async def get_or_build_daily(
     recommend_hot: bool = True,
     recommend_daily: bool = True,
     kind: str = "daily",
+    publication_guard=None,
 ) -> dict:
     kind = "hot" if kind == "hot" else "daily"
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
+
+    def current() -> bool:
+        return publication_guard is None or publication_guard() is True
+
+    if not current():
+        return empty_daily_bundle(user_guid, kind)
     purge_stale_daily_cache(user_guid, day)
     if kind == "daily":
         purge_stale_source_slots(day)
@@ -1762,6 +1839,8 @@ async def get_or_build_daily(
             items = await fetch_musicbox_recommend(
                 musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
             )
+            if not current():
+                return []
             if items and claim_source_slot(day, user_guid):
                 logger.info(
                     "daily source slot claimed by %s (%d candidates)", user_guid, len(items)
@@ -1801,12 +1880,12 @@ async def get_or_build_daily(
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
         # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源
         # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
-        if llm_http is None or not llm_enabled() or not recommend_daily:
+        if llm_http is None or not llm_daily_enabled() or not recommend_daily:
             return []
         recs = await call_llm(
             llm_http, build_llm_prompt(play_seeds, fav_seeds[:40], llm_candidate_count())
         )
-        if not recs:
+        if not recs or not current():
             return []
         return await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
@@ -1833,7 +1912,7 @@ async def get_or_build_daily(
     tier_failures: list[str] = []
 
     def _save_checkpoint() -> None:
-        if not tracks:
+        if not current() or not tracks:
             return
         stamped = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
         cover_id = guid
@@ -1881,7 +1960,7 @@ async def get_or_build_daily(
         - 可见：层失败 debug→warning，原因记入 tier_failures 落盘 + healthz。
         """
         nonlocal tracks
-        if len(tracks) >= PLAYLIST_SIZE:
+        if not current() or len(tracks) >= PLAYLIST_SIZE:
             return
         budget = build_budget_s()
         remaining = budget - (time.monotonic() - t0)
@@ -1896,7 +1975,7 @@ async def get_or_build_daily(
 
         def _emit(track: dict) -> None:
             nonlocal added
-            if len(tracks) >= PLAYLIST_SIZE:
+            if not current() or len(tracks) >= PLAYLIST_SIZE:
                 return
             cur_guids, cur_ta = _cur_keys()
             tg = str(track.get("guid") or "")
@@ -1912,7 +1991,7 @@ async def get_or_build_daily(
             _save_checkpoint_throttled()
 
         def _should_stop() -> bool:
-            return len(tracks) >= PLAYLIST_SIZE or time.monotonic() >= tier_deadline
+            return not current() or len(tracks) >= PLAYLIST_SIZE or time.monotonic() >= tier_deadline
 
         try:
             chunk = await asyncio.wait_for(
@@ -1933,6 +2012,8 @@ async def get_or_build_daily(
             if added:
                 _save_checkpoint()
             return
+        if not current():
+            return
         if chunk:
             before = len(tracks)
             tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
@@ -1952,7 +2033,7 @@ async def get_or_build_daily(
         if not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
         await run_tier("llm", from_llm)
-        if len(tracks) < PLAYLIST_SIZE:
+        if current() and len(tracks) < PLAYLIST_SIZE:
             # local-random 兜底：纯本地只读查询（毫秒级、无网络开销），不占构建
             # 总预算——上层超时/全挂也保证歌单有内容（延续"每日推荐永不为空"）
             try:
@@ -1967,6 +2048,8 @@ async def get_or_build_daily(
                 tier_failures.append(f"local-random:{type(e).__name__}")
                 logger.warning("daily recommend tier local-random failed: %s", e)
 
+    if not current():
+        return empty_daily_bundle(user_guid, kind)
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
     cover_id = guid
     playlist = build_playlist_record(

@@ -30,6 +30,8 @@ def setup_recommend_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "cache_dir", cache_dir)
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.delenv("FNMUSIC_LLM_DAILY_ENABLED", raising=False)
+    monkeypatch.delenv("FNMUSIC_LLM_LIKED_ENABLED", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
     # lxmusic 客户端默认 mock（404），防止每日推荐链路在测试中触达真实 127.0.0.1:8772
@@ -203,6 +205,7 @@ def test_playlist_list_injects_daily_when_enabled(monkeypatch, tmp_path):
     # 大模型链路仅当网易音源未启用时生效（新策略），此处关闭网易以覆盖 LLM 注入端到端流程
     monkeypatch.setitem(CONF, "netease_enabled", False)
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
 
@@ -278,6 +281,7 @@ def test_playlist_list_injects_daily_when_enabled(monkeypatch, tmp_path):
 
 def test_playlist_unauth_passthrough(monkeypatch):
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -624,6 +628,7 @@ def test_collect_exclude_sets_from_favorites():
 async def test_daily_fills_twenty_online_and_skips_favorites(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
 
@@ -741,6 +746,7 @@ async def test_get_or_build_daily_uses_llm_when_netease_disabled(monkeypatch):
     """网易音源未启用且配置了 LLM 时走大模型，不能被 fallback 竞速取消。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", "/nonexistent.db")
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
     monkeypatch.setenv("FNMUSIC_LLM_MODEL", "gpt-test")
     llm_calls = {"n": 0}
@@ -805,6 +811,7 @@ async def test_daily_prefers_netease_daily_and_skips_llm(tmp_path, monkeypatch):
     """网易启用时：真·每日推荐直接命中（平台 ID 直连），LLM 完全不调用。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
     llm_calls = {"n": 0}
@@ -1363,6 +1370,7 @@ async def test_llm_timeout_falls_back_to_local_random(tmp_path, monkeypatch):
     _make_local_db(db, n_tracks=25)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
     monkeypatch.setattr(dailyrec, "build_budget_s", lambda: 3.0)
     from proxy.app import build_online_track
@@ -1480,6 +1488,7 @@ async def test_daily_case3_source_slot_first_netease_others_llm(tmp_path, monkey
     _make_local_db(db, n_tracks=30)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
     monkeypatch.setenv("FNMUSIC_LLM_MODEL", "gpt-test")
     mb_calls = {"n": 0}
@@ -1616,6 +1625,7 @@ def test_playlist_list_serves_partial_checkpoint_progressively(tmp_path, monkeyp
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
 
     from proxy.app import build_online_track

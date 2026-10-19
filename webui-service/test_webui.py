@@ -213,6 +213,114 @@ def test_lyric_auto_dl_default_false_and_roundtrip(env_file):
         assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
 
 
+# ------------------------------------------------------------------ 大模型用途与猜你喜欢参数 ---
+
+LLM_FLAGS = ("FNMUSIC_LLM_LIKED_ENABLED", "FNMUSIC_LLM_DAILY_ENABLED")
+
+
+def test_llm_opt_in_defaults_and_schema(env_file):
+    with authed_client() as client:
+        view = client.get("/api/config").json()
+    for key in LLM_FLAGS:
+        assert view["values"][key] == "false"
+        assert view["schema"][key]["kind"] == "bool"
+        assert view["schema"][key]["reload"] == "hot"
+    assert view["values"]["FNMUSIC_LIKED_REFRESH_HOURS"] == "0.5"
+    assert "max" not in view["schema"]["FNMUSIC_LIKED_REFRESH_HOURS"]
+    assert view["values"]["FNMUSIC_LIKED_SIZE"] == "20"
+    assert view["schema"]["FNMUSIC_LIKED_SIZE"]["min"] == 0
+    assert view["schema"]["FNMUSIC_LIKED_SIZE"]["max"] == 100
+
+
+def test_llm_credentials_do_not_opt_in_and_incomplete_opt_in_is_preserved(env_file):
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_BASE_URL": "https://example.test/v1", "FNMUSIC_LLM_API_KEY": "secret",
+        }})
+        assert saved.status_code == 200
+        assert all(client.get("/api/config").json()["values"][key] == "false" for key in LLM_FLAGS)
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_API_KEY": "", "FNMUSIC_LLM_LIKED_ENABLED": True,
+            "FNMUSIC_LLM_DAILY_ENABLED": True, "FNMUSIC_LIKED_SIZE": 0,
+            "FNMUSIC_LIKED_REFRESH_HOURS": 100000.25,
+        }})
+        assert saved.status_code == 200
+        assert saved.json()["actions"] == []
+        saved = client.put("/api/config", json={"values": {key: False for key in LLM_FLAGS}})
+        assert saved.status_code == 200
+        values = client.get("/api/config").json()["values"]
+    assert values["FNMUSIC_LIKED_SIZE"] == "0"
+    assert values["FNMUSIC_LIKED_REFRESH_HOURS"] == "100000.25"
+    assert values["FNMUSIC_RECOMMEND_DAILY"] == "true"
+    assert values["FNMUSIC_LLM_API_KEY"] == ""
+
+
+@pytest.mark.parametrize("size,hours", [(0, 0.5), (100, 0.51), (20, 100000.25)])
+def test_liked_valid_api_roundtrip(env_file, size, hours):
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_LIKED_SIZE": size, "FNMUSIC_LIKED_REFRESH_HOURS": hours,
+            "FNMUSIC_LLM_LIKED_ENABLED": True, "FNMUSIC_LLM_DAILY_ENABLED": False,
+        }})
+        assert response.status_code == 200
+        assert response.json()["actions"] == []
+        values = client.get("/api/config").json()["values"]
+    assert values["FNMUSIC_LIKED_SIZE"] == str(size)
+    assert float(values["FNMUSIC_LIKED_REFRESH_HOURS"]) == hours
+    assert values["FNMUSIC_LLM_LIKED_ENABLED"] == "true"
+    assert values["FNMUSIC_LLM_DAILY_ENABLED"] == "false"
+
+
+@pytest.mark.parametrize("key", LLM_FLAGS)
+@pytest.mark.parametrize("raw,expected", [(True, "true"), (False, "false"), (1, "true"),
+    (0, "false"), ("yes", "true"), ("off", "false"), (" true ", "true")])
+def test_llm_flag_boolean_normalization(key, raw, expected):
+    assert webui._normalize_value(key, raw) == expected
+
+
+@pytest.mark.parametrize("key", LLM_FLAGS)
+@pytest.mark.parametrize("raw", [None, [], {}, 0.5, 1.0, 2, -1, "maybe", "nan"])
+def test_llm_flag_rejects_weird_types(key, raw):
+    with pytest.raises(ValueError):
+        webui._normalize_value(key, raw)
+
+
+@pytest.mark.parametrize("raw,expected", [(0, "0"), (20, "20"), (100, "100"),
+    (20.0, "20"), (" 37 ", "37")])
+def test_liked_size_strict_valid_values(raw, expected):
+    assert webui._normalize_value("FNMUSIC_LIKED_SIZE", raw) == expected
+
+
+@pytest.mark.parametrize("key,raw", [
+    ("FNMUSIC_LIKED_SIZE", raw) for raw in
+    (-1, 101, 1.5, "20.5", "20junk", "", " ", None, True, False, [], {}, "nan", "inf")
+] + [
+    ("FNMUSIC_LIKED_REFRESH_HOURS", raw) for raw in
+    (0, -1, 0.49, "", " ", "0.5junk", None, True, False, [], {}, "nan", "inf", "-inf", "1e9999")
+])
+def test_liked_invalid_api_edit_is_rejected_atomically(env_file, key, raw):
+    before = env_file.read_bytes()
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_LIKED_ENABLED": True, key: raw,
+        }})
+    assert response.status_code == 400
+    assert key in response.json()["error"]
+    assert env_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("key", ["FNMUSIC_LIKED_SIZE", "FNMUSIC_LIKED_REFRESH_HOURS"])
+@pytest.mark.parametrize("raw", [float("nan"), float("inf"), -float("inf")])
+def test_liked_rejects_nonfinite_numbers(key, raw):
+    with pytest.raises(ValueError):
+        webui._normalize_value(key, raw)
+
+
+@pytest.mark.parametrize("raw", [0.5, 0.51, 2, " 2.75 ", 100000.25, 1e100])
+def test_liked_hours_finite_minimum_no_arbitrary_maximum(raw):
+    assert float(webui._normalize_value("FNMUSIC_LIKED_REFRESH_HOURS", raw)) == float(raw)
+
+
 # ------------------------------------------------------------------ 切源动作 ---
 
 def test_provider_switch_stops_old_starts_new(env_file, svctl):

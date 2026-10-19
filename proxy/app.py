@@ -95,13 +95,26 @@ def _normalize_lx_sources(raw: str) -> list[str]:
     return out
 
 
+def _safe_liked_number(raw: str, default: float | int, *, integer: bool = False):
+    """Invalid persisted settings must not prevent the proxy from starting."""
+    try:
+        value = int(raw) if integer else float(raw)
+        if not math.isfinite(value):
+            return default
+        if integer:
+            return value if 0 <= value <= 100 else default
+        return value if 0.5 <= value <= 8760 else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
-    "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").lower() in ("true", "1", "yes"),
-    "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").lower() in ("true", "1", "yes"),
-    "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
@@ -189,6 +202,10 @@ CONF = {
     ),
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
+    "llm_daily_enabled": os.environ.get("FNMUSIC_LLM_DAILY_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "llm_liked_enabled": os.environ.get("FNMUSIC_LLM_LIKED_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "liked_refresh_hours": _safe_liked_number(os.environ.get("FNMUSIC_LIKED_REFRESH_HOURS", "0.5"), 0.5),
+    "liked_size": _safe_liked_number(os.environ.get("FNMUSIC_LIKED_SIZE", "20"), 20, integer=True),
     # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order，只影响在线取源）；
     # 推荐双开关 / 封面补全 / .env 热重载默认开，均可被 .env 覆盖
     "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
@@ -553,16 +570,20 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_TRANSCODE_DL_BITRATE": ("transcode_dl_bitrate", "str"),
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
     "FNMUSIC_LLM_API_KEY": ("", "str"),
-    "FNMUSIC_LLM_MODEL": ("llm_model", "str"),
+    "FNMUSIC_LLM_MODEL": ("llm_model", "llm_model"),
+    "FNMUSIC_LLM_DAILY_ENABLED": ("llm_daily_enabled", "strict_bool"),
+    "FNMUSIC_LLM_LIKED_ENABLED": ("llm_liked_enabled", "strict_bool"),
+    "FNMUSIC_LIKED_REFRESH_HOURS": ("liked_refresh_hours", "liked_hours"),
+    "FNMUSIC_LIKED_SIZE": ("liked_size", "liked_size"),
     "FNMUSIC_SEARCH_TIMEOUT": ("search_timeout", "seconds"),
     # issue #29：推荐构建预算/候选数/逐首校验运行期可调（recommend.py 动态读 os.environ）
-    "FNMUSIC_RECOMMEND_BUDGET_S": ("", "str"),
-    "FNMUSIC_RECOMMEND_CANDIDATES": ("", "str"),
-    "FNMUSIC_LLM_TIMEOUT_S": ("", "str"),
-    "FNMUSIC_RECOMMEND_VERIFY_PLAYABLE": ("", "str"),
-    "FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S": ("", "str"),
-    "FNMUSIC_REC_SEARCH_CONCURRENCY": ("", "str"),
-    "FNMUSIC_REC_SEARCH_INTERVAL": ("", "str"),
+    "FNMUSIC_RECOMMEND_BUDGET_S": ("", "runtime_float"),
+    "FNMUSIC_RECOMMEND_CANDIDATES": ("", "runtime_int"),
+    "FNMUSIC_LLM_TIMEOUT_S": ("", "runtime_float"),
+    "FNMUSIC_RECOMMEND_VERIFY_PLAYABLE": ("", "bool"),
+    "FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S": ("", "runtime_float"),
+    "FNMUSIC_REC_SEARCH_CONCURRENCY": ("", "runtime_int"),
+    "FNMUSIC_REC_SEARCH_INTERVAL": ("", "runtime_float"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -576,10 +597,26 @@ def _env_watch_path() -> str:
 
 def _env_watch_parse(raw: str, kind: str):
     raw = str(raw or "").strip()
-    if kind == "bool":
+    if kind in ("bool", "strict_bool"):
+        if kind == "strict_bool" and raw.lower() not in ("true", "1", "yes", "false", "0", "no", ""):
+            return None
         return raw.lower() in ("true", "1", "yes")
+    if kind in ("runtime_float", "runtime_int"):
+        if not raw:
+            return raw  # Empty restores the getter's default.
+        try:
+            value = int(raw) if kind == "runtime_int" else float(raw)
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if kind in ("liked_hours", "seconds", "bind_timeout", "ttl_seconds"):
+        try:
+            if not math.isfinite(float(raw)):
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
     if kind == "cache_dir":
-        # 空值=恢复默认（<home>/cache）；解析前 os.environ 已写入原始串，不能用环境变量兜底
+        # 空值=恢复默认（<home>/cache）；不要用旧环境变量兜底
         return raw or os.path.join(dailyrec.home_dir(), "cache")
     if kind == "tee_cache_max":
         try:
@@ -596,6 +633,20 @@ def _env_watch_parse(raw: str, kind: str):
         return _normalize_lx_sources(raw)
     if kind == "llm_url":
         return raw.rstrip("/")
+    if kind == "llm_model":
+        return raw or "gpt-4o-mini"
+    if kind == "liked_hours":
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if 0.5 <= value <= 8760 else None
+    if kind == "liked_size":
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if 0 <= value <= 100 else None
     if kind == "seconds":
         try:
             return max(1.0, min(60.0, float(raw)))
@@ -665,9 +716,9 @@ def _migrate_media_refs(old_dir: str, new_dir: str) -> int:
 
 
 def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
-    """解析 .env 应用白名单键；返回发生变化的 CONF 键名（空 = 无变化）。
+    """解析 .env 应用白名单键；返回变化的 CONF 键（仅环境项返回环境键）。
 
-    环境变量同步写原始字符串（recommend 等模块直接读 os.environ）。
+    先验证再同步环境原始字符串；recommend 等模块直接读 os.environ。
     """
     path = env_path or _env_watch_path()
     kv = dict(parse_env_file(path)[0])
@@ -676,13 +727,18 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     for env_key, (conf_key, kind) in _ENV_WATCH_KEYS.items():
         if env_key not in kv:
             continue
-        os.environ[env_key] = str(kv[env_key])
         value = _env_watch_parse(kv[env_key], kind)
         if value is None:
             continue
+        previous = os.environ.get(env_key, "")
+        os.environ[env_key] = str(kv[env_key])
         if conf_key and CONF.get(conf_key) != value:
             CONF[conf_key] = value
             changed.append(conf_key)
+        elif not conf_key and _env_watch_parse(previous, kind) != value:
+            # API keys and runtime budgets are not stored in CONF. They still
+            # need to reach the reload handler, even in an otherwise unchanged save.
+            changed.append(env_key)
     if "cache_dir" in changed:
         _migrate_media_refs(old_cache_dir or "", CONF["cache_dir"])
     if set(changed) & {"quality_mode", "netease_quality"}:
@@ -710,14 +766,153 @@ def _env_watch_stat(path: "str | None" = None):
 
 
 # 音源集合相关的 CONF 键：任一变化意味着推荐缓存里的旧源曲目可能不可播（issue #22）
-_SOURCE_CONF_KEYS = {"musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources"}
+_SOURCE_CONF_KEYS = {
+    "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
+    "lx_source_url", "lx_source_list",
+}
+_LIKED_TASKS: dict[str, asyncio.Task] = {}
+_LIKED_WAKEUP: asyncio.Event | None = None
+_LIKED_BUILD_LOCK: asyncio.Lock | None = None
+_LIKED_EPOCH = 0
+_DAILY_EPOCHS = {"daily": 0, "hot": 0}
 
 
-def _cancel_daily_tasks() -> None:
+def _cancel_daily_tasks(kinds: set[str] | None = None) -> None:
+    # Cancellation can race a completed wait_for child; invalidate publication
+    # synchronously as well, without disturbing the other recommendation kind.
+    for kind in kinds if kinds is not None else _DAILY_EPOCHS:
+        _DAILY_EPOCHS[kind] = _DAILY_EPOCHS.get(kind, 0) + 1
     for key in list(_DAILY_TASKS):
+        if kinds is not None and str(key).rsplit(":", 2)[-2] not in kinds:
+            continue
         old = _DAILY_TASKS.pop(key, None)
         if old is not None and not old.done():
             old.cancel()
+    for key in list(_EMPTY_BUILD_COOLDOWN):
+        if kinds is None or str(key).rsplit(":", 2)[-2] in kinds:
+            _EMPTY_BUILD_COOLDOWN.pop(key, None)
+
+
+def _wake_liked_scheduler() -> None:
+    if _LIKED_WAKEUP is not None:
+        _LIKED_WAKEUP.set()
+
+
+def _liked_source_fingerprint() -> str:
+    return localrec.current_source_fingerprint(CONF)
+
+
+def _liked_runtime_usable() -> bool:
+    return dailyrec.llm_liked_enabled() and dailyrec.llm_liked_size() > 0
+
+
+def _liked_generation_current(epoch: int, fingerprint: str) -> bool:
+    return (epoch == _LIKED_EPOCH and _liked_runtime_usable()
+            and fingerprint == localrec.liked_config_fingerprint(_liked_source_fingerprint()))
+
+
+async def _run_liked_build(
+    fastapi_app: FastAPI, user_guid: str, fingerprint: str, epoch: int,
+) -> None:
+    global _LIKED_BUILD_LOCK
+    if _LIKED_BUILD_LOCK is None:
+        _LIKED_BUILD_LOCK = asyncio.Lock()
+    try:
+        # Includes queued accounts, not just concurrent model calls: one global
+        # generation at a time, with a fresh epoch check after acquiring the lock.
+        async with _LIKED_BUILD_LOCK:
+            if not _liked_generation_current(epoch, fingerprint):
+                return
+            # Discovery can finish after another build published a fresh batch.
+            # Recheck persisted due state when this queued account gets its turn.
+            due = await asyncio.to_thread(
+                localrec.llm_build_due, user_guid, fingerprint, time.time(),
+                db_path=str(CONF.get("music_db") or dailyrec.music_db_path()),
+            )
+            if not due or not _liked_generation_current(epoch, fingerprint):
+                return
+            bundle = await localrec.build_llm_bundle(
+                user_guid=user_guid,
+                db_path=str(CONF.get("music_db") or dailyrec.music_db_path()),
+                llm_http=get_llm_client(fastapi_app),
+                build_track=build_online_track,
+                musicbox_client=get_musicbox_client(fastapi_app) if CONF["netease_enabled"] else None,
+                netease_enabled=CONF["netease_enabled"],
+                lx_client=get_lx_client(fastapi_app) if CONF.get("lx_enabled") else None,
+                lx_enabled=bool(CONF.get("lx_enabled")),
+                lx_sources=CONF.get("lx_sources") or None,
+                source_fingerprint=_liked_source_fingerprint(),
+                publication_guard=lambda: _liked_generation_current(epoch, fingerprint),
+                get_source_fingerprint=_liked_source_fingerprint,
+                source_enabled=lambda track: _source_enabled(str(track.get("guid") or "")),
+                online_favorites=load_online_favorites,
+            )
+            if _liked_generation_current(epoch, fingerprint) and not bundle.get("tracks"):
+                localrec.record_llm_failure(user_guid, time.time(), fingerprint)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning("LLM liked build failed for %s: %s", user_guid, error)
+        if _liked_generation_current(epoch, fingerprint):
+            localrec.record_llm_failure(user_guid, time.time(), fingerprint)
+    finally:
+        # A cancelled old generation can finish after a replacement was queued.
+        if _LIKED_TASKS.get(user_guid) is asyncio.current_task():
+            _LIKED_TASKS.pop(user_guid, None)
+
+
+def _due_liked_accounts(db_path: str, fingerprint: str, now: float) -> list[str]:
+    """SQLite discovery, eligibility and persisted state reads stay off the loop."""
+    due = []
+    for user_guid in dict.fromkeys(localrec.list_user_guids(db_path)):
+        if not user_guid.strip() or user_guid == "shared":
+            continue
+        if not localrec.llm_build_due(user_guid, fingerprint, now, db_path=db_path):
+            continue
+        rows = localrec.read_library(db_path, user_guid)
+        if sum(bool(row.get("valid") and not row.get("favorite") and row.get("guid"))
+               for row in rows) >= 20:
+            due.append(user_guid)
+    return due
+
+
+async def _schedule_liked_builds(fastapi_app: FastAPI) -> None:
+    if not _liked_runtime_usable():
+        return
+    epoch = _LIKED_EPOCH
+    fingerprint = localrec.liked_config_fingerprint(_liked_source_fingerprint())
+    db_path = str(CONF.get("music_db") or dailyrec.music_db_path())
+    users = await asyncio.to_thread(_due_liked_accounts, db_path, fingerprint, time.time())
+    if not _liked_generation_current(epoch, fingerprint):
+        return
+    for user_guid in users:
+        if user_guid in _LIKED_TASKS:
+            continue
+        _LIKED_TASKS[user_guid] = asyncio.create_task(
+            _run_liked_build(fastapi_app, user_guid, fingerprint, epoch)
+        )
+
+
+async def _liked_scheduler_loop(fastapi_app: FastAPI) -> None:
+    global _LIKED_WAKEUP, _LIKED_BUILD_LOCK
+    _LIKED_WAKEUP = asyncio.Event()
+    _LIKED_BUILD_LOCK = asyncio.Lock()
+    try:
+        while True:
+            # Clear before enumeration: a reload while the worker is reading
+            # SQLite must trigger another pass rather than lose its wakeup.
+            _LIKED_WAKEUP.clear()
+            try:
+                await _schedule_liked_builds(fastapi_app)
+            except Exception as error:
+                logger.debug("liked scheduler pass failed: %s", error)
+            delay = min(30.0, max(1.0, dailyrec.llm_liked_refresh_hours() * 1800.0))
+            try:
+                await asyncio.wait_for(_LIKED_WAKEUP.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        _LIKED_WAKEUP = None
 
 
 async def _log_retention_loop() -> None:
@@ -730,6 +925,64 @@ async def _log_retention_loop() -> None:
         except Exception as exc:
             logger.debug("log retention failed: %s", type(exc).__name__)
         await asyncio.sleep(3600)
+
+
+def _invalidate_daily_llm_cache() -> int:
+    """Invalidate daily bundles only, retaining hot charts and Netease ownership.
+
+    The general source-change invalidator intentionally releases the source
+    slot, so usage/LLM connection reloads cannot use it.
+    """
+    day = dailyrec.today_key()
+    removed = 0
+    for suffix in (".json", ".fallback.json"):
+        pattern = os.path.join(dailyrec.recommend_cache_dir(), "*", f"daily-{day}{suffix}")
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as error:
+                logger.warning("failed to invalidate daily LLM cache %s: %s", path, error)
+    return removed
+
+
+def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
+    """Apply recommendation side effects independently of the file watcher.
+
+    apply_env_hot_reload reports environment-only keys too, so rotating an API
+    key without changing a CONF value follows exactly the same path.
+    """
+    global _LIKED_EPOCH
+    changes = set(changed)
+    source_changed = bool(_SOURCE_CONF_KEYS & changes)
+    connection_changed = bool({"llm_base_url", "llm_model", "FNMUSIC_LLM_API_KEY"} & changes)
+    liked_changed = source_changed or connection_changed or bool(
+        {"llm_liked_enabled", "liked_size"} & changes
+    )
+    if source_changed:
+        removed = dailyrec.invalidate_today_cache_all_users()
+        _cancel_daily_tasks()
+        logger.info("音源配置变化(%s)：已失效当日推荐缓存 %d 个",
+                    ",".join(sorted(_SOURCE_CONF_KEYS & changes)), removed)
+    elif ("llm_daily_enabled" in changes
+          or (connection_changed and CONF.get("llm_daily_enabled"))):
+        # LLM usage/connection changes affect daily only. A public hot chart
+        # and today's Netease source-slot owner are unrelated and must survive.
+        removed = _invalidate_daily_llm_cache()
+        _cancel_daily_tasks({"daily"})
+        logger.info("大模型每日推荐用途/连接变化：已失效每日推荐缓存 %d 个", removed)
+    if liked_changed:
+        _LIKED_EPOCH += 1
+        tasks = list(_LIKED_TASKS.values())
+        _LIKED_TASKS.clear()
+        for task in tasks:
+            task.cancel()
+        removed = localrec.invalidate_llm_bundles()
+        logger.info("大模型猜你喜欢配置/音源变化：已失效缓存 %d 个", removed)
+    if liked_changed or "liked_refresh_hours" in changes:
+        # An interval-only save keeps the batch and its first-fetch timestamp;
+        # the scheduler simply reevaluates the new deadline.
+        _wake_liked_scheduler()
 
 
 async def _env_watch_loop() -> None:
@@ -749,17 +1002,8 @@ async def _env_watch_loop() -> None:
             changed = apply_env_hot_reload()
             if changed:
                 _reset_search_cache()
-                if _SOURCE_CONF_KEYS & set(changed):
-                    # issue #22：切换音源后当日推荐立即失效，切回歌单按新音源重建，
-                    # 旧源曲目不再残留到当日结束
-                    removed = dailyrec.invalidate_today_cache_all_users()
-                    _cancel_daily_tasks()
-                    logger.info(
-                        "音源配置变化(%s)：已失效当日推荐缓存 %d 个，推荐歌单将按新音源重建",
-                        ",".join(sorted(_SOURCE_CONF_KEYS & set(changed))), removed,
-                    )
+                _refresh_recommend_config(changed)
                 logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
-                # 功能开启情况留档（[cfg] 行进本地日志，秘密值打码）
                 for key in sorted(changed):
                     logger.info("[cfg] %s", redact(f"{key}={CONF.get(key)}"))
         except asyncio.CancelledError:
@@ -3926,7 +4170,7 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
-    global _LX_SCRIPT_MAP_TASK
+    global _LX_SCRIPT_MAP_TASK, _LIKED_EPOCH, _LIKED_BUILD_LOCK
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
@@ -3945,6 +4189,7 @@ async def lifespan(fastapi_app: FastAPI):
     env_task = asyncio.create_task(_env_watch_loop()) if (
         _background_jobs_enabled() and CONF.get("env_watch", True)
     ) else None
+    liked_task = None
     created_upstream = False
     created_musicdl = False
     created_musicbox = False
@@ -3992,6 +4237,8 @@ async def lifespan(fastapi_app: FastAPI):
     if getattr(fastapi_app.state, "llm_client", None) is None:
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
+    if _background_jobs_enabled():
+        liked_task = asyncio.create_task(_liked_scheduler_loop(fastapi_app))
 
     maintenance_server = None
     if _background_jobs_enabled():
@@ -4031,6 +4278,17 @@ async def lifespan(fastapi_app: FastAPI):
         if log_task:
             log_task.cancel()
             await asyncio.gather(log_task, return_exceptions=True)
+        if liked_task:
+            liked_task.cancel()
+            await asyncio.gather(liked_task, return_exceptions=True)
+        _LIKED_EPOCH += 1
+        liked_builds = list(_LIKED_TASKS.values())
+        _LIKED_TASKS.clear()
+        for task in liked_builds:
+            task.cancel()
+        if liked_builds:
+            await asyncio.gather(*liked_builds, return_exceptions=True)
+        _LIKED_BUILD_LOCK = None
         map_task = _LX_SCRIPT_MAP_TASK
         _LX_SCRIPT_MAP_TASK = None
         if map_task is not None and map_task.get_loop() is asyncio.get_running_loop():
@@ -8149,7 +8407,7 @@ def _sync_recommend_version_marker() -> None:
 
 def _recommend_kind_enabled(kind: str) -> bool:
     if kind == "liked":
-        return True
+        return not (dailyrec.llm_liked_selected() and dailyrec.llm_liked_size() == 0)
     if kind == "hot":
         return bool(CONF.get("recommend_hot", True))
     return bool(CONF.get("recommend_daily", True))
@@ -8217,6 +8475,7 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
         if done is not None:
             return done
     _EMPTY_BUILD_COOLDOWN.pop(key, None)
+    epoch = _DAILY_EPOCHS[kind]
     async with _FAV_LOCK:
         favs = load_online_favorites(user_guid)
     task = asyncio.create_task(
@@ -8234,6 +8493,10 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
             recommend_hot=bool(CONF.get("recommend_hot", True)),
             recommend_daily=bool(CONF.get("recommend_daily", True)),
             kind=kind,
+            publication_guard=lambda: (
+                epoch == _DAILY_EPOCHS[kind] and day == dailyrec.today_key()
+                and _recommend_kind_enabled(kind)
+            ),
         )
     )
     _DAILY_TASKS[key] = task
@@ -8284,12 +8547,30 @@ async def _wait_progressive_bundle(
     return dailyrec.empty_daily_bundle(user_guid, kind)
 
 
+def _mark_liked_response_fetched(user_guid: str, bundle: dict) -> None:
+    """Acknowledge the actual returned batch, not a concurrently published one."""
+    if localrec.mark_llm_bundle_fetched(
+        user_guid, str(bundle.get("batchId") or ""),
+        source_fingerprint=_liked_source_fingerprint(),
+        db_path=str(CONF.get("music_db") or dailyrec.music_db_path()),
+    ):
+        _wake_liked_scheduler()
+
+
 async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
     """歌单列表用：有缓存立刻返回；否则等渐进 checkpoint，最多 2s，超时仍返回占位歌单。"""
     if kind not in _recommend_injectable_kinds(user_guid):
         # 开关关闭或身份探测失败（shared）的个性化 daily：注入与生成一并跳过
         return dailyrec.empty_daily_bundle(user_guid, kind)
     if kind == "liked":
+        if dailyrec.llm_liked_enabled():
+            # Passive reads never start or wait for generation, and never mark
+            # consumption (cover/prewarm call this helper too).
+            cached = await asyncio.to_thread(
+                localrec.load_llm_bundle, user_guid, _liked_source_fingerprint(),
+                db_path=str(CONF.get("music_db") or dailyrec.music_db_path()),
+            )
+            return cached or dailyrec.empty_daily_bundle(user_guid, "liked")
         return await localrec.get_bundle(user_guid, str(CONF.get("music_db") or dailyrec.music_db_path()))
     day = dailyrec.today_key()
     dailyrec.purge_stale_daily_cache(user_guid, day)
@@ -8642,6 +8923,7 @@ async def playlist_list(request: Request):
         official = []
         data["list"] = official
     recs: list[dict] = []
+    consumed_liked = None
     for kind in kinds:
         try:
             bundle = await _peek_daily_bundle(request, user_guid, kind)
@@ -8655,6 +8937,8 @@ async def playlist_list(request: Request):
         rec = _playlist_public_fields(bundle.get("playlist") or {}, tracks)
         rec["trackCount"] = len(tracks)
         recs.append(rec)
+        if kind == "liked" and tracks:
+            consumed_liked = bundle
     public_cards: list[dict] = []
     if public_on:
         try:
@@ -8695,7 +8979,10 @@ async def playlist_list(request: Request):
     data["list"] = recs + public_cards + nm_cards + official
     total = data.get("total")
     data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(public_cards) + len(nm_cards)
-    return JSONResponse(content=envelope, headers=headers)
+    response = JSONResponse(content=envelope, headers=headers)
+    if consumed_liked is not None:
+        _mark_liked_response_fetched(user_guid, consumed_liked)
+    return response
 
 
 @app.get("/music/api/v1/playlist/detail")
@@ -8759,7 +9046,10 @@ async def playlist_detail(request: Request):
     bundle = await _load_requested_playlist_bundle(request, user_guid, kind, guid)
     rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
     rec["trackCount"] = len(bundle.get("tracks") or [])
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
+    response = JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
+    if kind == "liked" and bundle.get("tracks"):
+        _mark_liked_response_fetched(user_guid, bundle)
+    return response
 
 
 @app.get("/music/api/v1/playlist/batch-detail")
@@ -8818,9 +9108,12 @@ async def playlist_batch_detail(request: Request):
                     tc = it.get("trackCount")
                     it["trackCount"] = (tc if isinstance(tc, int) else 0) + extra
     recs: list[dict] = []
+    consumed_liked = []
     for g in recommend_ids:
         kind = dailyrec.online_playlist_kind(g) or "daily"
         bundle = await _load_requested_playlist_bundle(request, user_guid, kind, g)
+        if kind == "liked" and bundle.get("tracks"):
+            consumed_liked.append(bundle)
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
         recs.append(rec)
@@ -8844,7 +9137,10 @@ async def playlist_batch_detail(request: Request):
             if tracks is not None:
                 card = {**card, "trackCount": len(tracks)}
             recs.append(card)
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
+    response = JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
+    for bundle in consumed_liked:
+        _mark_liked_response_fetched(user_guid, bundle)
+    return response
 
 
 @app.get("/music/api/v1/track/playlist-detail/list")
@@ -9025,13 +9321,16 @@ async def playlist_track_list(request: Request):
         tracks[start:start + size],
         await _online_favorite_set_for_user(user_guid),
     )
-    return JSONResponse(
+    response = JSONResponse(
         content=disguise_client_json({
             "code": 0,
             "msg": "ok",
             "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
         })
     )
+    if kind == "liked" and page_tracks:
+        _mark_liked_response_fetched(user_guid, bundle)
+    return response
 
 
 # === album detail（在线曲目伪装专辑详情，issue #22）===

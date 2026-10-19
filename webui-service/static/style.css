@@ -73,6 +73,8 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 .card-title { font-weight: 600; margin-bottom: 10px; }
 
 .hint { color: var(--muted); font-size: 13px; margin: 6px 0; }
+.hint.warning { color: var(--warn); }
+#llm-liked-settings[hidden], #llm-api-warning[hidden] { display: none; }
 .muted { color: var(--muted); }
 .stack { display: flex; flex-direction: column; gap: 8px; }
 .stack[hidden] { display: none; }
@@ -131,6 +133,7 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 }
 .switch-row:last-of-type { border-bottom: 0; }
 .switch-row .sub { font-size: 13px; color: var(--muted); }
+.switch-grid { display: grid; gap: 8px; margin-top: 12px; }
 input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent); flex: none; }
 input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 
