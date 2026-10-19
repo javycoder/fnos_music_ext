@@ -135,9 +135,15 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 原生形态前置要求与自动处理：
 
-- **Python 3.10+** 与 `python3-venv`（fnOS 自带 3.11 满足）；
-- **nodejs ≥ 16 / ffmpeg**：缺失时安装阶段自动 `sudo apt-get` 补装（失败会给出手动命令）；
-- **supervisor**：经 pip 装进 `.venv-sources`（无需系统包）；
+- **Python 3.11+**（需包含 `venv`、`ensurepip`、`ssl`、`sqlite3`）：
+  解释器探测按「显式配置 `FNMUSIC_PYTHON_BIN` → fnOS 应用中心 `python312`（`/var/apps/python312`）→ 系统 Python」优先级自动选择。已有正常且版本合格的虚拟环境继续复用。
+- **Node.js ≥ 20**（lxserver engines 契约要求）：
+  Node 运行时按「显式配置 `FNMUSIC_NODE_BIN` → fnOS 应用中心 `nodejs_v22`（`/var/apps/nodejs_v22`）→ 系统 Node」优先级选择；自动探测仍缺失时尝试 `sudo apt-get` 自动补装，仍不满足时给出应用中心安装指引。
+- **ffmpeg / ffprobe**：
+  优先探测显式配置、系统 PATH 与 fnOS 核心媒体组件（`/usr/trim/lib/mediasrv/ffmpeg` 等）。缺失时尝试 `sudo apt-get` 自动补装；若环境仍缺少 ffmpeg，将安全降级运行：原文件播放与取流不受影响，标准音质转码与音频解码校验受限，musicdl 仍执行取流探针但不因缺少 ffmpeg 误判坏流或强转 MP3。
+- **依赖缓存与快速跳过**：
+  `.venv-proxy` 与 `.venv-sources` 记录解释器身份与依赖清单指纹，依赖未变且本地校验通过时秒级跳过联网；`./extend.sh` 每次校验依赖完整性，可使用 `FNMUSIC_REFRESH_DEPS=1` 强制重新安装。
+- **supervisor**：经 pip 装进 `.venv-sources`（无需系统包），所选 Node 及组件路径完整写入原生配置；
 - **lxserver**：从 `container/lxserver-artifact/` 预置包或镜像加速链下载，sha256 校验后落位 `.lxserver/`，与 Docker 镜像同版本同补丁。
 
 常用运维（原生形态）：

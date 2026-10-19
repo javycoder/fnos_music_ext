@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Shared installation-only functions. Source after BASE_DIR and log_* definitions.
+_INSTALL_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${_INSTALL_COMMON_DIR}/runtime_common.sh" ]; then
+    source "${_INSTALL_COMMON_DIR}/runtime_common.sh"
+elif [ -n "${BASE_DIR:-}" ] && [ -f "${BASE_DIR}/proxy/runtime_common.sh" ]; then
+    source "${BASE_DIR}/proxy/runtime_common.sh"
+fi
 # NOTE: installation_lock()/retire_hung_installers() run BEFORE the caller's
 # log_* helpers are defined (install.sh acquires the lock at the very top), so
 # they must print with plain echo instead of log_warn/log_err.
@@ -407,21 +413,58 @@ native_sup_conf() {
 }
 
 render_native_placeholders() {
-    # $1 = 模板文件，渲染结果输出到 stdout（@REPO@/@VENV@/@DATA@/@RUN@ 四占位符）
+    # $1 = 模板文件；输出渲染后的 systemd/supervisor 配置。
+    if command -v choose_node_bin >/dev/null 2>&1; then
+        choose_node_bin || true
+    fi
+    if [ -z "${FNMUSIC_SELECTED_NODE:-}" ]; then
+        FNMUSIC_SELECTED_NODE="$(command -v node 2>/dev/null || true)"
+        FNMUSIC_NODE_SOURCE="system node"
+    fi
+    if command -v choose_media_bins >/dev/null 2>&1; then
+        choose_media_bins || true
+    fi
+    local node_bin="${FNMUSIC_SELECTED_NODE}" node_dir=""
+    if [ -n "${node_bin}" ]; then
+        node_dir="$(dirname "${node_bin}")"
+    fi
     python3 - "$1" "${BASE_DIR}" "$(native_venv_dir)" \
-        "${BASE_DIR}/sources-data" "$(native_run_dir)" <<'PY'
+        "${BASE_DIR}/sources-data" "$(native_run_dir)" \
+        "${node_bin}" "${node_dir}" "${FNMUSIC_SELECTED_FFMPEG:-}" \
+        "${FNMUSIC_SELECTED_FFPROBE:-}" <<'PY'
 import pathlib
 import sys
 
 template, *paths = sys.argv[1:]
+repo, venv, data, run, node, node_dir, ffmpeg, ffprobe = paths
 # These paths cross INI environment, shell argv and systemd parsers. Fail clearly
 # on ambiguous quoting rather than install a malformed unit or command.
 if any(any(c in path for c in "\n\r\"'\\") for path in paths):
     raise SystemExit("原生部署路径不能包含换行、引号或反斜杠")
+
+path_dirs = []
+if node_dir and node_dir not in path_dirs:
+    path_dirs.append(node_dir)
+if venv:
+    venv_bin = f"{venv}/bin"
+    if venv_bin not in path_dirs:
+        path_dirs.append(venv_bin)
+if ffmpeg:
+    ffmpeg_dir = str(pathlib.Path(ffmpeg).parent)
+    if ffmpeg_dir not in path_dirs and ffmpeg_dir not in ("/usr/bin", "/bin"):
+        path_dirs.append(ffmpeg_dir)
+standard_dirs = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+for d in standard_dirs:
+    if d not in path_dirs:
+        path_dirs.append(d)
+sources_path = ":".join(path_dirs)
+
 text = pathlib.Path(template).read_text(encoding="utf-8")
-for key, value in zip(("REPO", "VENV", "DATA", "RUN"), paths):
+for key, value in zip(("REPO", "VENV", "DATA", "RUN", "NODE", "NODE_BIN_DIR", "FFMPEG", "FFPROBE"), paths):
     # Both supervisor's interpolation and systemd's specifiers use percent.
     text = text.replace("@" + key + "@", value.replace("%", "%%"))
+text = text.replace("@SOURCES_PATH@", sources_path.replace("%", "%%"))
+
 if pathlib.Path(template).name == "supervisord-native.conf.in":
     text = text.replace('WEBUI_SUPERVISORCTL="supervisorctl -c ',
                         'WEBUI_SUPERVISORCTL="supervisorctl -c \'')

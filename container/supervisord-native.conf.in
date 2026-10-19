@@ -15,7 +15,7 @@ logfile_maxbytes=0
 pidfile=@RUN@/supervisord.pid
 ; 全部子进程的公共环境：PATH 前置 venv（uvicorn/supervisorctl/musicbox CLI）、
 ; 数据目录对齐容器卷映射（sources-data = 容器 /data，仓库 = 容器 /repo）
-environment=PATH="@VENV@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",PYTHONUNBUFFERED="1",FNMUSIC_ENV_FILE="@REPO@/.env",XDG_DATA_HOME="@DATA@",XDG_CACHE_HOME="@DATA@/cache",XDG_CONFIG_HOME="@DATA@/config",LX_DATA_DIR="@DATA@/lxmusic",LXSERVER_DATA_DIR="@DATA@/lxserver"
+environment=PATH="@SOURCES_PATH@",PYTHONUNBUFFERED="1",FNMUSIC_ENV_FILE="@REPO@/.env",XDG_DATA_HOME="@DATA@",XDG_CACHE_HOME="@DATA@/cache",XDG_CONFIG_HOME="@DATA@/config",LX_DATA_DIR="@DATA@/lxmusic",LXSERVER_DATA_DIR="@DATA@/lxserver",FNMUSIC_FFMPEG_BIN="@FFMPEG@",FNMUSIC_FFPROBE_BIN="@FFPROBE@"
 
 [unix_http_server]
 file=@RUN@/supervisor.sock
@@ -55,7 +55,7 @@ redirect_stderr=true
 
 [program:lxserver]
 directory=@REPO@/.lxserver
-command=node index.js
+command="@NODE@" index.js
 autostart=false
 autorestart=true
 startretries=5

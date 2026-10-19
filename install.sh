@@ -669,16 +669,13 @@ precheck_environment() {
     fi
 
     # 1. 检查 Python 3 与 venv 模块
-    if ! command -v python3 >/dev/null 2>&1; then
-        log_err "【缺少基础组件】系统未检测到 python3。"
+    if ! choose_python_bin; then
+        log_err "【缺少基础组件】系统未检测到合格的 Python 3.11+。"
         log_err "请先执行命令安装：sudo apt-get update && sudo apt-get install -y python3 python3-venv"
-        precheck_failed=1
-    elif ! python3 -c "import venv" >/dev/null 2>&1; then
-        log_err "【缺少基础组件】系统 Python 缺少 venv 模块。"
-        log_err "请先执行命令安装：sudo apt-get update && sudo apt-get install -y python3-venv"
+        log_err "或在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN。"
         precheck_failed=1
     else
-        log_info "Python 3 与 venv 模块已就绪。"
+        log_info "Python 解释器已就绪: ${FNMUSIC_SELECTED_PYTHON} ($(runtime_python_version "${FNMUSIC_SELECTED_PYTHON}")，来源: ${FNMUSIC_PYTHON_SOURCE})。"
     fi
 
     # 2. 检查 sudo 权限
@@ -710,23 +707,22 @@ precheck_environment() {
 
     # 4. 部署形态运行时检查（核心代理始终在宿主机 systemd）
     if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
-        # 原生模式：python3 ≥ 3.10（服务代码使用 PEP 604 联合类型语法）；
-        # nodejs/ffmpeg 缺失时可由 ensure_sources_native.sh 自动补装，此处仅预检提示
-        local py_major py_minor
-        py_major="$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
-        py_minor="$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
-        if [ "${py_major}" -lt 3 ] || { [ "${py_major}" -eq 3 ] && [ "${py_minor}" -lt 10 ]; }; then
-            log_err "【版本不足】原生模式需要 Python 3.10+（当前 ${py_major}.${py_minor}）。"
-            log_err "请升级系统 python3，或改用 Docker 模式（./install.sh --deploy docker）。"
+        if ! choose_python_bin; then
+            log_err "【版本不足】原生模式需要 Python 3.11+ 且包含 venv/ensurepip/ssl/sqlite3。"
+            log_err "可在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN。"
             precheck_failed=1
         else
-            log_info "Python ${py_major}.${py_minor} 满足原生模式要求。"
+            log_info "原生模式 Python 已选定: ${FNMUSIC_SELECTED_PYTHON} ($(runtime_python_version "${FNMUSIC_SELECTED_PYTHON}"))。"
         fi
-        if ! command -v node >/dev/null 2>&1; then
-            log_warn "未检测到 nodejs（lxserver 需要）：安装阶段将尝试 sudo apt-get 自动安装。"
+        if ! choose_node_bin; then
+            log_warn "未检测到 Node 20+（lxserver 需要）：安装阶段将尝试自动探测或 sudo apt-get 补装。"
+        else
+            log_info "原生模式 Node 已选定: ${FNMUSIC_SELECTED_NODE} (${FNMUSIC_NODE_SOURCE})。"
         fi
-        if ! command -v ffmpeg >/dev/null 2>&1; then
-            log_warn "未检测到 ffmpeg（musicdl 无损探针需要）：安装阶段将尝试 sudo apt-get 自动安装。"
+        if ! choose_media_bins; then
+            log_warn "未检测到 ffmpeg/ffprobe：安装阶段将尝试探测或 apt-get 补装（若仍缺失将按原文件播放降级）。"
+        else
+            log_info "原生模式媒体组件已选定: ffmpeg=${FNMUSIC_SELECTED_FFMPEG:-无}, ffprobe=${FNMUSIC_SELECTED_FFPROBE:-无}。"
         fi
     elif command -v docker >/dev/null 2>&1; then
         if run_docker info >/dev/null 2>&1; then

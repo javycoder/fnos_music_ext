@@ -598,11 +598,9 @@ else:
     esac
 fi
 
-# 1.5 检查 Python 虚拟环境与依赖（缺失时经多源回退安装，见 ensure_proxy_deps.sh）
-if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
-    log_info "创建 .venv-proxy 虚拟环境..."
-    PIP_INDEX="${PIP_INDEX:-}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
-fi
+# 1.5 检查 Python 虚拟环境与依赖（依赖未变化且校验通过时秒级跳过，见 ensure_proxy_deps.sh）
+log_info "检查 .venv-proxy 虚拟环境与依赖状态..."
+PIP_INDEX="${PIP_INDEX:-}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
 
 # 1.6 编译与语法检查
 takeover preflight --base "${BASE_DIR}"

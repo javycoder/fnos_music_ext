@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -413,15 +414,23 @@ _PROBE_CACHE_LOCK = threading.Lock()
 _PROBE_TTL = int(os.environ.get("MUSICDL_PROBE_TTL", "600"))
 
 
+def ffmpeg_bin() -> str | None:
+    return os.environ.get("FNMUSIC_FFMPEG_BIN") or shutil.which("ffmpeg")
+
+
 def _decode_probe_ok(path: str) -> bool:
     """ffmpeg 解码探针样本文件，以实际解出的时长判断好坏。
 
     截断的完好样本也能解出数十秒（探针只取头部字节）；从头就坏的样本
     time≈0。报错文本不可用作判据——截断与损坏的报错完全相同。
+    若系统未配置/缺少 ffmpeg，无法执行解码校验，放行样本文件返回 True。
     """
+    bin_path = ffmpeg_bin()
+    if not bin_path:
+        return True
     try:
         r = subprocess.run(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-i", path, "-f", "null", "-"],
+            [bin_path, "-nostdin", "-hide_banner", "-i", path, "-f", "null", "-"],
             capture_output=True, text=True, timeout=120,
         )
         times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
@@ -454,6 +463,10 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
             resp.close()
         if not buf:
             return False
+        if not ffmpeg_bin():
+            # 仍执行不依赖 ffmpeg 的取流检查；缺少 ffmpeg 时无法执行解码校验，
+            # 不判定音频损坏或因此强制降为 MP3，只要收到有效数据即放行
+            return True
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".probe", delete=False) as f:
             f.write(buf)

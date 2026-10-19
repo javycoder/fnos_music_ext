@@ -307,8 +307,9 @@ def test_search_playable_probes_parallel_and_keeps_library_order(clean_state, mo
     monkeypatch.setattr(app_module, "_search_one_source", lambda source, keyword, limit: songs)
 
     def _fake_probe(url: str, headers: dict) -> bool:
-        time.sleep(0.1)
-        return int(url.rsplit("/", 1)[-1].split(".")[0]) % 2 == 0  # 偶数 id 有效
+        num = int(url.rsplit("/", 1)[-1].split(".")[0])
+        time.sleep(0.02 + num * 0.01)
+        return num % 2 == 0  # 偶数 id 有效
 
     monkeypatch.setattr(app_module, "_probe_playable_sync", _fake_probe)
 
@@ -742,6 +743,64 @@ def test_decode_probe_ok_judges_by_decoded_duration(tmp_path):
     corrupt = tmp_path / "corrupt.flac"
     corrupt.write_bytes(data[:200] + b"\x00" * 100_000)
     assert app_module._decode_probe_ok(str(corrupt)) is False
+
+
+def test_decode_probe_ok_without_ffmpeg_returns_true(monkeypatch):
+    """缺少 ffmpeg 时无法执行解码校验，不判定音频损坏，直接放行。"""
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: None)
+    assert app_module._decode_probe_ok("/nonexistent/audio.flac") is True
+
+
+def test_head_probe_sync_without_ffmpeg_passes_if_bytes_received(monkeypatch):
+    """缺少 ffmpeg 时，取流成功收到字节则视为有效，不因无 ffmpeg 而报错或判定损坏。"""
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: None)
+    monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
+
+    class _Resp:
+        def iter_content(self, chunk_size):
+            yield b"fLaC" + b"\x00" * 1024
+
+        def close(self):
+            pass
+
+    class _Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def build_request(self, method, url, headers=None):
+            return object()
+
+        def send(self, req, stream=False):
+            return _Resp()
+
+    monkeypatch.setattr(app_module.httpx, "Client", _Client)
+    assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) is True
+
+
+def test_head_probe_sync_returns_false_when_stream_fetch_empty(monkeypatch):
+    """缺少 ffmpeg 时仍执行取流检查：若取流为空或失败，返回 False。"""
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: None)
+    monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
+
+    class _Resp:
+        def iter_content(self, chunk_size):
+            return []
+
+        def close(self):
+            pass
+
+    class _Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def build_request(self, method, url, headers=None):
+            return object()
+
+        def send(self, req, stream=False):
+            return _Resp()
+
+    monkeypatch.setattr(app_module.httpx, "Client", _Client)
+    assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) is False
 
 
 @pytest.mark.anyio
