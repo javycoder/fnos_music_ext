@@ -312,13 +312,19 @@ def test_safe_child_log_allows_request_log_and_degrade():
     # 损坏流防护/后台下载失败日志（2026-09-29 kuwo 坏流事件）需可观测
     for line in (
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "audio decode check error (rc=183): [in#0] Invalid data found when processing input",
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "audio decode check failed for online:kuwo:9 (ext=flac bytes=52159151)",
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "retrying online:kuwo:9 with mp3 tier after corrupt lossless stream",
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "tee finalize rejected corrupt lossless for online:kuwo:9",
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "Tee handoff resume rejected for online:kuwo:9",
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "Background full fetch failed for online:kuwo:9: RuntimeError",
+        "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
+        "Background full fetch finalize rejected for online:kuwo:9",
         # 2.8.0 边听边存写盘失败（弃件不停流）需可观测，与上游断流可区分
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "tee disk write failed for online:kuwo:9: OSError",

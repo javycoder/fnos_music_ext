@@ -2779,7 +2779,7 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
 
 
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
-                         meta: "dict | None" = None) -> "dict | None":
+                         meta: "dict | None" = None, max_quality: "str | None" = None) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
 
     fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
@@ -2797,11 +2797,23 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
         pin = _LX_URL_PIN.get(key)
         if pin:
             if time.monotonic() < pin[1]:
-                return dict(pin[0])
+                pinned = pin[0]
+                pinned_ext = str((pinned or {}).get("ext") or "").lower()
+                pinned_tier = str((pinned or {}).get("actual_tier") or (pinned or {}).get("quality") or "").lower()
+                is_lossless = pinned_ext in _LOSSLESS_EXTS or pinned_tier in ("lossless", "flac")
+                if not (max_quality in ("high", "standard", "mp3") and is_lossless):
+                    return dict(pinned)
             _LX_URL_PIN.pop(key, None)
     primary = str(CONF.get("lx_quality") or "lossless").strip()
-    qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities:
+    ladder = _LX_QUALITY_LADDER
+    if max_quality in ("high", "standard", "mp3"):
+        ladder = [q for q in _LX_QUALITY_LADDER if q not in ("lossless", "flac")]
+        if primary in ("lossless", "flac") or not primary:
+            primary = "high" if max_quality != "standard" else "standard"
+        if max_quality == "standard":
+            ladder = [q for q in ladder if q != "high"]
+    qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
+    if primary and primary not in qualities and primary in ladder:
         qualities.insert(0, primary)
 
     extra: dict[str, str] = {}
@@ -2840,6 +2852,10 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                 if isinstance(data, dict) and data.get("ok") is not False:
                     inner = data.get("data")
                     if isinstance(inner, dict) and inner.get("url"):
+                        tier = str(inner.get("actual_tier") or inner.get("quality") or "").lower()
+                        ext = str(inner.get("ext") or "").lower()
+                        if max_quality in ("high", "standard", "mp3") and (tier in ("lossless", "flac") or ext in _LOSSLESS_EXTS):
+                            continue
                         _lx_url_pin_store(key, inner)
                         return dict(inner)
         except Exception as e:
@@ -3070,12 +3086,12 @@ def _sync_netease_quality() -> None:
 
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: bool = False,
-                              prefetch: bool = False) -> str | None:
+                              prefetch: bool = False, max_quality: str | None = None) -> str | None:
     _sync_netease_quality()
     key = str(song_id)
     if not prefetch:
         _NETEASE_PREHEATED_PINS.pop(key, None)
-    gate_key = (asyncio.get_running_loop(), key)
+    gate_key = (asyncio.get_running_loop(), f"{key}:{max_quality or ''}")
     task = _NETEASE_URL_INFLIGHT.get(gate_key)
     if task is not None and not task.done():
         started = time.monotonic()
@@ -3085,15 +3101,15 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: 
         fn_diag(logger, "netease_resolve_wait", song_id=key, ms=int((time.monotonic()-started)*1000))
         return result
     observed_pin = _NETEASE_URL_PIN.get(key)
-    if not refresh and observed_pin and time.monotonic() < observed_pin[1]:
+    if not refresh and observed_pin and time.monotonic() < observed_pin[1] and not max_quality:
         fn_diag(logger, "netease_pin_hit", song_id=key)
         return observed_pin[0]
-    fresh = refresh or observed_pin is not None
+    fresh = refresh or observed_pin is not None or bool(max_quality)
 
     async def resolve():
         try:
             result = await asyncio.wait_for(
-                _resolve_netease_url_uncached(client, key, fresh), _NETEASE_URL_BUDGET_S)
+                _resolve_netease_url_uncached(client, key, fresh, max_quality=max_quality), _NETEASE_URL_BUDGET_S)
             if result and prefetch:
                 pin = _NETEASE_URL_PIN.get(key)
                 if pin:
@@ -3156,11 +3172,17 @@ def _prefetch_netease(request: Request, guid: str) -> None:
     fn_diag(logger, "netease_prefetch", guid=guid)
 
 
-async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str, fresh: bool) -> str | None:
+async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str, fresh: bool,
+                                        max_quality: str | None = None) -> str | None:
     key = str(song_id)
     primary = str(CONF.get("netease_quality") or "lossless").strip()
-    qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities:
+    ladder = _NETEASE_QUALITY_LADDER
+    if max_quality in ("exhigh", "higher", "standard", "mp3"):
+        ladder = [q for q in _NETEASE_QUALITY_LADDER if q not in ("lossless", "hires", "jymaster")]
+        if primary in ("lossless", "hires", "jymaster") or not primary:
+            primary = "exhigh"
+    qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
+    if primary and primary not in qualities and primary in ladder:
         qualities.insert(0, primary)
 
     mode = CONF.get("quality_mode")
@@ -4700,7 +4722,7 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
 
 
 def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool,
-                  retained: dict | None = None) -> dict | None:
+                  retained: dict | None = None, already_verified: bool = False) -> dict | None:
     """落盘转正：边听边存开→进曲库（定名/权限/标签，歌词仅在 FNMUSIC_LYRIC_AUTO_DL
     开启时随迁），关→进滚动缓存（不写歌词）。
 
@@ -4709,14 +4731,17 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     retained：内存搜索会话条目（播放时会话必在），元数据兜底链最前面的一环。
     返回实际落盘元数据 {"dest","title","artist","album"}（官方绑定按此匹配官方曲库）。
     """
-    if str(ext or "").lower() in _LOSSLESS_EXTS and not _audio_file_ok(part):
-        _lossless_blacklist(guid)
-        logger.warning("tee finalize rejected corrupt lossless for %s", guid)
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        return None
+    if str(ext or "").lower() in _LOSSLESS_EXTS and not already_verified:
+        ok, reason = _check_audio_file(part)
+        if not ok:
+            if reason == "decode_error":
+                _lossless_blacklist(guid)
+            logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            return None
     src = dict(info or {})
     title, artist, album = _tag_fields(src)
     reused = False
@@ -5055,17 +5080,21 @@ def stream_tee_response(
                         retained = None
                     try:
                         meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled, retained)
-                        # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
-                        if post_finalize is not None and meta:
-                            await post_finalize(meta)
-                        scan_headers = scan_headers_factory() if scan_headers_factory is not None else None
-                        if scan_headers and not (meta or {}).get("deferred"):
-                            # 元数据缺失暂存 cache 的曲目不触发曲库扫描/官方绑定，
-                            # 待转正后由 _promote_deferred_cache 统一调度
-                            _schedule_library_scan(scan_headers)
-                        if meta and tee_enabled and not meta.get("deferred"):
-                            # 官方绑定意图（收藏/歌单）统一在下载落库完成后调度
-                            _dispatch_official_binding(guid, scan_headers, meta)
+                        if not meta:
+                            if tee_enabled and _lossless_is_blacklisted(guid):
+                                _register_background_fetch(_synth_request(scan_headers_factory() if scan_headers_factory else {}), guid, "tee_save_enabled")
+                        else:
+                            # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
+                            if post_finalize is not None:
+                                await post_finalize(meta)
+                            scan_headers = scan_headers_factory() if scan_headers_factory is not None else None
+                            if scan_headers and not meta.get("deferred"):
+                                # 元数据缺失暂存 cache 的曲目不触发曲库扫描/官方绑定，
+                                # 待转正后由 _promote_deferred_cache 统一调度
+                                _schedule_library_scan(scan_headers)
+                            if tee_enabled and not meta.get("deferred"):
+                                # 官方绑定意图（收藏/歌单）统一在下载落库完成后调度
+                                _dispatch_official_binding(guid, scan_headers, meta)
                     except Exception as exc:
                         logger.warning("tee finalize execution failed for %s: %s", guid, type(exc).__name__)
                         if os.path.exists(to_finalize):
@@ -5193,15 +5222,23 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             try:
                 if source == "netease":
                     song_id = song_id_from_online_guid(guid).split(":")[-1]
-                    url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh)
+                    max_q = "exhigh" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
+                    if max_q:
+                        fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
+                    url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh or bool(max_q),
+                                                    max_quality=max_q)
                     if not url:
                         return None
                     headers["User-Agent"] = _MEDIA_UA_PC
                 else:
                     song_id = song_id_from_online_guid(guid)
+                    max_q = "high" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
+                    if max_q:
+                        fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
                     resolved = await resolve_lx_url(
-                        get_lx_client(request.app), song_id, fresh=fresh_url,
-                        meta=_online_meta_for_request(request, guid))
+                        get_lx_client(request.app), song_id, fresh=fresh_url or bool(max_q),
+                        meta=_online_meta_for_request(request, guid),
+                        max_quality=max_q)
                     if not resolved:
                         return None
                     url = resolved["url"]
@@ -5281,8 +5318,11 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
         # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
-        if via_musicdl and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
+        downgraded = (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header
+        if (via_musicdl or downgraded) and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
             ext = "mp3"
+        elif downgraded and (not ext or ext in _LOSSLESS_EXTS) and resolved and resolved.get("ext") not in _LOSSLESS_EXTS:
+            ext = resolved.get("ext") or "mp3"
         result = (resp, owned, ext, info, chunks, first)
         resp = owned = None  # transfer ownership to response iterator
         return result
@@ -5310,6 +5350,11 @@ _LOSSLESS_BAD_TTL_S = 6 * 3600.0
 
 def _lossless_blacklist(guid: str) -> None:
     _LOSSLESS_BAD[guid] = time.monotonic()
+    source = source_from_online_guid(guid)
+    if source == "lx":
+        _lx_url_pin_drop(song_id_from_online_guid(guid))
+    elif source == "netease":
+        _netease_url_pin_drop(song_id_from_online_guid(guid).split(":")[-1], reason="corrupt_lossless")
 
 
 def _lossless_is_blacklisted(guid: str) -> bool:
@@ -5322,23 +5367,41 @@ def _lossless_is_blacklisted(guid: str) -> bool:
     return True
 
 
-def _audio_file_ok(path: str) -> bool:
-    """完整音频文件的解码校验：ffmpeg 无任何错误输出才算通过。
+def _check_audio_file(path: str) -> tuple[bool, str]:
+    """完整音频文件的音轨解码校验。
 
-    只对已通过长度校验的完整文件调用——截断的完好文件同样会报解码错误，
-    报错文本无法区分二者，完整性必须由字节数校验先行保证。
-    ffmpeg 不可用（测试守卫/宿主机缺件）时无从校验，只能放行。
+    使用 -map 0:a:0 -vn -sn -dn -xerror 严格全量解码首个音轨。
+    成功退出返回 (True, "ok")；非零退出（音频损坏或无音轨）返回 (False, "decode_error")；
+    超时返回 (False, "timeout")；执行异常返回 (False, "exec_error")。
+    宿主机/测试守卫未配 ffmpeg 时放行，返回 (True, "no_ffmpeg")。
     """
     if not tc.FFMPEG_BIN:
-        return True
+        return True, "no_ffmpeg"
     try:
         r = subprocess.run(
-            [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-f", "null", "-"],
+            [
+                tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-xerror",
+                "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-f", "null", "-",
+            ],
             capture_output=True, text=True, timeout=300,
         )
-        return r.returncode == 0 and not (r.stderr or "").strip()
-    except Exception:  # noqa: BLE001
-        return False
+        if r.returncode == 0:
+            return True, "ok"
+        err_snippet = (r.stderr or "").strip().replace("\n", " ")[:200]
+        logger.warning("audio decode check error (rc=%d): %s", r.returncode, err_snippet)
+        return False, "decode_error"
+    except subprocess.TimeoutExpired:
+        logger.warning("audio decode check timed out after 300s for %s", path)
+        return False, "timeout"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audio decode check execution error for %s: %s", path, exc)
+        return False, "exec_error"
+
+
+def _audio_file_ok(path: str) -> bool:
+    """完整音频文件的解码校验（兼容布尔返回）。"""
+    ok, _ = _check_audio_file(path)
+    return ok
 
 
 def _prune_full_fetch_state(now: float) -> None:
@@ -5466,23 +5529,29 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
             raise RuntimeError(f"size mismatch written={written} expected={expected}")
         info = await _info_for_background_save(fake_request, guid, info)
         ext = ext or (info or {}).get("ext") or "mp3"
-        if ext in _LOSSLESS_EXTS and not await asyncio.to_thread(_audio_file_ok, part):
-            _lossless_blacklist(guid)
-            logger.warning("audio decode check failed for %s (ext=%s bytes=%d)", guid, ext, written)
-            # 坏流不落库：关掉当前连接后改要 mp3 档重来一次
-            with anyio.CancelScope(shield=True):
-                if resp:
-                    await resp.aclose()
-                if owned:
-                    await owned.aclose()
-                resp = owned = None
-            if not force_mp3:
-                logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
-                await _full_fetch_download(guid, cred_headers, force_mp3=True)
-                return
-            raise RuntimeError("corrupt stream even at mp3 tier")
-        meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True)
+        if ext in _LOSSLESS_EXTS:
+            ok, reason = await asyncio.to_thread(_check_audio_file, part)
+            if not ok:
+                if reason == "decode_error":
+                    _lossless_blacklist(guid)
+                logger.warning("audio decode check failed for %s (ext=%s bytes=%d)", guid, ext, written)
+                # 坏流不落库：关掉当前连接后改要 mp3 档重来一次
+                with anyio.CancelScope(shield=True):
+                    if resp:
+                        await resp.aclose()
+                    if owned:
+                        await owned.aclose()
+                    resp = owned = None
+                if not force_mp3 and reason == "decode_error":
+                    logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
+                    await _full_fetch_download(guid, cred_headers, force_mp3=True, fresh_url=True)
+                    return
+                raise RuntimeError("corrupt stream even at mp3 tier" if force_mp3 else f"decode check failed: {reason}")
+        meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True, already_verified=True)
         part = None
+        if not meta:
+            logger.warning("Background full fetch finalize rejected for %s", guid)
+            raise RuntimeError("finalize rejected")
         logger.info("Background full fetch saved %s (%d bytes)", guid, written)
         await _auto_lyric_after_finalize(fake_request, guid, meta)
         if not (meta or {}).get("deferred"):
@@ -5637,6 +5706,9 @@ async def _resume_part_download(guid: str, part: str, written: int, expected: in
         info = await _info_for_background_save(fake_request, guid, info)
         resolved_ext = ext or stream_ext or (info or {}).get("ext") or "mp3"
         meta = await asyncio.to_thread(_tee_finalize, part, guid, resolved_ext, info or {}, True)
+        if not meta:
+            logger.warning("Tee handoff resume rejected for %s", guid)
+            return False
         logger.info("Tee handoff resumed %s (+%d bytes, total %d)", guid, append_written, final_size)
         await _auto_lyric_after_finalize(fake_request, guid, meta)
         if not (meta or {}).get("deferred"):
@@ -6342,19 +6414,27 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
     source = source_from_online_guid(guid)
     try:
         if source == "netease":
+            max_q = "exhigh" if _lossless_is_blacklisted(guid) else None
             url = await resolve_netease_url(
-                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1],
+                max_quality=max_q)
             if not url:
                 return None, None
+            if _lossless_is_blacklisted(guid):
+                fn_diag(logger, "lossless_downgrade", guid=guid, path="transcode_source", tier="mp3")
             # 与播放路径对齐：ffmpeg 拉网易 CDN 也带 UA，降低源站拒无头客户端导致的
             # 转码中途退出（表现为标准音质下播一半分片 404 跳歌）
             return url, {"User-Agent": _MEDIA_UA_PC}
         if source == "lx":
+            max_q = "high" if _lossless_is_blacklisted(guid) else None
             resolved = await resolve_lx_url(
                 get_lx_client(request.app), song_id_from_online_guid(guid),
-                meta=_online_meta_for_request(request, guid))
+                meta=_online_meta_for_request(request, guid),
+                max_quality=max_q)
             if not resolved or not resolved.get("url"):
                 return None, None
+            if _lossless_is_blacklisted(guid):
+                fn_diag(logger, "lossless_downgrade", guid=guid, path="transcode_source", tier="mp3")
             return str(resolved["url"]), _lx_media_headers(resolved)
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):

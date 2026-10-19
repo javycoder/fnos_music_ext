@@ -359,6 +359,31 @@ async def test_resolve_lx_url_pin_consistent_within_ttl():
 
 
 @pytest.mark.anyio
+async def test_resolve_lx_url_max_quality_bypasses_lossless_pin_and_downgrades():
+    """max_quality=high 时旁路无损钉链，且请求 quality=high。"""
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params.get("quality")
+        hits.append(q)
+        if q == "lossless":
+            return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": "http://audio.test/lossless.flac", "ext": "flac", "actual_tier": "lossless"}})
+        return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": "http://audio.test/320.mp3", "ext": "mp3", "actual_tier": "high"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    first = await resolve_lx_url(client, "lx:kg:PINTEST_DOWN")
+    assert first and first["ext"] == "flac"
+    assert hits == ["lossless"]
+
+    # 再次解析但指定 max_quality="high"：必须旁路无损钉链，重新请求 high
+    downgraded = await resolve_lx_url(client, "lx:kg:PINTEST_DOWN", max_quality="high")
+    assert downgraded and downgraded["ext"] == "mp3"
+    assert downgraded["url"] == "http://audio.test/320.mp3"
+    assert hits == ["lossless", "high"]
+    await client.aclose()
+
+
+@pytest.mark.anyio
 async def test_resolve_lx_url_pin_expiry_re_resolves():
     """钉链过期：下一次解析重新出链并续钉（lxmusic 探活续期/重解析的入口）。"""
     import time as _time

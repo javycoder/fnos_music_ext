@@ -38,6 +38,9 @@ if "-f" in args and "null" in args:
     if os.environ.get("FAKE_FFMPEG_DECODE") == "bad":
         sys.stderr.write("[flac] invalid sync code\\n")
         sys.exit(1)
+    if os.environ.get("FAKE_FFMPEG_DECODE") == "warning":
+        sys.stderr.write("[png @ 0x1234] chunk too big\\n")
+        sys.exit(0)
     sys.exit(0)
 if "-hls_segment_filename" in args:
     pattern = args[args.index("-hls_segment_filename") + 1]
@@ -1062,6 +1065,93 @@ def test_open_stream_blacklisted_guid_requests_mp3(env):
     assert captured["params"].get("quality") == "mp3"
     assert opened is not None and opened[2] == "mp3"     # content-type 修正扩展名
     monkeypatch.undo()
+
+
+def test_open_stream_blacklisted_guid_lx_requests_high_mp3(env, monkeypatch):
+    """拉黑曲目的 LX 取流请求使用 max_quality=high 降档，且扩展名修正为 mp3。"""
+    guid = "online:lx:kw:99006"
+    appmod._LOSSLESS_BAD.clear()
+    appmod._lossless_blacklist(guid)
+    recorded_requests = []
+
+    def lx_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/track/url":
+            recorded_requests.append(dict(request.url.params))
+            return httpx.Response(200, json={
+                "ok": True,
+                "data": {
+                    "id": "lx:kw:99006",
+                    "url": "http://audio.test/99006.mp3",
+                    "ext": "mp3",
+                    "actual_tier": "high",
+                }
+            })
+        return httpx.Response(200, json={"ok": True, "data": {"id": "lx:kw:99006", "title": "曲", "artist": "人"}})
+
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772")
+
+    orig_client = httpx.AsyncClient
+
+    def mock_client_factory(**kwargs):
+        def media_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"ID3" + b"M" * 1000,
+                                  headers={"content-type": "audio/mpeg", "content-length": "1003"})
+        return orig_client(transport=httpx.MockTransport(media_handler), **kwargs)
+
+    monkeypatch.setattr(appmod.httpx, "AsyncClient", mock_client_factory)
+
+    async def _run():
+        req = appmod.Request({"type": "http", "headers": [], "app": app})
+        return await appmod._open_online_stream(req, guid, None)
+
+    opened = asyncio.run(_run())
+    assert opened is not None
+    assert opened[2] == "mp3"
+    assert len(recorded_requests) == 1
+    assert recorded_requests[0].get("quality") == "high"
+
+
+def test_check_audio_file_passes_when_stderr_has_warnings(env, fake_ffmpeg, monkeypatch, tmp_path):
+    """解码校验音轨正常、stderr 存在警告（如封面损坏）时视为通过，不误杀。"""
+    fake_ffmpeg("ok")
+    monkeypatch.setenv("FAKE_FFMPEG_DECODE", "warning")
+    part = _mk_part(tmp_path / "warn.part", 2048)
+    ok, reason = appmod._check_audio_file(part)
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_check_audio_file_timeout_does_not_blacklist(env, fake_ffmpeg, monkeypatch, tmp_path):
+    """解码校验超时仅标记超时，不拉黑歌曲为坏流。"""
+    import subprocess
+    guid = "online:kuwo:99007"
+    appmod._LOSSLESS_BAD.clear()
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=300)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    part = _mk_part(tmp_path / "timeout.part", 2048)
+    meta = appmod._tee_finalize(part, guid, "flac", {"title": "t", "artist": "a"}, True)
+    assert meta is None
+    assert not appmod._lossless_is_blacklisted(guid)
+
+
+def test_tee_finalize_skips_check_when_already_verified(env, fake_ffmpeg, monkeypatch, tmp_path):
+    """already_verified=True 时跳过重复解码校验。"""
+    called = {"n": 0}
+
+    def count_check(path):
+        called["n"] += 1
+        return True, "ok"
+
+    monkeypatch.setattr(appmod, "_check_audio_file", count_check)
+    part = _mk_part(tmp_path / "fast.part", 2048)
+    meta = appmod._tee_finalize(part, "online:kuwo:99008", "flac", {"title": "t", "artist": "a"}, True, already_verified=True)
+    assert meta is not None
+    assert called["n"] == 0
 
 
 def test_filter_headers_sanitizes_unicode_content_disposition():

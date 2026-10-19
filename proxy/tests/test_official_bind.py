@@ -358,6 +358,42 @@ async def test_resume_part_download_appends_and_finalizes(tmp_path, monkeypatch)
 
 
 @pytest.mark.anyio
+async def test_resume_part_download_returns_false_when_finalize_rejected(tmp_path, monkeypatch):
+    """续传完成后若 _tee_finalize 拒绝（如坏无损流），返回 False 且不调度扫描与绑定。"""
+    part = tmp_path / "x.flac"
+    part.write_bytes(b"a" * 1024)
+    calls: dict = {}
+    tail = b"b" * 1024
+
+    class FakeResp:
+        status_code = 206
+        headers = {"content-range": f"bytes 1024-{1024 + len(tail) - 1}/2048",
+                   "content-type": "audio/flac"}
+
+        async def aclose(self):
+            calls["closed"] = True
+
+    async def empty_chunks():
+        return
+        yield b"never"
+
+    async def fake_open(request, guid, range_header, force_mp3=False):
+        return (FakeResp(), None, "flac", {"title": "晴天", "artist": "周杰伦"},
+                empty_chunks(), tail)
+
+    monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
+    monkeypatch.setattr(appmod, "_tee_finalize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(appmod, "_schedule_library_scan", lambda h: calls.setdefault("scan", True))
+    monkeypatch.setattr(appmod, "_dispatch_official_binding",
+                        lambda g, h, m: calls.setdefault("dispatch", g))
+
+    ok = await appmod._resume_part_download(FAKE_KUWO1, str(part), 1024, 2048, "flac", {})
+    assert ok is False
+    assert "scan" not in calls and "dispatch" not in calls
+    assert calls.get("closed") is True
+
+
+@pytest.mark.anyio
 async def test_handoff_falls_back_to_full_download_on_no_range(tmp_path, monkeypatch):
     """源忽略 Range 返回 200：不可续传 → 删半截 part 回退整轨重下。"""
     part = tmp_path / "x.mp3"
