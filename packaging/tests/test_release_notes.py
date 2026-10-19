@@ -48,7 +48,8 @@ def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path
     git('config', 'user.name', 'Release Test')
     git('config', 'user.email', 'release@example.invalid')
     (repo / 'VERSION').write_text('2.10.0b\n')
-    initial = '# Changelog\n\n## [未发布]\n\n## [2.10.0b]\n\nPublished notes.\n'
+    initial = ('# Changelog\n\n## [未发布]\n\n## [2.10.0b]\n\nPublished notes.\n'
+               '\n## [2.9.0]\n' + 'Historical notes.\n' * 10000)
     (repo / 'CHANGELOG.md').write_text(initial)
     (repo / 'runtime.py').write_text('value = 1\n')
     git('add', '.')

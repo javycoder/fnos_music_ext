@@ -45,7 +45,8 @@ jobs:
           }
           extract_notes < CHANGELOG.md > /tmp/release-notes.md
           grep -q '[^[:space:]]' /tmp/release-notes.md
-          git show "${tag}:CHANGELOG.md" | extract_notes > /tmp/tagged-release-notes.md
+          git show "${tag}:CHANGELOG.md" > /tmp/tagged-changelog.md
+          extract_notes < /tmp/tagged-changelog.md > /tmp/tagged-release-notes.md
           if cmp -s /tmp/tagged-release-notes.md /tmp/release-notes.md; then
             echo "${tag} notes are unchanged; unreleased entries need no correction."
             exit 0
