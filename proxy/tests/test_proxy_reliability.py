@@ -189,7 +189,7 @@ async def test_search_timeout_returns_local_and_drops_late_online(monkeypatch):
         assert not entry["task"].done()
     finally:
         release.set()
-    await asyncio.wait_for(asyncio.shield(entry["task"]), 2)
+    await asyncio.wait_for(asyncio.gather(entry["task"], return_exceptions=True), 2)
     assert entry["items"] == []
     assert not any(item.get("id") == "kuwo:1" for item in entry["items"])
 
