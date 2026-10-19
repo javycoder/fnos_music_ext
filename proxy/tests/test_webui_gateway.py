@@ -21,6 +21,13 @@ serve = _MOD.serve
 socket_path_for = _MOD.socket_path_for
 
 
+class _TestHTTPServer(ThreadingHTTPServer):
+    """Short shutdown polling is test cleanup, not an upstream timing boundary."""
+
+    def serve_forever(self, poll_interval=0.01):
+        return super().serve_forever(poll_interval=poll_interval)
+
+
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         body = self.path.encode()
@@ -99,13 +106,15 @@ def test_socket_path_for_fpk_layout(tmp_path: Path):
 
 
 class _SlowHandler(BaseHTTPRequestHandler):
-    """响应故意晚于旧的 5 秒套接字超时，用来守住校验请求不被中途拆掉。"""
+    """Delay beyond the test-scaled connect timeout, not the relay timeout."""
+
+    delay = 0.3
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length:
             self.rfile.read(length)
-        time.sleep(6)
+        time.sleep(self.delay)
         body = b'{"ok":true}'
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -116,8 +125,21 @@ class _SlowHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_slow_upstream_is_not_cut_at_connect_timeout(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _SlowHandler)
+def test_slow_upstream_is_not_cut_at_connect_timeout(tmp_path: Path, monkeypatch):
+    # Keep the production boundary explicit, but scale the real socket wait.
+    assert _MOD.CONNECT_TIMEOUT == 5
+    assert _MOD.RELAY_TIMEOUT >= 180
+    monkeypatch.setattr(_MOD, "CONNECT_TIMEOUT", 0.1)
+    relay_timeouts = []
+    real_relay = _MOD._relay
+
+    def checked_relay(src, dst, prefix=b""):
+        if not prefix:  # upstream -> desktop: must not retain connect timeout
+            relay_timeouts.append(src.gettimeout())
+        return real_relay(src, dst, prefix)
+
+    monkeypatch.setattr(_MOD, "_relay", checked_relay)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _SlowHandler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -125,14 +147,19 @@ def test_slow_upstream_is_not_cut_at_connect_timeout(tmp_path: Path):
         b"POST /app/fnmusic-ext/api/lx/verify HTTP/1.1\r\n"
         b"Host: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
     )
-    data = _request(sock_path, raw, timeout=12)
-    upstream.shutdown()
+    try:
+        data = _request(sock_path, raw, timeout=3)
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+    assert relay_timeouts == [_MOD.RELAY_TIMEOUT]
+    assert _SlowHandler.delay > _MOD.CONNECT_TIMEOUT
     assert b"200" in data.split(b"\r\n", 1)[0]
     assert b'{"ok":true}' in data
 
 
 def test_socket_forwards_desktop_path(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -142,7 +169,7 @@ def test_socket_forwards_desktop_path(tmp_path: Path):
 
 
 def test_host_file_requires_admin(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -153,7 +180,7 @@ def test_host_file_requires_admin(tmp_path: Path):
 
 
 def test_host_file_validates_path_and_reads_content(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -179,7 +206,7 @@ def test_host_file_validates_path_and_reads_content(tmp_path: Path):
 
 def test_host_file_only_post_intercepted(tmp_path: Path):
     """GET /api/host-file 不是代读端点，走正常转发。"""
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -210,7 +237,7 @@ def _fs_check(sock_path: Path, path: str, is_admin: str = "true") -> "tuple[byte
 
 
 def test_fs_check_requires_admin(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -222,7 +249,7 @@ def test_fs_check_requires_admin(tmp_path: Path):
 
 
 def test_fs_check_validates_path(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -237,7 +264,7 @@ def test_fs_check_existing_dir_writability(tmp_path: Path):
     """存在目录：root 之外的运行身份下可写目录 → True，只读目录 → False。"""
     if os.geteuid() == 0:
         pytest.skip("root 不受权限位约束，只读目录用例无意义")
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -258,7 +285,7 @@ def test_fs_check_existing_dir_writability(tmp_path: Path):
 
 def test_fs_check_missing_dir_probes_nearest_ancestor(tmp_path: Path):
     """目录不存在：用最近存在祖先的可写性代表"能否创建"，且不创建目录。"""
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -310,7 +337,7 @@ def test_fs_check_directory_symlink_allows_missing_child(tmp_path: Path):
 
 def test_fs_check_only_post_intercepted(tmp_path: Path):
     """GET /api/fs-check 不是校验端点，走正常转发。"""
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)

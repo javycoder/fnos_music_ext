@@ -1051,13 +1051,29 @@ def test_search_offset_routes_to_web_fallback(monkeypatch):
     assert [it["song_id"] for it in data] == [33894312, 186016]
 
 
-def test_search_offset_zero_keeps_cli_path():
-    """offset=0（首屏）不触发 web 直连分支，维持 CLI 优先的既有路径。"""
+def test_search_offset_zero_keeps_cli_path(monkeypatch):
+    """offset=0 优先走 CLI；全部上游桩化，不能只检查真实网络降级后返回 200。"""
+    calls = []
+    fallback_calls = []
+    rows = [{"song_id": 33894312, "name": "晴天"}]
+
+    def cli(args):
+        calls.append(args)
+        return {"ok": True, "code": 200, "data": rows}
+
+    def fallback(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        return []
+
+    monkeypatch.setattr(musicbox_app, "exec_musicbox", cli)
+    monkeypatch.setattr(musicbox_app, "search_web_fallback", fallback)
+    monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
     with TestClient(app) as client:
         r = client.get("/api/v1/search", params={"keyword": "周杰伦", "offset": 0})
-    # CLI 路径失败会自动降级 web fallback，两条路径都返回 200 信封；断言不炸即可
     assert r.status_code == 200
-    assert isinstance(r.json().get("data"), list)
+    assert r.json()["data"] == rows
+    assert calls == [["search", "周杰伦", "--type", "song", "--limit", "20", "--json"]]
+    assert fallback_calls == []
 
 
 def test_map_song_detail_maps_fee():
