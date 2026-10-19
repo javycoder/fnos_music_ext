@@ -242,7 +242,6 @@ def test_api_key_only_reload_and_no_change_save(tmp_path, monkeypatch):
     ("FNMUSIC_LIKED_REFRESH_HOURS", "-inf"), ("FNMUSIC_LIKED_REFRESH_HOURS", "0.1"),
     ("FNMUSIC_LLM_LIKED_ENABLED", "typo"), ("FNMUSIC_SEARCH_TIMEOUT", "nan"),
     ("FNMUSIC_LLM_TIMEOUT_S", "inf"), ("FNMUSIC_REC_SEARCH_CONCURRENCY", "nan"),
-    ("FNMUSIC_LIKED_REFRESH_HOURS", "8761"),
 ])
 def test_invalid_reload_does_not_poison_environment(tmp_path, key, value):
     before_env = os.environ.get(key)

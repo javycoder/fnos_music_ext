@@ -290,7 +290,7 @@ _BUILD_TOKENS: dict[str, str] = {}
 
 
 async def get_bundle(user_guid: str, db_path: str) -> dict:
-    if rec.llm_liked_selected() and rec.llm_liked_size() == 0:
+    if rec.llm_liked_enabled() and rec.llm_liked_size() == 0:
         return rec.empty_daily_bundle(user_guid, "liked")
     if not rec.llm_liked_enabled():
         return await asyncio.to_thread(_load_or_build, user_guid, db_path)

@@ -105,7 +105,7 @@ def _safe_liked_number(raw: str, default: float | int, *, integer: bool = False)
             return default
         if integer:
             return value if 0 <= value <= 100 else default
-        return value if 0.5 <= value <= 8760 else default
+        return value if value >= 0.5 else default
     except (TypeError, ValueError, OverflowError):
         return default
 
@@ -645,7 +645,7 @@ def _env_watch_parse(raw: str, kind: str):
             value = float(raw)
         except (TypeError, ValueError):
             return None
-        return value if 0.5 <= value <= 8760 else None
+        return value if value >= 0.5 else None
     if kind == "liked_size":
         try:
             value = int(raw)
@@ -9020,7 +9020,7 @@ def _sync_recommend_version_marker() -> None:
 
 def _recommend_kind_enabled(kind: str) -> bool:
     if kind == "liked":
-        return not (dailyrec.llm_liked_selected() and dailyrec.llm_liked_size() == 0)
+        return not (dailyrec.llm_liked_enabled() and dailyrec.llm_liked_size() == 0)
     if kind == "hot":
         return bool(CONF.get("recommend_hot", True))
     return bool(CONF.get("recommend_daily", True))
