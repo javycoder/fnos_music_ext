@@ -490,6 +490,32 @@ def test_transcode_local_file_input_and_no_duplicate_download(env, tmp_path, mon
     assert appmod._full_fetch_tasks == {}                      # 不触发重复整轨下载
 
 
+def test_completed_hls_rendition_stays_pinned_when_local_appears(env, tmp_path, monkeypatch):
+    _install_fake_ffmpeg(monkeypatch, tmp_path)
+    directory = tc.session_dir(CONF["cache_dir"], GUID_KUWO)
+    os.makedirs(directory, exist_ok=True)
+    completed = tc.Session(GUID_KUWO, directory, 10, 10, 1, status="done")
+    with open(os.path.join(directory, tc.INIT_NAME), "wb") as fp:
+        fp.write(b"original-init")
+    with open(os.path.join(directory, "00000.m4s"), "wb") as fp:
+        fp.write(b"original-online")
+    tc._write_state(completed)
+    with TestClient(app) as client:
+        first = client.get(f"/music/api/v1/track/hls/{GUID_KUWO}/preset.m3u8")
+        assert completed.rendition in first.text
+        assert tc.playback_session(GUID_KUWO) is not None
+        _seed_library_song(env)
+        _write_recommend_cache(env, GUID_KUWO)
+        appmod.register_online_meta_one(GUID_KUWO, "晴天", "周杰伦", "叶惠美")
+        second = client.get(f"/music/api/v1/track/hls/{GUID_KUWO}/preset.m3u8")
+        assert completed.rendition in second.text
+        segment = client.get(f"/music/api/v1/track/hls/{GUID_KUWO}/{completed.rendition}__00000.m4s")
+        assert segment.content == b"original-online"
+        client.post("/music/api/v1/track/transcode/quit", json={"guid": GUID_KUWO})
+        assert not tc.playback_in_use()
+        restarted = client.get(f"/music/api/v1/track/hls/{GUID_KUWO}/preset.m3u8")
+        assert completed.rendition not in restarted.text
+    assert not env["musicdl"]
 
 
 def test_transcode_startup_failure_rebuilds_from_online(env, tmp_path, monkeypatch):

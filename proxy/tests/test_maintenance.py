@@ -433,6 +433,47 @@ def test_hls_known_files_without_state_can_be_cleaned(env):
     assert not segment.exists()
 
 
+@pytest.mark.parametrize('release', ['quit', 'expire'])
+def test_completed_hls_playback_lease_protects_manual_and_automatic_cleanup(env, monkeypatch, release):
+    from proxy import transcode as tc
+    env.runtime.tc = tc
+    env.runtime.CONF['transcode_cache_max_mb'] = 16
+    folder, state, init, segment = hls(env, 'large', size=17 * 1024 * 1024)
+    # Read-only cache inspection must not pin it indefinitely.
+    sess = tc.Session('online:large', str(folder), 10, 10, 1, status='done')
+    now = [100.0]
+    monkeypatch.setattr(tc.time, 'monotonic', lambda: now[0])
+    assert not tc.playback_in_use()
+    tc.lease_playback(sess, 10)
+    assert not tc._SESSIONS
+    run(env)
+    asyncio.run(tc._enforce_quota(str(env.cache), 1))
+    assert all(p.exists() for p in (state, init, segment))
+    now[0] = 109
+    tc.heartbeat(sess.guid)
+    now[0] = 115
+    assert tc.playback_session(sess.guid) is sess
+    if release == 'quit':
+        asyncio.run(tc.quit_session(sess.guid))
+    else:
+        now[0] = 120
+    assert not tc.playback_in_use()
+    run(env)
+    assert not any(p.exists() for p in (state, init, segment))
+
+
+def test_automatic_quota_evicts_after_playback_lease_release(env):
+    from proxy import transcode as tc
+    folder, state, init, segment = hls(env, 'complete')
+    sess = tc.Session('online:complete', str(folder), 10, 10, 1, status='done')
+    tc.lease_playback(sess)
+    asyncio.run(tc._enforce_quota(str(env.cache), 0))
+    assert segment.exists()
+    asyncio.run(tc.quit_session(sess.guid))
+    asyncio.run(tc._enforce_quota(str(env.cache), 0))
+    assert not folder.exists()
+
+
 def test_configured_cache_directories_and_default_both_scanned(env, tmp_path):
     rec = tmp_path / 'configured_recommend'
     public = tmp_path / 'configured_public'

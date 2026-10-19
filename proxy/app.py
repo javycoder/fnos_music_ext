@@ -7304,7 +7304,7 @@ async def _start_transcode_session(request: Request, guid: str) -> "tc.Session |
     已公开的运行会话固定版本；新播放优先本地，其次完整缓存与在线源。
     """
     try:
-        existing = tc.get_session(guid)
+        existing = tc.get_session(guid) or tc.playback_session(guid)
         if existing is not None:
             if existing.src_kind != "local" or await tc.wait_startup(existing, timeout=15):
                 return existing
@@ -7356,7 +7356,7 @@ async def _start_transcode_session(request: Request, guid: str) -> "tc.Session |
 
 def _transcode_live(guid: str) -> "tc.Session | None":
     """取在跑或磁盘已完整的转码会话（不解析在线源）。"""
-    return tc.get_session(guid) or tc.peek_cached(guid, CONF["cache_dir"])
+    return tc.get_session(guid) or tc.playback_session(guid) or tc.peek_cached(guid, CONF["cache_dir"])
 
 
 def _legacy_hls_stub(guid: str, info: "dict | None") -> Response:
@@ -7403,6 +7403,7 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
     if sess is not None:
         if filename != "preset.m3u8" and rendition != sess.rendition:
             return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
+        tc.lease_playback(sess, float(CONF.get("transcode_ttl_s") or 90))
         if filename == "preset.m3u8":
             # 新播放过程从此固定实际音频版本（本地/在线），分片不得跨版本混供
             playlist = tc.playlist_text(sess)
@@ -7468,6 +7469,8 @@ async def track_transcode(request: Request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     if CONF.get("transcode_enabled") and tc.FFMPEG_BIN:
         sess = await _start_transcode_session(request, guid)
+        if sess is not None:
+            tc.lease_playback(sess, float(CONF.get("transcode_ttl_s") or 90))
         if sess is not None and sess.status in ("starting", "running") \
                 and tc.session_kind(sess) != "local" and not find_cache_file(guid):
             # 标准音质播放不经过 /track/stream，tee 永不触发；挂后台整轨下载保住边听边存。

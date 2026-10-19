@@ -72,6 +72,8 @@ class Session:
 _SESSIONS: dict[str, Session] = {}
 _SLOT_COND: asyncio.Condition | None = None
 _ACTIVE = 0
+# Playback outlives ffmpeg: completed disk sessions need a heartbeat/quit lease too.
+_PLAYBACK_LEASES: dict[str, tuple[Session, float, float]] = {}
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -408,7 +410,38 @@ def peek_cached(guid: str, root: str) -> Session | None:
     return _reused_session_from_state(guid, directory, state, 0, 10.0, "128k")
 
 
+def _prune_playback_leases() -> None:
+    now = time.monotonic()
+    for guid, (sess, until, _) in list(_PLAYBACK_LEASES.items()):
+        if (now >= until or sess.status in ("failed", "aborted")
+                or (sess.status == "done" and not os.path.isfile(os.path.join(sess.directory, INIT_NAME)))):
+            _PLAYBACK_LEASES.pop(guid, None)
+
+
+def lease_playback(sess: Session, ttl_s: float = 90.0) -> None:
+    """Pin the exposed rendition until quit or inactivity; no filesystem writes."""
+    _prune_playback_leases()
+    ttl = max(1.0, float(ttl_s))
+    _PLAYBACK_LEASES[sess.guid] = (sess, time.monotonic() + ttl, ttl)
+
+
+def playback_session(guid: str) -> Session | None:
+    _prune_playback_leases()
+    lease = _PLAYBACK_LEASES.get(guid)
+    return lease[0] if lease else None
+
+
+def playback_in_use(directory: str | None = None) -> bool:
+    _prune_playback_leases()
+    return any(directory is None or os.path.abspath(sess.directory) == os.path.abspath(directory)
+               for sess, _, _ in _PLAYBACK_LEASES.values())
+
+
 def heartbeat(guid: str) -> None:
+    _prune_playback_leases()
+    lease = _PLAYBACK_LEASES.get(guid)
+    if lease:
+        lease_playback(lease[0], lease[2])
     sess = _SESSIONS.get(guid)
     if sess:
         sess.last_beat = time.monotonic()
@@ -417,6 +450,7 @@ def heartbeat(guid: str) -> None:
 @_serialized
 async def quit_session(guid: str) -> None:
     """App 主动结束：杀进程；已完整缓存保留复用，半成品清理。"""
+    _PLAYBACK_LEASES.pop(guid, None)
     sess = _SESSIONS.pop(guid, None)
     if not sess or not sess.proc:
         return
@@ -465,6 +499,7 @@ async def discard_session(guid: str, expected: Session | None = None) -> None:
     sess = _SESSIONS.get(guid)
     if sess is None or (expected is not None and sess is not expected):
         return
+    _PLAYBACK_LEASES.pop(guid, None)
     sess.status = "aborted"
     if sess.proc and sess.proc.returncode is None:
         try:
@@ -543,6 +578,8 @@ async def _enforce_quota(root: str, max_bytes: int) -> None:
     for atime, d, size in sorted(entries):
         if total <= max_bytes:
             break
+        if playback_in_use(d):
+            continue
         logger.info("transcode cache LRU evict: %s (%d bytes)", d, size)
         _remove_dir(d)
         total -= size
@@ -590,5 +627,6 @@ async def maintain(root: str, ttl_s: float, max_bytes: int) -> None:
 
 
 async def shutdown_all() -> None:
+    _PLAYBACK_LEASES.clear()
     for guid in list(_SESSIONS):
         await quit_session(guid)

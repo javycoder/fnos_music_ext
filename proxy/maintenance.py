@@ -126,7 +126,9 @@ def _active(runtime):
 
 
 def _sessions(runtime):
-    return bool(getattr(getattr(runtime, 'tc', None), '_SESSIONS', {}))
+    tc = getattr(runtime, 'tc', None)
+    leased = getattr(tc, 'playback_in_use', None)
+    return bool(getattr(tc, '_SESSIONS', {})) or bool(leased and leased())
 
 
 def _db_path(runtime):

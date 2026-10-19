@@ -14,6 +14,7 @@ def _no_real_ffmpeg(monkeypatch):
     monkeypatch.setattr(tc, "FFPROBE_BIN", None)
     # 隔离会话注册表与并发槽，避免跨用例串扰
     monkeypatch.setattr(tc, "_SESSIONS", {})
+    monkeypatch.setattr(tc, "_PLAYBACK_LEASES", {})
     monkeypatch.setattr(tc, "_SESSION_LOCKS", {})
     monkeypatch.setattr(tc, "_ACTIVE", 0)
     monkeypatch.setattr(tc, "_SLOT_COND", None)
