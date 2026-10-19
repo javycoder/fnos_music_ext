@@ -57,6 +57,52 @@ def link_tools(bindir: Path, tools: tuple[str, ...]) -> None:
             (bindir / tool).symlink_to(real)
 
 
+@pytest.mark.parametrize("failure", ["", "build", "up"])
+def test_container_build_then_start_stops_at_failed_stage(tmp_path, failure):
+    """执行真实安装函数；失败不能继续启动或进入健康检查，原始输出必须保留。"""
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    script = r'''
+set -euo pipefail
+BASE_DIR="/test repo"
+CONTAINER_NAME=fnmusic-sources
+ENABLE_MUSICBOX=0
+ENABLE_MUSICDL=1
+ENABLE_LX=0
+WEBUI_FLAG=false
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_err() { printf '[ERROR] %s\n' "$*" >&2; }
+cleanup_legacy_sources() { :; }
+remove_conflicting_native_unit() { return 0; }
+reclaim_container() { return 0; }
+env_newer_than_container() { return 1; }
+wait_http() { printf 'wait %s\n' "$*" >> "$CALLS"; }
+run_docker() {
+    [ "$1" = compose ] && [ "$2" = -f ] && [ "$3" = "$BASE_DIR/docker-compose.yml" ] || return 99
+    printf '%s\n' "$*" >> "$CALLS"
+    if [ "$4" = "$FAILURE" ]; then
+        printf 'original-%s-error\n' "$4" >&2
+        return 7
+    fi
+}
+''' + function(install, "install_sources_container") + '\ninstall_sources_container\n'
+    calls = tmp_path / "calls"
+    durable = tmp_path / "persistent-install.log"
+    result = run_bash(script, env={**os.environ, "FAILURE": failure,
+                                  "CALLS": str(calls), "FNMUSIC_DURABLE_LOG": str(durable)})
+    expected = ['compose -f /test repo/docker-compose.yml build']
+    if failure != "build":
+        expected.append('compose -f /test repo/docker-compose.yml up -d --no-build')
+    if not failure:
+        expected.append('wait http://127.0.0.1:8768/healthz 90 2')
+    assert calls.read_text().splitlines() == expected
+    assert result.returncode == (1 if failure else 0), result.stderr
+    if failure:
+        assert f"original-{failure}-error" in result.stderr
+        assert ("镜像构建失败" if failure == "build" else "容器启动失败") in result.stderr
+        assert str(durable) in result.stderr
+        assert "apt/pip" not in result.stderr
+
+
 # ------------------------------------------------------ private shared logs ---
 
 def logs_script(repo: Path) -> str:

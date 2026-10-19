@@ -321,6 +321,18 @@ location /music/ {
 - **入口差异**：自建 nginx/NPM 可按上方配置检查；HTTPS 端口映射保留客户端实际 Host 与端口；fn Connect 没有用户可配置的外层 nginx，遇到失败需结合日志继续定位。
 - **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
 
+### 构建时报 `pass "--allow=network.host"`（issue #71）
+
+旧版 Compose 配置强制使用宿主机网络构建，部分 BuildKit 构建器会要求额外的
+`network.host` 授权并拒绝构建。修复后的配置使用默认构建网络，无需该授权；
+构建中的 DNS 处理和 apt/pip 镜像源回退仍保留。
+
+源码部署请更新代码后重新执行 `./install.sh`；应用中心部署请使用包含此修复的安装包。
+自行维护的 Compose 配置需移除 `services.fnmusic-sources.build.network: host`。
+若仍失败，先区分日志中的“镜像构建失败”和“容器启动失败”，再查看上方原始错误；
+应用中心持久日志位于 `/var/log/apps/fnmusic-ext-install.log`，不可写时回退到
+`/tmp/fnmusic-ext-install.log`。
+
 ### 安装报「未检测到 docker」
 
 v2.0.0 起仅支持 Docker 部署。请先在 fnOS「应用中心」安装 Docker 后重试；

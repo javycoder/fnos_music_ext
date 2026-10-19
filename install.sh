@@ -1462,10 +1462,14 @@ install_sources_container() {
     fi
     # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
     export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
-        log_err "Docker 镜像构建或启动失败（compose up --build）。"
-        log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
-        log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" build; then
+        log_err "Docker 镜像构建失败（compose build），请查看上方原始错误。"
+        log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
+        return 1
+    fi
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build; then
+        log_err "Docker 容器启动失败（compose up --no-build），请查看上方原始错误。"
+        log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
         return 1
     fi
     # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的

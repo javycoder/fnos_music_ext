@@ -140,10 +140,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build unified fnmusic-sources image
         run: |
-          docker build --build-arg BASE_IMAGE=python:3.13-slim \
+          docker compose -f docker-compose.yml build --build-arg BASE_IMAGE=python:3.13-slim \
             --build-arg PIP_INDEX_URL=https://pypi.org/simple \
             --build-arg APT_MIRROR= \
-            -f container/Dockerfile -t fnmusic-sources:ci .
+            fnmusic-sources
+          docker tag fnmusic-sources:latest fnmusic-sources:ci
       - name: Verify non-root contract for each bundled service
         run: |
           for svc in musicdl musicbox lxmusic; do

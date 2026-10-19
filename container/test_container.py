@@ -297,7 +297,9 @@ def test_compose_build_args_mirror_passthrough():
     args = build["args"]
     for name in ("BASE_IMAGE", "PIP_INDEX_URL", "APT_MIRROR"):
         assert name in args and "${" in args[name], f"构建参数 {name} 需从 .env 透传"
-    assert build.get("network") == "host"
+    # issue #71：默认构建不依赖 BuildKit 的 network.host 授权。
+    assert build.get("network", "default") == "default"
+    assert not build.get("entitlements")
 
 
 def test_dockerfile_assembly():

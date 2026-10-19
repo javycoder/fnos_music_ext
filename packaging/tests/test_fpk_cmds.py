@@ -402,6 +402,21 @@ def test_install_callback_install_failure_surfaces_error_lines(sb):
     assert "\033[31m" not in trim_log
 
 
+@pytest.mark.parametrize("stage", ["镜像构建失败", "容器启动失败"])
+def test_install_callback_surfaces_docker_failure_stage(sb, stage):
+    sb.make_repo(stub=f'''#!/bin/bash
+echo 'original-docker-error' >&2
+echo '[ERROR] Docker {stage}，请查看上方原始错误。' >&2
+exit 7
+''')
+    result = sb.run("install_callback", wizard_extend="false")
+    assert result.returncode == 1
+    popup = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    assert stage in popup
+    assert str(sb.durable_log) in popup
+    assert "original-docker-error" in sb.durable_log.read_text(encoding="utf-8")
+
+
 def test_install_callback_ignores_buildkit_run_title_with_error_echo(sb):
     """BuildKit 步骤标题含 echo "[ERROR]" 时弹窗必须显示真实 [ERROR]，不能是 fix_dns。"""
     sb.make_repo()
