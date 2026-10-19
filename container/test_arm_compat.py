@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -244,3 +245,87 @@ def test_helper_refuses_missing_node_on_matching_host(tmp_path, arch):
     assert result.returncode != 0
     assert "无法执行 Node" in result.stdout + result.stderr
     assert "校验通过" not in result.stdout
+
+
+def test_helper_repairs_mismatched_arm64_loader_copy(tmp_path):
+    tarball = _make_tarball(tmp_path)
+    _write_version_file(tmp_path / "lxserver.version", hashlib.sha256(tarball.read_bytes()).hexdigest())
+    _install_in_place(tmp_path)
+    loader = tmp_path / "lxserver/node_modules/music-tag-native" / NATIVE_NAME
+    loader.write_bytes(b"different nonempty loader binding")
+    result = _run_helper(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "不一致" in result.stdout
+    assert loader.read_bytes() == b"locked-arm64-binding"
+
+
+@pytest.fixture
+def real_lxserver_artifacts():
+    values = {}
+    lock = REPO_ROOT / "container/lxserver.version"
+    for line in lock.read_text().splitlines():
+        if line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            values[key] = value
+    roots = (REPO_ROOT / "container/lxserver-artifact",
+             REPO_ROOT / "packaging/fpk/.build/cache")
+    def artifact(name, checksum):
+        path = next((root / name for root in roots if (root / name).is_file()), None)
+        if path is None:
+            pytest.skip(f"离线真实包未缓存: {name}")
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == checksum
+        return path
+    return lock, values, artifact
+
+
+def test_real_locked_zip_x64_platform_package_loads(tmp_path, real_lxserver_artifacts):
+    lock, values, artifact = real_lxserver_artifacts
+    path = artifact(values["LXSERVER_ZIP_NAME"], values["LXSERVER_SHA256"])
+    target = tmp_path / "lxserver"
+    with zipfile.ZipFile(path) as archive:
+        prefix = "lx-music-sync-server/"
+        loader = archive.read(prefix + "node_modules/music-tag-native/index.js").decode()
+        assert "require('./music-tag-native.linux-x64-gnu.node')" in loader
+        assert "require('music-tag-native-linux-x64-gnu')" in loader
+        assert "require('./music-tag-native.linux-arm64-gnu.node')" in loader
+        assert "require('music-tag-native-linux-arm64-gnu')" in loader
+        for member in archive.namelist():
+            if member.startswith(prefix + "node_modules/music-tag-native") and not member.endswith("/"):
+                dest = target / member[len(prefix):]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(archive.read(member))
+    assert not (target / "node_modules/music-tag-native" / X64_NATIVE_NAME).exists()
+    assert (target / "node_modules/music-tag-native-linux-x64-gnu" / X64_NATIVE_NAME).is_file()
+    result = subprocess.run(
+        ["bash", str(HELPER), "--lxserver-dir", str(target), "--required-arch", "x64",
+         "--version-file", str(lock)], capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    if NODE_AVAILABLE and platform.machine() in ("x86_64", "amd64"):
+        # 除 helper 的 dlopen 外，再经过真实 napi-rs 加载器，验证 fallback 路径。
+        result = subprocess.run(["node", "-e", "require(process.argv[1]);",
+                                 str(target / "node_modules/music-tag-native")],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+
+
+def test_real_locked_arm64_tarball_copies_match(tmp_path, real_lxserver_artifacts):
+    lock, values, artifact = real_lxserver_artifacts
+    name = f"music-tag-native-linux-arm64-gnu-{values['LXSERVER_NATIVE_VERSION']}.tgz"
+    path = artifact(name, values["LXSERVER_NATIVE_ARM64_SHA256"])
+    dest = tmp_path / "artifact"
+    dest.mkdir()
+    shutil.copy(path, dest / name)
+    with tarfile.open(path) as archive:
+        package = json.load(archive.extractfile("package/package.json"))
+        assert package["main"] == NATIVE_NAME
+        binary = archive.extractfile("package/" + NATIVE_NAME).read()
+    result = subprocess.run(
+        ["bash", str(HELPER), "--lxserver-dir", str(tmp_path / "lxserver"),
+         "--artifact-dir", str(dest), "--required-arch", "arm64", "--version-file", str(lock)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    modules = tmp_path / "lxserver/node_modules"
+    assert (modules / "music-tag-native-linux-arm64-gnu" / NATIVE_NAME).read_bytes() == binary
+    assert (modules / "music-tag-native" / NATIVE_NAME).read_bytes() == binary

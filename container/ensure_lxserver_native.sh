@@ -107,17 +107,29 @@ except Exception:
 validate_installed_native() {
     REJECT_REASON=""
     if [ "${REQUIRED_ARCH}" = "x64" ]; then
-        if [ ! -s "${PACKAGE_NATIVE}" ]; then
-            REJECT_REASON="上游 server.zip 未携带 x64 原生模块: ${NATIVE_NAME}"
-            return 1
+        # napi-rs 加载器先尝试同目录绑定，再回退独立平台包；锁定 zip
+        # 实际只携带后者。按真实加载顺序选择，不复制/替换上游 x64 构件。
+        local effective_native="${PACKAGE_NATIVE}"
+        if [ ! -s "${effective_native}" ]; then
+            effective_native="${NAMED_NATIVE}"
+            if [ ! -s "${effective_native}" ]; then
+                REJECT_REASON="上游 server.zip 未携带 x64 原生模块: ${NATIVE_NAME}"
+                return 1
+            fi
+            local pkg_version
+            pkg_version="$(read_pkg_version "${LXSERVER_DIR}/node_modules/${PACKAGE_DIR}/package.json")"
+            if [ "${pkg_version}" != "${NATIVE_VERSION}" ]; then
+                REJECT_REASON="x64 平台包版本不符（${pkg_version:-未知} != 锁定 ${NATIVE_VERSION}）"
+                return 1
+            fi
         fi
         if host_arch_matches "x64"; then
             if ! command -v "${NODE_BIN}" >/dev/null 2>&1; then
                 REJECT_REASON="无法执行 Node 进行原生模块校验: ${NODE_BIN}"
                 return 1
             fi
-            if ! "${NODE_BIN}" -e 'require(process.argv[1]);' "${PACKAGE_NATIVE}" >/dev/null 2>&1; then
-                REJECT_REASON="node 无法加载 x64 绑定（构件损坏或 ABI 不符）: ${PACKAGE_NATIVE}"
+            if ! "${NODE_BIN}" -e 'require(process.argv[1]);' "${effective_native}" >/dev/null 2>&1; then
+                REJECT_REASON="node 无法加载 x64 绑定（构件损坏或 ABI 不符）: ${effective_native}"
                 return 1
             fi
         fi
@@ -140,6 +152,10 @@ validate_installed_native() {
     fi
     if [ ! -s "${PACKAGE_NATIVE}" ]; then
         REJECT_REASON="加载器目录缺少绑定副本: ${PACKAGE_NATIVE}"
+        return 1
+    fi
+    if ! cmp -s "${PACKAGE_NATIVE}" "${NAMED_NATIVE}"; then
+        REJECT_REASON="加载器优先绑定副本与锁定平台包不一致: ${PACKAGE_NATIVE}"
         return 1
     fi
     if host_arch_matches "arm64"; then
