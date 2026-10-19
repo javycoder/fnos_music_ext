@@ -89,6 +89,7 @@ if (storageTitleBtn) storageTitleBtn.addEventListener("click", () => switchPage(
    $on('os/theme') 监听后续切换，见 fnOS「页面交互」文档）；宿主不可用或独立浏览器
    退回 prefers-color-scheme。用户选择只存当前浏览器，不进 .env，也不参与保存条。 */
 const THEME_KEY = "fnmusic-theme";
+const HOST_THEME_KEY = "fnmusic-host-theme";
 const themeMedia = (typeof window !== "undefined" && typeof window.matchMedia === "function")
   ? window.matchMedia("(prefers-color-scheme: dark)")
   : null;
@@ -105,6 +106,14 @@ function readThemePref() {
     if (saved === "light" || saved === "dark") return saved;
   } catch (_) { /* 隐私模式/直连没有 localStorage：按跟随系统处理 */ }
   return "auto";
+}
+
+function updateHostTheme(value) {
+  hostTheme = normalizeTheme(value);
+  try {
+    if (hostTheme) window.localStorage.setItem(HOST_THEME_KEY, hostTheme);
+    else window.localStorage.removeItem(HOST_THEME_KEY);
+  } catch (_) { /* 宿主主题仍可在本次页面生效 */ }
 }
 
 function effectiveTheme() {
@@ -133,7 +142,12 @@ function setThemePref(pref) {
 
 async function initTheme() {
   themePref = readThemePref();
-  hostTheme = null;  // 重新向宿主取一次，避免重复初始化时残留旧主题
+  const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
+  const embedded = pathname.startsWith("/app/");
+  hostTheme = null;
+  if (embedded) {
+    try { hostTheme = normalizeTheme(window.localStorage.getItem(HOST_THEME_KEY)); } catch (_) {}
+  }
   applyTheme();
   $$("input[name=theme]").forEach((el) => el.addEventListener("change", () => {
     if (el.checked) setThemePref(el.value);
@@ -142,22 +156,27 @@ async function initTheme() {
   if (themeMedia && typeof themeMedia.addEventListener === "function") {
     themeMedia.addEventListener("change", () => { if (themePref === "auto" && !hostTheme) applyTheme(); });
   }
-  const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
-  if (!pathname.startsWith("/app/")) return;  // 直连 8774：没有飞牛宿主，不碰 SDK
+  if (!embedded) return;  // 直连 8774：没有飞牛宿主，不碰 SDK
   const sdk = await loadTrimSdk();
-  if (!sdk) return;
+  if (!sdk) {
+    updateHostTheme(null);
+    applyTheme();
+    return;
+  }
   try {
     // 移动端 App 内嵌页也能取到主题；独立浏览器没有宿主桥，抛错后走媒体查询
     const config = await sdk.getPlatformConfig();
-    hostTheme = normalizeTheme(config && (config.theme || (config.os && config.os.theme)));
-    applyTheme();
-  } catch (_) { /* 取不到宿主配置时继续用系统媒体查询 */ }
+    updateHostTheme(config && (config.theme || (config.os && config.os.theme)));
+  } catch (_) {
+    updateHostTheme(null);
+  }
+  applyTheme();
   if (!sdk.isWeb || sdk.isStandaloneWeb) return;  // 只有 Web 宿主支持 $on 主题事件
   try {
     if (typeof sdk.$on === "function") {
       // 仅 Web 宿主支持；移动端 App 内嵌页与独立浏览器没有该事件
       await sdk.$on("os/theme", (theme) => {
-        hostTheme = normalizeTheme(theme);
+        updateHostTheme(theme);
         applyTheme();
       });
     }

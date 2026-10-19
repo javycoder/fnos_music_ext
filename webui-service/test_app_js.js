@@ -993,7 +993,12 @@ async function themeHarness(options = {}) {
     if (!elements.has(sel)) elements.set(sel, stubEl());
     return elements.get(sel);
   };
-  const root = { dataset: {} };
+  const appliedThemes = [];
+  const root = { dataset: new Proxy({}, { set(target, key, value) {
+    if (key === "theme") appliedThemes.push(value);
+    target[key] = value;
+    return true;
+  } }) };
   const radios = ["auto", "light", "dark"].map((value) => Object.assign(stubEl(), { value }));
   const pages = ["overview", "settings", "llm", "tee"].map((page) =>
     Object.assign(stubEl(), { id: "page-" + page }));
@@ -1001,6 +1006,7 @@ async function themeHarness(options = {}) {
     Object.assign(stubEl(), { dataset: { page } }));
   const media = Object.assign(stubEl(), { matches: !!options.dark });
   const saved = new Map(options.saved == null ? [] : [["fnmusic-theme", options.saved]]);
+  if (options.hostSaved != null) saved.set("fnmusic-host-theme", options.hostSaved);
   const storage = {
     getItem(key) { if (options.blockStorage) throw new Error("storage denied"); return saved.get(key) ?? null; },
     setItem(key, value) { if (options.blockStorage) throw new Error("storage denied"); saved.set(key, value); },
@@ -1031,7 +1037,7 @@ async function themeHarness(options = {}) {
   const initialTheme = root.dataset.theme;
   vm.runInContext(src + '\nasync function loadTrimSdk() { __sdkCalls++; return __sdk; }', context, { filename: "app.js" });
   await tick(0);
-  return { context, root, initialTheme, radios, media, saved, win, calls, elements, pages, nav };
+  return { context, root, initialTheme, appliedThemes, radios, media, saved, win, calls, elements, pages, nav };
 }
 
 function themeSelected(h) {
@@ -1139,6 +1145,59 @@ test("宿主主题：初值、os/theme 动态切换优先系统，手动偏好�
   h.media.matches = true;
   notify("invalid");
   assert.strictEqual(h.root.dataset.theme, "dark", "未知宿主主题回退媒体查询");
+});
+
+test("宿主主题：刷新沿用缓存直到异步校正，直连和手动选择不受缓存影响", async () => {
+  let notify;
+  const sdk = {
+    isWeb: true,
+    getPlatformConfig: async () => ({ theme: "dark" }),
+    $on: async (_, fn) => { notify = fn; },
+  };
+  const first = await themeHarness({ pathname: "/app/fnmusic-ext/", sdk });
+  assert.strictEqual(first.saved.get("fnmusic-host-theme"), "dark");
+  let resolveConfig;
+  const reloaded = await themeHarness({
+    pathname: "/app/fnmusic-ext/", hostSaved: first.saved.get("fnmusic-host-theme"),
+    sdk: { getPlatformConfig: () => new Promise((resolve) => { resolveConfig = resolve; }) },
+  });
+  assert.strictEqual(reloaded.initialTheme, "dark");
+  assert.ok(reloaded.appliedThemes.every((value) => value === "dark"), "SDK 返回前不能切回设备浅色");
+  resolveConfig({ theme: "light" });
+  await tick(0);
+  assert.strictEqual(reloaded.root.dataset.theme, "light");
+  assert.strictEqual(reloaded.saved.get("fnmusic-host-theme"), "light");
+  notify("light");
+  assert.strictEqual(first.saved.get("fnmusic-host-theme"), "light");
+  notify("invalid");
+  assert.strictEqual(first.saved.has("fnmusic-host-theme"), false);
+  for (const options of [
+    { hostSaved: "dark" },
+    { pathname: "/app/fnmusic-ext/", hostSaved: "dark", saved: "light", sdk },
+    { pathname: "/app/fnmusic-ext/", hostSaved: "invalid" },
+  ]) {
+    const h = await themeHarness(options);
+    assert.strictEqual(h.initialTheme, "light");
+    assert.strictEqual(h.root.dataset.theme, "light");
+  }
+});
+
+test("宿主主题：缓存失效或宿主不可用时清缓存并回退系统，存储禁用不阻断", async () => {
+  for (const sdk of [false, {},
+    { getPlatformConfig: async () => { throw new Error("no host"); } },
+    { getPlatformConfig: async () => ({ theme: "invalid" }) },
+  ]) {
+    const h = await themeHarness({ pathname: "/app/fnmusic-ext/", hostSaved: "dark", sdk });
+    assert.strictEqual(h.initialTheme, "dark");
+    assert.strictEqual(h.root.dataset.theme, "light");
+    assert.strictEqual(h.saved.has("fnmusic-host-theme"), false);
+    h.media.matches = true;
+    h.media.dispatch("change");
+    assert.strictEqual(h.root.dataset.theme, "dark");
+  }
+  const h = await themeHarness({ pathname: "/app/fnmusic-ext/", blockStorage: true,
+    sdk: { getPlatformConfig: async () => ({ theme: "dark" }) } });
+  assert.strictEqual(h.root.dataset.theme, "dark");
 });
 
 test("宿主主题：移动嵌入与独立 Web 可读取 os.theme，但不订阅 Web 宿主事件", async () => {
