@@ -163,23 +163,33 @@ async def test_search_timeout_returns_local_and_drops_late_online(monkeypatch):
     monkeypatch.setitem(p.CONF, "netease_enabled", False)
     monkeypatch.setitem(p.CONF, "lx_enabled", False)
 
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
     async def slow(*args):
-        await asyncio.sleep(0.4)
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
         return {"items": [song("kuwo:1")]}
 
     monkeypatch.setattr(p, "fetch_musicdl_search", slow)
     p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda r: httpx.Response(200, json={"code": 0, "data": {"list": [{"guid": "local:1", "title": "本地"}], "total": 1}})),
         base_url="http://test")
-    started = time.monotonic()
     import json
-    body = json.loads((await p.search_track(request("q=Song"))).body)
-    assert time.monotonic() - started < 0.3
-    guids = [item["guid"] for item in body["data"]["list"]]
-    assert guids == ["local:1"]
-    entry = next(iter(p._SEARCH_CACHE.values()))
-    await asyncio.wait({entry["task"]})
-    assert entry.get("abandoned") is True
+    try:
+        body = json.loads((await asyncio.wait_for(p.search_track(request("q=Song")), 2)).body)
+        guids = [item["guid"] for item in body["data"]["list"]]
+        assert guids == ["local:1"]
+        entry = next(iter(p._SEARCH_CACHE.values()))
+        await asyncio.wait_for(cancelled.wait(), 2)
+        assert entry.get("abandoned") is True
+        assert not entry["task"].done()
+    finally:
+        release.set()
+    await asyncio.wait_for(asyncio.shield(entry["task"]), 2)
     assert entry["items"] == []
     assert not any(item.get("id") == "kuwo:1" for item in entry["items"])
 
