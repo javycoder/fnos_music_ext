@@ -84,6 +84,86 @@ $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPag
 const storageTitleBtn = $("#nav-storage-title");
 if (storageTitleBtn) storageTitleBtn.addEventListener("click", () => switchPage("tee"));
 
+/* -------------------------------------------------------------- 主题 / 外观
+   默认「跟随系统」：飞牛 Web 宿主里以宿主主题为准（getPlatformConfig 取初值，
+   $on('os/theme') 监听后续切换，见 fnOS「页面交互」文档）；宿主不可用或独立浏览器
+   退回 prefers-color-scheme。用户选择只存当前浏览器，不进 .env，也不参与保存条。 */
+const THEME_KEY = "fnmusic-theme";
+const themeMedia = (typeof window !== "undefined" && typeof window.matchMedia === "function")
+  ? window.matchMedia("(prefers-color-scheme: dark)")
+  : null;
+let themePref = "auto";  // auto | light | dark —— 「设置 → 外观」里的选择
+let hostTheme = null;    // 飞牛宿主报告的主题：light | dark（无宿主时为 null）
+
+function normalizeTheme(value) {
+  return value === "dark" || value === "light" ? value : null;
+}
+
+function readThemePref() {
+  try {
+    const saved = window.localStorage.getItem(THEME_KEY);
+    if (saved === "light" || saved === "dark") return saved;
+  } catch (_) { /* 隐私模式/直连没有 localStorage：按跟随系统处理 */ }
+  return "auto";
+}
+
+function effectiveTheme() {
+  if (themePref !== "auto") return themePref;
+  if (hostTheme) return hostTheme;
+  return themeMedia && themeMedia.matches ? "dark" : "light";
+}
+
+function applyTheme() {
+  const theme = effectiveTheme();
+  // 与飞牛文档示例一致：主题写到 <html data-theme>，CSS 按此覆盖配色变量
+  if (typeof document !== "undefined" && document.documentElement && document.documentElement.dataset) {
+    document.documentElement.dataset.theme = theme;
+  }
+  $$("input[name=theme]").forEach((el) => { el.checked = el.value === themePref; });
+}
+
+function setThemePref(pref) {
+  themePref = normalizeTheme(pref) || "auto";
+  try {
+    if (themePref === "auto") window.localStorage.removeItem(THEME_KEY);
+    else window.localStorage.setItem(THEME_KEY, themePref);
+  } catch (_) { /* 存不了就只对本次会话生效 */ }
+  applyTheme();
+}
+
+async function initTheme() {
+  themePref = readThemePref();
+  hostTheme = null;  // 重新向宿主取一次，避免重复初始化时残留旧主题
+  applyTheme();
+  $$("input[name=theme]").forEach((el) => el.addEventListener("change", () => {
+    if (el.checked) setThemePref(el.value);
+  }));
+  // 独立浏览器 / 设备级深浅色变化（宿主主题优先，变化由下面的 $on 刷新）
+  if (themeMedia && typeof themeMedia.addEventListener === "function") {
+    themeMedia.addEventListener("change", () => { if (themePref === "auto" && !hostTheme) applyTheme(); });
+  }
+  const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
+  if (!pathname.startsWith("/app/")) return;  // 直连 8774：没有飞牛宿主，不碰 SDK
+  const sdk = await loadTrimSdk();
+  if (!sdk) return;
+  try {
+    // 移动端 App 内嵌页也能取到主题；独立浏览器没有宿主桥，抛错后走媒体查询
+    const config = await sdk.getPlatformConfig();
+    hostTheme = normalizeTheme(config && (config.theme || (config.os && config.os.theme)));
+    applyTheme();
+  } catch (_) { /* 取不到宿主配置时继续用系统媒体查询 */ }
+  if (!sdk.isWeb || sdk.isStandaloneWeb) return;  // 只有 Web 宿主支持 $on 主题事件
+  try {
+    if (typeof sdk.$on === "function") {
+      // 仅 Web 宿主支持；移动端 App 内嵌页与独立浏览器没有该事件
+      await sdk.$on("os/theme", (theme) => {
+        hostTheme = normalizeTheme(theme);
+        applyTheme();
+      });
+    }
+  } catch (_) { /* 宿主不支持事件推送时退回媒体查询 */ }
+}
+
 /* -------------------------------------------------------------- 概览 */
 async function loadStatus() {
   try {
@@ -992,14 +1072,7 @@ $("#lx-test").addEventListener("click", async () => {
     body: JSON.stringify({ values: { url } }),
   });
   try {
-    let r;
-    try {
-      r = await callVerify();
-    } catch (exc) {
-      // lxmusic 进程未运行（未点选/预览过期）：临时拉起后重试一次
-      if (!await startPreview("lxmusic")) throw exc;
-      r = await callVerify();
-    }
+    const r = await callVerify();
     if (r.ok) {
       const d = r.data || {};
       const meta = d.meta || {};
@@ -1027,18 +1100,11 @@ $("#lx-test").addEventListener("click", async () => {
 
 /* -------------------------------------------------- lx 源：文件上传 / NAS 选择 */
 async function lxUploadScript(filename, script) {
-  // 先确保 lxmusic 进程可用（预览拉起），再转发落盘
-  const callUpload = () => api("/api/lx/upload", {
+  return api("/api/lx/upload", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ filename, script }),
   });
-  try {
-    return await callUpload();
-  } catch (exc) {
-    if (!await startPreview("lxmusic")) throw exc;
-    return await callUpload();
-  }
 }
 
 async function lxAfterUpload(r) {
@@ -1510,6 +1576,7 @@ window.addEventListener("keydown", (ev) => {
 
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {
+  initTheme().catch(() => {});  // 外观先应用（内部等宿主 SDK，不阻塞配置加载）
   await loadConfig();
   await loadStatus();
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
