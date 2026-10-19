@@ -1354,6 +1354,122 @@ $("#update-modal").addEventListener("click", (ev) => {
   if (ev.target === ev.currentTarget) closeUpdateModal();  // 点遮罩空白处关闭
 });
 
+/* -------------------------------------------------------------- 垃圾清理 Beta */
+let cleanupJob = null;
+let cleanupSubmitting = false;
+let cleanupPolling = false;
+let cleanupTimer = null;
+
+function renderCleanupJob(job) {
+  const labels = { running: "清理中", completed: "清理完成", failed: "清理失败" };
+  $("#cleanup-status").textContent =
+    `任务 ${job.id} · ${labels[job.status]} · 阶段：${job.phase || "-"}` +
+    ` · 已扫描 ${job.scanned ?? 0} · 已删除 ${job.removed ?? 0}` +
+    ` · 释放 ${job.bytes ?? 0} 字节 · 已跳过 ${job.skipped ?? 0}`;
+  const lines = [];
+  for (const [name, counts] of Object.entries(job.categories || {})) {
+    lines.push(`${name}：扫描 ${counts.scanned || 0}，删除 ${counts.removed || 0}，释放 ${counts.bytes || 0} 字节，跳过 ${counts.skipped || 0}`);
+  }
+  for (const [key, label] of [["errors", "错误"], ["details", "详情"]]) {
+    for (const item of (Array.isArray(job[key]) ? job[key] : [])) {
+      lines.push(`${label}：${typeof item === "string" ? item : JSON.stringify(item)}`);
+    }
+  }
+  // 文件名、错误及详情均不可信，绝不作为 HTML 插入。
+  $("#cleanup-details").textContent = lines.join("\n");
+  $("#cleanup-details").hidden = !lines.length;
+  $("#cleanup-open-btn").textContent = job.status === "running" ? "查看当前清理任务" : "清理垃圾文件（Beta）";
+}
+
+function acceptCleanupJob(response) {
+  const job = response && response.job;
+  if (!response || response.ok !== true || !job || !job.id ||
+      !["running", "completed", "failed"].includes(job.status)) {
+    throw new Error("清理任务响应格式无效");
+  }
+  cleanupJob = job;
+  renderCleanupJob(job);
+  clearTimeout(cleanupTimer);
+  cleanupTimer = null;
+  if (job.status === "running") cleanupTimer = setTimeout(pollCleanupJob, 1000);
+}
+
+async function pollCleanupJob() {
+  if (cleanupPolling || !cleanupJob || cleanupJob.status !== "running") return;
+  clearTimeout(cleanupTimer);
+  cleanupTimer = null;
+  cleanupPolling = true;
+  try {
+    acceptCleanupJob(await api("/api/maintenance/cleanup/" + encodeURIComponent(cleanupJob.id)));
+  } catch (exc) {
+    $("#cleanup-status").textContent = `任务 ${cleanupJob.id} · 查询失败：${exc.message}；点击查看当前清理任务重试，不会重复提交。`;
+  } finally {
+    cleanupPolling = false;
+  }
+}
+
+function closeCleanupModal() {
+  $("#cleanup-modal").hidden = true;
+  $("#cleanup-open-btn").focus();
+}
+
+function openCleanupModal() {
+  if (cleanupSubmitting) return;
+  if (cleanupJob && cleanupJob.status === "running") {
+    renderCleanupJob(cleanupJob);
+    pollCleanupJob();
+    return;
+  }
+  $("#cleanup-modal").hidden = false;
+  $("#cleanup-cancel-btn").focus();
+}
+
+async function startCleanup() {
+  // 只有可见警告框中的确认才可提交；双击和在途提交均不创建新任务。
+  if ($("#cleanup-modal").hidden || cleanupSubmitting) return;
+  if (cleanupJob && cleanupJob.status === "running") {
+    closeCleanupModal();
+    renderCleanupJob(cleanupJob);
+    return;
+  }
+  cleanupSubmitting = true;
+  $("#cleanup-open-btn").disabled = true;
+  closeCleanupModal();
+  $("#cleanup-status").textContent = "正在提交清理任务…";
+  $("#cleanup-details").textContent = "";
+  $("#cleanup-details").hidden = true;
+  try {
+    acceptCleanupJob(await api("/api/maintenance/cleanup", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm_beta: true }),
+    }));
+  } catch (exc) {
+    $("#cleanup-status").textContent = "清理请求失败：" + exc.message;
+  } finally {
+    cleanupSubmitting = false;
+    $("#cleanup-open-btn").disabled = false;
+  }
+}
+
+$("#cleanup-open-btn").addEventListener("click", openCleanupModal);
+$("#cleanup-cancel-btn").addEventListener("click", closeCleanupModal);
+$("#cleanup-confirm-btn").addEventListener("click", startCleanup);
+$("#cleanup-modal").addEventListener("click", (ev) => {
+  if (ev.target === ev.currentTarget) closeCleanupModal();
+});
+window.addEventListener("keydown", (ev) => {
+  if ($("#cleanup-modal").hidden) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeCleanupModal();
+  } else if (ev.key === "Tab") {
+    // 对话框仅有两个按钮，将键盘焦点限制在其中，默认落在取消。
+    ev.preventDefault();
+    const cancel = $("#cleanup-cancel-btn");
+    (document.activeElement === cancel ? $("#cleanup-confirm-btn") : cancel).focus();
+  }
+});
+
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {
   await loadConfig();

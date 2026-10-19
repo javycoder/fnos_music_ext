@@ -1669,11 +1669,21 @@ def _cover_disk_gc() -> None:
         total = 0
         for fname in os.listdir(d):
             fpath = os.path.join(d, fname)
+            is_url = re.fullmatch(r"g_[0-9a-f]{40}\.url", fname) is not None
+            if not is_url and not re.fullmatch(r"[0-9a-f]{40}\.(jpg|png|webp|gif)", fname):
+                continue
+            if os.path.islink(fpath):
+                continue
             try:
                 st = os.stat(fpath)
             except OSError:
                 continue
             if not os.path.isfile(fpath):
+                continue
+            if is_url:
+                if now - st.st_mtime > _COVER_GUID_URL_TTL_S:
+                    with contextlib.suppress(OSError):
+                        os.unlink(fpath)
                 continue
             total += st.st_size
             if now - st.st_mtime > _COVER_DISK_TTL_S:
@@ -1723,6 +1733,7 @@ def _cover_disk_read(url: str) -> "tuple[bytes, str] | None":
 def _cover_disk_write(url: str, data: bytes, mime: str) -> None:
     d = os.path.join(CONF["cache_dir"], _COVER_DISK_DIR)
     fpath = _cover_disk_path(url, mime)
+    tmp = ""
     try:
         os.makedirs(d, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
@@ -1732,8 +1743,8 @@ def _cover_disk_write(url: str, data: bytes, mime: str) -> None:
     except OSError as e:
         logger.debug("cover disk write failed: %s", type(e).__name__)
         with contextlib.suppress(OSError):
-            if os.path.exists(fpath + ".tmp"):
-                os.unlink(fpath + ".tmp")
+            if tmp:
+                os.unlink(tmp)
         return
     _cover_disk_gc()
 
@@ -1815,6 +1826,7 @@ def _cover_guid_url_lookup(guid: str) -> str:
 def _cover_guid_url_persist(guid: str, url: str) -> None:
     _cover_guid_url_remember(guid, url)
     fpath = _cover_guid_url_file(guid)
+    tmp = ""
     try:
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(fpath), suffix=".tmp")
@@ -1823,6 +1835,9 @@ def _cover_guid_url_persist(guid: str, url: str) -> None:
         os.replace(tmp, fpath)
     except OSError as e:
         logger.debug("cover guid-url persist failed: %s", type(e).__name__)
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def _has_embedded_cover(path: str) -> bool:
@@ -3864,6 +3879,51 @@ async def _lyric_orphan_sweeper() -> None:
         await asyncio.sleep(1800)
 
 
+_maintenance_jobs: dict[str, dict] = {}
+_maintenance_task: asyncio.Task | None = None
+
+
+async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int, dict]:
+    global _maintenance_task
+    if method == "GET":
+        job = _maintenance_jobs.get(path.rsplit("/", 1)[-1])
+        return (200, {"ok": True, "job": dict(job)}) if job else (
+            404, {"ok": False, "error": "任务不存在或服务已重启，请重新执行清理"})
+    if method != "POST" or body != {"confirm_beta": True}:
+        return 400, {"ok": False, "error": "必须明确确认 Beta 风险"}
+    if _maintenance_task is not None and not _maintenance_task.done():
+        job = next(j for j in _maintenance_jobs.values() if j["status"] == "running")
+        return 200, {"ok": True, "job": dict(job)}
+    job = {"id": uuid4().hex, "status": "running", "phase": "准备扫描",
+           "scanned": 0, "removed": 0, "bytes": 0, "skipped": 0,
+           "errors": [], "details": [], "started_at": time.time()}
+    while len(_maintenance_jobs) >= 10:
+        _maintenance_jobs.pop(next(iter(_maintenance_jobs)))
+    _maintenance_jobs[job["id"]] = job
+
+    async def run():
+        try:
+            try:
+                from .maintenance import run_cleanup
+            except ImportError:
+                from maintenance import run_cleanup
+            import sys
+            await run_cleanup(sys.modules[__name__], job)
+            if job["status"] != "failed":
+                job.update(status="completed", phase="清理完成")
+        except asyncio.CancelledError:
+            job.update(status="failed", phase="服务停止，清理已中断")
+            raise
+        except Exception as exc:
+            job["errors"].append(str(exc))
+            job.update(status="failed", phase="清理失败")
+        finally:
+            job["finished_at"] = time.time()
+
+    _maintenance_task = asyncio.create_task(run())
+    return 200, {"ok": True, "job": dict(job)}
+
+
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     global _LX_SCRIPT_MAP_TASK
@@ -3933,9 +3993,25 @@ async def lifespan(fastapi_app: FastAPI):
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
 
+    maintenance_server = None
+    if _background_jobs_enabled():
+        try:
+            from . import maintenance_socket
+        except ImportError:
+            import maintenance_socket
+        try:
+            maintenance_server = await maintenance_socket.start(
+                asyncio.get_running_loop(), _maintenance_request)
+        except OSError as exc:
+            logger.warning("Maintenance socket unavailable: %s", exc)
     try:
         yield
     finally:
+        if maintenance_server is not None:
+            await maintenance_socket.stop(maintenance_server)
+        if _maintenance_task is not None and not _maintenance_task.done():
+            _maintenance_task.cancel()
+            await asyncio.gather(_maintenance_task, return_exceptions=True)
         await pubpl.shutdown()
         netease_tasks = _cancel_netease_resolutions()
         netease_tasks = [task for task in netease_tasks if task.get_loop() is asyncio.get_running_loop()]
@@ -7957,7 +8033,7 @@ async def favorite_track_list(request: Request):
             logger.warning("Error reading online favorites for list for user %s: %s", user_guid, e)
             fav_items = []
 
-    # 自愈：bind=pending 的收藏在此补发官方绑定/下载（含代理重启后的恢复）
+    # 列表读取只恢复绑定意图；已有文件可重试绑定，缺失文件不补下载。
     _maybe_retry_official_binds(request, user_guid, fav_items=fav_items)
 
     # 官方真实条目作为结构模板：App 端解析严格，在线条目字段集需与官方对齐；
@@ -8835,7 +8911,7 @@ async def playlist_track_list(request: Request):
         extras = load_playlist_tracks(user_guid).get(resolved_pl_guid) or []
         if not extras:
             return JSONResponse(content=envelope, headers=headers)
-        # 自愈：bind=pending 的歌单条目在此补发官方绑定/下载
+        # 列表读取只对已有文件重试绑定，不补下载。
         _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
 
         data = envelope.get("data")

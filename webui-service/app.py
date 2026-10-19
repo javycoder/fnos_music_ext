@@ -1458,6 +1458,13 @@ async def api_fs_check():
     raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
+@app.post("/api/maintenance/cleanup")
+@app.get("/api/maintenance/cleanup/{job_id}")
+async def api_maintenance_cleanup(job_id: str = ""):
+    """与 fs-check 一致：真实清理由宿主网关处理，直连不得访问或删除文件。"""
+    raise HTTPException(status_code=501, detail="直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台")
+
+
 # ------------------------------------------------------------------ 关于页 --
 
 ABOUT = {

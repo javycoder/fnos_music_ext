@@ -1,0 +1,639 @@
+"""Black-box safety and retention checks for the cooperative cleanup engine."""
+import asyncio
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from proxy import maintenance as m
+
+
+@pytest.fixture
+def env(tmp_path):
+    home = tmp_path / 'install'
+    cache = home / 'cache'
+    library = tmp_path / 'library'
+    cache.mkdir(parents=True)
+    library.mkdir()
+    db = tmp_path / 'music.db'
+    with sqlite3.connect(db) as con:
+        con.execute('CREATE TABLE audio_file (path TEXT)')
+    # The host itself has /tmp/.git; isolate only that external fixture state.
+    original_present = m._present
+    runtime = SimpleNamespace(
+        CONF={'cache_dir': str(cache), 'tee_cache_max': 1, 'tee_save_enabled': False},
+        _HOME=str(home), iter_media_dirs=lambda: [str(library), str(cache)],
+        _tee_active={}, _full_fetch_tasks={}, _tee_handoff_active=set(),
+        tc=SimpleNamespace(_SESSIONS={}),
+        dailyrec=SimpleNamespace(music_db_path=lambda: str(db), today_key=lambda: '20261019'))
+    def isolated_present(path):
+        if os.path.basename(path) == '.git' and not m._within(path, str(tmp_path)):
+            return False
+        return original_present(path)
+    with patch.object(m, '_present', isolated_present):
+        yield SimpleNamespace(home=home, cache=cache, library=library, db=db, runtime=runtime)
+
+
+def put(path, content=b'x', age=2 * m.DAY):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, dict):
+        content = json.dumps(content).encode()
+    if isinstance(content, str):
+        content = content.encode()
+    path.write_bytes(content)
+    now = m.time.time()
+    os.utime(path, (now - age, now - age))
+    return path
+
+
+def run(env):
+    job = {'id': 'test', 'status': 'queued', 'phase': '', 'scanned': 0,
+           'removed': 0, 'bytes': 0, 'skipped': 0, 'errors': [], 'details': []}
+    assert asyncio.run(m.run_cleanup(env.runtime, job)) is job
+    assert job['status'] == 'done', job
+    return job
+
+
+def ref(env, stem, name='online_song.ref', age=2 * m.DAY):
+    return put(env.cache / name, str(stem), age)
+
+
+def test_lyrics_before_refs_and_unowned_preserved(env):
+    stem = env.library / 'orphan'
+    lyric = put(stem.with_suffix('.lrc'))
+    marker = ref(env, stem)
+    user = put(env.library / 'user.lrc')
+    job = run(env)
+    assert not lyric.exists() and not marker.exists()
+    assert user.exists()
+    removed = [d['category'] for d in job['details'] if d['action'] == 'removed']
+    assert removed == ['lyrics', 'refs']
+    assert job['bytes'] > 0
+    assert job['categories']['lyrics']['removed'] == 1
+
+
+@pytest.mark.parametrize('protection', ['audio', 'upper_audio', 'db', 'db_error', 'wal', 'young', 'boundary'])
+def test_orphan_lyric_protections(env, protection):
+    stem = env.library / 'song'
+    age = 10 if protection == 'young' else m.DAY if protection == 'boundary' else 2 * m.DAY
+    lyric = put(stem.with_suffix('.lrc'), age=age)
+    marker = ref(env, stem)
+    if protection in ('audio', 'upper_audio'):
+        put(stem.with_suffix('.FLAC' if protection == 'upper_audio' else '.mp3'))
+    if protection == 'db':
+        with sqlite3.connect(env.db) as con:
+            con.execute('INSERT INTO audio_file VALUES (?)', (str(stem) + '.mp3',))
+    if protection == 'db_error':
+        env.db.write_bytes(b'broken')
+    if protection == 'wal':
+        put(Path(str(env.db) + '-wal'))
+    # Freeze wallclock so the exact 24h boundary is deterministic.
+    with patch.object(m.time, 'time', return_value=lyric.stat().st_mtime + age):
+        run(env)
+    assert lyric.exists() and marker.exists()
+
+
+@pytest.mark.parametrize('field', ['_tee_active', '_full_fetch_tasks', '_tee_handoff_active'])
+def test_all_writer_guards(env, field):
+    setattr(env.runtime, field, {'anything': object()})
+    lyric = put(env.library / 'orphan.lrc')
+    ref(env, lyric.with_suffix(''))
+    temporary = put(env.cache / ('online_a.' + 'a' * 32 + '.part'))
+    old = put(env.cache / 'online_old.mp3', age=4 * m.DAY)
+    put(env.cache / 'online_new.mp3')
+    cover = put(env.cache / 'covers' / ('a' * 40 + '.jpg'), age=8 * m.DAY)
+    run(env)
+    assert lyric.exists() and temporary.exists() and old.exists()
+    assert not cover.exists()  # Independent cover cache can still be reclaimed.
+
+
+def test_activity_rechecked_after_yield(env):
+    temp = put(env.cache / ('online_song.' + 'a' * 32 + '.part'))
+    original = asyncio.sleep
+
+    async def activate(delay):
+        env.runtime._tee_active['new'] = 1
+        await original(0)
+
+    with patch.object(m.asyncio, 'sleep', activate):
+        run(env)
+    assert temp.exists()
+
+
+@pytest.mark.parametrize('where', ['root', 'parent', 'file', 'ref_target'])
+def test_symlinks_never_followed(env, tmp_path, where):
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    victim = put(outside / ('online_song.' + 'a' * 32 + '.part'))
+    if where == 'root':
+        link = env.home / 'linked'
+        link.symlink_to(outside, target_is_directory=True)
+        env.runtime.CONF['cache_dir'] = str(link)
+    elif where == 'parent':
+        link = env.home / 'linked'
+        link.symlink_to(outside, target_is_directory=True)
+        (outside / 'nested').mkdir()
+        victim = put(outside / 'nested' / victim.name)
+        env.runtime.CONF['cache_dir'] = str(link / 'nested')
+    elif where == 'file':
+        (env.cache / victim.name).symlink_to(victim)
+    else:
+        lyric = put(outside / 'song.lrc')
+        (env.library / 'linked').symlink_to(outside, target_is_directory=True)
+        ref(env, env.library / 'linked' / 'song')
+        victim = lyric
+    run(env)
+    assert victim.exists()
+
+
+@pytest.mark.parametrize('root', sorted(m.DANGEROUS))
+def test_dangerous_roots_refused(env, root):
+    engine = m._Engine(env.runtime, {'errors': [], 'details': [], 'categories': {}, 'skipped': 0})
+    assert engine.root(root) is None
+    assert engine.job['errors']
+
+
+def test_hardlinks_special_files_and_unknown_names(env):
+    hard = put(env.cache / ('online_x.' + 'a' * 32 + '.part'))
+    os.link(hard, env.cache / 'backup')
+    fifo = env.cache / ('online_fifo.' + 'b' * 32 + '.part')
+    os.mkfifo(fifo)
+    unknown = put(env.cache / 'random.part')
+    directory = env.cache / ('online_dir.' + 'a' * 32 + '.part')
+    directory.mkdir()
+    nested = put(directory / 'unknown')
+    run(env)
+    assert all(p.exists() for p in (hard, fifo, unknown, nested))
+
+
+def test_identity_replacement_before_unlink(env):
+    path = put(env.cache / ('online_song.' + 'a' * 32 + '.part'))
+    original = asyncio.sleep
+    changed = False
+
+    async def replace(delay):
+        nonlocal changed
+        if not changed:
+            changed = True
+            path.unlink()
+            put(path, b'new file')
+        await original(0)
+
+    with patch.object(m.asyncio, 'sleep', replace):
+        job = run(env)
+    assert path.read_bytes() == b'new file'
+    assert job['skipped']
+
+
+def test_failure_continues(env):
+    bad = put(env.cache / 'covers' / ('a' * 40 + '.jpg'), age=8 * m.DAY)
+    good = put(env.cache / 'covers' / ('b' * 40 + '.jpg'), age=8 * m.DAY)
+    original = os.unlink
+
+    def unlink(name, **kwargs):
+        if name == bad.name:
+            raise PermissionError('denied')
+        return original(name, **kwargs)
+
+    with patch.object(m.os, 'unlink', unlink):
+        job = run(env)
+    assert bad.exists() and not good.exists() and job['errors']
+
+
+def test_cache_cover_and_temporary_ages(env):
+    entries = [
+        ('covers/' + 'a' * 40 + '.jpg', 8 * m.DAY, False),
+        ('covers/' + 'b' * 40 + '.png', 6 * m.DAY, True),
+        ('covers/g_' + 'a' * 40 + '.url', 15 * m.DAY, False),
+        ('covers/g_' + 'b' * 40 + '.url', 13 * m.DAY, True),
+        ('covers/tmpabcd.tmp', 2 * m.DAY, False),
+        ('covers/tmpnew.tmp', 10, True),
+        ('covers/user.jpg', 99 * m.DAY, True),
+        ('online_x.' + 'a' * 32 + '.part', 2 * m.DAY, False),
+        ('online_x.12345678-1234-1234-1234-123456789abc.part', 2 * m.DAY, False),
+        ('data.json.abcdef12.part', 2 * m.DAY, False),
+        ('data.json.abcdef12.part.more', 2 * m.DAY, True),
+        ('anything.part', 2 * m.DAY, True),
+        ('online_y.' + 'a' * 32 + '.part', 1, True),
+    ]
+    paths = [(put(env.cache / name, age=age), keep) for name, age, keep in entries]
+    run(env)
+    for path, keep in paths:
+        assert path.exists() == keep, path
+
+
+def test_rolling_only_excess_no_refs_no_library_audio(env):
+    old = put(env.cache / 'online_old.mp3', age=4 * m.DAY)
+    new = put(env.cache / 'online_new.mp3')
+    owned = put(env.cache / 'online_owned.mp3', age=5 * m.DAY)
+    ref(env, owned.with_suffix(''), 'online_owned.ref')
+    ordinary = put(env.cache / 'personal.mp3', age=5 * m.DAY)
+    library = put(env.library / 'online_old.mp3', age=5 * m.DAY)
+    run(env)
+    assert not old.exists()
+    assert all(p.exists() for p in (new, owned, ordinary, library))
+
+
+def test_rolling_disabled_when_saving_or_db_unknown(env):
+    old = put(env.cache / 'online_old.mp3', age=4 * m.DAY)
+    put(env.cache / 'online_new.mp3')
+    env.runtime.CONF['tee_save_enabled'] = True
+    run(env)
+    assert old.exists()
+    env.runtime.CONF['tee_save_enabled'] = False
+    env.db.unlink()
+    run(env)
+    assert old.exists()
+
+
+def test_valid_ref_and_outside_ref_are_kept(env, tmp_path):
+    song = put(env.library / 'song.mp3')
+    valid = ref(env, song, 'valid.ref')
+    external = ref(env, tmp_path / 'outside', 'external.ref')
+    invalid = put(env.cache / 'invalid.ref', '../escape')
+    run(env)
+    assert all(p.exists() for p in (song, valid, external, invalid))
+
+
+@pytest.mark.parametrize('audio', [False, True])
+def test_provenance_images_and_shared_cover(env, audio):
+    stem = env.library / 'song'
+    ref(env, stem)
+    image = put(stem.with_suffix('.jpg'))
+    cover = put(env.library / 'cover.jpg')
+    user = put(env.library / 'unowned.png')
+    if audio:
+        put(env.library / 'nested' / 'other.FLAC')
+    run(env)
+    assert not image.exists()
+    assert cover.exists() == audio
+    assert user.exists()
+
+
+def test_young_orphan_image_preserves_ref_until_second_cleanup(env):
+    stem = env.library / 'song'
+    marker = ref(env, stem)
+    image = put(stem.with_suffix('.jpg'), age=60)
+    first = run(env)
+    assert image.exists() and marker.exists()
+    assert first['categories']['refs']['removed'] == 0
+    future = m.time.time() + 2 * m.DAY
+    with patch.object(m.time, 'time', return_value=future):
+        run(env)
+    assert not image.exists() and not marker.exists()
+
+
+def test_shared_cover_retention_preserves_ref_across_cleanup(env):
+    stem = env.library / 'song'
+    marker = ref(env, stem)
+    cover = put(env.library / 'cover.jpg')
+    audio = put(env.library / 'nested' / 'other.mp3')
+    run(env)
+    assert cover.exists() and marker.exists()
+    audio.unlink()
+    run(env)
+    assert not cover.exists() and not marker.exists()
+
+
+def test_paired_images_and_unknown_subtree_kept(env, tmp_path):
+    stem = env.library / 'song'
+    ref(env, stem)
+    image = put(stem.with_suffix('.png'))
+    cover = put(env.library / 'cover.jpg')
+    put(stem.with_suffix('.mp3'))
+    (env.library / 'link').symlink_to(tmp_path, target_is_directory=True)
+    run(env)
+    assert image.exists() and cover.exists()
+
+
+def test_recommend_fallback_liked_slots_and_future(env):
+    folder = env.home / 'recommend_cache' / 'user'
+    today = put(folder / 'daily-20261019.json', {'day': '20261019', 'status': 'ready', 'tracks': [{}]})
+    redundant = put(folder / 'daily-20261019.fallback.json')
+    needed = put(folder / 'hot-20261019.fallback.json')
+    old = put(folder / 'daily-20261018.json')
+    old_fallback = put(folder / 'hot-20261018.fallback.json')
+    future = put(folder / 'daily-20261020.json')
+    liked = put(folder / 'liked.json')
+    user = put(folder / 'user.json')
+    slot = put(folder.parent / '_source-slot-20261018.json')
+    today_slot = put(folder.parent / '_source-slot-20261019.json')
+    run(env)
+    assert all(p.exists() for p in (today, needed, future, liked, user, today_slot))
+    assert not any(p.exists() for p in (old, old_fallback, redundant, slot))
+
+
+@pytest.mark.parametrize('payload', [{}, {'day': '20261019', 'status': 'ready', 'tracks': []},
+                                     {'day': '20261018', 'status': 'ready', 'tracks': [{}]}])
+def test_invalid_fresh_bundle_does_not_destroy_fallback(env, payload):
+    folder = env.home / 'recommend_cache' / 'user'
+    put(folder / 'daily-20261019.json', payload)
+    fallback = put(folder / 'daily-20261019.fallback.json')
+    run(env)
+    assert fallback.exists()
+
+
+def test_public_saved_at_not_mtime_and_private_state(env):
+    folder = env.home / 'public_playlists_cache'
+    old = put(folder / ('tracks-' + 'a' * 24 + '.json'), {'savedAt': m.time.time() - 2 * m.DAY}, age=0)
+    fresh = put(folder / ('summary-' + 'b' * 24 + '.json'), {'savedAt': m.time.time()}, age=99 * m.DAY)
+    invalid = put(folder / ('tracks-' + 'c' * 24 + '.json'), {'savedAt': 'old'})
+    private = [put(env.home / p) for p in ('liked.json', 'album_registry.json', 'bind_registry.json',
+               'play_history/user.json', 'online_favorites/a.json', 'playlist_tracks/a.json', 'credentials.json')]
+    run(env)
+    assert not old.exists()
+    assert all(p.exists() for p in [fresh, invalid] + private)
+
+
+@pytest.mark.parametrize('active', [False, True])
+def test_hls_session_guard_and_unknown_content(env, active):
+    folder = env.cache / 'hls' / 'online_song'
+    segment = put(folder / '00000.m4s')
+    init = put(folder / 'init.mp4')
+    unknown = put(folder / 'user.bin')
+    if active:
+        env.runtime.tc._SESSIONS['x'] = object()
+    run(env)
+    # Unknown content makes the whole session ineligible, even when inactive.
+    assert segment.exists() and init.exists()
+    assert folder.exists() and unknown.exists()
+
+
+def hls(env, name, status='done', age=2 * m.DAY, size=1):
+    folder = env.cache / 'hls' / name
+    state = put(folder / 'state.json', {'guid': 'online:' + name, 'status': status,
+                                        'declared_count': 1}, age=age)
+    init = put(folder / 'init.mp4', age=age)
+    segment = put(folder / '00000.m4s', age=age)
+    if size > 1:
+        with segment.open('r+b') as stream:
+            stream.truncate(size)
+        os.utime(segment, (state.stat().st_mtime, state.stat().st_mtime))
+    return folder, state, init, segment
+
+
+def test_complete_hls_below_quota_retained_regardless_age(env):
+    paths = hls(env, 'complete', age=99 * m.DAY)
+    run(env)
+    assert all(p.exists() for p in paths)
+
+
+@pytest.mark.parametrize('status,age,active,keep', [
+    ('failed', 2 * m.DAY, False, False), ('running', 10, False, True),
+    ('failed', 2 * m.DAY, True, True), ('done', 2 * m.DAY, False, True)])
+def test_hls_incomplete_age_session_policy(env, status, age, active, keep):
+    folder, state, init, segment = hls(env, 'session', status=status, age=age)
+    if active:
+        env.runtime.tc._SESSIONS['anything'] = object()
+    run(env)
+    assert state.exists() == keep and segment.exists() == keep and init.exists() == keep
+    assert folder.exists()  # No recursive deletion.
+
+
+def test_complete_hls_quota_uses_oldest_state_mtime(env):
+    env.runtime.CONF['transcode_cache_max_mb'] = 16
+    old = hls(env, 'old', age=3 * m.DAY, size=9 * 1024 * 1024)
+    new = hls(env, 'new', age=2 * m.DAY, size=9 * 1024 * 1024)
+    run(env)
+    assert not any(p.exists() for p in old[1:])
+    assert all(p.exists() for p in new)
+
+
+def test_hls_quota_active_and_unknown_directory_protection(env):
+    env.runtime.CONF['transcode_cache_max_mb'] = 16
+    paths = hls(env, 'large', size=17 * 1024 * 1024)
+    env.runtime.tc._SESSIONS['anything'] = object()
+    run(env)
+    assert all(p.exists() for p in paths)
+    env.runtime.tc._SESSIONS.clear()
+    unknown = put(paths[0] / 'user.txt')
+    run(env)
+    assert unknown.exists() and all(p.exists() for p in paths)
+
+
+def test_unknown_hls_state_and_fresh_incomplete_files_retained(env):
+    folder, state, init, segment = hls(env, 'session', status='failed')
+    state.write_text('{"user":"data"}')
+    run(env)
+    assert all(p.exists() for p in (state, init, segment))
+    put(state, {'guid': 'online:session', 'status': 'failed', 'declared_count': 1})
+    put(segment, age=10)
+    run(env)
+    assert all(p.exists() for p in (state, init, segment))
+
+
+def test_hls_known_files_without_state_can_be_cleaned(env):
+    segment = put(env.cache / 'hls' / 'broken' / '00000.m4s')
+    run(env)
+    assert not segment.exists()
+
+
+def test_configured_cache_directories_and_default_both_scanned(env, tmp_path):
+    rec = tmp_path / 'configured_recommend'
+    public = tmp_path / 'configured_public'
+    fav = tmp_path / 'configured_fav'
+    plt = tmp_path / 'configured_plt'
+    env.runtime.dailyrec.recommend_cache_dir = lambda: str(rec)
+    env.runtime.pubpl = SimpleNamespace(cache_dir=lambda: str(public))
+    env.runtime.CONF.update(fav_dir=str(fav), plt_dir=str(plt))
+    paths = [put(rec / 'user' / 'daily-20261018.json'),
+             put(public / ('summary-' + 'a' * 24 + '.json'), {'savedAt': m.time.time() - 2 * m.DAY}),
+             put(fav / 'user.json.abcdef12.part'), put(plt / 'u' / 'list.json.abcdef12.part'),
+             put(env.home / 'recommend_cache' / 'user' / 'daily-20261018.json')]
+    liked = put(rec / 'user' / 'liked.json')
+    favorite = put(fav / 'user.json')
+    run(env)
+    assert not any(p.exists() for p in paths)
+    assert liked.exists() and favorite.exists()
+
+
+def manifest(env, entries):
+    put(env.home / 'proxy' / 'maintenance_test_hashes.json', entries)
+
+
+@pytest.mark.parametrize('git', [None, 'file', 'directory', 'ancestor'])
+def test_hash_whitelist_only_without_git(env, git):
+    exact = put(env.home / 'proxy/tests/test_old.py', b'known test')
+    modified = put(env.home / 'proxy/tests/test_modified.py', b'local edit')
+    unlisted = put(env.home / 'proxy/tests/test_user.py')
+    source = put(env.home / 'proxy/app.py', b'source')
+    digest = lambda data: hashlib.sha256(data).hexdigest()
+    manifest(env, {'proxy/tests/test_old.py': [digest(b'known test')],
+                   'proxy/tests/test_modified.py': [digest(b'original')],
+                   'proxy/app.py': [digest(b'source')], '../test_escape.py': [digest(b'x')]})
+    if git == 'file':
+        put(env.home / '.git', 'gitdir: anywhere')
+    elif git == 'directory':
+        (env.home / '.git').mkdir()
+    elif git == 'ancestor':
+        put(env.home.parent / '.git')
+    run(env)
+    assert exact.exists() == bool(git)
+    assert all(p.exists() for p in (modified, unlisted, source))
+    assert exact.parent.exists()  # Never recursive directory deletion.
+
+
+def test_details_are_bounded_and_loop_yields(env):
+    for i in range(220):
+        put(env.cache / f'{i}.json.abcdef12.part')
+    beats = 0
+
+    async def scenario():
+        nonlocal beats
+        job = {}
+        task = asyncio.create_task(m.run_cleanup(env.runtime, job))
+        while not task.done():
+            beats += 1
+            await asyncio.sleep(0)
+        await task
+        return job
+
+    job = asyncio.run(scenario())
+    assert job['removed'] == 220
+    assert len(job['details']) <= m.DETAIL_LIMIT
+    assert beats > 10
+
+
+def test_conf_database_precedes_dailyrec_default(env):
+    env.runtime.CONF['music_db'] = str(env.db)
+    env.runtime.dailyrec.music_db_path = lambda: '/missing/default.db'
+    lyric = put(env.library / 'orphan.lrc')
+    ref(env, lyric.with_suffix(''))
+    run(env)
+    assert not lyric.exists()
+
+
+def test_database_mutation_after_snapshot_retains_attachments(env):
+    lyric = put(env.library / 'orphan.lrc')
+    ref(env, lyric.with_suffix(''))
+    original = m._Engine.prepare_database
+
+    async def changed(engine):
+        await original(engine)
+        with sqlite3.connect(env.db) as con:
+            con.execute('INSERT INTO audio_file VALUES (?)', (str(lyric.with_suffix('.mp3')),))
+
+    with patch.object(m._Engine, 'prepare_database', changed):
+        run(env)
+    assert lyric.exists()
+
+
+def test_media_and_home_known_temporaries_only(env):
+    audio = put(env.library / 'nested' / 'online_song.mp3')
+    media_temp = put(env.library / 'nested' / ('online_song.' + 'a' * 32 + '.part'))
+    unknown = put(env.library / 'nested' / 'user.part')
+    fav = put(env.home / 'online_favorites' / 'user.json')
+    fav_temp = put(env.home / 'online_favorites' / 'user.json.abcdef12.part')
+    plt_temp = put(env.home / 'playlist_tracks' / 'u' / 'list.json.abcdef12.part')
+    unrelated_temp = put(env.home / 'play_history' / 'user.json.abcdef12.part')
+    run(env)
+    assert all(p.exists() for p in (audio, unknown, fav, unrelated_temp))
+    assert not any(p.exists() for p in (media_temp, fav_temp, plt_temp))
+
+
+def test_database_read_offloaded_but_unlink_on_main_thread(env):
+    import threading
+    main = threading.get_ident()
+    read_threads, unlink_threads = [], []
+    original_db = m._db_paths
+    original_unlink = os.unlink
+    put(env.cache / 'a.json.abcdef12.part')
+
+    def database(runtime):
+        read_threads.append(threading.get_ident())
+        return original_db(runtime)
+
+    def unlink(*args, **kwargs):
+        unlink_threads.append(threading.get_ident())
+        return original_unlink(*args, **kwargs)
+
+    with patch.object(m, '_db_paths', database), patch.object(m.os, 'unlink', unlink):
+        run(env)
+    assert read_threads and all(t != main for t in read_threads)
+    assert unlink_threads and all(t == main for t in unlink_threads)
+
+
+def test_album_registry_ttl_invalid_and_nonpersist_memory(env):
+    now = m.time.time()
+    rows = [{'track_guid': 'old', 'saved_at': now - 15 * m.DAY},
+            {'track_guid': 'warm', 'saved_at': now - 15 * m.DAY},
+            {'track_guid': 'fresh', 'saved_at': now},
+            {'track_guid': 'uncertain'}, {'track_guid': ''}, 'bad']
+    path = put(env.home / 'album_registry.json', {'version': 1, 'savedAt': now, 'entries': rows})
+    env.runtime._FAKE_ALBUM_REGISTRY = {
+        'old': {'track_guid': 'old', 'persist': True},
+        'warm': {'track_guid': 'warm', 'persist': False},
+        'fresh': {'track_guid': 'fresh', 'persist': True}}
+    job = run(env)
+    assert [r['track_guid'] for r in json.loads(path.read_text())['entries']] == ['fresh', 'uncertain']
+    assert set(env.runtime._FAKE_ALBUM_REGISTRY) == {'warm', 'fresh'}
+    assert job['categories']['album_registry']['entries_removed'] == 4
+    assert any(d.get('entries_removed') == 4 for d in job['details'])
+
+
+@pytest.mark.parametrize('loaded', [False, True])
+def test_bind_registry_preserves_intents_and_syncs_memory(env, loaded):
+    now = m.time.time()
+    entries = {
+        'live': {'official': 'official-guid', 'fav': True, 'at': now - 40 * m.DAY},
+        'playlist': {'official': 'official-guid', 'playlists': ['playlist-id'], 'at': now},
+        'pending': {'fav': True, 'at': now - 40 * m.DAY},
+        'fresh': {'official': 'official-guid', 'at': now},
+        'uncertain': {'official': 'official-guid'},
+        'expired': {'official': 'official-guid', 'at': now - 40 * m.DAY},
+        'invalid': {}, 'bad': 'not an entry'}
+    path = put(env.home / 'bind_registry.json', {'u': entries})
+    env.runtime._bind_registry_loaded = loaded
+    env.runtime._bind_registry = {'u': dict(entries)} if loaded else {}
+    original_memory = env.runtime._bind_registry
+    job = run(env)
+    expected = {'live', 'playlist', 'pending', 'fresh', 'uncertain'}
+    assert set(json.loads(path.read_text())['u']) == expected
+    assert env.runtime._bind_registry is original_memory
+    assert set(original_memory['u']) == expected
+    assert env.runtime._bind_registry_loaded
+    assert job['categories']['bind_registry']['entries_removed'] == 3
+
+
+def test_registry_rewrite_failure_does_not_mutate_memory(env):
+    path = put(env.home / 'album_registry.json', {'entries': [{'track_guid': 'old', 'saved_at': 1}]})
+    env.runtime._FAKE_ALBUM_REGISTRY = {'old': {'track_guid': 'old', 'persist': True}}
+    original = path.read_bytes()
+    with patch.object(m.os, 'replace', side_effect=PermissionError('no replace')):
+        job = run(env)
+    assert path.read_bytes() == original
+    assert 'old' in env.runtime._FAKE_ALBUM_REGISTRY
+    assert not list(env.home.glob('*.part'))
+    assert job['errors']
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'hardlink'])
+def test_registry_unsafe_target_retained(env, tmp_path, kind):
+    target = put(tmp_path / 'target.json', {'entries': [{'track_guid': 'old', 'saved_at': 1}]})
+    path = env.home / 'album_registry.json'
+    if kind == 'symlink':
+        path.symlink_to(target)
+    else:
+        os.link(target, path)
+    run(env)
+    assert json.loads(target.read_text())['entries']
+
+
+def test_cancellation_propagates(env):
+    put(env.cache / 'a.json.abcdef12.part')
+
+    async def scenario():
+        job = {}
+        task = asyncio.create_task(m.run_cleanup(env.runtime, job))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert job['status'] == 'cancelled'
+
+    asyncio.run(scenario())

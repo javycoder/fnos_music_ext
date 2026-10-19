@@ -286,8 +286,11 @@ verify_acceptance() {
     fi
     log_info "验收 6a 通过：未登录拒绝正确透传，耗时 ${time_total}s (< 3s)。"
 
-    # 6b. 在线音频取流与全链路测试 (Range: bytes=0-1048575 -> 200/206)
-    log_info "验收 6b: 验证在线播放全链路取流 (Range 200/206 及数据流传输)..."
+    # 6b. 音源搜索连通性检查（issue #62）。
+    # 不再经代理播放接口自动取流验收：取流会触发边听边存，让《晴天》等探针
+    # 歌曲在用户未播放、未收藏的情况下被自动下载进曲库。实际播放由用户在
+    # 客户端手动触发，这里只确认音源搜索链路可用。
+    log_info "验收 6b: 验证音源搜索连通性（在线取流不自动验收，由用户手动试播）..."
 
     local probe_keywords=("晴天" "海阔天空" "稻香")
     local search_any_result=0
@@ -344,64 +347,19 @@ except Exception:
         fi
     }
 
-    # 对指定 guid 尝试全链路取流，成功返回 0
-    try_probe_stream() {
-        local probe_id="$1"
-        local stream_guid="online:${probe_id}"
-        local stream_sock="http://localhost/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_https="https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_http="http://127.0.0.1:${GW_HTTP_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_443="https://127.0.0.1/music/api/v1/track/stream?guid=${stream_guid}"
-        local out_file http_code recv_size=0
-        out_file="$(mktemp)"
-        log_info "试播 guid=${stream_guid}"
-        http_code="$(curl -s -o "${out_file}" -w "%{http_code}" --unix-socket "${TARGET_SOCK}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_sock}" 2>/dev/null || echo "000")"
-        if [ "${http_code}" = "000" ]; then
-            log_warn "socket 取流异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT}) 取流..."
-            http_code="$(curl -sk -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_https}" 2>/dev/null || echo "000")"
-        fi
-        if [ "${http_code}" = "000" ]; then
-            log_warn "网关 https 端口取流异常，尝试 fallback 访问网关 http 端口 (${GW_HTTP_PORT}) 取流..."
-            http_code="$(curl -s -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_http}" 2>/dev/null || echo "000")"
-        fi
-        if [ "${http_code}" = "000" ]; then
-            log_warn "网关 http 端口取流异常，尝试 fallback 访问 443 端口取流..."
-            http_code="$(curl -skL -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_443}" 2>/dev/null || echo "000")"
-        fi
-        if [ -f "${out_file}" ]; then
-            recv_size="$(wc -c < "${out_file}" | tr -d ' ')"
-            rm -f "${out_file}"
-        fi
-        if { [ "${http_code}" = "206" ] || [ "${http_code}" = "200" ]; } && [ "${recv_size}" -gt 10000 ]; then
-            if [ "${recv_size}" -lt 500000 ]; then
-                log_warn "在线音频流接收大小为 ${recv_size} 字节 (偏小但已收到有效数据)。"
-            else
-                log_info "在线音频流接收大小为 ${recv_size} 字节 (≈1MB)。"
-            fi
-            return 0
-        fi
-        log_warn "取流未成功: guid=${stream_guid} HTTP=${http_code} recv=${recv_size}B"
-        return 1
-    }
-
     local sources=()
     [ "${ENABLE_MUSICDL}" -eq 1 ] && sources+=("musicdl")
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
     [ "${ENABLE_LX}" -eq 1 ] && sources+=("lxmusic")
 
-    local src kw id first_failed_lx_id=""
+    local src kw id
     for src in "${sources[@]}"; do
         for kw in "${probe_keywords[@]}"; do
             while IFS= read -r id; do
                 [ -z "${id}" ] && continue
                 search_any_result=1
-                if [ "${src}" = "lxmusic" ] && [ -z "${first_failed_lx_id}" ]; then
-                    first_failed_lx_id="${id}"
-                fi
-                if try_probe_stream "${id}"; then
-                    log_info "验收 6b 通过：音源 ${src} 在线播放流取流成功。"
-                    return 0
-                fi
+                log_info "验收 6b 通过：音源 ${src} 搜索链路可用 (关键词「${kw}」返回结果)。"
+                return 0
             done < <(search_probe_ids "${src}" "${kw}")
         done
     done
@@ -409,17 +367,8 @@ except Exception:
     # 外部音源网络波动不阻断部署：仅输出警告，绝不触发 return 1 / rollback
     if [ "${search_any_result}" -eq 0 ]; then
         log_warn "所有已启用音源 (${sources[*]}) 搜索结果均为空：可能是外部网络异常或第三方平台限流。"
-    else
-        log_warn "所有候选歌曲均未能成功取流 (外部音源网络波动，不阻断部署)。"
-        if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${first_failed_lx_id}" ]; then
-            local lx_diag
-            lx_diag="$(curl -s --max-time 5 "${LX_URL}/api/v1/track/url?id=${first_failed_lx_id}&quality=standard" 2>/dev/null || echo "")"
-            if [ -n "${lx_diag}" ]; then
-                log_warn "洛雪音源直链诊断返回数据（正文已隐藏）。"
-            fi
-        fi
     fi
-    log_warn "跳过在线播放自动验收，建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
+    log_warn "在线播放取流不做自动验收（避免自动触发边听边存下载），请稍后在飞牛音乐 Web 端手动搜索试播验证。"
     return 0
 }
 

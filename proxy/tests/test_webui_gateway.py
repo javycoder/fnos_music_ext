@@ -1,6 +1,7 @@
 """桌面网关 socket 把 HTTP 原样转到 WebUI 端口；/api/host-file、/api/fs-check 由网关本地处理。"""
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -316,3 +317,89 @@ def test_fs_check_only_post_intercepted(tmp_path: Path):
     data = _request(sock_path, b"GET /app/fnmusic-ext/api/fs-check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     upstream.shutdown()
     assert b"/app/fnmusic-ext/api/fs-check" in data
+
+
+def _maintenance_request(method="POST", path="/api/maintenance/cleanup",
+                         body=b'{"confirm_beta":true}', admin="true", extra=b""):
+    return (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+            f"X-Trim-Isadmin: {admin}\r\nContent-Length: {len(body)}\r\n".encode()
+            + extra + b"\r\n" + body)
+
+
+@pytest.mark.parametrize("admin", ["false", "", "1"])
+def test_maintenance_requires_admin(tmp_path, admin):
+    sock = _start_gateway(tmp_path, 1)
+    data = _request(sock, _maintenance_request(admin=admin))
+    assert data.startswith(b"HTTP/1.1 403")
+
+
+@pytest.mark.parametrize("body", [b'{}', b'{"confirm_beta":false}', b'{"confirm_beta":1}',
+                                   b'{"confirm_beta":true,"path":"/tmp"}', b'[]', b'null'])
+def test_maintenance_requires_only_explicit_confirmation(tmp_path, body):
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request(body=body)).startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/api/maintenance/cleanup/" + "g" * 32),
+    ("GET", "/api/maintenance/cleanup/" + "a" * 31),
+    ("GET", "/api/maintenance/cleanup/" + "a" * 33),
+    ("GET", "/api/maintenance/cleanup/" + "a" * 32 + "?path=/tmp"),
+    ("DELETE", "/api/maintenance/cleanup"),
+    ("POST", "/app/fnmusic-ext/api/maintenance/unknown"),
+])
+def test_unknown_maintenance_never_reaches_webui(tmp_path, method, path):
+    # No upstream exists: only a local rejection can produce this HTTP response.
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request(method, path)).startswith(b"HTTP/1.1 404")
+
+
+def test_maintenance_unreachable_is_503(tmp_path, monkeypatch):
+    monkeypatch.setattr(_MOD, "MAINTENANCE_SOCKET", str(tmp_path / "absent.sock"))
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request()).startswith(b"HTTP/1.1 503")
+
+
+@pytest.mark.parametrize("extra", [b"Transfer-Encoding: chunked\r\n", b"Content-Length: 1\r\n",
+                                    b"X-Trim-Isadmin: false\r\n",
+                                    b"Long: " + b"x" * 16384 + b"\r\n"])
+def test_maintenance_rejects_bad_headers(tmp_path, extra):
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request(extra=extra)).startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.parametrize("prefix", ["", "/app/fnmusic-ext"])
+def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
+    spec = importlib.util.spec_from_file_location(
+        "maintenance_socket", Path(__file__).resolve().parents[1] / "maintenance_socket.py")
+    maintenance = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(maintenance)
+    private_path = tmp_path / "maintenance.sock"
+    monkeypatch.setattr(_MOD, "MAINTENANCE_SOCKET", str(private_path))
+    gateway_path = _start_gateway(tmp_path, 1)
+
+    async def run():
+        calls = []
+        job = "a" * 32
+
+        async def callback(method, path, body):
+            calls.append((method, path, body))
+            if method == "POST":
+                return 202, {"job_id": job, "state": "pending"}
+            return 200, {"job_id": job, "state": "done", "deleted": 7}
+
+        server = await maintenance.start(asyncio.get_running_loop(), callback, private_path)
+        try:
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                path=prefix + "/api/maintenance/cleanup"))
+            assert data.startswith(b"HTTP/1.1 202")
+            assert json.loads(data.split(b"\r\n\r\n")[1]) == {"job_id": job, "state": "pending"}
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                "GET", prefix + "/api/maintenance/cleanup/" + job, b""))
+            assert data.startswith(b"HTTP/1.1 200")
+            assert json.loads(data.split(b"\r\n\r\n")[1]) == {"job_id": job, "state": "done", "deleted": 7}
+            assert calls == [("POST", "/api/maintenance/cleanup", {"confirm_beta": True}),
+                             ("GET", "/api/maintenance/cleanup/" + job, {})]
+        finally:
+            await maintenance.stop(server)
+    asyncio.run(run())

@@ -93,11 +93,12 @@ rsync -a --delete \
     --include='.env.example' \
     --exclude='.env' --exclude='.env.*' \
     --exclude='.git/' --exclude='.git*' \
-    --exclude='.github/' --exclude='.zcode/' --exclude='.cursor/' \
+    --exclude='.github/' --exclude='.zcode/' --exclude='.cursor/' --exclude='.agents/' \
     --exclude='.tasks_archive/' --exclude='.tools/' \
     --exclude='packaging/' --exclude='dist/' \
     --exclude='tests/' --exclude='docs/' --exclude='pytest.ini' \
-    --exclude='CONTRIBUTING.md' \
+    --exclude='CONTRIBUTING.md' --exclude='AGENTS.md' \
+    --exclude='test_*.py' --exclude='test_*.js' --exclude='conftest.py' --exclude='smoke_test.sh' \
     --exclude='.venv*/' --exclude='__pycache__/' --exclude='.pytest_cache/' \
     --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' --exclude='logs/' --exclude='/logs' \
     --exclude='*.part' --exclude='.DS_Store' \
@@ -105,6 +106,7 @@ rsync -a --delete \
     --exclude='musicbox-data/' --exclude='musicdl_outputs/' \
     --exclude='recommend_cache/' --exclude='public_playlists_cache/' --exclude='play_history/' \
     --exclude='online_favorites/' --exclude='online_favorites.json' \
+    --exclude='playlist_tracks/' --exclude='album_registry.json' --exclude='bind_registry.json' \
     --exclude='*.fpk' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
 

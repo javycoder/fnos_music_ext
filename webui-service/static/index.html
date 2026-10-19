@@ -215,7 +215,7 @@
       <section class="page" id="page-tee">
         <h2>边听边存</h2>
         <div class="card">
-          <label class="switch-row"><span>边听边存<div class="sub">完整试听在线歌后自动保存到本地曲库</div></span><input type="checkbox" id="tee-enabled"></label>
+          <label class="switch-row"><span>边听边存<div class="sub">在线试听时，歌曲下载完整即保存到本地曲库，不必听完整首</div></span><input type="checkbox" id="tee-enabled"></label>
           <label class="switch-row"><span>自动下载封面<div class="sub">自动保存到本地的歌曲会顺带把封面一起下回来，直接嵌进音频文件里；飞牛音乐认的就是内嵌封面，这样官方 App 里下载的歌就有图。歌曲保存成功后才会去下封面，不会出现只有封面没有歌的垃圾文件。默认开启。</div></span><input type="checkbox" id="auto-cover"></label>
           <label class="switch-row"><span>自动下载歌词<div class="sub">自动保存到本地的歌曲在完整下载成功后，自动下载同名 .lrc 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放就能显示歌词。歌曲下载成功后才会去下歌词，不会出现只有歌词没有歌的垃圾文件。酷我源的歌词接口已失效，暂无歌词。默认关闭。</div></span><input type="checkbox" id="lyric-auto-dl"></label>
           <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
@@ -236,6 +236,13 @@
             <input class="input" id="scan-path" placeholder="留空=官方自动扫描入库">
           </label>
           <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口无公开文档，可从 FNMUSIC_TRACE_FORWARD=detail 取证日志捕获后填入以加速官方入库。</p>
+        </div>
+        <div class="card">
+          <div class="card-title">清理垃圾文件 <span class="badge">Beta</span></div>
+          <p class="hint">清理可能遗留的垃圾文件。此功能可能误删歌曲、封面、歌词等文件，删除后无法自动恢复，请谨慎操作。</p>
+          <button class="btn" id="cleanup-open-btn" type="button">清理垃圾文件（Beta）</button>
+          <p id="cleanup-status" role="status" aria-live="polite"></p>
+          <pre class="update-changelog" id="cleanup-details" hidden></pre>
         </div>
       </section>
 
@@ -337,6 +344,17 @@
   <div class="save-bar" id="save-bar">
     <span id="save-note" class="muted"></span>
     <button class="btn primary" id="save-btn">保存并生效</button>
+  </div>
+
+  <div class="modal-mask" id="cleanup-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cleanup-modal-title" aria-describedby="cleanup-warning">
+      <div class="modal-title" id="cleanup-modal-title">清理垃圾文件（Beta）</div>
+      <p id="cleanup-warning">此功能为 Beta，可能误删歌曲、封面、歌词等文件，删除后无法自动恢复。是否确认执行？</p>
+      <div class="btn-row modal-actions">
+        <button class="btn" id="cleanup-cancel-btn" type="button">取消</button>
+        <button class="btn" id="cleanup-confirm-btn" type="button">确认执行</button>
+      </div>
+    </div>
   </div>
 
   <!-- 新版本详情弹窗 -->

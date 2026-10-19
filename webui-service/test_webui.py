@@ -1468,6 +1468,38 @@ def test_fs_check_endpoint_placeholder(env_file):
         assert denied.status_code == 403
 
 
+@pytest.mark.parametrize("method,path,payload", [
+    ("POST", "/api/maintenance/cleanup", {"confirm_beta": True}),
+    ("POST", "/api/maintenance/cleanup", {}),
+    ("GET", "/api/maintenance/cleanup/job-1", None),
+])
+def test_cleanup_endpoint_placeholder(env_file, method, path, payload):
+    """直连始终 501（不执行清理）；两个端点仍需管理员，兼容桌面路径前缀。"""
+    before = env_file.read_bytes()
+    for prefix in ("", "/app/fnmusic-ext"):
+        with authed_client() as client:
+            response = client.request(method, prefix + path, json=payload)
+            assert response.status_code == 501
+            assert response.json()["detail"] == "直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台"
+        with TestClient(webui.app) as client:
+            denied = client.request(method, prefix + path, json=payload)
+            assert denied.status_code == 403
+    assert env_file.read_bytes() == before
+
+
+def test_cleanup_beta_markup():
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    tee = html.split('id="page-tee"', 1)[1].split("</section>", 1)[0]
+    assert 'id="cleanup-open-btn"' in tee
+    assert "清理垃圾文件" in tee and "Beta" in tee
+    assert "下载完整即保存" in tee
+    assert "不必听完整首" in tee
+    assert "完整试听在线歌后" not in html
+    assert 'id="cleanup-modal" hidden' in html
+    assert 'aria-describedby="cleanup-warning"' in html
+    assert "此功能为 Beta，可能误删歌曲、封面、歌词等文件，删除后无法自动恢复。是否确认执行？" in html
+
+
 # ------------------------------------------------------------------ 网关管理员 ---
 
 def test_api_requires_admin(env_file):

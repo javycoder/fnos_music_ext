@@ -467,3 +467,116 @@ def test_env_hot_reload_new_keys(tmp_path, monkeypatch):
     finally:
         os.environ.pop("FNMUSIC_OFFICIAL_BIND_TIMEOUT_S", None)
         os.environ.pop("FNMUSIC_TEE_HANDOFF_MAX", None)
+
+
+# --------------------------------------------------------------------------
+# #67 回归：列表读取绝不补下载（路由级）
+# - pending 条目文件缺失时，反复读列表（跨节流窗口）+ 模拟代理重启（清空内存
+#   意图后再读），都只补登记绑定意图，不注册任何后台下载；
+# - 文件已存在的条目则照旧重试官方绑定。
+# --------------------------------------------------------------------------
+
+def _no_download_guards(monkeypatch):
+    downloads = []
+    monkeypatch.setattr(appmod, "_register_background_fetch", lambda *a, **k: downloads.append(a))
+    return downloads
+
+
+def test_favorite_list_route_never_downloads_missing_files(env, monkeypatch):
+    """收藏列表：pending 且无缓存文件 -> 跨节流窗口/重启模拟反复读取，零下载注册。"""
+    downloads = _no_download_guards(monkeypatch)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: None)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_online_favorites("user-a", [{
+        "guid": FAKE_KUWO1, "createdAt": 1, "bind": "pending", "track": snapshot,
+    }])
+
+    with TestClient(app) as client:
+        for _ in range(3):
+            resp = client.get("/music/api/v1/favorite-track/list", cookies={"music-token": "t"})
+            assert resp.status_code == 200
+            # 在线条目仍正常合入列表（列表渲染不受自愈节流影响）
+            assert any(it.get("guid") == appmod.fake_official_guid(FAKE_KUWO1)
+                       for it in resp.json()["data"]["list"])
+            # 意图被（重新）登记（重启恢复场景），但从未派发下载
+            assert FAKE_KUWO1 in appmod._bind_pending
+            assert downloads == []
+            appmod._bind_retry_last.clear()  # 跨节流窗口（>60s 后的等效读取）
+            # 模拟代理重启：内存意图清空，重启后首次列表读取
+            appmod._bind_pending.clear()
+            appmod._bind_tasks.clear()
+
+    assert downloads == []
+    assert appmod._full_fetch_tasks == {}
+
+
+def test_playlist_detail_route_never_downloads_missing_files(env, monkeypatch):
+    """歌单详情：官方歌单的 pending 在线条目 -> 反复读取，零下载注册。"""
+    downloads = _no_download_guards(monkeypatch)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: None)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot}],
+    })
+
+    with TestClient(app) as client:
+        for _ in range(3):
+            resp = client.get(
+                "/music/api/v1/track/playlist-detail/list",
+                params={"playlistGUID": PL_CUSTOM, "page": 1, "size": 50},
+                cookies={"music-token": "t"},
+            )
+            assert resp.status_code == 200
+            assert any(it.get("guid") == appmod.fake_official_guid(FAKE_KUWO1)
+                       for it in resp.json()["data"]["list"])
+            appmod._bind_retry_last.clear()
+            appmod._bind_pending.clear()
+            appmod._bind_tasks.clear()
+
+    assert downloads == []
+    assert appmod._full_fetch_tasks == {}
+
+
+def test_playlist_detail_route_retries_bind_only_for_existing_files(env, monkeypatch):
+    """歌单详情：已有缓存文件的 pending 条目重试官方绑定（不下载），缺失条目不动。"""
+    downloads = _no_download_guards(monkeypatch)
+    make_official_db(env["db_path"], with_track=True)
+    existing = env["dirs"]["library"] + "/f.mp3"
+
+    def fake_find(guid):
+        return existing if guid == FAKE_KUWO1 else None
+
+    monkeypatch.setattr(appmod, "find_cache_file", fake_find)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    missing = appmod.build_favorite_track_obj(
+        "online:kuwo:999999", {"title": "missing", "artist": "none",
+                               "id": "999999", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [
+            {"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot},
+            {"guid": "online:kuwo:999999", "addedAt": 2, "bind": "pending", "track": missing},
+        ],
+    })
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": PL_CUSTOM, "page": 1, "size": 50},
+            cookies={"music-token": "t"},
+        )
+        assert resp.status_code == 200
+        assert wait_for(lambda: upstream_posts(env["upstream_calls"], "/playlist/add-track"))
+
+    assert downloads == []
+    adds = upstream_posts(env["upstream_calls"], "/playlist/add-track")
+    assert adds and adds[0]["json"]["trackGUIDs"] == [OFFICIAL_GUID]

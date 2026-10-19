@@ -1,0 +1,84 @@
+import asyncio
+import sys
+import types
+
+import pytest
+
+import proxy.app as runtime
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_jobs_confirmation_dedup_status_and_failure(monkeypatch):
+    gate = asyncio.Event()
+
+    async def cleanup(rt, job):
+        assert rt is runtime
+        await gate.wait()
+        job["removed"] = 2
+
+    monkeypatch.setitem(sys.modules, "proxy.maintenance", types.SimpleNamespace(run_cleanup=cleanup))
+    monkeypatch.setattr(runtime, "_maintenance_jobs", {})
+    monkeypatch.setattr(runtime, "_maintenance_task", None)
+    status, _ = await runtime._maintenance_request("POST", "/api/maintenance/cleanup", {})
+    assert status == 400
+    status, first = await runtime._maintenance_request("POST", "/api/maintenance/cleanup", {"confirm_beta": True})
+    assert status == 200
+    _, second = await runtime._maintenance_request("POST", "/api/maintenance/cleanup", {"confirm_beta": True})
+    assert first["job"]["id"] == second["job"]["id"]
+    gate.set()
+    await runtime._maintenance_task
+    _, result = await runtime._maintenance_request("GET", "/api/maintenance/cleanup/" + first["job"]["id"], {})
+    assert result["job"]["status"] == "completed"
+    assert result["job"]["removed"] == 2
+    assert (await runtime._maintenance_request("GET", "/api/maintenance/cleanup/" + "0" * 32, {}))[0] == 404
+
+    async def broken(rt, job):
+        raise OSError("isolated test failure")
+
+    monkeypatch.setitem(sys.modules, "proxy.maintenance", types.SimpleNamespace(run_cleanup=broken))
+    _, started = await runtime._maintenance_request("POST", "/api/maintenance/cleanup", {"confirm_beta": True})
+    await runtime._maintenance_task
+    job = runtime._maintenance_jobs[started["job"]["id"]]
+    assert job["status"] == "failed"
+    assert "isolated test failure" in job["errors"]
+
+
+def test_cover_gc_respects_separate_ttls(tmp_path, monkeypatch):
+    import os
+    import time
+
+    covers = tmp_path / "covers"
+    covers.mkdir()
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(tmp_path))
+    monkeypatch.setattr(runtime, "_cover_disk_last_clean", 0)
+    image = covers / ("a" * 40 + ".jpg")
+    mapping = covers / ("g_" + "b" * 40 + ".url")
+    old_mapping = covers / ("g_" + "c" * 40 + ".url")
+    for file, days in ((image, 8), (mapping, 8), (old_mapping, 15)):
+        file.write_text("test")
+        t = time.time() - days * 86400
+        os.utime(file, (t, t))
+    runtime._cover_disk_gc()
+    assert not image.exists()
+    assert mapping.exists()
+    assert not old_mapping.exists()
+
+
+@pytest.mark.parametrize("kind", ["image", "mapping"])
+def test_failed_cover_write_cleans_actual_temp(tmp_path, monkeypatch, kind):
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(tmp_path))
+
+    def fail(*args):
+        raise OSError("test replace failure")
+
+    monkeypatch.setattr(runtime.os, "replace", fail)
+    if kind == "image":
+        runtime._cover_disk_write("https://example.invalid/cover", b"image", "image/jpeg")
+    else:
+        runtime._cover_guid_url_persist("online:kuwo:test", "https://example.invalid/cover")
+    assert list((tmp_path / "covers").iterdir()) == []

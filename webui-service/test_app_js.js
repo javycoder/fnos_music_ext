@@ -34,7 +34,8 @@ function stubEl() {
     removeChild(child) { return child; },
     remove() {},
     // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
-    dispatch(type) { (listeners[type] || []).slice().forEach((fn) => fn({ type })); },
+    dispatch(type, props = {}) { (listeners[type] || []).slice().forEach((fn) => fn({ type, ...props })); },
+    focus() { document.activeElement = this; },
     // 测试用：重置标量状态但保留元素身份与监听器——app.js 在加载期把监听器
     // 绑到元素上，元素必须终身同一个对象（真实 DOM 亦如此），不能整体换新
     _resetState() {
@@ -67,7 +68,7 @@ global.document = {
   },
   body: stubEl(),
 };
-global.window = { addEventListener() {} };
+global.window = stubEl();
 // 日志导出的 blob 下载链路（URL.createObjectURL + a[download]）
 const createdUrls = [];
 global.URL.createObjectURL = (blob) => { createdUrls.push(blob); return `blob:fake-${createdUrls.length}`; };
@@ -679,6 +680,101 @@ test("switchPage('about') 顺带触发检查更新", async () => {
   await new Promise((r) => realSetTimeout(r, 0));
   assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/update-check"));
   assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
+});
+
+const CLEANUP_PATH = "/app/fnmusic-ext/api/maintenance/cleanup";
+const cleanupResponse = (status, extra = {}) => ({ ok: true, job: {
+  id: "cleanup-1", status, phase: "scan", scanned: 10, removed: 2,
+  bytes: 1024, skipped: 8, errors: [], details: [], ...extra,
+} });
+
+test("清理 Beta：默认取消焦点，按钮/Escape/遮罩取消均不请求；卡片内点击不取消", () => {
+  global.openCleanupModal();
+  assert.strictEqual(document.activeElement, els.get("#cleanup-cancel-btn"));
+  window.dispatch("keydown", { key: "Tab", preventDefault() {} });
+  assert.strictEqual(document.activeElement, els.get("#cleanup-confirm-btn"));
+  window.dispatch("keydown", { key: "Tab", preventDefault() {} });
+  assert.strictEqual(document.activeElement, els.get("#cleanup-cancel-btn"));
+  els.get("#cleanup-cancel-btn").dispatch("click");
+  assert.strictEqual(els.get("#cleanup-modal").hidden, true);
+  assert.strictEqual(document.activeElement, els.get("#cleanup-open-btn"));
+  global.openCleanupModal();
+  window.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.strictEqual(els.get("#cleanup-modal").hidden, true);
+  global.openCleanupModal();
+  const mask = els.get("#cleanup-modal");
+  mask.dispatch("click", { target: {}, currentTarget: mask });
+  assert.strictEqual(mask.hidden, false);
+  mask.dispatch("click", { target: mask, currentTarget: mask });
+  assert.strictEqual(mask.hidden, true);
+  assert.strictEqual(fetchCalls.length, 0);
+});
+
+test("清理 Beta：确认 POST，双击及重复点击只展示同任务，GET 轮询进度至完成，详情安全输出", async () => {
+  enqueue(CLEANUP_PATH, cleanupResponse("running"));
+  global.openCleanupModal();
+  const first = global.startCleanup();
+  await global.startCleanup();
+  await first;
+  const post = fetchCalls.filter((c) => c.method === "POST");
+  assert.strictEqual(post.length, 1);
+  assert.deepStrictEqual(JSON.parse(post[0].body), { confirm_beta: true });
+  assert.ok(els.get("#cleanup-status").textContent.includes("清理中"));
+  assert.ok(els.get("#cleanup-status").textContent.includes("已扫描 10"));
+  enqueue(CLEANUP_PATH + "/cleanup-1", cleanupResponse("running", { scanned: 20 }));
+  global.openCleanupModal();
+  await tick(5);
+  assert.strictEqual(fetchCalls.filter((c) => c.method === "POST").length, 1);
+  assert.strictEqual(els.get("#cleanup-modal").hidden, true);
+  assert.ok(els.get("#cleanup-status").textContent.includes("已扫描 20"));
+  const attack = '<img src=x onerror="alert(1)">';
+  enqueue(CLEANUP_PATH + "/cleanup-1", cleanupResponse("completed", {
+    details: [attack, { path: attack }], errors: [attack],
+  }));
+  await tick(1100); // 真正触发自动 GET 轮询
+  assert.ok(els.get("#cleanup-status").textContent.includes("清理完成"));
+  assert.ok(els.get("#cleanup-status").textContent.includes("1024 字节"));
+  assert.ok(els.get("#cleanup-details").textContent.includes(attack));
+  assert.strictEqual(els.get("#cleanup-details").innerHTML, "");
+  assert.strictEqual(els.get("#cleanup-details").hidden, false);
+  const count = fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length;
+  await tick(1100);
+  assert.strictEqual(fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length, count); // terminal 状态停表
+});
+
+test("清理 Beta：查询失败保留任务，重试只 GET，failed 停止轮询", async () => {
+  enqueue(CLEANUP_PATH, cleanupResponse("running"));
+  global.openCleanupModal();
+  await global.startCleanup();
+  enqueue(CLEANUP_PATH + "/cleanup-1", new Error("离线"));
+  await global.pollCleanupJob();
+  assert.ok(els.get("#cleanup-status").textContent.includes("查询失败"));
+  enqueue(CLEANUP_PATH + "/cleanup-1", cleanupResponse("failed", { errors: ["无权限"] }));
+  global.openCleanupModal();
+  await tick(5);
+  assert.ok(els.get("#cleanup-status").textContent.includes("清理失败"));
+  assert.ok(els.get("#cleanup-details").textContent.includes("无权限"));
+  assert.strictEqual(fetchCalls.filter((c) => c.method === "POST").length, 1);
+  const count = fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length;
+  await tick(1100);
+  assert.strictEqual(fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length, count);
+});
+
+test("清理 Beta：501 直连错误可见；取消后确认无效；无效响应不启动轮询", async () => {
+  enqueue(CLEANUP_PATH, { __rawResponse: true, resp: {
+    ok: false, status: 501, json: async () => ({ detail: "直连模式不支持清理垃圾文件" }),
+  } });
+  global.openCleanupModal();
+  await global.startCleanup();
+  assert.ok(els.get("#cleanup-status").textContent.includes("直连模式不支持"));
+  global.openCleanupModal();
+  global.closeCleanupModal();
+  await global.startCleanup();
+  assert.strictEqual(fetchCalls.length, 1);
+  enqueue(CLEANUP_PATH, { ok: true });
+  global.openCleanupModal();
+  await global.startCleanup();
+  assert.ok(els.get("#cleanup-status").textContent.includes("响应格式无效"));
 });
 
 /* ------------------------------------------------ 运行 --------------------- */
