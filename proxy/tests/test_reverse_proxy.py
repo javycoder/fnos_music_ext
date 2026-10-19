@@ -73,6 +73,10 @@ pid {tmp_path / 'nginx.pid'};
 events {{ worker_connections 64; }}
 http {{
     access_log off;
+    client_body_temp_path {tmp_path / 'body'};
+    fastcgi_temp_path {tmp_path / 'fastcgi'};
+    uwsgi_temp_path {tmp_path / 'uwsgi'};
+    scgi_temp_path {tmp_path / 'scgi'};
     proxy_temp_path {tmp_path / 'proxy'};
     server {{
         listen 127.0.0.1:{inner_port};
