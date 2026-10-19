@@ -98,7 +98,7 @@ rsync -a --delete \
     --exclude='packaging/' --exclude='dist/' \
     --exclude='tests/' --exclude='docs/' --exclude='pytest.ini' \
     --exclude='CONTRIBUTING.md' --exclude='AGENTS.md' \
-    --exclude='test_*.py' --exclude='test_*.js' --exclude='conftest.py' --exclude='smoke_test.sh' \
+    --exclude='test_*.py' --exclude='test_*.js' --exclude='conftest.py' --exclude='smoke_test.sh' --exclude='run_tests.py' \
     --exclude='.venv*/' --exclude='__pycache__/' --exclude='.pytest_cache/' \
     --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' --exclude='logs/' --exclude='/logs' \
     --exclude='*.part' --exclude='.DS_Store' \

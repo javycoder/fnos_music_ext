@@ -190,23 +190,9 @@ class TestCmdScripts:
             assert path.is_file(), f"缺少 cmd/{name}"
             assert os.access(path, os.X_OK), f"cmd/{name} 缺少可执行权限"
 
-    def test_main_handles_start_stop_status(self, stage: Path):
-        text = (stage / "cmd" / "main").read_text()
-        for kw in ("start)", "stop)", "status)", "exit 3"):
-            assert kw in text
-
-    def test_install_callback_maps_wizard(self, stage: Path):
-        text = (stage / "cmd" / "install_callback").read_text()
-        assert "--non-interactive" in text
-        assert "--webui" in text
-        assert "wizard_sources" in text
-        assert "wizard_extend" in text
-
-    def test_uninstall_restores_official(self, stage: Path):
-        text = (stage / "cmd" / "uninstall_init").read_text()
-        assert "restore.sh" in text
-        # 卸载前必须自动备份用户数据（向导已被移除，无法交互选择）
-        assert "fnmusic-ext-backup-" in text
+    # Lifecycle semantics are exercised by test_fpk_cmds.py against real shell
+    # scripts in a sandbox. Checking that keyword strings exist here duplicated
+    # that coverage without detecting broken execution or argument forwarding.
 
 
 class TestPayload:
@@ -253,6 +239,7 @@ class TestPayload:
         target.mkdir(parents=True)
         excluded = (
             "test_root.py", "test_root.js", "conftest.py", "smoke_test.sh",
+            "scripts/run_tests.py",
             "proxy/test_loose.py", "webui-service/test_app_js.js",
             "nested/conftest.py", "nested/smoke_test.sh",
             ".agents/skills/local/SKILL.md", "nested/.agents/config.json",
