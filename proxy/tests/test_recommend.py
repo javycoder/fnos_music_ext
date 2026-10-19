@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
 from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value, fake_official_guid
-from proxy.app import resolve_real_guid
+from proxy.app import resolve_real_guid, save_online_favorites
 
 
 @pytest.fixture(autouse=True)
@@ -420,6 +420,46 @@ def test_playlist_detail_size_minus_one_returns_all(tmp_path, monkeypatch):
         assert len(page_resp.json()["data"]["list"]) == 50
         zero_resp = client.get(base, params={"playlistGUID": guid, "page": 1, "size": 0})
         assert len(zero_resp.json()["data"]["list"]) == 50
+
+
+def test_recommend_playlists_favorite_state_is_user_scoped_and_refreshes(monkeypatch):
+    """每日/热门推荐按当前用户和实时收藏状态回填红心，不污染推荐缓存。"""
+    current_user = {"guid": "user-a"}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": current_user["guid"]}})
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream), base_url="http://unix"
+    )
+    for kind, guid in (
+        ("daily", dailyrec.recommend_playlist_guid("daily", user_guid="user-a")),
+        ("hot", dailyrec.hot_playlist_guid(user_guid="user-a")),
+    ):
+        original = {"guid": f"online:netease:{kind}:1", "title": kind, "artist": "歌手"}
+
+        async def fake_bundle(request, user_guid, requested_kind="daily", _guid=guid, _track=original):
+            return {"playlist": {"guid": _guid, "name": requested_kind}, "tracks": [dict(_track)]}
+
+        monkeypatch.setattr("proxy.app._load_requested_playlist_bundle", fake_bundle)
+        base = "/music/api/v1/track/playlist-detail/list"
+        params = {"playlistGUID": guid, "page": 1, "size": -1}
+        with TestClient(app) as client:
+            before = client.get(base, params=params).json()["data"]["list"]
+            assert before[0]["isFavorite"] is False
+            fake = before[0]["guid"]
+            save_online_favorites("user-a", [{"guid": resolve_real_guid(fake), "createdAt": 1, "track": {}}])
+            user_a = client.get(base, params=params).json()["data"]["list"]
+            current_user["guid"] = "user-b"
+            user_b = client.get(base, params=params).json()["data"]["list"]
+            current_user["guid"] = "user-a"
+            save_online_favorites("user-a", [])
+            after_delete = client.get(base, params=params).json()["data"]["list"]
+        assert user_a[0]["isFavorite"] is True
+        assert user_b[0]["isFavorite"] is False
+        assert after_delete[0]["isFavorite"] is False
 
 
 def test_read_local_recent_tracks(tmp_path):

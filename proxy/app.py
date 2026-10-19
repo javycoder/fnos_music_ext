@@ -7664,6 +7664,28 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
         return True, "shared", None
 
 
+async def _online_favorite_set_for_user(user_guid: str) -> set[str]:
+    """读取已鉴权用户的在线收藏 guid 集合，供个性化歌单响应覆盖状态。"""
+    if not user_guid:
+        return set()
+    try:
+        async with _FAV_LOCK:
+            return {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+    except Exception:
+        return set()
+
+
+def _stamp_online_favorite_state(tracks: list[dict], fav_guids: set[str]) -> list[dict]:
+    """仅在响应曲目副本上回填在线收藏状态，不污染共享歌单缓存。"""
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        guid = str(track.get("guid") or "")
+        if is_online_guid(guid):
+            track["isFavorite"] = guid in fav_guids
+    return tracks
+
+
 async def _online_favorite_set(request: Request) -> set[str]:
     """当前用户在线收藏 guid 集合（探测失败回退 shared/空集，绝不抛错）。"""
     try:
@@ -7745,14 +7767,16 @@ async def favorite_track_create(request: Request):
                 if autobind:
                     item["bind"] = "pending"
                 items.append(item)
-            save_online_favorites(user_guid, items)
-            saved = True
+            saved = save_online_favorites(user_guid, items)
         except Exception as e:
             logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
 
-    if saved:
-        _register_fav_autobind(request, guid, user_guid)
+    if not saved:
+        return JSONResponse(
+            content={"code": -1, "msg": "收藏保存失败，请稍后重试", "data": None}
+        )
 
+    _register_fav_autobind(request, guid, user_guid)
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
@@ -7789,13 +7813,19 @@ async def favorite_track_delete(request: Request):
     if not is_authed and auth_resp is not None:
         return auth_resp
 
+    saved = False
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
             items = [it for it in items if it.get("guid") != guid]
-            save_online_favorites(user_guid, items)
+            saved = save_online_favorites(user_guid, items)
         except Exception as e:
             logger.warning("Error deleting from online favorites for user %s: %s", user_guid, e)
+
+    if not saved:
+        return JSONResponse(
+            content={"code": -1, "msg": "取消收藏失败，请稍后重试", "data": None}
+        )
 
     entry = lookup_bind_entry(user_guid, guid)
     if entry and entry.get("fav"):
@@ -8674,7 +8704,7 @@ async def playlist_track_list(request: Request):
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
     if public_entry:
         upstream_client = get_upstream_client(request.app)
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
         try:
@@ -8698,10 +8728,14 @@ async def playlist_track_list(request: Request):
         if size < 1:
             size = 50
         start = (page - 1) * size
+        page_tracks = _stamp_online_favorite_state(
+            tracks[start:start + size],
+            await _online_favorite_set_for_user(user_guid),
+        )
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0, "msg": "ok",
-                "data": {"list": tracks[start:start + size], "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+                "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
             })
         )
     nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
@@ -8728,7 +8762,10 @@ async def playlist_track_list(request: Request):
         if size < 1:
             size = 50
         start = (page - 1) * size
-        page_tracks = tracks[start:start + size]
+        page_tracks = _stamp_online_favorite_state(
+            tracks[start:start + size],
+            await _online_favorite_set_for_user(user_guid),
+        )
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
@@ -8828,7 +8865,10 @@ async def playlist_track_list(request: Request):
     if size < 1:
         size = 50
     start = (page - 1) * size
-    page_tracks = tracks[start:start + size]
+    page_tracks = _stamp_online_favorite_state(
+        tracks[start:start + size],
+        await _online_favorite_set_for_user(user_guid),
+    )
     return JSONResponse(
         content=disguise_client_json({
             "code": 0,
