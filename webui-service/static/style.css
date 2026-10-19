@@ -14,9 +14,9 @@
   --muted: #68788a;
   --accent: #2f6fed;
   --accent-soft: #e8f0fe;
-  --ok: #1a9e5c;
+  --ok: #157d49;
   --warn: #d97706;
-  --err: #d64545;
+  --err: #c93636;
   --input-bg: #ffffff;   /* 表单、芯片等“比卡片再亮一层”的底色 */
   --chip-bg: #ffffff;
   --surface-2: #fafbfd;  /* 报告、更新说明等浅衬底 */
@@ -54,6 +54,7 @@
   --badge-dim-bg: #222a34;
   --ok-soft: #14301f;
   --dot-idle: #46505e;
+  --on-accent: #0f1318;
   --overlay: rgba(0, 0, 0, 0.62);
   --bar-bg: rgba(23, 28, 35, 0.96);
   --nav-bg: rgba(23, 28, 35, 0.97);
@@ -362,8 +363,8 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   background: var(--toast-bg); color: var(--toast-text); border-radius: 8px; padding: 10px 18px;
   font-size: 14px; max-width: 90vw; box-shadow: var(--shadow);
 }
-.toast.ok { background: var(--ok); }
-.toast.fail { background: var(--err); }
+.toast.ok { background: var(--ok); color: var(--on-accent); }
+.toast.fail { background: var(--err); color: var(--on-accent); }
 
 /* -------------------------------------------------- 移动端 */
 .bottom-nav { display: none; }

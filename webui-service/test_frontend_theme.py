@@ -77,6 +77,28 @@ def test_theme_tokens_cover_surfaces_and_keep_code_images_white():
         assert "background: var(--" in body, selector
 
 
+@pytest.mark.parametrize("selector", [":root", ':root[data-theme="dark"]'])
+def test_solid_controls_and_status_toasts_have_readable_contrast(selector):
+    values = dict(re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{6})", blocks(selector)[0]))
+
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+                  for v in channels]
+        return sum(v * weight for v, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+    for control, background in [(".nav-item.active", "--accent"),
+                                (".btn.primary", "--accent"),
+                                (".btn.danger:hover", "--err"),
+                                (".badge.new", "--err"),
+                                (".toast.ok", "--ok"), (".toast.fail", "--err")]:
+        body = blocks(control)[0]
+        assert f"background: var({background})" in body
+        assert "color: var(--on-accent)" in body
+        low, high = sorted((luminance(values[background]), luminance(values["--on-accent"])))
+        assert (high + 0.05) / (low + 0.05) >= 4.5, (selector, control)
+
+
 def test_pages_share_centered_content_width_and_save_bar_alignment():
     main = blocks(".main")
     assert len(main) == 2  # 桌面主规则 + 手机内边距覆盖，共用同一个宽度上限。
