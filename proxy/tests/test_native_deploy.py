@@ -299,7 +299,7 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     package_dir = tmp_path / "native-package" / "package"
     package_dir.mkdir(parents=True)
     (package_dir / "package.json").write_text(
-        '{"name":"music-tag-native-linux-arm64-gnu"}\n', encoding="utf-8"
+        '{"name":"music-tag-native-linux-arm64-gnu","version":"0.2.5"}\n', encoding="utf-8"
     )
     (package_dir / "music-tag-native.linux-arm64-gnu.node").write_bytes(b"arm64-native")
     with tarfile.open(native_tarball, "w:gz") as archive:

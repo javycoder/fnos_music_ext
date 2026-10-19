@@ -919,7 +919,7 @@ async def api_status(request: Request):
         "deploy_mode": values.get("FNMUSIC_DEPLOY_MODE", "docker"),
         "current_provider": provider or "none",
         "processes": {name: processes.get(name, {"state": "UNKNOWN", "detail": ""})
-                      for name in ("musicdl", "musicbox", "lxmusic", "webui")},
+                      for name in ("musicdl", "musicbox", "lxserver", "lxmusic", "webui")},
         "previews": {p: round(preview_seconds_left(p)) for p in list(_preview_until)},
         "services": services,
         "lx_source": lx_source,

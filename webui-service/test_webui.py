@@ -70,6 +70,7 @@ def svctl(monkeypatch):
     status_output = {
         "musicdl": "musicdl                        STOPPED   Not started",
         "musicbox": "musicbox                       RUNNING   pid 7, uptime 0:01:00",
+        "lxserver": "lxserver                       STOPPED   Not started",
         "lxmusic": "lxmusic                        STOPPED   Not started",
         "webui": "webui                          RUNNING   pid 8, uptime 0:01:00",
     }
@@ -830,10 +831,40 @@ def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
         assert rj["version"] == "2.0.0"
         assert rj["current_provider"] == "musicbox"
         assert rj["processes"]["musicbox"]["state"] == "RUNNING"
+        # lxserver 与 lxmusic 并列出现在进程概览，便于定位洛雪链路哪一环故障
+        assert rj["processes"]["lxserver"]["state"] == "STOPPED"
         assert rj["processes"]["lxmusic"]["state"] == "STOPPED"
+        assert set(rj["processes"]) == {"musicdl", "musicbox", "lxserver", "lxmusic", "webui"}
         assert rj["services"]["musicbox"]["reachable"] is True
         assert rj["services"]["lxmusic"]["note"]  # 未启用提示
         assert rj["lx_source"] is None
+
+
+def test_status_lxmusic_unreachable_exposes_health_detail(env_file, svctl, monkeypatch):
+    """当前音源为洛雪且 lxserver 挂掉：/api/status 透出 healthz 的失败原因。"""
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+        .replace("FNMUSIC_LX_ENABLED='false'", "FNMUSIC_LX_ENABLED='true'"),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    svctl.status_output["lxserver"] = "lxserver                       FATAL     Exited too quickly"
+    svctl.status_output["lxmusic"] = "lxmusic                        RUNNING   pid 9, uptime 0:01:00"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"initialized": False}})
+        return httpx.Response(503, json={"ok": False, "error": "lxserver unreachable"})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        r = client.get("/api/status")
+        assert r.status_code == 200
+        rj = r.json()
+        assert rj["current_provider"] == "lxmusic"
+        assert rj["processes"]["lxserver"]["state"] == "FATAL"
+        assert rj["services"]["lxmusic"]["reachable"] is False
+        assert rj["services"]["lxmusic"]["detail"] == "lxserver unreachable"
 
 
 def test_platforms_from_musicdl(env_file, monkeypatch):
