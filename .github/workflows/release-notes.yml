@@ -3,7 +3,7 @@ name: Correct release notes
 on:
   push:
     branches: [dev]
-    paths: [CHANGELOG.md]
+    paths: [CHANGELOG.md, .github/workflows/release-notes.yml]
   workflow_dispatch:
 
 permissions:

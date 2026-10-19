@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_notes_correction_only_updates_existing_release_body(tmp_path):
     workflow = (ROOT / '.github/workflows/release-notes.yml').read_text()
+    assert 'paths: [CHANGELOG.md, .github/workflows/release-notes.yml]' in workflow
     script = workflow.split('        run: |\n', 1)[1]
     script = '\n'.join(line[10:] for line in script.splitlines())
     path = tmp_path / 'notes.sh'
