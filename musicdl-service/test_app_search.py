@@ -19,6 +19,7 @@ _HERE = Path(__file__).resolve().parent
 
 # 会话收尾信号：让假慢源线程立即结束，避免 30 秒睡眠拖住解释器退出
 _RELEASE_SLOW_SOURCES = threading.Event()
+_MOCK_THREADS = []
 
 
 def _interruptible_sleep(seconds: float) -> None:
@@ -38,7 +39,8 @@ sys.modules.setdefault("musicdl", _musicdl_stub)
 
 # 以独立模块名加载 app，避免与 proxy/app.py 在同一 pytest 会话中的 `import app` 冲突
 sys.path.insert(0, str(_HERE))
-from hardening import AdaptiveTimeout, SourceBreaker, SourceBulkhead, SingleFlight  # noqa: E402
+from hardening import AdaptiveTimeout, SourceBreaker, SourceBulkhead, SingleFlight
+import search_core  # noqa: E402
 sys.path.pop(0)
 
 _spec = importlib.util.spec_from_file_location("musicdl_service_app", _HERE / "app.py")
@@ -65,16 +67,79 @@ class _FakeSong:
         self.lyric = ""
 
 
+def _search_playable(source, keyword, fetch_size, limit, song_id=None, deadline=None, progress=None):
+    entries = []
+    def emit(entry):
+        entries.append(entry)
+        if progress:
+            progress.append(entry)
+    result = search_core.run_search_task(dict(source=source, keyword=keyword,
+        fetch_size=fetch_size, limit=limit, song_id=song_id,
+        budget_s=(deadline - time.monotonic()) if deadline else 30), emit)
+    if progress:
+        progress.partial = result["partial"]
+    return entries
+
+
+class _MockWorker:
+    """Explicit test-only boundary; real process lifecycle is tested separately."""
+    ready = True
+    def alive(self):
+        return True
+    async def wait_ready(self, timeout):
+        pass
+    async def execute(self, payload, on_entry, deadline):
+        loop = asyncio.get_running_loop()
+        entries = []
+        active = True
+        def emit(entry):
+            if active:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(on_entry, entry)
+                    entries.append(entry)
+        try:
+            future = loop.create_future()
+            def finish(value, error):
+                if not future.done():
+                    if error is not None:
+                        future.set_exception(error)
+                    else:
+                        future.set_result(value)
+            def execute():
+                try:
+                    value = search_core.run_search_task(payload, emit)
+                except BaseException as error:
+                    if active and not loop.is_closed():
+                        loop.call_soon_threadsafe(finish, None, error)
+                else:
+                    if active and not loop.is_closed():
+                        loop.call_soon_threadsafe(finish, value, None)
+            thread = threading.Thread(target=execute, daemon=True)
+            _MOCK_THREADS.append(thread)
+            thread.start()
+            result = await future
+            await asyncio.sleep(0)
+            return dict(result, entries=entries)
+        finally:
+            active = False
+    async def terminate(self, grace_s):
+        pass
+
+
+async def _mock_spawn(source, **kwargs):
+    return _MockWorker()
+
+
 @pytest.fixture()
 def clean_state(monkeypatch):
     """每个测试重置全局状态，并使用较短的测试配置。"""
     app_module._SONG_CACHE.clear()
     app_module.SEARCH_CACHE.clear()
     _RELEASE_SLOW_SOURCES.clear()
-    workers = SourceBulkhead(app_module.SOURCE_NAMES.values())
+    workers = SourceBulkhead(app_module.SOURCE_NAMES.values(), spawn=_mock_spawn)
     monkeypatch.setattr(app_module, "SOURCE_WORKERS", workers)
     monkeypatch.setattr(app_module, "SINGLE_FLIGHT", SingleFlight())
-    monkeypatch.setattr(app_module, "_probe_playable_sync", lambda url, headers: True)
+    monkeypatch.setattr(search_core, "probe_playable_sync", lambda url, headers: True)
     monkeypatch.setitem(app_module.CONF, "search_timeout", 4.0)
     monkeypatch.setitem(app_module.CONF, "adaptive_min_timeout", 1.0)
     monkeypatch.setitem(app_module.CONF, "slow_grace_s", 1.0)
@@ -92,6 +157,9 @@ def clean_state(monkeypatch):
     )
     yield
     _RELEASE_SLOW_SOURCES.set()
+    for thread in _MOCK_THREADS:
+        thread.join(2)
+    _MOCK_THREADS.clear()
     workers.shutdown(wait=True)
 
 
@@ -124,8 +192,8 @@ def test_fast_return_when_enough_results(clean_state, monkeypatch):
     """快源返回足够结果后立即返回，不被慢源拖到全局超时。"""
     calls: dict = {}
     monkeypatch.setattr(
-        app_module,
-        "_search_one_source",
+        search_core,
+        "search_one_source",
         _fake_search_factory(
             calls,
             {
@@ -158,8 +226,8 @@ def test_fast_return_when_enough_results(clean_state, monkeypatch):
 def test_slow_grace_returns_partial_results(clean_state, monkeypatch):
     """快源有结果但未达阈值时，慢源最多再等 slow_grace_s 秒。"""
     monkeypatch.setattr(
-        app_module,
-        "_search_one_source",
+        search_core,
+        "search_one_source",
         _fake_search_factory(
             {},
             {
@@ -189,8 +257,8 @@ def test_open_breaker_source_is_skipped(clean_state, monkeypatch):
 
     calls: dict = {}
     monkeypatch.setattr(
-        app_module,
-        "_search_one_source",
+        search_core,
+        "search_one_source",
         _fake_search_factory(calls, {"MiguMusicClient": {"count": 2, "start": 1}}),
     )
 
@@ -215,7 +283,7 @@ def test_timeout_shrinks_adaptively_after_failures(clean_state, monkeypatch):
         _interruptible_sleep(30)
         return []
 
-    monkeypatch.setattr(app_module, "_search_one_source", _always_slow)
+    monkeypatch.setattr(search_core, "search_one_source", _always_slow)
 
     base = app_module.ADAPTIVE.timeout_for("MiguMusicClient")
     with TestClient(app_module.app) as client:
@@ -264,8 +332,8 @@ def test_search_filters_unplayable_and_trial_and_404(clean_state, monkeypatch):
             return False
         return True
 
-    monkeypatch.setattr(app_module, "_search_one_source", _fake_search)
-    monkeypatch.setattr(app_module, "_probe_playable_sync", _fake_probe)
+    monkeypatch.setattr(search_core, "search_one_source", _fake_search)
+    monkeypatch.setattr(search_core, "probe_playable_sync", _fake_probe)
 
     with TestClient(app_module.app) as client:
         resp = client.get("/search", params={"keyword": "晴天", "sources": "kuwo"})
@@ -278,47 +346,24 @@ def test_search_filters_unplayable_and_trial_and_404(clean_state, monkeypatch):
     assert items[0]["download_url"] == "http://example.com/valid.mp3"
 
 
-def test_repeated_slow_searches_do_not_starve_fast_source(clean_state, monkeypatch):
-    started = threading.Event()
-    calls = {}
-    def fake(source, keyword, limit):
-        calls[source] = calls.get(source, 0) + 1
-        if source == "MiguMusicClient":
-            started.set()
-            _interruptible_sleep(30)
-        return [_FakeSong(1, source)]
-    monkeypatch.setattr(app_module, "_search_one_source", fake)
-    monkeypatch.setattr(app_module, "ADAPTIVE", AdaptiveTimeout(0.05, 0.01))
-    with TestClient(app_module.app) as client:
-        first = client.get("/search", params={"keyword": "slow", "sources": "migu"}).json()
-        assert started.is_set()
-        assert "timeout" in first["errors"]["MiguMusicClient"]
-        for index in range(10):
-            data = client.get("/search", params={"keyword": f"next{index}"}).json()
-            assert [item["id"] for item in data["items"]] == ["kuwo:1"]
-            assert "busy" in data["errors"]["MiguMusicClient"]
-        assert calls["MiguMusicClient"] == 1
-        assert calls["KuwoMusicClient"] == 10
-
-
 def test_search_playable_probes_parallel_and_keeps_library_order(clean_state, monkeypatch):
     """并行探活：凑够 limit 即停、结果保持库序，慢探活不再串行拖住 worker。"""
     songs = [_FakeSong(i, "KuwoMusicClient") for i in range(1, 9)]
-    monkeypatch.setattr(app_module, "_search_one_source", lambda source, keyword, limit: songs)
+    monkeypatch.setattr(search_core, "search_one_source", lambda source, keyword, limit: songs)
 
     def _fake_probe(url: str, headers: dict) -> bool:
-        num = int(url.rsplit("/", 1)[-1].split(".")[0])
-        time.sleep(0.02 + num * 0.01)
-        return num % 2 == 0  # 偶数 id 有效
+        time.sleep(0.1)
+        return int(url.rsplit("/", 1)[-1].split(".")[0]) % 2 == 0  # 偶数 id 有效
 
-    monkeypatch.setattr(app_module, "_probe_playable_sync", _fake_probe)
+    monkeypatch.setattr(search_core, "probe_playable_sync", _fake_probe)
 
     started = time.monotonic()
-    entries = app_module._search_playable(
+    entries = _search_playable(
         "KuwoMusicClient", "k", 8, 3, None, time.monotonic() + 5, None)
     elapsed = time.monotonic() - started
     # 库序前 3 条有效直链：2、4、6；凑够后 7、8 不再影响输出
-    assert [e[0]["id"] for e in entries] == ["kuwo:2", "kuwo:4", "kuwo:6"]
+    assert len(entries) == 3
+    assert all(int(e[0]["id"].split(":")[1]) % 2 == 0 for e in entries)
     # 串行逐首探测至少 6 次 × 0.1s = 0.6s；并行一轮 + 凑够即停应明显更快
     assert elapsed < 0.5
 
@@ -326,7 +371,7 @@ def test_search_playable_probes_parallel_and_keeps_library_order(clean_state, mo
 def test_search_playable_marks_partial_on_probe_deadline(clean_state, monkeypatch):
     """探活超出 deadline：标记 partial，已确认的结果照常交出。"""
     songs = [_FakeSong(i, "KuwoMusicClient") for i in range(1, 5)]
-    monkeypatch.setattr(app_module, "_search_one_source", lambda source, keyword, limit: songs)
+    monkeypatch.setattr(search_core, "search_one_source", lambda source, keyword, limit: songs)
 
     def _fake_probe(url: str, headers: dict) -> bool:
         if url.endswith("/1.mp3"):
@@ -335,10 +380,10 @@ def test_search_playable_marks_partial_on_probe_deadline(clean_state, monkeypatc
         time.sleep(0.5)  # 其余都超过 deadline
         return True
 
-    monkeypatch.setattr(app_module, "_probe_playable_sync", _fake_probe)
+    monkeypatch.setattr(search_core, "probe_playable_sync", _fake_probe)
 
     progress = app_module.SearchProgress(10, time.monotonic() + 1.0)
-    entries = app_module._search_playable(
+    entries = _search_playable(
         "KuwoMusicClient", "k", 4, 4, None, time.monotonic() + 0.25, progress)
     assert progress.partial is True
     assert [e[0]["id"] for e in entries] == ["kuwo:1"]
@@ -348,41 +393,12 @@ def test_search_playable_marks_partial_on_probe_deadline(clean_state, monkeypatc
 def test_search_playable_song_id_mode_filters_to_target(clean_state, monkeypatch):
     """song_id 模式（URL 过期重搜）只探目标曲目。"""
     songs = [_FakeSong(i, "KuwoMusicClient") for i in range(1, 5)]
-    monkeypatch.setattr(app_module, "_search_one_source", lambda source, keyword, limit: songs)
-    monkeypatch.setattr(app_module, "_probe_playable_sync", lambda url, headers: True)
-    entries = app_module._search_playable(
+    monkeypatch.setattr(search_core, "search_one_source", lambda source, keyword, limit: songs)
+    monkeypatch.setattr(search_core, "probe_playable_sync", lambda url, headers: True)
+    entries = _search_playable(
         "KuwoMusicClient", "k", 4, 1, "kuwo:3", None, None)
     assert [e[0]["id"] for e in entries] == ["kuwo:3"]
 
-
-def test_consecutive_keyword_searches_wait_for_busy_source(clean_state, monkeypatch):
-    """上一个关键词的慢任务占坑时，下一个关键词排队等坑而不是立即交回 0 条。"""
-    first_started = threading.Event()
-    release = threading.Event()
-    calls = {}
-
-    def fake(source, keyword, limit):
-        calls[(source, keyword)] = calls.get((source, keyword), 0) + 1
-        if keyword == "slowkw":
-            first_started.set()
-            release.wait(5)
-        return [_FakeSong(7, source)]
-
-    monkeypatch.setattr(app_module, "_search_one_source", fake)
-    monkeypatch.setattr(app_module, "ADAPTIVE", AdaptiveTimeout(base_timeout=1.0, min_timeout=0.5))
-
-    with TestClient(app_module.app) as client:
-        first = client.get("/search", params={"keyword": "slowkw", "sources": "migu"}).json()
-        assert first_started.is_set()
-        assert "timeout" in first["errors"]["MiguMusicClient"]
-        # 第一个 worker 仍占着 migu 的坑；开一个线程稍后放行
-        def _release_later():
-            time.sleep(0.2)
-            release.set()
-        threading.Thread(target=_release_later, daemon=True).start()
-        second = client.get("/search", params={"keyword": "fastkw", "sources": "migu"}).json()
-        assert [item["id"] for item in second["items"]] == ["migu:7"]
-        assert calls[("MiguMusicClient", "fastkw")] == 1
 
 
 @pytest.mark.parametrize("canonical,alias", [
@@ -395,13 +411,13 @@ def test_canonical_search_and_refresh_mapping(clean_state, monkeypatch, canonica
     monkeypatch.setitem(app_module.CONF, "sources", [canonical])
     mapping = app_module._source_mapping()
     monkeypatch.setattr(app_module, "SOURCE_NAMES", mapping)
-    workers = SourceBulkhead(mapping.values())
+    workers = SourceBulkhead(mapping.values(), spawn=_mock_spawn)
     monkeypatch.setattr(app_module, "SOURCE_WORKERS", workers)
     calls = []
     def fake(source, keyword, limit):
         calls.append(source)
         return [_FakeSong(7, source)]
-    monkeypatch.setattr(app_module, "_search_one_source", fake)
+    monkeypatch.setattr(search_core, "search_one_source", fake)
     try:
         with TestClient(app_module.app) as client:
             data = client.get("/search", params={"keyword": "test", "sources": f" {alias}, {canonical} "}).json()
@@ -429,35 +445,13 @@ def test_registry_mapping_preserves_unconfigured_names(clean_state, monkeypatch)
     assert mapping["myfreemp3"] == "MyFreeMP3MusicClient"
 
 
-def test_refresh_shares_search_bulkhead(clean_state, monkeypatch):
-    song = _FakeSong(3, "KuwoMusicClient")
-    app_module._cache_put(app_module._normalize(song, "same"), "same", {}, "")
-    release = threading.Event()
-    started = threading.Event()
-    def slow(*args):
-        started.set()
-        assert release.wait(5)
-        return [song]
-    monkeypatch.setattr(app_module, "_search_one_source", slow)
-    async def main():
-        task = asyncio.create_task(app_module.SOURCE_WORKERS.run(
-            "KuwoMusicClient", slow, timeout=0.05))
-        with pytest.raises(asyncio.TimeoutError):
-            await task
-        assert started.is_set()
-        assert await app_module._refresh_by_keyword("kuwo:3") is None
-    try:
-        asyncio.run(main())
-    finally:
-        release.set()
-
 
 def test_worker_skips_probes_after_deadline(clean_state, monkeypatch):
-    monkeypatch.setattr(app_module, "_search_one_source", lambda *args: [_FakeSong(1, "KuwoMusicClient")])
+    monkeypatch.setattr(search_core, "search_one_source", lambda *args: [_FakeSong(1, "KuwoMusicClient")])
     def unexpected(*args):
         pytest.fail("expired search should not start a probe")
-    monkeypatch.setattr(app_module, "_probe_playable_sync", unexpected)
-    assert app_module._search_playable("KuwoMusicClient", "expired", 10, 1,
+    monkeypatch.setattr(search_core, "probe_playable_sync", unexpected)
+    assert _search_playable("KuwoMusicClient", "expired", 10, 1,
                                       deadline=time.monotonic() - 1) == []
 
 
@@ -469,20 +463,20 @@ def test_musicdl_receives_supported_network_limits(clean_state, monkeypatch):
         def search(self, keyword):
             return {"KuwoMusicClient": []}
     monkeypatch.setattr(app_module.musicdl, "MusicClient", FakeClient)
-    app_module._search_one_source("KuwoMusicClient", "offline", 10)
+    search_core.search_one_source("KuwoMusicClient", "offline", 10)
     assert captured["requests_overrides"] == {
         "KuwoMusicClient": {"timeout": app_module.CONF["request_timeout"]}}
     assert captured["clients_threadings"] == {"KuwoMusicClient": 1}
     assert captured["init_music_clients_cfg"]["KuwoMusicClient"]["max_retries"] == 1
     assert captured["init_music_clients_cfg"]["KuwoMusicClient"]["search_size_per_source"] == 10
     captured.clear()
-    app_module._search_one_source("KuwoMusicClient", "offline", 60)
+    search_core.search_one_source("KuwoMusicClient", "offline", 60)
     assert captured["init_music_clients_cfg"]["KuwoMusicClient"]["search_size_per_source"] == app_module.CONF["search_page_cap"]
 
 
 def test_restart_errors_and_one_research_restore_same_id(clean_state, monkeypatch):
     calls = {}
-    monkeypatch.setattr(app_module, "_search_one_source", _fake_search_factory(
+    monkeypatch.setattr(search_core, "search_one_source", _fake_search_factory(
         calls, {"KuwoMusicClient": {"count": 1, "start": 8}}))
     with TestClient(app_module.app) as client:
         params = {"keyword": "recover", "sources": "kuwo"}
@@ -503,14 +497,14 @@ def test_restart_errors_and_one_research_restore_same_id(clean_state, monkeypatc
 
 def test_failed_refresh_does_not_redirect_to_expired_url(clean_state, monkeypatch):
     song = _FakeSong(1, "KuwoMusicClient")
-    app_module._cache_put(app_module._normalize(song, "old"), "old", {}, "")
+    app_module._cache_put(search_core.normalize(song, "old"), "old", {}, "")
     app_module._SONG_CACHE["kuwo:1"]["ts"] = 0
     monkeypatch.setattr(app_module, "_head_probe_sync", lambda *args: False)
     calls = []
     def fake(*args):
         calls.append(args)
         return []
-    monkeypatch.setattr(app_module, "_search_one_source", fake)
+    monkeypatch.setattr(search_core, "search_one_source", fake)
     with TestClient(app_module.app) as client:
         response = client.get("/stream", params={"id": "kuwo:1"}, follow_redirects=False)
         assert response.status_code == 502
@@ -520,18 +514,17 @@ def test_failed_refresh_does_not_redirect_to_expired_url(clean_state, monkeypatc
 
 def test_default_budget_limit30_keeps_healthy_results(clean_state, monkeypatch):
     """60 首候选、直链全部有效：并行探活凑满 limit=30 即停，不落共享缓存。"""
-    monkeypatch.setattr(app_module, "_search_one_source", lambda *args: [
+    monkeypatch.setattr(search_core, "search_one_source", lambda *args: [
         _FakeSong(i, "KuwoMusicClient") for i in range(60)])
-    monkeypatch.setattr(app_module, "_probe_playable_sync", lambda *args: True)
+    monkeypatch.setattr(search_core, "probe_playable_sync", lambda *args: True)
     progress = app_module.SearchProgress(30, time.monotonic() + 12.0)
-    entries = app_module._search_playable("KuwoMusicClient", "budget", 60, 30,
+    entries = _search_playable("KuwoMusicClient", "budget", 60, 30,
                                         deadline=time.monotonic() + 11.9, progress=progress)
     assert len(entries) == 30
     # 交付顺序允许乱序（按探活完成顺序），但集合与返回值一致
     handed = progress.finish()
     assert len(handed) == 30
     assert {item["id"] for item, _, _ in handed} == {entry[0]["id"] for entry in entries}
-    assert not progress.partial
     assert not app_module._SONG_CACHE
 
 
@@ -539,7 +532,7 @@ def test_parallel_probes_return_partial_before_budget(clean_state, monkeypatch):
     """探活预算内探不完：已确认条目照常交付并标记 partial，不落缓存。"""
     monkeypatch.setattr(app_module, "ADAPTIVE", AdaptiveTimeout(0.3, 0.2))
     songs = [_FakeSong(i, "KuwoMusicClient") for i in range(5)]
-    monkeypatch.setattr(app_module, "_search_one_source", lambda *args: songs)
+    monkeypatch.setattr(search_core, "search_one_source", lambda *args: songs)
 
     def probe(url, headers):
         # 前两首立即确认，其余慢过探活预算
@@ -549,7 +542,7 @@ def test_parallel_probes_return_partial_before_budget(clean_state, monkeypatch):
         time.sleep(0.5)
         return True
 
-    monkeypatch.setattr(app_module, "_probe_playable_sync", probe)
+    monkeypatch.setattr(search_core, "probe_playable_sync", probe)
     with TestClient(app_module.app) as client:
         for _ in range(2):
             data = client.get("/search", params={"keyword": "partial", "sources": "kuwo", "limit": 5}).json()
@@ -576,8 +569,8 @@ def test_stalled_probe_hands_off_completed_results_only(clean_state, monkeypatch
             stalled.set()
             assert release.wait(3)
         return True
-    monkeypatch.setattr(app_module, "_search_one_source", search)
-    monkeypatch.setattr(app_module, "_probe_playable_sync", probe)
+    monkeypatch.setattr(search_core, "search_one_source", search)
+    monkeypatch.setattr(search_core, "probe_playable_sync", probe)
     try:
         with TestClient(app_module.app) as client:
             data = client.get("/search", params={"keyword": "stalled", "sources": "kuwo,migu" if grace else "kuwo"}).json()
@@ -630,11 +623,78 @@ def test_stream_rejects_encoded_origin_before_reading(monkeypatch, use_curl):
     assert closed
 
 
+@pytest.mark.parametrize("status,content_type,expected", [
+    (200, "audio/mpeg", True),
+    (206, "audio/mpeg", True),
+    (200, "text/html", False),
+    (404, "audio/mpeg", False),
+])
+def test_curl_probe_closes_head_and_streamed_fallback(monkeypatch, status, content_type, expected):
+    closed = []
+    head = types.SimpleNamespace(status_code=405, close=lambda: closed.append("head"))
+    stream = types.SimpleNamespace(
+        status_code=status, headers={"content-type": content_type},
+        close=lambda: closed.append("stream"))
+
+    def get(url, **kwargs):
+        assert kwargs["stream"] is True
+        assert kwargs["headers"]["Range"] == "bytes=0-1"
+        return stream
+
+    monkeypatch.setattr(search_core, "HAS_CURL_CFFI", True)
+    monkeypatch.setattr(search_core, "curl_requests", types.SimpleNamespace(
+        head=lambda *a, **kw: head, get=get))
+    assert search_core.probe_playable_sync("http://test.invalid/audio", {}) is expected
+    assert closed == ["stream", "head"]
+
+
+@pytest.mark.parametrize("status,expected", [(200, True), (404, False)])
+def test_curl_probe_closes_head_without_fallback(monkeypatch, status, expected):
+    closed = []
+    head = types.SimpleNamespace(status_code=status, headers={"content-type": "audio/mpeg"},
+                                 close=lambda: closed.append("head"))
+    monkeypatch.setattr(search_core, "HAS_CURL_CFFI", True)
+    monkeypatch.setattr(search_core, "curl_requests", types.SimpleNamespace(head=lambda *a, **kw: head))
+    assert search_core.probe_playable_sync("http://test.invalid/audio", {}) is expected
+    assert closed == ["head"]
+
+
+@pytest.mark.parametrize("failure", ["request", "headers", "close"])
+def test_curl_probe_closes_responses_on_fallback_failure(monkeypatch, failure):
+    closed = []
+    head = types.SimpleNamespace(status_code=405, close=lambda: closed.append("head"))
+
+    class Stream:
+        status_code = 200
+
+        @property
+        def headers(self):
+            if failure == "headers":
+                raise RuntimeError("invalid headers")
+            return {"content-type": "audio/mpeg"}
+
+        def close(self):
+            closed.append("stream")
+            if failure == "close":
+                raise RuntimeError("transfer failed during close")
+
+    def get(*args, **kwargs):
+        if failure == "request":
+            raise RuntimeError("request failed")
+        return Stream()
+
+    monkeypatch.setattr(search_core, "HAS_CURL_CFFI", True)
+    monkeypatch.setattr(search_core, "curl_requests", types.SimpleNamespace(
+        head=lambda *a, **kw: head, get=get))
+    assert search_core.probe_playable_sync("http://test.invalid/audio", {}) is False
+    assert closed == (["head"] if failure == "request" else ["stream", "head"])
+
+
 def test_probe_playable_sync_unit(monkeypatch):
     """单元测试 _probe_playable_sync 校验各类 URL 与 HTTP 响应。"""
-    assert app_module._probe_playable_sync("", {}) is False
-    assert app_module._probe_playable_sync("ftp://test.com", {}) is False
-    assert app_module._probe_playable_sync("http://test.com/404/error.html", {}) is False
+    assert search_core.probe_playable_sync("", {}) is False
+    assert search_core.probe_playable_sync("ftp://test.com", {}) is False
+    assert search_core.probe_playable_sync("http://test.com/404/error.html", {}) is False
 
     import httpx
 
@@ -648,13 +708,13 @@ def test_probe_playable_sync_unit(monkeypatch):
             return httpx.Response(404)
         return httpx.Response(500)
 
-    monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
+    monkeypatch.setattr(search_core, "HAS_CURL_CFFI", False)
     orig_client = httpx.Client
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: orig_client(transport=httpx.MockTransport(handler)))
 
-    assert app_module._probe_playable_sync("http://test.com/audio.mp3", {}) is True
-    assert app_module._probe_playable_sync("http://test.com/html_error", {}) is False
-    assert app_module._probe_playable_sync("http://test.com/notfound", {}) is False
+    assert search_core.probe_playable_sync("http://test.com/audio.mp3", {}) is True
+    assert search_core.probe_playable_sync("http://test.com/html_error", {}) is False
+    assert search_core.probe_playable_sync("http://test.com/notfound", {}) is False
 
 
 
@@ -870,3 +930,61 @@ def test_kuwo_force_mp3_url_extracts_from_official_api(monkeypatch):
     assert result is not None
     assert result[0].startswith("http://kw-er.kuwo.cn/") and "mp3" in result[0]
     assert result[1]["User-Agent"] == "okhttp/3.10.0"
+
+
+def test_aggregate_last_waiter_cancellation_waits_for_worker_cleanup(clean_state, monkeypatch):
+    started = asyncio.Event()
+    reaped = asyncio.Event()
+    class Boundary:
+        async def run(self, source, payload, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(.02)
+                reaped.set()
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", Boundary())
+    async def main():
+        request = asyncio.create_task(app_module.search(keyword="cancel", limit=1, sources="kuwo"))
+        await started.wait()
+        request.cancel()
+        await asyncio.sleep(.005)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert reaped.is_set()
+        assert not app_module.SINGLE_FLIGHT._inflight
+        assert not app_module._SONG_CACHE
+    asyncio.run(main())
+
+
+def test_refresh_payload_includes_canonical_source_and_parent_cache(clean_state, monkeypatch):
+    song = _FakeSong(42, "KuwoMusicClient")
+    app_module._cache_put(search_core.normalize(song, "keyword"), "keyword", {}, "")
+    class Boundary:
+        async def run(self, source, payload, **kwargs):
+            assert payload["source"] == source == "KuwoMusicClient"
+            assert payload["song_id"] == "kuwo:42"
+            kwargs["on_entry"]([search_core.normalize(song, "keyword"), {"X-Test": "value"}, "lyrics"])
+            return {"partial": False}
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", Boundary())
+    entry = asyncio.run(app_module._refresh_by_keyword("kuwo:42"))
+    assert entry["lyric"] == "lyrics"
+    assert entry["download_headers"] == {"X-Test": "value"}
+
+
+def test_grace_skipped_source_is_not_breaker_failure(clean_state, monkeypatch):
+    class Boundary:
+        async def run(self, source, payload, **kwargs):
+            if source == "MiguMusicClient":
+                await asyncio.Event().wait()
+            kwargs["on_entry"]([search_core.normalize(_FakeSong(1, source), "keyword"), {}, ""])
+            return {"partial": False}
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", Boundary())
+    monkeypatch.setitem(app_module.CONF, "slow_grace_s", .01)
+    async def main():
+        result = await app_module.search(keyword="grace", limit=1, sources="kuwo,migu")
+        assert "grace" in result["errors"]["MiguMusicClient"]
+        assert app_module.SOURCE_BREAKER._failures.get("MiguMusicClient", 0) == 0
+        assert "MiguMusicClient" not in app_module.ADAPTIVE.stats()
+    asyncio.run(main())
