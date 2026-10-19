@@ -164,7 +164,7 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 }
 .btn:hover { border-color: var(--accent); color: var(--accent); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.btn.primary:hover { opacity: .92; color: var(--on-accent); }
+.btn.primary:hover { box-shadow: inset 0 0 0 1px var(--on-accent); color: var(--on-accent); }
 .btn.small { padding: 5px 12px; font-size: 13px; }
 .btn.danger { color: var(--err); }
 .btn.danger:hover { border-color: var(--err); background: var(--err); color: var(--on-accent); }
@@ -311,7 +311,7 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   border: 0; cursor: pointer; font-family: inherit;
   background: var(--err); color: var(--on-accent);
 }
-.badge.new:hover { opacity: .88; }
+.badge.new:hover { text-decoration: underline; }
 /* 这些元素靠 hidden 属性切换显隐：类规则里的 display 声明会压过 UA 样式表的
    [hidden]{display:none}（作者样式优先于 UA 样式），必须显式补回，否则弹窗常显
    遮罩盖住整页、点取消也关不掉。 */

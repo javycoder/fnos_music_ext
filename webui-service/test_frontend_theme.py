@@ -97,6 +97,10 @@ def test_solid_controls_and_status_toasts_have_readable_contrast(selector):
         assert "color: var(--on-accent)" in body
         low, high = sorted((luminance(values[background]), luminance(values["--on-accent"])))
         assert (high + 0.05) / (low + 0.05) >= 4.5, (selector, control)
+    for control in (".btn.primary:hover", ".badge.new:hover"):
+        body = blocks(control)[0]
+        assert not re.search(r"(?:opacity|filter|background|color)\s*:", body.replace(
+            "color: var(--on-accent);", "")), "悬停反馈不能降低已验证的文字对比度"
 
 
 def test_pages_share_centered_content_width_and_save_bar_alignment():
