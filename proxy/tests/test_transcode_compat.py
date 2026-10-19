@@ -1113,6 +1113,48 @@ def test_open_stream_blacklisted_guid_lx_requests_high_mp3(env, monkeypatch):
     assert recorded_requests[0].get("quality") == "high"
 
 
+@pytest.mark.asyncio
+async def test_corrupt_stream_tee_retries_only_after_writer_released(env, monkeypatch):
+    guid = "online:kuwo:99009"
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    monkeypatch.setattr(appmod, "_check_audio_file", lambda path: (False, "decode_error"))
+    appmod._LOSSLESS_BAD.clear()
+    registrations = []
+    def register(request, track_guid, reason):
+        registrations.append((track_guid, track_guid in appmod._tee_active, reason))
+        return True
+    monkeypatch.setattr(appmod, "_register_background_fetch", register)
+    data = b"fLaC" + b"bad" * 1000
+    response = httpx.Response(200, stream=_Whole(data), headers={
+        "content-type": "audio/flac", "content-length": str(len(data))})
+    streamed = appmod.stream_tee_response(response, guid, None, resolved_ext="flac",
+                                          pre_info={"title": "t", "artist": "a"})
+    body = b"".join([part async for part in streamed.body_iterator])
+    assert body == data
+    assert appmod._lossless_is_blacklisted(guid)
+    assert registrations == [(guid, False, "tee_save_enabled")]
+
+
+@pytest.mark.asyncio
+async def test_netease_downgrade_octet_stream_does_not_read_lx_resolution(env, monkeypatch):
+    guid = "online:netease:99010"
+    monkeypatch.setattr(appmod, "_retained_track", lambda *a: ({"ext": "flac"}, None))
+    async def resolve(*args, **kwargs):
+        assert kwargs["max_quality"] == "exhigh"
+        return "http://audio.test/99010"
+    monkeypatch.setattr(appmod, "resolve_netease_url", resolve)
+    original = httpx.AsyncClient
+    def factory(**kwargs):
+        return original(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, content=b"ID3mp3data", headers={"content-type": "application/octet-stream"})), **kwargs)
+    monkeypatch.setattr(appmod.httpx, "AsyncClient", factory)
+    request = appmod.Request({"type": "http", "headers": [], "app": app})
+    opened = await appmod._open_online_stream(request, guid, None, force_mp3=True)
+    assert opened and opened[2] == "mp3"
+    await opened[0].aclose()
+    await opened[1].aclose()
+
+
 def test_check_audio_file_passes_when_stderr_has_warnings(env, fake_ffmpeg, monkeypatch, tmp_path):
     """解码校验音轨正常、stderr 存在警告（如封面损坏）时视为通过，不误杀。"""
     fake_ffmpeg("ok")

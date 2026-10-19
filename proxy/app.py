@@ -5579,6 +5579,7 @@ def stream_tee_response(
         eof = False
         info_task = None
         tee_active_token = False
+        retry_corrupt_tee = False
         upstream_aborted = False
 
         def _close_tee_file() -> None:
@@ -5692,8 +5693,7 @@ def stream_tee_response(
                     try:
                         meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled, retained)
                         if not meta:
-                            if tee_enabled and _lossless_is_blacklisted(guid):
-                                _register_background_fetch(_synth_request(scan_headers_factory() if scan_headers_factory else {}), guid, "tee_save_enabled")
+                            retry_corrupt_tee = tee_enabled and _lossless_is_blacklisted(guid)
                         else:
                             # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
                             if post_finalize is not None:
@@ -5741,6 +5741,10 @@ def stream_tee_response(
                     await client_to_close.aclose()
                 if resume_part:
                     _register_tee_handoff(guid, resume_part, written, expected, ext, scan_headers_factory)
+                if retry_corrupt_tee:
+                    _register_background_fetch(
+                        _synth_request(scan_headers_factory() if scan_headers_factory else {}),
+                        guid, "tee_save_enabled")
             if not eof and delivery_outcome == "complete":
                 delivery_outcome = "client_closed"
             _log_stream_delivery(
@@ -5935,8 +5939,10 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
         downgraded = (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header
         if (via_musicdl or downgraded) and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
             ext = "mp3"
-        elif downgraded and (not ext or ext in _LOSSLESS_EXTS) and resolved and resolved.get("ext") not in _LOSSLESS_EXTS:
-            ext = resolved.get("ext") or "mp3"
+        elif downgraded and (not ext or ext in _LOSSLESS_EXTS):
+            # NetEase returns a URL, not LX's resolved dict. The capped resolver
+            # has selected a lossy tier even if CDN headers retain stale metadata.
+            ext = (resolved.get("ext") or "mp3") if source == "lx" else "mp3"
         result = (resp, owned, ext, info, chunks, first)
         resp = owned = None  # transfer ownership to response iterator
         return result
