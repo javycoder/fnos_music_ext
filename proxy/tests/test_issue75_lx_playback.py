@@ -24,11 +24,8 @@ from proxy import transcode as tc
 from proxy.app import (
     CONF,
     _LX_CONFIG_KEYS,
-    _LX_URL_INFLIGHT,
     _LX_URL_PIN,
-    _LX_URL_PREFETCH,
-    _cancel_lx_resolutions_for,
-    _lx_resolve_epoch,
+    _cancel_lx_resolutions,
     _lx_url_pin_drop,
     _lx_url_pin_store,
     _lx_url_pin_valid,
@@ -40,20 +37,25 @@ from proxy.app import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_lx_state():
-    """每次测试前清空洛雪相关状态，避免跨用例串扰。"""
+def _clean_lx_state(tmp_path, monkeypatch):
+    """Isolate config, storage and clients; never touch real library data."""
     _LX_URL_PIN.clear()
-    _LX_URL_INFLIGHT.clear()
-    _LX_URL_PREFETCH.clear()
     appmod._LX_FRESH_COOLDOWN.clear()
     appmod._LOSSLESS_BAD.clear()
-    CONF["lx_enabled"] = True
-    CONF["lx_quality"] = "lossless"
-    CONF["quality_mode"] = "high"
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "lx_quality", "lossless")
+    monkeypatch.setitem(CONF, "quality_mode", "high")
+    monkeypatch.setitem(CONF, "tee_save_enabled", False)
+    monkeypatch.setitem(CONF, "music_db", str(tmp_path / "missing.db"))
+    for key in ("cache_dir", "library_dir", "fav_dir"):
+        path = tmp_path / key
+        path.mkdir()
+        monkeypatch.setitem(CONF, key, str(path))
+    monkeypatch.setattr(appmod, "_HOME", str(tmp_path))
+    for attr in ("upstream_client", "musicdl_client", "musicbox_client", "lx_client"):
+        monkeypatch.setattr(app.state, attr, None, raising=False)
     yield
     _LX_URL_PIN.clear()
-    _LX_URL_INFLIGHT.clear()
-    _LX_URL_PREFETCH.clear()
     appmod._LX_FRESH_COOLDOWN.clear()
     appmod._LOSSLESS_BAD.clear()
 
@@ -117,7 +119,7 @@ async def test_lx_url_inflight_shared_single_upstream_call():
         assert res["url"] == "http://audio.test/song.flac"
         assert res["ext"] == "flac"
 
-    assert len(_LX_URL_INFLIGHT) == 0
+    assert len(appmod._LX_URL_INFLIGHT) == 0
     await client.aclose()
 
 
@@ -185,9 +187,9 @@ def test_lx_stream_and_head_wait_beyond_legacy_limits(monkeypatch, tmp_path):
     monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
     os.makedirs(CONF["cache_dir"], exist_ok=True)
 
-    # 模拟上游慢解析 0.25 秒
-    def lx_handler(request: httpx.Request) -> httpx.Response:
-        time.sleep(0.25)
+    # Yield to the event loop while resolving; a synchronous sleep cannot test deadlines.
+    async def lx_handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.025)
         return httpx.Response(
             200,
             json={
@@ -218,9 +220,15 @@ def test_lx_stream_and_head_wait_beyond_legacy_limits(monkeypatch, tmp_path):
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
     )
 
-    # 模拟旧版预算只有 0.1s，新版有 2.0s（缩放比例对应 6s 与 20s）
-    monkeypatch.setattr(appmod, "_STREAM_STARTUP_S", 0.1)
-    monkeypatch.setattr(appmod, "_LX_STREAM_STARTUP_S", 2.0)
+    monkeypatch.setattr(appmod, "_STREAM_STARTUP_S", 0.01)
+    monkeypatch.setattr(appmod, "_LX_STREAM_STARTUP_S", 0.1)
+    real_wait_for = asyncio.wait_for
+    first_byte_budgets = []
+    async def record_budget(awaitable, timeout):
+        if getattr(awaitable, "cr_code", None) is appmod._open_online_stream.__code__:
+            first_byte_budgets.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+    monkeypatch.setattr(asyncio, "wait_for", record_budget)
 
     # 拦截向 audio.test 发起的请求
     orig_async_client = httpx.AsyncClient
@@ -238,11 +246,15 @@ def test_lx_stream_and_head_wait_beyond_legacy_limits(monkeypatch, tmp_path):
         assert head_resp.status_code == 200
         assert head_resp.headers["content-type"] == "audio/flac"
 
+        # Clear the HEAD pin so GET also exercises cold resolution.
+        _LX_URL_PIN.clear()
         # 冷缓存 GET
         get_resp = test_client.get("/music/api/v1/track/stream?guid=online:lx:kg:SLOW1")
         assert get_resp.status_code == 200
         assert get_resp.headers["content-type"] == "audio/flac"
         assert get_resp.content.startswith(b"fLaC")
+    assert len(first_byte_budgets) == 2
+    assert all(.025 < budget <= .1 for budget in first_byte_budgets)
 
 
 def test_lx_stream_timeout_exceeded_no_fresh_no_leak(monkeypatch, tmp_path):
@@ -252,9 +264,9 @@ def test_lx_stream_timeout_exceeded_no_fresh_no_leak(monkeypatch, tmp_path):
 
     requests_seen = []
 
-    def lx_handler(request: httpx.Request) -> httpx.Response:
+    async def lx_handler(request: httpx.Request) -> httpx.Response:
         requests_seen.append(request)
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
         return httpx.Response(
             200,
             json={"ok": True, "data": {"id": "x", "url": "http://audio.test/timeout.flac", "ext": "flac"}},
@@ -276,7 +288,7 @@ def test_lx_stream_timeout_exceeded_no_fresh_no_leak(monkeypatch, tmp_path):
         assert req.url.params.get("fresh") != "1"
 
     # 验证在途解析任务已全部清理
-    assert len(_LX_URL_INFLIGHT) == 0
+    assert len(appmod._LX_URL_INFLIGHT) == 0
 
 
 # ==============================================================================
@@ -518,7 +530,7 @@ async def test_lx_config_epoch_and_disabled_prevents_stale_writeback():
 
     # 触发配置变更
     CONF["lx_quality"] = "high"
-    _sync_lx_config_epoch(force=True)
+    _sync_lx_config_epoch()
 
     upstream_release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -526,11 +538,6 @@ async def test_lx_config_epoch_and_disabled_prevents_stale_writeback():
 
     # 旧任务的结果绝不应该写入 _LX_URL_PIN
     assert "lx:kg:STALE_TASK" not in _LX_URL_PIN
-
-    # 旧代次直接调用 resolve_lx_url：结果返回给调用方，但阻止写入钉链
-    res_stale = await appmod.resolve_lx_url(client, "lx:kg:OLD_EPOCH", epoch=_lx_resolve_epoch() - 1)
-    assert res_stale is not None
-    assert "lx:kg:OLD_EPOCH" not in _LX_URL_PIN
 
     # Case 2: 洛雪源被禁用阻止回写
     CONF["lx_enabled"] = False
@@ -554,16 +561,16 @@ async def test_lx_lifespan_cancels_and_reaps_tasks():
 
     t1 = asyncio.create_task(resolve_lx_url_shared(client, "lx:kg:HANG1"))
     await asyncio.sleep(0.01)
-    assert len(_LX_URL_INFLIGHT) == 1
+    assert len(appmod._LX_URL_INFLIGHT) == 1
 
-    reap = []
-    _cancel_lx_resolutions_for(reap)
+    reap = _cancel_lx_resolutions()
 
-    assert len(_LX_URL_INFLIGHT) == 0
-    assert len(_LX_URL_PREFETCH) == 0
+    assert len(appmod._LX_URL_INFLIGHT) == 0
+    assert len(appmod._LX_URL_PREFETCH) == 0
     assert len(reap) == 1
     await asyncio.gather(*reap, return_exceptions=True)
     assert reap[0].cancelled()
+    await asyncio.gather(t1, return_exceptions=True)
     await client.aclose()
 
 
@@ -633,6 +640,7 @@ async def test_lx_standard_transcode_reuses_shared_resolution(fake_ffmpeg, tmp_p
     # 复用了同一条解析，upstream_calls 仍然为 1
     assert len(upstream_calls) == 1
     assert sess is not None
+    await tc.shutdown_all()
     await client.aclose()
 
 

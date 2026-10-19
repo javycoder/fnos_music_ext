@@ -28,3 +28,7 @@ def _isolate_cover_state(monkeypatch):
 
     monkeypatch.setattr(pa, "_COVER_GUID_URL_MEM", {})
     monkeypatch.setattr(pa, "_COVER_UNRESOLVED_SEEN", set())
+    monkeypatch.setattr(pa, "_LX_URL_INFLIGHT", {})
+    monkeypatch.setattr(pa, "_LX_URL_PREFETCH", set())
+    monkeypatch.setattr(pa, "_LX_CONFIG_SIG", None)
+    monkeypatch.setattr(pa, "_LX_RESOLVE_EPOCH", 0)
