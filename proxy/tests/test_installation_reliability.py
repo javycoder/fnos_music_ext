@@ -698,56 +698,24 @@ def test_extend_docker_only_and_single_container_probe():
     assert 'musicbox-data -> sources-data' in text
 
 
-def test_extend_healthy_path_still_syncs_image_and_env(tmp_path):
-    """升级语义：服务全健康时也要 compose up -d --build 同步新代码（git pull 后生效）；
-    镜像未变且 .env 比容器启动新时才显式重启容器让 entrypoint 重读开关。"""
+def test_extend_image_ensure_delegates_to_shared_fingerprint_reuse():
+    """issue #70：extend.sh 不再自带"无条件 compose up --build"的镜像保障；收敛到
+    proxy/install_common.sh 的 ensure_image_current——按构建指纹复用镜像（不探测/
+    拉取基础镜像），缺失或输入变化才重建。行为矩阵见 test_build_fingerprint.py。"""
     extend = (BASE/'extend.sh').read_text(encoding='utf-8')
-    common = (BASE/'proxy'/'install_common.sh').read_text(encoding='utf-8')
-    start = extend.index('if [ "${need_start}" -eq 0 ]; then')
-    end = extend.index('\nfi', extend.index('run_docker restart "${CONTAINER_NAME}"', start)) + 3
-    block = extend[start:end]
-    funcs = function(extend, 'ensure_image_current') + function(common, 'env_newer_than_container')
-    env_file = tmp_path/'.env'
-    env_file.write_text('FNMUSIC_NETEASE_ENABLED=true\n', encoding='utf-8')
-    log = tmp_path/'docker.log'
-
-    stub_tpl = """set -uo pipefail
-log_info() { printf 'info %s\\n' "$*"; }
-log_warn() { printf 'warn %s\\n' "$*"; }
-log_err() { printf 'err %s\\n' "$*"; }
-need_start=0
-CONTAINER_NAME=fnmusic-sources
-BASE_DIR=__BASE__
-BASE_IMAGE_ENSURED=1
-STARTED_AT='__STARTED__'
-DOCKER_LOG=__LOG__
-run_docker() {
-  printf '%s\\n' "$*" >> "${DOCKER_LOG}"
-  case "$1" in
-    container) return 0 ;;
-    inspect) if [ "$3" = '{{.Image}}' ]; then printf 'sha256:img'; else printf '%s' "${STARTED_AT}"; fi; return 0 ;;
-    compose|restart) return 0 ;;
-  esac
-}
-reclaim_container() { return 0; }
-"""
-    def run_case(started_at):
-        script = (stub_tpl + funcs + '\n' + block
-                  ).replace('__BASE__', str(tmp_path)).replace('__STARTED__', started_at
-                  ).replace('__LOG__', str(log))
-        log.write_text('', encoding='utf-8')
-        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        return log.read_text(encoding='utf-8')
-
-    # 容器比 .env 新（未改配置的例行运行）：重建校验执行，但不重启
-    out = run_case('2100-01-01T00:00:00Z')
-    assert 'up -d --build' in out
-    assert 'restart' not in out
-    # .env 比容器启动新（安装/切源后）：重建之外还要重启容器
-    out = run_case('2000-01-01T00:00:00Z')
-    assert 'up -d --build' in out
-    assert 'restart fnmusic-sources' in out
+    common = (BASE/'proxy/install_common.sh').read_text(encoding='utf-8')
+    # extend 只有容器保障壳，无本地 ensure_image_current 遮蔽定义
+    assert 'ensure_image_current()' not in extend
+    assert 'ensure_sources_container' in extend
+    assert 'ensure_image_current || exit 1' in extend
+    # 共享函数三条路径：指纹复用（不探测）、探测后复用、探测后重建
+    assert 'up -d --no-build --pull never' in common
+    assert 'up -d --build' in common
+    assert 'ensure_base_image.sh' in common
+    assert 'BUILDKIT_PROGRESS' in common  # issue #24 构建日志可见性不回退
+    # 健康端口在但容器缺失：同样进入容器保障流程（不再仅告警建议重装）
+    assert '按当前应用镜像重建' in extend
+    assert '建议重新运行 ./install.sh 完成 v2.0.0 单容器迁移' not in extend
 
 
 def test_install_aligns_container_process_set_before_healthz(tmp_path):

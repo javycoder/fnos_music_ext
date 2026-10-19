@@ -7841,6 +7841,7 @@ def _stamp_online_favorite_state(tracks: list[dict], fav_guids: set[str]) -> lis
             track["isFavorite"] = guid in fav_guids
     return tracks
 
+
 async def _online_favorite_set(request: Request) -> set[str]:
     """当前用户在线收藏 guid 集合（探测失败回退 shared/空集，绝不抛错）。"""
     try:
