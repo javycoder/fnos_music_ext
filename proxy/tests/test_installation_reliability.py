@@ -57,9 +57,19 @@ def servers(tmp_path):
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         children.append(p)
         deadline = time.monotonic()+5
-        while not path.exists() and p.poll() is None and time.monotonic()<deadline:
-            time.sleep(0.01)
-        assert p.poll() is None and path.exists()
+        ready = False
+        while p.poll() is None and time.monotonic() < deadline:
+            # bind() publishes the pathname before listen(); wait for an actual
+            # connection so identity checks do not race server startup.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.1)
+                try:
+                    probe.connect(str(path))
+                    ready = True
+                    break
+                except OSError:
+                    time.sleep(0.01)
+        assert p.poll() is None and ready
         return p
     yield start
     for p in children:
