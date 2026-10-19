@@ -1994,10 +1994,15 @@ async def get_or_build_daily(
             return not current() or len(tracks) >= PLAYLIST_SIZE or time.monotonic() >= tier_deadline
 
         try:
-            chunk = await asyncio.wait_for(
-                tier_factory(on_track=_emit, should_stop=_should_stop),
-                timeout=remaining,
+            # Python 3.13 wait_for may execute a coroutine inline. A tier that
+            # completes synchronously can then publish before its call_soon
+            # config-reload callback invalidates this generation. Give the tier
+            # its own task so queued invalidation runs before we consume its
+            # result; current() below still rejects cancellation races.
+            tier_task = asyncio.create_task(
+                tier_factory(on_track=_emit, should_stop=_should_stop)
             )
+            chunk = await asyncio.wait_for(tier_task, timeout=remaining)
         except asyncio.TimeoutError:
             tier_failures.append(f"{name}:timeout")
             logger.warning(
