@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import publicplaylists as pubpl
-from proxy.app import CONF, app, fake_official_guid, resolve_real_guid
+from proxy.app import CONF, app, fake_official_guid, resolve_real_guid, save_online_favorites
 
 
 SELECTION = [
@@ -236,6 +236,43 @@ def test_playlist_list_detail_tracks_and_readonly():
         for path in ("/music/api/v1/playlist/add-track", "/music/api/v1/playlist/remove-track"):
             assert client.post(path, json={"guid": pubpl.playlist_guid(SELECTION[0]), "trackGUIDs": ["x"]}).json()["code"] == 0
         assert client.post("/music/api/v1/playlist/delete", json={"guid": pubpl.playlist_guid(SELECTION[0])}).json()["code"] == 0
+
+
+def test_public_playlist_favorite_state_is_user_scoped_and_refreshes():
+    """公共歌单按当前用户和实时收藏状态回填红心，不污染磁盘与内存缓存。"""
+    current_user = {"guid": "user-a"}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": current_user["guid"]}})
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    _wire()
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream), base_url="http://unix"
+    )
+    playlist_guid = pubpl.playlist_guid(SELECTION[0])
+    base = "/music/api/v1/track/playlist-detail/list"
+    params = {"playlistGUID": playlist_guid, "page": 1, "size": -1}
+    with TestClient(app) as client:
+        before = client.get(base, params=params).json()["data"]["list"]
+    assert all(track["isFavorite"] is False for track in before)
+    fake = before[0]["guid"]
+    real = resolve_real_guid(fake)
+
+    save_online_favorites("user-a", [{"guid": real, "createdAt": 1, "track": {}}])
+    with TestClient(app) as client:
+        user_a = client.get(base, params=params).json()["data"]["list"]
+        current_user["guid"] = "user-b"
+        user_b = client.get(base, params=params).json()["data"]["list"]
+        current_user["guid"] = "user-a"
+        save_online_favorites("user-a", [])
+        after_delete = client.get(base, params=params).json()["data"]["list"]
+    assert user_a[0]["isFavorite"] is True
+    assert user_a[1]["isFavorite"] is False
+    assert user_b[0]["isFavorite"] is False
+    assert all(track["isFavorite"] is False for track in after_delete)
+    assert all(track["isFavorite"] is False for track in pubpl.cached_tracks(playlist_guid))
 
 
 def test_upstream_failure_does_not_block_official_list():

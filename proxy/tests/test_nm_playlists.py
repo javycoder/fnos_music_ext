@@ -7,7 +7,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import nmplaylists as nmpl
-from proxy.app import CONF, app, ensure_registry_warm, fake_official_guid, resolve_real_guid
+from proxy.app import (
+    CONF,
+    app,
+    ensure_registry_warm,
+    fake_official_guid,
+    resolve_real_guid,
+    save_online_favorites,
+)
 import proxy.app as proxy_app
 
 
@@ -265,6 +272,43 @@ def test_detail_batch_and_track_list_flow():
         resp = client.get("/music/api/v1/track/playlist-detail/list",
                           params={"playlistGUID": "online:playlist:nm:111", "page": 1, "size": -1})
         assert len(resp.json()["data"]["list"]) == 2
+
+
+def test_track_list_favorite_state_is_user_scoped_and_refreshes(monkeypatch):
+    """网易账号歌单按当前用户和实时收藏状态回填红心，不污染共享缓存。"""
+    current_user = {"guid": "user-a"}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": current_user["guid"]}})
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream), base_url="http://unix"
+    )
+    base = "/music/api/v1/track/playlist-detail/list"
+    params = {"playlistGUID": "online:playlist:nm:111", "page": 1, "size": -1}
+    with TestClient(app) as client:
+        client.get("/music/api/v1/playlist/list")
+        before = client.get(base, params=params).json()["data"]["list"]
+    assert all(track["isFavorite"] is False for track in before)
+    fake = before[0]["guid"]
+    real = resolve_real_guid(fake)
+
+    save_online_favorites("user-a", [{"guid": real, "createdAt": 1, "track": {}}])
+    with TestClient(app) as client:
+        user_a = client.get(base, params=params).json()["data"]["list"]
+        current_user["guid"] = "user-b"
+        user_b = client.get(base, params=params).json()["data"]["list"]
+        current_user["guid"] = "user-a"
+        save_online_favorites("user-a", [])
+        after_delete = client.get(base, params=params).json()["data"]["list"]
+    assert user_a[0]["isFavorite"] is True
+    assert user_a[1]["isFavorite"] is False
+    assert user_b[0]["isFavorite"] is False
+    assert all(track["isFavorite"] is False for track in after_delete)
+    assert all(track["isFavorite"] is False for track in nmpl.cached_tracks(111))
 
 
 def test_cover_redirect(monkeypatch):
