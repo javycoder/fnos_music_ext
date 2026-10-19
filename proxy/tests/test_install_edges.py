@@ -57,9 +57,10 @@ def link_tools(bindir: Path, tools: tuple[str, ...]) -> None:
             (bindir / tool).symlink_to(real)
 
 
-@pytest.mark.parametrize("failure", ["", "build", "up"])
-def test_container_build_then_start_stops_at_failed_stage(tmp_path, failure):
-    """执行真实安装函数；失败不能继续启动或进入健康检查，原始输出必须保留。"""
+@pytest.mark.parametrize("failure", ["", "ensure"])
+def test_container_ensure_then_start_stops_at_failed_stage(tmp_path, failure):
+    """执行真实安装函数；镜像保障/启动任一阶段失败都不能继续启动或进入健康检查，
+    原始输出必须保留（ensure_image_current 内部行为见 test_build_fingerprint.py）。"""
     install = (BASE / "install.sh").read_text(encoding="utf-8")
     script = r'''
 set -euo pipefail
@@ -74,6 +75,13 @@ log_err() { printf '[ERROR] %s\n' "$*" >&2; }
 cleanup_legacy_sources() { :; }
 remove_conflicting_native_unit() { return 0; }
 reclaim_container() { return 0; }
+ensure_image_current() {
+    printf 'ensure-image\n' >> "$CALLS"
+    if [ "$FAILURE" = ensure ]; then
+        printf 'original-ensure-error\n' >&2
+        return 7
+    fi
+}
 env_newer_than_container() { return 1; }
 wait_http() { printf 'wait %s\n' "$*" >> "$CALLS"; }
 run_docker() {
@@ -89,16 +97,14 @@ run_docker() {
     durable = tmp_path / "persistent-install.log"
     result = run_bash(script, env={**os.environ, "FAILURE": failure,
                                   "CALLS": str(calls), "FNMUSIC_DURABLE_LOG": str(durable)})
-    expected = ['compose -f /test repo/docker-compose.yml build']
-    if failure != "build":
-        expected.append('compose -f /test repo/docker-compose.yml up -d --no-build')
+    expected = ['ensure-image']
     if not failure:
         expected.append('wait http://127.0.0.1:8768/healthz 90 2')
     assert calls.read_text().splitlines() == expected
     assert result.returncode == (1 if failure else 0), result.stderr
     if failure:
         assert f"original-{failure}-error" in result.stderr
-        assert ("镜像构建失败" if failure == "build" else "容器启动失败") in result.stderr
+        assert ("镜像保障失败" if failure == "ensure" else "容器启动失败") in result.stderr
         assert str(durable) in result.stderr
         assert "apt/pip" not in result.stderr
 

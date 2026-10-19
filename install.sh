@@ -570,7 +570,14 @@ run_docker() {
     if docker info >/dev/null 2>&1; then
         docker "$@"
     elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
-        sudo docker "$@"
+        local key
+        local -a build_env=()
+        for key in FNMUSIC_BUILD_FINGERPRINT FNMUSIC_BASE_IMAGE FNMUSIC_PIP_INDEX FNMUSIC_APT_MIRROR; do
+            if [[ -v "${key}" ]]; then
+                build_env+=("${key}=${!key}")
+            fi
+        done
+        sudo env "${build_env[@]}" docker "$@"
     else
         return 1
     fi
@@ -1460,15 +1467,8 @@ install_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || return 1
     fi
-    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
-    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" build; then
-        log_err "Docker 镜像构建失败（compose build），请查看上方原始错误。"
-        log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
-        return 1
-    fi
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build; then
-        log_err "Docker 容器启动失败（compose up --no-build），请查看上方原始错误。"
+    if ! ensure_image_current; then
+        log_err "Docker 镜像保障失败（复用或重建应用镜像未成功），请查看上方原始错误。"
         log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
         return 1
     fi
@@ -1782,15 +1782,6 @@ lx_verify_and_activate() {
     return 0
 }
 
-# Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
-# 结果写入 .env 的 FNMUSIC_BASE_IMAGE 供 compose build.args 使用；失败直接退出，不动现有部署
-if [ "${DEPLOY_MODE:-docker}" = "docker" ]; then
-    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
-        bash "${BASE_DIR}/ensure_base_image.sh"; then
-        log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源后重试。"
-        exit 1
-    fi
-fi
 
 takeover preflight --base "${BASE_DIR}"
 if [ "${DEPLOY_MODE:-docker}" = "native" ]; then

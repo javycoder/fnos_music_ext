@@ -333,6 +333,23 @@ location /music/ {
 应用中心持久日志位于 `/var/log/apps/fnmusic-ext-install.log`，不可写时回退到
 `/tmp/fnmusic-ext-install.log`。
 
+### 启动时总是重新拉取 python 基础镜像（issue #70）
+
+Python 基础镜像（如 `docker.m.daocloud.io/library/python:3.13-slim`）**只用于构建**
+`fnmusic-sources` 应用镜像，实际运行的容器始终使用应用镜像，不会出现单独使用基础
+镜像的容器，因此它删除与否不影响已构建好的应用镜像运行。
+
+启动时的镜像保障按**构建指纹**工作：指纹汇总 Dockerfile、`.dockerignore`、`COPY`
+进镜像的源码/依赖/静态资源/离线构建包与 Compose 构建参数，并记录在应用镜像的
+`io.fnmusic-ext.build-fingerprint` 标签里。启动时与本地应用镜像标签比对——
+一致就复用镜像（不探测、不拉取基础镜像，也无需构建）；代码或构建参数变化
+（例如 `git pull` 升级后）、应用镜像缺失或旧版镜像没有指纹标签时，才探测基础
+镜像并重建，因此升级后第一次启动会构建一次，属于正常现象。仅修改音源开关等
+运行配置不会重建镜像，启动脚本仍会按需重启容器，使新配置生效。
+
+已有基础镜像由用户自行管理，本项目不会自动删除镜像或执行全局镜像清理。
+`--force` 仍只表示强制重启代理，不是强制重建应用镜像。
+
 ### 安装报「未检测到 docker」
 
 v2.0.0 起仅支持 Docker 部署。请先在 fnOS「应用中心」安装 Docker 后重试；
