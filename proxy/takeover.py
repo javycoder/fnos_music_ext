@@ -527,6 +527,7 @@ _SAFE_OUTCOME = re.compile(
     r'llm call failed|daily recommend (?:peek|list inject|llm branch|fallback branch) failed|'
     r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge)|'
     r'(?:favorite|play history) list degraded to official-only|'
+    r'local-first fault recorded for [a-zA-Z0-9:_.-]{1,140}: [a-zA-Z0-9 _-]{1,60}|'
     r'\[diag\] [ -~]{0,300}|'
     r'\[cfg\] [ -~]{0,200}|'
     r'\[env\] [ -~]{0,300}|'

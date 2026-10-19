@@ -39,6 +39,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 try:
     from . import recommend as dailyrec
     from . import localrecommend as localrec
+    from . import localmatch
     from . import nmplaylists as nmpl
     from . import publicplaylists as pubpl
     from . import transcode as tc
@@ -50,6 +51,7 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import localrecommend as localrec
+    import localmatch  # type: ignore
     import nmplaylists as nmpl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
@@ -1310,6 +1312,10 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
         "bitDepth": 16 if play_format in ("wav", "flac", "aiff") else None,
         "bitrate": 1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000,
     }
+    if "audio_spec" in item:
+        for key in ("channel", "sampleRate", "bitDepth", "bitrate"):
+            audio_spec.pop(key, None)
+        audio_spec.update(item["audio_spec"])
     audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
 
     return {
@@ -1972,9 +1978,9 @@ def adopt_library_perms(path: str) -> None:
         pass
 
 
-def find_cache_file(guid: str) -> str | None:
+def find_cache_file(guid: str, *, playback: bool = False) -> str | None:
     recalled = recalled_media_path(guid)
-    if recalled:
+    if recalled and (not playback or _playback_cache_allowed(guid, recalled)):
         return recalled
     safe = cache_safe_guid(guid)
     for d in iter_media_dirs():
@@ -1983,8 +1989,28 @@ def find_cache_file(guid: str) -> str | None:
         for ext in CACHE_EXTS:
             exact = os.path.join(d, f"{safe}.{ext}")
             if os.path.exists(exact) and os.path.getsize(exact) > 0:
-                return exact
-    return _find_file_by_snapshot_tags(guid)
+                if not playback or _playback_cache_allowed(guid, exact):
+                    return exact
+    return None if playback else _find_file_by_snapshot_tags(guid)
+
+
+def _playback_cache_allowed(guid: str, path: str) -> bool:
+    fingerprint = localmatch._readable_audio_file(path)
+    if fingerprint is None:
+        return False
+    match = {"path": path, "size": fingerprint[0], "mtime": fingerprint[1]}
+    if localmatch.fault_active(guid, match):
+        return False
+    db = str(CONF.get("music_db") or dailyrec.music_db_path())
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as con:
+            rows = con.execute("""SELECT t.is_audio_file_deleted, t.is_admin_deleted,
+                t.is_cue, af.is_physical_file_deleted FROM track t
+                JOIN audio_file af ON af.id=t.audio_file_id WHERE af.path=?""", (path,)).fetchall()
+        return not rows or any(not any(row) for row in rows)
+    except sqlite3.Error:
+        # Explicit GUID-named files/.refs remain usable when the library is offline.
+        return True
 
 
 # 标签兜底查库的阴性缓存：确认不在曲库的 guid 短期内不再反复扫快照/查库
@@ -2309,8 +2335,10 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
 
 def serve_file_with_range(path: str, range_header: str | None, media_type: str,
                           extra_headers: dict | None = None, delivery_kind: str | None = None,
-                          delivery_guid: str | None = None) -> Response:
-    file_size = os.path.getsize(path)
+                          delivery_guid: str | None = None,
+                          error_hook: "Callable[[], None] | None" = None,
+                          opened_file=None, first_chunk: bytes = b"") -> Response:
+    file_size = os.fstat(opened_file.fileno()).st_size if opened_file else os.path.getsize(path)
     rng = parse_http_range(range_header, file_size)
 
     def iter_file(offset: int, length: int) -> AsyncGenerator[bytes, None]:
@@ -2321,8 +2349,14 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str,
             outcome = "complete"
             try:
                 remaining = length
-                with open(path, "rb") as fp:
-                    fp.seek(offset)
+                with opened_file if opened_file is not None else open(path, "rb") as fp:
+                    if opened_file is None:
+                        fp.seek(offset)
+                    if first_chunk:
+                        remaining -= len(first_chunk)
+                        sent += len(first_chunk)
+                        first_ms = int((time.monotonic() - started) * 1000)
+                        yield first_chunk
                     while remaining > 0:
                         chunk = fp.read(min(64 * 1024, remaining))
                         if not chunk:
@@ -2343,6 +2377,12 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str,
                 if delivery_kind:
                     _log_stream_delivery(delivery_kind, delivery_guid or "unknown", range_header,
                                          outcome, sent, length, first_ms, total_ms)
+                # 中途读错或未送满即断（文件收缩）：供本地优先路径记故障指纹
+                if error_hook is not None and (outcome == "error" or (outcome == "complete" and sent < length)):
+                    try:
+                        error_hook()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         return gen()
 
@@ -2991,6 +3031,8 @@ def register_online_meta_one(guid: str, title: str, artist: str, album: str = ""
     }
     while len(_ONLINE_META) > _ONLINE_META_MAX:
         _ONLINE_META.popitem(last=False)
+    # 本地优先匹配按 guid 失效：登记新元数据后立即重查曲库（新入库歌曲可见）
+    localmatch.invalidate(guid)
 
 
 def _online_meta_get(guid: str) -> "dict | None":
@@ -6230,6 +6272,178 @@ def ordered_stream_alternatives(item: dict) -> list[dict]:
     return sorted(alts, key=lambda x: rank.get(round(_candidate_kbps(x), 1), len(order)))
 
 
+# === 在线曲目本地优先播放（proxy/localmatch.py 只读官方曲库）===
+# 每日推荐、公共歌单、账号歌单、搜索、收藏及播放历史中的在线歌曲统一：
+# 匹配本地曲库 → 尝试本地播放 → 本地缺失或失败时走既有在线链路。
+# 保留在线 GUID/歌单顺序/收藏身份，仅在播放层选择实际音频来源。
+
+
+def _local_needle_provider(request: Request, guid: str):
+    """本地匹配的元数据针：内存（搜索会话/已登记）→ 歌单缓存 → 收藏/历史快照。
+
+    返回 (title, artist, album, cover_url)；展示前缀（音源标记/VIP）剥离，
+    Live/伴奏/Remix/翻唱等版本文字保留参与精确比较。
+    """
+    def needle() -> tuple[str, str, str, str]:
+        meta = _online_meta_for_request(request, guid) or {}
+        if not (str(meta.get("title") or "").strip() and str(meta.get("artist") or "").strip()):
+            track = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
+            if isinstance(track, dict):
+                title, artist, album = _tag_fields(track)
+                if isinstance(track.get("artists"), list):
+                    names = [_person_name(value) for value in track["artists"]]
+                    artist = "\x1f".join(name for name in names if name) or artist
+                meta = {
+                    "title": title, "artist": artist, "album": album,
+                    "cover_url": str(track.get("cover_url") or track.get("coverUrl")
+                                     or track.get("coverURL") or ""),
+                }
+        title = strip_source_tag(str(meta.get("title") or ""))
+        return (title, str(meta.get("artist") or ""), str(meta.get("album") or ""),
+                str(meta.get("cover_url") or ""))
+    return needle
+
+
+async def resolve_local_play(request: Request, guid: str, *, probe: bool = True) -> "dict | None":
+    """本地优先解析：曲库匹配 → 故障指纹检查 →（可选）音轨探测；失败返回 None。
+
+    数据库缺失/异常不阻断：直接返回 None 走在线链路。
+    """
+    if not is_online_guid(guid):
+        return None
+    db_path = str(CONF.get("music_db") or dailyrec.music_db_path())
+    match = await asyncio.to_thread(
+        localmatch.resolve_guid, guid, _local_needle_provider(request, guid), db_path)
+    if not match:
+        return None
+    if localmatch.fault_active(guid, match):
+        fn_diag(logger, "local_first_skip_fault", guid=guid)
+        return None
+    if probe:
+        probed = await localmatch.probe_audio_async(match)
+        if probed is None:
+            localmatch.record_fault(guid, match, "probe failed")
+            fn_diag(logger, "local_first_fault", guid=guid, reason="probe")
+            return None
+        match.update(probed)
+    return match
+
+
+def _sanitize_stale_local_range(guid: str, range_header: str | None) -> "str | None":
+    """本地版本中途故障后，客户端续拉偏移指向本地字节布局：不套用到在线文件。
+
+    仅丢弃确信来自本地布局的非零起始 Range（整段重起播，不承诺无缝续播）；
+    bytes=0- 与正常在线 seek 的 Range 原样放行。
+    """
+    if not range_header or not localmatch.range_from_local_layout(guid):
+        return range_header
+    m = re.match(r"bytes=(\d*)-(\d*)", range_header.strip(), re.I)
+    if m and (not m.group(1) or int(m.group(1)) > 0):
+        fn_diag(logger, "local_first_range_reset", guid=guid)
+        return None
+    return range_header
+
+
+async def _serve_local_stream(guid: str, match: dict, range_header: str | None) -> "Response | None":
+    """直接播放：打开、定位、首块读取完成后才提交响应；失败当场记故障回在线。"""
+    path = str(match.get("path") or "")
+    prior = localmatch._SERVED.get(guid)
+    if prior and time.monotonic() < prior[3] and prior[:3] != (path, match["size"], match["mtime"]):
+        # A different file layout can only restart at byte zero, never resume old offsets.
+        range_header = None
+
+    def preflight():
+        fp = open(path, "rb")
+        try:
+            stat = os.fstat(fp.fileno())
+            if (stat.st_size, stat.st_mtime) != (match["size"], match["mtime"]):
+                raise OSError("file changed")
+            rng = parse_http_range(range_header, stat.st_size)
+            start, end = rng if rng else (0, stat.st_size - 1)
+            fp.seek(start)
+            first = fp.read(min(64 * 1024, end - start + 1))
+            if not first:
+                raise OSError("no first chunk")
+            return fp, first
+        except BaseException:
+            fp.close()
+            raise
+
+    try:
+        fp, first = preflight()
+    except Exception as e:  # noqa: BLE001
+        localmatch.record_fault(guid, match, f"preflight: {type(e).__name__}")
+        fn_diag(logger, "local_first_fault", guid=guid, reason="preflight")
+        return None
+    localmatch.mark_served(guid, match)
+    fn_diag(logger, "local_first_serve", guid=guid, bytes=int(match.get("size") or 0))
+    return serve_file_with_range(
+        path, range_header, media_type_for_ext(str(match.get("ext") or "mp3")),
+        delivery_kind="local", delivery_guid=guid,
+        error_hook=lambda: localmatch.record_fault(guid, match, "mid-read"),
+        opened_file=fp, first_chunk=first,
+    )
+
+
+def _local_head_response(guid: str, match: dict, range_header: str | None) -> "Response | None":
+    """已通过音轨探测的本地文件返回真实大小与类型。"""
+    try:
+        full = serve_file_with_range(
+            str(match.get("path") or ""), range_header,
+            media_type_for_ext(str(match.get("ext") or "mp3")))
+    except OSError:
+        localmatch.record_fault(guid, match, "head stat")
+        return None
+    return Response(status_code=full.status_code, headers=dict(full.headers))
+
+
+async def _ensure_local_transcode(guid: str, match: dict) -> "tc.Session | None":
+    """标准音质：本地文件直喂 ffmpeg，等 init+首分片成形才算起播成功。
+
+    起播失败（清理会话并记故障）由调用方回落在线输入重建；复用中的在线
+    会话/在线 done 缓存原样返回，保持分片序列单一音频版本。
+    """
+    try:
+        fingerprint = {k: match[k] for k in ("path", "size", "mtime")}
+        sess = await tc.ensure_session(
+            guid, str(match["path"]), float(match.get("duration_s") or 0),
+            root=CONF["cache_dir"],
+            bitrate=str(CONF.get("transcode_bitrate") or "128k"),
+            hls_time=float(CONF.get("transcode_hls_time") or 10),
+            max_active=max(1, int(CONF.get("transcode_max_sessions") or 2)),
+            max_cache_bytes=max(16, int(CONF.get("transcode_cache_max_mb") or 512)) * 1024 * 1024,
+            headers=None, source_fingerprint=fingerprint,
+            on_failure=lambda failed: _on_hls_segment_failure(guid, failed),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("local transcode start failed for %s: %s", guid, type(e).__name__)
+        localmatch.record_fault(guid, match, "ensure failed")
+        return None
+    if sess is None:
+        localmatch.record_fault(guid, match, "ffmpeg unavailable")
+        return None
+    if sess.src_kind != "local" or sess.status == "done":
+        return sess
+    if not await tc.wait_startup(sess, timeout=15.0):
+        await tc.discard_session(guid, expected=sess)
+        localmatch.record_fault(guid, match, "transcode startup wait failed")
+        fn_diag(logger, "local_first_fault", guid=guid, reason="transcode_startup")
+        return None
+    fn_diag(logger, "local_first_transcode", guid=guid)
+    return sess
+
+
+def _on_hls_segment_failure(guid: str, sess: "tc.Session | None") -> None:
+    """本地输入会话中途失败：记文件故障指纹，新的播放请求换在线版本起播。"""
+    if sess is None or tc.session_kind(sess) != "local":
+        return
+    if not sess.src and not sess.source_fingerprint:
+        return
+    fingerprint = sess.source_fingerprint or {"path": sess.src, "size": 0, "mtime": 0.0}
+    localmatch.record_fault(guid, fingerprint, "hls segment failed")
+    fn_diag(logger, "local_first_fault", guid=guid, reason="hls_mid")
+
+
 @app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request, subpath: str = ""):
@@ -6238,10 +6452,25 @@ async def stream_track(request: Request, subpath: str = ""):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
-    cached = find_cache_file(guid)
-    log_stream_probe(request.method, guid, range_header, bool(cached))
     if request.method == "HEAD":
+        local_head = await resolve_local_play(request, guid)
+        if local_head is not None:
+            head = _local_head_response(guid, local_head, range_header)
+            if head is not None:
+                return head
+        range_header = _sanitize_stale_local_range(guid, range_header)
+        cached = find_cache_file(guid, playback=True)
         return await _stream_head_response(request, guid, cached, range_header)
+    # 本地曲库命中优先于普通试听缓存（规格）：命中且可播则完全不触在线链路
+    local = await resolve_local_play(request, guid)
+    if local is not None:
+        local_resp = await _serve_local_stream(guid, local, range_header)
+        if local_resp is not None:
+            return local_resp
+    # 本地起播失败或因故障跳过：客户端续拉偏移可能指向本地布局，不能套到在线文件上
+    range_header = _sanitize_stale_local_range(guid, range_header)
+    cached = find_cache_file(guid, playback=True)
+    log_stream_probe(request.method, guid, range_header, bool(cached))
     if cached:
         if request.method != "HEAD" and _is_deferred_cache_file(guid, cached):
             # 元数据缺失暂存 cache 的曲目（issue #52）：重播时补齐元数据转正进曲库。
@@ -6334,7 +6563,7 @@ async def stream_track(request: Request, subpath: str = ""):
 
 async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, dict | None]":
     """转码输入源：已落库/已缓存文件优先（源关了也能转），其次在线直链。"""
-    cached = find_cache_file(guid)
+    cached = find_cache_file(guid, playback=True)
     if cached:
         return cached, None
     if not _source_enabled(guid):
@@ -6368,8 +6597,25 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
 
 
 async def _start_transcode_session(request: Request, guid: str) -> "tc.Session | None":
-    """启动/复用标准音质转码会话；不可用返回 None（调用方回落单分片桩）。"""
+    """启动/复用标准音质转码会话；不可用返回 None（调用方回落单分片桩）。
+
+    已公开的运行会话固定版本；新播放优先本地，其次完整缓存与在线源。
+    """
     try:
+        existing = tc.get_session(guid)
+        if existing is not None:
+            if existing.src_kind != "local" or await tc.wait_startup(existing, timeout=15):
+                return existing
+            _on_hls_segment_failure(guid, existing)
+            await tc.discard_session(guid, expected=existing)
+        local = await resolve_local_play(request, guid)
+        if local is not None:
+            sess = await _ensure_local_transcode(guid, local)
+            if sess is not None:
+                return sess
+        existing = tc.peek_cached(guid, CONF["cache_dir"])
+        if existing is not None:
+            return existing
         if source_from_online_guid(guid) == "netease":
             retained = _online_meta_for_request(request, guid)
             if retained and retained.get("duration_s"):
@@ -6433,28 +6679,57 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
+    rendition = None
+    versioned = re.fullmatch(r"([a-f0-9]{32}|legacy)__(init\.mp4|[0-9]{5}\.m4s)", filename)
+    if versioned:
+        rendition, filename = versioned.groups()
     if filename != "preset.m3u8" and not tc.valid_segment_name(filename):
         return JSONResponse(content={"code": 404, "msg": "not found", "data": None}, status_code=404)
 
-    sess = _transcode_live(guid)
-    if sess is None and CONF.get("transcode_enabled") and tc.FFMPEG_BIN:
-        # App 有时不先 POST /track/transcode 直接拉 playlist（实测），此处惰性补启
+    sess = _transcode_live(guid) if filename != "preset.m3u8" else None
+    if filename == "preset.m3u8" and CONF.get("transcode_enabled") and tc.FFMPEG_BIN:
         sess = await _start_transcode_session(request, guid)
 
     if sess is not None:
         if filename == "preset.m3u8":
-            return Response(content=tc.playlist_text(sess), media_type="application/vnd.apple.mpegurl",
+            # 新播放过程从此固定实际音频版本（本地/在线），分片不得跨版本混供
+            playlist = tc.playlist_text(sess)
+            playlist = playlist.replace('URI="init.mp4"', f'URI="{sess.rendition}__init.mp4"')
+            playlist = re.sub(r"(?m)^([0-9]{5}\.m4s)$", lambda m: f"{sess.rendition}__{m[1]}", playlist)
+            return Response(content=playlist, media_type="application/vnd.apple.mpegurl",
                             headers={"X-Accel-Buffering": "no"})
+        if rendition != sess.rendition:
+            return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
         path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
         if path:
+            current = _transcode_live(guid)
+            if current is None or current.rendition != rendition:
+                return Response(status_code=404)
             media = "audio/mp4" if filename == tc.INIT_NAME else "video/iso.segment"
+            try:
+                fp = open(path, "rb")
+                size = os.fstat(fp.fileno()).st_size
+                rng = parse_http_range(request.headers.get("range"), size)
+                start, end = rng if rng else (0, size - 1)
+                fp.seek(start)
+                first = fp.read(min(64 * 1024, end - start + 1))
+                if not first:
+                    fp.close()
+                    return Response(status_code=404)
+            except OSError:
+                if "fp" in locals():
+                    fp.close()
+                return Response(status_code=404)
             return serve_file_with_range(path, request.headers.get("range"), media,
-                                         delivery_kind="hls", delivery_guid=guid)
+                                         delivery_kind="hls", delivery_guid=guid,
+                                         opened_file=fp, first_chunk=first)
+        _on_hls_segment_failure(guid, sess)
         return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
 
     if filename != "preset.m3u8":
         return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
-    info = await _online_info(request, guid)
+    local = await resolve_local_play(request, guid)
+    info = local or _online_meta_for_request(request, guid)
     return _legacy_hls_stub(guid, info)
 
 
@@ -6482,11 +6757,11 @@ async def track_transcode(request: Request):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     if CONF.get("transcode_enabled") and tc.FFMPEG_BIN:
-        sess = _transcode_live(guid)
-        if sess is None:
-            sess = await _start_transcode_session(request, guid)
-        if sess is not None and sess.status in ("starting", "running") and not find_cache_file(guid):
-            # 标准音质播放不经过 /track/stream，tee 永不触发；挂后台整轨下载保住边听边存
+        sess = await _start_transcode_session(request, guid)
+        if sess is not None and sess.status in ("starting", "running") \
+                and tc.session_kind(sess) != "local" and not find_cache_file(guid):
+            # 标准音质播放不经过 /track/stream，tee 永不触发；挂后台整轨下载保住边听边存。
+            # 本地文件输入的会话不挂（本地播放成功时不触发重复整轨下载）。
             _register_full_fetch(request, guid)
     return JSONResponse(
         content={
@@ -6921,7 +7196,21 @@ async def track_metadata(request: Request, subpath: str = ""):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
-    if source_from_online_guid(guid) == "netease":
+    # 本地命中：直接用本地音频规格（格式/大小/时长），跳过网易直链预取与在线详情请求
+    local = await resolve_local_play(request, guid)
+    if local is not None:
+        meta = local.get("meta") or {}
+        data = {
+            "title": str(meta.get("title") or ""),
+            "artist": str(meta.get("artist") or ""),
+            "album": str(meta.get("album") or local.get("album") or ""),
+            "duration_s": float(local.get("duration_s") or 0),
+            "ext": str(local.get("ext") or "mp3"),
+            "file_size": int(local.get("size") or 0),
+            "cover_url": str(meta.get("cover_url") or ""),
+            "audio_spec": local.get("audio_spec") or {},
+        }
+    elif source_from_online_guid(guid) == "netease":
         _prefetch_netease(request, guid)
         data = _online_meta_for_request(request, guid)
         if not data or not data.get("duration_s"):
@@ -7907,7 +8196,8 @@ async def favorite_track_list(request: Request):
             logger.warning("Error reading online favorites for list for user %s: %s", user_guid, e)
             fav_items = []
 
-    # 自愈：bind=pending 的收藏在此补发官方绑定/下载（含代理重启后的恢复）
+    # 自愈：bind=pending 的收藏在此补发官方绑定重试（含代理重启后的恢复）。
+    # #67 后列表读取只对已有缓存文件的条目重试绑定，绝不补发下载。
     _maybe_retry_official_binds(request, user_guid, fav_items=fav_items)
 
     # 官方真实条目作为结构模板：App 端解析严格，在线条目字段集需与官方对齐；
@@ -8792,7 +9082,7 @@ async def playlist_track_list(request: Request):
         extras = load_playlist_tracks(user_guid).get(resolved_pl_guid) or []
         if not extras:
             return JSONResponse(content=envelope, headers=headers)
-        # 自愈：bind=pending 的歌单条目在此补发官方绑定/下载
+        # 自愈：bind=pending 的歌单条目在此补发官方绑定重试（#67 后不补发下载）
         _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
 
         data = envelope.get("data")

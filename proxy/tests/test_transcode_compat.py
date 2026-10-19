@@ -515,16 +515,17 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
 
         body = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8").text
         assert "#EXT-X-VERSION:7" in body
-        assert '#EXT-X-MAP:URI="init.mp4"' in body
+        import re
+        token = re.search(r'URI="([a-f0-9]{32})__init.mp4"', body)[1]
         assert "00000.m4s" in body and "#EXT-X-ENDLIST" in body
 
-        init = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/init.mp4")
+        init = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__init.mp4")
         assert init.status_code == 200
         assert init.content.startswith(b"ftypinit")
         assert init.headers["content-type"].startswith("audio/mp4")
         assert init.headers["x-accel-buffering"] == "no"
 
-        seg = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/00000.m4s")
+        seg = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__00000.m4s")
         assert seg.status_code == 200
         assert seg.headers["content-type"].startswith("video/iso.segment")
         assert seg.headers["x-accel-buffering"] == "no"
