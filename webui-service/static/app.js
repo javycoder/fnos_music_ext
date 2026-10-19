@@ -9,7 +9,7 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", lxmusic: "洛雪自定义源", none: "未配置" };
-const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxmusic: "lxmusic", webui: "WebUI" };
+const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
@@ -80,11 +80,17 @@ async function loadStatus() {
     $("#ov-processes").innerHTML = Object.entries(st.processes).map(([name, p]) => {
       const ok = p.state === "RUNNING";
       const cls = ok ? "ok" : p.state === "FATAL" ? "err" : "";
-      return `<span class="chip"><span class="dot ${cls}"></span>${PROC_LABEL[name] || name} · ${p.state}</span>`;
+      return `<span class="chip"><span class="dot ${cls}"></span>${escapeHtml(PROC_LABEL[name] || name)} · ${escapeHtml(p.state)}</span>`;
     }).join("");
     $("#ov-services").innerHTML = Object.entries(st.services).map(([name, s]) => {
-      if (!s.reachable && s.note) return `<span class="state-line"><span class="dot"></span>${PROC_LABEL[name]}：${s.note}</span>`;
-      return `<span class="state-line"><span class="dot ${s.reachable ? "ok" : "err"}"></span>${PROC_LABEL[name]}：${s.reachable ? "正常" : "不可达"}</span>`;
+      if (!s.reachable && s.note) return `<span class="state-line"><span class="dot"></span>${escapeHtml(PROC_LABEL[name])}：${escapeHtml(s.note)}</span>`;
+      if (!s.reachable) {
+        // 后端探活失败时透出 healthz 返回的具体原因（如 lxserver unreachable），
+        // 便于区分"进程异常"与"进程在但底层服务不可达"
+        const why = String(s.detail || "").trim();
+        return `<span class="state-line"><span class="dot err"></span>${escapeHtml(PROC_LABEL[name])}：不可达${why ? "（" + escapeHtml(why) + "）" : ""}</span>`;
+      }
+      return `<span class="state-line"><span class="dot ok"></span>${escapeHtml(PROC_LABEL[name])}：正常</span>`;
     }).join("");
     const lxCard = $("#ov-lx-card");
     if (st.current_provider === "lxmusic" && st.lx_source) {
@@ -95,15 +101,15 @@ async function loadStatus() {
       const sources = ls.sources || [];
       if (sources.length) {
         rows.push(`<div class="kv"><b>已激活源</b>${sources.length} 个：${sources.map((s) =>
-          `${escapeHtml(s.name || "-")}${s.version ? " v" + s.version : ""}`).join("、")}</div>`);
+          `${escapeHtml(s.name || "-")}${s.version ? " v" + escapeHtml(s.version) : ""}`).join("、")}</div>`);
         const plats = new Set();
         sources.forEach((s) => (s.platforms || []).forEach((p) => plats.add(p)));
-        rows.push(`<div class="kv"><b>平台</b>${[...plats].join("、") || "-"}</div>`);
+        rows.push(`<div class="kv"><b>平台</b>${escapeHtml([...plats].join("、")) || "-"}</div>`);
       } else if (ls.source) {
-        rows.push(`<div class="kv"><b>源名称</b>${ls.source.name || "-"} ${ls.source.version ? "v" + ls.source.version : ""}</div>`);
-        rows.push(`<div class="kv"><b>平台</b>${Object.keys(ls.source.platforms || {}).join("、") || "-"}</div>`);
+        rows.push(`<div class="kv"><b>源名称</b>${escapeHtml(ls.source.name || "-")} ${ls.source.version ? "v" + escapeHtml(ls.source.version) : ""}</div>`);
+        rows.push(`<div class="kv"><b>平台</b>${escapeHtml(Object.keys(ls.source.platforms || {}).join("、")) || "-"}</div>`);
       }
-      if (ls.last_error) rows.push(`<div class="kv"><b>错误</b>${ls.last_error}</div>`);
+      if (ls.last_error) rows.push(`<div class="kv"><b>错误</b>${escapeHtml(ls.last_error)}</div>`);
       $("#ov-lx").innerHTML = rows.join("");
     } else {
       lxCard.hidden = true;

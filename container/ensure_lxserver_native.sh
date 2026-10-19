@@ -6,6 +6,9 @@ set -euo pipefail
 # 上游 v2.1.2 server.zip 只内嵌 linux-x64-gnu 绑定，ARM64 启动即报：
 # Cannot find module music-tag-native-linux-arm64-gnu。此脚本按构建机架构
 # 下载并落位锁定的 npm 平台包，Docker、原生与 FPK 离线安装共用同一校验。
+# 已落位的模块不再"文件非空即放行"：先核对平台包版本与锁定版本一致，再在
+# 宿主架构允许时用 node 实际加载验证；ARM64 校验失败自动从锁定包重新补装
+# （仍失败则中止并报告原因），x64 构件来自上游 zip，损坏时明确报错终止。
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -75,16 +78,88 @@ if [ "${REQUIRED_ARCH}" = "arm64" ] && [ -z "${NATIVE_SHA256}" ]; then
     exit 1
 fi
 
+# 宿主机是否能实际加载 REQUIRED_ARCH 的二进制：交叉场景（如在 x64 构建机上
+# 处理 arm64 包）无法 dlopen，只做版本与完整性核对，实际加载验证留给目标机。
+host_arch_matches() {
+    case "$(uname -m)" in
+        x86_64|amd64) [ "${1}" = "x64" ] ;;
+        aarch64|arm64) [ "${1}" = "arm64" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+read_pkg_version() {
+    python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        print(json.load(fh).get("version", ""))
+except Exception:
+    pass
+' "$1" 2>/dev/null || true
+}
+
+# 校验已落位模块，原因写入 REJECT_REASON，返回 1 表示不可信（需补装或报错）。
+# x64 绑定由上游 server.zip 自带，没有可重装的锁定包，只验不修；
+# arm64 以本脚本补装的平台包为准，完整核对 包目录/版本/加载器副本/可加载性。
+validate_installed_native() {
+    REJECT_REASON=""
+    if [ "${REQUIRED_ARCH}" = "x64" ]; then
+        if [ ! -s "${PACKAGE_NATIVE}" ]; then
+            REJECT_REASON="上游 server.zip 未携带 x64 原生模块: ${NATIVE_NAME}"
+            return 1
+        fi
+        if host_arch_matches "x64" && command -v node >/dev/null 2>&1 \
+            && ! node -e 'require(process.argv[1]);' "${PACKAGE_NATIVE}" >/dev/null 2>&1; then
+            REJECT_REASON="node 无法加载 x64 绑定（构件损坏或 ABI 不符）: ${PACKAGE_NATIVE}"
+            return 1
+        fi
+        return 0
+    fi
+    if [ ! -s "${NAMED_NATIVE}" ]; then
+        REJECT_REASON="原生模块文件缺失: ${NAMED_NATIVE}"
+        return 1
+    fi
+    local pkg_json="${LXSERVER_DIR}/node_modules/${PACKAGE_DIR}/package.json"
+    if [ ! -s "${pkg_json}" ]; then
+        REJECT_REASON="平台包不完整（缺 ${pkg_json}）"
+        return 1
+    fi
+    local pkg_version
+    pkg_version="$(read_pkg_version "${pkg_json}")"
+    if [ "${pkg_version}" != "${NATIVE_VERSION}" ]; then
+        REJECT_REASON="平台包版本不符（${pkg_version:-未知} != 锁定 ${NATIVE_VERSION}）"
+        return 1
+    fi
+    if [ ! -s "${PACKAGE_NATIVE}" ]; then
+        REJECT_REASON="加载器目录缺少绑定副本: ${PACKAGE_NATIVE}"
+        return 1
+    fi
+    if host_arch_matches "arm64" && command -v node >/dev/null 2>&1 \
+        && ! node -e 'require(process.argv[1]);' "${NAMED_NATIVE}" >/dev/null 2>&1; then
+        REJECT_REASON="node 无法加载 arm64 绑定（构件损坏或 ABI 不符）: ${NAMED_NATIVE}"
+        return 1
+    fi
+    return 0
+}
+
+PACKAGE_NATIVE="${LXSERVER_DIR}/node_modules/music-tag-native/${NATIVE_NAME}"
+NAMED_NATIVE="${LXSERVER_DIR}/node_modules/${PACKAGE_DIR}/${NATIVE_NAME}"
+
 if [ "${DOWNLOAD_ONLY}" -ne 1 ]; then
-    PACKAGE_NATIVE="${LXSERVER_DIR}/node_modules/music-tag-native/${NATIVE_NAME}"
-    NAMED_NATIVE="${LXSERVER_DIR}/node_modules/${PACKAGE_DIR}/${NATIVE_NAME}"
-    if [ -s "${PACKAGE_NATIVE}" ] || [ -s "${NAMED_NATIVE}" ]; then
-        log_info "lxserver ${REQUIRED_ARCH} 原生模块已就位，跳过。"
+    if validate_installed_native; then
+        log_info "lxserver ${REQUIRED_ARCH} 原生模块已就位且校验通过，跳过。"
         exit 0
     fi
-    if [ "${REQUIRED_ARCH}" = "x64" ]; then
-        log_err "上游 server.zip 缺少 x64 原生模块: ${NATIVE_NAME}"
+    if [ "${REQUIRED_ARCH}" != "arm64" ]; then
+        log_err "x64 原生模块来自上游 server.zip，无法自动修复。${REJECT_REASON}"
         exit 1
+    fi
+    if [ -s "${NAMED_NATIVE}" ] || [ -s "${PACKAGE_NATIVE}" ]; then
+        log_info "已落位模块未通过校验：${REJECT_REASON}"
+        log_info "清除失效文件，从锁定包重新补装 ARM64 原生模块..."
+        rm -f "${NAMED_NATIVE}" "${PACKAGE_NATIVE}"
+        rm -rf "${LXSERVER_DIR}/node_modules/${PACKAGE_DIR}"
     fi
 fi
 
@@ -146,5 +221,9 @@ PY
     cp -a "${TEMP_DIR}/package/." "${NAMED_DEST}/"
     mkdir -p "${LXSERVER_DIR}/node_modules/music-tag-native"
     cp -f "${NAMED_DEST}/${NATIVE_NAME}" "${LXSERVER_DIR}/node_modules/music-tag-native/${NATIVE_NAME}"
-    log_info "lxserver ${REQUIRED_ARCH} 原生模块已补齐。"
+    if ! validate_installed_native; then
+        log_err "ARM64 原生模块补装后仍未通过校验：${REJECT_REASON}"
+        exit 1
+    fi
+    log_info "lxserver ${REQUIRED_ARCH} 原生模块已补齐并通过校验。"
 fi

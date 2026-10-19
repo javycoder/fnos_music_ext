@@ -777,6 +777,55 @@ test("清理 Beta：501 直连错误可见；取消后确认无效；无效响�
   assert.ok(els.get("#cleanup-status").textContent.includes("响应格式无效"));
 });
 
+test("loadStatus：概览进程含 lxserver，不可达透出 healthz 详情并转义", async () => {
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t",
+    current_provider: "lxmusic",
+    processes: {
+      musicdl: { state: "STOPPED", detail: "" },
+      lxserver: { state: "FATAL", detail: "" },
+      lxmusic: { state: "RUNNING", detail: "" },
+      webui: { state: "RUNNING", detail: "" },
+    },
+    services: {
+      lxmusic: { reachable: false, detail: "lxserver unreachable <script>alert(1)</script>" },
+    },
+    lx_source: null,
+    previews: {},
+  });
+  await global.loadStatus();
+  const procHtml = els.get("#ov-processes").innerHTML;
+  assert.ok(procHtml.includes("lxserver"), "进程概览应包含 lxserver 标签");
+  assert.ok(procHtml.includes("FATAL"));
+  const svcHtml = els.get("#ov-services").innerHTML;
+  assert.ok(svcHtml.includes("不可达"), "不可达状态应显示");
+  assert.ok(svcHtml.includes("lxserver unreachable"), "healthz 失败详情应透出，便于定位底层进程故障");
+  assert.ok(!svcHtml.includes("<script>"), "错误详情必须 HTML 转义");
+  assert.ok(svcHtml.includes("&lt;script&gt;"));
+});
+
+test("loadStatus：洛雪卡片源信息与错误文本转义", async () => {
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t",
+    current_provider: "lxmusic",
+    processes: {},
+    services: {},
+    previews: {},
+    lx_source: {
+      initialized: true,
+      sources: [],
+      source: { name: "<b>evil</b>", version: "1.0", platforms: { kw: {} } },
+      last_error: "<img src=x onerror=alert(1)>",
+    },
+  });
+  await global.loadStatus();
+  const lxHtml = els.get("#ov-lx").innerHTML;
+  assert.ok(!lxHtml.includes("<img src=x"), "last_error 必须转义");
+  assert.ok(lxHtml.includes("&lt;img"));
+  assert.ok(!lxHtml.includes("<b>evil</b>"), "源名称必须转义");
+  assert.ok(lxHtml.includes("&lt;b&gt;evil&lt;/b&gt;"));
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;
