@@ -27,7 +27,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, AsyncGenerator, Callable, Coroutine
+from typing import Any, AsyncGenerator, Callable, Coroutine, Mapping
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -743,6 +743,8 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         _migrate_media_refs(old_cache_dir or "", CONF["cache_dir"])
     if set(changed) & {"quality_mode", "netease_quality"}:
         _sync_netease_quality()
+    if set(changed) & _LX_CONFIG_KEYS:
+        _sync_lx_config_epoch()
     return changed
 
 
@@ -766,6 +768,9 @@ def _env_watch_stat(path: "str | None" = None):
 
 
 # 音源集合相关的 CONF 键：任一变化意味着推荐缓存里的旧源曲目可能不可播（issue #22）
+# issue #75：洛雪解析身份相关配置（音质/音源/开关）。任一变化都让在途解析与钉链
+# 失效，避免旧音质配置的解析结果写回新配置下的首播。
+_LX_CONFIG_KEYS = {"lx_enabled", "lx_quality", "quality_mode", "lx_sources", "lx_source_list"}
 _SOURCE_CONF_KEYS = {
     "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
     "lx_source_url", "lx_source_list",
@@ -1614,6 +1619,13 @@ def title_from_track(item: dict) -> str:
     if not isinstance(item, dict):
         return ""
     return str(item.get("title") or item.get("name") or "").strip().lower()
+
+
+# issue #75：在线曲目首播总预算。lxmusic 端点总预算（LX_URL_TIMEOUT）默认 15s，
+# 网易/洛雪之外的音源维持原有 12s。单次尝试不再另设 6s 上限，冷播放等待解析结果
+# 而不提前放弃——App 首播失败的核心成因即"音源还在解析，代理已经超时放弃"。
+_LX_STREAM_STARTUP_S = 20.0
+_STREAM_STARTUP_S = 12.0
 
 
 def should_cache(range_header: str | None) -> bool:
@@ -3037,15 +3049,134 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
+# 洛雪直链钉住（2.8.0j）：与网易钉链同构。窗口型播放内核按 1MB 窗口续拉，
+# 每个窗口各自重解析；lxmusic 虽有 600s 成功缓存 + 到期探活续期，但缓存边界
+# 后旧链失效重解析时，同曲可能换 rendition（实测同曲 lossless 档可从 320k MP3
+# 换成 48k AAC，字节布局完全不同），带偏移的续拉即错位断流，表象仍为"播到
+# 一半跳歌"。有效期内钉住同一条解析结果，取流/续传/转码各调用点自动一致。
+_LX_URL_PIN: "dict[str, tuple[dict, float]]" = {}
+_LX_URL_PIN_MAX = 1024
+# 与 lxmusic LX_URL_CACHE_TTL 默认值对齐：钉链到期时 lxmusic 缓存同样到期，
+# 由其探活续期保持同链或重解析，proxy 侧不自行强制 fresh
+_LX_URL_PIN_TTL_S = 600.0
+
+# issue #75：在途解析合并表（同网易 inflight 同型）：同曲首播的 metadata/HEAD/
+# GET/转码/后台下载只跑一次解析，调用方取消不取消共享任务。
+_LX_URL_INFLIGHT: "dict[tuple, asyncio.Task]" = {}
+_LX_URL_INFLIGHT_MAX = 16
+_LX_URL_PREFETCH: "set[asyncio.Task]" = set()
+_LX_PREFETCH_MAX = 2
+_LX_RESOLVE_EPOCH: list[int] = [0]
+_LX_CONFIG_SIG: "tuple | None" = None
+
+
+def _lx_resolve_epoch() -> int:
+    """音质/音源配置代次：切档后旧代次的在途解析不复用、也不写回新代次。"""
+    return _LX_RESOLVE_EPOCH[0]
+
+
+def _lx_config_signature() -> tuple:
+    keys = ("lx_enabled", "lx_quality", "quality_mode", "lx_sources", "lx_source_list")
+    return tuple(str(CONF.get(k)) for k in keys)
+
+
+def _cancel_lx_resolutions_for(reap: "list | None" = None) -> list:
+    """取消本事件循环上的在途解析与预热，清登记；返回需回收的任务列表。
+
+    调用方（生命周期收尾）自行 gather 回收，避免在同步辅助函数里直接 await。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    tasks: list = []
+    for gate_key, task in list(_LX_URL_INFLIGHT.items()):
+        if loop is not None and not task.done() and task.get_loop() is loop:
+            task.cancel()
+            tasks.append(task)
+        _LX_URL_INFLIGHT.pop(gate_key, None)
+    for task in list(_LX_URL_PREFETCH):
+        if loop is not None and not task.done() and task.get_loop() is loop:
+            task.cancel()
+            tasks.append(task)
+        _LX_URL_PREFETCH.discard(task)
+    if reap is not None:
+        reap.extend(tasks)
+    return tasks
+
+
+def _cancel_lx_resolutions() -> int:
+    """取消在途解析并清登记；返回取消个数（配置失效路径用，同步调用）。"""
+    tasks = _cancel_lx_resolutions_for()
+    if tasks:
+        asyncio.gather(*tasks, return_exceptions=True)
+    return len(tasks)
+
+
+def _sync_lx_config_epoch(force: bool = False) -> bool:
+    """洛雪配置变化 → 失效在途解析与钉链（与 _sync_netease_quality 同型）。"""
+    global _LX_CONFIG_SIG
+    sig = _lx_config_signature()
+    if sig == _LX_CONFIG_SIG and not force:
+        return False
+    first = _LX_CONFIG_SIG is None
+    _LX_CONFIG_SIG = sig
+    if first:
+        return False
+    _LX_RESOLVE_EPOCH[0] += 1
+    _LX_URL_PIN.clear()
+    _LX_FRESH_COOLDOWN.clear()
+    cancelled = _cancel_lx_resolutions()
+    logger.info("lx config changed: invalidated %d inflight resolutions and pins", cancelled)
+    return True
+
+
+def _lx_url_pin_valid(song_id: str) -> bool:
+    pin = _LX_URL_PIN.get(str(song_id))
+    return bool(pin and time.monotonic() < pin[1])
+
+
+def _lx_url_pin_drop(song_id: str, reason: str = "") -> None:
+    """直链打不开/首字节失败即弃钉：后续解析重新出链，不再撞同一条死链。"""
+    dropped = _LX_URL_PIN.pop(str(song_id), None)
+    if dropped and reason:
+        fn_diag(logger, "lx_pin_drop", guid=str(song_id)[:80], reason=reason)
+
+
+def _lx_url_pin_store(song_id: str, resolved: dict, epoch: "int | None" = None) -> None:
+    """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。
+    如果配置代次已变或源已被关闭，放弃写入，防止旧任务写回覆盖新配置。"""
+    if epoch is not None and epoch != _lx_resolve_epoch():
+        return
+    if not CONF.get("lx_enabled", True):
+        return
+    now = time.monotonic()
+    if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
+        for k in [k for k, v in _LX_URL_PIN.items() if v[1] <= now]:
+            _LX_URL_PIN.pop(k, None)
+        if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
+            oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
+            _LX_URL_PIN.pop(oldest, None)
+    _LX_URL_PIN[str(song_id)] = (resolved, now + _LX_URL_PIN_TTL_S)
+
+
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
-                         meta: "dict | None" = None, max_quality: "str | None" = None) -> "dict | None":
+                         meta: "dict | None" = None, max_quality: "str | None" = None,
+                         epoch: "int | None" = None) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
 
     fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
     重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。
     meta（issue #49）：曲目真实标签（title/artist/album/duration_s/cover_url），
     songInfo 反查缓存全冷（重启后点播存量歌单/收藏/历史）时透传给 lxmusic
-    兜底合成——关键词型源脚本按歌名歌手取链，"未知曲目"必然解析失败。"""
+    兜底合成——关键词型源脚本按歌名歌手取链，"未知曲目"必然解析失败。
+
+    issue #75：同一首洛雪曲的首播可能同时被 metadata 预热、HEAD 探测、起流、转码
+    与后台整轨下载触发，各自解析既拉长首播等待，也让慢解析在多处并发重试。按
+    事件循环 + 曲目 + 音质上限 + 配置代次 + 刷新模式合并在途任务，调用方取消不
+    取消共享任务（与 resolve_netease_url 的 shield 语义同构）。"""
+    _sync_lx_config_epoch()
+    if epoch is None:
+        epoch = _lx_resolve_epoch()
     key = str(song_id)
     # issue #54：fresh 冷却窗内快速失败——刚确认打不开的直链短时间重试 fresh
     # 只会重复消耗音源解析额度；非 fresh 路径不受影响
@@ -3061,6 +3192,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                 pinned_tier = str((pinned or {}).get("actual_tier") or (pinned or {}).get("quality") or "").lower()
                 is_lossless = pinned_ext in _LOSSLESS_EXTS or pinned_tier in ("lossless", "flac")
                 if not (max_quality in ("high", "standard", "mp3") and is_lossless):
+                    fn_diag(logger, "lx_pin_hit", guid=key[:80])
                     return dict(pinned)
             _LX_URL_PIN.pop(key, None)
     primary = str(CONF.get("lx_quality") or "lossless").strip()
@@ -3115,40 +3247,122 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                         ext = str(inner.get("ext") or "").lower()
                         if max_quality in ("high", "standard", "mp3") and (tier in ("lossless", "flac") or ext in _LOSSLESS_EXTS):
                             continue
-                        _lx_url_pin_store(key, inner)
+                        _lx_url_pin_store(key, inner, epoch=epoch)
                         return dict(inner)
         except Exception as e:
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
     return None
 
 
-# 洛雪直链钉住（2.8.0j）：与网易钉链同构。窗口型播放内核按 1MB 窗口续拉，
-# 每个窗口各自重解析；lxmusic 虽有 600s 成功缓存 + 到期探活续期，但缓存边界
-# 后旧链失效重解析时，同曲可能换 rendition（实测同曲 lossless 档可从 320k MP3
-# 换成 48k AAC，字节布局完全不同），带偏移的续拉即错位断流，表象仍为"播到
-# 一半跳歌"。有效期内钉住同一条解析结果，取流/续传/转码各调用点自动一致。
-_LX_URL_PIN: "dict[str, tuple[dict, float]]" = {}
-_LX_URL_PIN_MAX = 1024
-# 与 lxmusic LX_URL_CACHE_TTL 默认值对齐：钉链到期时 lxmusic 缓存同样到期，
-# 由其探活续期保持同链或重解析，proxy 侧不自行强制 fresh
-_LX_URL_PIN_TTL_S = 600.0
+def _lx_gate_key(key: str, fresh: bool, max_quality: "str | None") -> tuple:
+    """在途解析合并键：同事件循环、同曲、同音质上限、同配置代次、同刷新模式。"""
+    return (asyncio.get_running_loop(), key, str(max_quality or ""),
+            _lx_resolve_epoch(), bool(fresh))
 
 
-def _lx_url_pin_drop(song_id: str) -> None:
-    """直链打不开/首字节失败即弃钉：后续解析重新出链，不再撞同一条死链。"""
-    _LX_URL_PIN.pop(str(song_id), None)
+async def _resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: bool,
+                                 meta: "dict | None", max_quality: "str | None",
+                                 gate_key: tuple, epoch: int) -> "dict | None":
+    """共享解析任务本体：领队跑一次，其余调用方复用同一次出网。
+
+    gate_key 由调用方创建时原样传入（不在任务内重算）：取消或配置代次变化后
+    重算会得到不同 key，遗留的登记项会让后来的调用方 await 一个永不完成的任务。
+    共享任务自身最多运行 20 秒，结束后清理登记。"""
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            resolve_lx_url(client, song_id, fresh=fresh, meta=meta,
+                           max_quality=max_quality, epoch=epoch),
+            timeout=_LX_STREAM_STARTUP_S,
+        )
+        fn_diag(logger, "lx_resolve", guid=str(song_id)[:80], fresh=int(bool(fresh)),
+                outcome="ok" if result else "none",
+                ms=int((time.monotonic() - started) * 1000))
+        return result
+    except asyncio.TimeoutError:
+        fn_diag(logger, "lx_resolve_timeout", guid=str(song_id)[:80], fresh=int(bool(fresh)),
+                ms=int((time.monotonic() - started) * 1000))
+        return None
+    finally:
+        if _LX_URL_INFLIGHT.get(gate_key) is not None:
+            _LX_URL_INFLIGHT.pop(gate_key, None)
 
 
-def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
-    """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
-    now = time.monotonic()
-    if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
-        for k in [k for k, v in _LX_URL_PIN.items() if v[1] <= now]:
-            _LX_URL_PIN.pop(k, None)
-        if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
-            oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
-            _LX_URL_PIN.pop(oldest, None)
-    _LX_URL_PIN[str(song_id)] = (resolved, now + _LX_URL_PIN_TTL_S)
+async def resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
+                                meta: "dict | None" = None,
+                                max_quality: "str | None" = None) -> "dict | None":
+    """带在途合并的洛雪解析入口：首播各调用点统一走这里。"""
+    _sync_lx_config_epoch()
+    key = str(song_id)
+    epoch = _lx_resolve_epoch()
+    gate_key = _lx_gate_key(key, bool(fresh), max_quality)
+    task = _LX_URL_INFLIGHT.get(gate_key)
+    if task is not None and not task.done():
+        started = time.monotonic()
+        try:
+            return await asyncio.shield(task)
+        finally:
+            fn_diag(logger, "lx_resolve_wait", guid=key[:80], fresh=int(bool(fresh)),
+                    ms=int((time.monotonic() - started) * 1000))
+
+    task = asyncio.create_task(
+        _resolve_lx_url_shared(client, key, fresh, meta, max_quality, gate_key, epoch)
+    )
+    _LX_URL_INFLIGHT[gate_key] = task
+
+    def finish(done: asyncio.Task) -> None:
+        if _LX_URL_INFLIGHT.get(gate_key) is done:
+            _LX_URL_INFLIGHT.pop(gate_key, None)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(finish)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        fn_diag(logger, "lx_resolve_leader_orphaned", guid=key[:80])
+        raise
+
+
+def _prefetch_lx(request: Request, guid: str) -> None:
+    """issue #75：当前曲目提前解析直链（metadata/audio-info 即触发），让首播
+    从"等解析完才开始出声"变成"取已解析好的直链"。最多两曲并发，在途解析达
+    上限时不再新增，避免预热把音源额度吃满。"""
+    _sync_lx_config_epoch()
+    if not CONF.get("lx_enabled") or find_cache_file(guid) or not _source_enabled(guid):
+        return
+    song_id = song_id_from_online_guid(guid)
+    if _lx_url_pin_valid(song_id) or _lx_fresh_cooldown_active(song_id):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # 无运行循环（单测直连）：不预热
+        return
+    gate_key = (loop, song_id, "", _lx_resolve_epoch(), False)
+    if gate_key in _LX_URL_INFLIGHT:
+        return
+    if len(_LX_URL_PREFETCH) >= _LX_PREFETCH_MAX or len(_LX_URL_INFLIGHT) >= _LX_URL_INFLIGHT_MAX:
+        return
+
+    async def warm() -> None:
+        try:
+            await resolve_lx_url_shared(get_lx_client(request.app), song_id, fresh=False,
+                                        meta=_online_meta_for_request(request, guid))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.info("lx prefetch unavailable for %s: %s", guid, type(e).__name__)
+
+    task = asyncio.create_task(warm())
+    _LX_URL_PREFETCH.add(task)
+
+    def finish(done: asyncio.Task) -> None:
+        _LX_URL_PREFETCH.discard(done)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(finish)
+    fn_diag(logger, "lx_prefetch", guid=guid[:80])
 
 
 # issue #54：UA 敏感 CDN（如酷我）按 User-Agent 放行/拒绝——lxmusic 探活统一用
@@ -4264,6 +4478,10 @@ async def lifespan(fastapi_app: FastAPI):
         netease_tasks = [task for task in netease_tasks if task.get_loop() is asyncio.get_running_loop()]
         if netease_tasks:
             await asyncio.gather(*netease_tasks, return_exceptions=True)
+        lx_tasks = _cancel_lx_resolutions_for()
+        lx_tasks = [task for task in lx_tasks if task.get_loop() is asyncio.get_running_loop()]
+        if lx_tasks:
+            await asyncio.gather(*lx_tasks, return_exceptions=True)
         tasks = [entry["task"] for entry in _SEARCH_CACHE.values() if entry.get("task") and not entry["task"].done()]
         for task in tasks:
             task.cancel()
@@ -5566,10 +5784,12 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     headers["User-Agent"] = _MEDIA_UA_PC
                 else:
                     song_id = song_id_from_online_guid(guid)
+                    if _lx_fresh_cooldown_active(song_id) and not _lx_url_pin_valid(song_id):
+                        return None
                     max_q = "high" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
                     if max_q:
                         fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
-                    resolved = await resolve_lx_url(
+                    resolved = await resolve_lx_url_shared(
                         get_lx_client(request.app), song_id, fresh=fresh_url or bool(max_q),
                         meta=_online_meta_for_request(request, guid),
                         max_quality=max_q)
@@ -5628,24 +5848,25 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
                     _netease_url_pin_drop(song_id, reason=f"cdn_status_{resp.status_code}_or_non_audio")
                 elif source == "lx":
-                    _lx_url_pin_drop(song_id)
+                    _lx_url_pin_drop(song_id, reason=f"cdn_status_{resp.status_code}_or_non_audio")
                     # issue #54：fresh 强刷出的直链也打不开，冷却窗内不再重复重解析
                     if fresh_url:
                         _lx_fresh_cooldown_mark(song_id)
                 return None
             chunks = resp.aiter_bytes()
             first = await anext(chunks, b"")
-        except Exception:
+        except Exception as exc:
             if source == "lx":
-                _lx_url_pin_drop(song_id)
-                if fresh_url:
-                    _lx_fresh_cooldown_mark(song_id)
+                if not isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
+                    _lx_url_pin_drop(song_id, reason="cdn_error")
+                    if fresh_url:
+                        _lx_fresh_cooldown_mark(song_id)
             raise
         if not first:
             if source == "netease":
                 _netease_url_pin_drop(song_id, reason="empty_stream")
             elif source == "lx":
-                _lx_url_pin_drop(song_id)
+                _lx_url_pin_drop(song_id, reason="empty_stream")
                 if fresh_url:
                     _lx_fresh_cooldown_mark(song_id)
             return None
@@ -6573,6 +6794,16 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
             _dispatch_official_binding(guid, headers, None)
 
 
+class HeadResponse(Response):
+    """HEAD 响应专用 Response：当上游未提供有效 content-length 时省略该头，
+    避免 Starlette 默认按空响应体补出 content-length: 0 导致部分客户端判定文件为空。"""
+
+    def init_headers(self, headers: "Mapping[str, str] | None" = None) -> None:
+        super().init_headers(headers)
+        if headers is None or "content-length" not in headers:
+            del self.headers["content-length"]
+
+
 async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
     """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源轻量试开一次即关。"""
     if cached:
@@ -6580,23 +6811,33 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
         return Response(status_code=full.status_code, headers=dict(full.headers))
     opened = None
+    budget = _LX_STREAM_STARTUP_S if source_from_online_guid(guid) == "lx" else 4.0
     try:
-        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=4.0)
+        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=budget)
     except Exception:
         opened = None
     if not opened:
         return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
-    resp, owned, _ext, _info, _chunks, _first = opened
+    resp, owned, ext, _info, _chunks, _first = opened
     headers = _media_stream_headers({"Cache-Control": "no-store"})
     for key in ("content-type", "content-length", "content-range"):
         val = resp.headers.get(key)
         if val:
             headers[key] = val
+    # issue #75：HEAD 与 GET 必须给出同一个音频类型（洛雪源站常错报 audio/mpeg），
+    # 播放器据 HEAD 预判格式；源站未给大小时省略 Content-Length，绝不让 Starlette
+    # 用空体补出 content-length: 0——部分播放器据此判定文件为空而直接报无法播放。
+    if ext:
+        headers["content-type"] = media_type_for_ext(ext or "mp3")
+    length = headers.get("content-length")
+    if not (length or "").isdigit() or int(length) <= 0:
+        headers.pop("content-length", None)
     with anyio.CancelScope(shield=True):
         await resp.aclose()
         if owned:
             await owned.aclose()
-    return Response(status_code=206 if "content-range" in headers else 200, headers=headers)
+    status = 206 if "content-range" in headers else 200
+    return HeadResponse(status_code=status, headers=headers)
 
 
 def _candidate_kbps(item: dict) -> float:
@@ -6663,10 +6904,18 @@ async def stream_track(request: Request, subpath: str = ""):
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
-    deadline = asyncio.get_running_loop().time() + 12.0
+    primary_source = source_from_online_guid(guid)
+    deadline = asyncio.get_running_loop().time() + (_LX_STREAM_STARTUP_S
+                                                   if primary_source == "lx"
+                                                   else _STREAM_STARTUP_S)
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
             continue
+        if source_from_online_guid(candidate) == "lx":
+            song_id_key = song_id_from_online_guid(candidate)
+            if _lx_fresh_cooldown_active(song_id_key) and not _lx_url_pin_valid(song_id_key):
+                fn_diag(logger, "lx_cooldown_skip", guid=candidate)
+                continue
         for attempt in range(2):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -6677,10 +6926,20 @@ async def stream_track(request: Request, subpath: str = ""):
                 if source_from_online_guid(candidate) == "netease" and attempt:
                     pin = _NETEASE_URL_PIN.get(song_id_from_online_guid(candidate).split(":")[-1])
                     refresh_netease = bool(pin and pin[1] == 0)
+                # issue #75：洛雪等待超时不触发 fresh=1；只有明确死链（已被弃钉）才在剩余预算内刷新一次
+                refresh_lx = False
+                if source_from_online_guid(candidate) == "lx" and attempt:
+                    song_id_key = song_id_from_online_guid(candidate)
+                    refresh_lx = not _lx_url_pin_valid(song_id_key) and not _lx_fresh_cooldown_active(song_id_key)
+                    if not refresh_lx:
+                        break
+                attempt_cap = remaining if source_from_online_guid(candidate) == "lx" \
+                    else min(6.0, remaining)
                 opened = await asyncio.wait_for(
                     _open_online_stream(request, candidate, range_header,
-                                        fresh_url=attempt > 0, refresh=refresh_netease),
-                    timeout=min(6.0, remaining),
+                                        fresh_url=refresh_lx if source_from_online_guid(candidate) == "lx" else (attempt > 0),
+                                        refresh=refresh_netease),
+                    timeout=attempt_cap,
                 )
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
@@ -6688,6 +6947,10 @@ async def stream_track(request: Request, subpath: str = ""):
                     if isinstance(exc, (TimeoutError, httpx.TimeoutException)) and attempt == 0:
                         continue
                     break
+                if source_from_online_guid(candidate) == "lx":
+                    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                        break
+                opened = None
                 opened = None
             if opened:
                 resp, owned, ext, info, chunks, first = opened
@@ -6761,7 +7024,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             return url, {"User-Agent": _MEDIA_UA_PC}
         if source == "lx":
             max_q = "high" if _lossless_is_blacklisted(guid) else None
-            resolved = await resolve_lx_url(
+            resolved = await resolve_lx_url_shared(
                 get_lx_client(request.app), song_id_from_online_guid(guid),
                 meta=_online_meta_for_request(request, guid),
                 max_quality=max_q)
@@ -6785,6 +7048,14 @@ async def _start_transcode_session(request: Request, guid: str) -> "tc.Session |
     """启动/复用标准音质转码会话；不可用返回 None（调用方回落单分片桩）。"""
     try:
         if source_from_online_guid(guid) == "netease":
+            retained = _online_meta_for_request(request, guid)
+            if retained and retained.get("duration_s"):
+                info = retained
+                src, headers = await _transcode_source(request, guid)
+            else:
+                info, (src, headers) = await asyncio.gather(
+                    _online_info(request, guid, include_lyric=False), _transcode_source(request, guid))
+        elif source_from_online_guid(guid) == "lx":
             retained = _online_meta_for_request(request, guid)
             if retained and retained.get("duration_s"):
                 info = retained
@@ -7337,6 +7608,11 @@ async def track_metadata(request: Request, subpath: str = ""):
 
     if source_from_online_guid(guid) == "netease":
         _prefetch_netease(request, guid)
+        data = _online_meta_for_request(request, guid)
+        if not data or not data.get("duration_s"):
+            data = await _online_info(request, guid, include_lyric=False)
+    elif source_from_online_guid(guid) == "lx":
+        _prefetch_lx(request, guid)
         data = _online_meta_for_request(request, guid)
         if not data or not data.get("duration_s"):
             data = await _online_info(request, guid, include_lyric=False)

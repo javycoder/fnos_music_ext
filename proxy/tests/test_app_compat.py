@@ -328,6 +328,11 @@ def test_safe_child_log_allows_request_log_and_degrade():
         # 2.8.0 边听边存写盘失败（弃件不停流）需可观测，与上游断流可区分
         "2026-09-18 10:00:00,123 [WARNING] fnmusic_proxy: "
         "tee disk write failed for online:kuwo:9: OSError",
+        # issue #75 洛雪生命周期与预热日志需可观测
+        "2026-10-19 10:00:00,123 [INFO] fnmusic_proxy: "
+        "lx config changed: invalidated 1 inflight resolutions and pins",
+        "2026-10-19 10:00:00,123 [INFO] fnmusic_proxy: "
+        "lx prefetch unavailable for online:lx:kg:123: TimeoutError",
     ):
         assert safe_child_log(line) is not None
 
