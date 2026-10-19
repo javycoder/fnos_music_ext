@@ -19,6 +19,10 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load_webui():
+    """加载离线业务测试使用的 WebUI 实例。"""
+    cached = sys.modules.get("webui_service_app")
+    if cached is not None:
+        return cached
     spec = importlib.util.spec_from_file_location("webui_service_app", HERE / "app.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["webui_service_app"] = mod
@@ -42,6 +46,14 @@ FNMUSIC_TEE_SAVE_ENABLED='true'
 FNMUSIC_TEE_CACHE_MAX='2'
 CUSTOM_KEY='keepme'
 """
+
+
+@pytest.fixture(autouse=True)
+def lx_ready_mock(monkeypatch):
+    """业务测试仅 mock 就绪；真实恢复行为由 test_lx_ready.py 覆盖。"""
+    async def ready(*args, **kwargs):
+        return {"ok": True, "status": 200, "stage": "", "error": ""}
+    monkeypatch.setattr(webui, "_lx_ensure_ready", ready)
 
 
 @pytest.fixture
@@ -332,7 +344,7 @@ def test_provider_switch_stops_old_starts_new(env_file, svctl):
         assert r.status_code == 200
         actions = r.json()["actions"]
         assert ("stop", "musicbox") in svctl.calls
-        assert ("start", "lxmusic") in svctl.calls
+        assert ("start", "lxmusic") not in svctl.calls  # 已由就绪步骤负责，不重复启动
         assert all(a["ok"] for a in actions if a["kind"] == "process")
 
 
@@ -576,7 +588,7 @@ def test_lx_multi_source_save_blocked_when_no_active(env_file, svctl, monkeypatc
     assert "LX_SOURCE_LIST" not in env_file.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("failure", ["verify", "verify_http", "verify_timeout", "activate", "activate_timeout", "runtime_failed"])
+@pytest.mark.parametrize("failure", ["verify", "verify_http", "activate", "runtime_failed"])
 @pytest.mark.parametrize("already_active", [False, True])
 def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, monkeypatch, failure, already_active):
     """失效项自动停用；健康项、其它设置和提示都保留，重新加载不恢复失效项。"""
@@ -603,8 +615,6 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         calls.append((req.url.path, body))
         is_bad = url in (bad, "bad.js")
         if req.url.path.endswith("/verify"):
-            if is_bad and failure == "verify_timeout":
-                raise httpx.ReadTimeout("校验超时", request=req)
             if is_bad and failure == "verify_http":
                 return httpx.Response(503, json={"ok": True})
             if is_bad and failure == "verify":
@@ -616,8 +626,6 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
             return httpx.Response(200, json={"ok": True})
         # 已激活项不重复 verify，但实际激活失败仍应取消。
         if is_bad:
-            if failure == "activate_timeout":
-                raise httpx.ReadTimeout("激活超时", request=req)
             if failure == "runtime_failed":
                 enabled[bad] = True
                 return httpx.Response(200, json={"ok": True, "source_id": "bad.js", "data": {
@@ -1658,24 +1666,12 @@ def test_api_requires_admin(env_file):
 
 
 def test_preview_endpoint_cleans_up_on_partial_start_failure(env_file, monkeypatch):
-    """多进程音源（如 lxmusic 的 lxserver + lxmusic）如果后一进程启动失败，应回滚停止已启动的前置进程。"""
-    calls: list[tuple[str, str]] = []
-
-    def fake_supervisorctl(cmd, prog, timeout=20.0):
-        calls.append((cmd, prog))
-        if cmd == "start" and prog == "lxmusic":
-            return 1, "failed to start lxmusic"
-        return 0, "ok"
-
-    monkeypatch.setattr(webui, "supervisorctl", fake_supervisorctl)
+    """其它单进程源启动失败不登记预览；洛雪依赖回滚见 test_lx_ready。"""
+    monkeypatch.setattr(webui, "supervisorctl", lambda *a, **k: (1, "failed to start"))
     with authed_client() as client:
-        r = client.post("/api/preview", json={"provider": "lxmusic"})
+        r = client.post("/api/preview", json={"provider": "musicdl"})
         assert r.status_code == 500
-        assert "lxmusic" not in webui._preview_until
-    # 验证 lxserver 被拉起后又被停止回滚
-    assert ("start", "lxserver") in calls
-    assert ("start", "lxmusic") in calls
-    assert ("stop", "lxserver") in calls
+        assert "musicdl" not in webui._preview_until
 
 
 def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):

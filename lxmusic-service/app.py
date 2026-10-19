@@ -33,6 +33,7 @@ from lxserver_client import (
     DEFAULT_LXSERVER_URL,
     LxServerClient,
     SUPPORTED_PLATFORMS,
+    is_lxserver_unreachable,
     map_lxserver_song,
     normalize_source,
     parse_interval_to_seconds,
@@ -1582,9 +1583,20 @@ async def source_verify(body: SourceBody):
     except asyncio.TimeoutError:
         return _err("校验超时 (120s)", 504)
     except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            logger.error("lxserver 不可连接，校验源失败: %s", exc)
+            return JSONResponse(
+                content={"ok": False, "data": {
+                    "category": "service_unavailable", "stage": "lxmusic_to_lxserver",
+                    "message": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志"}},
+                status_code=503,
+            )
         return JSONResponse(
             content={"ok": False, "data": {"category": "internal", "message": f"校验失败: {exc}"}}
         )
+    # 服务故障返回 503，不按源失效处理。
+    if str(report.get("category") or "") == "service_unavailable":
+        return JSONResponse(content={"ok": False, "data": report}, status_code=503)
     return {"ok": bool(report.get("ok")), "data": report}
 
 
@@ -1648,7 +1660,9 @@ async def _find_lxserver_source(*, by_id: str = "", by_name: str = "", by_url: s
     """在 lxserver 已有源列表中查找（按 id / 名称 / 导入 URL 任一命中）。"""
     try:
         sources = await LXSERVER.list_custom_sources()
-    except Exception:
+    except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            raise
         return None
     for s in sources:
         if by_id and str(s.get("id") or "") == by_id:
@@ -1676,11 +1690,29 @@ async def source_upload(body: UploadBody):
         res = await LXSERVER.upload_custom_source(body.filename, body.script)
     except Exception as exc:
         if "已存在" not in str(exc):
+            # 内部通信故障与脚本错误分别归类。
+            if is_lxserver_unreachable(exc):
+                logger.error("lxserver 不可连接，上传源失败: %s", exc)
+                return JSONResponse(
+                    content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                             "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                    status_code=503,
+                )
             return JSONResponse(
                 content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
                 status_code=500,
             )
-        existing = await _find_lxserver_source(by_name=name)
+        try:
+            existing = await _find_lxserver_source(by_name=name)
+        except Exception as lookup_exc:
+            if not is_lxserver_unreachable(lookup_exc):
+                raise
+            logger.error("lxserver 不可连接，查询重复上传源失败: %s", lookup_exc)
+            return JSONResponse(
+                content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                         "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                status_code=503,
+            )
         if not existing:
             return JSONResponse(
                 content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
@@ -1721,6 +1753,12 @@ async def source_set(body: SourceBody):
             res = await LXSERVER.upload_custom_source("custom_source.js", body.script)
             url = f"file://{_lx_source_fs_path(str(res.get('id') or 'custom_source.js'))}"
         except Exception as exc:
+            if is_lxserver_unreachable(exc):
+                return JSONResponse(
+                    content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                             "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                    status_code=503,
+                )
             return JSONResponse(
                 content={"ok": False, "error": f"上传脚本失败: {exc}", "category": "download"},
                 status_code=500,
@@ -1742,7 +1780,7 @@ async def source_set(body: SourceBody):
                         status_code=500,
                     )
             else:
-                # http(s) URL：交给 lxserver 下载导入；同脚本已导入过则直接复用
+                # 外部下载由 lxserver 执行；此处 HTTP 异常仅来自内部通信。
                 try:
                     res = await LXSERVER.import_custom_source(url)
                     source_id = str(res.get("id") or "")
@@ -1814,6 +1852,13 @@ async def source_set(body: SourceBody):
                         status_code=500,
                     )
     except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            logger.error("lxserver 不可连接，切换源失败: %s", exc)
+            return JSONResponse(
+                content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                         "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                status_code=503,
+            )
         return JSONResponse(
             content={"ok": False, "error": f"切换源失败: {exc}", "category": "runtime"},
             status_code=500,

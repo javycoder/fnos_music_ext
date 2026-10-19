@@ -210,12 +210,12 @@ def supervisorctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
     return proc.returncode, output.strip()
 
 
-def supervisor_status() -> dict[str, dict]:
+def supervisor_status(*, timeout: float = 20.0) -> dict[str, dict]:
     # supervisorctl status 的退出码语义是“是否全部 RUNNING”（存在 STOPPED 即 3、
     # 存在 FATAL 即 4），按需加载架构下未选中的音源常驻 STOPPED 是正常态，
     # 不能用退出码判成败：只认输出里能解析出的状态行；连接失败等异常输出
     # 解析不出任何状态行，自然返回空表（前端显示未知）。
-    _, out = supervisorctl("status")
+    _, out = supervisorctl("status", timeout=timeout)
     result: dict[str, dict] = {}
     for line in out.splitlines():
         parts = line.split()
@@ -324,6 +324,162 @@ def preview_reconcile_after_save(keep_musicbox: bool = False) -> list[dict]:
             actions.append({"kind": "process", "program": prog, "op": "stop",
                             "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
     return actions
+
+
+# ---------------------------------------------------------- 洛雪链路就绪保障 --
+LX_READY_TIMEOUT = 30.0
+# 已在跑或正在起来的进程不再重复 start（supervisorctl 会报 already started）
+_LX_RUNNING_STATES = ("RUNNING", "STARTING", "BACKOFF")
+_lx_ready_lock = asyncio.Lock()
+
+
+def _lx_ready_error(stage: str, detail: str = "") -> str:
+    base = ("洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志"
+            if stage == "lxmusic_to_lxserver"
+            else "洛雪音源服务 lxmusic 不可连接，请查看 lxmusic 运行日志")
+    detail = " ".join(redact(str(detail or "")).split())[:120]
+    return f"{base}（{detail}）" if detail else base
+
+
+def _is_service_unavailable(status_code: int, payload: dict) -> bool:
+    """上游是否报告内部服务不可用（而非脚本本身失效）。"""
+    # 只认 lxmusic 明确标注的内部服务故障：它自己的上传/校验失败也可能回 503
+    # （如源下载超时），那种 503 属于脚本问题，不能据此跳过源失效处理。
+    payload = payload or {}
+    data = payload.get("data")
+    return (payload.get("category") == "service_unavailable"
+            or isinstance(data, dict) and data.get("category") == "service_unavailable")
+
+
+async def _lx_probe(client: "httpx.AsyncClient", *, timeout: float = 3.0) -> tuple[bool, str, str]:
+    """探活洛雪链路，返回 (可用, 失败阶段, 细节)。"""
+    try:
+        resp = await client.get(f"{CONF['lx_url']}/healthz", timeout=timeout)
+    except Exception as exc:  # noqa: BLE001  # 连不上 lxmusic 本身
+        return False, "webui_to_lxmusic", str(exc) or exc.__class__.__name__
+    data = _resp_json(resp)
+    if not isinstance(data, dict):
+        data = {}
+    if resp.status_code == 200 and data.get("ok") is True:
+        return True, "", ""
+    user_source = data.get("user_source")
+    user_source = user_source if isinstance(user_source, dict) else {}
+    text = " ".join(
+        str(v) for v in (data.get("error"), user_source.get("last_error")) if v
+    ) or f"HTTP {resp.status_code}"
+    stage = "lxmusic_to_lxserver" if "lxserver" in text.lower() else "webui_to_lxmusic"
+    return False, stage, text
+
+
+async def _lx_ensure_ready(request: Request, *, timeout: float = 0.0,
+                           preview: bool = False) -> dict:
+    """锁等待、线程池 supervisor 操作及探活共用一个 deadline；只补启一轮。"""
+    budget = timeout or LX_READY_TIMEOUT
+    deadline = time.monotonic() + budget
+    # 总预算内预留少量时间供失败回滚，清理同样不得越过请求 deadline。
+    recovery_deadline = deadline - min(2.0, budget * 0.1)
+    client = get_http(request)
+    started: list[str] = []
+    last_states = {p: "UNKNOWN" for p in PROVIDER_PROGRAMS["lxmusic"]}
+    stage, detail = "webui_to_lxmusic", "等待洛雪链路就绪超时"
+    locked = False
+    success = False
+
+    def remaining() -> float:
+        budget = recovery_deadline - time.monotonic()
+        if budget <= 0:
+            raise asyncio.TimeoutError
+        return budget
+
+    async def ctl(*args):
+        budget = remaining()
+        # 外层约束线程池排队，子进程 timeout 约束实际执行。
+        return await asyncio.wait_for(
+            run_in_threadpool(supervisorctl, *args, timeout=budget), budget)
+
+    def warn(event: str, error: str = "", program: str = "") -> None:
+        logger.warning("[lx_ready] event=%s stage=%s program=%s states=%s started=%s detail=%s",
+                       event, stage, program or "-", last_states, started,
+                       " ".join(redact(str(error)).split())[:240])
+
+    async def states():
+        budget = remaining()
+        try:
+            result = await asyncio.wait_for(
+                run_in_threadpool(supervisor_status, timeout=budget), budget)
+        except asyncio.TimeoutError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"无法读取音源进程状态：{exc}") from exc
+        for prog in last_states:
+            state = result.get(prog, {}).get("state", "UNKNOWN")
+            last_states[prog] = state if state in (*_LX_RUNNING_STATES, "STOPPED", "EXITED", "FATAL") else "UNKNOWN"
+        if "UNKNOWN" in last_states.values():
+            raise ValueError("无法读取音源进程状态")
+        return dict(last_states)
+
+    try:
+        await asyncio.wait_for(_lx_ready_lock.acquire(), remaining())
+        locked = True
+        # 在锁内重检：前一个请求可能已经完成补启。
+        healthy, stage, detail = await asyncio.wait_for(
+            _lx_probe(client, timeout=min(3.0, remaining())), remaining())
+        if not healthy:
+            for prog in PROVIDER_PROGRAMS["lxmusic"]:
+                while True:
+                    state = (await states())[prog]
+                    if state == "RUNNING":
+                        break
+                    if state in ("STARTING", "BACKOFF"):
+                        await asyncio.sleep(min(0.1, remaining()))
+                        continue
+                    if state not in ("STOPPED", "EXITED", "FATAL"):
+                        raise ValueError(f"无法读取音源进程状态：{prog} {state}")
+                    warn("start", detail, prog)
+                    code, out = await ctl("start", prog)
+                    if code == 0:
+                        started.append(prog)
+                    else:
+                        # 非零可能是其它调用已启动；不取得该进程的回滚所有权。
+                        if (await states())[prog] not in _LX_RUNNING_STATES:
+                            raise ValueError(f"supervisorctl start {prog} 失败: {out}")
+                    break
+            while True:
+                healthy, stage, detail = await asyncio.wait_for(
+                    _lx_probe(client, timeout=min(3.0, remaining())), remaining())
+                if healthy:
+                    break
+                await asyncio.sleep(min(0.1, remaining()))
+        success = True
+        if preview:
+            _preview_until["lxmusic"] = time.monotonic() + PREVIEW_TTL
+        return {"ok": True, "status": 200, "stage": "", "error": ""}
+    except asyncio.TimeoutError:
+        warn("timeout", detail)
+        return {"ok": False, "status": 504, "stage": stage,
+                "error": _lx_ready_error(stage, detail)}
+    except ValueError as exc:
+        warn("failed", str(exc))
+        return {"ok": False, "status": 503, "stage": stage,
+                "error": f"{redact(str(exc))}：{_lx_ready_error(stage, detail)}"}
+    finally:
+        if locked:
+            try:
+                if not success:
+                    # 仅回滚明确成功 start 的进程，按依赖逆序；使用预留预算。
+                    for prog in reversed(started):
+                        budget = deadline - time.monotonic()
+                        if budget <= 0:
+                            warn("rollback_timeout", program=prog)
+                            break
+                        code, out = await asyncio.wait_for(run_in_threadpool(
+                            supervisorctl, "stop", prog, timeout=budget), budget)
+                        if code != 0:
+                            warn("rollback_failed", out, prog)
+            except (Exception, asyncio.CancelledError) as exc:
+                warn("rollback_failed", f"{type(exc).__name__}: {exc}", prog)
+            finally:
+                _lx_ready_lock.release()
 
 
 # ------------------------------------------------------------------ 网易云歌单常驻 --
@@ -984,6 +1140,17 @@ async def api_preview(body: PreviewBody, request: Request):
     provider = body.provider
     if provider not in PROVIDERS:
         raise HTTPException(status_code=400, detail="provider 必须是 musicdl/musicbox/lxmusic 之一")
+    if provider == "lxmusic":
+        enabled = current_provider(read_env()) == provider
+        ready = await _lx_ensure_ready(request, preview=not enabled)
+        if not ready["ok"]:
+            return JSONResponse(content={"ok": False, "error": ready["error"],
+                                         "category": "service_unavailable",
+                                         "stage": ready["stage"]}, status_code=ready["status"])
+        if enabled:
+            return {"ok": True, "preview": False, "note": "该音源已启用，进程常驻"}
+        _preview_until[provider] = time.monotonic() + PREVIEW_TTL
+        return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
     if current_provider(read_env()) == provider:
         return {"ok": True, "preview": False, "note": "该音源已启用，进程常驻"}
     if provider == "musicbox" and (
@@ -1034,6 +1201,14 @@ async def api_config_put(body: ConfigBody, request: Request):
     after_preview = dict(before)
     after_preview.update(updates)
     lx_provider = current_provider(after_preview) == "lxmusic"
+
+    # 服务故障不得按脚本失效取消激活，也不得落盘。
+    if lx_provider:
+        ready = await _lx_ensure_ready(request, preview=current_provider(before) != "lxmusic")
+        if not ready["ok"]:
+            return JSONResponse(content={"ok": False, "error": ready["error"],
+                                         "category": "service_unavailable",
+                                         "stage": ready["stage"]}, status_code=ready["status"])
 
     # lx 多源激活集合：active_items 待激活列表、to_activate 新激活（需校验）、to_deactivate 被取消激活
     active_items: list[dict] = []
@@ -1103,15 +1278,27 @@ async def api_config_put(body: ConfigBody, request: Request):
         if not url:
             continue
         verify_ok = False
+        verify_status = 0
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
                                      json={"url": url}, timeout=130.0)
             report = _resp_json(resp)
             verify_ok = resp.status_code == 200 and bool(report.get("ok"))
+            verify_status = resp.status_code
         except Exception as exc:  # noqa: BLE001
-            report = {"ok": False, "data": {"message": str(exc)}}
+            # 连不上 lxmusic 是服务故障，不是源失效：不要据此取消激活有效源
+            report = {"ok": False, "data": {"message": str(exc)},
+                      "category": "service_unavailable", "stage": "webui_to_lxmusic"}
         if not verify_ok:
             message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
+            if _is_service_unavailable(verify_status, report):
+                return JSONResponse(
+                    content={"ok": False, "error": f"洛雪音源服务不可用，未改动配置：{message}",
+                             "category": "service_unavailable",
+                             "stage": report.get("stage") or (report.get("data") or {}).get("stage")
+                                      or "webui_to_lxmusic"},
+                    status_code=503,
+                )
             if lx_reconcile:
                 disable_failed_source(url, message)
                 continue
@@ -1172,15 +1359,17 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
-        actions.extend(switch_provider_process(old_provider, new_provider,
+        actions.extend(switch_provider_process(old_provider, "" if new_provider == "lxmusic" else new_provider,
                                                keep_musicbox=resident_keep))
 
     async def _lx_source_post(payload: dict, source: str, op: str) -> str:
         api_payload: dict = {}
+        status_code = 0
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
                                      json=payload, timeout=130.0)
             api_payload = _resp_json(resp)
+            status_code = resp.status_code
             ok = resp.status_code == 200 and api_payload.get("ok", False)
             err = "" if ok else (api_payload.get("error") or f"HTTP {resp.status_code}")
             if ok and op == "activate":
@@ -1193,8 +1382,15 @@ async def api_config_put(body: ConfigBody, request: Request):
                         break
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
+            api_payload = {"category": "service_unavailable", "stage": "webui_to_lxmusic"}
         actions.append({"kind": "lx_activate", "op": op, "source": source,
                         "ok": ok, "error": err or ""})
+        if not ok and _is_service_unavailable(status_code, api_payload):
+            # 服务故障不代表脚本失效。
+            actions[-1]["category"] = "service_unavailable"
+            actions[-1]["stage"] = (api_payload.get("stage")
+                                     or (api_payload.get("data") or {}).get("stage")
+                                     or "webui_to_lxmusic")
         return str(api_payload.get("source_id") or "") if ok else ""
 
     # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
@@ -1205,6 +1401,8 @@ async def api_config_put(body: ConfigBody, request: Request):
                 await _lx_source_post({"url": url, "enabled": False},
                                       str(item.get("name") or "") or url, "deactivate")
             target_ids: set[str] = set()
+            activation_service_failed = any(
+                a.get("category") == "service_unavailable" for a in actions)
             for item in active_items:
                 url = str(item["url"]).strip()
                 sid = await _lx_source_post({"url": url},
@@ -1212,15 +1410,21 @@ async def api_config_put(body: ConfigBody, request: Request):
                 if sid:
                     target_ids.add(sid)
                 if not actions[-1]["ok"]:
-                    disable_failed_source(url, actions[-1]["error"])
-                    actions[-1]["auto_disabled"] = True
+                    if actions[-1].get("category") == "service_unavailable":
+                        activation_service_failed = True
+                        # 服务故障保留 active，且禁止后续清理实际源。
+                        warnings.append({"source": str(item.get("name") or "") or url,
+                                         "url": url, "message": actions[-1]["error"]})
+                    else:
+                        disable_failed_source(url, actions[-1]["error"])
+                        actions[-1]["auto_disabled"] = True
             # 激活失败也写回取消激活状态，避免重开页面仍显示已激活。
             sync_lx_updates()
             new_active = {str(i["url"]).strip() for i in active_items}
             # 不仅比较已写入的 .env：失败的停用仍会出现在实际启用集合中。
             # 已自动停用失败项，按最终激活集合清理实际仍启用的脚本。
             try:
-                actual = await _lx_enabled_sources(request)
+                actual = [] if activation_service_failed else await _lx_enabled_sources(request)
                 for s in actual:
                     sid = str(s.get("id") or "")
                     url = str(s.get("url") or "")
@@ -1279,13 +1483,20 @@ async def api_lx_verify(body: ConfigBody, request: Request):
     if not url.lower().startswith(("http://", "https://", "file://")):
         raise HTTPException(status_code=400, detail="url 必须以 http:// 、https:// 或 file:// 开头")
     client = get_http(request)
+    ready = await _lx_ensure_ready(request, preview=current_provider(read_env()) != "lxmusic")
+    if not ready["ok"]:
+        return JSONResponse(content={"ok": False, "error": ready["error"],
+                                     "category": "service_unavailable",
+                                     "stage": ready["stage"]}, status_code=ready["status"])
     try:
         resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
                                  json={"url": url}, timeout=130.0)
         return JSONResponse(content=_resp_json(resp) or {"ok": False},
                             status_code=resp.status_code)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+        return JSONResponse(content={"ok": False, "error": _lx_ready_error("webui_to_lxmusic", str(exc)),
+                                     "category": "service_unavailable", "stage": "webui_to_lxmusic"},
+                            status_code=503)
 
 
 def _lx_script_limits(filename: str, script: str) -> None:
@@ -1332,6 +1543,11 @@ async def api_lx_upload(request: Request):
             status_code=400, detail="请用 application/json 或 multipart/form-data 上传文件")
     _lx_script_limits(filename, script)
     client = get_http(request)
+    ready = await _lx_ensure_ready(request, preview=current_provider(read_env()) != "lxmusic")
+    if not ready["ok"]:
+        return JSONResponse(content={"ok": False, "error": ready["error"],
+                                     "category": "service_unavailable",
+                                     "stage": ready["stage"]}, status_code=ready["status"])
     try:
         resp = await client.post(f"{CONF['lx_url']}/api/v1/source/upload",
                                  json={"filename": filename, "script": script},
@@ -1339,7 +1555,9 @@ async def api_lx_upload(request: Request):
         return JSONResponse(content=_resp_json(resp) or {"ok": False},
                             status_code=resp.status_code)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
+        return JSONResponse(content={"ok": False, "error": _lx_ready_error("webui_to_lxmusic", str(exc)),
+                                     "category": "service_unavailable", "stage": "webui_to_lxmusic"},
+                            status_code=503)
 
 
 @app.get("/api/platforms")

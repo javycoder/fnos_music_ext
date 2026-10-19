@@ -30,12 +30,18 @@ from lxserver_client import (
     DEFAULT_LXSERVER_URL,
     LxServerClient,
     SUPPORTED_PLATFORMS,
+    is_lxserver_unreachable,
     normalize_source,
 )
 
 VERIFY_KEYWORDS = ("晴天", "江南", "十年", "倔强")
 _PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
+
+
+def _new_temp_client(**kwargs) -> LxServerClient:
+    """创建校验用临时 lxserver 客户端。"""
+    return LxServerClient(**kwargs)
 
 _NET_DEAD_MARKERS = (
     "ECONNREFUSED",
@@ -152,7 +158,7 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
     meta = parse_script_meta(script)
     report["meta"] = meta
 
-    temp_client = LxServerClient(
+    temp_client = _new_temp_client(
         base_url=os.environ.get("LXSERVER_URL", DEFAULT_LXSERVER_URL),
         admin_password=os.environ.get("LXSERVER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
         timeout=15.0,
@@ -170,6 +176,9 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
             temp_source_id = str(upload_res.get("id") or "") or None
         except Exception as upload_exc:
             if "已存在" not in str(upload_exc):
+                # 内部通信故障上浮，不能归为脚本错误。
+                if is_lxserver_unreachable(upload_exc):
+                    raise
                 report.update(category="internal", message=f"临时源上传失败: {upload_exc}")
                 return report
         # 等待源在沙箱初始化并查询平台
@@ -231,6 +240,8 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
                 try:
                     search_res = await temp_client.search(kw, source=platform, page=1, limit=3)
                 except Exception as exc:
+                    if is_lxserver_unreachable(exc):
+                        raise
                     attempt.update(result="search_error", error=str(exc))
                     report["attempts"].append(attempt)
                     continue
@@ -250,6 +261,8 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
                         sinfo, "128k", exclude_api_sources=other_sources
                     )
                 except Exception as exc:
+                    if is_lxserver_unreachable(exc):
+                        raise
                     attempt.update(result="resolve_failed", error=str(exc))
                     report["attempts"].append(attempt)
                     continue
@@ -296,6 +309,14 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         )
         return report
 
+    except Exception as exc:
+        if not is_lxserver_unreachable(exc):
+            raise
+        report.update(
+            ok=False, category="service_unavailable", stage="lxmusic_to_lxserver",
+            message="洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+        )
+        return report
     finally:
         # 清理：自建的临时源直接删除；复用的既有源还原启用态
         if temp_source_id:
