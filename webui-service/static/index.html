@@ -270,10 +270,23 @@
       <section class="page" id="page-llm">
         <h2>高级 · 大模型</h2>
         <div class="card">
-          <p class="hint">配置 OpenAI 兼容接口后，非网易音源也可获得每日推荐。留空即禁用。保存后代理热重载生效。</p>
+          <p class="hint">配置 OpenAI 兼容接口不会自动启用推荐用途。以下两个用途默认关闭，需明确勾选；保存后代理热重载生效。模型留空使用 gpt-4o-mini。</p>
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+          <div class="switch-grid">
+            <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
+            <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
+          </div>
+          <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
+          <p class="hint">每日推荐仍受「每日推荐」总开关控制：音源原生推荐优先 → 已勾选且接口完整时的大模型 → 本地曲库兜底。取消大模型每日推荐不会关闭每日推荐歌单。</p>
+          <div id="llm-liked-settings" hidden>
+            <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
+            <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
+            <p class="hint">间隔默认 0.5 小时，须为有限数字且至少 0.5，无上限；数量默认 20，须为 0–100 的整数，不可留空。数量 0 在此用途生效时停止生成且不展示猜你喜欢。</p>
+            <p class="hint">启用并保存生效后后台预生成首批，不必先打开歌单。每批首次被客户端获取后才开始计时，到间隔后后台被动预生成下一批；尚未获取的批次不会到期或轮换。间隔不是缓存失效时间。</p>
+          </div>
+          <p class="hint">取消勾选会隐藏猜你喜欢参数并保留已保存值，恢复原本的纯本地猜你喜欢；本地有效、未收藏候选至少 20 首的门槛不变，不随上述数量调整。</p>
         </div>
       </section>
 

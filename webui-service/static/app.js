@@ -31,6 +31,21 @@ async function api(path, options) {
   return body;
 }
 
+function updateLlmLikedSettings() {
+  $("#llm-liked-settings").hidden = !$("#llm-liked").checked;
+  const selected = $("#llm-liked").checked || $("#llm-daily").checked;
+  $("#llm-api-warning").hidden = !selected || !!($("#llm-base").value.trim() && $("#llm-key").value.trim());
+}
+
+function likedNumber(selector, label, min, max, integer = false) {
+  const text = $(selector).value.trim();
+  const num = Number(text);
+  if (!text || !Number.isFinite(num) || num < min || (max != null && num > max) || (integer && !Number.isInteger(num))) {
+    throw new Error(label + (integer ? "必须是 0–100 的整数" : "必须是大于或等于 0.5 的有限数字"));
+  }
+  return num;
+}
+
 function toast(message, kind) {
   const el = $("#toast");
   el.textContent = message;
@@ -164,6 +179,11 @@ function applyConfigToForm() {
   $("#llm-base").value = v.FNMUSIC_LLM_BASE_URL || "";
   $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
+  $("#llm-liked").checked = v.FNMUSIC_LLM_LIKED_ENABLED === "true";
+  $("#llm-daily").checked = v.FNMUSIC_LLM_DAILY_ENABLED === "true";
+  $("#liked-refresh-hours").value = v.FNMUSIC_LIKED_REFRESH_HOURS ?? "0.5";
+  $("#liked-size").value = v.FNMUSIC_LIKED_SIZE ?? "20";
+  updateLlmLikedSettings();
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
   $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
@@ -217,6 +237,8 @@ function collectConfig() {
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
     FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
+    FNMUSIC_LLM_LIKED_ENABLED: $("#llm-liked").checked,
+    FNMUSIC_LLM_DAILY_ENABLED: $("#llm-daily").checked,
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
     FNMUSIC_SEARCH_PROBE: $("#search-probe").checked,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
@@ -225,6 +247,11 @@ function collectConfig() {
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
+  // 隐藏的参数不提交：关闭用途不清空已保存值，也不让隐藏的无效编辑阻塞保存。
+  if (values.FNMUSIC_LLM_LIKED_ENABLED) {
+    values.FNMUSIC_LIKED_REFRESH_HOURS = likedNumber("#liked-refresh-hours", "猜你喜欢生成间隔", 0.5, null);
+    values.FNMUSIC_LIKED_SIZE = likedNumber("#liked-size", "猜你喜欢歌曲数量", 0, 100, true);
+  }
   if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
     values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
       publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))
@@ -1214,8 +1241,13 @@ DIR_FIELDS.forEach(bindDirField);
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
+["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
+["#llm-liked", "#llm-daily"].forEach((sel) => $(sel).addEventListener("change", () => {
+  updateLlmLikedSettings();
+  markDirty();
+}));
+["#llm-base", "#llm-key"].forEach((sel) => $(sel).addEventListener("input", updateLlmLikedSettings));
 $("#lx-url").addEventListener("input", () => {
   // #lx-url 仅为「添加」入口输入框，激活态由列表 active 标记决定，与它无关
   syncLxAddButton();

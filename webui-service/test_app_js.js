@@ -223,6 +223,148 @@ test("syncNeteaseAccount：未登录清空 / 请求失败清空", async () => {
   assert.strictEqual(els.get("#qr-check").textContent, "");
 });
 
+test("大模型：接口完整也默认不勾选，隐藏参数保留缺省值", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LLM_BASE_URL: "https://example.test/v1", FNMUSIC_LLM_API_KEY: "secret",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#llm-liked").checked, false);
+  assert.strictEqual(els.get("#llm-daily").checked, false);
+  assert.strictEqual(els.get("#llm-liked-settings").hidden, true);
+  assert.strictEqual(els.get("#llm-api-warning").hidden, true);
+  assert.strictEqual(els.get("#liked-refresh-hours").value, "0.5");
+  assert.strictEqual(els.get("#liked-size").value, "20");
+  const values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_LLM_LIKED_ENABLED, false);
+  assert.strictEqual(values.FNMUSIC_LLM_DAILY_ENABLED, false);
+  assert.ok(!("FNMUSIC_LIKED_SIZE" in values));
+});
+
+test("大模型：已存空白参数不在回填时静默恢复默认", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LLM_LIKED_ENABLED: "true", FNMUSIC_LIKED_SIZE: "", FNMUSIC_LIKED_REFRESH_HOURS: "",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#liked-size").value, "");
+  assert.strictEqual(els.get("#liked-refresh-hours").value, "");
+  assert.throws(() => global.collectConfig(), /必须是/);
+});
+
+test("大模型：取消猜你喜欢隐藏但不清空，保存不覆盖已存参数", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LLM_LIKED_ENABLED: "true", FNMUSIC_LIKED_SIZE: "0", FNMUSIC_LIKED_REFRESH_HOURS: "100000.25",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#llm-liked-settings").hidden, false);
+  assert.strictEqual(global.collectConfig().FNMUSIC_LIKED_SIZE, 0);
+  assert.strictEqual(global.collectConfig().FNMUSIC_LIKED_REFRESH_HOURS, 100000.25);
+  els.get("#llm-liked").checked = false;
+  els.get("#llm-liked").dispatch("change");
+  assert.strictEqual(els.get("#llm-liked-settings").hidden, true);
+  assert.strictEqual(els.get("#liked-size").value, "0");
+  assert.strictEqual(els.get("#liked-refresh-hours").value, "100000.25");
+  els.get("#liked-size").value = "";
+  els.get("#liked-refresh-hours").value = "invalid";
+  const values = global.collectConfig();
+  assert.ok(!("FNMUSIC_LIKED_SIZE" in values));
+  assert.ok(!("FNMUSIC_LIKED_REFRESH_HOURS" in values));
+  await global.saveConfig();
+  const saved = JSON.parse(fetchCalls.find((c) => c.method === "PUT").body).values;
+  assert.strictEqual(saved.FNMUSIC_LLM_LIKED_ENABLED, false);
+  assert.ok(!("FNMUSIC_LIKED_SIZE" in saved));
+  assert.ok(!("FNMUSIC_LIKED_REFRESH_HOURS" in saved));
+});
+
+test("大模型：任一用途显式勾选且接口不完整才警告，输入即时更新", async () => {
+  for (const flag of ["#llm-liked", "#llm-daily"]) {
+    reset();
+    await global.loadConfig();
+    els.get(flag).checked = true;
+    els.get(flag).dispatch("change");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, false);
+    assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+    els.get("#llm-base").value = "https://example.test/v1";
+    els.get("#llm-base").dispatch("input");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, false);
+    els.get("#llm-key").value = "secret";
+    els.get("#llm-key").dispatch("input");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, true);
+    els.get("#llm-base").value = "  ";
+    els.get("#llm-base").dispatch("input");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, false);
+    els.get(flag).checked = false;
+    els.get(flag).dispatch("change");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, true);
+  }
+});
+
+test("猜你喜欢：有限小时无上限，整数数量端点与小数小时完整提交", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LLM_LIKED_ENABLED: "true" } });
+  await global.loadConfig();
+  for (const hours of ["0.5", "0.51", "1.75", "100000.25", "1e100"]) {
+    for (const size of ["0", "20", "100"]) {
+      els.get("#liked-refresh-hours").value = hours;
+      els.get("#liked-size").value = size;
+      const values = global.collectConfig();
+      assert.strictEqual(values.FNMUSIC_LIKED_REFRESH_HOURS, Number(hours));
+      assert.strictEqual(values.FNMUSIC_LIKED_SIZE, Number(size));
+    }
+  }
+});
+
+test("猜你喜欢：无效编辑不截断、不静默恢复默认、不发 PUT", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LLM_LIKED_ENABLED: "true" } });
+  await global.loadConfig();
+  for (const [selector, badValues] of [
+    ["#liked-size", ["", " ", "20.9", "20junk", "-1", "101", "NaN", "Infinity"]],
+    ["#liked-refresh-hours", ["", " ", "0", "0.49", "-1", "0.5junk", "NaN", "Infinity", "1e9999"]],
+  ]) {
+    for (const bad of badValues) {
+      els.get("#liked-size").value = "20";
+      els.get("#liked-refresh-hours").value = "0.5";
+      els.get(selector).value = bad;
+      assert.throws(() => global.collectConfig(), /必须是/);
+      await global.saveConfig();
+      assert.ok(els.get("#toast").textContent.includes("必须是"));
+      assert.strictEqual(fetchCalls.some((c) => c.method === "PUT"), false);
+    }
+  }
+});
+
+test("猜你喜欢参数输入标脏，每日用途不影响每日总开关", async () => {
+  reset();
+  await global.loadConfig();
+  for (const selector of ["#liked-size", "#liked-refresh-hours"]) {
+    global.clearDirty();
+    els.get(selector).dispatch("input");
+    assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  }
+  els.get("#recommend-daily").checked = true;
+  els.get("#llm-daily").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_RECOMMEND_DAILY, true);
+  els.get("#llm-daily").checked = true;
+  assert.strictEqual(global.collectConfig().FNMUSIC_LLM_DAILY_ENABLED, true);
+  els.get("#recommend-daily").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_RECOMMEND_DAILY, false);
+});
+
+test("大模型页面：无最大小时限制、初始隐藏且语义说明完整", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const hours = html.match(/<input[^>]*id="liked-refresh-hours"[^>]*>/)[0];
+  assert.ok(!/\bmax=/.test(hours));
+  assert.ok(hours.includes('step="any"'));
+  assert.ok(html.includes('id="llm-liked-settings" hidden'));
+  assert.ok(html.includes('id="llm-api-warning" role="status" hidden'));
+  for (const phrase of ["不会自动启用", "首次被客户端获取", "不会到期或轮换", "本地有效、未收藏候选至少 20 首", "停止生成且不展示猜你喜欢"]) {
+    assert.ok(html.includes(phrase), phrase);
+  }
+});
+
 test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () => {
   reset();
   global.markDirty("已修改配置");
