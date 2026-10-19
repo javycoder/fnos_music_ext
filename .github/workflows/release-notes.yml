@@ -36,18 +36,26 @@ jobs:
             exit 0
           fi
           git merge-base --is-ancestor "$tag" HEAD
+          extract_notes() {
+            awk -v ver="$version" '
+              index($0, "## [" ver "]") == 1 { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            '
+          }
+          extract_notes < CHANGELOG.md > /tmp/release-notes.md
+          grep -q '[^[:space:]]' /tmp/release-notes.md
+          git show "${tag}:CHANGELOG.md" | extract_notes > /tmp/tagged-release-notes.md
+          if cmp -s /tmp/tagged-release-notes.md /tmp/release-notes.md; then
+            echo "${tag} notes are unchanged; unreleased entries need no correction."
+            exit 0
+          fi
           git diff --exit-code "$tag" HEAD -- . \
             ':!CHANGELOG.md' \
             ':!.github/workflows/release-notes.yml' \
             ':!packaging/tests/test_release_notes.py' \
             ':!CHANGELOG.md' \
             ':!.zcode/skills/fnmusic-release/SKILL.md'
-          awk -v ver="$version" '
-            index($0, "## [" ver "]") == 1 { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > /tmp/release-notes.md
-          grep -q '[^[:space:]]' /tmp/release-notes.md
           gh api "repos/${GH_REPO}/releases/tags/${tag}" > /tmp/release-before.json
           jq -e '.draft == false' /tmp/release-before.json
           gh release edit "$tag" --notes-file /tmp/release-notes.md

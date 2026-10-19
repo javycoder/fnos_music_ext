@@ -28,6 +28,86 @@ def test_notes_correction_only_updates_existing_release_body(tmp_path):
     assert 'git push' not in script
 
 
+@pytest.mark.parametrize('case,success,edited', [
+    ('unreleased-runtime', True, False),
+    ('changed-runtime', False, False),
+    ('correction-only', True, True),
+    ('missing-section', False, False),
+])
+def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path, case, success, edited):
+    if not shutil.which('jq'):
+        pytest.skip('release shell sandbox requires jq')
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(['git', '-C', str(repo), *args], check=True,
+                              capture_output=True, text=True)
+
+    git('init', '-q')
+    git('config', 'user.name', 'Release Test')
+    git('config', 'user.email', 'release@example.invalid')
+    (repo / 'VERSION').write_text('2.10.0b\n')
+    initial = '# Changelog\n\n## [未发布]\n\n## [2.10.0b]\n\nPublished notes.\n'
+    (repo / 'CHANGELOG.md').write_text(initial)
+    (repo / 'runtime.py').write_text('value = 1\n')
+    git('add', '.')
+    git('commit', '-qm', 'release')
+    git('tag', 'v2.10.0b')
+    updated = initial.replace('## [未发布]\n', '## [未发布]\n\nUnreleased fix.\n')
+    if case in ('changed-runtime', 'correction-only'):
+        updated = updated.replace('Published notes.', 'Corrected published notes.')
+    elif case == 'missing-section':
+        updated = updated.split('## [2.10.0b]')[0]
+    if case != 'correction-only':
+        (repo / 'runtime.py').write_text('value = 2\n')
+    (repo / 'CHANGELOG.md').write_text(updated)
+    git('add', '.')
+    git('commit', '-qm', 'update')
+    state = tmp_path / 'calls.json'
+    state.write_text('[]')
+    gh = tmp_path / 'gh'
+    gh.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+        import json, os, sys
+        from pathlib import Path
+        path = Path(os.environ['MOCK_CALLS'])
+        calls = json.loads(path.read_text())
+        args = sys.argv[1:]
+        calls.append(args)
+        path.write_text(json.dumps(calls))
+        notes = Path(os.environ['MOCK_NOTES'])
+        if args == ['api', 'repos/example/music/releases/tags/v2.10.0b']:
+            print(json.dumps(dict(id=1, tag_name='v2.10.0b', draft=False,
+                prerelease=True, assets=[dict(id=2, name='package.fpk', size=123,
+                digest='sha256:unchanged')], body=notes.read_text())))
+        elif args[:3] == ['release', 'edit', 'v2.10.0b']:
+            assert args[3] == '--notes-file'
+            notes.write_text(Path(args[4]).read_text())
+        else:
+            sys.exit(99)
+    '''))
+    gh.chmod(0o755)
+    notes = tmp_path / 'published.md'
+    notes.write_text('Published notes.\n')
+    workflow = (ROOT / '.github/workflows/release-notes.yml').read_text()
+    script = '\n'.join(line[10:] for line in workflow.split('        run: |\n', 1)[1].splitlines())
+    # Each sandbox owns the workflow scratch files as well as its fake gh state.
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    script = script.replace('/tmp/', str(scratch) + '/')
+    env = dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}',
+               GH_REPO='example/music', MOCK_CALLS=str(state), MOCK_NOTES=str(notes))
+    result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=repo,
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert (result.returncode == 0) is success, result.stdout + result.stderr
+    calls = json.loads(state.read_text())
+    assert any(call[:2] == ['release', 'edit'] for call in calls) is edited
+    if not edited:
+        assert calls == []
+    else:
+        assert notes.read_text().strip() == 'Corrected published notes.'
+
+
 def test_first_210_prerelease_documents_changes_since_290():
     notes = (ROOT / 'CHANGELOG.md').read_text().split('## [2.10.0a]', 1)[1].split('\n## [', 1)[0]
     for required in ('v2.9.0', '猜你喜欢', '30 分钟', 'ARM64', '503', '#67', '封面', '只读'):
