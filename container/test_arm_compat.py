@@ -181,3 +181,66 @@ def test_helper_rejects_corrupt_x64_binding(tmp_path):
     result = _run_helper(tmp_path, required_arch="x64")
     assert result.returncode != 0
     assert "无法加载" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("via_env", [False, True])
+def test_helper_uses_selected_node_outside_path_for_arm64_repair(tmp_path, via_env):
+    tarball = _make_tarball(tmp_path)
+    _write_version_file(tmp_path / "lxserver.version", hashlib.sha256(tarball.read_bytes()).hexdigest())
+    named = _install_in_place(tmp_path, node_content=b"corrupt-binding")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # 模拟 ARM64 宿主，且 PATH 中的 Node 不可用于实际校验。
+    for name, body in (("uname", "printf 'aarch64\\n'\n"),
+                       ("node", 'printf "WRONG_NODE\\n" >> "$NODE_LOG"; exit 1\n')):
+        path = bindir / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+    selected = tmp_path / "app-node"
+    selected.write_text(
+        "#!/bin/sh\n"
+        'printf "selected\\n" >> "$NODE_LOG"\n'
+        '[ "$1" = -e ] || exit 1\n'
+        '[ "$(/bin/cat "$3")" = locked-arm64-binding ]\n'
+    )
+    selected.chmod(0o755)
+    log = tmp_path / "node.log"
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "NODE_LOG": str(log)}
+    args = ["bash", str(HELPER), "--artifact-dir", str(tmp_path / "artifact"),
+            "--lxserver-dir", str(tmp_path / "lxserver"),
+            "--version-file", str(tmp_path / "lxserver.version")]
+    if via_env:
+        env["FNMUSIC_NODE_BIN"] = str(selected)
+    else:
+        env["FNMUSIC_NODE_BIN"] = str(bindir / "node")
+        args += ["--node-bin", str(selected)]
+    result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "重新补装" in result.stdout
+    assert named.read_bytes() == b"locked-arm64-binding"
+    assert log.read_text().splitlines() == ["selected", "selected"]
+
+
+@pytest.mark.parametrize("arch", ["x64", "arm64"])
+def test_helper_refuses_missing_node_on_matching_host(tmp_path, arch):
+    tarball = _make_tarball(tmp_path)
+    _write_version_file(tmp_path / "lxserver.version", hashlib.sha256(tarball.read_bytes()).hexdigest())
+    _install_in_place(tmp_path)
+    loader = tmp_path / "lxserver/node_modules/music-tag-native"
+    (loader / X64_NATIVE_NAME).write_bytes(b"unchecked-x64-binding")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    uname = bindir / "uname"
+    uname.write_text(f"#!/bin/sh\nprintf '{'aarch64' if arch == 'arm64' else 'x86_64'}\\n'\n")
+    uname.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(HELPER), "--artifact-dir", str(tmp_path / "artifact"),
+         "--lxserver-dir", str(tmp_path / "lxserver"),
+         "--version-file", str(tmp_path / "lxserver.version"),
+         "--required-arch", arch, "--node-bin", str(tmp_path / "missing-node")],
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "无法执行 Node" in result.stdout + result.stderr
+    assert "校验通过" not in result.stdout

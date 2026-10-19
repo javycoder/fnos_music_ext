@@ -384,16 +384,10 @@ except Exception:
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 1/5: 环境预检... (fnmusic-ext v${FNMUSIC_VERSION})"
 
-# 1.1 检查 Python 3 与 venv 模块
-if ! command -v python3 >/dev/null 2>&1; then
-    log_err "【缺少基础依赖】系统未检测到 python3。"
-    log_err "请先执行以下命令安装基础组件：sudo apt-get update && sudo apt-get install -y python3 python3-venv"
-    exit 1
-fi
-
-if ! python3 -c "import venv" >/dev/null 2>&1; then
-    log_err "【缺少基础依赖】系统 Python 缺少 venv 模块。"
-    log_err "请先执行以下命令安装基础组件：sudo apt-get update && sudo apt-get install -y python3-venv"
+# 1.1 与安装脚本共用运行时探测，不要求系统 Python 额外提供 venv。
+if ! choose_python_bin; then
+    log_err "【缺少基础依赖】未找到合格的 Python 3.11+（需包含 venv/ensurepip/ssl/sqlite3）。"
+    log_err "请在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN 指向合格解释器。"
     exit 1
 fi
 

@@ -206,11 +206,11 @@ fi
 NODE_BIN="${FNMUSIC_SELECTED_NODE}"
 log_info "选用 Node: ${NODE_BIN} ($("${NODE_BIN}" --version 2>/dev/null || echo '?')，来源: ${FNMUSIC_NODE_SOURCE})"
 
-choose_media_bins
+choose_media_bins || true
 if [ -z "${FNMUSIC_SELECTED_FFMPEG}" ] || [ -z "${FNMUSIC_SELECTED_FFPROBE}" ]; then
     log_warn "未检测到完整 ffmpeg/ffprobe，尝试 sudo apt-get 补装..."
     apt_install_packages ffmpeg || true
-    choose_media_bins
+    choose_media_bins || true
 fi
 if [ -z "${FNMUSIC_SELECTED_FFMPEG}" ]; then
     log_warn "缺少 ffmpeg：音频解码校验与标准音质转码不可用，将继续安装并按原文件/无法校验处理。"
@@ -305,9 +305,16 @@ else
     log_info "lxserver ${LXSERVER_TAG} 已落位 ${LXSERVER_DIR}。"
 fi
 
+# 与 Docker 构建应用同一份幂等补丁；同版本在位也需修复旧安装的漏补丁。
+if [ -f "${LXSERVER_DIR}/server/server/userApi.js" ]; then
+    "${PYTHON_BIN}" "${BASE_DIR}/container/lxserver_compat.py" \
+        "${LXSERVER_DIR}/server/server/userApi.js"
+fi
+
 bash "${BASE_DIR}/container/ensure_lxserver_native.sh" \
     --artifact-dir "${LXSERVER_ARTIFACT_DIR}" \
     --lxserver-dir "${LXSERVER_DIR}" \
-    --version-file "${LXSERVER_VERSION_FILE}"
+    --version-file "${LXSERVER_VERSION_FILE}" \
+    --node-bin "${NODE_BIN}"
 
 log_info "原生音源运行时就绪。"

@@ -284,6 +284,9 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     shutil.copy(BASE / "ensure_sources_native.sh", repo / "ensure_sources_native.sh")
     shutil.copy(BASE / "container/ensure_lxserver_native.sh",
                 repo / "container/ensure_lxserver_native.sh")
+    shutil.copy(BASE / "container/lxserver_compat.py", repo / "container/lxserver_compat.py")
+    compat = _load_module("container/lxserver_compat.py", "native_provision_compat_test")
+    upstream_api = "\n".join((compat.ANCHOR_BTOA, compat.ANCHOR_CALL_OLD, compat.ANCHOR_AES_OLD))
     for req in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         (repo / req).mkdir()
         (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
@@ -294,6 +297,7 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     with zipfile.ZipFile(artifact, "w") as zf:
         zf.writestr("lx-music-sync-server/index.js", "#!/usr/bin/env node\nrequire('./server/server');\n")
         zf.writestr("lx-music-sync-server/server/server.js", f"#!/usr/bin/env node\n{original_line}\n")
+        zf.writestr("lx-music-sync-server/server/server/userApi.js", upstream_api)
     sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
     native_tarball = repo / "container/lxserver-artifact/music-tag-native-linux-arm64-gnu-0.2.5.tgz"
     package_dir = tmp_path / "native-package" / "package"
@@ -325,6 +329,7 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     _write_stub(stub_bin, "ffmpeg", 'echo "ffmpeg version 6.0" ; exit 0\n')
     env = {
         "BASE_DIR": str(repo),
+        "FNMUSIC_PYTHON_BIN": sys.executable,
         "FNMUSIC_LXSERVER_ARCH": "arm64",
         "FNMUSIC_VENV_SOURCES_DIR": str(venv),
         "PATH": f"{stub_bin}:{os.environ['PATH']}",
@@ -337,12 +342,22 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     patched = server_js.read_text(encoding="utf-8")
     assert "const result = await (_res && _res.promise ? _res.promise : _res);" in patched
     assert (repo / ".lxserver" / ".provisioned-version").read_text().strip() == "vtest"
+    api = repo / ".lxserver/server/server/userApi.js"
+    patched_api = api.read_text()
+    for patch in (compat.PATCH_GLOBALS, compat.ANCHOR_CALL_NEW, compat.ANCHOR_AES_NEW):
+        assert patch in patched_api
+    # 同版本旧安装也必须补齐沙箱补丁，且不得重新解压覆盖其他在位文件。
+    api.write_text(upstream_api)
     # 真实包允许主脚本嵌套；幂等判定必须使用根入口而非 server/server.js。
     server_js.unlink()
-    # 幂等：同版本重跑直接跳过（不重新解压）
     r2 = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env=env)
     assert r2.returncode == 0, r2.stderr
     assert "已就位" in r2.stdout
+    assert not server_js.exists()
+    assert api.read_text() == patched_api
+    r3 = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env=env)
+    assert r3.returncode == 0, r3.stderr
+    assert api.read_text() == patched_api
 
 
 def test_ensure_sources_native_rejects_bad_sha256(tmp_path):

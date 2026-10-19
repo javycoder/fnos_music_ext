@@ -297,3 +297,73 @@ def test_deps_state_valid_and_invalidation(tmp_path):
     res = run_bash_cmd(script)
     assert res.returncode == 0, res.stderr
     assert "ALL_OK" in res.stdout
+
+
+@pytest.mark.parametrize("apt_recovers", [False, True])
+def test_native_missing_media_attempts_install_then_continues(apt_recovers):
+    text = (BASE / "ensure_sources_native.sh").read_text()
+    start = text.index("\nchoose_media_bins", text.index('NODE_BIN="${FNMUSIC_SELECTED_NODE}"'))
+    end = text.index("\n# ------------------------------------------------------- 3.", start)
+    script = r'''
+set -euo pipefail
+source "$RUNTIME_SH"
+media_ready=0
+runtime_tool_path() {
+    [ "$media_ready" = 1 ] || return 1
+    printf '/fake/%s\n' "$2"
+}
+log_info() { printf '%s\n' "$*"; }
+log_warn() { printf '%s\n' "$*"; }
+apt_install_packages() {
+    printf 'APT_ATTEMPTED\n'
+    media_ready="$APT_RECOVERS"
+    [ "$media_ready" = 1 ]
+}
+'''
+    res = run_bash_cmd(script + text[start:end] + "\nprintf 'CONTINUED_TO_LXSERVER\\n'\n",
+                       {"RUNTIME_SH": str(RUNTIME_SH), "APT_RECOVERS": str(int(apt_recovers))})
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "APT_ATTEMPTED" in res.stdout
+    assert "CONTINUED_TO_LXSERVER" in res.stdout
+    assert ("缺少 ffmpeg：" in res.stdout) == (not apt_recovers)
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_extend_precheck_uses_selected_python_not_system_venv(tmp_path, valid):
+    selected = tmp_path / "app-python"
+    selected.write_text(f"#!/bin/sh\nexit {0 if valid else 1}\n")
+    selected.chmod(0o755)
+    text = (BASE / "extend.sh").read_text()
+    start = text.index("# 1.1 ")
+    end = text.index("# 1.2 ", start)
+    script = r'''
+set -euo pipefail
+source "$RUNTIME_SH"
+python3() { printf 'SYSTEM_PYTHON_CALLED\n' >&2; return 1; }
+log_err() { printf '%s\n' "$*" >&2; }
+'''
+    res = run_bash_cmd(script + text[start:end] + "\nprintf 'PRECHECK_OK\\n'\n",
+                       {"RUNTIME_SH": str(RUNTIME_SH), "FNMUSIC_PYTHON_BIN": str(selected)})
+    assert res.returncode == (0 if valid else 1), res.stdout + res.stderr
+    assert "SYSTEM_PYTHON_CALLED" not in res.stderr
+    assert ("PRECHECK_OK" in res.stdout) == valid
+    if not valid:
+        assert "Python 3.11+" in res.stderr
+
+
+def test_native_forwards_selected_node_to_module_validator(tmp_path):
+    text = (BASE / "ensure_sources_native.sh").read_text()
+    start = text.index('bash "${BASE_DIR}/container/ensure_lxserver_native.sh"')
+    end = text.index('\n\nlog_info "原生音源运行时就绪。"', start)
+    selected = str(tmp_path / "Node Runtime/bin/node")
+    script = r'''
+set -euo pipefail
+bash() { printf '%s\n' "$@"; }
+'''
+    res = run_bash_cmd(script + text[start:end], {
+        "BASE_DIR": str(BASE), "LXSERVER_ARTIFACT_DIR": "/fake/artifacts",
+        "LXSERVER_DIR": "/fake/lxserver", "LXSERVER_VERSION_FILE": "/fake/version",
+        "NODE_BIN": selected,
+    })
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.splitlines()[-2:] == ["--node-bin", selected]

@@ -16,6 +16,7 @@ VERSION_FILE="${BASE_DIR}/container/lxserver.version"
 ARTIFACT_DIR="${BASE_DIR}/container/lxserver-artifact"
 LXSERVER_DIR="${BASE_DIR}/.lxserver"
 REQUIRED_ARCH="${FNMUSIC_LXSERVER_ARCH:-}"
+NODE_BIN="${FNMUSIC_NODE_BIN:-node}"
 DOWNLOAD_ONLY=0
 
 log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
@@ -26,10 +27,11 @@ while [ $# -gt 0 ]; do
         --artifact-dir) ARTIFACT_DIR="$2"; shift 2 ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --lxserver-dir) LXSERVER_DIR="$2"; shift 2 ;;
+        --node-bin) NODE_BIN="$2"; shift 2 ;;
         --required-arch) REQUIRED_ARCH="$2"; shift 2 ;;
         --version-file) VERSION_FILE="$2"; shift 2 ;;
         *)
-            echo "用法: $0 [--artifact-dir DIR] [--lxserver-dir DIR] [--required-arch x64|arm64] [--version-file FILE] [--download-only]" >&2
+            echo "用法: $0 [--artifact-dir DIR] [--lxserver-dir DIR] [--node-bin NODE] [--required-arch x64|arm64] [--version-file FILE] [--download-only]" >&2
             exit 2
             ;;
     esac
@@ -109,10 +111,15 @@ validate_installed_native() {
             REJECT_REASON="上游 server.zip 未携带 x64 原生模块: ${NATIVE_NAME}"
             return 1
         fi
-        if host_arch_matches "x64" && command -v node >/dev/null 2>&1 \
-            && ! node -e 'require(process.argv[1]);' "${PACKAGE_NATIVE}" >/dev/null 2>&1; then
-            REJECT_REASON="node 无法加载 x64 绑定（构件损坏或 ABI 不符）: ${PACKAGE_NATIVE}"
-            return 1
+        if host_arch_matches "x64"; then
+            if ! command -v "${NODE_BIN}" >/dev/null 2>&1; then
+                REJECT_REASON="无法执行 Node 进行原生模块校验: ${NODE_BIN}"
+                return 1
+            fi
+            if ! "${NODE_BIN}" -e 'require(process.argv[1]);' "${PACKAGE_NATIVE}" >/dev/null 2>&1; then
+                REJECT_REASON="node 无法加载 x64 绑定（构件损坏或 ABI 不符）: ${PACKAGE_NATIVE}"
+                return 1
+            fi
         fi
         return 0
     fi
@@ -135,10 +142,15 @@ validate_installed_native() {
         REJECT_REASON="加载器目录缺少绑定副本: ${PACKAGE_NATIVE}"
         return 1
     fi
-    if host_arch_matches "arm64" && command -v node >/dev/null 2>&1 \
-        && ! node -e 'require(process.argv[1]);' "${NAMED_NATIVE}" >/dev/null 2>&1; then
-        REJECT_REASON="node 无法加载 arm64 绑定（构件损坏或 ABI 不符）: ${NAMED_NATIVE}"
-        return 1
+    if host_arch_matches "arm64"; then
+        if ! command -v "${NODE_BIN}" >/dev/null 2>&1; then
+            REJECT_REASON="无法执行 Node 进行原生模块校验: ${NODE_BIN}"
+            return 1
+        fi
+        if ! "${NODE_BIN}" -e 'require(process.argv[1]);' "${NAMED_NATIVE}" >/dev/null 2>&1; then
+            REJECT_REASON="node 无法加载 arm64 绑定（构件损坏或 ABI 不符）: ${NAMED_NATIVE}"
+            return 1
+        fi
     fi
     return 0
 }
