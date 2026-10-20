@@ -567,6 +567,28 @@ class LxServerClient:
             raise RuntimeError("lxserver song lists returned invalid payload")
         return data
 
+    async def get_song_list_search(self, source: str, text: str, page: int = 1) -> dict:
+        """歌单关键词搜索（lxserver 原生 /api/music/songList/search，v2.1.2 起自带）。
+
+        上游 SDK 固定页大小（默认 20），不透传 limit；返回 {list, limit, total, source}。
+        """
+        src = normalize_source(source)
+        keyword = str(text or "").strip()
+        if not src:
+            raise ValueError("unsupported source")
+        if not keyword:
+            raise ValueError("empty search keyword")
+        params = {"source": src, "text": keyword, "page": max(1, int(page or 1))}
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            resp = await client.get("/api/music/songList/search", params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver song list search error {resp.status_code}: {resp.text[:160]}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver song list search returned invalid payload")
+        return data
+
     async def get_song_list_detail(self, source: str, playlist_id: str, page: int = 1) -> dict:
         src = normalize_source(source)
         raw_id = str(playlist_id or "")

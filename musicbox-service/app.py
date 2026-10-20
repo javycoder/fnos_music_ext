@@ -386,6 +386,7 @@ def public_playlist_capabilities():
                 {"id": "recommend", "name": "推荐歌单", "login_required": False},
                 {"id": "top", "name": "热门与分类", "login_required": False},
                 {"id": "highquality", "name": "精品歌单", "login_required": False},
+                {"id": "search", "name": "搜索歌单", "login_required": False},
                 {"id": "charts", "name": "排行榜", "login_required": False},
                 {"id": "account_recommend", "name": "账号推荐歌单", "login_required": True},
             ],
@@ -427,17 +428,20 @@ def public_playlists_api(
     channel: str = Query("top"),
     category: str = Query(""),
     sort: str = Query("hot"),
-    page: int = Query(1, ge=1, le=100),
+    keyword: str = Query(""),
+    page: int = Query(1, ge=1, le=10000),
     limit: int = Query(30, ge=1, le=50),
     cursor: str = Query(""),
 ):
     if source not in ("netease", "wy", "163"):
         raise HTTPException(status_code=400, detail="unsupported source")
-    channels = {"recommend", "top", "highquality", "charts", "account_recommend"}
+    channels = {"recommend", "top", "highquality", "search", "charts", "account_recommend"}
     if channel not in channels:
         raise HTTPException(status_code=400, detail=f"unsupported channel {channel}")
+    if channel == "search" and not keyword.strip():
+        raise HTTPException(status_code=400, detail="keyword is required for search channel")
     try:
-        return public_playlists(channel, category, sort, page, limit, cursor)
+        return public_playlists(channel, category, sort, page, limit, cursor, keyword)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"netease playlists failed: {exc}") from exc
 

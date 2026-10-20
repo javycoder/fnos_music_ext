@@ -180,12 +180,18 @@
               <select class="input grow" id="public-category" aria-label="分类"></select>
               <button class="btn" id="public-refresh">刷新</button>
             </div>
+            <div class="btn-row">
+              <input class="input grow" id="public-keyword" placeholder="输入歌单名称关键词搜索公共歌单" aria-label="搜索公共歌单">
+              <button class="btn" id="public-search">搜索</button>
+              <button class="btn" id="public-search-clear" hidden>清除搜索</button>
+            </div>
             <p class="hint" id="public-note">选择音源后加载歌单。</p>
             <div id="public-list" class="public-list"></div>
             <div class="btn-row">
               <button class="btn small" id="public-prev">上一页</button>
-              <span id="public-page" class="muted">1 / 1</span>
+              <span id="public-page" class="muted">1</span>
               <button class="btn small" id="public-next">下一页</button>
+              <button class="btn small" id="public-load-rest" hidden>加载剩余歌单</button>
             </div>
             <div>
               <div class="card-title">已选歌单（音乐页展示顺序）</div>

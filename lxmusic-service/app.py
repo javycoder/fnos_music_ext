@@ -1220,6 +1220,7 @@ async def public_playlist_capabilities():
             "reason": caps.get(src, {}).get("reason") or "",
             "channels": [
                 {"id": "top", "name": "热门与分类", "login_required": False},
+                {"id": "search", "name": "搜索歌单", "login_required": False},
                 {"id": "charts", "name": "排行榜", "login_required": False},
             ],
             "logged_in": False,
@@ -1257,7 +1258,8 @@ async def public_playlists(
     channel: str = Query("top"),
     category: str = Query(""),
     sort: str = Query(""),
-    page: int = Query(1, ge=1, le=100),
+    keyword: str = Query(""),
+    page: int = Query(1, ge=1, le=10000),
     limit: int = Query(30, ge=1, le=50),
     cursor: str = Query(""),
 ):
@@ -1266,6 +1268,25 @@ async def public_playlists(
         rows = await LXSERVER.get_leaderboard_boards(src)
         items = [LXSERVER.normalize_public_playlist(row, src, "chart") for row in rows if isinstance(row, dict)]
         return {"ok": True, "items": [it for it in items if it["id"]], "total": len(items), "has_more": False}
+    if channel == "search":
+        # lxserver 原生歌单搜索：SDK 固定页大小（默认 20），limit 不透传
+        data = await LXSERVER.get_song_list_search(src, keyword, page)
+        raw_items = data.get("list") or []
+        items = [LXSERVER.normalize_public_playlist(row, src) for row in raw_items if isinstance(row, dict)]
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        try:
+            page_limit = max(1, int(data.get("limit") or 20))
+        except (TypeError, ValueError):
+            page_limit = 20
+        return {
+            "ok": True,
+            "items": [it for it in items if it["id"]],
+            "total": total,
+            "has_more": (page * page_limit < total) if total else bool(raw_items),
+        }
     if channel != "top":
         raise ValueError(f"unsupported channel {channel!r}")
     if not sort:

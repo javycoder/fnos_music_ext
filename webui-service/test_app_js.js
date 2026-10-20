@@ -114,7 +114,8 @@ function enqueue(p, ...bodies) {
 
 global.fetch = async (url, options = {}) => {
   const p = String(url).split("?")[0];
-  fetchCalls.push({ path: p, method: (options.method || "GET").toUpperCase(), body: options.body });
+  // 记录完整 URL（含 query）：公共歌单搜索等用例需要断言查询参数契约
+  fetchCalls.push({ path: p, url: String(url), method: (options.method || "GET").toUpperCase(), body: options.body });
   if (routes.has(p) && routes.get(p).length) {
     const body = routes.get(p).shift();
     if (body && body.__rawResponse) { return body.resp; }
@@ -1259,6 +1260,137 @@ test("宿主主题：异步初值未返回不阻塞配置加载，返回后仍�
   assert.strictEqual(h.root.dataset.theme, "light");
   changeTheme(h, "auto");
   assert.strictEqual(h.root.dataset.theme, "dark");
+});
+
+/* ---------------------------------------------- 公共歌单：搜索/加载剩余/名称 -- */
+test("公共歌单搜索：关键词走 channel=search 并渲染搜索文案与清除按钮", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", {
+    ok: true,
+    items: [{ id: 7108, name: "华语速爆新歌", cover_url: "", track_count: 30, author: "网易" }],
+    total: 57, has_more: true,
+  });
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.keyword = "华语"; publicState.page = 1;
+  `);
+  await global.loadPublicList();
+  const call = fetchCalls.find((c) => c.path === "/app/fnmusic-ext/api/public-playlists/");
+  assert.ok(call, "应请求公共歌单列表");
+  assert.ok(call.url.includes("channel=search"), "搜索走 channel=search");
+  assert.ok(call.url.includes("keyword=" + encodeURIComponent("华语")));
+  assert.ok(els.get("#public-list").innerHTML.includes("华语速爆新歌"));
+  assert.ok(els.get("#public-note").textContent.includes("搜索"), "提示应区分搜索模式");
+  assert.strictEqual(els.get("#public-search-clear").hidden, false);
+  assert.strictEqual(els.get("#public-category").hidden, true, "搜索时隐藏分类选择");
+  assert.strictEqual(els.get("#public-load-rest").hidden, false, "搜索结果也可加载剩余");
+});
+
+test("公共歌单搜索：清除关键词后回到普通浏览 channel", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", { ok: true, items: [], total: 0, has_more: false });
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.keyword = "华语";
+    $("#public-keyword").value = "华语";
+  `);
+  await global.clearPublicSearch();
+  const call = fetchCalls.find((c) => c.path === "/app/fnmusic-ext/api/public-playlists/");
+  assert.ok(call.url.includes("channel=top"));
+  assert.ok(!call.url.includes("keyword=" + encodeURIComponent("华语")));
+  assert.strictEqual(els.get("#public-search-clear").hidden, true);
+  assert.strictEqual(vm.runInThisContext("publicState.keyword"), "");
+});
+
+test("公共歌单：请求期间切换关键词，过期响应不覆盖新结果", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", {
+    ok: true, items: [{ id: 1, name: "旧关键词结果" }], has_more: false, total: 1,
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", {
+    ok: true, items: [{ id: 2, name: "新关键词结果" }], has_more: false, total: 1,
+  });
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.page = 1; publicState.keyword = "旧";
+  `);
+  const first = global.loadPublicList();
+  vm.runInThisContext('publicState.keyword = "新"; publicState.page = 1;');
+  const second = global.loadPublicList();
+  await Promise.all([first, second]);
+  const html = els.get("#public-list").innerHTML;
+  assert.ok(html.includes("新关键词结果"));
+  assert.ok(!html.includes("旧关键词结果"), "过期响应必须被丢弃");
+});
+
+test("加载剩余歌单：逐页追加去重，上游重复页判停", async () => {
+  reset();
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.keyword = ""; publicState.page = 1;
+    publicState.items = []; publicState.hasMore = true;
+  `);
+  const page = (names, hasMore) => ({
+    ok: true, items: names.map((nm) => ({ id: nm, name: nm })), total: 99, has_more: hasMore,
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", page(["歌单甲", "歌单乙"], true));
+  await global.loadPublicList();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", page(["歌单丙"], true));
+  enqueue("/app/fnmusic-ext/api/public-playlists/", page(["歌单丙"], true)); // 上游卡住：整页重复
+  await global.loadPublicRest();
+  const html = els.get("#public-list").innerHTML;
+  assert.ok(html.includes("歌单甲") && html.includes("歌单乙") && html.includes("歌单丙"), "三页内容都应保留");
+  assert.deepStrictEqual(vm.runInThisContext("publicState.items.map((it) => it.id)"),
+    ["歌单甲", "歌单乙", "歌单丙"], "重复页的歌单不重复追加");
+  assert.ok(els.get("#public-note").textContent.includes("不再返回新歌单"));
+  assert.strictEqual(els.get("#public-load-rest").hidden, true, "判停后不再提供继续加载");
+  assert.strictEqual(vm.runInThisContext("publicState.page"), 3);
+});
+
+test("已选歌单：配置回填只有身份字段时按状态显示，详情补齐后显示名称", async () => {
+  reset();
+  vm.runInThisContext(`
+    publicSelection = [{ provider: "musicbox", source: "netease", kind: "playlist", id: "7108" }];
+    $("#public-playlists-browser").hidden = false;
+    renderPublicSelected();
+  `);
+  const before = els.get("#public-selected").innerHTML;
+  assert.ok(before.includes("正在获取歌单名称"));
+  assert.ok(!before.includes("<b>7108</b>"), "数字 ID 不应再作标题");
+  enqueue("/app/fnmusic-ext/api/public-playlists/7108", {
+    ok: true, data: { name: "华语速爆新歌", cover_url: "", track_count: 30 },
+  });
+  await global.ensurePublicSelectionDetails();
+  const after = els.get("#public-selected").innerHTML;
+  assert.ok(after.includes("华语速爆新歌"));
+  assert.ok(!after.includes("正在获取歌单名称"));
+  const callsAfterFirst = fetchCalls.length;
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, callsAfterFirst, "已有名称/缓存命中时不再请求");
+});
+
+test("已选歌单：详情失败显示获取失败与重试按钮，重试成功恢复名称", async () => {
+  reset();
+  vm.runInThisContext(`
+    publicSelection = [{ provider: "lx", source: "kg", kind: "chart", id: "8888" }];
+    $("#public-playlists-browser").hidden = false;
+  `);
+  enqueue("/app/fnmusic-ext/api/public-playlists/8888", new Error("音源服务不可达"));
+  await global.ensurePublicSelectionDetails();
+  const failed = els.get("#public-selected").innerHTML;
+  assert.ok(failed.includes("名称获取失败"));
+  assert.ok(failed.includes("data-public-retry"), "失败项应有重试按钮");
+  assert.ok(!failed.includes("<b>8888</b>"));
+  const callsAfterFail = fetchCalls.length;
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, callsAfterFail, "失败缓存期间不重复请求");
+  enqueue("/app/fnmusic-ext/api/public-playlists/8888", {
+    ok: true, data: { name: "TOP500", cover_url: "", track_count: 500 },
+  });
+  await global.retryPublicDetail(0);
+  const okHtml = els.get("#public-selected").innerHTML;
+  assert.ok(okHtml.includes("TOP500"));
+  assert.ok(!okHtml.includes("名称获取失败"));
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

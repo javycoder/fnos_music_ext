@@ -324,6 +324,109 @@ def test_song_list_client_contracts_preserve_raw_ids():
     assert chart["id"] == "8888"
 
 
+def test_song_list_search_client_contract():
+    """歌单搜索：source/text/page 契约、字符串 ID 透传、非 200 与非法载荷报错。"""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({"path": request.url.path, "params": dict(request.url.params)})
+        return httpx.Response(200, json={
+            "list": [{"id": "kw_pl_9", "name": "华语精选", "img": "http://img/kw.jpg",
+                      "total": 33, "author": "酷我用户", "source": "kw"}],
+            "limit": 20, "total": 57, "source": "kw",
+        })
+
+    client = LxServerClient(base_url="http://lxserver-test")
+
+    async def _run():
+        client._client = httpx.AsyncClient(
+            base_url=client.base_url, transport=httpx.MockTransport(handler), timeout=5.0,
+        )
+        try:
+            data = await client.get_song_list_search("kw", " 华语 ", 3)
+        finally:
+            await client.close()
+        return data
+
+    data = asyncio.run(_run())
+    assert seen == [{"path": "/api/music/songList/search",
+                     "params": {"source": "kw", "text": "华语", "page": "3"}}]
+    summary = client.normalize_public_playlist(data["list"][0], "kw")
+    assert summary["id"] == "kw_pl_9" and summary["track_count"] == 33
+    assert summary["name"] == "华语精选" and summary["cover_url"] == "http://img/kw.jpg"
+
+
+def test_song_list_search_client_rejects_bad_input_and_payloads():
+    client = LxServerClient(base_url="http://lxserver-test")
+
+    with pytest.raises(ValueError, match="keyword"):
+        asyncio.run(client.get_song_list_search("kw", "   ", 1))
+    with pytest.raises(ValueError, match="source"):
+        asyncio.run(client.get_song_list_search("xm", "华语", 1))
+
+    def bad_status(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    def bad_payload(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"list": "nope"})
+
+    async def _with(handler, fn):
+        client._client = httpx.AsyncClient(
+            base_url=client.base_url, transport=httpx.MockTransport(handler), timeout=5.0,
+        )
+        try:
+            await fn()
+        finally:
+            await client.close()
+
+    with pytest.raises(RuntimeError, match="500"):
+        asyncio.run(_with(bad_status, lambda: client.get_song_list_search("kw", "华语", 1)))
+    with pytest.raises(RuntimeError, match="invalid payload"):
+        asyncio.run(_with(bad_payload, lambda: client.get_song_list_search("kw", "华语", 1)))
+
+
+def test_public_playlist_search_maps_and_infers_more(test_app_client, fake_lx):
+    async def search(source, text, page=1):
+        if not text.strip():
+            raise ValueError("empty search keyword")  # 与真实客户端契约一致 → 400
+        assert source == "kw" and text == "华语"
+        if page == 1:
+            return {"list": [{"id": "kw_pl_9", "name": "华语精选", "total": 33,
+                              "img": "http://img/kw.jpg", "author": "酷我用户"}],
+                    "limit": 20, "total": 57, "source": "kw"}
+        return {"list": [], "limit": 20, "total": 57, "source": "kw"}
+
+    fake_lx.get_song_list_search = search
+    fake_lx.normalize_public_playlist = LxServerClient.normalize_public_playlist
+    res = test_app_client.get(
+        "/api/v1/public-playlists",
+        params={"source": "kw", "channel": "search", "keyword": "华语", "page": 1},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is True and data["total"] == 57 and data["has_more"] is True
+    assert data["items"][0]["id"] == "kw_pl_9" and data["items"][0]["track_count"] == 33
+    assert data["items"][0]["name"] == "华语精选"
+
+    # 上游固定页大小 20：第 3 页已越过 total=57，即使空页也不再有下一页
+    page3 = test_app_client.get(
+        "/api/v1/public-playlists",
+        params={"source": "kw", "channel": "search", "keyword": "华语", "page": 3},
+    ).json()
+    assert page3["has_more"] is False and page3["items"] == []
+
+    # 深页（原 100 页限制已解除）与缺关键词均为合法路径：深页透传，缺关键词 400
+    deep = test_app_client.get(
+        "/api/v1/public-playlists",
+        params={"source": "kw", "channel": "search", "keyword": "华语", "page": 150},
+    )
+    assert deep.status_code == 200
+    missing = test_app_client.get(
+        "/api/v1/public-playlists", params={"source": "kw", "channel": "search"},
+    )
+    assert missing.status_code == 400 and missing.json()["ok"] is False
+
+
 def test_public_chart_tracks_follow_native_pages(test_app_client, fake_lx):
     calls: list[int] = []
 

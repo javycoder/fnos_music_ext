@@ -585,6 +585,29 @@ def _public_summary(item: dict[str, Any], kind: str = "playlist") -> dict[str, A
     }
 
 
+def public_playlist_search(keyword: str, page: int = 1, limit: int = 30) -> dict[str, Any]:
+    """网易公共歌单关键词搜索（/weapi/search/get type=1000，原生 offset 分页）。
+
+    与 search_web_fallback 的歌曲降级不同：这里读取 result.playlists 并复用
+    _public_summary 的歌单摘要映射，offset 推进基于上游原始窗口。
+    """
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 30), 50))
+    text = str(keyword or "").strip()
+    if not text:
+        return {"ok": True, "items": [], "total": 0, "has_more": False}
+    data = _public_post("/weapi/search/get", {
+        "s": text, "type": 1000,
+        "offset": (page - 1) * limit, "total": "true", "limit": limit,
+    })
+    result = data.get("result") if isinstance(data, dict) else None
+    rows = result.get("playlists") if isinstance(result, dict) else None
+    items = [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")]
+    total = _int_or_zero(result.get("playlistCount")) if isinstance(result, dict) else 0
+    has_more = ((page - 1) * limit + len(items) < total) if total else bool(items)
+    return {"ok": True, "items": items, "total": total, "has_more": has_more}
+
+
 def public_playlists(
     channel: str,
     category: str = "",
@@ -592,9 +615,12 @@ def public_playlists(
     page: int = 1,
     limit: int = 30,
     cursor: str = "",
+    keyword: str = "",
 ) -> dict[str, Any]:
     page = max(1, int(page or 1))
     limit = max(1, min(int(limit or 30), 50))
+    if channel == "search":
+        return public_playlist_search(keyword, page, limit)
     if channel == "charts":
         data = _public_get("/api/toplist")
         rows = data.get("list") if isinstance(data, dict) else []
@@ -634,7 +660,9 @@ def public_playlists(
             "ok": True,
             "items": [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")],
             "total": _int_or_zero(data.get("total")),
-            "has_more": bool(data.get("more")) if isinstance(data, dict) else bool(rows),
+            # 空页时没有可推进的游标（next_cursor 取自最后一个原始条目），必须停：
+            # 否则前端带空 before 会从头重复第一页
+            "has_more": bool(rows) and (bool(data.get("more")) if isinstance(data, dict) else True),
             "next_cursor": next_cursor,
         }
 

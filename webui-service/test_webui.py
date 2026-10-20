@@ -1044,6 +1044,33 @@ def test_public_playlist_proxy_routes_and_strips_provider(env_file, monkeypatch)
     key = next(iter(webui._public_discovery_cache))
     assert key == ("musicbox", "", (("channel", "charts"),))
 
+
+def test_public_playlist_proxy_forwards_keyword_and_caches_by_keyword(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(dict(request.url.params))
+        return httpx.Response(200, json={"ok": True, "items": []})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        first = client.get("/api/public-playlists", params={
+            "provider": "musicbox", "channel": "search", "keyword": "华语", "page": "1",
+        })
+        other = client.get("/api/public-playlists", params={
+            "provider": "musicbox", "channel": "search", "keyword": "周杰伦", "page": "1",
+        })
+        again = client.get("/api/public-playlists", params={
+            "provider": "musicbox", "channel": "search", "keyword": "华语", "page": "1",
+        })
+    assert all(r.status_code == 200 and r.json()["ok"] is True for r in (first, other, again))
+    # 关键词进入上游参数与缓存键：不同关键词分别请求，相同关键词命中缓存
+    assert calls == [
+        {"channel": "search", "keyword": "华语", "page": "1"},
+        {"channel": "search", "keyword": "周杰伦", "page": "1"},
+    ]
+
 # musicbox CLI（auth ... --json）的真实输出契约：{ok, data:{...}} 信封结构。
 # 前端 static/app.js pollQr/checkQrStatus 与 netease_login.sh 均按此解析（code 在 data 里），
 # 与 proxy/tests/test_musicbox_service.py 的 CLI mock 保持一致。

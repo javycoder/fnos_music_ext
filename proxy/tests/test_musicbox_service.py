@@ -1029,6 +1029,74 @@ def test_public_business_failure_is_not_successful_empty_list(monkeypatch):
         netease_ext.public_playlists("top")
 
 
+def test_public_playlist_search_parses_playlists_and_advances_native_offset(monkeypatch):
+    """歌单搜索走 /weapi/search/get type=1000：offset 按上游原始窗口推进，has_more 对账 total。"""
+    captured: dict = {}
+
+    def fake_post(path, params):
+        captured.update(path=path, params=dict(params))
+        remaining = max(0, 57 - int(params["offset"]))
+        rows = [
+            {"id": 1000 + i, "name": f"歌单{i}", "coverImgUrl": f"http://img/{i}.jpg",
+             "trackCount": 10 + i, "creator": {"nickname": "作者"}}
+            for i in range(min(int(params["limit"]), remaining))
+        ]
+        return {"code": 200, "result": {"playlists": rows, "playlistCount": 57}}
+
+    monkeypatch.setattr(netease_ext, "_public_post", fake_post)
+
+    page1 = netease_ext.public_playlist_search(" 华语 ", page=1, limit=30)
+    assert captured["path"] == "/weapi/search/get"
+    assert captured["params"] == {"s": "华语", "type": 1000, "offset": 0, "total": "true", "limit": 30}
+    assert page1["total"] == 57 and len(page1["items"]) == 30 and page1["has_more"] is True
+    assert page1["items"][0]["id"] == "1000" and page1["items"][0]["author"] == "作者"
+
+    # 末页：offset 30 + 27 = 57 对齐 total，不再有下一页；offset 按页码推进
+    page2 = netease_ext.public_playlist_search("华语", page=2, limit=30)
+    assert captured["params"]["offset"] == 30
+    assert len(page2["items"]) == 27 and page2["has_more"] is False
+
+    # 空关键词直接空结果，不打上游
+    captured.clear()
+    empty = netease_ext.public_playlist_search("   ")
+    assert empty == {"ok": True, "items": [], "total": 0, "has_more": False}
+    assert captured == {}
+
+
+def test_public_playlist_search_via_channel_requires_keyword(monkeypatch):
+    monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: pytest.fail("不应发起上游请求"))
+    assert netease_ext.public_playlists("search", keyword="")["items"] == []
+
+
+def test_highquality_empty_rows_report_no_more(monkeypatch):
+    """more=true 但整页为空时没有可推进的游标：必须判停，否则前端会从头重复第一页。"""
+    monkeypatch.setattr(netease_ext, "_public_get", lambda *a, **k: {
+        "code": 200, "playlists": [], "more": True, "total": 99,
+    })
+    result = netease_ext.public_playlists("highquality")
+    assert result["items"] == [] and result["has_more"] is False and result["next_cursor"] == ""
+
+
+def test_public_playlists_endpoint_search_and_deep_pages(monkeypatch):
+    captured: dict = {}
+
+    def fake_public_playlists(channel, category="", sort="hot", page=1, limit=30, cursor="", keyword=""):
+        captured.update(channel=channel, keyword=keyword, page=page)
+        return {"ok": True, "items": [], "total": 0, "has_more": False}
+
+    monkeypatch.setattr(musicbox_app, "public_playlists", fake_public_playlists)
+    with TestClient(app) as client:
+        r = client.get("/api/v1/public-playlists", params={
+            "source": "netease", "channel": "search", "keyword": "华语", "page": 101,
+        })
+        assert r.status_code == 200
+        assert captured == {"channel": "search", "keyword": "华语", "page": 101}
+        missing = client.get("/api/v1/public-playlists", params={"source": "netease", "channel": "search"})
+        assert missing.status_code == 400
+        bad = client.get("/api/v1/public-playlists", params={"source": "netease", "channel": "nope"})
+        assert bad.status_code == 400
+
+
 def test_search_offset_routes_to_web_fallback(monkeypatch):
     """offset>0（深分页）直接走官方 web 搜索接口：offset/limit 透传，可播过滤沿用。"""
     captured: dict = {}
