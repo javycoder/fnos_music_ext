@@ -5898,25 +5898,60 @@ def _lossless_is_blacklisted(guid: str) -> bool:
     return True
 
 
+_DECODE_TAIL_SLACK_S = 0.35
+
+
+def _clock_seconds(text: str) -> "float | None":
+    parts = str(text or "").split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return None
+
+
+def _lossless_decode_reached_end(stderr: str) -> bool:
+    """音轨已解到容器时长，结尾多余字节触发的同步错误不算损坏。
+
+    飞牛自带 ffmpeg 对合法 FLAC 尾部的填充会报 invalid sync code。
+    加上 -xerror 时退出码变成 183，但 out_time 已经等于 Duration。
+    中途坏帧会提前停住，解出时长明显短于容器时长。
+    """
+    decoded_marks = re.findall(r"out_time=(\d+:\d+:\d+(?:\.\d+)?)", stderr or "")
+    if not decoded_marks:
+        decoded_marks = re.findall(r"(?<![\w])time=(\d+:\d+:\d+(?:\.\d+)?)", stderr or "")
+    duration_mark = re.search(r"Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)", stderr or "")
+    if not decoded_marks or not duration_mark:
+        return False
+    decoded = _clock_seconds(decoded_marks[-1])
+    duration = _clock_seconds(duration_mark.group(1))
+    if decoded is None or duration is None or duration <= 0 or decoded <= 0:
+        return False
+    return decoded + _DECODE_TAIL_SLACK_S >= duration
+
+
 def _check_audio_file(path: str) -> tuple[bool, str]:
     """完整音频文件的音轨解码校验。
 
-    使用 -map 0:a:0 -vn -sn -dn -xerror 严格全量解码首个音轨。
-    成功退出返回 (True, "ok")；非零退出（音频损坏或无音轨）返回 (False, "decode_error")；
-    超时返回 (False, "timeout")；执行异常返回 (False, "exec_error")。
-    宿主机/测试守卫未配 ffmpeg 时放行，返回 (True, "no_ffmpeg")。
+    使用 -map 0:a:0 -vn -sn -dn -xerror 全量解码首个音轨。
+    成功退出返回 (True, "ok")。非零退出时，只有进度已经走到容器时长才放行，
+    用来保留尾部有多余字节、正文仍可播放的无损文件。
+    中途解码失败返回 (False, "decode_error")；超时返回 (False, "timeout")；
+    执行异常返回 (False, "exec_error")。未配置 ffmpeg 时放行，返回 (True, "no_ffmpeg")。
     """
     if not tc.FFMPEG_BIN:
         return True, "no_ffmpeg"
     try:
         r = subprocess.run(
             [
-                tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-xerror",
+                tc.FFMPEG_BIN, "-hide_banner", "-v", "info", "-nostdin", "-xerror",
+                "-progress", "pipe:2",
                 "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-f", "null", "-",
             ],
             capture_output=True, text=True, timeout=300,
         )
-        if r.returncode == 0:
+        if r.returncode == 0 or _lossless_decode_reached_end(r.stderr or ""):
             return True, "ok"
         err_snippet = (r.stderr or "").strip().replace("\n", " ")[:200]
         logger.warning("audio decode check error (rc=%d): %s", r.returncode, err_snippet)
@@ -10514,7 +10549,7 @@ async def play_history_list(request: Request):
 
     async with _HISTORY_LOCK:
         online_items = dailyrec.load_online_play_history(user_guid)
-    fav_set = {str(it.get("guid") or "") for it in load_online_favorites(user_guid)}
+    fav_set = await _online_favorite_set_for_user(user_guid)
     template = official_track_template(official)
     online_tracks = []
     for it in reversed(online_items):

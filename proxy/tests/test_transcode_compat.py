@@ -1155,6 +1155,76 @@ async def test_netease_downgrade_octet_stream_does_not_read_lx_resolution(env, m
     await opened[1].aclose()
 
 
+def test_check_audio_file_accepts_trailing_sync_error_after_full_decode(env, monkeypatch, tmp_path):
+    """尾部多余字节让 -xerror 返回 183，但音轨已解完时必须保留文件。"""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        completed = subprocess.CompletedProcess(args[0], 183, "", """
+Input #0, flac, from 'track.flac':
+  Duration: 00:03:41.20, start: 0.000000, bitrate: 980 kb/s
+[flac @ 0x1] invalid sync code
+[flac @ 0x1] invalid frame header
+[flac @ 0x1] decode_frame() failed
+out_time=00:03:41.200000
+progress=end
+""")
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    part = _mk_part(tmp_path / "tail.part", 2048)
+    ok, reason = appmod._check_audio_file(part)
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_check_audio_file_rejects_midstream_decode_error(env, monkeypatch, tmp_path):
+    """坏帧出现在中途、解出时长远短于容器时长时仍然拒绝。"""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 183, "", """
+  Duration: 00:03:41.20, start: 0.000000, bitrate: 980 kb/s
+[flac @ 0x1] invalid sync code
+out_time=00:00:12.000000
+progress=end
+""")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    part = _mk_part(tmp_path / "mid.part", 2048)
+    ok, reason = appmod._check_audio_file(part)
+    assert ok is False
+    assert reason == "decode_error"
+
+
+def test_real_ffmpeg_keeps_flac_with_trailing_bytes(env, monkeypatch, tmp_path):
+    """与 issue #80 相同的尾部填充：完整音轨保留，中途坏帧仍拒绝。"""
+    import shutil
+    import subprocess
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        pytest.skip("宿主机无 ffmpeg")
+    monkeypatch.setattr(tc, "FFMPEG_BIN", ffmpeg_path)
+    good = tmp_path / "good.flac"
+    subprocess.run(
+        [ffmpeg_path, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+         "-c:a", "flac", str(good)],
+        check=True, timeout=60,
+    )
+    trailed = tmp_path / "trail.flac"
+    trailed.write_bytes(good.read_bytes() + b"ID3TRAIL")
+    ok, reason = appmod._check_audio_file(str(trailed))
+    assert ok is True and reason == "ok"
+    raw = good.read_bytes()
+    broken = tmp_path / "mid.flac"
+    broken.write_bytes(raw[: len(raw) // 2] + b"\x00" * 4000 + raw[len(raw) // 2 + 4000:])
+    bad, bad_reason = appmod._check_audio_file(str(broken))
+    assert bad is False and bad_reason == "decode_error"
+
+
 def test_check_audio_file_passes_when_stderr_has_warnings(env, fake_ffmpeg, monkeypatch, tmp_path):
     """解码校验音轨正常、stderr 存在警告（如封面损坏）时视为通过，不误杀。"""
     fake_ffmpeg("ok")

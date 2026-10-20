@@ -599,3 +599,23 @@ async def test_bound_online_favorite_uses_current_official_state_per_user(env):
     with sqlite3.connect(env["db_path"]) as con:
         con.execute("DELETE FROM favorite_track")
     assert FAKE_KUWO1 not in await appmod._online_favorite_set_for_user("user-a")
+
+
+def test_play_history_keeps_heart_after_online_favorite_is_bound(env):
+    """绑定完成后本地收藏记录已删除，最近播放仍按官方收藏显示红心。"""
+    import proxy.recommend as dailyrec
+
+    make_official_db(env["db_path"])
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("INSERT INTO user VALUES (1, 'user-a')")
+        con.execute("INSERT INTO favorite_track VALUES (1, 10, 1)")
+    appmod._bind_registry.update({
+        "user-a": {FAKE_KUWO1: {"official": OFFICIAL_GUID, "fav": True}},
+    })
+    dailyrec.record_online_play("user-a", FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦"})
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/play-history/list")
+    assert resp.status_code == 200
+    by_title = {item.get("title"): item for item in resp.json()["data"]["list"]}
+    assert by_title["晴天"]["isFavorite"] is True
