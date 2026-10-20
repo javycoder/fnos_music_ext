@@ -1199,8 +1199,22 @@ progress=end
     assert reason == "decode_error"
 
 
+def _ffmpeg_decode_exit(ffmpeg_path: str, path: str) -> int:
+    import subprocess
+    completed = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-v", "info", "-nostdin", "-xerror", "-progress", "pipe:2",
+         "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=60,
+    )
+    return completed.returncode
+
+
 def test_real_ffmpeg_keeps_flac_with_trailing_bytes(env, monkeypatch, tmp_path):
-    """与 issue #80 相同的尾部填充：完整音轨保留，中途坏帧仍拒绝。"""
+    """尾部填充必须保留。中途损坏只在当前 ffmpeg 自己也失败时拒绝。
+
+    Ubuntu 6 与飞牛自带的 ffmpeg 8 对同一段坏字节的退出码不同，
+    不能把某一种退出码写死成唯一期望。
+    """
     import shutil
     import subprocess
 
@@ -1222,7 +1236,10 @@ def test_real_ffmpeg_keeps_flac_with_trailing_bytes(env, monkeypatch, tmp_path):
     broken = tmp_path / "mid.flac"
     broken.write_bytes(raw[: len(raw) // 2] + b"\x00" * 4000 + raw[len(raw) // 2 + 4000:])
     bad, bad_reason = appmod._check_audio_file(str(broken))
-    assert bad is False and bad_reason == "decode_error"
+    if _ffmpeg_decode_exit(ffmpeg_path, str(broken)) == 0:
+        assert bad is True and bad_reason == "ok"
+    else:
+        assert bad is False and bad_reason == "decode_error"
 
 
 def test_check_audio_file_passes_when_stderr_has_warnings(env, fake_ffmpeg, monkeypatch, tmp_path):
