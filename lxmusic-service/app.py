@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 import json
 import logging
 import os
@@ -67,7 +66,6 @@ CONF: dict[str, Any] = {
     "url_cache_neg_ttl": float(os.environ.get("LX_URL_CACHE_NEG_TTL", "60.0")),
     "url_cache_max": int(os.environ.get("LX_URL_CACHE_MAX", "512")),
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
-    "search_probe": bool(os.environ.get("FNMUSIC_SEARCH_PROBE", "").lower() in ("1", "true", "yes", "on")),
     "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
 
@@ -93,16 +91,6 @@ _STATS = {"searches": 0, "url_resolutions": 0, "url_cache_hits": 0, "errors": 0}
 
 # 探活前缀字节数
 _PROBE_BYTES = 4096
-
-_SEARCH_PROBE_ENABLED: ContextVar[bool | None] = ContextVar("lx_search_probe_enabled", default=None)
-
-
-def is_probe_enabled() -> bool:
-    v = _SEARCH_PROBE_ENABLED.get()
-    if v is not None:
-        return v
-    return bool(CONF.get("search_probe", False))
-
 
 def parse_track_id(track_id: str) -> tuple[str, str]:
     """解析 "lx:<source>:<identifier>" -> ("kg", "<identifier>")；异常时返回 ("", "")."""
@@ -1085,10 +1073,9 @@ async def search_tracks(
     sources: str = Query(""),
     limit: int = Query(0),
     page: int = Query(1),
-    probe: int = Query(0),
     scope: str = Header(default="global", alias="X-Fnmusic-Scope"),
 ):
-    """跨平台聚合搜索。支持防抖门闸与逐曲探活。"""
+    """跨平台聚合搜索。支持防抖门闸。"""
     kw = (keyword or q or "").strip()
     if not kw:
         return {"ok": True, "items": [], "errors": {}, "stats": dict(_STATS)}
@@ -1099,9 +1086,6 @@ async def search_tracks(
     wanted_raw = [s.strip() for s in (sources or "").split(",") if s.strip()]
     wanted = [normalize_source(s) for s in wanted_raw] if wanted_raw else CONF["sources"]
     wanted = [s for s in wanted if s in SUPPORTED_PLATFORMS]
-
-    probe_enabled = bool(probe == 1 or is_probe_enabled())
-    probe_token = _SEARCH_PROBE_ENABLED.set(probe_enabled)
 
     async def _do_search():
         _STATS["searches"] += 1
@@ -1130,20 +1114,9 @@ async def search_tracks(
                 continue
             for it in sub_items:
                 _cache_put(it)
-                if probe_enabled:
-                    # 逐曲探活模式
-                    probe_res = await resolve_and_probe(client, src, it, quality="standard", budget=4.0)
-                    if probe_res:
-                        it["verified"] = True
-                        it["validation_status"] = "verified"
-                        items.append(it)
-                    else:
-                        it["verified"] = False
-                        it["validation_status"] = "candidate"
-                else:
-                    it["verified"] = False
-                    it["validation_status"] = "candidate"
-                    items.append(it)
+                it["verified"] = False
+                it["validation_status"] = "candidate"
+                items.append(it)
 
         caps = await source_capabilities()
         return {
@@ -1154,16 +1127,13 @@ async def search_tracks(
             "capabilities": caps,
         }
 
-    try:
-        subkey = f"{page}:{limit}:{','.join(sorted(wanted))}:{probe_enabled}"
-        gate_res = await _SEARCH_GATE.run(scope, kw, _do_search, subkey=subkey)
-        if gate_res is _LX_SUPERSEDED:
-            return {"ok": True, "items": [], "superseded": True}
-        if isinstance(gate_res, Exception):
-            return _err(f"search failed: {gate_res}", 500)
-        return gate_res
-    finally:
-        _SEARCH_PROBE_ENABLED.reset(probe_token)
+    subkey = f"{page}:{limit}:{','.join(sorted(wanted))}"
+    gate_res = await _SEARCH_GATE.run(scope, kw, _do_search, subkey=subkey)
+    if gate_res is _LX_SUPERSEDED:
+        return {"ok": True, "items": [], "superseded": True}
+    if isinstance(gate_res, Exception):
+        return _err(f"search failed: {gate_res}", 500)
+    return gate_res
 
 
 # 免登录榜单目标：平台 -> (榜单名, bangid 内置回退值)。

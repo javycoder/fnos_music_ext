@@ -284,7 +284,6 @@ function applyConfigToForm() {
   $("#liked-size").value = v.FNMUSIC_LIKED_SIZE ?? "20";
   updateLlmLikedSettings();
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
-  $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
@@ -339,7 +338,6 @@ function collectConfig() {
     FNMUSIC_LLM_LIKED_ENABLED: $("#llm-liked").checked,
     FNMUSIC_LLM_DAILY_ENABLED: $("#llm-daily").checked,
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
-    FNMUSIC_SEARCH_PROBE: $("#search-probe").checked,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
@@ -1342,7 +1340,7 @@ if ($("#lx-name")) {
 }
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
 $$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("下载音质需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {

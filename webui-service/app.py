@@ -135,7 +135,6 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LIKED_REFRESH_HOURS": {"kind": "float", "default": "0.5", "min": 0.5, "step": "any", "group": "llm", "reload": "hot", "label": "猜你喜欢生成间隔（小时）"},
     "FNMUSIC_LIKED_SIZE": {"kind": "int", "default": "20", "min": 0, "max": 100, "strict": True, "group": "llm", "reload": "hot", "label": "猜你喜欢歌曲数量"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
-    "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},

@@ -617,6 +617,13 @@ def test_env_flags_written_before_container_up():
     assert env_write < up_call, '.env 开关必须先于单容器 up -d 写入'
 
 
+def test_legacy_search_probe_forced_off_on_install():
+    """已开启逐曲探活的旧安装升级后必须被强制关闭。"""
+    text = (BASE / "install.sh").read_text(encoding="utf-8")
+    assert "echo \"FNMUSIC_SEARCH_PROBE='false'\"" in text
+    assert "FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE" in text
+
+
 def test_data_migration_musicbox_to_sources_data(tmp_path):
     """v1.x musicbox-data → v2.0.0 sources-data：登录态原样保留 + 权限收紧到位。"""
     text = (BASE/'install.sh').read_text(encoding='utf-8')

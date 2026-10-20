@@ -185,21 +185,32 @@ def test_search_timeout_defaults_and_saves(env_file):
         view = client.get("/api/config")
         assert view.status_code == 200
         assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
-        assert view.json()["values"]["FNMUSIC_SEARCH_PROBE"] == "false"
-        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9, "FNMUSIC_SEARCH_PROBE": True}})
+        assert "FNMUSIC_SEARCH_PROBE" not in view.json()["values"]
+        assert "FNMUSIC_SEARCH_PROBE" not in view.json()["schema"]
+        rejected = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_PROBE": True}})
+        assert rejected.status_code == 400
+        assert "不支持的配置键" in rejected.json()["error"]
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})
         assert saved.status_code == 200
         assert "FNMUSIC_SEARCH_TIMEOUT" in saved.json()["changed"]
-        assert "FNMUSIC_SEARCH_PROBE" in saved.json()["changed"]
     text = env_file.read_text(encoding="utf-8")
     assert "FNMUSIC_SEARCH_TIMEOUT='9'" in text
-    assert "FNMUSIC_SEARCH_PROBE='true'" in text
+    assert "FNMUSIC_SEARCH_PROBE" not in text
     with authed_client() as client:
         again = client.get("/api/config")
         assert again.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "9"
-        assert again.json()["values"]["FNMUSIC_SEARCH_PROBE"] == "true"
         clamped = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 99}})
         assert clamped.status_code == 200
     assert "FNMUSIC_SEARCH_TIMEOUT='60'" in env_file.read_text(encoding="utf-8")
+
+
+def test_search_probe_control_removed():
+    """逐曲探活功能下线：界面、脚本与配置 Schema 均不得再暴露入口。"""
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    assert "逐曲探活" not in html
+    assert "#search-probe" not in js
+    assert "FNMUSIC_SEARCH_PROBE" not in js
 
 
 def test_put_int_clamps_and_bool_normalizes(env_file):

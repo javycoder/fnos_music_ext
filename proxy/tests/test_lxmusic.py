@@ -161,11 +161,12 @@ async def test_fetch_lx_search_mapping():
 
 
 @pytest.mark.anyio
-async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
-    """verified 条目（服务端已探活实证）绕过收费元数据拦截（逐曲探活开启时）。"""
-    monkeypatch.setitem(CONF, "search_probe", True)
+async def test_fetch_lx_search_ignores_probe_and_allows_unverified_vip():
+    """搜索不再预探活；第三方 VIP 候选直接展示，播放时再按需解析。"""
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(
             200,
             json={
@@ -194,7 +195,7 @@ async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
                         "ext": "mp3",
                         "cover_url": "",
                         "file_size": 0,
-                        "fee": 1,  # VIP 且未 verified → 仍被拦截
+                            "fee": 1,  # VIP 元数据保留，候选仍直接展示
                     },
                 ],
                 "errors": {},
@@ -203,45 +204,9 @@ async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
     items = await fetch_lx_search(client, "晴天", 20)
-    assert [it["id"] for it in items] == ["lx:kw:228908"]
-    assert items[0]["verified"] is True  # 字段透传
-    await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_fetch_lx_search_probe_disabled_allows_unverified_vip(monkeypatch):
-    """逐曲探活未开启时，lx 候选曲目跳过收费拦截直出（由客户端播放时按需解析）。"""
-    monkeypatch.setitem(CONF, "search_probe", False)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "ok": True,
-                "items": [
-                    {
-                        "id": "lx:kw:228908",
-                        "lx_source": "kw",
-                        "title": "晴天",
-                        "artist": "周杰伦",
-                        "album": "叶惠美",
-                        "duration_s": 269.0,
-                        "ext": "flac",
-                        "cover_url": "",
-                        "file_size": 38210000,
-                        "pay_type": 1,
-                        "verified": False,
-                    },
-                ],
-                "errors": {},
-            },
-        )
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
-    items = await fetch_lx_search(client, "晴天", 20)
-    assert len(items) == 1
-    assert items[0]["id"] == "lx:kw:228908"
-    assert items[0]["verified"] is False
+    assert requests[0].url.params.get("probe") is None
+    assert [it["id"] for it in items] == ["lx:kw:228908", "lx:wy:999999"]
+    assert [it["verified"] for it in items] == [True, False]
     await client.aclose()
 
 

@@ -166,8 +166,13 @@ def test_healthz_reports_lxserver_failure(test_app_client, fake_lx):
     assert data["user_source"]["last_error"] == "lxserver unreachable"
 
 
-def test_search_endpoint(test_app_client):
-    res = test_app_client.get("/api/v1/search?q=海阔天空&sources=kw&limit=10")
+def test_search_endpoint_ignores_probe_and_skips_pre_probe(test_app_client, fake_lx, monkeypatch):
+    """旧客户端 probe=1 被忽略；搜索结果直接交付，不预解析直链。"""
+    def fail_resolve(*args, **kwargs):
+        pytest.fail("search must not resolve URLs")
+
+    monkeypatch.setattr(lxapp, "resolve_and_probe", fail_resolve)
+    res = test_app_client.get("/api/v1/search?q=海阔天空&sources=kw&limit=10&probe=1")
     assert res.status_code == 200
     data = res.json()
     assert data["ok"] is True
@@ -177,6 +182,9 @@ def test_search_endpoint(test_app_client):
     assert item["id"] == "lx:kw:5886682"
     assert item["title"] == "海阔天空"
     assert item["artist"] == "Beyond"
+    assert item["verified"] is False
+    assert item["validation_status"] == "candidate"
+    assert fake_lx.url_calls == []
 
 
 def test_recommend_endpoint(test_app_client):

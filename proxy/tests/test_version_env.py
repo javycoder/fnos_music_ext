@@ -151,6 +151,14 @@ def test_merge_explicit_disable_clears_llm_config():
     assert m["FNMUSIC_LLM_MODEL"] == ""
 
 
+def test_merge_forces_legacy_search_probe_off():
+    existing = EXISTING + [("FNMUSIC_SEARCH_PROBE", "true")]
+    desired = [("FNMUSIC_SEARCH_PROBE", "false")]
+    merged, summary = env_merge.merge_env(existing, desired, explicit={"FNMUSIC_SEARCH_PROBE"})
+    assert dict(merged)["FNMUSIC_SEARCH_PROBE"] == "false"
+    assert summary["updated"] == ["FNMUSIC_SEARCH_PROBE"]
+
+
 def test_merge_same_version_reinstall_keeps_everything():
     existing = EXISTING + [("FNMUSIC_VERSION", "1.1.0")]
     merged, summary = env_merge.merge_env(existing, DESIRED, explicit={"FNMUSIC_VERSION"})
