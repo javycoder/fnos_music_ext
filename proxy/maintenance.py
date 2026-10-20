@@ -13,12 +13,19 @@ from datetime import datetime
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 import math
 import sqlite3
 import stat
+import tempfile
 import time
+
+try:
+    from .fnlog import RETENTION_DAYS, log_dir
+except ImportError:
+    from fnlog import RETENTION_DAYS, log_dir  # type: ignore
 
 DAY = 86400
 DETAIL_LIMIT = 200
@@ -32,6 +39,8 @@ COVER = re.compile(r'[0-9a-f]{40}\.(?:jpg|jpeg|png|webp)\Z')
 COVER_URL = re.compile(r'g_[0-9a-f]{40}\.url\Z')
 RECOMMEND = re.compile(r'(daily|hot)-(\d{8})(\.fallback)?\.json\Z')
 PUBLIC = re.compile(r'(summary|tracks)-[0-9a-f]{24}\.json\Z')
+LOG_EXPORT = re.compile(r'[0-9]{14}\.logzip\Z')
+LOG_ARCHIVE = re.compile(r'(?:proxy|webui|lxmusic|musicbox)\.log\.[0-9]{8}(?:\.[0-9]{8})?\Z')
 
 
 def _absolute(path):
@@ -137,23 +146,100 @@ def _db_path(runtime):
 
 
 def _db_paths(runtime):
-    """Read only, fail closed, including WAL databases we cannot snapshot safely.
+    """Return a read-only audio-path snapshot and the state it represents.
 
-    Read through nofollow descriptors then deserialize into an in-memory SQLite
-    connection, so SQLite itself never opens an unchecked filesystem path.
+    Read through nofollow descriptors, copy WAL databases into a private
+    directory, and validate the WAL frame chain there. SQLite never opens the
+    official database path, so no checkpoint or auxiliary file is created.
     """
     db = _db_path(runtime)
-    if _present(db + '-wal') or _present(db + '-journal'):
-        raise ValueError('database has a journal/WAL; attachments retained')
-    before = _identity(_stat(db))
-    blob = _read(db, 128 * 1024 * 1024)
-    with sqlite3.connect(':memory:') as con:
-        con.deserialize(blob)
-        con.execute('PRAGMA query_only=ON')
-        paths = {row[0] for row in con.execute('SELECT path FROM audio_file')}
-    if before != _identity(_stat(db)) or _present(db + '-wal') or _present(db + '-journal'):
-        raise ValueError('database changed; attachments retained')
-    return {os.path.normpath(p) for p in paths if isinstance(p, str)}
+    for attempt in range(3):
+        before = _db_state(db)
+        database = _read(db, 128 * 1024 * 1024)
+        wal = _read(db + '-wal', 128 * 1024 * 1024) if before[1] is not None else b''
+        try:
+            after = _db_state(db)
+        except (OSError, ValueError) as exc:
+            if attempt < 2:
+                continue
+            raise ValueError(f'database changed during snapshot: {db}') from exc
+        if before != after:
+            if attempt < 2:
+                continue
+            raise ValueError(f'database changed during snapshot: {db}')
+        if wal:
+            _validate_wal(wal)
+        with tempfile.TemporaryDirectory(prefix='fnmusic-maintenance-db-') as directory:
+            snapshot = Path(directory) / 'music.db'
+            snapshot.write_bytes(database)
+            if wal:
+                Path(str(snapshot) + '-wal').write_bytes(wal)
+            with sqlite3.connect(snapshot.as_uri() + '?mode=ro', uri=True) as con:
+                con.execute('PRAGMA query_only=ON')
+                check = con.execute('PRAGMA quick_check').fetchall()
+                if check != [('ok',)]:
+                    raise ValueError(f'database snapshot integrity check failed: {check[:3]}')
+                paths = {row[0] for row in con.execute('SELECT path FROM audio_file')}
+        return ({os.path.normpath(p) for p in paths if isinstance(p, str)}, before)
+    raise ValueError(f'could not snapshot database: {db}')
+
+
+def _db_state(path):
+    database = _stat(path)
+    if not _regular(database):
+        raise ValueError(f'database is not a single-link regular file: {path}')
+    if _present(path + '-journal'):
+        raise ValueError(f'database rollback journal retained: {path}-journal')
+    wal = None
+    if _present(path + '-wal'):
+        wal = _stat(path + '-wal')
+        if not _regular(wal):
+            raise ValueError(f'database WAL is not a single-link regular file: {path}-wal')
+    return (_identity(database), None if wal is None else _identity(wal))
+
+
+def _wal_checksum(data, state=(0, 0), big=False):
+    first, second = state
+    for offset in range(0, len(data) - 7, 8):
+        left = int.from_bytes(data[offset:offset + 4], 'big' if big else 'little')
+        right = int.from_bytes(data[offset + 4:offset + 8], 'big' if big else 'little')
+        first = (first + left + second) & 0xffffffff
+        second = (second + right + first) & 0xffffffff
+    return first, second
+
+
+def _validate_wal(data):
+    if not data:
+        return
+    if len(data) < 32:
+        raise ValueError('truncated WAL header')
+    magic = int.from_bytes(data[:4], 'big')
+    if magic not in (0x377f0682, 0x377f0683):
+        raise ValueError('invalid WAL magic')
+    native_big = magic == 0x377f0683
+    expected = int.from_bytes(data[24:28], 'big'), int.from_bytes(data[28:32], 'big')
+    if _wal_checksum(data[:24], big=native_big) != expected:
+        raise ValueError('invalid WAL header checksum')
+    page_size = int.from_bytes(data[8:12], 'big')
+    if page_size == 1:
+        page_size = 65536
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise ValueError('invalid WAL page size')
+    salts = data[16:24]
+    checksum = expected
+    offset = 32
+    frame_size = 24 + page_size
+    while offset < len(data):
+        if len(data) - offset < frame_size:
+            raise ValueError('truncated WAL frame')
+        frame = data[offset:offset + frame_size]
+        if frame[8:16] != salts:
+            break
+        expected = int.from_bytes(frame[16:20], 'big'), int.from_bytes(frame[20:24], 'big')
+        checksum = _wal_checksum(frame[:8] + frame[24:], checksum, native_big)
+        if checksum != expected:
+            raise ValueError('invalid WAL frame checksum')
+        offset += frame_size
 
 
 def _db_has_stem(paths, stem):
@@ -179,21 +265,17 @@ class _Engine:
         # policy checks, removal and registry mutations stay on the main loop.
         try:
             path = _db_path(self.runtime)
-            before = _identity(_stat(path))
-            self.db_snapshot = await asyncio.to_thread(_db_paths, self.runtime)
-            if before != _identity(_stat(path)):
-                raise ValueError('database changed during snapshot')
-            self.db_token = (path, before)
+            self.db_snapshot, token = await asyncio.to_thread(_db_paths, self.runtime)
+            self.db_token = (path, token)
         except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
             self.db_error = str(exc)
-            self.error('database', '', exc)
+            self.error('database', path if 'path' in locals() else '', exc)
 
     def database(self):
         if self.db_error or self.db_token is None:
             raise ValueError('database unavailable; attachments/audio retained: ' + str(self.db_error))
         path, token = self.db_token
-        if (_db_path(self.runtime) != path or _identity(_stat(path)) != token or
-                _present(path + '-wal') or _present(path + '-journal')):
+        if _db_path(self.runtime) != path or _db_state(path) != token:
             raise ValueError('database snapshot changed; attachments/audio retained')
         return self.db_snapshot
 
@@ -764,6 +846,16 @@ class _Engine:
         except (OSError, ValueError, TypeError) as exc:
             self.error('bind_registry', path, exc)
 
+    async def logs(self):
+        root = self.root(log_dir())
+        async for path, current in self.walk(root):
+            name = os.path.basename(path)
+            eligible = (name == 'install.log' or LOG_ARCHIVE.fullmatch(name) or
+                        LOG_EXPORT.fullmatch(name))
+            if eligible:
+                await self.remove(path, current, 'logs',
+                                  lambda snapshot=current: self.old(snapshot, RETENTION_DAYS * DAY))
+
     async def test_residue(self):
         if not self.home or not self.installed():
             return
@@ -818,10 +910,11 @@ async def run_cleanup(runtime, job):
         if engine.cache:
             engine.media.add(engine.cache)
         await engine.prepare_database()
-        engine.note('dltrans', 'skipped', reason='retained: completed download/transcode ownership cannot be established')
-        engine.note('logs', 'skipped', reason='retained: no approved log ownership/rotation policy')
+        engine.note('dltrans', 'skipped',
+                    reason='暂未建立可靠的文件归属和使用保护，保留下载转码缓存')
         for phase in (engine.attachments_and_refs, engine.caches, engine.hls_caches,
-                      engine.media_temporaries, engine.home_caches, engine.registries, engine.test_residue):
+                      engine.media_temporaries, engine.home_caches, engine.registries,
+                      engine.logs, engine.test_residue):
             try:
                 await phase()
             except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:

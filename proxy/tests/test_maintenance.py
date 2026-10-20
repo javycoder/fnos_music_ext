@@ -59,6 +59,25 @@ def run(env):
     return job
 
 
+def wal_database(env, paths):
+    writer = sqlite3.connect(env.db)
+    writer.execute('PRAGMA journal_mode=WAL')
+    writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    writer.commit()
+    holder = sqlite3.connect(env.db)
+    holder.execute('BEGIN')
+    holder.execute('SELECT count(*) FROM sqlite_master').fetchone()
+    for path in paths:
+        writer.execute('INSERT INTO audio_file VALUES (?)', (path,))
+    writer.commit()
+    database = env.db.read_bytes()
+    wal = Path(str(env.db) + '-wal').read_bytes()
+    writer.close()
+    holder.close()
+    env.db.write_bytes(database)
+    Path(str(env.db) + '-wal').write_bytes(wal)
+
+
 def ref(env, stem, name='online_song.ref', age=2 * m.DAY):
     return put(env.cache / name, str(stem), age)
 
@@ -225,6 +244,56 @@ def test_cache_cover_and_temporary_ages(env):
     run(env)
     for path, keep in paths:
         assert path.exists() == keep, path
+
+
+def test_log_cleanup_uses_three_day_policy_and_strict_ownership(env, monkeypatch, tmp_path):
+    logs = tmp_path / 'logs'
+    old_archive = put(logs / 'proxy.log.20261017.00000001', age=3 * m.DAY + 1)
+    new_archive = put(logs / 'proxy.log.20261017.00000002', age=2 * m.DAY)
+    old_export = put(logs / '20261017120000.logzip', age=3 * m.DAY + 1)
+    bad_export = put(logs / 'not-a-timestamp.logzip', age=99 * m.DAY)
+    current = put(logs / 'proxy.log', age=99 * m.DAY)
+    snapshot = put(logs / 'env_snapshot.txt', age=99 * m.DAY)
+    unknown = put(logs / 'keep.log.20261017.00000001', age=99 * m.DAY)
+    nested = put(logs / 'nested' / 'proxy.log.20261017.00000001', age=99 * m.DAY)
+    reclaimed = old_archive.stat().st_size + old_export.stat().st_size
+    monkeypatch.setenv('FNMUSIC_LOG_DIR', str(logs))
+    job = run(env)
+    assert not old_archive.exists() and not old_export.exists()
+    retained = (new_archive, bad_export, current, snapshot, unknown, nested)
+    assert all(path.exists() for path in retained), [str(path) for path in retained if not path.exists()]
+    assert job['categories']['logs']['scanned'] == 3
+    assert job['categories']['logs']['removed'] == 2
+    assert job['categories']['logs']['skipped'] == 1
+    assert job['categories']['logs']['bytes'] == reclaimed
+
+
+def test_log_cleanup_rejects_links_and_replacements(env, monkeypatch, tmp_path):
+    logs = tmp_path / 'logs'
+    target = put(tmp_path / 'outside.log', age=99 * m.DAY)
+    hardlink = logs / 'proxy.log.20261017.00000001'
+    hardlink.parent.mkdir(parents=True)
+    os.link(target, hardlink)
+    os.utime(hardlink, (m.time.time() - 99 * m.DAY,) * 2)
+    symlink = logs / '20261017120000.logzip'
+    symlink.symlink_to(target)
+    replaceable = put(logs / 'install.log', age=99 * m.DAY)
+    monkeypatch.setenv('FNMUSIC_LOG_DIR', str(logs))
+    original_sleep = asyncio.sleep
+    replaced = False
+
+    async def replace_on_yield(delay):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            replaceable.unlink()
+            put(replaceable, age=1)
+        await original_sleep(delay)
+
+    with patch.object(m.asyncio, 'sleep', replace_on_yield):
+        run(env)
+    assert target.exists() and hardlink.exists() and symlink.exists()
+    assert replaceable.exists()
 
 
 def test_rolling_only_excess_no_refs_no_library_audio(env):
@@ -564,17 +633,96 @@ def test_database_mutation_after_snapshot_retains_attachments(env):
     assert lyric.exists()
 
 
-def test_media_and_home_known_temporaries_only(env):
-    audio = put(env.library / 'nested' / 'online_song.mp3')
-    media_temp = put(env.library / 'nested' / ('online_song.' + 'a' * 32 + '.part'))
-    unknown = put(env.library / 'nested' / 'user.part')
-    fav = put(env.home / 'online_favorites' / 'user.json')
-    fav_temp = put(env.home / 'online_favorites' / 'user.json.abcdef12.part')
-    plt_temp = put(env.home / 'playlist_tracks' / 'u' / 'list.json.abcdef12.part')
-    unrelated_temp = put(env.home / 'play_history' / 'user.json.abcdef12.part')
-    run(env)
-    assert all(p.exists() for p in (audio, unknown, fav, unrelated_temp))
-    assert not any(p.exists() for p in (media_temp, fav_temp, plt_temp))
+def test_wal_snapshot_reads_committed_paths_without_touching_source(env):
+    protected = env.library / 'protected'
+    orphan = env.library / 'orphan'
+    protected_lyric = put(protected.with_suffix('.lrc'))
+    orphan_lyric = put(orphan.with_suffix('.lrc'))
+    ref(env, protected, 'protected.ref')
+    ref(env, orphan, 'orphan.ref')
+    wal_database(env, [str(protected) + '.flac'])
+    source = {path.name: path.read_bytes() for path in env.db.parent.iterdir()
+              if path.is_file() and path.name.startswith(env.db.name)}
+    directories = []
+    original_directory = m.tempfile.TemporaryDirectory
+
+    def tracked(*args, **kwargs):
+        result = original_directory(*args, **kwargs)
+        directories.append(Path(result.name))
+        return result
+
+    with patch.object(m.tempfile, 'TemporaryDirectory', tracked):
+        job = run(env)
+    assert protected_lyric.exists() and not orphan_lyric.exists()
+    assert not job['errors']
+    assert directories and all(not directory.exists() for directory in directories)
+    assert {path.name: path.read_bytes() for path in env.db.parent.iterdir()
+            if path.is_file() and path.name.startswith(env.db.name)} == source
+
+
+def test_wal_snapshot_retries_after_transient_change(env):
+    wal_database(env, [str(env.library / 'retry.flac')])
+    original_read = m._read
+    calls = 0
+
+    def read(path, limit=1024 * 1024):
+        nonlocal calls
+        data = original_read(path, limit)
+        if path == str(env.db):
+            calls += 1
+            if calls == 1:
+                now = m.time.time()
+                os.utime(path, (now, now))
+        return data
+
+    with patch.object(m, '_read', read):
+        job = run(env)
+    assert calls == 2 and not job['errors']
+
+
+@pytest.mark.parametrize('kind', ['delete-wal', 'replace-wal', 'touch-database'])
+def test_wal_state_mutation_after_snapshot_retains_attachments(env, kind):
+    protected = env.library / 'protected'
+    lyric = put(protected.with_suffix('.lrc'))
+    ref(env, protected)
+    wal_database(env, [str(protected) + '.flac'])
+    original = m._Engine.prepare_database
+
+    async def changed(engine):
+        await original(engine)
+        if kind == 'delete-wal':
+            Path(str(env.db) + '-wal').unlink()
+        elif kind == 'replace-wal':
+            wal = Path(str(env.db) + '-wal')
+            wal.unlink()
+            put(wal)
+        else:
+            now = m.time.time()
+            os.utime(env.db, (now, now))
+
+    with patch.object(m._Engine, 'prepare_database', changed):
+        run(env)
+    assert lyric.exists()
+
+
+@pytest.mark.parametrize('kind', ['partial-frame', 'bad-checksum', 'journal'])
+def test_uncertain_database_retains_attachments(env, kind):
+    protected = env.library / 'protected'
+    lyric = put(protected.with_suffix('.lrc'))
+    ref(env, protected)
+    wal_database(env, [str(protected) + '.flac'])
+    if kind == 'partial-frame':
+        wal = Path(str(env.db) + '-wal')
+        wal.write_bytes(wal.read_bytes() + b'x')
+    elif kind == 'bad-checksum':
+        wal = Path(str(env.db) + '-wal')
+        data = bytearray(wal.read_bytes())
+        data[-1] ^= 1
+        wal.write_bytes(data)
+    else:
+        Path(str(env.db) + '-journal').write_bytes(b'hot journal')
+    job = run(env)
+    assert lyric.exists() and job['errors']
 
 
 def test_database_read_offloaded_but_unlink_on_main_thread(env):
@@ -590,13 +738,27 @@ def test_database_read_offloaded_but_unlink_on_main_thread(env):
         return original_db(runtime)
 
     def unlink(*args, **kwargs):
-        unlink_threads.append(threading.get_ident())
+        if str(args[0]).endswith('.part'):
+            unlink_threads.append((str(args[0]), threading.get_ident()))
         return original_unlink(*args, **kwargs)
 
     with patch.object(m, '_db_paths', database), patch.object(m.os, 'unlink', unlink):
         run(env)
     assert read_threads and all(t != main for t in read_threads)
-    assert unlink_threads and all(t == main for t in unlink_threads)
+    assert unlink_threads and all(item[1] == main for item in unlink_threads), (main, unlink_threads)
+
+
+def test_media_and_home_known_temporaries_only(env):
+    audio = put(env.library / 'nested' / 'online_song.mp3')
+    media_temp = put(env.library / 'nested' / ('online_song.' + 'a' * 32 + '.part'))
+    unknown = put(env.library / 'nested' / 'user.part')
+    fav = put(env.home / 'online_favorites' / 'user.json')
+    fav_temp = put(env.home / 'online_favorites' / 'user.json.abcdef12.part')
+    plt_temp = put(env.home / 'playlist_tracks' / 'u' / 'list.json.abcdef12.part')
+    unrelated_temp = put(env.home / 'play_history' / 'user.json.abcdef12.part')
+    run(env)
+    assert all(p.exists() for p in (audio, unknown, fav, unrelated_temp))
+    assert not any(p.exists() for p in (media_temp, fav_temp, plt_temp))
 
 
 def test_album_registry_ttl_invalid_and_nonpersist_memory(env):
