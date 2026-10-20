@@ -1,5 +1,6 @@
 """Black-box safety and retention checks for the cooperative cleanup engine."""
 import asyncio
+from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import json
 import os
@@ -13,15 +14,33 @@ import pytest
 from proxy import maintenance as m
 
 
+@pytest.fixture(scope='module', autouse=True)
+def isolated_import_logging(tmp_path_factory):
+    # conftest's function-scoped cover fixture imports proxy.app, whose logging
+    # setup purges stale files. Isolate that import before any function fixture,
+    # without changing global conftest or suppressing production logging behavior.
+    logs = tmp_path_factory.mktemp('maintenance-import-logs')
+    import logging
+    logger = logging.getLogger('fnmusic_proxy')
+    existing = set(logger.handlers)
+    with patch.dict(os.environ, {'FNMUSIC_LOG_DIR': str(logs)}):
+        yield
+    for handler in set(logger.handlers) - existing:
+        logger.removeHandler(handler)
+        handler.close()
+
+
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
     home = tmp_path / 'install'
     cache = home / 'cache'
     library = tmp_path / 'library'
     cache.mkdir(parents=True)
     library.mkdir()
+    logs = tmp_path / 'logs'
+    monkeypatch.setenv('FNMUSIC_LOG_DIR', str(logs))
     db = tmp_path / 'music.db'
-    with sqlite3.connect(db) as con:
+    with closing(sqlite3.connect(db)) as con:
         con.execute('CREATE TABLE audio_file (path TEXT)')
     # The host itself has /tmp/.git; isolate only that external fixture state.
     original_present = m._present
@@ -36,7 +55,7 @@ def env(tmp_path):
             return False
         return original_present(path)
     with patch.object(m, '_present', isolated_present):
-        yield SimpleNamespace(home=home, cache=cache, library=library, db=db, runtime=runtime)
+        yield SimpleNamespace(home=home, cache=cache, library=library, logs=logs, db=db, runtime=runtime)
 
 
 def put(path, content=b'x', age=2 * m.DAY):
@@ -76,6 +95,46 @@ def wal_database(env, paths):
     holder.close()
     env.db.write_bytes(database)
     Path(str(env.db) + '-wal').write_bytes(wal)
+
+
+@contextmanager
+def rollback_tail_database(env, paths):
+    """Real SQLite spill/rollback/reuse, not hand-crafted invalid WAL bytes."""
+    with closing(sqlite3.connect(env.db)) as writer, closing(sqlite3.connect(env.db)) as holder:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute('PRAGMA wal_autocheckpoint=0')
+        writer.execute('PRAGMA cache_size=5')
+        writer.execute('CREATE TABLE payload(data BLOB)')
+        writer.commit()
+        writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        holder.execute('BEGIN')
+        holder.execute('SELECT * FROM audio_file').fetchall()
+        writer.execute('INSERT INTO audio_file VALUES (?)', (paths[0],))
+        writer.commit()
+        writer.execute('BEGIN')
+        for _ in range(100):
+            writer.execute('INSERT INTO payload VALUES(zeroblob(4096))')
+        wal_path = Path(str(env.db) + '-wal')
+        spilled_size = wal_path.stat().st_size
+        writer.rollback()
+        writer.execute('INSERT INTO audio_file VALUES (?)', (paths[1],))
+        writer.commit()
+        wal = wal_path.read_bytes()
+        index = Path(str(env.db) + '-shm').read_bytes()
+        frame_size = 24 + int.from_bytes(wal[8:12], 'big')
+        import sys
+        committed = int.from_bytes(index[16:20], sys.byteorder)
+        assert spilled_size == len(wal) > 32 + committed * frame_size
+        # The rolled-back tail has matching salts but a broken checksum chain.
+        with pytest.raises(ValueError, match='frame checksum'):
+            m._validate_wal(wal)
+        assert {row[0] for row in writer.execute('SELECT path FROM audio_file')} == set(paths)
+        yield writer, holder
+
+
+def source_database_files(env):
+    return {path.name: path.read_bytes() for path in env.db.parent.iterdir()
+            if path.is_file() and path.name.startswith(env.db.name)}
 
 
 def ref(env, stem, name='online_song.ref', age=2 * m.DAY):
@@ -246,6 +305,38 @@ def test_cache_cover_and_temporary_ages(env):
         assert path.exists() == keep, path
 
 
+def test_cleanup_fixture_ignores_ambient_deployment_logs(env, monkeypatch, tmp_path):
+    deployment = tmp_path / 'deployment-logs'
+    sentinel = put(deployment / 'proxy.log.20261017.00000001', age=4 * m.DAY)
+    monkeypatch.setenv('FNMUSIC_HOME', str(deployment.parent))
+    monkeypatch.setenv('WEBUI_REPO_DIR', str(deployment.parent))
+    owned = put(env.logs / 'proxy.log.20261017.00000001', age=4 * m.DAY)
+    job = run(env)
+    assert m.log_dir() == env.logs
+    assert sentinel.read_bytes() == b'x' and not owned.exists()
+    assert job['categories']['logs']['removed'] == 1
+    assert all(d['path'] != str(sentinel) for d in job['details'])
+
+
+def test_maintenance_import_logging_isolated_before_function_fixtures(tmp_path):
+    import subprocess
+    import sys
+    deployment = tmp_path / 'deployment-logs'
+    sentinel = put(deployment / 'proxy.log.20261017.00000001', age=4 * m.DAY)
+    result = subprocess.run(
+        [sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider',
+         str(Path(__file__).resolve()) + '::test_lyrics_before_refs_and_unowned_preserved', '-q'],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, 'FNMUSIC_LOG_DIR': str(deployment),
+             'FNMUSIC_HOME': str(tmp_path / 'unused-home'),
+             'FNMUSIC_MUSIC_DB': str(tmp_path / 'unused.db'),
+             'PYTHONDONTWRITEBYTECODE': '1', 'PYTEST_ADDOPTS': ''},
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sentinel.read_bytes() == b'x'
+    assert list(deployment.iterdir()) == [sentinel]
+
+
 def test_log_cleanup_uses_three_day_policy_and_strict_ownership(env, monkeypatch, tmp_path):
     logs = tmp_path / 'logs'
     old_archive = put(logs / 'proxy.log.20261017.00000001', age=3 * m.DAY + 1)
@@ -272,7 +363,7 @@ def test_log_cleanup_rejects_links_and_replacements(env, monkeypatch, tmp_path):
     logs = tmp_path / 'logs'
     target = put(tmp_path / 'outside.log', age=99 * m.DAY)
     hardlink = logs / 'proxy.log.20261017.00000001'
-    hardlink.parent.mkdir(parents=True)
+    hardlink.parent.mkdir(parents=True, exist_ok=True)
     os.link(target, hardlink)
     os.utime(hardlink, (m.time.time() - 99 * m.DAY,) * 2)
     symlink = logs / '20261017120000.logzip'
@@ -658,6 +749,156 @@ def test_wal_snapshot_reads_committed_paths_without_touching_source(env):
     assert directories and all(not directory.exists() for directory in directories)
     assert {path.name: path.read_bytes() for path in env.db.parent.iterdir()
             if path.is_file() and path.name.startswith(env.db.name)} == source
+
+
+def test_wal_rollback_tail_uses_published_commit_without_source_writes(env):
+    stems = [env.library / name for name in ('first', 'protected', 'orphan')]
+    lyrics = [put(stem.with_suffix('.lrc')) for stem in stems]
+    for stem in stems:
+        ref(env, stem, stem.name + '.ref')
+    paths = [str(stem) + '.flac' for stem in stems[:2]]
+    with rollback_tail_database(env, paths):
+        source = source_database_files(env)
+        snapshot, token = m._db_paths(env.runtime)
+        assert snapshot == set(paths) and token == m._db_state(str(env.db))
+        job = run(env)
+        assert not job['errors']
+        assert lyrics[0].exists() and lyrics[1].exists() and not lyrics[2].exists()
+        assert source_database_files(env) == source
+
+
+@pytest.mark.parametrize('kind', ['committed-checksum', 'committed-salt', 'truncated-commit',
+                                 'index-copies', 'index-checksum', 'index-salt',
+                                 'index-frame-checksum', 'index-page-count', 'missing-index',
+                                 'database-mode', 'database-page-size'])
+def test_wal_rollback_tail_uncertainty_retains_all_attachments(env, kind):
+    import sys
+    protected = env.library / 'protected'
+    orphan = env.library / 'orphan'
+    lyrics = [put(stem.with_suffix('.lrc')) for stem in (protected, orphan)]
+    for stem in (protected, orphan):
+        ref(env, stem, stem.name + '.ref')
+    with rollback_tail_database(env, [str(env.library / 'first.flac'), str(protected) + '.flac']):
+        wal_path = Path(str(env.db) + '-wal')
+        index_path = Path(str(env.db) + '-shm')
+        wal, index = bytearray(wal_path.read_bytes()), bytearray(index_path.read_bytes())
+        frame_size = 24 + int.from_bytes(wal[8:12], 'big')
+        committed = int.from_bytes(index[16:20], sys.byteorder)
+        if kind == 'committed-checksum':
+            wal[32 + committed * frame_size - 1] ^= 1
+        elif kind == 'committed-salt':
+            wal[32 + (committed - 1) * frame_size + 8] ^= 1
+        elif kind == 'truncated-commit':
+            del wal[32 + committed * frame_size - 1:]
+        elif kind == 'missing-index':
+            index_path.unlink()
+        elif kind.startswith('database-'):
+            database = bytearray(env.db.read_bytes())
+            if kind == 'database-mode':
+                database[18:20] = b'\x01\x01'
+            else:
+                database[16:18] = (8192).to_bytes(2, 'big')
+            env.db.write_bytes(database)
+        else:
+            offset = {'index-copies': 48, 'index-checksum': 40, 'index-salt': 32,
+                      'index-frame-checksum': 24, 'index-page-count': 20}[kind]
+            index[offset] ^= 1
+            if kind != 'index-copies':
+                if kind != 'index-checksum':
+                    checksum = m._wal_checksum(index[:40], big=sys.byteorder == 'big')
+                    index[40:48] = b''.join(n.to_bytes(4, sys.byteorder) for n in checksum)
+                index[48:96] = index[:48]
+            index_path.write_bytes(index)
+        wal_path.write_bytes(wal)
+        source = source_database_files(env)
+        job = run(env)
+        assert all(lyric.exists() for lyric in lyrics)
+        assert job['errors'] and any(e['category'] == 'database' for e in job['errors'])
+        assert source_database_files(env) == source
+
+
+def test_wal_index_mmap_mutation_after_snapshot_retains_attachments(env):
+    import mmap
+    protected = env.library / 'protected'
+    orphan = env.library / 'orphan'
+    lyric = put(orphan.with_suffix('.lrc'))
+    ref(env, orphan)
+    with rollback_tail_database(env, [str(env.library / 'first.flac'), str(protected) + '.flac']):
+        original = m._Engine.prepare_database
+
+        async def changed(engine):
+            await original(engine)
+            path = str(env.db) + '-shm'
+            # mmap metadata behavior varies by filesystem. Freeze shm stat to
+            # model a mapped write with no mtime/ctime update deterministically.
+            stat = m._stat
+            before = stat(path)
+            with open(path, 'r+b') as stream, mmap.mmap(stream.fileno(), 0) as mapped:
+                mapped[8] ^= 1
+                mapped[56] ^= 1
+            patches.enter_context(patch.object(
+                m, '_stat', lambda candidate: before if candidate == path else stat(candidate)))
+
+        with ExitStack() as patches, patch.object(m._Engine, 'prepare_database', changed):
+            job = run(env)
+        assert lyric.exists() and job['errors']
+
+
+def test_snapshot_connection_closed_before_directory_removal(env):
+    _check_snapshot_closure(env, 'success')
+
+
+@pytest.mark.parametrize('failure', ['integrity', 'query'])
+def test_snapshot_connection_closed_on_error_before_directory_removal(env, failure):
+    _check_snapshot_closure(env, failure)
+
+
+def _check_snapshot_closure(env, failure):
+    opened, closed, removed = [], [], []
+    connect, directory = m.sqlite3.connect, m.tempfile.TemporaryDirectory
+
+    class TrackedConnection(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if failure == 'integrity' and sql == 'PRAGMA quick_check':
+                return SimpleNamespace(fetchall=lambda: [('corrupt snapshot',)])
+            if failure == 'query' and sql == 'SELECT path FROM audio_file':
+                raise sqlite3.OperationalError('injected query failure')
+            return super().execute(sql, *args)
+
+        def close(self):
+            closed.append(self)
+            super().close()
+
+    def tracked_connect(database, **kwargs):
+        assert database.endswith('/music.db?mode=ro') and kwargs == {'uri': True}
+        assert str(env.db) not in database
+        con = connect(database, factory=TrackedConnection, **kwargs)
+        opened.append(con)
+        return con
+
+    @contextmanager
+    def tracked_directory(**kwargs):
+        try:
+            with directory(**kwargs) as path:
+                try:
+                    yield path
+                finally:
+                    assert opened and closed == opened
+                    for con in opened:
+                        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                            con.execute('SELECT 1')
+        finally:
+            removed.append(path)
+            assert not Path(path).exists()
+
+    with patch.object(m.sqlite3, 'connect', tracked_connect), patch.object(
+            m.tempfile, 'TemporaryDirectory', tracked_directory):
+        if failure == 'success':
+            assert m._db_paths(env.runtime)[0] == set()
+        else:
+            with pytest.raises((ValueError, sqlite3.OperationalError)):
+                m._db_paths(env.runtime)
+    assert len(opened) == len(closed) == len(removed) == 1
 
 
 def test_wal_snapshot_retries_after_transient_change(env):

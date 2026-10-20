@@ -8,7 +8,7 @@ still cooperate: POSIX has no compare-and-unlink syscall.
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -19,6 +19,7 @@ import secrets
 import math
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 
@@ -157,6 +158,7 @@ def _db_paths(runtime):
         before = _db_state(db)
         database = _read(db, 128 * 1024 * 1024)
         wal = _read(db + '-wal', 128 * 1024 * 1024) if before[1] is not None else b''
+        index = _read(db + '-shm', 16 * 1024 * 1024) if before[2] is not None else None
         try:
             after = _db_state(db)
         except (OSError, ValueError) as exc:
@@ -168,13 +170,19 @@ def _db_paths(runtime):
                 continue
             raise ValueError(f'database changed during snapshot: {db}')
         if wal:
-            _validate_wal(wal)
+            if (len(database) < 100 or database[:16] != b'SQLite format 3\x00' or
+                    database[18:20] != b'\x02\x02'):
+                raise ValueError('database header does not support WAL')
+            size = int.from_bytes(database[16:18], 'big')
+            if (65536 if size == 1 else size) != int.from_bytes(wal[8:12], 'big'):
+                raise ValueError('database and WAL page sizes differ')
+            wal = _validate_wal(wal, index)
         with tempfile.TemporaryDirectory(prefix='fnmusic-maintenance-db-') as directory:
             snapshot = Path(directory) / 'music.db'
             snapshot.write_bytes(database)
             if wal:
                 Path(str(snapshot) + '-wal').write_bytes(wal)
-            with sqlite3.connect(snapshot.as_uri() + '?mode=ro', uri=True) as con:
+            with closing(sqlite3.connect(snapshot.as_uri() + '?mode=ro', uri=True)) as con:
                 con.execute('PRAGMA query_only=ON')
                 check = con.execute('PRAGMA quick_check').fetchall()
                 if check != [('ok',)]:
@@ -195,7 +203,16 @@ def _db_state(path):
         wal = _stat(path + '-wal')
         if not _regular(wal):
             raise ValueError(f'database WAL is not a single-link regular file: {path}-wal')
-    return (_identity(database), None if wal is None else _identity(wal))
+    index = None
+    if wal is not None and _present(path + '-shm'):
+        index = _stat(path + '-shm')
+        if not _regular(index):
+            raise ValueError(f'database WAL index is not a single-link regular file: {path}-shm')
+    # mmap writes need not update shm mtime/ctime. Include its duplicated commit
+    # header, not only stat identity, in snapshot and pre-deletion revalidation.
+    header = _read(path + '-shm', 16 * 1024 * 1024)[:96] if index is not None else None
+    return (_identity(database), None if wal is None else _identity(wal),
+            None if index is None else _identity(index), header)
 
 
 def _wal_checksum(data, state=(0, 0), big=False):
@@ -208,14 +225,49 @@ def _wal_checksum(data, state=(0, 0), big=False):
     return first, second
 
 
-def _validate_wal(data):
+def _wal_index(index, data, page_size):
+    """Read the published commit boundary, never SQLite locks or source writes.
+
+    WAL-index headers are duplicated, checksummed and native-endian. A stable
+    filesystem identity alone cannot make a torn/unpublished header trustworthy.
+    Only this verified boundary lets us distinguish rollback residue from damage
+    to a committed frame; quick_check alone cannot detect missing committed rows.
+    """
+    if len(index) < 96 or index[:48] != index[48:96]:
+        raise ValueError('inconsistent WAL index headers')
+    header = index[:48]
+    word = lambda offset: int.from_bytes(header[offset:offset + 4], sys.byteorder)
+    if (word(0) != 3007000 or header[12] != 1 or
+            header[13] != (data[:4] == bytes.fromhex('377f0683'))):
+        raise ValueError('invalid WAL index version/initialization')
+    size = int.from_bytes(header[14:16], sys.byteorder)
+    if (65536 if size == 1 else size) != page_size or header[32:40] != data[16:24]:
+        raise ValueError('WAL index does not match WAL')
+    if _wal_checksum(header[:40], big=sys.byteorder == 'big') != (word(40), word(44)):
+        raise ValueError('invalid WAL index checksum')
+    frames, pages = word(16), word(20)
+    if frames == 0 or pages == 0:
+        raise ValueError('WAL index has no verifiable commit')
+    return frames, pages, (word(24), word(28))
+
+
+def _validate_wal(data, index=None):
+    """Return only verified committed frames; fail closed on ambiguous damage.
+
+    With a validated WAL index, SQLite's published mxFrame bounds the current
+    transaction chain: later bytes may be rollback residue, including frames with
+    matching salts but invalid rolling checksums. Without an index we cannot
+    distinguish that residue from corruption, so validate the entire file.
+    """
     if not data:
-        return
+        return data
     if len(data) < 32:
         raise ValueError('truncated WAL header')
     magic = int.from_bytes(data[:4], 'big')
     if magic not in (0x377f0682, 0x377f0683):
         raise ValueError('invalid WAL magic')
+    if int.from_bytes(data[4:8], 'big') != 3007000:
+        raise ValueError('invalid WAL version')
     native_big = magic == 0x377f0683
     expected = int.from_bytes(data[24:28], 'big'), int.from_bytes(data[28:32], 'big')
     if _wal_checksum(data[:24], big=native_big) != expected:
@@ -229,17 +281,33 @@ def _validate_wal(data):
     checksum = expected
     offset = 32
     frame_size = 24 + page_size
-    while offset < len(data):
-        if len(data) - offset < frame_size:
+    published = _wal_index(index, data, page_size) if index is not None else None
+    end = 32 + published[0] * frame_size if published else len(data)
+    if end > len(data):
+        raise ValueError('truncated committed WAL')
+    committed_end = 32
+    pages = 0
+    while offset < end:
+        if end - offset < frame_size:
             raise ValueError('truncated WAL frame')
         frame = data[offset:offset + frame_size]
         if frame[8:16] != salts:
-            break
+            raise ValueError('WAL frame salts changed without a verified commit boundary')
+        if int.from_bytes(frame[:4], 'big') == 0:
+            raise ValueError('invalid WAL frame page number')
         expected = int.from_bytes(frame[16:20], 'big'), int.from_bytes(frame[20:24], 'big')
         checksum = _wal_checksum(frame[:8] + frame[24:], checksum, native_big)
         if checksum != expected:
             raise ValueError('invalid WAL frame checksum')
         offset += frame_size
+        pages = int.from_bytes(frame[4:8], 'big')
+        if pages:
+            committed_end = offset
+    if published and (committed_end != end or pages != published[1] or checksum != published[2]):
+        raise ValueError('WAL commit does not match published index')
+    if len(data) > 32 and committed_end == 32:
+        raise ValueError('WAL has no verifiable commit')
+    return data[:committed_end]
 
 
 def _db_has_stem(paths, stem):
