@@ -1481,15 +1481,23 @@ let cleanupSubmitting = false;
 let cleanupPolling = false;
 let cleanupTimer = null;
 
+function formatCleanupBytes(size) {
+  const value = Number(size);
+  if (!Number.isFinite(value) || value < 0) return "0.0 KB";
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
 function renderCleanupJob(job) {
   const labels = { running: "清理中", completed: "清理完成", failed: "清理失败" };
   $("#cleanup-status").textContent =
     `任务 ${job.id} · ${labels[job.status]} · 阶段：${job.phase || "-"}` +
     ` · 已扫描 ${job.scanned ?? 0} · 已删除 ${job.removed ?? 0}` +
-    ` · 释放 ${job.bytes ?? 0} 字节 · 已跳过 ${job.skipped ?? 0}`;
+    ` · 释放 ${formatCleanupBytes(job.bytes ?? 0)} · 已跳过 ${job.skipped ?? 0}`;
   const lines = [];
   for (const [name, counts] of Object.entries(job.categories || {})) {
-    lines.push(`${name}：扫描 ${counts.scanned || 0}，删除 ${counts.removed || 0}，释放 ${counts.bytes || 0} 字节，跳过 ${counts.skipped || 0}`);
+    lines.push(`${name}：扫描 ${counts.scanned || 0}，删除 ${counts.removed || 0}，释放 ${formatCleanupBytes(counts.bytes || 0)}，跳过 ${counts.skipped || 0}`);
   }
   for (const [key, label] of [["errors", "错误"], ["details", "详情"]]) {
     for (const item of (Array.isArray(job[key]) ? job[key] : [])) {

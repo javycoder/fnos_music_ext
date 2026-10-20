@@ -889,13 +889,31 @@ test("清理 Beta：确认 POST，双击及重复点击只展示同任务，GET 
   }));
   await tick(1100); // 真正触发自动 GET 轮询
   assert.ok(els.get("#cleanup-status").textContent.includes("清理完成"));
-  assert.ok(els.get("#cleanup-status").textContent.includes("1024 字节"));
+  assert.ok(els.get("#cleanup-status").textContent.includes("1.0 KB"));
   assert.ok(els.get("#cleanup-details").textContent.includes(attack));
   assert.strictEqual(els.get("#cleanup-details").innerHTML, "");
   assert.strictEqual(els.get("#cleanup-details").hidden, false);
   const count = fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length;
   await tick(1100);
   assert.strictEqual(fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length, count); // terminal 状态停表
+});
+
+test("清理 Beta：释放空间按 KB/MB/GB 友好显示", () => {
+  assert.strictEqual(global.formatCleanupBytes(512), "0.5 KB");
+  assert.strictEqual(global.formatCleanupBytes(1024 * 1024), "1.0 MB");
+  assert.strictEqual(global.formatCleanupBytes(33996008), "32.4 MB");
+  assert.strictEqual(global.formatCleanupBytes(1024 * 1024 * 1024), "1.0 GB");
+  const friendlyJob = cleanupResponse("completed", {
+    bytes: 33996008,
+    categories: { temporary: { scanned: 2, removed: 2, bytes: 33996008, skipped: 0 } },
+  }).job;
+  assert.strictEqual(friendlyJob.bytes, 33996008);
+  global.renderCleanupJob(friendlyJob);
+  assert.ok(
+    els.get("#cleanup-status").textContent.includes("32.4 MB"),
+    els.get("#cleanup-status").textContent
+  );
+  assert.ok(els.get("#cleanup-details").textContent.includes("temporary：扫描 2，删除 2，释放 32.4 MB，跳过 0"));
 });
 
 test("清理 Beta：查询失败保留任务，重试只 GET，failed 停止轮询", async () => {
