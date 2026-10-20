@@ -602,10 +602,12 @@ def public_playlist_search(keyword: str, page: int = 1, limit: int = 30) -> dict
     })
     result = data.get("result") if isinstance(data, dict) else None
     rows = result.get("playlists") if isinstance(result, dict) else None
-    items = [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")]
+    rows = rows if isinstance(rows, list) else []
+    items = [_public_summary(row) for row in rows if isinstance(row, dict) and row.get("id")]
     total = _int_or_zero(result.get("playlistCount")) if isinstance(result, dict) else 0
-    has_more = ((page - 1) * limit + len(items) < total) if total else bool(items)
-    return {"ok": True, "items": items, "total": total, "has_more": has_more}
+    # 总数可能过期；真空页必须停，过滤条目则不改变上游窗口的推进。
+    has_more = bool(rows) and (page * limit < total if total else True)
+    return {"ok": True, "items": items, "raw_count": len(rows), "total": total, "has_more": has_more}
 
 
 def public_playlists(

@@ -1063,6 +1063,40 @@ def test_public_playlist_search_parses_playlists_and_advances_native_offset(monk
     assert captured == {}
 
 
+@pytest.mark.parametrize("total", [0, 99999])
+def test_public_playlist_search_empty_raw_page_stops_despite_stale_total(monkeypatch, total):
+    monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: {
+        "code": 200, "result": {"playlists": [], "playlistCount": total, "more": True},
+    })
+    result = netease_ext.public_playlist_search("华语", page=2, limit=30)
+    assert result["items"] == [] and result["raw_count"] == 0
+    assert result["total"] == total and result["has_more"] is False
+
+
+def test_public_playlist_search_filtered_raw_window_uses_native_page_boundary(monkeypatch):
+    offsets = []
+
+    def fake_post(path, params):
+        offsets.append(params["offset"])
+        # 第 1 页部分行无身份；第 2 页全被过滤，但原始窗口已经到达总数。
+        rows = [{"id": 1, "name": "有效"}, {}, None] if params["offset"] == 0 else [{}, None]
+        return {"code": 200, "result": {"playlists": rows, "playlistCount": 5}}
+
+    monkeypatch.setattr(netease_ext, "_public_post", fake_post)
+    first = netease_ext.public_playlist_search("华语", page=1, limit=3)
+    last = netease_ext.public_playlist_search("华语", page=2, limit=3)
+    assert offsets == [0, 3]
+    assert len(first["items"]) == 1 and first["raw_count"] == 3 and first["has_more"] is True
+    assert last["items"] == [] and last["raw_count"] == 2 and last["has_more"] is False
+
+    # 非空但全部无效的中间窗口不误判成真空页，下页仍可请求。
+    monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: {
+        "code": 200, "result": {"playlists": [{}, None], "playlistCount": 100},
+    })
+    filtered = netease_ext.public_playlist_search("华语", page=2, limit=3)
+    assert filtered["items"] == [] and filtered["raw_count"] == 2 and filtered["has_more"] is True
+
+
 def test_public_playlist_search_via_channel_requires_keyword(monkeypatch):
     monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: pytest.fail("不应发起上游请求"))
     assert netease_ext.public_playlists("search", keyword="")["items"] == []

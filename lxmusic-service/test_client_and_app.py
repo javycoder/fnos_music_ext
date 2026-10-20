@@ -427,6 +427,40 @@ def test_public_playlist_search_maps_and_infers_more(test_app_client, fake_lx):
     assert missing.status_code == 400 and missing.json()["ok"] is False
 
 
+@pytest.mark.parametrize("total", [0, 99999])
+def test_public_playlist_search_empty_raw_page_stops(test_app_client, fake_lx, total):
+    async def search(source, text, page=1):
+        return {"list": [], "limit": 20, "total": total, "has_more": True}
+
+    fake_lx.get_song_list_search = search
+    fake_lx.normalize_public_playlist = LxServerClient.normalize_public_playlist
+    response = test_app_client.get("/api/v1/public-playlists", params={
+        "source": "kw", "channel": "search", "keyword": "华语", "page": 2,
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["items"] == [] and result["raw_count"] == 0
+    assert result["total"] == total and result["has_more"] is False
+
+
+def test_public_playlist_search_filtered_window_keeps_native_pagination(test_app_client, fake_lx):
+    pages = []
+
+    async def search(source, text, page=1):
+        pages.append(page)
+        return {"list": [{}, None], "limit": 20, "total": 57}
+
+    fake_lx.get_song_list_search = search
+    fake_lx.normalize_public_playlist = LxServerClient.normalize_public_playlist
+    for page, more in [(2, True), (3, False)]:
+        result = test_app_client.get("/api/v1/public-playlists", params={
+            "source": "kw", "channel": "search", "keyword": "华语", "page": page,
+        }).json()
+        assert result["items"] == [] and result["raw_count"] == 2
+        assert result["has_more"] is more
+    assert pages == [2, 3]
+
+
 def test_public_chart_tracks_follow_native_pages(test_app_client, fake_lx):
     calls: list[int] = []
 

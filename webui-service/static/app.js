@@ -24,7 +24,7 @@ let publicCapabilities = null;
 let publicState = {
   provider: "musicbox", channel: "charts", source: "netease", category: "", sort: "",
   keyword: "", page: 1, items: [], hasMore: false, total: 0, cursor: "",
-  cursors: { 1: "" }, seq: 0, bulk: null,
+  cursors: { 1: "" }, seq: 0, loading: false, bulk: null,
 };
 // 已选歌单的展示元数据缓存（key=publicEntryKey）：保存后重新回填、跨 provider
 // 补齐时复用，避免每次渲染都打详情接口
@@ -594,6 +594,10 @@ function renderPublicSelected() {
   const box = $("#public-selected");
   if (!box) return;
   box.innerHTML = publicSelection.length ? publicSelection.map((item, index) => {
+    // 浏览/默认榜单已提供的元数据同样进缓存，保存回填后无需依赖音源仍在运行。
+    if (item._name) publicDetailCache.set(publicEntryKey(item), {
+      name: item._name, cover_url: item._cover_url || "", track_count: item._track_count || 0,
+    });
     // 名称是展示元数据不进配置：未取到时给出状态而不是把数字 ID 当标题
     const title = item._name ? escapeHtml(item._name)
       : item._detail_failed ? "名称获取失败" : "正在获取歌单名称…";
@@ -684,7 +688,11 @@ async function fetchPublicItemDetail(item) {
 function applyPublicDetailCache(item) {
   const cached = publicDetailCache.get(publicEntryKey(item));
   if (!cached) return false;
-  if (cached.failed) { item._detail_failed = true; return true; }
+  if (cached.failed) {
+    if (Date.now() - cached.failedAt < 30000) { item._detail_failed = true; return true; }
+    publicDetailCache.delete(publicEntryKey(item));
+    return false;
+  }
   item._name = cached.name || "";
   item._cover_url = cached.cover_url || "";
   item._track_count = cached.track_count || 0;
@@ -711,7 +719,7 @@ async function ensurePublicSelectionDetails() {
       });
     } catch (_) {
       if (seq !== publicSelectionDetailSeq) return;
-      publicDetailCache.set(publicEntryKey(item), { failed: true });
+      publicDetailCache.set(publicEntryKey(item), { failed: true, failedAt: Date.now() });
     }
     // 等待期间条目可能被移除/重排：按身份键重新定位后再落值
     const target = publicSelection.find((it) => publicEntryKey(it) === publicEntryKey(item));
@@ -742,10 +750,22 @@ function currentUiProvider() {
   return ($$("input[name=provider]").find((el) => el.checked) || {}).value || savedProvider();
 }
 
-async function loadPublicCapabilities(retry = true) {
+async function loadPublicCapabilities(seq = publicState.seq) {
+  const provider = publicState.provider;
   try {
-    publicCapabilities = await publicApi("capabilities");
+    const data = await publicApi("capabilities", {}, true, provider);
+    if (seq !== publicState.seq || provider !== publicState.provider) return;
+    publicCapabilities = data;
+    // 配置回填可能早于预览启动；就绪后只清除本音源的瞬时失败。
+    publicSelectionDetailSeq++;
+    for (const item of publicSelection) {
+      if (publicUiProviderOf(item) !== provider) continue;
+      const key = publicEntryKey(item);
+      if (publicDetailCache.get(key)?.failed) publicDetailCache.delete(key);
+      delete item._detail_failed;
+    }
   } catch (exc) {
+    if (seq !== publicState.seq || provider !== publicState.provider) return;
     publicCapabilities = null;
     $("#public-note").textContent = "音源不可达：" + exc.message;
   }
@@ -803,21 +823,51 @@ function fillPublicCategories(data) {
   publicState.sort = sorts[0]?.id || "";
 }
 
-async function loadPublicCategories() {
-  if (publicState.channel === "recommend" || publicState.channel === "account_recommend") {
+async function loadPublicCategories(seq = publicState.seq) {
+  const { provider, source, channel } = publicState;
+  if (seq !== publicState.seq) return;
+  if (channel === "recommend" || channel === "account_recommend") {
     fillPublicCategories({ categories: [] });
     return;
   }
   try {
-    const highquality = publicState.provider === "musicbox" && publicState.channel === "highquality";
+    const highquality = provider === "musicbox" && channel === "highquality";
     const data = await publicApi("categories", {
-      source: publicState.source, kind: publicState.channel === "charts" ? "chart" : "playlist",
-    });
+      source, kind: channel === "charts" ? "chart" : "playlist",
+    }, true, provider);
+    if (seq !== publicState.seq) return;
     fillPublicCategories(highquality ? { categories: data.highquality_tags || data.tags || [] } : data);
   } catch (exc) {
+    if (seq !== publicState.seq) return;
     fillPublicCategories({ categories: [] });
     $("#public-note").textContent = "分类加载失败：" + exc.message;
   }
+}
+
+// 必须在 capabilities/categories 的 await 之前失效旧请求并阻止翻页。
+function invalidatePublicBrowse() {
+  const seq = ++publicState.seq;
+  publicState.loading = true;
+  publicState.bulk = null;
+  publicState.items = []; publicState.hasMore = false;
+  renderPublicList(); renderPublicPage();
+  return seq;
+}
+
+async function reloadPublicBrowser(withCapabilities = false) {
+  const seq = invalidatePublicBrowse();
+  if (withCapabilities) {
+    await loadPublicCapabilities(seq);
+    if (seq !== publicState.seq) return;
+  }
+  await loadPublicCategories(seq);
+  if (seq !== publicState.seq) return;
+  await loadPublicList(seq);
+  if (seq !== publicState.seq) return;
+  annotatePublicSelectionAvailability();
+  renderPublicSelected();
+  void ensurePublicSelectionDetails();
+  return seq;
 }
 
 function publicSearchActive() {
@@ -829,26 +879,30 @@ function paginatedPublicChannel() {
   return publicSearchActive() || publicState.channel === "top" || publicState.channel === "highquality";
 }
 
-function publicListRequestParams(page) {
+function publicListRequestParams(page, state = publicState) {
   const params = {
-    source: publicState.source,
-    channel: publicSearchActive() ? "search" : publicState.channel,
-    keyword: publicState.keyword,
-    category: publicState.category, sort: publicState.sort, page,
+    source: state.source,
+    channel: state.keyword ? "search" : state.channel,
+    keyword: state.keyword,
+    category: state.category, sort: state.sort, page,
   };
-  if (!publicSearchActive() && publicState.channel === "highquality") {
-    params.cursor = (publicState.cursors || {})[page] || "";
+  if (!state.keyword && state.channel === "highquality") {
+    params.cursor = (state.cursors || {})[page] || "";
   }
   return params;
 }
 
-function publicItemsFromResponse(data, provider) {
+function publicItemsFromResponse(data, state) {
   return (data.items || []).map((item) => ({
     ...item,
-    provider: provider === "musicbox" ? "musicbox" : "lx",
-    source: publicState.source,
-    kind: !publicSearchActive() && publicState.channel === "charts" ? "chart" : "playlist",
+    provider: state.provider === "musicbox" ? "musicbox" : "lx",
+    source: state.source,
+    kind: !state.keyword && state.channel === "charts" ? "chart" : "playlist",
   }));
+}
+
+function publicRawCount(data) {
+  return Math.max((data.items || []).length, Number(data.raw_count) || 0);
 }
 
 function syncPublicSearchUi() {
@@ -870,31 +924,35 @@ function updatePublicNote() {
     : `返回 ${publicState.items.length} 份${suffix}；勾选后保存生效。`;
 }
 
-async function loadPublicList() {
-  const seq = ++publicState.seq;
-  const provider = publicState.provider;
-  publicState.bulk = null;
+async function loadPublicList(seq = invalidatePublicBrowse()) {
+  if (seq !== publicState.seq) return;
+  const state = { ...publicState };
+  const params = publicListRequestParams(state.page, state);
   syncPublicSearchUi();
-  $("#public-note").textContent = publicSearchActive() ? `正在搜索“${publicState.keyword}”…` : "正在加载歌单…";
+  $("#public-note").textContent = state.keyword ? `正在搜索“${state.keyword}”…` : "正在加载歌单…";
   try {
-    const data = await publicApi("", publicListRequestParams(publicState.page), true, provider);
+    const data = await publicApi("", params, true, state.provider);
     if (seq !== publicState.seq) return; // 请求期间条件已变化，丢弃过期响应
-    publicState.items = publicItemsFromResponse(data, provider);
-    publicState.hasMore = !!data.has_more;
+    publicState.items = publicItemsFromResponse(data, state);
+    publicState.hasMore = !!data.has_more && publicRawCount(data) > 0;
     publicState.total = Number(data.total || 0);
-    publicState.cursor = data.next_cursor || publicState.cursor;
-    if (!publicSearchActive() && publicState.channel === "highquality") {
+    publicState.cursor = data.next_cursor || "";
+    if (params.channel === "highquality") {
       publicState.cursors = publicState.cursors || { 1: "" };
-      publicState.cursors[publicState.page + 1] = data.next_cursor || "";
+      publicState.cursors[state.page + 1] = data.next_cursor || "";
+      if (!data.next_cursor || data.next_cursor === params.cursor) publicState.hasMore = false;
     }
     updatePublicNote();
   } catch (exc) {
     if (seq !== publicState.seq) return;
     publicState.items = []; publicState.hasMore = false;
-    $("#public-note").textContent = (publicSearchActive() ? "搜索失败：" : "歌单加载失败：") + exc.message;
+    $("#public-note").textContent = (state.keyword ? "搜索失败：" : "歌单加载失败：") + exc.message;
+  } finally {
+    if (seq === publicState.seq) {
+      publicState.loading = false;
+      renderPublicList(); renderPublicPage();
+    }
   }
-  renderPublicList();
-  renderPublicPage();
 }
 
 // 单次"加载剩余"连续翻页的安全上限：按上游真实尽头推进，但避免无界请求串；
@@ -902,16 +960,13 @@ async function loadPublicList() {
 const PUBLIC_BULK_MAX_PAGES = 500;
 
 async function loadPublicRest() {
-  if (publicState.bulk) {
-    if (publicState.bulk.active) { publicState.bulk.abort = true; return; }
-    publicState.bulk = null; // 上轮已结束（中断/停止），这次是重试
-    renderPublicPage();
-  }
+  if (publicState.loading) return;
+  if (publicState.bulk?.active) { publicState.bulk.abort = true; return; }
   if (!publicState.hasMore || !paginatedPublicChannel()) return;
   const seq = publicState.seq;
-  const provider = publicState.provider;
+  const state = { ...publicState, cursors: { ...publicState.cursors } };
   const bulk = {
-    active: true, abort: false, basePage: publicState.page, pages: 0,
+    active: true, abort: false, basePage: publicState.bulk?.basePage || state.page, pages: 0,
     seen: new Set(publicState.items.map((it) => publicEntryKey(it))),
   };
   publicState.bulk = bulk;
@@ -920,11 +975,13 @@ async function loadPublicRest() {
   let stopReason = "";
   try {
     while (!bulk.abort && bulk.pages < PUBLIC_BULK_MAX_PAGES) {
-      const data = await publicApi("", publicListRequestParams(publicState.page + 1), true, provider);
+      const params = publicListRequestParams(state.page + 1, state);
+      const data = await publicApi("", params, true, state.provider);
       if (seq !== publicState.seq || publicState.bulk !== bulk) return; // 条件已切换
-      publicState.page += 1;
+      state.page += 1;
+      publicState.page = state.page;
       bulk.pages += 1;
-      const rows = publicItemsFromResponse(data, provider);
+      const rows = publicItemsFromResponse(data, state);
       let added = 0;
       for (const row of rows) {
         const key = publicEntryKey(row);
@@ -935,16 +992,17 @@ async function loadPublicRest() {
       }
       publicState.hasMore = !!data.has_more;
       publicState.total = Number(data.total || 0);
-      if (!publicSearchActive() && publicState.channel === "highquality") {
-        publicState.cursors = publicState.cursors || { 1: "" };
-        publicState.cursors[publicState.page + 1] = data.next_cursor || "";
+      if (params.channel === "highquality") {
+        state.cursors[state.page + 1] = data.next_cursor || "";
+        publicState.cursors = { ...state.cursors };
+        if (!data.next_cursor || data.next_cursor === params.cursor) publicState.hasMore = false;
       }
       renderPublicList();
       renderPublicPage();
       $("#public-note").textContent = `正在加载剩余歌单：已累计 ${publicState.items.length} 份（第 ${bulk.basePage}–${publicState.page} 页）…`;
       if (!publicState.hasMore) { stopReason = "done"; break; }
-      if (rows.length && added === 0) {
-        // 上游没有前进（整页都是已见过的歌单）：按到尽头处理，避免无限翻页
+      if (!publicRawCount(data) || (rows.length && added === 0)) {
+        // 真空页或整页重复才判停；非空原始窗口被过滤后仍按原生分页推进。
         publicState.hasMore = false;
         stopReason = "stalled"; break;
       }
@@ -978,13 +1036,15 @@ function renderPublicPage() {
   $("#public-page").textContent = publicState.bulk
     ? `第 ${publicState.bulk.basePage}–${publicState.page} 页`
     : String(publicState.page);
-  $("#public-prev").disabled = publicState.page <= 1 || !!publicState.bulk;
-  $("#public-next").disabled = !publicState.hasMore || !!publicState.bulk;
+  const busy = publicState.loading || !!publicState.bulk?.active;
+  $("#public-prev").disabled = publicState.page <= 1 || busy;
+  $("#public-next").disabled = !publicState.hasMore || busy;
   const loadRest = $("#public-load-rest");
   if (loadRest) {
-    const busy = !!(publicState.bulk && publicState.bulk.active);
-    loadRest.hidden = !(paginatedPublicChannel() && (publicState.hasMore || busy));
-    loadRest.textContent = busy ? "停止加载" : "加载剩余歌单";
+    const bulkBusy = !!publicState.bulk?.active;
+    loadRest.hidden = publicState.loading || !(paginatedPublicChannel() && (publicState.hasMore || bulkBusy));
+    loadRest.disabled = !!publicState.loading;
+    loadRest.textContent = bulkBusy ? "停止加载" : "加载剩余歌单";
   }
 }
 
@@ -1029,29 +1089,30 @@ async function showPublicBrowser() {
   $("#public-playlists-browser").hidden = false;
   const saved = savedProvider();
   publicState.provider = currentUiProvider() === "lxmusic" ? "lxmusic" : "musicbox";
-  await loadPublicCapabilities();
-  await loadPublicCategories();
-  await loadPublicList();
-  annotatePublicSelectionAvailability();
-  renderPublicSelected();
-  void ensurePublicSelectionDetails();
-  if (saved === "musicdl") $("#public-note").textContent = "当前音源是 musicdl：它没有统一推荐歌单接口；可浏览网易/洛雪，保存后按常驻规则展示网易公共歌单。";
+  const seq = await reloadPublicBrowser(true);
+  if (seq === publicState.seq && saved === "musicdl") $("#public-note").textContent = "当前音源是 musicdl：它没有统一推荐歌单接口；可浏览网易/洛雪，保存后按常驻规则展示网易公共歌单。";
 }
 
 $("#public-playlists-enabled").addEventListener("change", async () => {
   const enabled = $("#public-playlists-enabled").checked;
   updateResidentAvailability();
   markDirty(enabled ? "公共歌单已开启" : "公共歌单已关闭");
-  if (!enabled) { $("#public-playlists-browser").hidden = true; return; }
+  if (!enabled) {
+    invalidatePublicBrowse();
+    publicState.loading = false;
+    publicSelectionDetailSeq++;
+    $("#public-playlists-browser").hidden = true;
+    return;
+  }
   if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
   await showPublicBrowser();
 });
 function runPublicSearch() {
   const keyword = $("#public-keyword").value.trim();
-  if (!keyword) { clearPublicSearch(); return; }
+  if (!keyword) return clearPublicSearch();
   publicState.keyword = keyword;
   publicState.page = 1;
-  loadPublicList();
+  return loadPublicList();
 }
 
 function clearPublicSearch() {
@@ -1059,7 +1120,7 @@ function clearPublicSearch() {
   $("#public-keyword").value = "";
   publicState.page = 1;
   publicState.cursors = { 1: "" }; publicState.cursor = "";
-  loadPublicList();
+  return loadPublicList();
 }
 
 $("#public-search").addEventListener("click", runPublicSearch);
@@ -1071,15 +1132,15 @@ $("#public-search-clear").addEventListener("click", clearPublicSearch);
 $("#public-provider").addEventListener("change", async () => {
   publicState.provider = $("#public-provider").value;
   publicState.page = 1; publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
-  await loadPublicCapabilities(); await loadPublicCategories(); await loadPublicList();
+  await reloadPublicBrowser(true);
 });
 $("#public-channel").addEventListener("change", async () => {
   publicState.channel = $("#public-channel").value; publicState.page = 1;
-  await loadPublicCategories(); await loadPublicList();
+  await reloadPublicBrowser();
 });
 $("#public-source").addEventListener("change", async () => {
   publicState.source = $("#public-source").value; publicState.page = 1;
-  await loadPublicCategories(); await loadPublicList();
+  await reloadPublicBrowser();
 });
 $("#public-category").addEventListener("change", async () => {
   publicState.category = $("#public-category").value; publicState.page = 1;
@@ -1092,14 +1153,19 @@ $("#public-sort").addEventListener("change", async () => {
 });
 $("#public-refresh").addEventListener("click", async () => {
   publicState.page = 1; // 刷新=从头重新浏览，与其它条件切换一致
-  await loadPublicCapabilities(); await loadPublicCategories(); await loadPublicList();
+  await reloadPublicBrowser(true);
 });
 $("#public-load-rest").addEventListener("click", () => { void loadPublicRest(); });
 $("#public-prev").addEventListener("click", async () => {
-  if (publicState.page > 1 && !publicState.bulk) { publicState.page--; await loadPublicList(); }
+  if (publicState.page > 1 && !publicState.loading && !publicState.bulk?.active) {
+    // 累计视图离开后，loadPublicList 清除范围并恢复目标页的普通单页视图。
+    publicState.page--; await loadPublicList();
+  }
 });
 $("#public-next").addEventListener("click", async () => {
-  if (publicState.hasMore && !publicState.bulk) { publicState.page++; await loadPublicList(); }
+  if (publicState.hasMore && !publicState.loading && !publicState.bulk?.active) {
+    publicState.page++; await loadPublicList();
+  }
 });
 
 /* -------------------------------------------------------------- 网易扫码 */

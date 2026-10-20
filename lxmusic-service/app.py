@@ -1284,8 +1284,9 @@ async def public_playlists(
         return {
             "ok": True,
             "items": [it for it in items if it["id"]],
+            "raw_count": len(raw_items),
             "total": total,
-            "has_more": (page * page_limit < total) if total else bool(raw_items),
+            "has_more": bool(raw_items) and (page * page_limit < total if total else True),
         }
     if channel != "top":
         raise ValueError(f"unsupported channel {channel!r}")

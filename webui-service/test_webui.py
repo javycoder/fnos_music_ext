@@ -1048,10 +1048,11 @@ def test_public_playlist_proxy_routes_and_strips_provider(env_file, monkeypatch)
 def test_public_playlist_proxy_forwards_keyword_and_caches_by_keyword(env_file, monkeypatch):
     monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
     calls: list[dict] = []
+    payload = {"ok": True, "items": [], "raw_count": 20, "total": 99999, "has_more": True}
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(dict(request.url.params))
-        return httpx.Response(200, json={"ok": True, "items": []})
+        return httpx.Response(200, json=payload)
 
     _mock_http(handler)
     with authed_client() as client:
@@ -1064,7 +1065,7 @@ def test_public_playlist_proxy_forwards_keyword_and_caches_by_keyword(env_file, 
         again = client.get("/api/public-playlists", params={
             "provider": "musicbox", "channel": "search", "keyword": "华语", "page": "1",
         })
-    assert all(r.status_code == 200 and r.json()["ok"] is True for r in (first, other, again))
+    assert all(r.status_code == 200 and r.json() == payload for r in (first, other, again))
     # 关键词进入上游参数与缓存键：不同关键词分别请求，相同关键词命中缓存
     assert calls == [
         {"channel": "search", "keyword": "华语", "page": "1"},
