@@ -1179,6 +1179,82 @@ progress=end
     assert reason == "ok"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decoded_time, keep_flac", [
+    ("00:03:41.200000", True),
+    ("00:00:12.000000", False),
+], ids=["trailing-error", "midstream-error"])
+async def test_lx_stream_tee_decode_error_preserves_only_complete_audio(
+    env, monkeypatch, tmp_path, decoded_time, keep_flac,
+):
+    import subprocess
+
+    guid = "online:lx:kw:38526274"
+    data = b"fLaC" + b"F" * 4096 + b"ID3TRAIL"
+    first_chunk = data[:1024]
+    checked_parts = []
+    registrations = []
+    finalized = []
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    monkeypatch.setattr(appmod, "_LOSSLESS_BAD", {})
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    monkeypatch.setattr(appmod, "write_audio_tags", lambda *args: None)
+    monkeypatch.setattr(appmod, "_dispatch_official_binding", lambda *args: None)
+
+    def fake_run(args, **kwargs):
+        part = args[args.index("-i") + 1]
+        with open(part, "rb") as f:
+            assert f.read() == data
+        checked_parts.append(part)
+        return subprocess.CompletedProcess(args, 183, "", f"""
+  Duration: 00:03:41.20, start: 0.000000, bitrate: 980 kb/s
+[flac @ 0x1] invalid sync code
+[flac @ 0x1] invalid frame header
+[flac @ 0x1] decode_frame() failed
+out_time={decoded_time}
+progress=end
+""")
+
+    def register(request, track_guid, reason):
+        registrations.append((track_guid, track_guid in appmod._tee_active, reason))
+        assert checked_parts and not os.path.exists(checked_parts[0])
+        return True
+
+    async def post_finalize(meta):
+        finalized.append(meta)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(appmod, "_register_background_fetch", register)
+    response = httpx.Response(200, stream=_Whole(data[len(first_chunk):]), headers={
+        "content-type": "audio/flac", "content-length": str(len(data))})
+    streamed = appmod.stream_tee_response(
+        response, guid, None, resolved_ext="flac",
+        pre_info={"title": "t", "artist": "a"},
+        first_chunk=first_chunk, chunks=response.aiter_bytes(chunk_size=1024),
+        post_finalize=post_finalize,
+    )
+    body = b"".join([part async for part in streamed.body_iterator])
+
+    assert body == data
+    assert response.is_closed
+    assert len(checked_parts) == 1
+    assert not os.path.exists(checked_parts[0])
+    assert guid not in appmod._tee_active
+    assert not list(tmp_path.rglob("*.part"))
+    assert appmod._lossless_is_blacklisted(guid) is not keep_flac
+    library = tmp_path / "library"
+    if keep_flac:
+        dest = library / "a - t.flac"
+        assert dest.read_bytes() == data
+        assert list(library.iterdir()) == [dest]
+        assert len(finalized) == 1 and finalized[0]["dest"] == str(dest)
+        assert registrations == []
+    else:
+        assert list(library.iterdir()) == []
+        assert finalized == []
+        assert registrations == [(guid, False, "tee_save_enabled")]
+
+
 def test_check_audio_file_rejects_midstream_decode_error(env, monkeypatch, tmp_path):
     """坏帧出现在中途、解出时长远短于容器时长时仍然拒绝。"""
     import subprocess
