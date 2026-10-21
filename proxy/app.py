@@ -5371,6 +5371,59 @@ async def _promote_deferred_cache(headers: dict, guid: str, cached: str,
         logger.warning("deferred cache promote failed for %s: %s", guid, type(e).__name__)
 
 
+_rolling_promote_active: "set[str]" = set()
+
+
+async def _promote_rolling_cache(guid: str, headers: "dict | None",
+                                 cached: "str | None" = None) -> None:
+    """收藏/加歌单触达的滚动缓存转存进曲库（issue #82）。
+
+    边听边存关闭时播放只落滚动缓存，官方扫描不进 cache 目录；用户显式收藏
+    即是要求入库，复用转正链（元数据兜底 → 曲库安装 → 歌词/扫描/官方绑定）。
+    缓存文件与暂存形态同经 tee finalize 的无损解码校验，此处不再重复校验；
+    元数据缺失或落盘失败时保持缓存形态（意图留 pending，由列表读取自愈重试），
+    绝不删文件。已在曲库的文件维持"直接尝试官方绑定"的既有语义。
+    """
+    try:
+        if cached is None:
+            cached = find_cache_file(guid)
+        if not cached or not _is_rolling_cache_stem(cached, guid):
+            _dispatch_official_binding(guid, headers, None)
+            return
+        src: dict = {}
+        title, artist, album = _tee_metadata_fallback(guid, "", "", "", src)
+        title = strip_source_tag(title)
+        if not (title and artist):
+            logger.warning(
+                "rolling cache promote missing metadata for %s：保持缓存形态待自愈重试", guid)
+            return
+        ext = os.path.splitext(cached)[1].lstrip(".").lower() or "mp3"
+        dest, _reused = await asyncio.to_thread(
+            _install_library_audio, cached, guid, ext, title, artist, album, src)
+        meta = {"dest": dest, "title": title, "artist": artist, "album": album}
+        await _auto_lyric_after_finalize(_synth_request(headers or {}), guid, meta)
+        _schedule_library_scan(headers)
+        _dispatch_official_binding(guid, headers, meta)
+        fn_diag(logger, "tee_saved", guid=guid, title=title, artist=artist, ext=ext,
+                tee=False, promoted=1)
+        logger.info("rolling cache promoted into library for %s: %s", guid, dest)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("rolling cache promote failed for %s: %s", guid, type(e).__name__)
+    finally:
+        _rolling_promote_active.discard(guid)
+
+
+def _schedule_rolling_promote(guid: str, headers: "dict | None",
+                              cached: "str | None" = None) -> None:
+    """转存去重调度：同 guid 在途不重复搬文件（重复收藏/列表自愈并发触发）。"""
+    if guid in _rolling_promote_active:
+        return
+    _rolling_promote_active.add(guid)
+    asyncio.create_task(_promote_rolling_cache(guid, headers, cached))
+
+
 async def _auto_lyric_after_finalize(request: Request, guid: str, meta: dict | None) -> None:
     """音乐完整落库成功后补齐歌词（FNMUSIC_LYRIC_AUTO_DL，默认关）。
 
@@ -5602,9 +5655,12 @@ def stream_tee_response(
                     else:
                         retained = None
                     try:
-                        meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_enabled, retained)
+                        # 播放期间已收藏/加歌单的 guid 按入库语义 finalize（issue #82）：
+                        # 边听边存关闭时也直接进曲库，否则收藏意图无人调度只能空等超时
+                        tee_effective = tee_enabled or bool(_bind_pending.get(guid))
+                        meta = await asyncio.to_thread(_tee_finalize, to_finalize, guid, ext, info, tee_effective, retained)
                         if not meta:
-                            retry_corrupt_tee = tee_enabled and _lossless_is_blacklisted(guid)
+                            retry_corrupt_tee = tee_effective and _lossless_is_blacklisted(guid)
                         else:
                             # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
                             if post_finalize is not None:
@@ -5614,7 +5670,7 @@ def stream_tee_response(
                                 # 元数据缺失暂存 cache 的曲目不触发曲库扫描/官方绑定，
                                 # 待转正后由 _promote_deferred_cache 统一调度
                                 _schedule_library_scan(scan_headers)
-                            if tee_enabled and not meta.get("deferred"):
+                            if tee_effective and not meta.get("deferred"):
                                 # 官方绑定意图（收藏/歌单）统一在下载落库完成后调度
                                 _dispatch_official_binding(guid, scan_headers, meta)
                     except Exception as exc:
@@ -6011,15 +6067,20 @@ def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
 
     下载不与边听边存重复：tee 正在流式下载或后台任务在途时只登记意图，由对应
     完成路径（tee 转正 / 后台整轨下载 / 切歌续传）统一调度官方绑定。文件已在
-    库时无需下载，直接尝试官方绑定（官方可能已扫入库）。
+    曲库时无需下载，直接尝试官方绑定（官方可能已扫入库）；命中的只是试听/
+    暂存缓存时先转存进曲库（issue #82：官方扫描不进 cache 目录，空等必超时）。
     """
     if not CONF.get("fav_auto_bind"):
         return
     headers = copy_incoming_headers(request)
     if user_guid:
         _register_bind_intent(guid, user_guid, headers, playlist_guid)
-    if find_cache_file(guid):
-        _dispatch_official_binding(guid, headers, None)
+    cached = find_cache_file(guid)
+    if cached:
+        if _is_rolling_cache_stem(cached, guid):
+            _schedule_rolling_promote(guid, headers, cached)
+        else:
+            _dispatch_official_binding(guid, headers, None)
         return
     _register_background_fetch(request, guid, "fav_auto_bind")
 
@@ -6801,7 +6862,11 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
         for guid in guids[:_BIND_RETRY_BATCH]:
             _register_bind_intent(guid, user_guid, headers, playlist_guid)
     for guid in uniq[:_BIND_RETRY_BATCH]:
-        if find_cache_file(guid):
+        cached = find_cache_file(guid)
+        if cached and _is_rolling_cache_stem(cached, guid):
+            # 试听/暂存缓存先转存进曲库，再由转存完成路径调度绑定（issue #82）
+            _schedule_rolling_promote(guid, headers, cached)
+        elif cached:
             _dispatch_official_binding(guid, headers, None)
 
 
