@@ -29,6 +29,9 @@ import os
 import re
 import shutil
 import time
+import uuid
+import weakref
+from functools import wraps
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("fnmusic-ext.transcode")
@@ -60,12 +63,33 @@ class Session:
     watcher: asyncio.Task | None = None
     src: str = ""                     # 转码输入源；产出不足时探测音源真实时长用
     headers: dict | None = None
+    rendition: str = field(default_factory=lambda: uuid.uuid4().hex)
+    source_fingerprint: dict = field(default_factory=dict)
+    on_failure: object = None
+    src_kind: str = "online"          # local|online：同一 guid 换版本重建的分片混用防线
 
 
 # guid → Session；仅存活进程在内，done 会话按磁盘 state.json 复用
 _SESSIONS: dict[str, Session] = {}
 _SLOT_COND: asyncio.Condition | None = None
 _ACTIVE = 0
+# Playback outlives ffmpeg: completed disk sessions need a heartbeat/quit lease too.
+_PLAYBACK_LEASES: dict[str, tuple[Session, float, float]] = {}
+# guid → Lock；弱值字典：持锁协程的局部引用维持条目存活，全部结束后自动回收，
+# 常驻进程不随历史 guid 无界累积。
+_SESSION_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+
+
+def _serialized(fn):
+    @wraps(fn)
+    async def locked(guid, *args, **kwargs):
+        lock = _SESSION_LOCKS.get(guid)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SESSION_LOCKS[guid] = lock
+        async with lock:
+            return await fn(guid, *args, **kwargs)
+    return locked
 
 
 def _slot_cond() -> asyncio.Condition:
@@ -100,6 +124,9 @@ def _write_state(sess: Session) -> None:
                 "bitrate": sess.bitrate,
                 "started_ts": sess.started_ts,
                 "done_ts": sess.done_ts,
+                "src_kind": sess.src_kind,
+                "rendition": sess.rendition,
+                "source_fingerprint": sess.source_fingerprint,
             }, f)
     except Exception as e:  # noqa: BLE001
         logger.warning("write state failed for %s: %s", sess.guid, e)
@@ -206,7 +233,11 @@ async def _watch(sess: Session) -> None:
         sess.status = "failed"
         _remove_dir(sess.directory)
         _SESSIONS.pop(sess.guid, None)
-    sess.exit_event.set()
+    try:
+        if sess.status == "failed" and callable(sess.on_failure):
+            sess.on_failure(sess)
+    finally:
+        sess.exit_event.set()
 
 
 async def _finalize_complete_output(sess: Session) -> None:
@@ -261,6 +292,7 @@ def _touch_state(directory: str) -> None:
         pass
 
 
+@_serialized
 async def ensure_session(
     guid: str,
     src: str,
@@ -272,6 +304,8 @@ async def ensure_session(
     max_active: int = 2,
     max_cache_bytes: int = 512 * 1024 * 1024,
     headers: dict | None = None,
+    source_fingerprint: dict | None = None,
+    on_failure=None,
 ) -> Session | None:
     """取或建转码会话；ffmpeg 不可用 / 启动失败返回 None（调用方回落单分片桩）。"""
     directory = session_dir(root, guid)
@@ -281,18 +315,14 @@ async def ensure_session(
         alive.last_beat = time.monotonic()
         return alive
 
+    if alive and alive.watcher and not alive.watcher.done():
+        await asyncio.shield(alive.watcher)
     state = _usable_cache(directory)
+    if state and source_fingerprint is not None and state.get("source_fingerprint") != source_fingerprint:
+        state = None
     if state:
-        sess = Session(
-            guid=guid, directory=directory,
-            duration_s=float(state.get("duration_s") or duration_s or 0),
-            hls_time=float(state.get("hls_time") or hls_time),
-            declared_count=int(state.get("declared_count") or 1),
-            bitrate=str(state.get("bitrate") or bitrate),
-            status="done",
-        )
         _touch_state(directory)
-        return sess
+        return _reused_session_from_state(guid, directory, state, duration_s, hls_time, bitrate)
 
     if not FFMPEG_BIN:
         return None
@@ -321,8 +351,11 @@ async def ensure_session(
         guid=guid, directory=directory, duration_s=duration_s,
         hls_time=hls_time, declared_count=_declared_count(duration_s, hls_time),
         bitrate=bitrate, src=src, headers=headers,
+        source_fingerprint=source_fingerprint or {}, on_failure=on_failure,
+        src_kind="local" if src and not src.startswith(("http://", "https://")) else "online",
     )
     _write_state(sess)
+    _SESSIONS[guid] = sess
     try:
         sess.proc = await asyncio.create_subprocess_exec(
             *_ffmpeg_argv(src, headers, sess, directory),
@@ -335,6 +368,8 @@ async def ensure_session(
             _ACTIVE = max(0, _ACTIVE - 1)
             _slot_cond().notify(1)
         _remove_dir(directory)
+        if _SESSIONS.get(guid) is sess:
+            _SESSIONS.pop(guid, None)
         return None
     sess.status = "running"
     _SESSIONS[guid] = sess
@@ -344,9 +379,26 @@ async def ensure_session(
 
 def get_session(guid: str) -> Session | None:
     sess = _SESSIONS.get(guid)
+    if sess and sess.status in ("failed", "aborted"):
+        return None
     if sess:
         sess.last_beat = time.monotonic()
     return sess
+
+
+def _reused_session_from_state(guid: str, directory: str, state: dict,
+                               duration_s: float, hls_time: float, bitrate: str) -> Session:
+    return Session(
+        guid=guid, directory=directory,
+        duration_s=float(state.get("duration_s") or duration_s or 0),
+        hls_time=float(state.get("hls_time") or hls_time),
+        declared_count=int(state.get("declared_count") or 1),
+        bitrate=str(state.get("bitrate") or bitrate),
+        status="done",
+        src_kind=str(state.get("src_kind") or "online"),
+        rendition=str(state.get("rendition") or "legacy"),
+        source_fingerprint=state.get("source_fingerprint") or {},
+    )
 
 
 def peek_cached(guid: str, root: str) -> Session | None:
@@ -355,25 +407,58 @@ def peek_cached(guid: str, root: str) -> Session | None:
     state = _usable_cache(directory)
     if not state:
         return None
+    if not state.get("rendition"):
+        # 升级遗留缓存无 rendition：按目录确定性铸造，并发首播的两次触碰得到
+        # 同一值，不再各持不同 rendition 互踢导致其中一方分片 404。
+        state["rendition"] = uuid.uuid5(uuid.NAMESPACE_URL, f"fnmusic-legacy:{directory}").hex
+        sess = _reused_session_from_state(guid, directory, state, 0, 10.0, "128k")
+        _write_state(sess)
+        return sess
     _touch_state(directory)
-    return Session(
-        guid=guid, directory=directory,
-        duration_s=float(state.get("duration_s") or 0),
-        hls_time=float(state.get("hls_time") or 10.0),
-        declared_count=int(state.get("declared_count") or 1),
-        bitrate=str(state.get("bitrate") or "128k"),
-        status="done",
-    )
+    return _reused_session_from_state(guid, directory, state, 0, 10.0, "128k")
+
+
+def _prune_playback_leases() -> None:
+    now = time.monotonic()
+    for guid, (sess, until, _) in list(_PLAYBACK_LEASES.items()):
+        if (now >= until or sess.status in ("failed", "aborted")
+                or (sess.status == "done" and not os.path.isfile(os.path.join(sess.directory, INIT_NAME)))):
+            _PLAYBACK_LEASES.pop(guid, None)
+
+
+def lease_playback(sess: Session, ttl_s: float = 90.0) -> None:
+    """Pin the exposed rendition until quit or inactivity; no filesystem writes."""
+    _prune_playback_leases()
+    ttl = max(1.0, float(ttl_s))
+    _PLAYBACK_LEASES[sess.guid] = (sess, time.monotonic() + ttl, ttl)
+
+
+def playback_session(guid: str) -> Session | None:
+    _prune_playback_leases()
+    lease = _PLAYBACK_LEASES.get(guid)
+    return lease[0] if lease else None
+
+
+def playback_in_use(directory: str | None = None) -> bool:
+    _prune_playback_leases()
+    return any(directory is None or os.path.abspath(sess.directory) == os.path.abspath(directory)
+               for sess, _, _ in _PLAYBACK_LEASES.values())
 
 
 def heartbeat(guid: str) -> None:
+    _prune_playback_leases()
+    lease = _PLAYBACK_LEASES.get(guid)
+    if lease:
+        lease_playback(lease[0], lease[2])
     sess = _SESSIONS.get(guid)
     if sess:
         sess.last_beat = time.monotonic()
 
 
+@_serialized
 async def quit_session(guid: str) -> None:
     """App 主动结束：杀进程；已完整缓存保留复用，半成品清理。"""
+    _PLAYBACK_LEASES.pop(guid, None)
     sess = _SESSIONS.pop(guid, None)
     if not sess or not sess.proc:
         return
@@ -384,6 +469,56 @@ async def quit_session(guid: str) -> None:
         sess.proc.kill()
     except ProcessLookupError:
         pass
+    if sess.watcher:
+        await asyncio.shield(sess.watcher)
+
+
+def session_kind(sess: "Session | None") -> str:
+    """会话实际音频来源：local（曲库文件直连）/ online。"""
+    if sess is None:
+        return ""
+    return sess.src_kind or "online"
+
+
+async def wait_startup(sess: Session, timeout: float = 20.0) -> bool:
+    """起播校验：等初始化文件与首个分片成形；会话失败或超时返回 False。
+
+    本地文件输入的会话在返回播放清单前必须通过此校验，失败由调用方清理
+    会话后换在线输入重建，避免客户端拿到永不产片的空清单。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if sess.status in ("failed", "aborted"):
+            return False
+        if os.path.isfile(os.path.join(sess.directory, INIT_NAME)):
+            if sess.status == "done" or _produced_count(sess.directory) >= 1:
+                return True
+        if sess.exit_event.is_set():
+            return sess.status == "done" and bool(
+                os.path.isfile(os.path.join(sess.directory, INIT_NAME)))
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.2)
+
+
+@_serialized
+async def discard_session(guid: str, expected: Session | None = None) -> None:
+    """Wait for the old watcher before allowing reuse of its directory."""
+    sess = _SESSIONS.get(guid)
+    if sess is None or (expected is not None and sess is not expected):
+        return
+    _PLAYBACK_LEASES.pop(guid, None)
+    sess.status = "aborted"
+    if sess.proc and sess.proc.returncode is None:
+        try:
+            sess.proc.kill()
+        except ProcessLookupError:
+            pass
+    if sess.watcher:
+        await asyncio.shield(sess.watcher)
+    _remove_dir(sess.directory)
+    if _SESSIONS.get(guid) is sess:
+        _SESSIONS.pop(guid, None)
 
 
 def _kill_expired(ttl_s: float) -> None:
@@ -412,7 +547,7 @@ def _reap_expired(root: str, ttl_s: float) -> int:
         if _usable_cache(d):
             continue
         # 半成品且无在管进程（内存注册表里没有指向它的会话）
-        if not any(s.directory == d for s in _SESSIONS.values()):
+        if not playback_in_use(d) and not any(s.directory == d for s in _SESSIONS.values()):
             _remove_dir(d)
             removed += 1
     return removed
@@ -451,6 +586,8 @@ async def _enforce_quota(root: str, max_bytes: int) -> None:
     for atime, d, size in sorted(entries):
         if total <= max_bytes:
             break
+        if playback_in_use(d):
+            continue
         logger.info("transcode cache LRU evict: %s (%d bytes)", d, size)
         _remove_dir(d)
         total -= size
@@ -498,5 +635,6 @@ async def maintain(root: str, ttl_s: float, max_bytes: int) -> None:
 
 
 async def shutdown_all() -> None:
+    _PLAYBACK_LEASES.clear()
     for guid in list(_SESSIONS):
         await quit_session(guid)

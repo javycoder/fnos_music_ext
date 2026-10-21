@@ -719,8 +719,8 @@ def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
     assert resp.content == b"\xFF\xD8\xFFmigu2"
 
 
-def test_static_cover_playlist_without_covers_returns_404(tmp_path, monkeypatch):
-    """歌单内全部曲目无封面 → 404（客户端回落自带默认样式，不再给占位图）。"""
+def test_static_cover_playlist_without_covers_returns_placeholder(tmp_path, monkeypatch):
+    """歌单内全部曲目无封面时返回不可缓存的有效图片。"""
     rec_dir = _cover_env(tmp_path, monkeypatch)
     tracks = [
         {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
@@ -730,7 +730,9 @@ def test_static_cover_playlist_without_covers_returns_404(tmp_path, monkeypatch)
 
     with TestClient(app) as client:
         resp = client.get(f"/music/api/v1/static/cover?coverId={pl_guid}&size=120", follow_redirects=False)
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.content.startswith(b"\x89PNG")
 
 
 def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkeypatch):

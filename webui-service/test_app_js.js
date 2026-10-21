@@ -34,7 +34,11 @@ function stubEl() {
     removeChild(child) { return child; },
     remove() {},
     // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
-    dispatch(type) { (listeners[type] || []).slice().forEach((fn) => fn({ type })); },
+    dispatch(type, props = {}) { return Promise.all((listeners[type] || []).slice().map((fn) => fn({ type, ...props }))); },
+    get options() {
+      return Array.from(this.innerHTML.matchAll(/<option value="([^"]*)"/g), (match) => ({ value: match[1] }));
+    },
+    focus() { document.activeElement = this; },
     // 测试用：重置标量状态但保留元素身份与监听器——app.js 在加载期把监听器
     // 绑到元素上，元素必须终身同一个对象（真实 DOM 亦如此），不能整体换新
     _resetState() {
@@ -67,7 +71,7 @@ global.document = {
   },
   body: stubEl(),
 };
-global.window = { addEventListener() {} };
+global.window = stubEl();
 // 日志导出的 blob 下载链路（URL.createObjectURL + a[download]）
 const createdUrls = [];
 global.URL.createObjectURL = (blob) => { createdUrls.push(blob); return `blob:fake-${createdUrls.length}`; };
@@ -113,7 +117,8 @@ function enqueue(p, ...bodies) {
 
 global.fetch = async (url, options = {}) => {
   const p = String(url).split("?")[0];
-  fetchCalls.push({ path: p, method: (options.method || "GET").toUpperCase(), body: options.body });
+  // 记录完整 URL（含 query）：公共歌单搜索等用例需要断言查询参数契约
+  fetchCalls.push({ path: p, url: String(url), method: (options.method || "GET").toUpperCase(), body: options.body });
   if (routes.has(p) && routes.get(p).length) {
     const body = routes.get(p).shift();
     if (body && body.__rawResponse) { return body.resp; }
@@ -221,6 +226,148 @@ test("syncNeteaseAccount：未登录清空 / 请求失败清空", async () => {
   enqueue("/app/fnmusic-ext/api/netease/auth/status", new Error("down"));
   await global.syncNeteaseAccount();
   assert.strictEqual(els.get("#qr-check").textContent, "");
+});
+
+test("大模型：接口完整也默认不勾选，隐藏参数保留缺省值", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LLM_BASE_URL: "https://example.test/v1", FNMUSIC_LLM_API_KEY: "secret",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#llm-liked").checked, false);
+  assert.strictEqual(els.get("#llm-daily").checked, false);
+  assert.strictEqual(els.get("#llm-liked-settings").hidden, true);
+  assert.strictEqual(els.get("#llm-api-warning").hidden, true);
+  assert.strictEqual(els.get("#liked-refresh-hours").value, "0.5");
+  assert.strictEqual(els.get("#liked-size").value, "20");
+  const values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_LLM_LIKED_ENABLED, false);
+  assert.strictEqual(values.FNMUSIC_LLM_DAILY_ENABLED, false);
+  assert.ok(!("FNMUSIC_LIKED_SIZE" in values));
+});
+
+test("大模型：已存空白参数不在回填时静默恢复默认", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LLM_LIKED_ENABLED: "true", FNMUSIC_LIKED_SIZE: "", FNMUSIC_LIKED_REFRESH_HOURS: "",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#liked-size").value, "");
+  assert.strictEqual(els.get("#liked-refresh-hours").value, "");
+  assert.throws(() => global.collectConfig(), /必须是/);
+});
+
+test("大模型：取消猜你喜欢隐藏但不清空，保存不覆盖已存参数", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LLM_LIKED_ENABLED: "true", FNMUSIC_LIKED_SIZE: "0", FNMUSIC_LIKED_REFRESH_HOURS: "100000.25",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#llm-liked-settings").hidden, false);
+  assert.strictEqual(global.collectConfig().FNMUSIC_LIKED_SIZE, 0);
+  assert.strictEqual(global.collectConfig().FNMUSIC_LIKED_REFRESH_HOURS, 100000.25);
+  els.get("#llm-liked").checked = false;
+  els.get("#llm-liked").dispatch("change");
+  assert.strictEqual(els.get("#llm-liked-settings").hidden, true);
+  assert.strictEqual(els.get("#liked-size").value, "0");
+  assert.strictEqual(els.get("#liked-refresh-hours").value, "100000.25");
+  els.get("#liked-size").value = "";
+  els.get("#liked-refresh-hours").value = "invalid";
+  const values = global.collectConfig();
+  assert.ok(!("FNMUSIC_LIKED_SIZE" in values));
+  assert.ok(!("FNMUSIC_LIKED_REFRESH_HOURS" in values));
+  await global.saveConfig();
+  const saved = JSON.parse(fetchCalls.find((c) => c.method === "PUT").body).values;
+  assert.strictEqual(saved.FNMUSIC_LLM_LIKED_ENABLED, false);
+  assert.ok(!("FNMUSIC_LIKED_SIZE" in saved));
+  assert.ok(!("FNMUSIC_LIKED_REFRESH_HOURS" in saved));
+});
+
+test("大模型：任一用途显式勾选且接口不完整才警告，输入即时更新", async () => {
+  for (const flag of ["#llm-liked", "#llm-daily"]) {
+    reset();
+    await global.loadConfig();
+    els.get(flag).checked = true;
+    els.get(flag).dispatch("change");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, false);
+    assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+    els.get("#llm-base").value = "https://example.test/v1";
+    els.get("#llm-base").dispatch("input");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, false);
+    els.get("#llm-key").value = "secret";
+    els.get("#llm-key").dispatch("input");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, true);
+    els.get("#llm-base").value = "  ";
+    els.get("#llm-base").dispatch("input");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, false);
+    els.get(flag).checked = false;
+    els.get(flag).dispatch("change");
+    assert.strictEqual(els.get("#llm-api-warning").hidden, true);
+  }
+});
+
+test("猜你喜欢：有限小时无上限，整数数量端点与小数小时完整提交", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LLM_LIKED_ENABLED: "true" } });
+  await global.loadConfig();
+  for (const hours of ["0.5", "0.51", "1.75", "100000.25", "1e100"]) {
+    for (const size of ["0", "20", "100"]) {
+      els.get("#liked-refresh-hours").value = hours;
+      els.get("#liked-size").value = size;
+      const values = global.collectConfig();
+      assert.strictEqual(values.FNMUSIC_LIKED_REFRESH_HOURS, Number(hours));
+      assert.strictEqual(values.FNMUSIC_LIKED_SIZE, Number(size));
+    }
+  }
+});
+
+test("猜你喜欢：无效编辑不截断、不静默恢复默认、不发 PUT", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LLM_LIKED_ENABLED: "true" } });
+  await global.loadConfig();
+  for (const [selector, badValues] of [
+    ["#liked-size", ["", " ", "20.9", "20junk", "-1", "101", "NaN", "Infinity"]],
+    ["#liked-refresh-hours", ["", " ", "0", "0.49", "-1", "0.5junk", "NaN", "Infinity", "1e9999"]],
+  ]) {
+    for (const bad of badValues) {
+      els.get("#liked-size").value = "20";
+      els.get("#liked-refresh-hours").value = "0.5";
+      els.get(selector).value = bad;
+      assert.throws(() => global.collectConfig(), /必须是/);
+      await global.saveConfig();
+      assert.ok(els.get("#toast").textContent.includes("必须是"));
+      assert.strictEqual(fetchCalls.some((c) => c.method === "PUT"), false);
+    }
+  }
+});
+
+test("猜你喜欢参数输入标脏，每日用途不影响每日总开关", async () => {
+  reset();
+  await global.loadConfig();
+  for (const selector of ["#liked-size", "#liked-refresh-hours"]) {
+    global.clearDirty();
+    els.get(selector).dispatch("input");
+    assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+  }
+  els.get("#recommend-daily").checked = true;
+  els.get("#llm-daily").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_RECOMMEND_DAILY, true);
+  els.get("#llm-daily").checked = true;
+  assert.strictEqual(global.collectConfig().FNMUSIC_LLM_DAILY_ENABLED, true);
+  els.get("#recommend-daily").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_RECOMMEND_DAILY, false);
+});
+
+test("大模型页面：无最大小时限制、初始隐藏且语义说明完整", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const hours = html.match(/<input[^>]*id="liked-refresh-hours"[^>]*>/)[0];
+  assert.ok(!/\bmax=/.test(hours));
+  assert.ok(hours.includes('step="any"'));
+  assert.ok(html.includes('id="llm-liked-settings" hidden'));
+  assert.ok(html.includes('id="llm-api-warning" role="status" hidden'));
+  for (const phrase of ["不会自动启用", "首次被客户端获取", "不会到期或轮换", "本地有效、未收藏候选至少 20 首", "停止生成且不展示猜你喜欢"]) {
+    assert.ok(html.includes(phrase), phrase);
+  }
 });
 
 test("markDirty / clearDirty：save-bar 的 show 类显隐与文案同步", () => {
@@ -364,6 +511,42 @@ test("saveConfig：自动取消失效源后提示保存成功并刷新激活状�
   assert.strictEqual(els.get("#save-btn").disabled, false);
 });
 
+test("saveConfig：服务故障的源保留激活并如实提示，不谎报已取消激活", async () => {
+  reset();
+  const items = [
+    { name: "故障源", url: "file:///down.js", active: true },
+  ];
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_LIST: JSON.stringify(items),
+  } });
+  await global.loadConfig();
+  global.markDirty();
+  enqueue("/app/fnmusic-ext/api/config", {
+    ok: true, changed: ["LX_SOURCE_LIST"],
+    actions: [
+      { kind: "lx_activate", op: "activate", source: "故障源", ok: false,
+        error: "服务未就绪", category: "service_unavailable" },
+    ],
+    warnings: [{ source: "故障源", url: "file:///down.js", message: "服务未就绪",
+                 category: "service_unavailable" }],
+  }, { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_URL: "file:///down.js",
+    LX_SOURCE_LIST: JSON.stringify(items),
+  } });
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    await global.saveConfig();
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+  const message = els.get("#toast").textContent;
+  assert.ok(message.includes("「故障源」服务暂不可用，激活配置已保留（服务未就绪）"));
+  assert.ok(!message.includes("已自动取消激活"));
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
 test("collectConfig：全部源自动停用后仍可保存其它设置且不恢复旧激活标记", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: {
@@ -382,17 +565,31 @@ test("collectConfig：全部源自动停用后仍可保存其它设置且不恢�
   }
 });
 
-test("lxUploadScript：lxmusic 未运行时先拉预览再重试", async () => {
+test("洛雪测试：服务失败直接显示，不拉预览或重复校验", async () => {
   reset();
-  // 第一次 upload 502（进程未起），预览成功后重试成功
-  enqueue("/app/fnmusic-ext/api/lx/upload", new Error("lxmusic 服务不可达"));
-  enqueue("/app/fnmusic-ext/api/preview", { ok: true, preview: true });
-  enqueue("/app/fnmusic-ext/api/lx/upload", {
-    ok: true,
-    data: { path: "/p", url: "file:///p", meta: { name: "n" } },
-  });
-  const r = await global.lxUploadScript("a.js", "/*s*/");
-  assert.strictEqual(r.ok, true);
+  $("#lx-url").value = "https://example.com/source.js";
+  enqueue("/app/fnmusic-ext/api/lx/verify", new Error("洛雪脚本服务 lxserver 不可连接"));
+  $("#lx-test").dispatch("click");
+  await tick(0);
+  assert.ok($("#lx-report").textContent.includes("lxserver 不可连接"));
+  assert.strictEqual(global.fetchCalls.filter((c) => c.path.endsWith("/api/lx/verify")).length, 1);
+  assert.strictEqual(global.fetchCalls.filter((c) => c.path.endsWith("/api/preview")).length, 0);
+});
+
+test("lxUploadScript：就绪补启交给后端，失败不再重复提交", async () => {
+  reset();
+  // issue #78：后端负责补启 lxserver/lxmusic；前端只提交一次，失败直接上抛
+  enqueue("/app/fnmusic-ext/api/lx/upload", new Error("洛雪脚本服务 lxserver 不可连接"));
+  let rejected = false;
+  try {
+    await global.lxUploadScript("a.js", "/*s*/");
+  } catch (_) {
+    rejected = true;
+  }
+  assert.strictEqual(rejected, true);
+  // 提交次数必须为 1（重复提交会把同一脚本导入两次）
+  const uploads = global.fetchCalls.filter((c) => c.path === "/app/fnmusic-ext/api/lx/upload");
+  assert.strictEqual(uploads.length, 1);
 });
 
 test("网易账号歌单开关：loadConfig 回填 + collectConfig 收集", async () => {
@@ -679,6 +876,863 @@ test("switchPage('about') 顺带触发检查更新", async () => {
   await new Promise((r) => realSetTimeout(r, 0));
   assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/update-check"));
   assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
+});
+
+const CLEANUP_PATH = "/app/fnmusic-ext/api/maintenance/cleanup";
+const cleanupResponse = (status, extra = {}) => ({ ok: true, job: {
+  id: "cleanup-1", status, phase: "scan", scanned: 10, removed: 2,
+  bytes: 1024, skipped: 8, errors: [], details: [], ...extra,
+} });
+
+test("清理 Beta：默认取消焦点，按钮/Escape/遮罩取消均不请求；卡片内点击不取消", () => {
+  global.openCleanupModal();
+  assert.strictEqual(document.activeElement, els.get("#cleanup-cancel-btn"));
+  window.dispatch("keydown", { key: "Tab", preventDefault() {} });
+  assert.strictEqual(document.activeElement, els.get("#cleanup-confirm-btn"));
+  window.dispatch("keydown", { key: "Tab", preventDefault() {} });
+  assert.strictEqual(document.activeElement, els.get("#cleanup-cancel-btn"));
+  els.get("#cleanup-cancel-btn").dispatch("click");
+  assert.strictEqual(els.get("#cleanup-modal").hidden, true);
+  assert.strictEqual(document.activeElement, els.get("#cleanup-open-btn"));
+  global.openCleanupModal();
+  window.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.strictEqual(els.get("#cleanup-modal").hidden, true);
+  global.openCleanupModal();
+  const mask = els.get("#cleanup-modal");
+  mask.dispatch("click", { target: {}, currentTarget: mask });
+  assert.strictEqual(mask.hidden, false);
+  mask.dispatch("click", { target: mask, currentTarget: mask });
+  assert.strictEqual(mask.hidden, true);
+  assert.strictEqual(fetchCalls.length, 0);
+});
+
+test("清理 Beta：确认 POST，双击及重复点击只展示同任务，GET 轮询进度至完成，详情安全输出", async () => {
+  enqueue(CLEANUP_PATH, cleanupResponse("running"));
+  global.openCleanupModal();
+  const first = global.startCleanup();
+  await global.startCleanup();
+  await first;
+  const post = fetchCalls.filter((c) => c.method === "POST");
+  assert.strictEqual(post.length, 1);
+  assert.deepStrictEqual(JSON.parse(post[0].body), { confirm_beta: true });
+  assert.ok(els.get("#cleanup-status").textContent.includes("清理中"));
+  assert.ok(els.get("#cleanup-status").textContent.includes("已扫描 10"));
+  enqueue(CLEANUP_PATH + "/cleanup-1", cleanupResponse("running", { scanned: 20 }));
+  global.openCleanupModal();
+  await tick(5);
+  assert.strictEqual(fetchCalls.filter((c) => c.method === "POST").length, 1);
+  assert.strictEqual(els.get("#cleanup-modal").hidden, true);
+  assert.ok(els.get("#cleanup-status").textContent.includes("已扫描 20"));
+  const attack = '<img src=x onerror="alert(1)">';
+  enqueue(CLEANUP_PATH + "/cleanup-1", cleanupResponse("completed", {
+    details: [attack, { path: attack }], errors: [attack],
+  }));
+  await tick(1100); // 真正触发自动 GET 轮询
+  assert.ok(els.get("#cleanup-status").textContent.includes("清理完成"));
+  assert.ok(els.get("#cleanup-status").textContent.includes("1.0 KB"));
+  assert.ok(els.get("#cleanup-details").textContent.includes(attack));
+  assert.strictEqual(els.get("#cleanup-details").innerHTML, "");
+  assert.strictEqual(els.get("#cleanup-details").hidden, false);
+  const count = fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length;
+  await tick(1100);
+  assert.strictEqual(fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length, count); // terminal 状态停表
+});
+
+test("清理 Beta：释放空间按 KB/MB/GB 友好显示", () => {
+  assert.strictEqual(global.formatCleanupBytes(512), "0.5 KB");
+  assert.strictEqual(global.formatCleanupBytes(1024 * 1024), "1.0 MB");
+  assert.strictEqual(global.formatCleanupBytes(33996008), "32.4 MB");
+  assert.strictEqual(global.formatCleanupBytes(1024 * 1024 * 1024), "1.0 GB");
+  const friendlyJob = cleanupResponse("completed", {
+    bytes: 33996008,
+    categories: { temporary: { scanned: 2, removed: 2, bytes: 33996008, skipped: 0 } },
+  }).job;
+  assert.strictEqual(friendlyJob.bytes, 33996008);
+  global.renderCleanupJob(friendlyJob);
+  assert.ok(
+    els.get("#cleanup-status").textContent.includes("32.4 MB"),
+    els.get("#cleanup-status").textContent
+  );
+  assert.ok(els.get("#cleanup-details").textContent.includes("temporary：扫描 2，删除 2，释放 32.4 MB，跳过 0"));
+});
+
+test("清理 Beta：查询失败保留任务，重试只 GET，failed 停止轮询", async () => {
+  enqueue(CLEANUP_PATH, cleanupResponse("running"));
+  global.openCleanupModal();
+  await global.startCleanup();
+  enqueue(CLEANUP_PATH + "/cleanup-1", new Error("离线"));
+  await global.pollCleanupJob();
+  assert.ok(els.get("#cleanup-status").textContent.includes("查询失败"));
+  enqueue(CLEANUP_PATH + "/cleanup-1", cleanupResponse("failed", { errors: ["无权限"] }));
+  global.openCleanupModal();
+  await tick(5);
+  assert.ok(els.get("#cleanup-status").textContent.includes("清理失败"));
+  assert.ok(els.get("#cleanup-details").textContent.includes("无权限"));
+  assert.strictEqual(fetchCalls.filter((c) => c.method === "POST").length, 1);
+  const count = fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length;
+  await tick(1100);
+  assert.strictEqual(fetchCalls.filter((c) => c.path.startsWith(CLEANUP_PATH)).length, count);
+});
+
+test("清理 Beta：501 直连错误可见；取消后确认无效；无效响应不启动轮询", async () => {
+  enqueue(CLEANUP_PATH, { __rawResponse: true, resp: {
+    ok: false, status: 501, json: async () => ({ detail: "直连模式不支持清理垃圾文件" }),
+  } });
+  global.openCleanupModal();
+  await global.startCleanup();
+  assert.ok(els.get("#cleanup-status").textContent.includes("直连模式不支持"));
+  global.openCleanupModal();
+  global.closeCleanupModal();
+  await global.startCleanup();
+  assert.strictEqual(fetchCalls.length, 1);
+  enqueue(CLEANUP_PATH, { ok: true });
+  global.openCleanupModal();
+  await global.startCleanup();
+  assert.ok(els.get("#cleanup-status").textContent.includes("响应格式无效"));
+});
+
+test("loadStatus：概览进程含 lxserver，不可达透出 healthz 详情并转义", async () => {
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t",
+    current_provider: "lxmusic",
+    processes: {
+      musicdl: { state: "STOPPED", detail: "" },
+      lxserver: { state: "FATAL", detail: "" },
+      lxmusic: { state: "RUNNING", detail: "" },
+      webui: { state: "RUNNING", detail: "" },
+    },
+    services: {
+      lxmusic: { reachable: false, detail: "lxserver unreachable <script>alert(1)</script>" },
+    },
+    lx_source: null,
+    previews: {},
+  });
+  await global.loadStatus();
+  const procHtml = els.get("#ov-processes").innerHTML;
+  assert.ok(procHtml.includes("lxserver"), "进程概览应包含 lxserver 标签");
+  assert.ok(procHtml.includes("FATAL"));
+  const svcHtml = els.get("#ov-services").innerHTML;
+  assert.ok(svcHtml.includes("不可达"), "不可达状态应显示");
+  assert.ok(svcHtml.includes("lxserver unreachable"), "healthz 失败详情应透出，便于定位底层进程故障");
+  assert.ok(!svcHtml.includes("<script>"), "错误详情必须 HTML 转义");
+  assert.ok(svcHtml.includes("&lt;script&gt;"));
+});
+
+test("loadStatus：洛雪卡片源信息与错误文本转义", async () => {
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t",
+    current_provider: "lxmusic",
+    processes: {},
+    services: {},
+    previews: {},
+    lx_source: {
+      initialized: true,
+      sources: [],
+      source: { name: "<b>evil</b>", version: "1.0", platforms: { kw: {} } },
+      last_error: "<img src=x onerror=alert(1)>",
+    },
+  });
+  await global.loadStatus();
+  const lxHtml = els.get("#ov-lx").innerHTML;
+  assert.ok(!lxHtml.includes("<img src=x"), "last_error 必须转义");
+  assert.ok(lxHtml.includes("&lt;img"));
+  assert.ok(!lxHtml.includes("<b>evil</b>"), "源名称必须转义");
+  assert.ok(lxHtml.includes("&lt;b&gt;evil&lt;/b&gt;"));
+});
+
+/* ------------------------------------------------ 主题 / 设置 -------------- */
+const themeBootSrc = fs.readFileSync(path.join(__dirname, "static", "theme-boot.js"), "utf8");
+
+// 每例完整加载生产 app.js 到独立页面，避免主题偏好、媒体/宿主监听器污染既有用例。
+// 仅以同名函数桩替换 SDK 加载边界，不改主题实现；其余启动流程照常执行。
+async function themeHarness(options = {}) {
+  const elements = new Map();
+  const get = (sel) => {
+    if (!elements.has(sel)) elements.set(sel, stubEl());
+    return elements.get(sel);
+  };
+  const appliedThemes = [];
+  const root = { dataset: new Proxy({}, { set(target, key, value) {
+    if (key === "theme") appliedThemes.push(value);
+    target[key] = value;
+    return true;
+  } }) };
+  const radios = ["auto", "light", "dark"].map((value) => Object.assign(stubEl(), { value }));
+  const pages = ["overview", "settings", "llm", "tee"].map((page) =>
+    Object.assign(stubEl(), { id: "page-" + page }));
+  const nav = ["settings", "settings", "llm", "tee"].map((page) =>
+    Object.assign(stubEl(), { dataset: { page } }));
+  const media = Object.assign(stubEl(), { matches: !!options.dark });
+  const saved = new Map(options.saved == null ? [] : [["fnmusic-theme", options.saved]]);
+  if (options.hostSaved != null) saved.set("fnmusic-host-theme", options.hostSaved);
+  const storage = {
+    getItem(key) { if (options.blockStorage) throw new Error("storage denied"); return saved.get(key) ?? null; },
+    setItem(key, value) { if (options.blockStorage) throw new Error("storage denied"); saved.set(key, value); },
+    removeItem(key) { if (options.blockStorage) throw new Error("storage denied"); saved.delete(key); },
+  };
+  const win = Object.assign(stubEl(), {
+    location: { pathname: options.pathname || "/" }, localStorage: storage,
+    matchMedia: options.noMedia ? undefined : () => media,
+  });
+  const calls = [];
+  const context = vm.createContext({
+    window: win,
+    document: {
+      documentElement: root,
+      querySelector: get,
+      querySelectorAll(sel) {
+        return ({ "input[name=theme]": radios, ".page": pages, "[data-page]": nav })[sel] || [];
+      },
+    },
+    fetch: async (url, request = {}) => {
+      calls.push({ url, ...request });
+      return { ok: true, json: async () => defaults.get(url) || { ok: true } };
+    },
+    setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
+    __sdk: options.sdk || false, __sdkCalls: 0,
+  });
+  vm.runInContext(themeBootSrc, context, { filename: "theme-boot.js" });
+  const initialTheme = root.dataset.theme;
+  vm.runInContext(src + '\nasync function loadTrimSdk() { __sdkCalls++; return __sdk; }', context, { filename: "app.js" });
+  await tick(0);
+  return { context, root, initialTheme, appliedThemes, radios, media, saved, win, calls, elements, pages, nav };
+}
+
+function themeSelected(h) {
+  return h.radios.filter((el) => el.checked).map((el) => el.value);
+}
+
+function changeTheme(h, value) {
+  h.radios.forEach((el) => { el.checked = el.value === value; });
+  h.radios.find((el) => el.checked).dispatch("change");
+}
+
+test("首屏主题：偏好优先，非法/缺省/存储禁用回退系统，无媒体查询默认浅色", async () => {
+  for (const [options, expected, selected] of [
+    [{ dark: true }, "dark", "auto"],
+    [{ dark: false }, "light", "auto"],
+    [{ saved: "light", dark: true }, "light", "light"],
+    [{ saved: "dark", dark: false }, "dark", "dark"],
+    [{ saved: "invalid", dark: true }, "dark", "auto"],
+    [{ saved: "auto", dark: true }, "dark", "auto"],
+    [{ blockStorage: true, dark: true }, "dark", "auto"],
+    [{ noMedia: true }, "light", "auto"],
+  ]) {
+    const h = await themeHarness(options);
+    assert.strictEqual(h.initialTheme, expected, "样式表前已写入正确主题");
+    assert.strictEqual(h.root.dataset.theme, expected, "app 初始化与首屏引导一致");
+    assert.deepStrictEqual(themeSelected(h), [selected]);
+    assert.strictEqual(h.context.__sdkCalls, 0, "直连不加载宿主 SDK");
+  }
+});
+
+test("设置主题：立即生效、持久化/恢复 auto，不标脏、不写业务配置", async () => {
+  const h = await themeHarness();
+  const configBefore = JSON.stringify(h.context.collectConfig());
+  for (const value of ["dark", "light"]) {
+    changeTheme(h, value);
+    assert.strictEqual(h.root.dataset.theme, value);
+    assert.strictEqual(h.saved.get("fnmusic-theme"), value);
+    assert.deepStrictEqual(themeSelected(h), [value]);
+    const reloaded = await themeHarness({ saved: h.saved.get("fnmusic-theme"), dark: value !== "dark" });
+    assert.strictEqual(reloaded.initialTheme, value);
+  }
+  changeTheme(h, "auto");
+  assert.strictEqual(h.saved.has("fnmusic-theme"), false);
+  h.media.matches = true;
+  h.media.dispatch("change");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+  assert.deepStrictEqual(themeSelected(h), ["auto"]);
+  assert.strictEqual(JSON.stringify(h.context.collectConfig()), configBefore);
+  assert.strictEqual(h.elements.get("#save-bar").classList.contains("show"), false);
+  h.win.dispatch("beforeunload", { preventDefault() { assert.fail("主题不应产生未保存警告"); } });
+  assert.ok(h.calls.every((call) => !call.method || call.method === "GET"));
+  h.context.markDirty("已编辑业务配置");
+  changeTheme(h, "dark");
+  assert.strictEqual(h.elements.get("#save-bar").classList.contains("show"), true, "不清除既有脏标记");
+});
+
+test("主题：存储拒绝写入仍在本次页面生效，手动偏好不受系统切换影响", async () => {
+  const h = await themeHarness({ blockStorage: true });
+  changeTheme(h, "dark");
+  h.media.dispatch("change");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+  changeTheme(h, "light");
+  h.media.matches = true;
+  h.media.dispatch("change");
+  assert.strictEqual(h.root.dataset.theme, "light");
+  changeTheme(h, "auto");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+});
+
+test("设置导航：桌面和移动入口切换同一页面，不破坏 LLM/储存导航", async () => {
+  const h = await themeHarness();
+  for (const button of h.nav.slice(0, 2)) {
+    h.context.switchPage("tee");
+    button.dispatch("click");
+    assert.deepStrictEqual(h.pages.filter((el) => el.classList.contains("active")).map((el) => el.id), ["page-settings"]);
+    assert.ok(h.nav.slice(0, 2).every((el) => el.classList.contains("active")));
+    assert.strictEqual(h.elements.get("#nav-storage-title").classList.contains("active"), false);
+    h.context.switchPage("llm");
+    assert.strictEqual(h.pages.find((el) => el.id === "page-llm").classList.contains("active"), true);
+  }
+});
+
+test("宿主主题：初值、os/theme 动态切换优先系统，手动偏好优先宿主", async () => {
+  let notify;
+  const h = await themeHarness({
+    pathname: "/app/fnmusic-ext/", dark: false,
+    sdk: {
+      isWeb: true, isStandaloneWeb: false,
+      getPlatformConfig: async () => ({ theme: "dark" }),
+      $on: async (name, fn) => { assert.strictEqual(name, "os/theme"); notify = fn; },
+    },
+  });
+  assert.strictEqual(h.initialTheme, "light");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+  assert.deepStrictEqual(themeSelected(h), ["auto"]);
+  h.media.dispatch("change");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+  notify("light");
+  assert.strictEqual(h.root.dataset.theme, "light");
+  changeTheme(h, "dark");
+  notify("light");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+  changeTheme(h, "auto");
+  assert.strictEqual(h.root.dataset.theme, "light");
+  h.media.matches = true;
+  notify("invalid");
+  assert.strictEqual(h.root.dataset.theme, "dark", "未知宿主主题回退媒体查询");
+});
+
+test("宿主主题：刷新沿用缓存直到异步校正，直连和手动选择不受缓存影响", async () => {
+  let notify;
+  const sdk = {
+    isWeb: true,
+    getPlatformConfig: async () => ({ theme: "dark" }),
+    $on: async (_, fn) => { notify = fn; },
+  };
+  const first = await themeHarness({ pathname: "/app/fnmusic-ext/", sdk });
+  assert.strictEqual(first.saved.get("fnmusic-host-theme"), "dark");
+  let resolveConfig;
+  const reloaded = await themeHarness({
+    pathname: "/app/fnmusic-ext/", hostSaved: first.saved.get("fnmusic-host-theme"),
+    sdk: { getPlatformConfig: () => new Promise((resolve) => { resolveConfig = resolve; }) },
+  });
+  assert.strictEqual(reloaded.initialTheme, "dark");
+  assert.ok(reloaded.appliedThemes.every((value) => value === "dark"), "SDK 返回前不能切回设备浅色");
+  resolveConfig({ theme: "light" });
+  await tick(0);
+  assert.strictEqual(reloaded.root.dataset.theme, "light");
+  assert.strictEqual(reloaded.saved.get("fnmusic-host-theme"), "light");
+  notify("light");
+  assert.strictEqual(first.saved.get("fnmusic-host-theme"), "light");
+  notify("invalid");
+  assert.strictEqual(first.saved.has("fnmusic-host-theme"), false);
+  for (const options of [
+    { hostSaved: "dark" },
+    { pathname: "/app/fnmusic-ext/", hostSaved: "dark", saved: "light", sdk },
+    { pathname: "/app/fnmusic-ext/", hostSaved: "invalid" },
+  ]) {
+    const h = await themeHarness(options);
+    assert.strictEqual(h.initialTheme, "light");
+    assert.strictEqual(h.root.dataset.theme, "light");
+  }
+});
+
+test("宿主主题：缓存失效或宿主不可用时清缓存并回退系统，存储禁用不阻断", async () => {
+  for (const sdk of [false, {},
+    { getPlatformConfig: async () => { throw new Error("no host"); } },
+    { getPlatformConfig: async () => ({ theme: "invalid" }) },
+  ]) {
+    const h = await themeHarness({ pathname: "/app/fnmusic-ext/", hostSaved: "dark", sdk });
+    assert.strictEqual(h.initialTheme, "dark");
+    assert.strictEqual(h.root.dataset.theme, "light");
+    assert.strictEqual(h.saved.has("fnmusic-host-theme"), false);
+    h.media.matches = true;
+    h.media.dispatch("change");
+    assert.strictEqual(h.root.dataset.theme, "dark");
+  }
+  const h = await themeHarness({ pathname: "/app/fnmusic-ext/", blockStorage: true,
+    sdk: { getPlatformConfig: async () => ({ theme: "dark" }) } });
+  assert.strictEqual(h.root.dataset.theme, "dark");
+});
+
+test("宿主主题：移动嵌入与独立 Web 可读取 os.theme，但不订阅 Web 宿主事件", async () => {
+  for (const flags of [{ isWeb: false }, { isWeb: true, isStandaloneWeb: true }]) {
+    const h = await themeHarness({
+      pathname: "/app/fnmusic-ext/",
+      sdk: { ...flags, getPlatformConfig: async () => ({ os: { theme: "dark" } }),
+        $on() { assert.fail("非 Web 宿主不应订阅事件"); } },
+    });
+    assert.strictEqual(h.root.dataset.theme, "dark");
+  }
+});
+
+test("宿主主题：SDK/配置/事件不可用均不阻断业务配置与系统主题", async () => {
+  for (const sdk of [false, {},
+    { isWeb: true, getPlatformConfig: async () => { throw new Error("no bridge"); },
+      $on: async () => { throw new Error("no event bridge"); } },
+    { isWeb: true, getPlatformConfig: async () => ({ theme: "invalid" }) },
+  ]) {
+    const h = await themeHarness({ pathname: "/app/fnmusic-ext/", sdk, dark: true });
+    assert.strictEqual(h.root.dataset.theme, "dark");
+    h.media.matches = false;
+    h.media.dispatch("change");
+    assert.strictEqual(h.root.dataset.theme, "light");
+    assert.strictEqual(h.elements.get("#liked-size").value, "20", "LLM 配置照常回填");
+    assert.ok(h.calls.some((call) => call.url.endsWith("/api/status")));
+  }
+});
+
+test("宿主主题：异步初值未返回不阻塞配置加载，返回后仍尊重期间选择的手动偏好", async () => {
+  let resolveConfig;
+  const h = await themeHarness({
+    pathname: "/app/fnmusic-ext/",
+    sdk: { getPlatformConfig: () => new Promise((resolve) => { resolveConfig = resolve; }) },
+  });
+  assert.strictEqual(h.elements.get("#liked-size").value, "20");
+  assert.ok(h.calls.some((call) => call.url.endsWith("/api/status")));
+  changeTheme(h, "light");
+  resolveConfig({ theme: "dark" });
+  await tick(0);
+  assert.strictEqual(h.root.dataset.theme, "light");
+  changeTheme(h, "auto");
+  assert.strictEqual(h.root.dataset.theme, "dark");
+});
+
+/* ---------------------------------------------- 公共歌单：搜索/加载剩余/名称 -- */
+test("公共歌单搜索：关键词走 channel=search 并渲染搜索文案与清除按钮", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", {
+    ok: true,
+    items: [{ id: 7108, name: "华语速爆新歌", cover_url: "", track_count: 30, author: "网易" }],
+    total: 57, has_more: true,
+  });
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.keyword = "华语"; publicState.page = 1;
+  `);
+  await global.loadPublicList();
+  const call = fetchCalls.find((c) => c.path === "/app/fnmusic-ext/api/public-playlists/");
+  assert.ok(call, "应请求公共歌单列表");
+  assert.ok(call.url.includes("channel=search"), "搜索走 channel=search");
+  assert.ok(call.url.includes("keyword=" + encodeURIComponent("华语")));
+  assert.ok(els.get("#public-list").innerHTML.includes("华语速爆新歌"));
+  assert.ok(els.get("#public-note").textContent.includes("搜索"), "提示应区分搜索模式");
+  assert.strictEqual(els.get("#public-search-clear").hidden, false);
+  assert.strictEqual(els.get("#public-category").hidden, true, "搜索时隐藏分类选择");
+  assert.strictEqual(els.get("#public-load-rest").hidden, false, "搜索结果也可加载剩余");
+});
+
+test("公共歌单搜索：清除关键词后回到普通浏览 channel", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", { ok: true, items: [], total: 0, has_more: false });
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.keyword = "华语";
+    $("#public-keyword").value = "华语";
+  `);
+  await global.clearPublicSearch();
+  const call = fetchCalls.find((c) => c.path === "/app/fnmusic-ext/api/public-playlists/");
+  assert.ok(call.url.includes("channel=top"));
+  assert.ok(!call.url.includes("keyword=" + encodeURIComponent("华语")));
+  assert.strictEqual(els.get("#public-search-clear").hidden, true);
+  assert.strictEqual(vm.runInThisContext("publicState.keyword"), "");
+});
+
+test("公共歌单：请求期间切换关键词，过期响应不覆盖新结果", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", {
+    ok: true, items: [{ id: 1, name: "旧关键词结果" }], has_more: false, total: 1,
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", {
+    ok: true, items: [{ id: 2, name: "新关键词结果" }], has_more: false, total: 1,
+  });
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.page = 1; publicState.keyword = "旧";
+  `);
+  const first = global.loadPublicList();
+  vm.runInThisContext('publicState.keyword = "新"; publicState.page = 1;');
+  const second = global.loadPublicList();
+  await Promise.all([first, second]);
+  const html = els.get("#public-list").innerHTML;
+  assert.ok(html.includes("新关键词结果"));
+  assert.ok(!html.includes("旧关键词结果"), "过期响应必须被丢弃");
+});
+
+test("加载剩余歌单：逐页追加去重，上游重复页判停", async () => {
+  reset();
+  vm.runInThisContext(`
+    publicState.provider = "musicbox"; publicState.source = "netease";
+    publicState.channel = "top"; publicState.keyword = ""; publicState.page = 1;
+    publicState.items = []; publicState.hasMore = true;
+  `);
+  const page = (names, hasMore) => ({
+    ok: true, items: names.map((nm) => ({ id: nm, name: nm })), total: 99, has_more: hasMore,
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", page(["歌单甲", "歌单乙"], true));
+  await global.loadPublicList();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", page(["歌单丙"], true));
+  enqueue("/app/fnmusic-ext/api/public-playlists/", page(["歌单丙"], true)); // 上游卡住：整页重复
+  await global.loadPublicRest();
+  const html = els.get("#public-list").innerHTML;
+  assert.ok(html.includes("歌单甲") && html.includes("歌单乙") && html.includes("歌单丙"), "三页内容都应保留");
+  assert.deepStrictEqual(vm.runInThisContext("publicState.items.map((it) => it.id)"),
+    ["歌单甲", "歌单乙", "歌单丙"], "重复页的歌单不重复追加");
+  assert.ok(els.get("#public-note").textContent.includes("不再返回新歌单"));
+  assert.strictEqual(els.get("#public-load-rest").hidden, true, "判停后不再提供继续加载");
+  assert.strictEqual(vm.runInThisContext("publicState.page"), 3);
+});
+
+test("已选歌单：配置回填只有身份字段时按状态显示，详情补齐后显示名称", async () => {
+  reset();
+  vm.runInThisContext(`
+    publicSelection = [{ provider: "musicbox", source: "netease", kind: "playlist", id: "7108" }];
+    $("#public-playlists-browser").hidden = false;
+    renderPublicSelected();
+  `);
+  const before = els.get("#public-selected").innerHTML;
+  assert.ok(before.includes("正在获取歌单名称"));
+  assert.ok(!before.includes("<b>7108</b>"), "数字 ID 不应再作标题");
+  enqueue("/app/fnmusic-ext/api/public-playlists/7108", {
+    ok: true, data: { name: "华语速爆新歌", cover_url: "", track_count: 30 },
+  });
+  await global.ensurePublicSelectionDetails();
+  const after = els.get("#public-selected").innerHTML;
+  assert.ok(after.includes("华语速爆新歌"));
+  assert.ok(!after.includes("正在获取歌单名称"));
+  const callsAfterFirst = fetchCalls.length;
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, callsAfterFirst, "已有名称/缓存命中时不再请求");
+});
+
+test("已选歌单：详情失败显示获取失败与重试按钮，重试成功恢复名称", async () => {
+  reset();
+  vm.runInThisContext(`
+    publicSelection = [{ provider: "lx", source: "kg", kind: "chart", id: "8888" }];
+    $("#public-playlists-browser").hidden = false;
+  `);
+  enqueue("/app/fnmusic-ext/api/public-playlists/8888", new Error("音源服务不可达"));
+  await global.ensurePublicSelectionDetails();
+  const failed = els.get("#public-selected").innerHTML;
+  assert.ok(failed.includes("名称获取失败"));
+  assert.ok(failed.includes("data-public-retry"), "失败项应有重试按钮");
+  assert.ok(!failed.includes("<b>8888</b>"));
+  const callsAfterFail = fetchCalls.length;
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, callsAfterFail, "失败缓存期间不重复请求");
+  enqueue("/app/fnmusic-ext/api/public-playlists/8888", {
+    ok: true, data: { name: "TOP500", cover_url: "", track_count: 500 },
+  });
+  await global.retryPublicDetail(0);
+  const okHtml = els.get("#public-selected").innerHTML;
+  assert.ok(okHtml.includes("TOP500"));
+  assert.ok(!okHtml.includes("名称获取失败"));
+});
+
+function resetPublicBrowser(overrides = {}) {
+  reset();
+  vm.runInThisContext(`
+    publicSelectionDetailSeq++;
+    publicSelection = []; publicCapabilities = null; publicDetailCache.clear();
+    publicState = {
+      provider: "musicbox", source: "netease", channel: "top", keyword: "", category: "", sort: "",
+      page: 1, seq: publicState.seq + 1, loading: false, bulk: null, items: [], hasMore: false,
+      total: 0, cursor: "", cursors: {1: ""}, ...${JSON.stringify(overrides)},
+    };
+  `);
+}
+
+function deferPublicResponse(endpoint) {
+  let resolve;
+  let reject;
+  const body = new Promise((yes, no) => { resolve = yes; reject = no; });
+  enqueue(`/app/fnmusic-ext/api/public-playlists/${endpoint}`, {
+    __rawResponse: true, resp: { ok: true, status: 200, json: () => body },
+  });
+  return { resolve, reject };
+}
+
+const publicPage = (ids, has_more = true, extra = {}) => ({
+  ok: true, items: ids.map((id) => ({ id, name: id })), has_more, total: 99999, ...extra,
+});
+
+for (const bulk of [false, true]) {
+  for (const condition of ["source", "channel", "provider"]) {
+    test(`公共歌单：${bulk ? "连续" : "普通"}请求在切换 ${condition} 时立即失效`, async () => {
+      resetPublicBrowser({ provider: "lxmusic", source: "kw", hasMore: true });
+      const old = deferPublicResponse("");
+      const pending = bulk ? global.loadPublicRest() : global.loadPublicList();
+      await tick(0);
+      const waiting = deferPublicResponse(condition === "provider" ? "capabilities" : "categories");
+      const select = els.get(`#public-${condition}`);
+      select.value = { source: "kg", channel: "charts", provider: "musicbox" }[condition];
+      const change = select.dispatch("change");
+      const requestCount = fetchCalls.length;
+      old.resolve(publicPage(["旧酷我歌单"]));
+      await pending;
+      assert.strictEqual(fetchCalls.length, requestCount, "旧连续加载不得请求混合条件的下一页");
+      assert.deepStrictEqual(vm.runInThisContext("publicState.items"), []);
+      assert.strictEqual(vm.runInThisContext("publicState.page"), 1);
+      assert.ok(!els.get("#public-list").innerHTML.includes("旧酷我歌单"));
+      if (condition === "provider") {
+        enqueue("/app/fnmusic-ext/api/public-playlists/categories", { ok: true, categories: [] });
+      }
+      enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["新条件歌单"], false));
+      waiting.resolve(condition === "provider"
+        ? { ok: true, sources: [{ id: "netease", name: "网易", playback_available: true }] }
+        : { ok: true, categories: [] });
+      await change;
+      const item = vm.runInThisContext("publicState.items[0]");
+      assert.strictEqual(item.id, "新条件歌单");
+      assert.strictEqual(item.source, condition === "provider" ? "netease" : condition === "source" ? "kg" : "kw");
+      assert.strictEqual(item.provider, condition === "provider" ? "musicbox" : "lx");
+      assert.strictEqual(item.kind, condition === "source" ? "playlist" : "chart");
+    });
+  }
+}
+
+test("公共歌单：过期 capabilities 不重写控件、不继续旧刷新链", async () => {
+  resetPublicBrowser();
+  const old = deferPublicResponse("capabilities");
+  els.get("#public-provider").value = "lxmusic";
+  const first = els.get("#public-provider").dispatch("change");
+  enqueue("/app/fnmusic-ext/api/public-playlists/capabilities", {
+    ok: true, sources: [{ id: "netease", name: "新网易", playback_available: true }],
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/categories", { ok: true, categories: [{ id: "new", name: "新分类" }] });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["新网易榜单"], false));
+  els.get("#public-provider").value = "musicbox";
+  await els.get("#public-provider").dispatch("change");
+  const count = fetchCalls.length;
+  old.resolve({ ok: true, sources: [{ id: "kg", name: "过期酷狗", playback_available: true }] });
+  await first;
+  assert.strictEqual(fetchCalls.length, count);
+  assert.strictEqual(vm.runInThisContext("publicState.source"), "netease");
+  assert.ok(els.get("#public-source").innerHTML.includes("新网易"));
+  assert.ok(!els.get("#public-source").innerHTML.includes("过期酷狗"));
+  assert.ok(els.get("#public-category").innerHTML.includes("新分类"));
+});
+
+for (const failure of [false, true]) {
+  test(`公共歌单：过期分类${failure ? "失败" : "成功"}不覆盖新分类/排序/列表`, async () => {
+    resetPublicBrowser({ provider: "lxmusic", source: "kw" });
+    const old = deferPublicResponse("categories");
+    els.get("#public-source").value = "kg";
+    const first = els.get("#public-source").dispatch("change");
+    enqueue("/app/fnmusic-ext/api/public-playlists/categories", {
+      ok: true, categories: [{ id: "new", name: "新分类" }], sorts: [{ id: "new-sort", name: "新排序" }],
+    });
+    enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["新结果"], false));
+    els.get("#public-source").value = "wy";
+    await els.get("#public-source").dispatch("change");
+    if (failure) {
+      enqueue("/app/fnmusic-ext/api/public-playlists/categories", new Error("旧分类失败"));
+      old.resolve({ ok: false, error: "旧分类失败" });
+    } else {
+      old.resolve({ ok: true, categories: [{ id: "old", name: "旧分类" }], sorts: [{ id: "old-sort", name: "旧排序" }] });
+    }
+    await first;
+    assert.ok(els.get("#public-category").innerHTML.includes("新分类"));
+    assert.ok(!els.get("#public-category").innerHTML.includes("旧分类"));
+    assert.strictEqual(vm.runInThisContext("publicState.sort"), "new-sort");
+    assert.deepStrictEqual(vm.runInThisContext("publicState.items.map(it => it.id)"), ["新结果"]);
+    assert.ok(!els.get("#public-note").textContent.includes("旧分类失败"));
+    assert.strictEqual(fetchCalls.filter(c => c.path.endsWith("/public-playlists/")).length, 1);
+  });
+}
+
+test("公共歌单：普通列表加载期间禁止连续加载与翻页", async () => {
+  resetPublicBrowser({ page: 2, hasMore: true });
+  const response = deferPublicResponse("");
+  const pending = global.loadPublicList();
+  assert.strictEqual(els.get("#public-load-rest").hidden, true);
+  assert.strictEqual(els.get("#public-prev").disabled, true);
+  assert.strictEqual(els.get("#public-next").disabled, true);
+  await global.loadPublicRest();
+  await els.get("#public-next").dispatch("click");
+  await els.get("#public-prev").dispatch("click");
+  assert.strictEqual(fetchCalls.length, 1, "隐藏/禁用之外，函数和事件也必须拒绝重叠请求");
+  response.resolve(publicPage(["当前页"]));
+  await pending;
+  assert.strictEqual(els.get("#public-prev").disabled, false);
+  assert.strictEqual(els.get("#public-next").disabled, false);
+  assert.strictEqual(els.get("#public-load-rest").hidden, false);
+});
+
+test("公共歌单：新普通请求取消连续加载，迟到的批次不覆盖新列表", async () => {
+  resetPublicBrowser({ hasMore: true });
+  const old = deferPublicResponse("");
+  const pending = global.loadPublicRest();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["刷新结果"], false));
+  await global.loadPublicList();
+  old.resolve(publicPage(["旧批次"]));
+  await pending;
+  assert.deepStrictEqual(vm.runInThisContext("publicState.items.map(it => it.id)"), ["刷新结果"]);
+  assert.strictEqual(vm.runInThisContext("publicState.bulk"), null);
+  assert.strictEqual(vm.runInThisContext("publicState.loading"), false);
+});
+
+for (const ending of ["done", "stalled", "stopped", "failed", "capped"]) {
+  test(`连续加载：${ending} 后可翻页并恢复普通单页视图`, async () => {
+    resetPublicBrowser({ page: 2, hasMore: true });
+    let pending;
+    if (ending === "stopped") {
+      const response = deferPublicResponse("");
+      pending = global.loadPublicRest();
+      await global.loadPublicRest(); // 第二次点击停止
+      response.resolve(publicPage(["第三页"]));
+    } else if (ending === "failed") {
+      enqueue("/app/fnmusic-ext/api/public-playlists/", new Error("失败"), new Error("失败"));
+    } else if (ending === "capped") {
+      for (let page = 3; page < 503; page++) enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage([String(page)]));
+    } else if (ending === "stalled") {
+      enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["重复"]), publicPage(["重复"]));
+    } else {
+      enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["末页"], false));
+    }
+    await (pending || global.loadPublicRest());
+    assert.strictEqual(vm.runInThisContext("publicState.bulk.active"), false);
+    assert.strictEqual(els.get("#public-prev").disabled, false);
+    assert.strictEqual(els.get("#public-next").disabled, ending === "done" || ending === "stalled");
+    const targetPage = vm.runInThisContext("publicState.page - 1");
+    enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["普通目标页"]));
+    await els.get("#public-prev").dispatch("click");
+    assert.strictEqual(vm.runInThisContext("publicState.page"), targetPage);
+    assert.strictEqual(vm.runInThisContext("publicState.bulk"), null);
+    assert.strictEqual(els.get("#public-page").textContent, String(targetPage));
+    assert.deepStrictEqual(vm.runInThisContext("publicState.items.map(it => it.id)"), ["普通目标页"]);
+  });
+}
+
+test("连续加载：失败重试同一页并保留累计范围，随后可下一页", async () => {
+  resetPublicBrowser({ hasMore: true });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["第二页"]), new Error("失败"), new Error("失败"));
+  await global.loadPublicRest();
+  assert.strictEqual(vm.runInThisContext("publicState.page"), 2);
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["第三页"]), publicPage(["第三页"]));
+  await global.loadPublicRest();
+  const pages = fetchCalls.filter(c => c.path.endsWith("/public-playlists/")).map(c => new URL(c.url, "http://test").searchParams.get("page"));
+  assert.deepStrictEqual(pages, ["2", "3", "3", "3", "4"]);
+  assert.ok(els.get("#public-page").textContent.includes("1–4"));
+  assert.deepStrictEqual(vm.runInThisContext("publicState.items.map(it => it.id)"), ["第二页", "第三页"]);
+});
+
+test("连续加载：空页与过期 total/has_more 只请求一次就判停", async () => {
+  resetPublicBrowser({ keyword: "空页", hasMore: true });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage([]));
+  await global.loadPublicRest();
+  assert.strictEqual(fetchCalls.length, 1);
+  assert.strictEqual(vm.runInThisContext("publicState.hasMore"), false);
+  assert.strictEqual(els.get("#public-load-rest").hidden, true);
+});
+
+test("搜索分页：过滤空窗口仍前进，真空页才停止", async () => {
+  resetPublicBrowser({ keyword: "搜索" });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage([], true, { raw_count: 20 }));
+  await global.loadPublicList();
+  assert.strictEqual(vm.runInThisContext("publicState.hasMore"), true);
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage([], true, { raw_count: 20 }), publicPage(["有效结果"]), publicPage([], true, { raw_count: 0 }));
+  await global.loadPublicRest();
+  assert.strictEqual(fetchCalls.length, 4);
+  assert.deepStrictEqual(vm.runInThisContext("publicState.items.map(it => it.id)"), ["有效结果"]);
+  assert.strictEqual(vm.runInThisContext("publicState.page"), 4);
+  assert.strictEqual(vm.runInThisContext("publicState.hasMore"), false);
+});
+
+test("精品分页：按游标连续加载，完成后上一页保留目标游标", async () => {
+  resetPublicBrowser({ channel: "highquality" });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["第一页"], true, { next_cursor: "100" }));
+  await global.loadPublicList();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["第二页"], true, { next_cursor: "90" }), publicPage(["第三页"], false, { next_cursor: "80" }));
+  await global.loadPublicRest();
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["第二页"], true, { next_cursor: "90" }));
+  await els.get("#public-prev").dispatch("click");
+  const cursors = fetchCalls.map(c => new URL(c.url, "http://test").searchParams.get("cursor"));
+  assert.deepStrictEqual(cursors, ["", "100", "90", "100"]);
+  assert.strictEqual(vm.runInThisContext("publicState.page"), 2);
+  assert.strictEqual(vm.runInThisContext("publicState.bulk"), null);
+});
+
+test("精品分页：缺失或不推进的游标不从头重复加载", async () => {
+  for (const cursor of ["", "100"]) {
+    resetPublicBrowser({ channel: "highquality", hasMore: true, cursors: { 1: "", 2: "100" } });
+    enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["第二页"], true, { next_cursor: cursor }));
+    await global.loadPublicRest();
+    assert.strictEqual(fetchCalls.length, 1);
+    assert.strictEqual(vm.runInThisContext("publicState.hasMore"), false);
+  }
+});
+
+test("已选名称：配置先于预览启动时，音源就绪后自动恢复且不启动其它音源", async () => {
+  resetPublicBrowser({ channel: "charts" });
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_NETEASE_ENABLED: "true", FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+    FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify([
+      { provider: "musicbox", source: "netease", kind: "chart", id: "startup" },
+      { provider: "lx", source: "kg", kind: "chart", id: "other-provider" },
+    ]),
+  } });
+  enqueue("/app/fnmusic-ext/api/public-playlists/startup", new Error("未启动"), { ok: true, data: { name: "热歌榜" } });
+  enqueue("/app/fnmusic-ext/api/public-playlists/other-provider", new Error("未启动"));
+  await global.loadConfig(); await tick(0);
+  assert.ok(els.get("#public-selected").innerHTML.includes("名称获取失败"));
+  enqueue("/app/fnmusic-ext/api/public-playlists/capabilities", new Error("未启动"), {
+    ok: true, sources: [{ id: "netease", name: "网易", playback_available: true }],
+  });
+  enqueue("/app/fnmusic-ext/api/preview", { ok: true, preview: true });
+  enqueue("/app/fnmusic-ext/api/public-playlists/categories", { ok: true, categories: [] });
+  enqueue("/app/fnmusic-ext/api/public-playlists/", publicPage(["热歌榜"], false));
+  await global.showPublicBrowser(); await tick(0);
+  assert.ok(els.get("#public-selected").innerHTML.includes("<b>热歌榜</b>"));
+  assert.strictEqual(fetchCalls.filter(c => c.path.endsWith("/startup")).length, 2);
+  assert.strictEqual(fetchCalls.filter(c => c.path.endsWith("/other-provider")).length, 1);
+  const previews = fetchCalls.filter(c => c.path.endsWith("/api/preview")).map(c => JSON.parse(c.body).provider);
+  assert.deepStrictEqual(previews, ["musicbox"]);
+});
+
+test("已选名称：音源就绪时仍在途的旧详情失败不能覆盖恢复结果", async () => {
+  resetPublicBrowser();
+  vm.runInThisContext('publicSelection = [{provider:"musicbox",source:"netease",kind:"playlist",id:"late-detail"}];');
+  const old = deferPublicResponse("late-detail");
+  const first = global.ensurePublicSelectionDetails();
+  enqueue("/app/fnmusic-ext/api/public-playlists/capabilities", { ok: true, sources: [] });
+  await global.loadPublicCapabilities();
+  enqueue("/app/fnmusic-ext/api/public-playlists/late-detail", { ok: true, data: { name: "恢复名称" } });
+  await global.ensurePublicSelectionDetails();
+  old.resolve({ ok: false, error: "旧失败" }); await first;
+  assert.ok(els.get("#public-selected").innerHTML.includes("恢复名称"));
+  assert.ok(!els.get("#public-selected").innerHTML.includes("名称获取失败"));
+});
+
+test("已选名称：已知名称/封面/数量跨身份回填复用缓存，默认榜单也缓存", async () => {
+  resetPublicBrowser();
+  global.setPublicSelection({ provider: "lx", source: "kg", kind: "playlist", id: "known", name: "已知名称", cover_url: "https://img.test/known", track_count: 1200 }, true);
+  vm.runInThisContext('publicSelection = publicSelection.map(({provider,source,kind,id}) => ({provider,source,kind,id}));');
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, 0);
+  const html = els.get("#public-selected").innerHTML;
+  assert.ok(html.includes("已知名称") && html.includes("https://img.test/known") && html.includes("超过 1,000 首"));
+  vm.runInThisContext('configValues = {FNMUSIC_NETEASE_ENABLED:"true"};');
+  await global.initPublicDefaults();
+  vm.runInThisContext('publicSelection = publicSelection.map(({provider,source,kind,id}) => ({provider,source,kind,id}));');
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, 0);
+  assert.ok(els.get("#public-selected").innerHTML.includes("热歌榜"));
+});
+
+test("已选名称：瞬时失败缓存到期可恢复，不永久保留失败", async () => {
+  resetPublicBrowser();
+  vm.runInThisContext('publicSelection=[{provider:"lx",source:"kg",kind:"chart",id:"expiry"}];');
+  enqueue("/app/fnmusic-ext/api/public-playlists/expiry", new Error("瞬时失败"));
+  await global.ensurePublicSelectionDetails();
+  vm.runInThisContext('publicDetailCache.get(publicEntryKey(publicSelection[0])).failedAt = Date.now() - 30001;');
+  enqueue("/app/fnmusic-ext/api/public-playlists/expiry", { ok: true, data: { name: "到期恢复" } });
+  await global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.length, 2);
+  assert.ok(els.get("#public-selected").innerHTML.includes("到期恢复"));
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

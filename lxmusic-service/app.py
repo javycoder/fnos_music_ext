@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 import json
 import logging
 import os
@@ -33,6 +32,7 @@ from lxserver_client import (
     DEFAULT_LXSERVER_URL,
     LxServerClient,
     SUPPORTED_PLATFORMS,
+    is_lxserver_unreachable,
     map_lxserver_song,
     normalize_source,
     parse_interval_to_seconds,
@@ -66,7 +66,6 @@ CONF: dict[str, Any] = {
     "url_cache_neg_ttl": float(os.environ.get("LX_URL_CACHE_NEG_TTL", "60.0")),
     "url_cache_max": int(os.environ.get("LX_URL_CACHE_MAX", "512")),
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
-    "search_probe": bool(os.environ.get("FNMUSIC_SEARCH_PROBE", "").lower() in ("1", "true", "yes", "on")),
     "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
 
@@ -92,16 +91,6 @@ _STATS = {"searches": 0, "url_resolutions": 0, "url_cache_hits": 0, "errors": 0}
 
 # 探活前缀字节数
 _PROBE_BYTES = 4096
-
-_SEARCH_PROBE_ENABLED: ContextVar[bool | None] = ContextVar("lx_search_probe_enabled", default=None)
-
-
-def is_probe_enabled() -> bool:
-    v = _SEARCH_PROBE_ENABLED.get()
-    if v is not None:
-        return v
-    return bool(CONF.get("search_probe", False))
-
 
 def parse_track_id(track_id: str) -> tuple[str, str]:
     """解析 "lx:<source>:<identifier>" -> ("kg", "<identifier>")；异常时返回 ("", "")."""
@@ -1046,8 +1035,25 @@ def _err(msg: str, code: int = 404) -> JSONResponse:
 
 @app.get("/healthz")
 async def healthz():
+    lxserver_alive = await LXSERVER.is_alive()
     user_src = await describe_user_source()
     caps = await source_capabilities()
+    if not lxserver_alive:
+        user_src["last_error"] = "lxserver unreachable"
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": "lxserver unreachable",
+                "service": "fnmusic-lxmusic",
+                "version": SERVICE_VERSION,
+                "sources": CONF["sources"],
+                "user_source": user_src,
+                "circuit": chain_health_snapshot(),
+                "capabilities": caps,
+                "charts": ["kg", "kw", "wy"],
+            },
+        )
     return {
         "ok": True,
         "service": "fnmusic-lxmusic",
@@ -1067,10 +1073,9 @@ async def search_tracks(
     sources: str = Query(""),
     limit: int = Query(0),
     page: int = Query(1),
-    probe: int = Query(0),
     scope: str = Header(default="global", alias="X-Fnmusic-Scope"),
 ):
-    """跨平台聚合搜索。支持防抖门闸与逐曲探活。"""
+    """跨平台聚合搜索。支持防抖门闸。"""
     kw = (keyword or q or "").strip()
     if not kw:
         return {"ok": True, "items": [], "errors": {}, "stats": dict(_STATS)}
@@ -1081,9 +1086,6 @@ async def search_tracks(
     wanted_raw = [s.strip() for s in (sources or "").split(",") if s.strip()]
     wanted = [normalize_source(s) for s in wanted_raw] if wanted_raw else CONF["sources"]
     wanted = [s for s in wanted if s in SUPPORTED_PLATFORMS]
-
-    probe_enabled = bool(probe == 1 or is_probe_enabled())
-    probe_token = _SEARCH_PROBE_ENABLED.set(probe_enabled)
 
     async def _do_search():
         _STATS["searches"] += 1
@@ -1112,20 +1114,9 @@ async def search_tracks(
                 continue
             for it in sub_items:
                 _cache_put(it)
-                if probe_enabled:
-                    # 逐曲探活模式
-                    probe_res = await resolve_and_probe(client, src, it, quality="standard", budget=4.0)
-                    if probe_res:
-                        it["verified"] = True
-                        it["validation_status"] = "verified"
-                        items.append(it)
-                    else:
-                        it["verified"] = False
-                        it["validation_status"] = "candidate"
-                else:
-                    it["verified"] = False
-                    it["validation_status"] = "candidate"
-                    items.append(it)
+                it["verified"] = False
+                it["validation_status"] = "candidate"
+                items.append(it)
 
         caps = await source_capabilities()
         return {
@@ -1136,16 +1127,13 @@ async def search_tracks(
             "capabilities": caps,
         }
 
-    try:
-        subkey = f"{page}:{limit}:{','.join(sorted(wanted))}:{probe_enabled}"
-        gate_res = await _SEARCH_GATE.run(scope, kw, _do_search, subkey=subkey)
-        if gate_res is _LX_SUPERSEDED:
-            return {"ok": True, "items": [], "superseded": True}
-        if isinstance(gate_res, Exception):
-            return _err(f"search failed: {gate_res}", 500)
-        return gate_res
-    finally:
-        _SEARCH_PROBE_ENABLED.reset(probe_token)
+    subkey = f"{page}:{limit}:{','.join(sorted(wanted))}"
+    gate_res = await _SEARCH_GATE.run(scope, kw, _do_search, subkey=subkey)
+    if gate_res is _LX_SUPERSEDED:
+        return {"ok": True, "items": [], "superseded": True}
+    if isinstance(gate_res, Exception):
+        return _err(f"search failed: {gate_res}", 500)
+    return gate_res
 
 
 # 免登录榜单目标：平台 -> (榜单名, bangid 内置回退值)。
@@ -1232,6 +1220,7 @@ async def public_playlist_capabilities():
             "reason": caps.get(src, {}).get("reason") or "",
             "channels": [
                 {"id": "top", "name": "热门与分类", "login_required": False},
+                {"id": "search", "name": "搜索歌单", "login_required": False},
                 {"id": "charts", "name": "排行榜", "login_required": False},
             ],
             "logged_in": False,
@@ -1269,7 +1258,8 @@ async def public_playlists(
     channel: str = Query("top"),
     category: str = Query(""),
     sort: str = Query(""),
-    page: int = Query(1, ge=1, le=100),
+    keyword: str = Query(""),
+    page: int = Query(1, ge=1, le=10000),
     limit: int = Query(30, ge=1, le=50),
     cursor: str = Query(""),
 ):
@@ -1278,6 +1268,26 @@ async def public_playlists(
         rows = await LXSERVER.get_leaderboard_boards(src)
         items = [LXSERVER.normalize_public_playlist(row, src, "chart") for row in rows if isinstance(row, dict)]
         return {"ok": True, "items": [it for it in items if it["id"]], "total": len(items), "has_more": False}
+    if channel == "search":
+        # lxserver 原生歌单搜索：SDK 固定页大小（默认 20），limit 不透传
+        data = await LXSERVER.get_song_list_search(src, keyword, page)
+        raw_items = data.get("list") or []
+        items = [LXSERVER.normalize_public_playlist(row, src) for row in raw_items if isinstance(row, dict)]
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        try:
+            page_limit = max(1, int(data.get("limit") or 20))
+        except (TypeError, ValueError):
+            page_limit = 20
+        return {
+            "ok": True,
+            "items": [it for it in items if it["id"]],
+            "raw_count": len(raw_items),
+            "total": total,
+            "has_more": bool(raw_items) and (page * page_limit < total if total else True),
+        }
     if channel != "top":
         raise ValueError(f"unsupported channel {channel!r}")
     if not sort:
@@ -1565,9 +1575,20 @@ async def source_verify(body: SourceBody):
     except asyncio.TimeoutError:
         return _err("校验超时 (120s)", 504)
     except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            logger.error("lxserver 不可连接，校验源失败: %s", exc)
+            return JSONResponse(
+                content={"ok": False, "data": {
+                    "category": "service_unavailable", "stage": "lxmusic_to_lxserver",
+                    "message": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志"}},
+                status_code=503,
+            )
         return JSONResponse(
             content={"ok": False, "data": {"category": "internal", "message": f"校验失败: {exc}"}}
         )
+    # 服务故障返回 503，不按源失效处理。
+    if str(report.get("category") or "") == "service_unavailable":
+        return JSONResponse(content={"ok": False, "data": report}, status_code=503)
     return {"ok": bool(report.get("ok")), "data": report}
 
 
@@ -1631,7 +1652,9 @@ async def _find_lxserver_source(*, by_id: str = "", by_name: str = "", by_url: s
     """在 lxserver 已有源列表中查找（按 id / 名称 / 导入 URL 任一命中）。"""
     try:
         sources = await LXSERVER.list_custom_sources()
-    except Exception:
+    except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            raise
         return None
     for s in sources:
         if by_id and str(s.get("id") or "") == by_id:
@@ -1659,11 +1682,29 @@ async def source_upload(body: UploadBody):
         res = await LXSERVER.upload_custom_source(body.filename, body.script)
     except Exception as exc:
         if "已存在" not in str(exc):
+            # 内部通信故障与脚本错误分别归类。
+            if is_lxserver_unreachable(exc):
+                logger.error("lxserver 不可连接，上传源失败: %s", exc)
+                return JSONResponse(
+                    content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                             "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                    status_code=503,
+                )
             return JSONResponse(
                 content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
                 status_code=500,
             )
-        existing = await _find_lxserver_source(by_name=name)
+        try:
+            existing = await _find_lxserver_source(by_name=name)
+        except Exception as lookup_exc:
+            if not is_lxserver_unreachable(lookup_exc):
+                raise
+            logger.error("lxserver 不可连接，查询重复上传源失败: %s", lookup_exc)
+            return JSONResponse(
+                content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                         "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                status_code=503,
+            )
         if not existing:
             return JSONResponse(
                 content={"ok": False, "error": f"上传到 lxserver 失败: {exc}", "category": "download"},
@@ -1704,6 +1745,12 @@ async def source_set(body: SourceBody):
             res = await LXSERVER.upload_custom_source("custom_source.js", body.script)
             url = f"file://{_lx_source_fs_path(str(res.get('id') or 'custom_source.js'))}"
         except Exception as exc:
+            if is_lxserver_unreachable(exc):
+                return JSONResponse(
+                    content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                             "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                    status_code=503,
+                )
             return JSONResponse(
                 content={"ok": False, "error": f"上传脚本失败: {exc}", "category": "download"},
                 status_code=500,
@@ -1725,7 +1772,7 @@ async def source_set(body: SourceBody):
                         status_code=500,
                     )
             else:
-                # http(s) URL：交给 lxserver 下载导入；同脚本已导入过则直接复用
+                # 外部下载由 lxserver 执行；此处 HTTP 异常仅来自内部通信。
                 try:
                     res = await LXSERVER.import_custom_source(url)
                     source_id = str(res.get("id") or "")
@@ -1797,6 +1844,13 @@ async def source_set(body: SourceBody):
                         status_code=500,
                     )
     except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            logger.error("lxserver 不可连接，切换源失败: %s", exc)
+            return JSONResponse(
+                content={"ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
+                         "category": "service_unavailable", "stage": "lxmusic_to_lxserver"},
+                status_code=503,
+            )
         return JSONResponse(
             content={"ok": False, "error": f"切换源失败: {exc}", "category": "runtime"},
             status_code=500,

@@ -94,6 +94,7 @@ ARG LXSERVER_MIRROR="https://ghfast.top"
 COPY container/lxserver.version /srv/lxserver.version
 COPY container/lxserver-artifact/ /srv/lxserver-artifact/
 COPY container/lxserver_compat.py /srv/lxserver_compat.py
+COPY container/ensure_lxserver_native.sh /usr/local/bin/ensure-lxserver-native
 RUN set -eu; \
     . /srv/lxserver.version; \
     TARGET_ZIP="/srv/lxserver-artifact/${LXSERVER_ZIP_NAME}"; \
@@ -139,11 +140,16 @@ RUN set -eu; \
     if [ -f /srv/lxserver/server/server/userApi.js ]; then \
         python3 /srv/lxserver_compat.py /srv/lxserver/server/server/userApi.js; \
     fi; \
+    chmod 0755 /usr/local/bin/ensure-lxserver-native; \
+    /usr/local/bin/ensure-lxserver-native \
+        --artifact-dir /srv/lxserver-artifact \
+        --lxserver-dir /srv/lxserver \
+        --version-file /srv/lxserver.version; \
     rm -rf /srv/lxserver-tmp /srv/lxserver-artifact /srv/lxserver_compat.py; \
     chown -R appuser:appuser /srv/lxserver
 
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
-COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py /srv/musicdl-service/
+COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/worker.py /srv/musicdl-service/
 COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py /srv/musicbox-service/
 COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/

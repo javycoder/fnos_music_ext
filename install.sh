@@ -570,7 +570,14 @@ run_docker() {
     if docker info >/dev/null 2>&1; then
         docker "$@"
     elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
-        sudo docker "$@"
+        local key
+        local -a build_env=()
+        for key in FNMUSIC_BUILD_FINGERPRINT FNMUSIC_BASE_IMAGE FNMUSIC_PIP_INDEX FNMUSIC_APT_MIRROR; do
+            if [[ -v "${key}" ]]; then
+                build_env+=("${key}=${!key}")
+            fi
+        done
+        sudo env "${build_env[@]}" docker "$@"
     else
         return 1
     fi
@@ -662,16 +669,13 @@ precheck_environment() {
     fi
 
     # 1. 检查 Python 3 与 venv 模块
-    if ! command -v python3 >/dev/null 2>&1; then
-        log_err "【缺少基础组件】系统未检测到 python3。"
+    if ! choose_python_bin; then
+        log_err "【缺少基础组件】系统未检测到合格的 Python 3.11+。"
         log_err "请先执行命令安装：sudo apt-get update && sudo apt-get install -y python3 python3-venv"
-        precheck_failed=1
-    elif ! python3 -c "import venv" >/dev/null 2>&1; then
-        log_err "【缺少基础组件】系统 Python 缺少 venv 模块。"
-        log_err "请先执行命令安装：sudo apt-get update && sudo apt-get install -y python3-venv"
+        log_err "或在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN。"
         precheck_failed=1
     else
-        log_info "Python 3 与 venv 模块已就绪。"
+        log_info "Python 解释器已就绪: ${FNMUSIC_SELECTED_PYTHON} ($(runtime_python_version "${FNMUSIC_SELECTED_PYTHON}")，来源: ${FNMUSIC_PYTHON_SOURCE})。"
     fi
 
     # 2. 检查 sudo 权限
@@ -703,23 +707,22 @@ precheck_environment() {
 
     # 4. 部署形态运行时检查（核心代理始终在宿主机 systemd）
     if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
-        # 原生模式：python3 ≥ 3.10（服务代码使用 PEP 604 联合类型语法）；
-        # nodejs/ffmpeg 缺失时可由 ensure_sources_native.sh 自动补装，此处仅预检提示
-        local py_major py_minor
-        py_major="$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
-        py_minor="$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
-        if [ "${py_major}" -lt 3 ] || { [ "${py_major}" -eq 3 ] && [ "${py_minor}" -lt 10 ]; }; then
-            log_err "【版本不足】原生模式需要 Python 3.10+（当前 ${py_major}.${py_minor}）。"
-            log_err "请升级系统 python3，或改用 Docker 模式（./install.sh --deploy docker）。"
+        if ! choose_python_bin; then
+            log_err "【版本不足】原生模式需要 Python 3.11+ 且包含 venv/ensurepip/ssl/sqlite3。"
+            log_err "可在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN。"
             precheck_failed=1
         else
-            log_info "Python ${py_major}.${py_minor} 满足原生模式要求。"
+            log_info "原生模式 Python 已选定: ${FNMUSIC_SELECTED_PYTHON} ($(runtime_python_version "${FNMUSIC_SELECTED_PYTHON}"))。"
         fi
-        if ! command -v node >/dev/null 2>&1; then
-            log_warn "未检测到 nodejs（lxserver 需要）：安装阶段将尝试 sudo apt-get 自动安装。"
+        if ! choose_node_bin; then
+            log_warn "未检测到 Node 20+（lxserver 需要）：安装阶段将尝试自动探测或 sudo apt-get 补装。"
+        else
+            log_info "原生模式 Node 已选定: ${FNMUSIC_SELECTED_NODE} (${FNMUSIC_NODE_SOURCE})。"
         fi
-        if ! command -v ffmpeg >/dev/null 2>&1; then
-            log_warn "未检测到 ffmpeg（musicdl 无损探针需要）：安装阶段将尝试 sudo apt-get 自动安装。"
+        if ! choose_media_bins; then
+            log_warn "未检测到 ffmpeg/ffprobe：安装阶段将尝试探测或 apt-get 补装（若仍缺失将按原文件播放降级）。"
+        else
+            log_info "原生模式媒体组件已选定: ffmpeg=${FNMUSIC_SELECTED_FFMPEG:-无}, ffprobe=${FNMUSIC_SELECTED_FFPROBE:-无}。"
         fi
     elif command -v docker >/dev/null 2>&1; then
         if run_docker info >/dev/null 2>&1; then
@@ -1241,12 +1244,13 @@ ENV_DESIRED="$(mktemp)"
         echo "FNMUSIC_LLM_API_KEY=''"
         echo "FNMUSIC_LLM_MODEL=''"
     fi
+    echo "FNMUSIC_SEARCH_PROBE='false'"
     # 其余情况不输出 LLM 键：env_merge 将原样保留 .env 中已保存的密钥
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
-ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
+ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
 # lx 源种子（校验通过后会再写一次推导出的 LX_SOURCE_LIST/LX_SOURCES）
 [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_LIST,LX_SOURCE_URL"
@@ -1460,12 +1464,9 @@ install_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || return 1
     fi
-    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
-    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
-        log_err "Docker 镜像构建或启动失败（compose up --build）。"
-        log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
-        log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
+    if ! ensure_image_current; then
+        log_err "Docker 镜像保障失败（复用或重建应用镜像未成功），请查看上方原始错误。"
+        log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
         return 1
     fi
     # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的
@@ -1778,15 +1779,6 @@ lx_verify_and_activate() {
     return 0
 }
 
-# Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
-# 结果写入 .env 的 FNMUSIC_BASE_IMAGE 供 compose build.args 使用；失败直接退出，不动现有部署
-if [ "${DEPLOY_MODE:-docker}" = "docker" ]; then
-    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
-        bash "${BASE_DIR}/ensure_base_image.sh"; then
-        log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源后重试。"
-        exit 1
-    fi
-fi
 
 takeover preflight --base "${BASE_DIR}"
 if [ "${DEPLOY_MODE:-docker}" = "native" ]; then

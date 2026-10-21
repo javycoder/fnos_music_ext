@@ -358,6 +358,42 @@ async def test_resume_part_download_appends_and_finalizes(tmp_path, monkeypatch)
 
 
 @pytest.mark.anyio
+async def test_resume_part_download_returns_false_when_finalize_rejected(tmp_path, monkeypatch):
+    """续传完成后若 _tee_finalize 拒绝（如坏无损流），返回 False 且不调度扫描与绑定。"""
+    part = tmp_path / "x.flac"
+    part.write_bytes(b"a" * 1024)
+    calls: dict = {}
+    tail = b"b" * 1024
+
+    class FakeResp:
+        status_code = 206
+        headers = {"content-range": f"bytes 1024-{1024 + len(tail) - 1}/2048",
+                   "content-type": "audio/flac"}
+
+        async def aclose(self):
+            calls["closed"] = True
+
+    async def empty_chunks():
+        return
+        yield b"never"
+
+    async def fake_open(request, guid, range_header, force_mp3=False):
+        return (FakeResp(), None, "flac", {"title": "晴天", "artist": "周杰伦"},
+                empty_chunks(), tail)
+
+    monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
+    monkeypatch.setattr(appmod, "_tee_finalize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(appmod, "_schedule_library_scan", lambda h: calls.setdefault("scan", True))
+    monkeypatch.setattr(appmod, "_dispatch_official_binding",
+                        lambda g, h, m: calls.setdefault("dispatch", g))
+
+    ok = await appmod._resume_part_download(FAKE_KUWO1, str(part), 1024, 2048, "flac", {})
+    assert ok is False
+    assert "scan" not in calls and "dispatch" not in calls
+    assert calls.get("closed") is True
+
+
+@pytest.mark.anyio
 async def test_handoff_falls_back_to_full_download_on_no_range(tmp_path, monkeypatch):
     """源忽略 Range 返回 200：不可续传 → 删半截 part 回退整轨重下。"""
     part = tmp_path / "x.mp3"
@@ -431,3 +467,155 @@ def test_env_hot_reload_new_keys(tmp_path, monkeypatch):
     finally:
         os.environ.pop("FNMUSIC_OFFICIAL_BIND_TIMEOUT_S", None)
         os.environ.pop("FNMUSIC_TEE_HANDOFF_MAX", None)
+
+
+# --------------------------------------------------------------------------
+# #67 回归：列表读取绝不补下载（路由级）
+# - pending 条目文件缺失时，反复读列表（跨节流窗口）+ 模拟代理重启（清空内存
+#   意图后再读），都只补登记绑定意图，不注册任何后台下载；
+# - 文件已存在的条目则照旧重试官方绑定。
+# --------------------------------------------------------------------------
+
+def _no_download_guards(monkeypatch):
+    downloads = []
+    monkeypatch.setattr(appmod, "_register_background_fetch", lambda *a, **k: downloads.append(a))
+    return downloads
+
+
+def test_favorite_list_route_never_downloads_missing_files(env, monkeypatch):
+    """收藏列表：pending 且无缓存文件 -> 跨节流窗口/重启模拟反复读取，零下载注册。"""
+    downloads = _no_download_guards(monkeypatch)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: None)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_online_favorites("user-a", [{
+        "guid": FAKE_KUWO1, "createdAt": 1, "bind": "pending", "track": snapshot,
+    }])
+
+    with TestClient(app) as client:
+        for _ in range(3):
+            resp = client.get("/music/api/v1/favorite-track/list", cookies={"music-token": "t"})
+            assert resp.status_code == 200
+            # 在线条目仍正常合入列表（列表渲染不受自愈节流影响）
+            assert any(it.get("guid") == appmod.fake_official_guid(FAKE_KUWO1)
+                       for it in resp.json()["data"]["list"])
+            # 意图被（重新）登记（重启恢复场景），但从未派发下载
+            assert FAKE_KUWO1 in appmod._bind_pending
+            assert downloads == []
+            appmod._bind_retry_last.clear()  # 跨节流窗口（>60s 后的等效读取）
+            # 模拟代理重启：内存意图清空，重启后首次列表读取
+            appmod._bind_pending.clear()
+            appmod._bind_tasks.clear()
+
+    assert downloads == []
+    assert appmod._full_fetch_tasks == {}
+
+
+def test_playlist_detail_route_never_downloads_missing_files(env, monkeypatch):
+    """歌单详情：官方歌单的 pending 在线条目 -> 反复读取，零下载注册。"""
+    downloads = _no_download_guards(monkeypatch)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: None)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot}],
+    })
+
+    with TestClient(app) as client:
+        for _ in range(3):
+            resp = client.get(
+                "/music/api/v1/track/playlist-detail/list",
+                params={"playlistGUID": PL_CUSTOM, "page": 1, "size": 50},
+                cookies={"music-token": "t"},
+            )
+            assert resp.status_code == 200
+            assert any(it.get("guid") == appmod.fake_official_guid(FAKE_KUWO1)
+                       for it in resp.json()["data"]["list"])
+            appmod._bind_retry_last.clear()
+            appmod._bind_pending.clear()
+            appmod._bind_tasks.clear()
+
+    assert downloads == []
+    assert appmod._full_fetch_tasks == {}
+
+
+def test_playlist_detail_route_retries_bind_only_for_existing_files(env, monkeypatch):
+    """歌单详情：已有缓存文件的 pending 条目重试官方绑定（不下载），缺失条目不动。"""
+    downloads = _no_download_guards(monkeypatch)
+    make_official_db(env["db_path"], with_track=True)
+    existing = env["dirs"]["library"] + "/f.mp3"
+
+    def fake_find(guid):
+        return existing if guid == FAKE_KUWO1 else None
+
+    monkeypatch.setattr(appmod, "find_cache_file", fake_find)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    missing = appmod.build_favorite_track_obj(
+        "online:kuwo:999999", {"title": "missing", "artist": "none",
+                               "id": "999999", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [
+            {"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot},
+            {"guid": "online:kuwo:999999", "addedAt": 2, "bind": "pending", "track": missing},
+        ],
+    })
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": PL_CUSTOM, "page": 1, "size": 50},
+            cookies={"music-token": "t"},
+        )
+        assert resp.status_code == 200
+        assert wait_for(lambda: upstream_posts(env["upstream_calls"], "/playlist/add-track"))
+
+    assert downloads == []
+    adds = upstream_posts(env["upstream_calls"], "/playlist/add-track")
+    assert adds and adds[0]["json"]["trackGUIDs"] == [OFFICIAL_GUID]
+
+
+@pytest.mark.asyncio
+async def test_bound_online_favorite_uses_current_official_state_per_user(env):
+    make_official_db(env["db_path"])
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("INSERT INTO user VALUES (1, 'user-a')")
+        con.execute("INSERT INTO user VALUES (2, 'user-b')")
+        con.execute("INSERT INTO favorite_track VALUES (1, 10, 1)")
+    appmod._bind_registry.update({
+        "user-a": {FAKE_KUWO1: {"official": OFFICIAL_GUID, "fav": True}},
+        "user-b": {FAKE_KUWO1: {"official": OFFICIAL_GUID, "fav": True}},
+    })
+    assert FAKE_KUWO1 in await appmod._online_favorite_set_for_user("user-a")
+    assert FAKE_KUWO1 not in await appmod._online_favorite_set_for_user("user-b")
+    # The binding registry is historical; cancellation through official UI wins.
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("DELETE FROM favorite_track")
+    assert FAKE_KUWO1 not in await appmod._online_favorite_set_for_user("user-a")
+
+
+def test_play_history_keeps_heart_after_online_favorite_is_bound(env):
+    """绑定完成后本地收藏记录已删除，最近播放仍按官方收藏显示红心。"""
+    import proxy.recommend as dailyrec
+
+    make_official_db(env["db_path"])
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("INSERT INTO user VALUES (1, 'user-a')")
+        con.execute("INSERT INTO favorite_track VALUES (1, 10, 1)")
+    appmod._bind_registry.update({
+        "user-a": {FAKE_KUWO1: {"official": OFFICIAL_GUID, "fav": True}},
+    })
+    dailyrec.record_online_play("user-a", FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦"})
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/play-history/list")
+    assert resp.status_code == 200
+    by_title = {item.get("title"): item for item in resp.json()["data"]["list"]}
+    assert by_title["晴天"]["isFavorite"] is True

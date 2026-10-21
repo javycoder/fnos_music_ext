@@ -28,6 +28,8 @@ __pycache__/
 !.env.example
 .pytest_cache/
 .zcode/
+.agents/
+AGENTS.md
 *.part
 *.log
 # 支付宝收款码：本地测试/CI 生成（ALIPAY_QRCODE secret），绝不入库

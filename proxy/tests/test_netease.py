@@ -1505,7 +1505,7 @@ async def test_netease_dead_pin_refresh_without_search_cache(monkeypatch):
     async with real_client(transport=httpx.MockTransport(mb_handler), base_url="http://mb.test") as client:
         monkeypatch.setattr(p, "get_musicbox_client", lambda a: client)
         monkeypatch.setattr(p, "_retained_track", lambda *a: ({"ext": "flac"}, None))
-        monkeypatch.setattr(p, "find_cache_file", lambda *a: None)
+        monkeypatch.setattr(p, "find_cache_file", lambda *a, **kw: None)
         monkeypatch.setattr(p, "_register_full_fetch", lambda *a: None)
         monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(cdn_handler), **kw))
         req = Request({"type": "http", "app": app, "method": "GET", "path": "/music/api/v1/track/stream", "query_string": f"guid={guid}".encode(), "headers": [(b"range", b"bytes=100-103")]})

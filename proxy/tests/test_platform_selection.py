@@ -61,7 +61,8 @@ async def test_fetch_lx_search_sources_passthrough(monkeypatch):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["params"] = dict(request.url.params)
+        if request.url.path == "/api/v1/search":
+            seen["params"] = dict(request.url.params)
         return httpx.Response(200, json={"ok": True, "items": []})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")

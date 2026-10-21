@@ -14,7 +14,10 @@ from proxy.app import (
 
 @pytest.fixture(autouse=True)
 def reset_state(monkeypatch):
+    import proxy.app as p
+    p.reset_source_search_gates()
     _SEARCH_CACHE.clear()
+    monkeypatch.setitem(CONF, "search_debounce_s", 0.0)
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "lx_enabled", True)
@@ -236,6 +239,80 @@ async def test_deadline_respected(monkeypatch, caplog):
 
     assert entry["partial"] is True
     assert len(entry["items"]) == 0
-    # search_timeout 是 0.1，min 是 1.0 (max(1.0, float(CONF["search_timeout"])))
-    # 所以 deadline 是 ~1.0s，由于 retry_delay 0.5s，在 deadline 剩余不足或者 delay 后受 deadline 保护
-    assert elapsed < 2.0
+    assert elapsed < .3
+
+
+@pytest.mark.anyio
+async def test_retry_once_max_and_failure_not_cached(monkeypatch):
+    monkeypatch.setitem(CONF, "search_empty_retry", 99)
+    calls = []
+    async def fail(*args):
+        calls.append(args[1])
+        return None
+    for name in ("fetch_musicbox_search", "fetch_musicdl_search", "fetch_lx_search"):
+        monkeypatch.setattr("proxy.app." + name, fail)
+    entry = {"items": [], "ts": 0}
+    await _aggregate_search(_DummyReq(), "same", entry)
+    assert calls == ["same"] * 6
+    assert entry["ts"] == 0 and entry["partial"] and entry["items"] == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change_keyword", [False, True])
+async def test_cancel_or_keyword_change_during_retry_delay_does_not_retry(monkeypatch, change_keyword):
+    import proxy.app as p
+    monkeypatch.setitem(CONF, "search_empty_retry_delay", .1)
+    called = asyncio.Event()
+    calls = []
+    async def fail(*args):
+        calls.append(args[1])
+        called.set()
+        return None
+    for name in ("fetch_musicbox_search", "fetch_musicdl_search", "fetch_lx_search"):
+        monkeypatch.setattr("proxy.app." + name, fail)
+    scope = p._credential_scope(_DummyReq())
+    gen = p._note_user_keyword(scope, "old")
+    entry = {"items": [], "ts": 0, "gen": gen, "credentials": scope}
+    task = asyncio.create_task(_aggregate_search(_DummyReq(), "old", entry))
+    await called.wait()
+    await asyncio.sleep(.02)
+    if change_keyword:
+        p._note_user_keyword(scope, "new")
+    else:
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert calls == ["old"] * 3
+    assert entry["items"] == [] and entry["ts"] == 0
+
+
+@pytest.mark.anyio
+async def test_retry_uses_original_deadline(monkeypatch):
+    monkeypatch.setitem(CONF, "search_timeout", .12)
+    monkeypatch.setitem(CONF, "search_empty_retry_delay", .02)
+    calls = []
+    async def fail_then_stall(*args):
+        calls.append(args[1])
+        if len(calls) <= 3:
+            await asyncio.sleep(.04)
+            return None
+        await asyncio.sleep(10)
+    for name in ("fetch_musicbox_search", "fetch_musicdl_search", "fetch_lx_search"):
+        monkeypatch.setattr("proxy.app." + name, fail_then_stall)
+    entry = {"items": [], "ts": 0}
+    started = asyncio.get_running_loop().time()
+    await _aggregate_search(_DummyReq(), "same", entry)
+    assert asyncio.get_running_loop().time() - started < .18
+    assert len(calls) == 6 and entry["ts"] == 0
+
+
+@pytest.mark.anyio
+async def test_musicdl_fetch_does_not_retry_inside_gate():
+    import httpx
+    import proxy.app as p
+    calls = []
+    def fail(req):
+        calls.append(req)
+        return httpx.Response(503)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail), base_url="http://test") as client:
+        assert await p.fetch_musicdl_search(client, "same", 20) is None
+    assert len(calls) == 1

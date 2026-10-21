@@ -1,11 +1,17 @@
-"""musicdl-service 鲁棒性组件：缓存、源熔断器、SingleFlight 并发去重.
+"""musicdl-service 鲁棒性组件：缓存、源熔断器、进程隔离舱壁、SingleFlight 并发去重.
 
 纯标准库实现，零第三方依赖，线程安全。
 """
 import asyncio
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 import inspect
+import logging
+import uuid
+import json
+import os
+from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Callable, List, Optional
@@ -13,6 +19,14 @@ from typing import Any, Callable, List, Optional
 
 class SourceBusy(RuntimeError):
     """A source already has work running; callers must not enqueue more."""
+
+
+class WorkerDead(RuntimeError):
+    """worker 进程异常退出或协议流损坏；坑位已回收，下一次请求自动重建。"""
+
+
+class WorkerTaskError(RuntimeError):
+    """任务级失败：worker 上报后仍健康存活，坑位保留复用，仅本次任务失败。"""
 
 
 class SearchProgress:
@@ -41,71 +55,330 @@ class SearchProgress:
             return list(self._entries)
 
 
-class SourceBulkhead:
-    """One persistent worker per known source, with no waiting job queue.
+_WORKER_SCRIPT = Path(__file__).resolve().parent / "worker.py"
 
-    Admission belongs to the concurrent future, not its asyncio waiter. Timing
-    out/cancelling a request cannot free the source until the worker exits.
-    Unknown names cannot create pools, and shutdown never replaces live pools.
+
+async def spawn_subprocess_worker(source, on_worker_line=None, script=None):
+    """启动一个 worker 子进程（当前解释器），返回父进程侧句柄。
+
+    不从多线程服务直接 fork；PYTHONPATH 前置脚本目录保证 search_core 可导入。
+    """
+    script = Path(script or _WORKER_SCRIPT)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(script.parent) + (os.pathsep + existing if existing else "")
+    # Shield creation: cancellation may arrive after exec but before the handle is returned.
+    starting = asyncio.create_task(asyncio.create_subprocess_exec(
+        sys.executable, "-u", str(script),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=env, limit=4 * 1024 * 1024,
+    ))
+    try:
+        proc = await asyncio.shield(starting)
+    except asyncio.CancelledError:
+        async def recover():
+            proc = await starting
+            await _SubprocessWorker(proc, source).terminate()
+        cleanup = asyncio.create_task(recover())
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                pass
+        # 待处理的取消必须原样传播：清理失败只降级为吞掉，不得顶替 CancelledError。
+        with suppress(Exception):
+            cleanup.result()
+        raise
+    worker = _SubprocessWorker(proc, source, on_worker_line)
+    worker.start_stderr_pump()
+    return worker
+
+
+class _SubprocessWorker:
+    """worker 子进程的父进程侧句柄。
+
+    协议流走独立 stdout，库输出改道 stderr 并丢弃；一次只执行一个任务。
     """
 
-    def __init__(self, sources) -> None:
-        self._executors = {
-            source: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"src-{source}")
-            for source in set(sources)
-        }
-        self._busy = set()
+    def __init__(self, proc, source, on_worker_line=None):
+        self.proc = proc
+        self.source = source
+        self.ready = False
+        self._on_worker_line = on_worker_line
+        self._stderr_task = None
+
+    def start_stderr_pump(self):
+        if self.proc.stderr is not None:
+            self._stderr_task = asyncio.create_task(self._pump_stderr())
+
+    async def _pump_stderr(self):
+        # Arbitrary library output may contain credentials, lyrics or URLs.
+        # Drain bounded chunks and deliberately discard it, even without a logger.
+        while await self.proc.stderr.read(8192):
+            pass
+
+    def alive(self) -> bool:
+        return self.proc.returncode is None
+
+    async def wait_ready(self, timeout: float) -> None:
+        try:
+            line = await asyncio.wait_for(self.proc.stdout.readline(), timeout)
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError("worker startup exceeded budget") from None
+        if not line:
+            raise WorkerDead("worker exited before ready handshake")
+        try:
+            msg = json.loads(line)
+        except ValueError as exc:
+            raise WorkerDead("corrupt worker handshake") from None
+        if not isinstance(msg, dict) or msg.get("type") != "ready":
+            raise WorkerDead("unexpected worker handshake")
+        self.ready = True
+
+    async def execute(self, payload: dict, on_entry, deadline: float) -> dict:
+        """执行一个任务直到 result/error；确认条目经 on_entry 即时上交。
+
+        超时抛 asyncio.TimeoutError；进程死亡/流损坏抛 WorkerDead；
+        任务级失败（worker 仍健康，可复用）抛 WorkerTaskError。
+        """
+        if deadline - time.monotonic() <= 0:
+            raise asyncio.TimeoutError("worker task budget already exhausted")
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            self.proc.stdin.write(data)
+            await self.proc.stdin.drain()
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            raise WorkerDead(f"worker stdin closed: {exc}") from None
+        entries = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("worker task budget exhausted")
+            try:
+                line = await asyncio.wait_for(self.proc.stdout.readline(), remaining)
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError("worker task budget exhausted") from None
+            if not line:
+                raise WorkerDead("worker exited mid-task")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                raise WorkerDead("corrupt worker output") from None
+            kind = msg.get("type") if isinstance(msg, dict) else None
+            if kind == "entry":
+                entry = msg.get("entry")
+                if (not isinstance(entry, list) or len(entry) != 3
+                        or not isinstance(entry[0], dict) or not isinstance(entry[0].get("id"), str)
+                        or not isinstance(entry[1], dict) or not isinstance(entry[2], str)):
+                    raise WorkerDead("invalid worker entry")
+                entries.append(entry)
+                if on_entry is not None:
+                    on_entry(entry)
+            elif kind == "result":
+                if type(msg.get("count")) is not int or type(msg.get("partial")) is not bool:
+                    raise WorkerDead("invalid worker result")
+                if msg["count"] != len(entries):
+                    raise WorkerDead("worker entry count mismatch")
+                return {"entries": entries,
+                        "count": int(msg.get("count") or len(entries)),
+                        "partial": bool(msg.get("partial"))}
+            elif kind == "error":
+                raise WorkerTaskError(str(msg.get("error") or "worker task failed"))
+            else:
+                raise WorkerDead("unknown worker message")
+
+    async def terminate(self, grace_s: float = 0.5) -> None:
+        """TERM, bounded grace, KILL, then unconditionally confirm reap."""
+        if self.proc.returncode is None:
+            with suppress(ProcessLookupError):
+                self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), min(0.5, grace_s))
+            except asyncio.TimeoutError:
+                with suppress(ProcessLookupError):
+                    self.proc.kill()
+        await self.proc.wait()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._stderr_task
+
+
+class _SourceSlot:
+    __slots__ = ("busy", "worker", "stats")
+
+    def __init__(self):
+        self.busy = False
+        self.worker = None
+        self.stats = {"admitted": 0, "ok": 0, "timeouts": 0, "crashed": 0, "task_failed": 0,
+                      "recycled": 0, "last_recycle_reason": ""}
+
+
+class SourceBulkhead:
+    """每源一个受管 worker 子进程：一次一任务，按需启动，干净完成后复用。
+
+    执行体在子进程内（默认 worker.py；spawn 仅作为显式测试边界），卡死的
+    任务不再永久占用音源：超时、取消或聚合提前结束时回收 worker——先 TERM，
+    最多 term_grace_s 秒，再 KILL，确认退出后才释放坑位。排队等待、进程启动、
+    搜索与探活共用调用方传入的单个超时预算；预算耗尽 admission 抢不到时抛
+    SourceBusy（busy 等待与主动跳过不是上游失败，由调用方决定计分）。
+    """
+
+    def __init__(self, sources, spawn=None,
+                 term_grace_s: float = 0.5, on_worker_line=None) -> None:
+        self._slots = {source: _SourceSlot() for source in set(sources)}
+        self._spawn = spawn
+        self._term_grace_s = min(0.5, max(0.0, float(term_grace_s)))
+        self._on_worker_line = on_worker_line
         self._lock = threading.Lock()
         self._closed = False
+        self._tasks = set()
 
-    def submit(self, source, fn, *args):
-        with self._lock:
-            if self._closed:
-                raise SourceBusy("source workers shutting down")
-            if source not in self._executors:
-                raise ValueError(f"unknown source {source!r}")
-            if source in self._busy:
-                raise SourceBusy("source busy (previous search still running); retry later")
-            self._busy.add(source)
-            try:
-                future = self._executors[source].submit(fn, *args)
-            except BaseException:
-                self._busy.remove(source)
-                raise
-        # Register outside the lock: completed futures invoke callbacks inline.
-        def release(_):
-            with self._lock:
-                self._busy.discard(source)
-        future.add_done_callback(release)
-        return future
-
-    async def run(self, source, fn, *args, timeout):
-        # A busy source means the previous keyword's worker still holds the
-        # slot. Rejecting instantly hands the caller an empty result while the
-        # real results are still being produced, so wait for admission within
-        # the caller's own timeout budget instead.
-        deadline = time.monotonic() + timeout
+    async def run(self, source, payload: dict, *, timeout: float, on_entry=None) -> dict:
+        slot = self._slots.get(source)
+        if slot is None:
+            raise ValueError(f"unknown source {source!r}")
+        deadline = time.monotonic() + max(0, float(timeout))
+        # busy 的源意味着上一个关键词的任务还占着坑。立即拒绝会让调用方拿到
+        # 空结果而真实结果仍在路上，所以在调用方自己的预算内等待 admission。
         while True:
+            with self._lock:
+                if self._closed:
+                    raise SourceBusy("source workers shutting down")
+                if not slot.busy:
+                    slot.busy = True
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SourceBusy("source busy (previous search still running); retry later")
+            await asyncio.sleep(min(0.02, remaining))
+        self._tasks.add(asyncio.current_task())
+        slot.stats["admitted"] += 1
+        task_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+        phase = "start"
+        reason = "complete"
+        count = 0
+
+        def confirmed(entry):
+            nonlocal count
+            count += 1
+            if on_entry is not None:
+                on_entry(entry)
+
+        try:
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                worker = await self._ensure_worker(source, slot, deadline)
+                phase = "search_probe"
+                remaining = max(0, deadline - time.monotonic())
+                payload = dict(payload, task_id=task_id,
+                               budget_s=max(0, remaining - min(0.1, remaining * 0.1)))
+                result = await worker.execute(payload, confirmed, deadline)
+                count = result.get("count", 0)
+            if result.get("partial"):
+                reason = "pending_probes"
+                await self._recycle(slot, worker, reason)
+            else:
+                slot.stats["ok"] += 1
+            return result
+        except WorkerTaskError:
+            # 任务级失败：worker 上报后仍健康（worker.py 协议），保留坑位复用，
+            # 不回收不计崩溃；由调用方按源失败处理本次任务。
+            reason = "task_failed"
+            slot.stats["task_failed"] += 1
+            raise
+        except BaseException as exc:
+            reason = ("cancelled" if isinstance(exc, asyncio.CancelledError) else
+                      "timeout" if isinstance(exc, asyncio.TimeoutError) else "worker_failed")
+            slot.stats["timeouts" if reason == "timeout" else "crashed"] += 1
+            if slot.worker is not None:
+                await self._recycle(slot, slot.worker, reason)
+            raise
+        finally:
+            logging.getLogger("musicdl_service").info(
+                "worker task=%s source=%s phase=%s duration=%.3f count=%d recycle=%s",
+                task_id, source, phase, time.monotonic() - started, count, reason)
+            self._tasks.discard(asyncio.current_task())
+            with self._lock:
+                slot.busy = False
+
+    async def _ensure_worker(self, source, slot, deadline: float):
+        worker = slot.worker
+        if worker is not None and worker.ready and worker.alive():
+            return worker
+        if worker is not None:
+            await self._recycle(slot, worker, "dead or unready worker")
+        if deadline - time.monotonic() <= 0.05:
+            raise asyncio.TimeoutError("worker startup budget exhausted")
+        spawn = self._spawn or spawn_subprocess_worker
+        worker = await spawn(source, on_worker_line=self._on_worker_line)
+        slot.worker = worker
+        if self._closed:
+            raise SourceBusy("source workers shutting down")
+        await worker.wait_ready(max(0, deadline - time.monotonic()))
+        return worker
+
+    async def _recycle(self, slot, worker, reason: str) -> None:
+        slot.stats["recycled"] += 1
+        slot.stats["last_recycle_reason"] = str(reason)[:200]
+        # Repeated caller cancellation must never release admission ahead of reap.
+        cleanup = asyncio.create_task(worker.terminate(self._term_grace_s))
+        cancelled = False
+        while not cleanup.done():
             try:
-                future = asyncio.wrap_future(self.submit(source, fn, *args))
-                break
-            except SourceBusy:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                await asyncio.sleep(min(0.2, max(0.02, remaining)))
-        # Never cancel the executor future, even before its worker starts:
-        # cancelled queue entries would otherwise release admission too early.
-        # Retrieve late failures even when their original waiter has gone away.
-        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-        remaining = max(0.05, deadline - time.monotonic())
-        return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if slot.worker is worker:
+            slot.worker = None
+        if cancelled:
+            raise asyncio.CancelledError
+
+    def stats(self) -> dict:
+        with self._lock:
+            sources = {}
+            for name, slot in sorted(self._slots.items()):
+                worker = slot.worker
+                if slot.busy:
+                    state = "busy"
+                elif worker is not None and worker.ready and worker.alive():
+                    state = "idle"
+                else:
+                    state = "down"
+                entry = dict(slot.stats)
+                entry["state"] = state
+                sources[name] = entry
+            return {
+                "sources": sources,
+                "totals": {
+                    "admitted": sum(s["admitted"] for s in sources.values()),
+                    "ok": sum(s["ok"] for s in sources.values()),
+                    "timeouts": sum(s["timeouts"] for s in sources.values()),
+                    "crashed": sum(s["crashed"] for s in sources.values()),
+                    "task_failed": sum(s["task_failed"] for s in sources.values()),
+                    "recycled": sum(s["recycled"] for s in sources.values()),
+                },
+                "term_grace_s": self._term_grace_s,
+            }
+
+    async def aclose(self) -> None:
+        """Stop active admissions/startup first, then reap every idle process."""
+        self._closed = True
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for slot in self._slots.values():
+            if slot.worker is not None:
+                await self._recycle(slot, slot.worker, "shutdown")
 
     def shutdown(self, wait=True):
-        with self._lock:
-            self._closed = True
-        for executor in self._executors.values():
-            executor.shutdown(wait=wait, cancel_futures=True)
+        """Only valid without real workers; async process owners must await aclose."""
+        if any(getattr(slot.worker, "proc", None) is not None for slot in self._slots.values()):
+            raise RuntimeError("subprocess workers require await aclose()")
+        self._closed = True
 
 
 class SearchCache:
@@ -293,34 +566,41 @@ class AdaptiveTimeout:
 
 
 class SingleFlight:
-    """同键并发请求去重（纯 asyncio 实现）。"""
+    """Shared task ownership is independent of the first waiter."""
 
-    def __init__(self) -> None:
-        self._inflight: dict[str, asyncio.Future] = {}
+    def __init__(self):
+        self._inflight = {}
+        self._waiters = {}
 
-    async def run(self, key: str, fn: Callable[..., Any]) -> Any:
-        if key in self._inflight:
-            return await asyncio.shield(self._inflight[key])
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._inflight[key] = fut
+    async def run(self, key, fn):
+        task = self._inflight.get(key)
+        if task is None:
+            async def invoke():
+                value = fn() if callable(fn) else fn
+                return await value if inspect.isawaitable(value) else value
+            task = asyncio.create_task(invoke())
+            task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+            self._inflight[key] = task
+            self._waiters[key] = 0
+        self._waiters[key] += 1
         try:
-            if callable(fn):
-                res = fn()
-                if inspect.isawaitable(res):
-                    res = await res
-            elif inspect.isawaitable(fn):
-                res = await fn
-            else:
-                res = fn
-            if not fut.done():
-                fut.set_result(res)
-            return res
-        except BaseException as exc:
-            if not fut.done():
-                fut.set_exception(exc)
-            raise
+            return await asyncio.shield(task)
         finally:
-            self._inflight.pop(key, None)
+            self._waiters[key] -= 1
+            if not self._waiters[key]:
+                self._inflight.pop(key, None)
+                self._waiters.pop(key, None)
+                if not task.done():
+                    task.cancel()
+                    cleanup = asyncio.gather(task, return_exceptions=True)
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            pass
 
+    async def aclose(self):
+        tasks = list(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

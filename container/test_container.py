@@ -297,7 +297,9 @@ def test_compose_build_args_mirror_passthrough():
     args = build["args"]
     for name in ("BASE_IMAGE", "PIP_INDEX_URL", "APT_MIRROR"):
         assert name in args and "${" in args[name], f"构建参数 {name} 需从 .env 透传"
-    assert build.get("network") == "host"
+    # issue #71：默认构建不依赖 BuildKit 的 network.host 授权。
+    assert build.get("network", "default") == "default"
+    assert not build.get("entitlements")
 
 
 def test_dockerfile_assembly():
@@ -309,6 +311,8 @@ def test_dockerfile_assembly():
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
     assert "container/lxserver.version" in text
+    assert "container/ensure_lxserver_native.sh" in text
+    assert "ensure-lxserver-native" in text
     assert "lxmusic-service/lxserver_client.py" in text
     assert "lxmusic-service/js/bridge.js" not in text
     assert text.count("HEALTHCHECK") >= 1

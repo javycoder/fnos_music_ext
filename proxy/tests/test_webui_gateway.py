@@ -1,6 +1,7 @@
 """桌面网关 socket 把 HTTP 原样转到 WebUI 端口；/api/host-file、/api/fs-check 由网关本地处理。"""
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -18,6 +19,13 @@ _MOD = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MOD)
 serve = _MOD.serve
 socket_path_for = _MOD.socket_path_for
+
+
+class _TestHTTPServer(ThreadingHTTPServer):
+    """Short shutdown polling is test cleanup, not an upstream timing boundary."""
+
+    def serve_forever(self, poll_interval=0.01):
+        return super().serve_forever(poll_interval=poll_interval)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -98,13 +106,15 @@ def test_socket_path_for_fpk_layout(tmp_path: Path):
 
 
 class _SlowHandler(BaseHTTPRequestHandler):
-    """响应故意晚于旧的 5 秒套接字超时，用来守住校验请求不被中途拆掉。"""
+    """Delay beyond the test-scaled connect timeout, not the relay timeout."""
+
+    delay = 0.3
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length:
             self.rfile.read(length)
-        time.sleep(6)
+        time.sleep(self.delay)
         body = b'{"ok":true}'
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -115,8 +125,21 @@ class _SlowHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_slow_upstream_is_not_cut_at_connect_timeout(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _SlowHandler)
+def test_slow_upstream_is_not_cut_at_connect_timeout(tmp_path: Path, monkeypatch):
+    # Keep the production boundary explicit, but scale the real socket wait.
+    assert _MOD.CONNECT_TIMEOUT == 5
+    assert _MOD.RELAY_TIMEOUT >= 180
+    monkeypatch.setattr(_MOD, "CONNECT_TIMEOUT", 0.1)
+    relay_timeouts = []
+    real_relay = _MOD._relay
+
+    def checked_relay(src, dst, prefix=b""):
+        if not prefix:  # upstream -> desktop: must not retain connect timeout
+            relay_timeouts.append(src.gettimeout())
+        return real_relay(src, dst, prefix)
+
+    monkeypatch.setattr(_MOD, "_relay", checked_relay)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _SlowHandler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -124,14 +147,19 @@ def test_slow_upstream_is_not_cut_at_connect_timeout(tmp_path: Path):
         b"POST /app/fnmusic-ext/api/lx/verify HTTP/1.1\r\n"
         b"Host: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
     )
-    data = _request(sock_path, raw, timeout=12)
-    upstream.shutdown()
+    try:
+        data = _request(sock_path, raw, timeout=3)
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+    assert relay_timeouts == [_MOD.RELAY_TIMEOUT]
+    assert _SlowHandler.delay > _MOD.CONNECT_TIMEOUT
     assert b"200" in data.split(b"\r\n", 1)[0]
     assert b'{"ok":true}' in data
 
 
 def test_socket_forwards_desktop_path(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -141,7 +169,7 @@ def test_socket_forwards_desktop_path(tmp_path: Path):
 
 
 def test_host_file_requires_admin(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -152,7 +180,7 @@ def test_host_file_requires_admin(tmp_path: Path):
 
 
 def test_host_file_validates_path_and_reads_content(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -178,7 +206,7 @@ def test_host_file_validates_path_and_reads_content(tmp_path: Path):
 
 def test_host_file_only_post_intercepted(tmp_path: Path):
     """GET /api/host-file 不是代读端点，走正常转发。"""
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -209,7 +237,7 @@ def _fs_check(sock_path: Path, path: str, is_admin: str = "true") -> "tuple[byte
 
 
 def test_fs_check_requires_admin(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -221,7 +249,7 @@ def test_fs_check_requires_admin(tmp_path: Path):
 
 
 def test_fs_check_validates_path(tmp_path: Path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -236,7 +264,7 @@ def test_fs_check_existing_dir_writability(tmp_path: Path):
     """存在目录：root 之外的运行身份下可写目录 → True，只读目录 → False。"""
     if os.geteuid() == 0:
         pytest.skip("root 不受权限位约束，只读目录用例无意义")
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -257,7 +285,7 @@ def test_fs_check_existing_dir_writability(tmp_path: Path):
 
 def test_fs_check_missing_dir_probes_nearest_ancestor(tmp_path: Path):
     """目录不存在：用最近存在祖先的可写性代表"能否创建"，且不创建目录。"""
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
@@ -309,10 +337,96 @@ def test_fs_check_directory_symlink_allows_missing_child(tmp_path: Path):
 
 def test_fs_check_only_post_intercepted(tmp_path: Path):
     """GET /api/fs-check 不是校验端点，走正常转发。"""
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     sock_path = _start_gateway(tmp_path, port)
     data = _request(sock_path, b"GET /app/fnmusic-ext/api/fs-check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     upstream.shutdown()
     assert b"/app/fnmusic-ext/api/fs-check" in data
+
+
+def _maintenance_request(method="POST", path="/api/maintenance/cleanup",
+                         body=b'{"confirm_beta":true}', admin="true", extra=b""):
+    return (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+            f"X-Trim-Isadmin: {admin}\r\nContent-Length: {len(body)}\r\n".encode()
+            + extra + b"\r\n" + body)
+
+
+@pytest.mark.parametrize("admin", ["false", "", "1"])
+def test_maintenance_requires_admin(tmp_path, admin):
+    sock = _start_gateway(tmp_path, 1)
+    data = _request(sock, _maintenance_request(admin=admin))
+    assert data.startswith(b"HTTP/1.1 403")
+
+
+@pytest.mark.parametrize("body", [b'{}', b'{"confirm_beta":false}', b'{"confirm_beta":1}',
+                                   b'{"confirm_beta":true,"path":"/tmp"}', b'[]', b'null'])
+def test_maintenance_requires_only_explicit_confirmation(tmp_path, body):
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request(body=body)).startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/api/maintenance/cleanup/" + "g" * 32),
+    ("GET", "/api/maintenance/cleanup/" + "a" * 31),
+    ("GET", "/api/maintenance/cleanup/" + "a" * 33),
+    ("GET", "/api/maintenance/cleanup/" + "a" * 32 + "?path=/tmp"),
+    ("DELETE", "/api/maintenance/cleanup"),
+    ("POST", "/app/fnmusic-ext/api/maintenance/unknown"),
+])
+def test_unknown_maintenance_never_reaches_webui(tmp_path, method, path):
+    # No upstream exists: only a local rejection can produce this HTTP response.
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request(method, path)).startswith(b"HTTP/1.1 404")
+
+
+def test_maintenance_unreachable_is_503(tmp_path, monkeypatch):
+    monkeypatch.setattr(_MOD, "MAINTENANCE_SOCKET", str(tmp_path / "absent.sock"))
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request()).startswith(b"HTTP/1.1 503")
+
+
+@pytest.mark.parametrize("extra", [b"Transfer-Encoding: chunked\r\n", b"Content-Length: 1\r\n",
+                                    b"X-Trim-Isadmin: false\r\n",
+                                    b"Long: " + b"x" * 16384 + b"\r\n"])
+def test_maintenance_rejects_bad_headers(tmp_path, extra):
+    sock = _start_gateway(tmp_path, 1)
+    assert _request(sock, _maintenance_request(extra=extra)).startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.parametrize("prefix", ["", "/app/fnmusic-ext"])
+def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
+    spec = importlib.util.spec_from_file_location(
+        "maintenance_socket", Path(__file__).resolve().parents[1] / "maintenance_socket.py")
+    maintenance = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(maintenance)
+    private_path = tmp_path / "maintenance.sock"
+    monkeypatch.setattr(_MOD, "MAINTENANCE_SOCKET", str(private_path))
+    gateway_path = _start_gateway(tmp_path, 1)
+
+    async def run():
+        calls = []
+        job = "a" * 32
+
+        async def callback(method, path, body):
+            calls.append((method, path, body))
+            if method == "POST":
+                return 202, {"job_id": job, "state": "pending"}
+            return 200, {"job_id": job, "state": "done", "deleted": 7}
+
+        server = await maintenance.start(asyncio.get_running_loop(), callback, private_path)
+        try:
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                path=prefix + "/api/maintenance/cleanup"))
+            assert data.startswith(b"HTTP/1.1 202")
+            assert json.loads(data.split(b"\r\n\r\n")[1]) == {"job_id": job, "state": "pending"}
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                "GET", prefix + "/api/maintenance/cleanup/" + job, b""))
+            assert data.startswith(b"HTTP/1.1 200")
+            assert json.loads(data.split(b"\r\n\r\n")[1]) == {"job_id": job, "state": "done", "deleted": 7}
+            assert calls == [("POST", "/api/maintenance/cleanup", {"confirm_beta": True}),
+                             ("GET", "/api/maintenance/cleanup/" + job, {})]
+        finally:
+            await maintenance.stop(server)
+    asyncio.run(run())

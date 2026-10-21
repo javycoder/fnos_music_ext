@@ -5,22 +5,28 @@
 <应用目录>/fnmusic-ext.sock，把 https://<主机>:<桌面端口>/app/fnmusic-ext/
 转到这个 socket。WebUI 自己监听 127.0.0.1:8774，并认识 /app/fnmusic-ext 前缀。
 
-本模块还处理两个例外端点（都只在桌面网关链路里存在，直连 8774 不经过这里，
+本模块还处理以下例外端点（都只在桌面网关链路里存在，直连 8774 不经过这里，
 都要求网关注入的 X-Trim-Isadmin: true；其余请求一律原样转发，不动字节）：
 - POST /app/fnmusic-ext/api/host-file——浏览器把 NAS 上选中的 .js 源脚本路径
   发来，由宿主侧（本进程，root）代读文件内容。
 - POST /app/fnmusic-ext/api/fs-check——浏览器把储存目录（缓存/下载目录）路径
   发来，由宿主侧按真实落盘视角（root proxy）探测目录存在性与可写性。
+- /api/maintenance：仅转发已确认的清理/任务查询到固定私有 Unix socket，
+  不持有业务状态，也不把未知维护请求交给普通 WebUI。
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import http.client
 import signal
 import socket
 import sys
 import threading
+import time
 import uuid
+from urllib.parse import unquote
 from pathlib import Path
 
 UPSTREAM = ("127.0.0.1", 8774)
@@ -36,6 +42,11 @@ HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径
 HOST_FILE_MAX_BYTES = 9_000_000       # 与 lxmusic SCRIPT_MAX_BYTES 对齐
 FS_CHECK_PATHS = ("/app/fnmusic-ext/api/fs-check", "/api/fs-check")
 FS_CHECK_MAX_BODY = 1 << 20           # 同 host-file：只装一个路径字符串
+MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+MAINTENANCE_ROOT = "/api/maintenance"
+MAINTENANCE_MAX_HEADER = 16 * 1024
+MAINTENANCE_MAX_BODY = 4096
+MAINTENANCE_TIMEOUT = 35
 
 
 def socket_path_for(base: Path) -> Path:
@@ -70,8 +81,13 @@ def _relay(src: socket.socket, dst: socket.socket, prefix: bytes = b"") -> None:
 def _read_request_head(client: socket.socket) -> "tuple[bytes, dict[str, str]] | None":
     """读到 HTTP 头部结束；返回 (头部原始字节, 解析出的头)。超时/格式异常返回 None。"""
     buf = b""
+    deadline = time.monotonic() + CONNECT_TIMEOUT
     try:
         while b"\r\n\r\n" not in buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            client.settimeout(remaining)
             if len(buf) > 65536:
                 return None
             chunk = client.recv(8192)
@@ -282,12 +298,113 @@ def _is_fs_check_request(head_raw: bytes) -> bool:
     return _post_request_path(head_raw) in FS_CHECK_PATHS
 
 
+def _maintenance_target(head_raw: bytes):
+    parts = head_raw.split(b"\r\n", 1)[0].decode("latin-1").split()
+    if len(parts) < 2:
+        return None
+    target = parts[1]
+    prefix = "/app/fnmusic-ext"
+    if target.startswith(prefix + "/"):
+        target = target[len(prefix):]
+    # Reserve the entire namespace, including malformed/unknown maintenance paths.
+    decoded = unquote(target)
+    if decoded.startswith(prefix + "/"):
+        decoded = decoded[len(prefix):]
+    if target.startswith(MAINTENANCE_ROOT) or decoded.startswith(MAINTENANCE_ROOT):
+        return parts[0], target
+    return None
+
+
+def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, target: str) -> None:
+    remote = None
+    try:
+        client.settimeout(CONNECT_TIMEOUT)
+        head = head_raw.split(b"\r\n\r\n", 1)[0]
+        if len(head) + 4 > MAINTENANCE_MAX_HEADER:
+            raise ValueError("请求头过大")
+        lines = head.decode("ascii").split("\r\n")
+        if len(lines[0].split(" ")) != 3 or lines[0].split(" ")[2] not in ("HTTP/1.0", "HTTP/1.1"):
+            raise ValueError("请求行无效")
+        headers = {}
+        for line in lines[1:]:
+            key, value = line.split(":", 1)
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key):
+                raise ValueError("请求头无效")
+            key = key.lower()
+            if key in headers:
+                raise ValueError("重复请求头")
+            headers[key] = value.strip()
+        if headers.get("x-trim-isadmin", "").lower() != "true":
+            client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可执行维护"}))
+            return
+        cleanup = MAINTENANCE_ROOT + "/cleanup"
+        if not ((method == "POST" and target == cleanup) or
+                (method == "GET" and re.fullmatch(cleanup + r"/[0-9a-fA-F]{32}", target))):
+            client.sendall(_json_response(404, {"ok": False, "error": "未知维护接口"}))
+            return
+        if "transfer-encoding" in headers:
+            raise ValueError("不支持 Transfer-Encoding")
+        length = headers.get("content-length", "0")
+        if not re.fullmatch(r"[0-9]{1,10}", length) or int(length) > MAINTENANCE_MAX_BODY:
+            raise ValueError("Content-Length 无效")
+        body = head_raw.split(b"\r\n\r\n", 1)[1][:int(length)]
+        deadline = time.monotonic() + CONNECT_TIMEOUT
+        while len(body) < int(length):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("请求体超时")
+            client.settimeout(remaining)
+            chunk = client.recv(int(length) - len(body))
+            if not chunk:
+                raise ValueError("请求体不完整")
+            body += chunk
+        if method == "POST":
+            req = json.loads(body)
+            if req != {"confirm_beta": True} or type(req.get("confirm_beta")) is not bool:
+                raise ValueError("仅允许 confirm_beta: true 确认字段")
+            body = b'{"confirm_beta":true}'
+        elif body:
+            raise ValueError("查询不允许请求体")
+        remote = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        remote.settimeout(MAINTENANCE_TIMEOUT)
+        remote.connect(MAINTENANCE_SOCKET)
+        remote.sendall((f"{method} {target} HTTP/1.1\r\nHost: localhost\r\n"
+                        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+        response = http.client.HTTPResponse(remote)
+        response.begin()
+        data = response.read(1 << 20)
+        if len(data) >= 1 << 20:
+            raise OSError("Maintenance response too large")
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            raise OSError("Invalid maintenance response")
+        client.sendall(_json_response(response.status, payload))
+    except (ValueError, UnicodeError) as exc:
+        client.sendall(_json_response(400 if remote is None else 503,
+                                     {"ok": False, "error": str(exc) if remote is None else "维护服务不可用"}))
+    except (OSError, http.client.HTTPException):
+        try:
+            client.sendall(_json_response(503, {"ok": False, "error": "维护服务不可用"}))
+        except OSError:
+            pass
+    finally:
+        if remote is not None:
+            remote.close()
+        client.close()
+
+
 def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
+    client.settimeout(CONNECT_TIMEOUT)
     head = _read_request_head(client)
     if head is None:
         client.close()
         return
     head_raw, headers = head
+    maintenance = _maintenance_target(head_raw)
+    if maintenance is not None:
+        handle_maintenance(client, head_raw, *maintenance)
+        return
+    client.settimeout(None)
     if _is_host_file_request(head_raw):
         handle_host_file(client, headers, head_raw)
         return

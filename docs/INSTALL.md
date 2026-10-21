@@ -16,6 +16,7 @@
 - **管理员权限**：具备 `sudo` 执行权限的管理员账号（非交互安装需免密 sudo）；
 - **官方音乐应用**：必须先在 fnOS「应用中心」安装并启动「飞牛音乐」（确保存在 `/var/run/trim_music.socket`）；
 - **Docker（默认形态需要）**：默认部署形态为 Docker 单容器，需先在 fnOS「应用中心」安装 Docker，脚本绝不会擅自安装 Docker 引擎。无 Docker 的机器可改用**原生部署**（`./install.sh --deploy native`，见下文「方式 C」），功能与 Docker 形态完全一致。
+- **CPU 架构**：支持 `x86_64` 与 `aarch64/ARM64`；ARM32（armv7/armhf）暂不支持。
 
 克隆项目并进入根目录赋予执行权限（**仅脚本安装需要**，fpk 安装可跳过）：
 
@@ -87,7 +88,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
    - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
 2. **是否安装管理 WebUI**（仅本机 8774，默认否；打开时走飞牛管理员登录）；
-3. **大模型每日推荐（可选）**：OpenAI 兼容 API，仅在未启用网易音源时作为推荐兜底；
+3. **大模型接口（可选）**：OpenAI 兼容 API；仅保存接口不会启用用途。安装后在管理页明确勾选「大模型用于猜你喜欢 / 每日推荐」，两个用途默认都关闭；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
 
 ### 非交互静默部署（自动化脚本）
@@ -106,7 +107,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --lx-source-url "$HOME/scripts/my-source.js" --extend   # 本机路径自动复制进数据卷
 ./install.sh --non-interactive --sources lxmusic --webui --extend  # 无源安装，装后在管理页配置
 
-# 附带大模型推荐兜底（密钥仅写入本地 .env，权限 600）
+# 保存大模型接口（密钥仅写入本地 .env，权限 600）；用途仍需在管理页明确启用
 ./install.sh --non-interactive --sources musicdl --enable-recommend \
   --llm-base-url 'https://api.openai.com/v1' \
   --llm-api-key '<KEY>' --llm-model 'gpt-4o-mini' --extend
@@ -134,9 +135,15 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 原生形态前置要求与自动处理：
 
-- **Python 3.10+** 与 `python3-venv`（fnOS 自带 3.11 满足）；
-- **nodejs ≥ 16 / ffmpeg**：缺失时安装阶段自动 `sudo apt-get` 补装（失败会给出手动命令）；
-- **supervisor**：经 pip 装进 `.venv-sources`（无需系统包）；
+- **Python 3.11+**（需包含 `venv`、`ensurepip`、`ssl`、`sqlite3`）：
+  解释器探测按「显式配置 `FNMUSIC_PYTHON_BIN` → fnOS 应用中心 `python312`（`/var/apps/python312`）→ 系统 Python」优先级自动选择。已有正常且版本合格的虚拟环境继续复用。
+- **Node.js ≥ 20**（lxserver engines 契约要求）：
+  Node 运行时按「显式配置 `FNMUSIC_NODE_BIN` → fnOS 应用中心 `nodejs_v22`（`/var/apps/nodejs_v22`）→ 系统 Node」优先级选择；自动探测仍缺失时尝试 `sudo apt-get` 自动补装，仍不满足时给出应用中心安装指引。
+- **ffmpeg / ffprobe**：
+  优先探测显式配置、系统 PATH 与 fnOS 核心媒体组件（`/usr/trim/lib/mediasrv/ffmpeg` 等）。缺失时尝试 `sudo apt-get` 自动补装；若环境仍缺少 ffmpeg，将安全降级运行：原文件播放与取流不受影响，标准音质转码与音频解码校验受限，musicdl 仍执行取流探针但不因缺少 ffmpeg 误判坏流或强转 MP3。
+- **依赖缓存与快速跳过**：
+  `.venv-proxy` 与 `.venv-sources` 记录解释器身份与依赖清单指纹，依赖未变且本地校验通过时秒级跳过联网；`./extend.sh` 每次校验依赖完整性，可使用 `FNMUSIC_REFRESH_DEPS=1` 强制重新安装。
+- **supervisor**：经 pip 装进 `.venv-sources`（无需系统包），所选 Node 及组件路径完整写入原生配置；
 - **lxserver**：从 `container/lxserver-artifact/` 预置包或镜像加速链下载，sha256 校验后落位 `.lxserver/`，与 Docker 镜像同版本同补丁。
 
 常用运维（原生形态）：
@@ -241,13 +248,15 @@ ls sources-native/                           # supervisor 套接字与各程序�
 
 ## 6. 推荐歌单工作机制
 
-用户登录飞牛音乐后，左侧歌单顶部呈现两个独立推荐歌单，各自受开关控制（默认都开）：
+用户登录飞牛音乐后，左侧歌单顶部显示每日、热门推荐及满足条件的猜你喜欢。每日与热门各有独立总开关（默认开启）；大模型的两个用途默认关闭，仅填写 API 接口不会自动启用。
 
-**「每日推荐 MM-DD」**（`FNMUSIC_RECOMMEND_DAILY` 控制），按当前音源裁剪：
+**「每日推荐 MM-DD」**（`FNMUSIC_RECOMMEND_DAILY` 总开关控制），按账户隔离、按以下顺序补齐：
 
-1. **网易每日推荐**：musicbox 源且已扫码登录时，直连网易云个性化推荐；
-2. **大模型兜底**：仅非网易音源且配置了 `FNMUSIC_LLM_*` 时启用；
-3. **关键词兜底**：全链路失败时按听歌历史关键词检索，确保歌单始终可用。
+1. **音源原生推荐**：musicbox 源且已扫码登录时，网易每日推荐每天由第一个打开的用户使用；
+2. **大模型兜底**：须明确设置 `FNMUSIC_LLM_DAILY_ENABLED=true` 且 Base URL / API Key 完整；原生推荐不可用或名额已占用时按当前用户的历史、收藏生成；
+3. **本地曲库兜底**：大模型未勾选、接口不完整或在线推荐失败时，从当前用户的本地曲库按最近没听过的曲目补齐，曲库为空时可能无曲目。
+
+关闭每日推荐总开关会停用整个每日链路；只取消大模型每日用途不会关闭歌单，也不会改变原生 → 本地的兜底顺序。
 
 **「热门推荐」**（`FNMUSIC_RECOMMEND_HOT` 控制），榜单原味、不排除已收藏曲目：
 
@@ -255,7 +264,19 @@ ls sources-native/                           # supervisor 套接字与各程序�
 2. **洛雪榜单**：lxmusic 源启用时聚合酷狗 TOP500 / 酷我飙升榜 / 网易新歌速递
    （按 `LX_SOURCES` 平台过滤）；全部榜单不可用时该歌单不显示。
 
-**封面图标**：两个歌单的封面都取列表里第一首带可用封面直链的曲目（依次向后找）；
+**「猜你喜欢」**：未勾选大模型用途时保留原本的纯本地行为：当前账户排除本地收藏后至少有 20 首有效本地候选才展示，最多 20 首；首次读取生成，缓存 30 分钟后下次读取更新。在线收藏不作为本地候选排除条件。
+
+在管理页「高级 · 大模型」填写 OpenAI 兼容 Base URL、API Key（模型默认 `gpt-4o-mini`），明确勾选「大模型用于猜你喜欢」后可设置：
+
+- `FNMUSIC_LIKED_REFRESH_HOURS`：默认 `0.5` 小时，只接受有限数字且至少 0.5，没有最大值，也不是缓存过期时间。
+- `FNMUSIC_LIKED_SIZE`：默认 `20`，只接受 0–100 的整数；`0` 在用途实际生效时停止生成且不展示猜你喜欢。即使设成 1，本地有效、未收藏候选至少 20 首的门槛也不降低。
+- 保存生效后在后台预生成首批，无需先打开歌单；每批**首次被客户端获取**后开始计时，到设定间隔后在后台被动预生成下一批。后续反复获取不重置首次计时；尚未获取的批次不会按时间到期、轮换或仅因间隔耗尽而重建。
+- 取消勾选会隐藏参数并保留已保存值，恢复旧纯本地链路；隐藏的无效编辑不会覆盖原值。勾选时空白、小数数量、越界及非有限值会阻止保存，而不是截断、钳制或恢复默认。
+- 若任一用途已勾选但 Base URL / API Key 不完整，页面会明确警告：不调用模型，保留选项并沿用未启用大模型的链路（包括本地猜你喜欢；此时上述数量 0 不禁用旧链路）。两个用途可分别启用，互不代替。
+
+只读访问官方曲库；推荐生成不会直接修改官方数据库。启用大模型会向所配 API 发送用于推荐的偏好、候选等信息，请仅使用可信接口。
+
+**封面图标**：每日与热门歌单的封面都取列表里第一首带可用封面直链的曲目（依次向后找）；
 全部曲目都没有封面时封面接口返回 404，客户端显示自带默认样式（不伪造占位图）。
 
 ---
@@ -319,6 +340,35 @@ location /music/ {
 - **热门推荐重启后不能播、第二天恢复**：先升级到 2.8.3 或更新版本；已修复洛雪 songInfo 只存内存导致重启后推荐曲目被当作“未知曲目”解析失败的问题。封面仍有 1 天客户端缓存，但不要把跨天等待当作处理办法。
 - **入口差异**：自建 nginx/NPM 可按上方配置检查；HTTPS 端口映射保留客户端实际 Host 与端口；fn Connect 没有用户可配置的外层 nginx，遇到失败需结合日志继续定位。
 - **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
+
+### 构建时报 `pass "--allow=network.host"`（issue #71）
+
+旧版 Compose 配置强制使用宿主机网络构建，部分 BuildKit 构建器会要求额外的
+`network.host` 授权并拒绝构建。修复后的配置使用默认构建网络，无需该授权；
+构建中的 DNS 处理和 apt/pip 镜像源回退仍保留。
+
+源码部署请更新代码后重新执行 `./install.sh`；应用中心部署请使用包含此修复的安装包。
+自行维护的 Compose 配置需移除 `services.fnmusic-sources.build.network: host`。
+若仍失败，先区分日志中的“镜像构建失败”和“容器启动失败”，再查看上方原始错误；
+应用中心持久日志位于 `/var/log/apps/fnmusic-ext-install.log`，不可写时回退到
+`/tmp/fnmusic-ext-install.log`。
+
+### 启动时总是重新拉取 python 基础镜像（issue #70）
+
+Python 基础镜像（如 `docker.m.daocloud.io/library/python:3.13-slim`）**只用于构建**
+`fnmusic-sources` 应用镜像，实际运行的容器始终使用应用镜像，不会出现单独使用基础
+镜像的容器，因此它删除与否不影响已构建好的应用镜像运行。
+
+启动时的镜像保障按**构建指纹**工作：指纹汇总 Dockerfile、`.dockerignore`、`COPY`
+进镜像的源码/依赖/静态资源/离线构建包与 Compose 构建参数，并记录在应用镜像的
+`io.fnmusic-ext.build-fingerprint` 标签里。启动时与本地应用镜像标签比对——
+一致就复用镜像（不探测、不拉取基础镜像，也无需构建）；代码或构建参数变化
+（例如 `git pull` 升级后）、应用镜像缺失或旧版镜像没有指纹标签时，才探测基础
+镜像并重建，因此升级后第一次启动会构建一次，属于正常现象。仅修改音源开关等
+运行配置不会重建镜像，启动脚本仍会按需重启容器，使新配置生效。
+
+已有基础镜像由用户自行管理，本项目不会自动删除镜像或执行全局镜像清理。
+`--force` 仍只表示强制重启代理，不是强制重建应用镜像。
 
 ### 安装报「未检测到 docker」
 

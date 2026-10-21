@@ -46,6 +46,19 @@ _SOURCE_ALIASES = {
 # 支持的平台集合
 SUPPORTED_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
 
+# 仅分类调用内部 lxserver 时的 HTTP 通信异常，不包含本地文件 OSError。
+# HTTP 500 也可能是脚本拒绝/执行失败，不能笼统归为服务不可用。
+_LXSERVER_CONNECT_ERRORS = (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError)
+_LXSERVER_UNAVAILABLE_STATUSES = (502, 503, 504)
+
+
+def is_lxserver_unreachable(exc: BaseException) -> bool:
+    """内部 lxserver 通信是否失败（调用方须确保异常来自内部 HTTP 请求）。"""
+    return isinstance(exc, _LXSERVER_CONNECT_ERRORS) or (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in _LXSERVER_UNAVAILABLE_STATUSES
+    )
+
 
 def normalize_source(src: str | None) -> str:
     if not src:
@@ -412,6 +425,8 @@ class LxServerClient:
             "limit": limit,
         }
         resp = await client.get("/api/music/search", params=params, timeout=self.timeout)
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
         if resp.status_code != 200:
             logger.warning("lxserver search error %s for %s (%s)", resp.status_code, keyword, src)
             return []
@@ -444,8 +459,8 @@ class LxServerClient:
         返回格式:
         {"url": "...", "type": "128k", "sourceName": "...", "sourceId": "...", ...}
         200 但无 url（脚本"成功"却拿不出直链，如平台未激活的静默空返回）时同样
-        返回完整响应（url 为空串/缺失，含 attempts 供换源排除）；非 200 或解析
-        异常才返回 None。
+        返回完整响应（url 为空串/缺失，含 attempts 供换源排除）。
+        服务不可用状态上浮；其他非 200 返回 None。
         """
         client = await self.get_client()
         body = {
@@ -456,6 +471,8 @@ class LxServerClient:
         if exclude_api_sources:
             body["excludeApiSources"] = exclude_api_sources
         resp = await client.post("/api/music/url", json=body, timeout=self.timeout)
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
         if resp.status_code != 200:
             logger.warning("lxserver get_music_url error %s: %.150s", resp.status_code, resp.text)
             return None
@@ -550,6 +567,28 @@ class LxServerClient:
             raise RuntimeError("lxserver song lists returned invalid payload")
         return data
 
+    async def get_song_list_search(self, source: str, text: str, page: int = 1) -> dict:
+        """歌单关键词搜索（lxserver 原生 /api/music/songList/search，v2.1.2 起自带）。
+
+        上游 SDK 固定页大小（默认 20），不透传 limit；返回 {list, limit, total, source}。
+        """
+        src = normalize_source(source)
+        keyword = str(text or "").strip()
+        if not src:
+            raise ValueError("unsupported source")
+        if not keyword:
+            raise ValueError("empty search keyword")
+        params = {"source": src, "text": keyword, "page": max(1, int(page or 1))}
+        async with self.song_list_lock(src):
+            client = await self.get_client()
+            resp = await client.get("/api/music/songList/search", params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver song list search error {resp.status_code}: {resp.text[:160]}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver song list search returned invalid payload")
+        return data
+
     async def get_song_list_detail(self, source: str, playlist_id: str, page: int = 1) -> dict:
         src = normalize_source(source)
         raw_id = str(playlist_id or "")
@@ -630,8 +669,8 @@ class LxServerClient:
         """获取所有已导入的自定义音源列表。"""
         client = await self.get_client()
         resp = await client.get("/api/custom-source/list", timeout=self.timeout)
-        if resp.status_code != 200:
-            return []
+        # HTTP 故障不能伪装成空列表，否则激活时会误报源不存在。
+        resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):
             return data
@@ -690,6 +729,8 @@ class LxServerClient:
     def _parse_admin_resp(resp: httpx.Response, action: str) -> dict:
         """lxserver 管理端点约定：HTTP 200 + {success: true} 才算成功，
         失败时（HTTP 500/403 或 success=false）抛 RuntimeError 带服务端错误文案。"""
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
         try:
             data = resp.json()
         except Exception:

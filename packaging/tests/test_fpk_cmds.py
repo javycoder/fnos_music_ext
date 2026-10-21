@@ -402,6 +402,21 @@ def test_install_callback_install_failure_surfaces_error_lines(sb):
     assert "\033[31m" not in trim_log
 
 
+@pytest.mark.parametrize("stage", ["镜像构建失败", "容器启动失败"])
+def test_install_callback_surfaces_docker_failure_stage(sb, stage):
+    sb.make_repo(stub=f'''#!/bin/bash
+echo 'original-docker-error' >&2
+echo '[ERROR] Docker {stage}，请查看上方原始错误。' >&2
+exit 7
+''')
+    result = sb.run("install_callback", wizard_extend="false")
+    assert result.returncode == 1
+    popup = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    assert stage in popup
+    assert str(sb.durable_log) in popup
+    assert "original-docker-error" in sb.durable_log.read_text(encoding="utf-8")
+
+
 def test_install_callback_ignores_buildkit_run_title_with_error_echo(sb):
     """BuildKit 步骤标题含 echo "[ERROR]" 时弹窗必须显示真实 [ERROR]，不能是 fix_dns。"""
     sb.make_repo()
@@ -499,21 +514,9 @@ def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
                              capture_output=True, text=True, check=True).stdout
     assert ".env.bak.20260101000000" in listing.splitlines()
     assert "FROM_CWD" not in listing
-
-
-def test_upgrade_init_backs_up_data_and_stops_service(sb):
-    repo = sb.make_repo(env_text="FNMUSIC_LX_ENABLED=true\n")
-    sb.add_data(repo)
-    sb.add_systemctl()
-    result = sb.run("upgrade_init", FNMUSIC_UNIT_FILE=str(sb.tmp / "absent-unit.service"))
-    assert result.returncode == 0, result.stderr
-    # 先停服务
+    # The same real upgrade invocation also covers service stop and complete
+    # backup contents; do not rerun the happy path with an otherwise clean cwd.
     assert "stop fnmusic-ext.service" in sb.ctl_log.read_text(encoding="utf-8")
-    # 备份内容覆盖 .env 与数据目录（真 tar 校验）
-    backup = sb.pkgvar / "upgrade-backup" / "data.tar.gz"
-    assert backup.is_file()
-    listing = subprocess.run(["tar", "-tzf", str(backup)],
-                             capture_output=True, text=True, check=True).stdout
     assert ".env" in listing.splitlines()
     assert any(entry.startswith("sources-data/") for entry in listing.splitlines())
     assert any(entry.startswith("play_history/") for entry in listing.splitlines())
@@ -681,15 +684,6 @@ def test_uninstall_init_degrades_when_restore_fails(sb):
     assert "czf" in sb.tar_log.read_text(encoding="utf-8")
 
 
-def test_uninstall_init_keep_data_false_skips_archive(sb):
-    repo = sb.make_repo(with_restore=True)
-    sb.add_data(repo)
-    sb.add_tar()
-    result = sb.run("uninstall_init", wizard_keep_data="false")
-    assert result.returncode == 0, result.stderr
-    assert not sb.tar_log.exists()
-
-
 def test_uninstall_init_archives_to_volume_root(sb):
     repo = sb.make_repo(env_text="X=1\n", with_restore=True)
     sb.add_data(repo)
@@ -785,7 +779,7 @@ def test_uninstall_init_preserves_data_to_keep_dir(sb):
     assert "重新安装 fnmusic-ext 时将自动检测并恢复" in (keep_dir / "README.txt").read_text(encoding="utf-8")
 
 
-def test_uninstall_init_keep_data_false_skips_keep_dir(sb):
+def test_uninstall_init_keep_data_false_skips_archive_and_keep_dir(sb):
     repo = sb.make_repo(with_restore=True)
     sb.add_data(repo)
     sb.add_tar()
@@ -793,6 +787,7 @@ def test_uninstall_init_keep_data_false_skips_keep_dir(sb):
     result = sb.run("uninstall_init", wizard_keep_data="false", FNMUSIC_KEEP_DIR=str(keep_dir))
     assert result.returncode == 0, result.stderr
     assert not keep_dir.exists()
+    assert not sb.tar_log.exists()
 
 
 # ------------------------------------------------------ uninstall_callback ---

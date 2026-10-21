@@ -8,11 +8,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -41,6 +41,19 @@ try:
     from proxy.env_merge import parse_env_file  # noqa: E402
 except ImportError:
     parse_env_file = None
+
+# 统一日志：主进程把诊断落盘到 logs/musicdl.log（脱敏、轮转、保留与 proxy 一致），
+# 管理页日志包按文件名自动收录。独立运行无 fnlog 时退回纯 stdout/stderr。
+try:
+    from proxy.fnlog import redact as _fnlog_redact, setup_logging as _fnlog_setup  # noqa: E402
+except ImportError:
+    try:
+        from fnlog import redact as _fnlog_redact, setup_logging as _fnlog_setup  # noqa: E402
+    except ImportError:
+        _fnlog_redact = None
+        _fnlog_setup = None
+if _fnlog_setup is not None:
+    _fnlog_setup("musicdl_service", "musicdl")
 
 
 def _startup_sources() -> "tuple[list[str], str]":
@@ -164,11 +177,15 @@ def _normalize_startup_sources(raw: list, registered: set | None = None) -> list
 CONF["sources"] = _normalize_startup_sources(CONF["sources"])
 
 SOURCE_NAMES = _source_mapping()
-SOURCE_WORKERS = SourceBulkhead(SOURCE_NAMES.values())
-# 直链探活共享池：探测跑在 worker 线程之外，单个源不会因为串行 HEAD
-# 占住自己的单线程舱壁 N×probe_timeout 秒。生命周期跟随进程（不随
-# lifespan 关闭），解释器退出时由 concurrent.futures 的 atexit 钩子回收。
-_PROBE_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
+
+
+def _log_worker_line(source: str, text: str) -> None:
+    """worker 子进程的诊断行：主进程统一落盘（脱敏），不记录凭证/完整直链。"""
+    # Unstructured worker output is intentionally discarded.
+    return None
+
+
+SOURCE_WORKERS = SourceBulkhead(SOURCE_NAMES.values(), on_worker_line=_log_worker_line)
 
 
 def _source_client(name: str) -> str:
@@ -198,183 +215,14 @@ def _cache_get(song_id: str):
         return _SONG_CACHE.get(song_id)
 
 
-def _search_one_source(source: str, keyword: str, limit: int) -> list:
-    """单个源搜索（工作线程内执行，阻塞）。"""
-    client = musicdl.MusicClient(
-        music_sources=[source],
-        init_music_clients_cfg={
-            source: {
-                # 库按这个数量翻页，并且每首都会先解析直链。30 条限额会变成 6 页，
-                # 整次 search() 返回前一首都交不出来。封顶一页，够首屏，也放得进超时。
-                "search_size_per_source": min(max(int(limit or 1), 1), int(CONF["search_page_cap"])),
-                "work_dir": CONF["work_dir"],
-                "max_retries": 1,
-            },
-        },
-        clients_threadings={source: 1},
-        requests_overrides={source: {"timeout": CONF["request_timeout"]}},
-    )
-    result = client.search(keyword=keyword)
-    return list(result.values())[0] if result else []
-
-
-def _normalize(song, keyword: str) -> dict:
-    src = _source_short(getattr(song, "source", "") or "")
-    sid = str(getattr(song, "identifier", "") or "")
+def _search_payload(source: str, keyword: str, fetch_size: int, limit: int,
+                    song_id: str | None, timeout: float) -> dict:
+    """构造 worker 任务。worker 内搜索+探活自限到预算的 90%，留尾部给父进程收尾交付。"""
     return {
-        "id": f"{src}:{sid}",
-        "source": src,
-        "title": getattr(song, "song_name", "") or "",
-        "artist": getattr(song, "singers", "") or "",
-        "album": getattr(song, "album", "") or "",
-        "duration_s": getattr(song, "duration_s", 0) or 0,
-        "ext": getattr(song, "ext", "") or "mp3",
-        "file_size": getattr(song, "file_size_bytes", 0) or 0,
-        "cover_url": getattr(song, "cover_url", "") or "",
-        # qq 曲目的专辑封面主键：封面兜底链用 albummid 直构 gtimg 图床 URL
-        "albummid": str(getattr(song, "albummid", "") or getattr(song, "album_mid", "") or ""),
-        "download_url": getattr(song, "download_url", "") or "",
+        "op": "search", "source": source, "keyword": keyword,
+        "fetch_size": fetch_size, "limit": limit, "song_id": song_id,
+        "budget_s": max(0.2, timeout - min(0.1, timeout * 0.1)) if song_id is None else timeout,
     }
-
-
-TRIAL_MARKERS = (
-    "(试听)",
-    "（试听）",
-    "试听片段",
-    "片段试听",
-    "试听版",
-    "[试听]",
-    "【试听】",
-    "- 试听",
-    " - 试听",
-)
-
-
-def _is_candidate_playable(song, item: dict) -> bool:
-    """初筛：检查 identifier、标题试听标记、download_url 存在且非错误页。"""
-    sid = item.get("id") or ""
-    if not sid or sid.endswith(":"):
-        return False
-    title = str(item.get("title") or "")
-    if not title:
-        return False
-    if any(marker in title for marker in TRIAL_MARKERS):
-        return False
-    url = str(item.get("download_url") or "").strip()
-    if not url or not url.startswith(("http://", "https://")):
-        return False
-    if "404/error.html" in url or "error.html" in url:
-        return False
-    return True
-
-
-def _probe_playable_sync(url: str, headers: dict) -> bool:
-    """探测直链是否有效且真实可播放（过滤无效/试听/404直链/HTML错误页）。"""
-    if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        return False
-    if "404/error.html" in url or "error.html" in url:
-        return False
-    hdrs = dict(headers or {})
-    if HAS_CURL_CFFI:
-        try:
-            r = curl_requests.head(
-                url,
-                headers=hdrs,
-                impersonate="chrome",
-                allow_redirects=True,
-                timeout=CONF["probe_timeout"],
-            )
-            if r.status_code == 405:
-                hdrs["Range"] = "bytes=0-1"
-                r = curl_requests.get(
-                    url,
-                    headers=hdrs,
-                    impersonate="chrome",
-                    allow_redirects=True,
-                    stream=True,
-                    timeout=CONF["probe_timeout"],
-                )
-            if r.status_code in (200, 206):
-                ct = (r.headers.get("content-type") or "").lower()
-                if "text/html" in ct:
-                    return False
-                return True
-            return False
-        except Exception:
-            return False
-    else:
-        try:
-            with httpx.Client(follow_redirects=True, timeout=CONF["probe_timeout"]) as cx:
-                r = cx.head(url, headers=hdrs)
-                if r.status_code == 405:
-                    hdrs["Range"] = "bytes=0-1"
-                    r = cx.get(url, headers=hdrs)
-                if r.status_code in (200, 206):
-                    ct = (r.headers.get("content-type") or "").lower()
-                    if "text/html" in ct:
-                        return False
-                    return True
-                return False
-        except Exception:
-            return False
-
-
-_head_probe_sync = _probe_playable_sync
-
-
-def _search_playable(source: str, keyword: str, fetch_size: int, limit: int,
-                     song_id: str | None = None, deadline: float | None = None,
-                     progress: SearchProgress | None = None) -> list:
-    """Keep search and bounded probes inside the same source admission slot.
-
-    Return metadata only; a timed-out worker must not update shared caches.
-    Probes fan out on the shared pool; each confirmed entry is handed to
-    `progress` immediately (same handoff timing as the old serial loop), and
-    the return value keeps library order.
-    """
-    songs = _search_one_source(source, keyword, fetch_size)
-    candidates = []
-    for song in songs[:fetch_size]:
-        if not song:
-            continue
-        item = _normalize(song, keyword)
-        if song_id is not None and item["id"] != song_id:
-            continue
-        if not _is_candidate_playable(song, item):
-            continue
-        headers = getattr(song, "default_download_headers", {}) or {}
-        lyric = str(getattr(song, "lyric", "") or "")
-        candidates.append((item, headers, lyric))
-    if not candidates:
-        return []
-    if (progress is not None and progress.stopped()) or (
-            deadline is not None and time.monotonic() >= deadline):
-        if progress is not None:
-            progress.partial = True
-        return []
-
-    valid = set()
-    futures = {}
-    for idx, (item, headers, _) in enumerate(candidates):
-        futures[_PROBE_POOL.submit(_probe_playable_sync, item["download_url"], headers)] = idx
-    try:
-        wait_budget = None if deadline is None else max(0.1, deadline - time.monotonic())
-        for fut in as_completed(futures, timeout=wait_budget):
-            idx = futures[fut]
-            if fut.result():
-                valid.add(idx)
-                if progress is not None:
-                    progress.append(candidates[idx])
-                if len(valid) >= limit:
-                    break
-    except FuturesTimeoutError:
-        if progress is not None:
-            progress.partial = True
-    finally:
-        for fut in futures:
-            fut.cancel()
-
-    return [entry for idx, entry in enumerate(candidates) if idx in valid]
 
 
 async def _refresh_by_keyword(song_id: str) -> dict | None:
@@ -386,9 +234,12 @@ async def _refresh_by_keyword(song_id: str) -> dict | None:
         src_client = _source_client(entry["item"].get("source", ""))
         limit = max(CONF["limit_per_source"], 10)
         timeout = ADAPTIVE.timeout_for(src_client)
-        entries = await SOURCE_WORKERS.run(
-            src_client, _search_playable, src_client, entry["keyword"], limit, 1, song_id,
-            time.monotonic() + timeout, timeout=timeout,
+        entries: list = []
+        await SOURCE_WORKERS.run(
+            src_client,
+            _search_payload(src_client, entry["keyword"], limit, 1, song_id, timeout),
+            timeout=timeout,
+            on_entry=lambda e: entries.append((e[0], e[1], e[2])),
         )
     except Exception as exc:
         logger.warning("Refresh failed for %s: %s", song_id, exc)
@@ -413,15 +264,23 @@ _PROBE_CACHE_LOCK = threading.Lock()
 _PROBE_TTL = int(os.environ.get("MUSICDL_PROBE_TTL", "600"))
 
 
+def ffmpeg_bin() -> str | None:
+    return os.environ.get("FNMUSIC_FFMPEG_BIN") or shutil.which("ffmpeg")
+
+
 def _decode_probe_ok(path: str) -> bool:
     """ffmpeg 解码探针样本文件，以实际解出的时长判断好坏。
 
     截断的完好样本也能解出数十秒（探针只取头部字节）；从头就坏的样本
     time≈0。报错文本不可用作判据——截断与损坏的报错完全相同。
+    若系统未配置/缺少 ffmpeg，无法执行解码校验，放行样本文件返回 True。
     """
+    bin_path = ffmpeg_bin()
+    if not bin_path:
+        return True
     try:
         r = subprocess.run(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-i", path, "-f", "null", "-"],
+            [bin_path, "-nostdin", "-hide_banner", "-i", path, "-f", "null", "-"],
             capture_output=True, text=True, timeout=120,
         )
         times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
@@ -454,6 +313,10 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
             resp.close()
         if not buf:
             return False
+        if not ffmpeg_bin():
+            # 仍执行不依赖 ffmpeg 的取流检查；缺少 ffmpeg 时无法执行解码校验，
+            # 不判定音频损坏或因此强制降为 MP3，只要收到有效数据即放行
+            return True
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".probe", delete=False) as f:
             f.write(buf)
@@ -623,8 +486,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await app.state.http.aclose()
-        SOURCE_WORKERS.shutdown(wait=False)
+        await SINGLE_FLIGHT.aclose()
+        try:
+            await SOURCE_WORKERS.aclose()
+        finally:
+            await app.state.http.aclose()
 
 
 app = FastAPI(title="musicdl-service", lifespan=lifespan)
@@ -639,6 +505,7 @@ async def healthz():
         "cache_entries": len(SEARCH_CACHE),
         "breaker_open": SOURCE_BREAKER.get_open_sources(),
         "adaptive_timeouts": ADAPTIVE.stats(),
+        "workers": SOURCE_WORKERS.stats(),
         "stats": _STATS,
     }
 
@@ -724,12 +591,15 @@ async def search(
             progress = SearchProgress(limit, started + timeout)
             progress_by_source[source] = progress
             fetch_size = max(limit * 2, 10)
+            payload = _search_payload(source, keyword, fetch_size, limit, None, timeout)
+
+            def on_entry(entry):
+                # worker 每确认一首即上交：[item, download_headers, lyric]
+                progress.append((entry[0], entry[1], entry[2]))
+
             try:
-                await SOURCE_WORKERS.run(
-                    source, _search_playable, source, keyword, fetch_size, limit,
-                    None, started + timeout - min(0.1, timeout * 0.1), progress,
-                    timeout=timeout,
-                )
+                result = await SOURCE_WORKERS.run(source, payload, timeout=timeout, on_entry=on_entry)
+                progress.partial = bool(result.get("partial"))
                 latency = time.monotonic() - started
                 items = collect(source)
                 if progress.partial:
@@ -766,40 +636,54 @@ async def search(
         overall = max(float(CONF["search_timeout"]), 4.0)
         deadline = time.monotonic() + overall
         skipped_fast_return = False
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, still = await asyncio.wait(
-                pending.keys(), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in done:
-                pending.pop(task, None)
-                try:
-                    results.append(task.result())
-                except Exception as e:  # noqa: BLE001
-                    _STATS["errors"] += 1
-                    results.append((task.get_name(), [], f"{type(e).__name__}: {e}"))
-            if not pending:
-                break
-            total_items = sum(len(items) for _, items, _ in results)
-            # 结果已足够优质：不再等待慢源，立即返回
-            if total_items >= CONF["fast_return_items"]:
-                skipped_fast_return = True
-                break
-            # 已有任意源出结果：再给其余源最多 slow_grace_s 秒，避免慢源拖死整页
-            if total_items > 0:
-                deadline = min(deadline, time.monotonic() + CONF["slow_grace_s"])
-        for task in pending:
-            task.cancel()
+        try:
+            grace_limited = False
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, still = await asyncio.wait(
+                    pending.keys(), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    pending.pop(task, None)
+                    try:
+                        results.append(task.result())
+                    except Exception as e:  # noqa: BLE001
+                        _STATS["errors"] += 1
+                        results.append((task.get_name(), [], f"{type(e).__name__}: {e}"))
+                if not pending:
+                    break
+                total_items = sum(len(items) for _, items, _ in results)
+                # 结果已足够优质：不再等待慢源，立即返回
+                if total_items >= CONF["fast_return_items"]:
+                    skipped_fast_return = True
+                    break
+                # 已有任意源出结果：再给其余源最多 slow_grace_s 秒，避免慢源拖死整页
+                if total_items > 0:
+                    grace_limited = True
+                    deadline = min(deadline, time.monotonic() + CONF["slow_grace_s"])
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                cleanup = asyncio.gather(*pending, return_exceptions=True)
+                interrupted = False
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        interrupted = True
+                if interrupted:
+                    raise asyncio.CancelledError
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-            skip_reason = "skipped (fast return)" if skipped_fast_return else f"timeout after {overall}s"
+            skip_reason = ("skipped (fast return)" if skipped_fast_return else
+                           "skipped (grace elapsed)" if grace_limited else f"timeout after {overall}s")
             for task, src in pending.items():
                 items = collect(src)
                 results.append((src, items, skip_reason + (" (partial results)" if items else "")))
                 # 没等到歌才收紧。已经有结果、或因为别的源够了而提前返回，都不是这个源坏了。
-                if not items and not skipped_fast_return:
+                if not items and not skipped_fast_return and not grace_limited:
                     ADAPTIVE.record_failure(src)
                     SOURCE_BREAKER.record_failure(src)
 

@@ -15,6 +15,11 @@ on:
 permissions:
   contents: write
 
+# 跨 tag / dispatch 串行发布，避免两个预发布同时清理后各自创建 Release。
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -93,6 +98,43 @@ jobs:
             exit 1
           fi
           head -5 /tmp/release-notes.md
+
+      - name: Remove previous published prereleases
+        if: steps.release-kind.outputs.formal == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # 仅允许 vX.Y.Z + 单个小写字母；目标 Release 在失败补发时也绝不删除。
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[a-z]$ ]] || exit 1
+          releases="$(gh api --paginate --slurp "repos/${GH_REPO}/releases?per_page=100")"
+          candidates="$(jq -r --arg target "$TAG" '
+            .[][] | select(.prerelease == true and .draft == false)
+            | select(.tag_name != $target)
+            | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+[a-z]$"))
+            | [.id, .tag_name] | @tsv
+          ' <<< "$releases")"
+          while IFS=$'\t' read -r release_id old_tag; do
+            [ -n "$release_id" ] || continue
+            # 删除前重新按 id 读取：身份或标记有变即中止，不碰正式版、draft。
+            current="$(gh api "repos/${GH_REPO}/releases/${release_id}")"
+            jq -e --arg id "$release_id" --arg tag "$old_tag" --arg target "$TAG" '
+              (.id | tostring) == $id and .tag_name == $tag and .tag_name != $target
+              and .prerelease == true and .draft == false
+              and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+[a-z]$"))
+            ' <<< "$current" >/dev/null
+            # 必须先删 Release 再删远端 tag；任何 API 失败均阻止创建新 Release。
+            gh api --method DELETE "repos/${GH_REPO}/releases/${release_id}"
+            gh api --method DELETE "repos/${GH_REPO}/git/refs/tags/${old_tag}"
+          done <<< "$candidates"
+          # 重新分页复核；非约定格式的预发布不自动删除，也不能与新版本并存。
+          remaining="$(gh api --paginate --slurp "repos/${GH_REPO}/releases?per_page=100")"
+          jq -e --arg target "$TAG" '
+            [.[][] | select(.prerelease == true and .draft == false and .tag_name != $target)]
+            | length == 0
+          ' <<< "$remaining" >/dev/null
 
       - name: Create or update GitHub Release
         env:

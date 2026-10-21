@@ -1712,8 +1712,8 @@ def test_favorite_track_list_merge():
         assert "updatedAt" in online_item
 
 
-def test_favorite_track_create_unwritable_fav_dir_safe():
-    """用例 6: create 时 fav 文件不可写（如路径指向不可写或非法路径）→ 不抛异常，返回仍 code:0（绝不能 500）。"""
+def test_favorite_track_create_unwritable_fav_dir_safe(monkeypatch):
+    """收藏落盘失败返回业务错误，不抛异常或误报成功。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/music/api/v1/user/me":
             return httpx.Response(200, json={"code": 0, "msg": "ok", "data": {"guid": "user-a"}})
@@ -1738,13 +1738,64 @@ def test_favorite_track_create_unwritable_fav_dir_safe():
         f.write("xxx")
     CONF["fav_dir"] = os.path.join(bad_file, "sub")
 
+    autobind_calls = []
+    monkeypatch.setattr(
+        "proxy.app._register_fav_autobind",
+        lambda *args, **kwargs: autobind_calls.append((args, kwargs)),
+    )
     with TestClient(app) as client:
         resp = client.post(
             "/music/api/v1/favorite-track/create",
             json={"trackGUID": "online:kuwo:228908"},
         )
         assert resp.status_code == 200
-        assert resp.json()["code"] == 0
+        assert resp.json() == {
+            "code": -1,
+            "msg": "收藏保存失败，请稍后重试",
+            "data": None,
+        }
+    assert autobind_calls == []
+
+
+def test_favorite_track_delete_unwritable_fav_dir_safe(monkeypatch):
+    """取消收藏落盘失败返回业务错误，并保留原有收藏。"""
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-a"}})
+        return httpx.Response(500)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    import json
+    with open(os.path.join(CONF["fav_dir"], "user-a.json"), "w", encoding="utf-8") as f:
+        json.dump({"items": [{"guid": "online:kuwo:228908"}]}, f)
+
+    os.makedirs(CONF["cache_dir"], exist_ok=True)
+    bad_file = os.path.join(CONF["cache_dir"], "not_a_dir_delete")
+    with open(bad_file, "w") as f:
+        f.write("xxx")
+    monkeypatch.setitem(CONF, "fav_dir", os.path.join(bad_file, "sub"))
+
+    official_writes = []
+
+    async def fake_write(*args, **kwargs):
+        official_writes.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr("proxy.app._official_upstream_write", fake_write)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/favorite-track/delete",
+            json={"trackGUID": "online:kuwo:228908"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "code": -1,
+            "msg": "取消收藏失败，请稍后重试",
+            "data": None,
+        }
+    assert official_writes == []
 
 
 def test_favorite_track_list_upstream_unauthorized():

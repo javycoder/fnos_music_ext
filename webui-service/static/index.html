@@ -180,12 +180,18 @@
               <select class="input grow" id="public-category" aria-label="分类"></select>
               <button class="btn" id="public-refresh">刷新</button>
             </div>
+            <div class="btn-row">
+              <input class="input grow" id="public-keyword" placeholder="输入歌单名称关键词搜索公共歌单" aria-label="搜索公共歌单">
+              <button class="btn" id="public-search">搜索</button>
+              <button class="btn" id="public-search-clear" hidden>清除搜索</button>
+            </div>
             <p class="hint" id="public-note">选择音源后加载歌单。</p>
             <div id="public-list" class="public-list"></div>
             <div class="btn-row">
               <button class="btn small" id="public-prev">上一页</button>
-              <span id="public-page" class="muted">1 / 1</span>
+              <span id="public-page" class="muted">1</span>
               <button class="btn small" id="public-next">下一页</button>
+              <button class="btn small" id="public-load-rest" hidden>加载剩余歌单</button>
             </div>
             <div>
               <div class="card-title">已选歌单（音乐页展示顺序）</div>
@@ -199,7 +205,6 @@
       <section class="page" id="page-search">
         <h2>搜索</h2>
         <div class="card">
-          <label class="switch-row"><span>逐曲探活(beta)<div class="sub">搜索时预先对候选歌曲进行直链解析与网络探活，确保“搜得到必能播”；但由于第三方音源解析较慢，开启后容易造成搜索超时甚至无法搜出结果，建议保持关闭。</div></span><input type="checkbox" id="search-probe"></label>
           <label class="switch-row"><span>搜索深分页<div class="sub">搜索结果翻页时，若在线歌曲不够填满一页，自动向音源继续取下一页补齐（本地歌曲始终排在最前）；musicdl 音源不支持分页，仅参与首屏。关闭后在线结果只显示首次搜索拿到的部分。</div></span><input type="checkbox" id="search-deep"></label>
         </div>
         <div class="card">
@@ -218,7 +223,7 @@
       <section class="page" id="page-tee">
         <h2>边听边存</h2>
         <div class="card">
-          <label class="switch-row"><span>边听边存<div class="sub">完整试听在线歌后自动保存到本地曲库</div></span><input type="checkbox" id="tee-enabled"></label>
+          <label class="switch-row"><span>边听边存<div class="sub">在线试听时，歌曲下载完整即保存到本地曲库，不必听完整首</div></span><input type="checkbox" id="tee-enabled"></label>
           <label class="switch-row"><span>自动下载封面<div class="sub">自动保存到本地的歌曲会顺带把封面一起下回来，直接嵌进音频文件里；飞牛音乐认的就是内嵌封面，这样官方 App 里下载的歌就有图。歌曲保存成功后才会去下封面，不会出现只有封面没有歌的垃圾文件。默认开启。</div></span><input type="checkbox" id="auto-cover"></label>
           <label class="switch-row"><span>自动下载歌词<div class="sub">自动保存到本地的歌曲在完整下载成功后，自动下载同名 .lrc 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放就能显示歌词。歌曲下载成功后才会去下歌词，不会出现只有歌词没有歌的垃圾文件。酷我源的歌词接口已失效，暂无歌词。默认关闭。</div></span><input type="checkbox" id="lyric-auto-dl"></label>
           <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
@@ -227,7 +232,7 @@
           <p class="hint">缓存数仅在关闭边听边存时生效；restore 还原时会一并清理这些滚动缓存。</p>
         </div>
         <div class="card">
-          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">收藏或加入歌单的在线歌曲先立即生效，随后在后台自动下载到本地曲库；下载完成后收藏列表或歌单自动绑定已经下载好的本地歌曲而不是绑定在线歌曲。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
+          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">显式收藏或加入歌单后，在后台下载并绑定本地歌曲。浏览列表不会触发音频下载；已有文件仍会重试绑定。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
           <label class="field"><span>官方绑定等待（秒） <b id="bind-timeout-label"></b></span>
             <input class="input" id="bind-timeout" type="number" min="10" max="3600">
           </label>
@@ -239,6 +244,13 @@
             <input class="input" id="scan-path" placeholder="留空=官方自动扫描入库">
           </label>
           <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口无公开文档，可从 FNMUSIC_TRACE_FORWARD=detail 取证日志捕获后填入以加速官方入库。</p>
+        </div>
+        <div class="card">
+          <div class="card-title">清理垃圾文件 <span class="badge">Beta</span></div>
+          <p class="hint">清理可能遗留的垃圾文件。此功能可能误删歌曲、封面、歌词等文件，删除后无法自动恢复，请谨慎操作。</p>
+          <button class="btn" id="cleanup-open-btn" type="button">清理垃圾文件（Beta）</button>
+          <p id="cleanup-status" role="status" aria-live="polite"></p>
+          <pre class="update-changelog" id="cleanup-details" hidden></pre>
         </div>
       </section>
 
@@ -273,14 +285,26 @@
       <section class="page" id="page-llm">
         <h2>高级 · 大模型</h2>
         <div class="card">
-          <p class="hint">配置 OpenAI 兼容接口后，非网易音源也可获得每日推荐。留空即禁用。保存后代理热重载生效。</p>
+          <p class="hint">配置 OpenAI 兼容接口不会自动启用推荐用途。以下两个用途默认关闭，需明确勾选；保存后代理热重载生效。模型留空使用 gpt-4o-mini。</p>
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+          <div class="switch-grid">
+            <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
+            <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
+          </div>
+          <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
+          <p class="hint">每日推荐仍受「每日推荐」总开关控制：音源原生推荐优先 → 已勾选且接口完整时的大模型 → 本地曲库兜底。取消大模型每日推荐不会关闭每日推荐歌单。</p>
+          <div id="llm-liked-settings" hidden>
+            <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
+            <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
+            <p class="hint">间隔默认 0.5 小时，须为有限数字且至少 0.5，无上限；数量默认 20，须为 0–100 的整数，不可留空。数量 0 在此用途生效时停止生成且不展示猜你喜欢。</p>
+            <p class="hint">启用并保存生效后后台预生成首批，不必先打开歌单。每批首次被客户端获取后才开始计时，到间隔后后台被动预生成下一批；尚未获取的批次不会到期或轮换。间隔不是缓存失效时间。</p>
+          </div>
+          <p class="hint">取消勾选会隐藏猜你喜欢参数并保留已保存值，恢复原本的纯本地猜你喜欢；本地有效、未收藏候选至少 20 首的门槛不变，不随上述数量调整。</p>
         </div>
       </section>
 
-      <!-- 关于 -->
       <!-- 设置 -->
       <section class="page" id="page-settings">
         <h2>设置</h2>
@@ -294,6 +318,7 @@
         </div>
       </section>
 
+      <!-- 关于 -->
       <section class="page" id="page-about">
         <div class="about-wrap">
           <div class="card about-head">
@@ -354,6 +379,17 @@
   <div class="save-bar" id="save-bar">
     <span id="save-note" class="muted"></span>
     <button class="btn primary" id="save-btn">保存并生效</button>
+  </div>
+
+  <div class="modal-mask" id="cleanup-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cleanup-modal-title" aria-describedby="cleanup-warning">
+      <div class="modal-title" id="cleanup-modal-title">清理垃圾文件（Beta）</div>
+      <p id="cleanup-warning">此功能为 Beta，可能误删歌曲、封面、歌词等文件，删除后无法自动恢复。是否确认执行？</p>
+      <div class="btn-row modal-actions">
+        <button class="btn" id="cleanup-cancel-btn" type="button">取消</button>
+        <button class="btn" id="cleanup-confirm-btn" type="button">确认执行</button>
+      </div>
+    </div>
   </div>
 
   <!-- 新版本详情弹窗 -->

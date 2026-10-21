@@ -1,3 +1,4 @@
 *.zip
+*.tgz
 !.gitignore
 !.placeholder

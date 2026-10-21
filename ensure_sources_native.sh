@@ -5,24 +5,68 @@ set -euo pipefail
 # fnmusic-ext 原生（无 Docker）音源运行时保障
 # 由 install.sh / extend.sh 在 FNMUSIC_DEPLOY_MODE=native 时调用，也可手动重跑。
 # 对齐 container/Dockerfile 的镜像层职责，全部落在宿主机：
-#   1. 确保 .venv-sources 存在，安装四服务 requirements 并集 + supervisor
+#   1. 选择合格宿主机 Python（显式配置 → fnOS python312 → 系统），确保
+#      .venv-sources 存在；依赖未变化且校验通过时跳过联网安装
 #      （容器内由镜像 pip 层安装；多 pip 源回退链与 ensure_proxy_deps.sh 同策略）
 #   2. 检测 nodejs（lxserver Node 沙箱）/ ffmpeg（musicdl 无损探针），缺失时
 #      尝试 sudo apt-get 安装，失败给出手动命令
 #   3. lxserver 预编译包落位 .lxserver/：container/lxserver-artifact/ 预置优先
 #      （离线/fpk 场景），缺失走镜像加速下载链；sha256 校验 + 补丁与 Dockerfile
-#      构建层一致，按版本幂等（同版本已就位则跳过）
+#      构建层一致，按版本幂等（同版本已就位则跳过）；ARM64 额外补齐锁定
+#      的 music-tag-native 平台绑定，避免上游 x64 单架构包启动崩溃
 # 本脚本不修改任何系统配置（apt 安装除外，且仅补缺失的两组件）。
 # 可调环境变量: PIP_INDEX / FNMUSIC_VENV_SOURCES_DIR / FNMUSIC_APT_MIRROR /
 #               FNMUSIC_LXSERVER_MIRROR（均默认与 Docker 构建一致）
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${BASE_DIR}/proxy/runtime_common.sh" ]; then
+    source "${BASE_DIR}/proxy/runtime_common.sh"
+else
+    runtime_python_ok() { [ -x "$1" ]; }
+    runtime_python_version() { "$1" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo unknown; }
+    choose_python_bin() {
+        if [ -n "${FNMUSIC_PYTHON_BIN:-}" ] && [ -x "${FNMUSIC_PYTHON_BIN}" ]; then
+            FNMUSIC_SELECTED_PYTHON="${FNMUSIC_PYTHON_BIN}"
+            FNMUSIC_PYTHON_SOURCE="explicit"
+            return 0
+        fi
+        if command -v python3 >/dev/null 2>&1; then
+            FNMUSIC_SELECTED_PYTHON="$(command -v python3)"
+            FNMUSIC_PYTHON_SOURCE="system python3"
+            return 0
+        fi
+        return 1
+    }
+    choose_node_bin() {
+        if [ -n "${FNMUSIC_NODE_BIN:-}" ] && [ -x "${FNMUSIC_NODE_BIN}" ]; then
+            FNMUSIC_SELECTED_NODE="${FNMUSIC_NODE_BIN}"
+            FNMUSIC_NODE_SOURCE="explicit"
+            return 0
+        fi
+        if command -v node >/dev/null 2>&1; then
+            FNMUSIC_SELECTED_NODE="$(command -v node)"
+            FNMUSIC_NODE_SOURCE="system node"
+            return 0
+        fi
+        return 1
+    }
+    choose_media_bins() {
+        FNMUSIC_SELECTED_FFMPEG="$(command -v ffmpeg 2>/dev/null || true)"
+        FNMUSIC_SELECTED_FFPROBE="$(command -v ffprobe 2>/dev/null || true)"
+        [ -n "${FNMUSIC_SELECTED_FFMPEG}" ]
+    }
+    deps_requirements_digest() { sha256sum "$@" 2>/dev/null | awk '{print $1}' | sha256sum | awk '{print $1}'; }
+    deps_state_valid() { return 1; }
+    deps_write_state() { :; }
+    deps_imports_ok() { return 0; }
+fi
 VENV_DIR="${FNMUSIC_VENV_SOURCES_DIR:-${BASE_DIR}/.venv-sources}"
 LXSERVER_DIR="${FNMUSIC_LXSERVER_DIR:-${BASE_DIR}/.lxserver}"
 LXSERVER_VERSION_FILE="${BASE_DIR}/container/lxserver.version"
 LXSERVER_ARTIFACT_DIR="${BASE_DIR}/container/lxserver-artifact"
 PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
+FNMUSIC_DEPS_REVISION="sources-20261019-1"
 FALLBACK_INDEXES="https://mirrors.aliyun.com/pypi/simple/ https://pypi.tuna.tsinghua.edu.cn/simple https://pypi.org/simple"
 APT_MIRROR="${FNMUSIC_APT_MIRROR:-}"
 
@@ -44,15 +88,37 @@ for req in "${REQ_FILES[@]}"; do
     fi
 done
 
+if ! choose_python_bin; then
+    log_err "未找到可用的 Python 3.11+（需包含 venv/ensurepip/ssl/sqlite3）。"
+    log_err "可在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN 指向合格解释器。"
+    exit 1
+fi
+PYTHON_BIN="${FNMUSIC_SELECTED_PYTHON}"
+log_info "选用 Python: ${PYTHON_BIN} ($(runtime_python_version "${PYTHON_BIN}")，来源: ${FNMUSIC_PYTHON_SOURCE})"
+
 if [ ! -x "${VENV_DIR}/bin/python" ]; then
     log_info "创建虚拟环境 ${VENV_DIR} ..."
-    python3 -m venv "${VENV_DIR}"
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 fi
+VENV_PYTHON="${VENV_DIR}/bin/python"
 PIP_BIN="${VENV_DIR}/bin/pip"
-if [ ! -x "${PIP_BIN}" ]; then
-    log_err "虚拟环境异常：${PIP_BIN} 不存在。"
+if [ ! -x "${VENV_PYTHON}" ] || [ ! -x "${PIP_BIN}" ]; then
+    log_err "虚拟环境异常：${VENV_PYTHON} 或 ${PIP_BIN} 不存在。"
     log_err "可删除 ${VENV_DIR} 后重跑本脚本重建。"
     exit 1
+fi
+if ! runtime_python_ok "${VENV_PYTHON}"; then
+    log_err "虚拟环境 Python 不满足 3.11+ 或缺少 ensurepip/ssl/sqlite3。"
+    log_err "请删除 ${VENV_DIR} 后重跑本脚本重建。"
+    exit 1
+fi
+
+REQ_DIGEST="$(deps_requirements_digest "${REQ_FILES[@]}")"
+if [ "${FNMUSIC_REFRESH_DEPS:-0}" != "1" ] \
+   && deps_state_valid "${VENV_DIR}" "${FNMUSIC_DEPS_REVISION}" "${VENV_PYTHON}" \
+        "${REQ_DIGEST}" supervisor musicdl fastapi uvicorn httpx curl_cffi PIL qrcode multipart; then
+    log_info "音源服务 Python 依赖已就绪，跳过联网安装。"
+    SKIP_PIP_INSTALL=1
 fi
 
 # supervisor 经 pip 安装（容器内为 apt supervisor；pip 包即同一项目，含
@@ -62,27 +128,36 @@ for idx in ${FALLBACK_INDEXES}; do
     [ "${idx}" = "${PIP_INDEX}" ] || candidates="${candidates} ${idx}"
 done
 
-ok_index=""
 REQ_ARGS=()
 for req in "${REQ_FILES[@]}"; do
     REQ_ARGS+=("-r" "${req}")
 done
-for idx in ${candidates}; do
-    log_info "尝试 pip 源: ${idx}"
-    if "${PIP_BIN}" install -q -U pip --retries 2 --timeout 30 -i "${idx}" \
-       && "${PIP_BIN}" install -q supervisor "${REQ_ARGS[@]}" --retries 2 --timeout 30 -i "${idx}"; then
-        ok_index="${idx}"
-        break
+if [ "${SKIP_PIP_INSTALL:-0}" != "1" ]; then
+    rm -f "${VENV_DIR}/.fnmusic-deps"
+    ok_index=""
+    for idx in ${candidates}; do
+        log_info "尝试 pip 源: ${idx}"
+        if "${PIP_BIN}" install -q -U pip --retries 2 --timeout 30 -i "${idx}" \
+           && "${PIP_BIN}" install -q supervisor "${REQ_ARGS[@]}" --retries 2 --timeout 30 -i "${idx}"; then
+            ok_index="${idx}"
+            break
+        fi
+        log_warn "pip 源不可用: ${idx}，切换下一候选源重试..."
+    done
+    if [ -z "${ok_index}" ]; then
+        log_err "所有 pip 源均安装失败（尝试了: ${candidates}）。"
+        log_err "排查建议：1) 检查宿主机网络 / DNS / 代理（含 http_proxy、https_proxy 环境变量）；"
+        log_err "           2) 换源重试: PIP_INDEX=<其他源URL> bash $(basename "${BASH_SOURCE[0]}")。"
+        exit 1
     fi
-    log_warn "pip 源不可用: ${idx}，切换下一候选源重试..."
-done
-if [ -z "${ok_index}" ]; then
-    log_err "所有 pip 源均安装失败（尝试了: ${candidates}）。"
-    log_err "排查建议：1) 检查宿主机网络 / DNS / 代理（含 http_proxy、https_proxy 环境变量）；"
-    log_err "           2) 换源重试: PIP_INDEX=<其他源URL> bash $(basename "${BASH_SOURCE[0]}")。"
-    exit 1
+    if ! "${PIP_BIN}" check >/dev/null 2>&1 \
+       || ! deps_imports_ok "${VENV_PYTHON}" supervisor musicdl fastapi uvicorn httpx curl_cffi PIL qrcode multipart; then
+        log_err "依赖安装后校验失败（pip check 或关键模块导入失败）。"
+        exit 1
+    fi
+    deps_write_state "${VENV_DIR}" "${FNMUSIC_DEPS_REVISION}" "${VENV_PYTHON}" "${REQ_DIGEST}"
+    log_info "音源服务 Python 依赖安装完成（pip 源: ${ok_index}）。"
 fi
-log_info "音源服务 Python 依赖安装完成（pip 源: ${ok_index}）。"
 
 # ------------------------------------------------------- 2. nodejs / ffmpeg
 apt_install_missing() {
@@ -104,26 +179,47 @@ apt_install_missing() {
     return 1
 }
 
-# node 命令由 nodejs 包提供（Debian 12 自带 18.x，满足 lxserver 要求）
-if ! command -v node >/dev/null 2>&1; then
-    apt_install_missing nodejs || {
-        log_err "缺少 nodejs：lxserver（洛雪同步服务）无法运行。"
+apt_install_packages() {
+    log_warn "尝试 sudo apt-get 安装/补齐: $*"
+    if command -v apt-get >/dev/null 2>&1 && sudo apt-get update -o Acquire::Retries=1 2>/dev/null \
+        && sudo apt-get install -y --no-install-recommends "$@"; then
+        return 0
+    fi
+    log_err "apt 自动安装失败，请手动安装后重跑："
+    log_err "  sudo apt-get update && sudo apt-get install -y $*"
+    return 1
+}
+
+if ! choose_node_bin; then
+    if [ -n "${FNMUSIC_NODE_BIN:-}" ]; then
+        log_err "FNMUSIC_NODE_BIN 不是可执行的 Node 20+：${FNMUSIC_NODE_BIN}"
         exit 1
-    }
-fi
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-if [ "${NODE_MAJOR}" -lt 16 ]; then
-    log_err "nodejs 版本过低（${NODE_MAJOR} < 16）：lxserver 需要 Node 16+。请升级后重跑。"
-    exit 1
-fi
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    apt_install_missing ffmpeg || {
-        log_err "缺少 ffmpeg：musicdl 无损流探针不可用（不影响其他音源）。"
-        log_err "如不需要 musicdl 可忽略此错误继续。"
+    fi
+    log_warn "未探测到 Node 20+，尝试 sudo apt-get 安装..."
+    apt_install_packages nodejs || true
+    if ! choose_node_bin; then
+        log_err "缺少可用的 Node 20+：lxserver 无法运行。"
+        log_err "可在飞牛应用中心安装 nodejs_v22，或设置 FNMUSIC_NODE_BIN 指向 Node 20+。"
         exit 1
-    }
+    fi
 fi
-log_info "系统组件就绪（node $(node --version 2>/dev/null || echo '?'), ffmpeg $(ffmpeg -version 2>/dev/null | head -n1 | awk '{print $3}' || echo '?')）。"
+NODE_BIN="${FNMUSIC_SELECTED_NODE}"
+log_info "选用 Node: ${NODE_BIN} ($("${NODE_BIN}" --version 2>/dev/null || echo '?')，来源: ${FNMUSIC_NODE_SOURCE})"
+
+choose_media_bins || true
+if [ -z "${FNMUSIC_SELECTED_FFMPEG}" ] || [ -z "${FNMUSIC_SELECTED_FFPROBE}" ]; then
+    log_warn "未检测到完整 ffmpeg/ffprobe，尝试 sudo apt-get 补装..."
+    apt_install_packages ffmpeg || true
+    choose_media_bins || true
+fi
+if [ -z "${FNMUSIC_SELECTED_FFMPEG}" ]; then
+    log_warn "缺少 ffmpeg：音频解码校验与标准音质转码不可用，将继续安装并按原文件/无法校验处理。"
+else
+    if [ -z "${FNMUSIC_SELECTED_FFPROBE}" ]; then
+        log_warn "检测到 ffmpeg 但缺少 ffprobe：转码完整性复核将降级。"
+    fi
+    log_info "选用 ffmpeg: ${FNMUSIC_SELECTED_FFMPEG}$( [ -n "${FNMUSIC_SELECTED_FFPROBE}" ] && printf '；ffprobe: %s' "${FNMUSIC_SELECTED_FFPROBE}" )"
+fi
 
 # ------------------------------------------------------- 3. lxserver 落位
 # 版本锁定文件与 Dockerfile 构建层同源（scripts/update_lxserver.sh 维护）
@@ -208,5 +304,17 @@ else
     printf '%s\n' "${LXSERVER_TAG}" > "${LXSERVER_STAMP}"
     log_info "lxserver ${LXSERVER_TAG} 已落位 ${LXSERVER_DIR}。"
 fi
+
+# 与 Docker 构建应用同一份幂等补丁；同版本在位也需修复旧安装的漏补丁。
+if [ -f "${LXSERVER_DIR}/server/server/userApi.js" ]; then
+    "${PYTHON_BIN}" "${BASE_DIR}/container/lxserver_compat.py" \
+        "${LXSERVER_DIR}/server/server/userApi.js"
+fi
+
+bash "${BASE_DIR}/container/ensure_lxserver_native.sh" \
+    --artifact-dir "${LXSERVER_ARTIFACT_DIR}" \
+    --lxserver-dir "${LXSERVER_DIR}" \
+    --version-file "${LXSERVER_VERSION_FILE}" \
+    --node-bin "${NODE_BIN}"
 
 log_info "原生音源运行时就绪。"

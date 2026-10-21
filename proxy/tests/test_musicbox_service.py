@@ -1029,6 +1029,108 @@ def test_public_business_failure_is_not_successful_empty_list(monkeypatch):
         netease_ext.public_playlists("top")
 
 
+def test_public_playlist_search_parses_playlists_and_advances_native_offset(monkeypatch):
+    """歌单搜索走 /weapi/search/get type=1000：offset 按上游原始窗口推进，has_more 对账 total。"""
+    captured: dict = {}
+
+    def fake_post(path, params):
+        captured.update(path=path, params=dict(params))
+        remaining = max(0, 57 - int(params["offset"]))
+        rows = [
+            {"id": 1000 + i, "name": f"歌单{i}", "coverImgUrl": f"http://img/{i}.jpg",
+             "trackCount": 10 + i, "creator": {"nickname": "作者"}}
+            for i in range(min(int(params["limit"]), remaining))
+        ]
+        return {"code": 200, "result": {"playlists": rows, "playlistCount": 57}}
+
+    monkeypatch.setattr(netease_ext, "_public_post", fake_post)
+
+    page1 = netease_ext.public_playlist_search(" 华语 ", page=1, limit=30)
+    assert captured["path"] == "/weapi/search/get"
+    assert captured["params"] == {"s": "华语", "type": 1000, "offset": 0, "total": "true", "limit": 30}
+    assert page1["total"] == 57 and len(page1["items"]) == 30 and page1["has_more"] is True
+    assert page1["items"][0]["id"] == "1000" and page1["items"][0]["author"] == "作者"
+
+    # 末页：offset 30 + 27 = 57 对齐 total，不再有下一页；offset 按页码推进
+    page2 = netease_ext.public_playlist_search("华语", page=2, limit=30)
+    assert captured["params"]["offset"] == 30
+    assert len(page2["items"]) == 27 and page2["has_more"] is False
+
+    # 空关键词直接空结果，不打上游
+    captured.clear()
+    empty = netease_ext.public_playlist_search("   ")
+    assert empty == {"ok": True, "items": [], "total": 0, "has_more": False}
+    assert captured == {}
+
+
+@pytest.mark.parametrize("total", [0, 99999])
+def test_public_playlist_search_empty_raw_page_stops_despite_stale_total(monkeypatch, total):
+    monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: {
+        "code": 200, "result": {"playlists": [], "playlistCount": total, "more": True},
+    })
+    result = netease_ext.public_playlist_search("华语", page=2, limit=30)
+    assert result["items"] == [] and result["raw_count"] == 0
+    assert result["total"] == total and result["has_more"] is False
+
+
+def test_public_playlist_search_filtered_raw_window_uses_native_page_boundary(monkeypatch):
+    offsets = []
+
+    def fake_post(path, params):
+        offsets.append(params["offset"])
+        # 第 1 页部分行无身份；第 2 页全被过滤，但原始窗口已经到达总数。
+        rows = [{"id": 1, "name": "有效"}, {}, None] if params["offset"] == 0 else [{}, None]
+        return {"code": 200, "result": {"playlists": rows, "playlistCount": 5}}
+
+    monkeypatch.setattr(netease_ext, "_public_post", fake_post)
+    first = netease_ext.public_playlist_search("华语", page=1, limit=3)
+    last = netease_ext.public_playlist_search("华语", page=2, limit=3)
+    assert offsets == [0, 3]
+    assert len(first["items"]) == 1 and first["raw_count"] == 3 and first["has_more"] is True
+    assert last["items"] == [] and last["raw_count"] == 2 and last["has_more"] is False
+
+    # 非空但全部无效的中间窗口不误判成真空页，下页仍可请求。
+    monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: {
+        "code": 200, "result": {"playlists": [{}, None], "playlistCount": 100},
+    })
+    filtered = netease_ext.public_playlist_search("华语", page=2, limit=3)
+    assert filtered["items"] == [] and filtered["raw_count"] == 2 and filtered["has_more"] is True
+
+
+def test_public_playlist_search_via_channel_requires_keyword(monkeypatch):
+    monkeypatch.setattr(netease_ext, "_public_post", lambda *a, **k: pytest.fail("不应发起上游请求"))
+    assert netease_ext.public_playlists("search", keyword="")["items"] == []
+
+
+def test_highquality_empty_rows_report_no_more(monkeypatch):
+    """more=true 但整页为空时没有可推进的游标：必须判停，否则前端会从头重复第一页。"""
+    monkeypatch.setattr(netease_ext, "_public_get", lambda *a, **k: {
+        "code": 200, "playlists": [], "more": True, "total": 99,
+    })
+    result = netease_ext.public_playlists("highquality")
+    assert result["items"] == [] and result["has_more"] is False and result["next_cursor"] == ""
+
+
+def test_public_playlists_endpoint_search_and_deep_pages(monkeypatch):
+    captured: dict = {}
+
+    def fake_public_playlists(channel, category="", sort="hot", page=1, limit=30, cursor="", keyword=""):
+        captured.update(channel=channel, keyword=keyword, page=page)
+        return {"ok": True, "items": [], "total": 0, "has_more": False}
+
+    monkeypatch.setattr(musicbox_app, "public_playlists", fake_public_playlists)
+    with TestClient(app) as client:
+        r = client.get("/api/v1/public-playlists", params={
+            "source": "netease", "channel": "search", "keyword": "华语", "page": 101,
+        })
+        assert r.status_code == 200
+        assert captured == {"channel": "search", "keyword": "华语", "page": 101}
+        missing = client.get("/api/v1/public-playlists", params={"source": "netease", "channel": "search"})
+        assert missing.status_code == 400
+        bad = client.get("/api/v1/public-playlists", params={"source": "netease", "channel": "nope"})
+        assert bad.status_code == 400
+
+
 def test_search_offset_routes_to_web_fallback(monkeypatch):
     """offset>0（深分页）直接走官方 web 搜索接口：offset/limit 透传，可播过滤沿用。"""
     captured: dict = {}
@@ -1051,13 +1153,29 @@ def test_search_offset_routes_to_web_fallback(monkeypatch):
     assert [it["song_id"] for it in data] == [33894312, 186016]
 
 
-def test_search_offset_zero_keeps_cli_path():
-    """offset=0（首屏）不触发 web 直连分支，维持 CLI 优先的既有路径。"""
+def test_search_offset_zero_keeps_cli_path(monkeypatch):
+    """offset=0 优先走 CLI；全部上游桩化，不能只检查真实网络降级后返回 200。"""
+    calls = []
+    fallback_calls = []
+    rows = [{"song_id": 33894312, "name": "晴天"}]
+
+    def cli(args):
+        calls.append(args)
+        return {"ok": True, "code": 200, "data": rows}
+
+    def fallback(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        return []
+
+    monkeypatch.setattr(musicbox_app, "exec_musicbox", cli)
+    monkeypatch.setattr(musicbox_app, "search_web_fallback", fallback)
+    monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
     with TestClient(app) as client:
         r = client.get("/api/v1/search", params={"keyword": "周杰伦", "offset": 0})
-    # CLI 路径失败会自动降级 web fallback，两条路径都返回 200 信封；断言不炸即可
     assert r.status_code == 200
-    assert isinstance(r.json().get("data"), list)
+    assert r.json()["data"] == rows
+    assert calls == [["search", "周杰伦", "--type", "song", "--limit", "20", "--json"]]
+    assert fallback_calls == []
 
 
 def test_map_song_detail_maps_fee():

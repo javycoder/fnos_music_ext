@@ -14,6 +14,8 @@ def _no_real_ffmpeg(monkeypatch):
     monkeypatch.setattr(tc, "FFPROBE_BIN", None)
     # 隔离会话注册表与并发槽，避免跨用例串扰
     monkeypatch.setattr(tc, "_SESSIONS", {})
+    monkeypatch.setattr(tc, "_PLAYBACK_LEASES", {})
+    monkeypatch.setattr(tc, "_SESSION_LOCKS", {})
     monkeypatch.setattr(tc, "_ACTIVE", 0)
     monkeypatch.setattr(tc, "_SLOT_COND", None)
 
@@ -26,3 +28,7 @@ def _isolate_cover_state(monkeypatch):
 
     monkeypatch.setattr(pa, "_COVER_GUID_URL_MEM", {})
     monkeypatch.setattr(pa, "_COVER_UNRESOLVED_SEEN", set())
+    monkeypatch.setattr(pa, "_LX_URL_INFLIGHT", {})
+    monkeypatch.setattr(pa, "_LX_URL_PREFETCH", set())
+    monkeypatch.setattr(pa, "_LX_CONFIG_SIG", None)
+    monkeypatch.setattr(pa, "_LX_RESOLVE_EPOCH", 0)

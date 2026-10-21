@@ -12,6 +12,7 @@
 """
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -189,23 +190,9 @@ class TestCmdScripts:
             assert path.is_file(), f"缺少 cmd/{name}"
             assert os.access(path, os.X_OK), f"cmd/{name} 缺少可执行权限"
 
-    def test_main_handles_start_stop_status(self, stage: Path):
-        text = (stage / "cmd" / "main").read_text()
-        for kw in ("start)", "stop)", "status)", "exit 3"):
-            assert kw in text
-
-    def test_install_callback_maps_wizard(self, stage: Path):
-        text = (stage / "cmd" / "install_callback").read_text()
-        assert "--non-interactive" in text
-        assert "--webui" in text
-        assert "wizard_sources" in text
-        assert "wizard_extend" in text
-
-    def test_uninstall_restores_official(self, stage: Path):
-        text = (stage / "cmd" / "uninstall_init").read_text()
-        assert "restore.sh" in text
-        # 卸载前必须自动备份用户数据（向导已被移除，无法交互选择）
-        assert "fnmusic-ext-backup-" in text
+    # Lifecycle semantics are exercised by test_fpk_cmds.py against real shell
+    # scripts in a sandbox. Checking that keyword strings exist here duplicated
+    # that coverage without detecting broken execution or argument forwarding.
 
 
 class TestPayload:
@@ -245,6 +232,52 @@ class TestPayload:
                        env={**os.environ, "REPO_ROOT": str(source), "STAGE": str(stage)})
         assert not (target / "logs").is_symlink()
 
+    def test_dev_files_and_runtime_maps_excluded_by_real_rsync(self, tmp_path):
+        source = tmp_path / "source"
+        stage = tmp_path / "stage"
+        target = stage / "app/repo"
+        target.mkdir(parents=True)
+        excluded = (
+            "test_root.py", "test_root.js", "conftest.py", "smoke_test.sh",
+            "scripts/run_tests.py",
+            "proxy/test_loose.py", "webui-service/test_app_js.js",
+            "nested/conftest.py", "nested/smoke_test.sh",
+            ".agents/skills/local/SKILL.md", "nested/.agents/config.json",
+            "AGENTS.md", "nested/AGENTS.md",
+            "playlist_tracks/user.json", "nested/playlist_tracks/user.json",
+            "album_registry.json", "bind_registry.json", "online_favorites.json",
+            "nested/album_registry.json", "nested/bind_registry.json",
+            "online_favorites/user.json", "cache/track.mp3",
+            "sources-data/session.json", "play_history/user.json",
+            "recommend_cache/user.json", "public_playlists_cache/list.json",
+        )
+        retained = (
+            "lxmusic-service/verify_source.py", "container/lxserver_compat.py",
+            "proxy/app.py", "webui-service/static/app.js", ".env.example",
+            "container/config.json",
+        )
+        for rel in (*excluded, *retained):
+            path = source / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+        # Also exercise --delete so stale payload files cannot survive restaging.
+        for rel in ("proxy/stale.py",):
+            path = target / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("stale")
+        text = (FPK_DIR / "build.sh").read_text()
+        start = text.index("rsync -a --delete")
+        end_marker = '"${REPO_ROOT}/" "${STAGE}/app/repo/"'
+        end = text.index(end_marker, start) + len(end_marker)
+        subprocess.run(
+            ["bash", "-c", text[start:end]], check=True, capture_output=True,
+            env={**os.environ, "REPO_ROOT": str(source), "STAGE": str(stage)},
+        )
+        actual = {str(p.relative_to(target)) for p in target.rglob("*") if p.is_file()}
+        assert actual == set(retained)
+        for name in (".agents", "playlist_tracks", "online_favorites", "cache"):
+            assert not list(target.rglob(name))
+
     def test_runtime_files_present(self, stage: Path):
         repo = stage / "app" / "repo"
         for rel in (
@@ -252,8 +285,21 @@ class TestPayload:
             "docker-compose.yml", ".env.example", ".dockerignore",
             "fnmusic-ext.service", "VERSION",
             "proxy/app.py", "container/Dockerfile", "webui-service/app.py",
+            "lxmusic-service/verify_source.py", "container/lxserver_compat.py",
         ):
             assert (repo / rel).is_file(), f"payload 缺少运行所需文件 {rel}"
+
+    def test_arm64_native_binding_is_embedded(self, stage: Path):
+        repo = stage / "app" / "repo"
+        version = {}
+        for line in (repo / "container/lxserver.version").read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key and not key.startswith("#"):
+                version[key] = value
+        expected = f"music-tag-native-linux-arm64-gnu-{version['LXSERVER_NATIVE_VERSION']}.tgz"
+        artifact = repo / "container/lxserver-artifact" / expected
+        assert artifact.is_file(), f"FPK 缺少 ARM64 原生模块 {expected}"
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == version["LXSERVER_NATIVE_ARM64_SHA256"]
 
     def test_no_dev_files_or_secrets(self, stage: Path):
         repo = stage / "app" / "repo"

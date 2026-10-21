@@ -16,7 +16,10 @@ services:
     build:
       context: .
       dockerfile: container/Dockerfile
-      network: host
+      # 构建指纹写入镜像标签（issue #70）：由 install/extend 注入 FNMUSIC_BUILD_FINGERPRINT，
+      # 启动时与本地应用镜像标签比对——一致则复用镜像（不探测/拉取基础镜像）。
+      labels:
+        - "io.fnmusic-ext.build-fingerprint=${FNMUSIC_BUILD_FINGERPRINT:-}"
       args:
         BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
         PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}

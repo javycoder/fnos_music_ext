@@ -38,6 +38,9 @@ if "-f" in args and "null" in args:
     if os.environ.get("FAKE_FFMPEG_DECODE") == "bad":
         sys.stderr.write("[flac] invalid sync code\\n")
         sys.exit(1)
+    if os.environ.get("FAKE_FFMPEG_DECODE") == "warning":
+        sys.stderr.write("[png @ 0x1234] chunk too big\\n")
+        sys.exit(0)
     sys.exit(0)
 if "-hls_segment_filename" in args:
     pattern = args[args.index("-hls_segment_filename") + 1]
@@ -515,16 +518,17 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
 
         body = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8").text
         assert "#EXT-X-VERSION:7" in body
-        assert '#EXT-X-MAP:URI="init.mp4"' in body
+        import re
+        token = re.search(r'URI="([a-f0-9]{32})__init.mp4"', body)[1]
         assert "00000.m4s" in body and "#EXT-X-ENDLIST" in body
 
-        init = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/init.mp4")
+        init = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__init.mp4")
         assert init.status_code == 200
         assert init.content.startswith(b"ftypinit")
         assert init.headers["content-type"].startswith("audio/mp4")
         assert init.headers["x-accel-buffering"] == "no"
 
-        seg = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/00000.m4s")
+        seg = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__00000.m4s")
         assert seg.status_code == 200
         assert seg.headers["content-type"].startswith("video/iso.segment")
         assert seg.headers["x-accel-buffering"] == "no"
@@ -1062,6 +1066,300 @@ def test_open_stream_blacklisted_guid_requests_mp3(env):
     assert captured["params"].get("quality") == "mp3"
     assert opened is not None and opened[2] == "mp3"     # content-type 修正扩展名
     monkeypatch.undo()
+
+
+def test_open_stream_blacklisted_guid_lx_requests_high_mp3(env, monkeypatch):
+    """拉黑曲目的 LX 取流请求使用 max_quality=high 降档，且扩展名修正为 mp3。"""
+    guid = "online:lx:kw:99006"
+    appmod._LOSSLESS_BAD.clear()
+    appmod._lossless_blacklist(guid)
+    recorded_requests = []
+
+    def lx_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/track/url":
+            recorded_requests.append(dict(request.url.params))
+            return httpx.Response(200, json={
+                "ok": True,
+                "data": {
+                    "id": "lx:kw:99006",
+                    "url": "http://audio.test/99006.mp3",
+                    "ext": "mp3",
+                    "actual_tier": "high",
+                }
+            })
+        return httpx.Response(200, json={"ok": True, "data": {"id": "lx:kw:99006", "title": "曲", "artist": "人"}})
+
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://127.0.0.1:8772")
+
+    orig_client = httpx.AsyncClient
+
+    def mock_client_factory(**kwargs):
+        def media_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"ID3" + b"M" * 1000,
+                                  headers={"content-type": "audio/mpeg", "content-length": "1003"})
+        return orig_client(transport=httpx.MockTransport(media_handler), **kwargs)
+
+    monkeypatch.setattr(appmod.httpx, "AsyncClient", mock_client_factory)
+
+    async def _run():
+        req = appmod.Request({"type": "http", "headers": [], "app": app})
+        return await appmod._open_online_stream(req, guid, None)
+
+    opened = asyncio.run(_run())
+    assert opened is not None
+    assert opened[2] == "mp3"
+    assert len(recorded_requests) == 1
+    assert recorded_requests[0].get("quality") == "high"
+
+
+@pytest.mark.asyncio
+async def test_corrupt_stream_tee_retries_only_after_writer_released(env, monkeypatch):
+    guid = "online:kuwo:99009"
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    monkeypatch.setattr(appmod, "_check_audio_file", lambda path: (False, "decode_error"))
+    appmod._LOSSLESS_BAD.clear()
+    registrations = []
+    def register(request, track_guid, reason):
+        registrations.append((track_guid, track_guid in appmod._tee_active, reason))
+        return True
+    monkeypatch.setattr(appmod, "_register_background_fetch", register)
+    data = b"fLaC" + b"bad" * 1000
+    response = httpx.Response(200, stream=_Whole(data), headers={
+        "content-type": "audio/flac", "content-length": str(len(data))})
+    streamed = appmod.stream_tee_response(response, guid, None, resolved_ext="flac",
+                                          pre_info={"title": "t", "artist": "a"})
+    body = b"".join([part async for part in streamed.body_iterator])
+    assert body == data
+    assert appmod._lossless_is_blacklisted(guid)
+    assert registrations == [(guid, False, "tee_save_enabled")]
+
+
+@pytest.mark.asyncio
+async def test_netease_downgrade_octet_stream_does_not_read_lx_resolution(env, monkeypatch):
+    guid = "online:netease:99010"
+    monkeypatch.setattr(appmod, "_retained_track", lambda *a: ({"ext": "flac"}, None))
+    async def resolve(*args, **kwargs):
+        assert kwargs["max_quality"] == "exhigh"
+        return "http://audio.test/99010"
+    monkeypatch.setattr(appmod, "resolve_netease_url", resolve)
+    original = httpx.AsyncClient
+    def factory(**kwargs):
+        return original(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, content=b"ID3mp3data", headers={"content-type": "application/octet-stream"})), **kwargs)
+    monkeypatch.setattr(appmod.httpx, "AsyncClient", factory)
+    request = appmod.Request({"type": "http", "headers": [], "app": app})
+    opened = await appmod._open_online_stream(request, guid, None, force_mp3=True)
+    assert opened and opened[2] == "mp3"
+    await opened[0].aclose()
+    await opened[1].aclose()
+
+
+def test_check_audio_file_accepts_trailing_sync_error_after_full_decode(env, monkeypatch, tmp_path):
+    """尾部多余字节让 -xerror 返回 183，但音轨已解完时必须保留文件。"""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        completed = subprocess.CompletedProcess(args[0], 183, "", """
+Input #0, flac, from 'track.flac':
+  Duration: 00:03:41.20, start: 0.000000, bitrate: 980 kb/s
+[flac @ 0x1] invalid sync code
+[flac @ 0x1] invalid frame header
+[flac @ 0x1] decode_frame() failed
+out_time=00:03:41.200000
+progress=end
+""")
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    part = _mk_part(tmp_path / "tail.part", 2048)
+    ok, reason = appmod._check_audio_file(part)
+    assert ok is True
+    assert reason == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decoded_time, keep_flac", [
+    ("00:03:41.200000", True),
+    ("00:00:12.000000", False),
+], ids=["trailing-error", "midstream-error"])
+async def test_lx_stream_tee_decode_error_preserves_only_complete_audio(
+    env, monkeypatch, tmp_path, decoded_time, keep_flac,
+):
+    import subprocess
+
+    guid = "online:lx:kw:38526274"
+    data = b"fLaC" + b"F" * 4096 + b"ID3TRAIL"
+    first_chunk = data[:1024]
+    checked_parts = []
+    registrations = []
+    finalized = []
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
+    monkeypatch.setattr(appmod, "_LOSSLESS_BAD", {})
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    monkeypatch.setattr(appmod, "write_audio_tags", lambda *args: None)
+    monkeypatch.setattr(appmod, "_dispatch_official_binding", lambda *args: None)
+
+    def fake_run(args, **kwargs):
+        part = args[args.index("-i") + 1]
+        with open(part, "rb") as f:
+            assert f.read() == data
+        checked_parts.append(part)
+        return subprocess.CompletedProcess(args, 183, "", f"""
+  Duration: 00:03:41.20, start: 0.000000, bitrate: 980 kb/s
+[flac @ 0x1] invalid sync code
+[flac @ 0x1] invalid frame header
+[flac @ 0x1] decode_frame() failed
+out_time={decoded_time}
+progress=end
+""")
+
+    def register(request, track_guid, reason):
+        registrations.append((track_guid, track_guid in appmod._tee_active, reason))
+        assert checked_parts and not os.path.exists(checked_parts[0])
+        return True
+
+    async def post_finalize(meta):
+        finalized.append(meta)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(appmod, "_register_background_fetch", register)
+    response = httpx.Response(200, stream=_Whole(data[len(first_chunk):]), headers={
+        "content-type": "audio/flac", "content-length": str(len(data))})
+    streamed = appmod.stream_tee_response(
+        response, guid, None, resolved_ext="flac",
+        pre_info={"title": "t", "artist": "a"},
+        first_chunk=first_chunk, chunks=response.aiter_bytes(chunk_size=1024),
+        post_finalize=post_finalize,
+    )
+    body = b"".join([part async for part in streamed.body_iterator])
+
+    assert body == data
+    assert response.is_closed
+    assert len(checked_parts) == 1
+    assert not os.path.exists(checked_parts[0])
+    assert guid not in appmod._tee_active
+    assert not list(tmp_path.rglob("*.part"))
+    assert appmod._lossless_is_blacklisted(guid) is not keep_flac
+    library = tmp_path / "library"
+    if keep_flac:
+        dest = library / "a - t.flac"
+        assert dest.read_bytes() == data
+        assert list(library.iterdir()) == [dest]
+        assert len(finalized) == 1 and finalized[0]["dest"] == str(dest)
+        assert registrations == []
+    else:
+        assert list(library.iterdir()) == []
+        assert finalized == []
+        assert registrations == [(guid, False, "tee_save_enabled")]
+
+
+def test_check_audio_file_rejects_midstream_decode_error(env, monkeypatch, tmp_path):
+    """坏帧出现在中途、解出时长远短于容器时长时仍然拒绝。"""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 183, "", """
+  Duration: 00:03:41.20, start: 0.000000, bitrate: 980 kb/s
+[flac @ 0x1] invalid sync code
+out_time=00:00:12.000000
+progress=end
+""")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    part = _mk_part(tmp_path / "mid.part", 2048)
+    ok, reason = appmod._check_audio_file(part)
+    assert ok is False
+    assert reason == "decode_error"
+
+
+def _ffmpeg_decode_exit(ffmpeg_path: str, path: str) -> int:
+    import subprocess
+    completed = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-v", "info", "-nostdin", "-xerror", "-progress", "pipe:2",
+         "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=60,
+    )
+    return completed.returncode
+
+
+def test_real_ffmpeg_keeps_flac_with_trailing_bytes(env, monkeypatch, tmp_path):
+    """尾部填充必须保留。中途损坏只在当前 ffmpeg 自己也失败时拒绝。
+
+    Ubuntu 6 与飞牛自带的 ffmpeg 8 对同一段坏字节的退出码不同，
+    不能把某一种退出码写死成唯一期望。
+    """
+    import shutil
+    import subprocess
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        pytest.skip("宿主机无 ffmpeg")
+    monkeypatch.setattr(tc, "FFMPEG_BIN", ffmpeg_path)
+    good = tmp_path / "good.flac"
+    subprocess.run(
+        [ffmpeg_path, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+         "-c:a", "flac", str(good)],
+        check=True, timeout=60,
+    )
+    trailed = tmp_path / "trail.flac"
+    trailed.write_bytes(good.read_bytes() + b"ID3TRAIL")
+    ok, reason = appmod._check_audio_file(str(trailed))
+    assert ok is True and reason == "ok"
+    raw = good.read_bytes()
+    broken = tmp_path / "mid.flac"
+    broken.write_bytes(raw[: len(raw) // 2] + b"\x00" * 4000 + raw[len(raw) // 2 + 4000:])
+    bad, bad_reason = appmod._check_audio_file(str(broken))
+    if _ffmpeg_decode_exit(ffmpeg_path, str(broken)) == 0:
+        assert bad is True and bad_reason == "ok"
+    else:
+        assert bad is False and bad_reason == "decode_error"
+
+
+def test_check_audio_file_passes_when_stderr_has_warnings(env, fake_ffmpeg, monkeypatch, tmp_path):
+    """解码校验音轨正常、stderr 存在警告（如封面损坏）时视为通过，不误杀。"""
+    fake_ffmpeg("ok")
+    monkeypatch.setenv("FAKE_FFMPEG_DECODE", "warning")
+    part = _mk_part(tmp_path / "warn.part", 2048)
+    ok, reason = appmod._check_audio_file(part)
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_check_audio_file_timeout_does_not_blacklist(env, fake_ffmpeg, monkeypatch, tmp_path):
+    """解码校验超时仅标记超时，不拉黑歌曲为坏流；完整字节也绝不销毁。"""
+    import subprocess
+    guid = "online:kuwo:99007"
+    appmod._LOSSLESS_BAD.clear()
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=300)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/bin/ffmpeg")
+    part = _mk_part(tmp_path / "timeout.part", 2048)
+    meta = appmod._tee_finalize(part, guid, "flac", {"title": "t", "artist": "a"}, True)
+    assert meta is None
+    assert not appmod._lossless_is_blacklisted(guid)
+    # 超时不能证明内容损坏：长度已校验完整的 part 必须留在磁盘上
+    assert os.path.exists(part)
+
+
+def test_tee_finalize_skips_check_when_already_verified(env, fake_ffmpeg, monkeypatch, tmp_path):
+    """already_verified=True 时跳过重复解码校验。"""
+    called = {"n": 0}
+
+    def count_check(path):
+        called["n"] += 1
+        return True, "ok"
+
+    monkeypatch.setattr(appmod, "_check_audio_file", count_check)
+    part = _mk_part(tmp_path / "fast.part", 2048)
+    meta = appmod._tee_finalize(part, "online:kuwo:99008", "flac", {"title": "t", "artist": "a"}, True, already_verified=True)
+    assert meta is not None
+    assert called["n"] == 0
 
 
 def test_filter_headers_sanitizes_unicode_content_disposition():

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Shared installation-only functions. Source after BASE_DIR and log_* definitions.
+_INSTALL_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${_INSTALL_COMMON_DIR}/runtime_common.sh" ]; then
+    source "${_INSTALL_COMMON_DIR}/runtime_common.sh"
+elif [ -n "${BASE_DIR:-}" ] && [ -f "${BASE_DIR}/proxy/runtime_common.sh" ]; then
+    source "${BASE_DIR}/proxy/runtime_common.sh"
+fi
 # NOTE: installation_lock()/retire_hung_installers() run BEFORE the caller's
 # log_* helpers are defined (install.sh acquires the lock at the very top), so
 # they must print with plain echo instead of log_warn/log_err.
@@ -256,6 +262,85 @@ remove_owned_container() {
     run_docker rm -f "${name}"
 }
 
+APP_IMAGE="fnmusic-sources:latest"
+BUILD_FINGERPRINT_LABEL="io.fnmusic-ext.build-fingerprint"
+
+compute_build_fingerprint() {
+    # Compose 自己解析插值/合并；Python 只哈希最终 build 配置与构建输入，
+    # 排除运行配置及指纹标签，避免自我依赖。分开检查命令状态，不依赖调用方 pipefail。
+    local config
+    config="$(run_docker compose -f "${BASE_DIR}/docker-compose.yml" config --format json)" || return 1
+    python3 "${BASE_DIR}/proxy/build_fingerprint.py" --repo "${BASE_DIR}" <<< "${config}"
+}
+
+app_image_fingerprint() {
+    run_docker image inspect "${APP_IMAGE}" \
+        --format "{{index .Config.Labels \"${BUILD_FINGERPRINT_LABEL}\"}}" 2>/dev/null || true
+}
+
+env_value() {
+    # 只读 .env 里单个键的值（供探测后同步 compose 参数），不展开其他键
+    [ -f "${BASE_DIR}/.env" ] || return 0
+    local raw
+    raw="$(sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?${1}=//p" "${BASE_DIR}/.env" 2>/dev/null | tail -1)"
+    raw="${raw#\"}"; raw="${raw%\"}"
+    raw="${raw#\'}"; raw="${raw%\'}"
+    printf '%s\n' "${raw}"
+}
+
+ensure_image_current() {
+    # 应用镜像保障（issue #70）：构建输入未变时复用本地镜像，跳过基础镜像探测与
+    # 拉取（python 基础镜像只参与构建，运行的是 fnmusic-sources 镜像）；镜像缺失、
+    # 旧镜像无指纹标签或构建输入变化时才探测基础镜像并重建。
+    local fingerprint stored manual_base
+    manual_base="${BASE_IMAGE:-}"
+    fingerprint="$(compute_build_fingerprint)" || {
+        log_err "无法计算应用镜像构建指纹。"
+        return 1
+    }
+    stored="$(app_image_fingerprint)"
+    # 手动指定的 BASE_IMAGE 与 .env 缓存不同 = 构建输入变化：跳过复用走探测，
+    # 让手动引用写入 .env 后重建（与旧版"安装必验证手动引用"的语义一致）
+    if [ "${stored}" = "${fingerprint}" ] \
+       && { [ -z "${manual_base}" ] || [ "${manual_base}" = "$(env_value FNMUSIC_BASE_IMAGE)" ]; }; then
+        log_info "应用镜像构建输入未变化，复用 ${APP_IMAGE}（跳过基础镜像探测与拉取）。"
+        FNMUSIC_BUILD_FINGERPRINT="${fingerprint}" \
+            run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build --pull never || return 1
+        return 0
+    fi
+    if ! BASE_IMAGE="${manual_base}" \
+         FNMUSIC_DOCKER_MIRRORS="${FNMUSIC_DOCKER_MIRRORS:-${DOCKER_IMAGE_MIRRORS:-}}" \
+         bash "${BASE_DIR}/ensure_base_image.sh"; then
+        log_err "基础镜像源探测失败，无法构建容器。可设置 BASE_IMAGE 环境变量手动指定可用镜像源后重试。"
+        return 1
+    fi
+    # 探测可能更新了 .env 的 FNMUSIC_BASE_IMAGE：重读并导出，覆盖启动脚本早已
+    # source 进环境的旧值（否则 compose 插值与指纹都会被旧值遮蔽），再重算指纹
+    FNMUSIC_BASE_IMAGE="$(env_value FNMUSIC_BASE_IMAGE)"
+    export FNMUSIC_BASE_IMAGE
+    fingerprint="$(compute_build_fingerprint)" || {
+        log_err "无法根据选定基础镜像计算应用镜像构建指纹。"
+        return 1
+    }
+    stored="$(app_image_fingerprint)"
+    if [ "${stored}" = "${fingerprint}" ]; then
+        log_info "基础镜像已就绪且应用镜像匹配最新构建输入，复用 ${APP_IMAGE}（不重建）。"
+        FNMUSIC_BUILD_FINGERPRINT="${fingerprint}" \
+            run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build --pull never || return 1
+        return 0
+    fi
+    log_info "应用镜像缺失或构建输入变化，重建 ${APP_IMAGE}..."
+    # issue #24：非 tty 下构建进度条会被压成静默（fpk 安装看似"卡在 55%"），默认 plain
+    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
+    FNMUSIC_BUILD_FINGERPRINT="${fingerprint}" \
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build || return 1
+    stored="$(app_image_fingerprint)"
+    if [ "${stored}" != "${fingerprint}" ]; then
+        log_err "新应用镜像的构建指纹缺失或与预期不符。"
+        return 1
+    fi
+}
+
 env_newer_than_container() {
     # .env 比容器启动新（安装/切源/升级恢复改了开关）且镜像未变时，compose 不会
     # 重建容器：需要显式重启让 entrypoint 重读 .env 重选进程集。
@@ -328,21 +413,58 @@ native_sup_conf() {
 }
 
 render_native_placeholders() {
-    # $1 = 模板文件，渲染结果输出到 stdout（@REPO@/@VENV@/@DATA@/@RUN@ 四占位符）
+    # $1 = 模板文件；输出渲染后的 systemd/supervisor 配置。
+    if command -v choose_node_bin >/dev/null 2>&1; then
+        choose_node_bin || true
+    fi
+    if [ -z "${FNMUSIC_SELECTED_NODE:-}" ]; then
+        FNMUSIC_SELECTED_NODE="$(command -v node 2>/dev/null || true)"
+        FNMUSIC_NODE_SOURCE="system node"
+    fi
+    if command -v choose_media_bins >/dev/null 2>&1; then
+        choose_media_bins || true
+    fi
+    local node_bin="${FNMUSIC_SELECTED_NODE}" node_dir=""
+    if [ -n "${node_bin}" ]; then
+        node_dir="$(dirname "${node_bin}")"
+    fi
     python3 - "$1" "${BASE_DIR}" "$(native_venv_dir)" \
-        "${BASE_DIR}/sources-data" "$(native_run_dir)" <<'PY'
+        "${BASE_DIR}/sources-data" "$(native_run_dir)" \
+        "${node_bin}" "${node_dir}" "${FNMUSIC_SELECTED_FFMPEG:-}" \
+        "${FNMUSIC_SELECTED_FFPROBE:-}" <<'PY'
 import pathlib
 import sys
 
 template, *paths = sys.argv[1:]
+repo, venv, data, run, node, node_dir, ffmpeg, ffprobe = paths
 # These paths cross INI environment, shell argv and systemd parsers. Fail clearly
 # on ambiguous quoting rather than install a malformed unit or command.
 if any(any(c in path for c in "\n\r\"'\\") for path in paths):
     raise SystemExit("原生部署路径不能包含换行、引号或反斜杠")
+
+path_dirs = []
+if node_dir and node_dir not in path_dirs:
+    path_dirs.append(node_dir)
+if venv:
+    venv_bin = f"{venv}/bin"
+    if venv_bin not in path_dirs:
+        path_dirs.append(venv_bin)
+if ffmpeg:
+    ffmpeg_dir = str(pathlib.Path(ffmpeg).parent)
+    if ffmpeg_dir not in path_dirs and ffmpeg_dir not in ("/usr/bin", "/bin"):
+        path_dirs.append(ffmpeg_dir)
+standard_dirs = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+for d in standard_dirs:
+    if d not in path_dirs:
+        path_dirs.append(d)
+sources_path = ":".join(path_dirs)
+
 text = pathlib.Path(template).read_text(encoding="utf-8")
-for key, value in zip(("REPO", "VENV", "DATA", "RUN"), paths):
+for key, value in zip(("REPO", "VENV", "DATA", "RUN", "NODE", "NODE_BIN_DIR", "FFMPEG", "FFPROBE"), paths):
     # Both supervisor's interpolation and systemd's specifiers use percent.
     text = text.replace("@" + key + "@", value.replace("%", "%%"))
+text = text.replace("@SOURCES_PATH@", sources_path.replace("%", "%%"))
+
 if pathlib.Path(template).name == "supervisord-native.conf.in":
     text = text.replace('WEBUI_SUPERVISORCTL="supervisorctl -c ',
                         'WEBUI_SUPERVISORCTL="supervisorctl -c \'')

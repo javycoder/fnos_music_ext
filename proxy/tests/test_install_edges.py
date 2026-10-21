@@ -57,6 +57,58 @@ def link_tools(bindir: Path, tools: tuple[str, ...]) -> None:
             (bindir / tool).symlink_to(real)
 
 
+@pytest.mark.parametrize("failure", ["", "ensure"])
+def test_container_ensure_then_start_stops_at_failed_stage(tmp_path, failure):
+    """执行真实安装函数；镜像保障/启动任一阶段失败都不能继续启动或进入健康检查，
+    原始输出必须保留（ensure_image_current 内部行为见 test_build_fingerprint.py）。"""
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    script = r'''
+set -euo pipefail
+BASE_DIR="/test repo"
+CONTAINER_NAME=fnmusic-sources
+ENABLE_MUSICBOX=0
+ENABLE_MUSICDL=1
+ENABLE_LX=0
+WEBUI_FLAG=false
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_err() { printf '[ERROR] %s\n' "$*" >&2; }
+cleanup_legacy_sources() { :; }
+remove_conflicting_native_unit() { return 0; }
+reclaim_container() { return 0; }
+ensure_image_current() {
+    printf 'ensure-image\n' >> "$CALLS"
+    if [ "$FAILURE" = ensure ]; then
+        printf 'original-ensure-error\n' >&2
+        return 7
+    fi
+}
+env_newer_than_container() { return 1; }
+wait_http() { printf 'wait %s\n' "$*" >> "$CALLS"; }
+run_docker() {
+    [ "$1" = compose ] && [ "$2" = -f ] && [ "$3" = "$BASE_DIR/docker-compose.yml" ] || return 99
+    printf '%s\n' "$*" >> "$CALLS"
+    if [ "$4" = "$FAILURE" ]; then
+        printf 'original-%s-error\n' "$4" >&2
+        return 7
+    fi
+}
+''' + function(install, "install_sources_container") + '\ninstall_sources_container\n'
+    calls = tmp_path / "calls"
+    durable = tmp_path / "persistent-install.log"
+    result = run_bash(script, env={**os.environ, "FAILURE": failure,
+                                  "CALLS": str(calls), "FNMUSIC_DURABLE_LOG": str(durable)})
+    expected = ['ensure-image']
+    if not failure:
+        expected.append('wait http://127.0.0.1:8768/healthz 90 2')
+    assert calls.read_text().splitlines() == expected
+    assert result.returncode == (1 if failure else 0), result.stderr
+    if failure:
+        assert f"original-{failure}-error" in result.stderr
+        assert ("镜像保障失败" if failure == "ensure" else "容器启动失败") in result.stderr
+        assert str(durable) in result.stderr
+        assert "apt/pip" not in result.stderr
+
+
 # ------------------------------------------------------ private shared logs ---
 
 def logs_script(repo: Path) -> str:
@@ -334,7 +386,7 @@ def test_acceptance_401_fast_path_then_empty_search_warns_not_fails(tmp_path):
     assert "err " not in result.stderr
 
 
-def test_acceptance_musicdl_stream_success(tmp_path):
+def test_acceptance_musicdl_search_success(tmp_path):
     result = acceptance_script(
         tmp_path, "ENABLE_MUSICDL=1",
         SEARCH_MDL_JSON=json.dumps({"items": [{"id": "mdl-1"}]}),
@@ -343,15 +395,16 @@ def test_acceptance_musicdl_stream_success(tmp_path):
     assert "验收 6b 通过：音源 musicdl" in result.stdout
 
 
-def test_acceptance_stream_too_small_counts_as_failure(tmp_path):
-    # 206 但字节数 < 10KB：不能算取流成功，最终仍是不阻断告警
+def test_acceptance_search_never_probes_stream_size(tmp_path):
+    # 安装只验搜索；即使媒体不可用，也不自动取流触发下载。
     result = acceptance_script(
         tmp_path, "ENABLE_MUSICDL=1",
         SEARCH_MDL_JSON=json.dumps({"items": [{"id": "mdl-1"}]}),
         STREAM_CODE="206", STREAM_BYTES="100")
     assert result.returncode == 0, result.stderr
-    assert "取流未成功" in result.stdout
-    assert "验收 6b 通过" not in result.stdout
+    assert "验收 6b 通过" in result.stdout
+    log = (tmp_path / "abin" / "curl.log").read_text(encoding="utf-8")
+    assert "/track/stream" not in log
 
 
 def test_acceptance_401_wrong_status_fails(tmp_path):
@@ -374,17 +427,17 @@ def test_acceptance_socket_probe_falls_back_to_gateway(tmp_path):
     assert "验收 6a 通过" in result.stdout
 
 
-def test_acceptance_lx_failure_runs_direct_url_diagnosis(tmp_path):
-    # lx 有搜索候选但取流全失败 → 告警 + 触发洛雪直链诊断，不 return 1
+def test_acceptance_lx_search_does_not_resolve_or_stream(tmp_path):
+    # 搜索可用即完成安装验收，不解析直链或经代理取流。
     result = acceptance_script(
         tmp_path, "ENABLE_MUSICDL=0 ENABLE_LX=1",
         SEARCH_LX_JSON=json.dumps({"items": [{"id": "lx:kg:abc"}]}),
         STREAM_CODE="404", STREAM_BYTES="0")
     assert result.returncode == 0, result.stderr
-    assert "未能成功取流" in result.stdout
+    assert "验收 6b 通过" in result.stdout
     log = (tmp_path / "abin" / "curl.log").read_text(encoding="utf-8")
-    assert "/api/v1/track/url?" in log
-    assert "直链诊断" in result.stdout
+    assert "/api/v1/track/url?" not in log
+    assert "/track/stream" not in log
 
 
 def test_rollback_refuses_when_restore_plan_unverifiable(tmp_path):

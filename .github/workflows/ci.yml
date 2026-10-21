@@ -23,8 +23,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 显式安装 node：lxmusic-service/test_bridge_node.py 依赖 node 跑 js/test_bridge.js，
-      # 只靠 runner 预装一旦变动，桥的 13 个行为测试会静默 skip
+      # WebUI 的 pytest 包装器执行 Node 行为测试；不要再单独执行同一 JS 套件。
+      # 显式安装 node，避免 runner 镜像变化后静默 skip。
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -52,12 +52,10 @@ jobs:
           musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py
           webui-service/app.py
 
-      # 覆盖率仅作摘要展示（不设门槛）；cov 参数只出现在 CI，本地 pytest 无需装 pytest-cov
+      # 服务各用独立解释器，避免 app/conftest/环境变量污染；仅服务之间限2并行。
+      # proxy/socket/部署与打包用例保守串行；覆盖率跨进程合并，仅展示不设门槛。
       - name: Run tests
-        run: >
-          python -m pytest
-          --cov=proxy --cov=lxmusic-service --cov=musicdl-service --cov=musicbox-service --cov=webui-service
-          --cov-report=term
+        run: python scripts/run_tests.py --jobs 2 --coverage
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -134,25 +132,57 @@ jobs:
       - name: Offline dependency and CLI contract
         run: python tests/integration/production_contract.py '${{ matrix.service }}' --app-dir '${{ matrix.service }}-service'
 
-  images:
+  # amd64 镜像只在下方矩阵构建一次，复用它验证 musicdl 与洛雪。
+  # 不再另起 images job 重建相同 Dockerfile/参数及重复跑非 root 契约。
+  # 双架构真实运行验证：amd64 原生构建，arm64 走 QEMU 用户态模拟，构建与冒烟
+  # 都在目标架构里执行——锁定 sha256 的 ARM64 原生模块必须能被 Node 真实加载，
+  # lxserver/lxmusic 正常运行且 healthz 通过，不再只验"构建成功"。
+  images-multiarch:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: x64
+          - platform: linux/arm64
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
-      - name: Build unified fnmusic-sources image
-        run: |
-          docker build --build-arg BASE_IMAGE=python:3.13-slim \
-            --build-arg PIP_INDEX_URL=https://pypi.org/simple \
-            --build-arg APT_MIRROR= \
-            -f container/Dockerfile -t fnmusic-sources:ci .
+      - name: Set up QEMU (arm64 emulation)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Validate compose configuration
+        if: matrix.arch == 'x64'
+        run: docker compose -f docker-compose.yml config --quiet
+      - name: Build fnmusic-sources for ${{ matrix.platform }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: fnmusic-sources:ci
+          build-args: |
+            BASE_IMAGE=python:3.13-slim
+            PIP_INDEX_URL=https://pypi.org/simple
+            APT_MIRROR=
+          cache-from: type=gha,scope=fnmusic-images-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=fnmusic-images-${{ matrix.arch }}
       - name: Verify non-root contract for each bundled service
         run: |
           for svc in musicdl musicbox lxmusic; do
-            docker run --rm --network none --user 1000 --entrypoint python \
+            docker run --rm --platform '${{ matrix.platform }}' --network none --user 1000 --entrypoint python \
               -v "$PWD/tests/integration/production_contract.py:/tmp/production_contract.py:ro" \
               fnmusic-sources:ci /tmp/production_contract.py \
               "$svc" --app-dir "/srv/${svc}-service" --require-non-root
           done
       - name: Verify on-demand musicdl healthz
+        if: matrix.arch == 'x64'
         run: |
           mkdir -p /tmp/fnrepo
           printf '%s\n' 'FNMUSIC_MUSICDL_ENABLED=true' 'FNMUSIC_WEBUI_ENABLED=false' > /tmp/fnrepo/.env
@@ -169,3 +199,32 @@ jobs:
             sleep 1
           done
           test "$ready" = 1
+      - name: Smoke lxmusic chain on ${{ matrix.platform }}
+        run: |
+          mkdir -p /tmp/fnrepo
+          printf '%s\n' 'FNMUSIC_LX_ENABLED=true' 'FNMUSIC_WEBUI_ENABLED=false' > /tmp/fnrepo/.env
+          name="fnmusic-ci-lx-${{ matrix.arch }}"
+          cleanup() { docker logs "$name" 2>&1 | tail -100; docker rm -f "$name"; }
+          trap cleanup EXIT
+          docker run -d --name "$name" --platform '${{ matrix.platform }}' --network none \
+            -v /tmp/fnrepo:/repo fnmusic-sources:ci
+          # 平台原生绑定已随镜像落位（ARM64 包来自锁定 sha256 校验的离线构件）
+          docker exec "$name" sh -c "test -s '/srv/lxserver/node_modules/music-tag-native-linux-${{ matrix.arch }}-gnu/music-tag-native.linux-${{ matrix.arch }}-gnu.node'"
+          # lxserver RUNNING 即证明 Node 真实加载了原生模块（缺失时进程会崩溃进入 FATAL）
+          ready=0
+          for attempt in $(seq 1 120); do
+            if docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf status lxserver 2>/dev/null | grep -q RUNNING \
+              && docker exec "$name" python -c 'import urllib.request,json; d=json.load(urllib.request.urlopen("http://127.0.0.1:8003/healthz", timeout=3)); assert d.get("ok") is True' 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1 || { echo "ERROR: lxmusic 链路未就绪"; exit 1; }
+          lx_pid="$(docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf pid lxserver)"
+          echo "lxserver pid=${lx_pid}; 观察 120s 稳定性..."
+          sleep 120
+          docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf status lxserver | grep -q RUNNING
+          test "$(docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf pid lxserver)" = "$lx_pid"
+          docker exec "$name" python -c 'import urllib.request,json; d=json.load(urllib.request.urlopen("http://127.0.0.1:8003/healthz", timeout=3)); assert d.get("ok") is True'
+          docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf status lxmusic | grep -q RUNNING

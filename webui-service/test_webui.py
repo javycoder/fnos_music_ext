@@ -19,6 +19,10 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load_webui():
+    """加载离线业务测试使用的 WebUI 实例。"""
+    cached = sys.modules.get("webui_service_app")
+    if cached is not None:
+        return cached
     spec = importlib.util.spec_from_file_location("webui_service_app", HERE / "app.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["webui_service_app"] = mod
@@ -42,6 +46,14 @@ FNMUSIC_TEE_SAVE_ENABLED='true'
 FNMUSIC_TEE_CACHE_MAX='2'
 CUSTOM_KEY='keepme'
 """
+
+
+@pytest.fixture(autouse=True)
+def lx_ready_mock(monkeypatch):
+    """业务测试仅 mock 就绪；真实恢复行为由 test_lx_ready.py 覆盖。"""
+    async def ready(*args, **kwargs):
+        return {"ok": True, "status": 200, "stage": "", "error": ""}
+    monkeypatch.setattr(webui, "_lx_ensure_ready", ready)
 
 
 @pytest.fixture
@@ -70,6 +82,7 @@ def svctl(monkeypatch):
     status_output = {
         "musicdl": "musicdl                        STOPPED   Not started",
         "musicbox": "musicbox                       RUNNING   pid 7, uptime 0:01:00",
+        "lxserver": "lxserver                       STOPPED   Not started",
         "lxmusic": "lxmusic                        STOPPED   Not started",
         "webui": "webui                          RUNNING   pid 8, uptime 0:01:00",
     }
@@ -172,21 +185,32 @@ def test_search_timeout_defaults_and_saves(env_file):
         view = client.get("/api/config")
         assert view.status_code == 200
         assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
-        assert view.json()["values"]["FNMUSIC_SEARCH_PROBE"] == "false"
-        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9, "FNMUSIC_SEARCH_PROBE": True}})
+        assert "FNMUSIC_SEARCH_PROBE" not in view.json()["values"]
+        assert "FNMUSIC_SEARCH_PROBE" not in view.json()["schema"]
+        rejected = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_PROBE": True}})
+        assert rejected.status_code == 400
+        assert "不支持的配置键" in rejected.json()["error"]
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})
         assert saved.status_code == 200
         assert "FNMUSIC_SEARCH_TIMEOUT" in saved.json()["changed"]
-        assert "FNMUSIC_SEARCH_PROBE" in saved.json()["changed"]
     text = env_file.read_text(encoding="utf-8")
     assert "FNMUSIC_SEARCH_TIMEOUT='9'" in text
-    assert "FNMUSIC_SEARCH_PROBE='true'" in text
+    assert "FNMUSIC_SEARCH_PROBE" not in text
     with authed_client() as client:
         again = client.get("/api/config")
         assert again.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "9"
-        assert again.json()["values"]["FNMUSIC_SEARCH_PROBE"] == "true"
         clamped = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 99}})
         assert clamped.status_code == 200
     assert "FNMUSIC_SEARCH_TIMEOUT='60'" in env_file.read_text(encoding="utf-8")
+
+
+def test_search_probe_control_removed():
+    """逐曲探活功能下线：界面、脚本与配置 Schema 均不得再暴露入口。"""
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    assert "逐曲探活" not in html
+    assert "#search-probe" not in js
+    assert "FNMUSIC_SEARCH_PROBE" not in js
 
 
 def test_put_int_clamps_and_bool_normalizes(env_file):
@@ -212,6 +236,114 @@ def test_lyric_auto_dl_default_false_and_roundtrip(env_file):
         assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
 
 
+# ------------------------------------------------------------------ 大模型用途与猜你喜欢参数 ---
+
+LLM_FLAGS = ("FNMUSIC_LLM_LIKED_ENABLED", "FNMUSIC_LLM_DAILY_ENABLED")
+
+
+def test_llm_opt_in_defaults_and_schema(env_file):
+    with authed_client() as client:
+        view = client.get("/api/config").json()
+    for key in LLM_FLAGS:
+        assert view["values"][key] == "false"
+        assert view["schema"][key]["kind"] == "bool"
+        assert view["schema"][key]["reload"] == "hot"
+    assert view["values"]["FNMUSIC_LIKED_REFRESH_HOURS"] == "0.5"
+    assert "max" not in view["schema"]["FNMUSIC_LIKED_REFRESH_HOURS"]
+    assert view["values"]["FNMUSIC_LIKED_SIZE"] == "20"
+    assert view["schema"]["FNMUSIC_LIKED_SIZE"]["min"] == 0
+    assert view["schema"]["FNMUSIC_LIKED_SIZE"]["max"] == 100
+
+
+def test_llm_credentials_do_not_opt_in_and_incomplete_opt_in_is_preserved(env_file):
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_BASE_URL": "https://example.test/v1", "FNMUSIC_LLM_API_KEY": "secret",
+        }})
+        assert saved.status_code == 200
+        assert all(client.get("/api/config").json()["values"][key] == "false" for key in LLM_FLAGS)
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_API_KEY": "", "FNMUSIC_LLM_LIKED_ENABLED": True,
+            "FNMUSIC_LLM_DAILY_ENABLED": True, "FNMUSIC_LIKED_SIZE": 0,
+            "FNMUSIC_LIKED_REFRESH_HOURS": 100000.25,
+        }})
+        assert saved.status_code == 200
+        assert saved.json()["actions"] == []
+        saved = client.put("/api/config", json={"values": {key: False for key in LLM_FLAGS}})
+        assert saved.status_code == 200
+        values = client.get("/api/config").json()["values"]
+    assert values["FNMUSIC_LIKED_SIZE"] == "0"
+    assert values["FNMUSIC_LIKED_REFRESH_HOURS"] == "100000.25"
+    assert values["FNMUSIC_RECOMMEND_DAILY"] == "true"
+    assert values["FNMUSIC_LLM_API_KEY"] == ""
+
+
+@pytest.mark.parametrize("size,hours", [(0, 0.5), (100, 0.51), (20, 100000.25)])
+def test_liked_valid_api_roundtrip(env_file, size, hours):
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_LIKED_SIZE": size, "FNMUSIC_LIKED_REFRESH_HOURS": hours,
+            "FNMUSIC_LLM_LIKED_ENABLED": True, "FNMUSIC_LLM_DAILY_ENABLED": False,
+        }})
+        assert response.status_code == 200
+        assert response.json()["actions"] == []
+        values = client.get("/api/config").json()["values"]
+    assert values["FNMUSIC_LIKED_SIZE"] == str(size)
+    assert float(values["FNMUSIC_LIKED_REFRESH_HOURS"]) == hours
+    assert values["FNMUSIC_LLM_LIKED_ENABLED"] == "true"
+    assert values["FNMUSIC_LLM_DAILY_ENABLED"] == "false"
+
+
+@pytest.mark.parametrize("key", LLM_FLAGS)
+@pytest.mark.parametrize("raw,expected", [(True, "true"), (False, "false"), (1, "true"),
+    (0, "false"), ("yes", "true"), ("off", "false"), (" true ", "true")])
+def test_llm_flag_boolean_normalization(key, raw, expected):
+    assert webui._normalize_value(key, raw) == expected
+
+
+@pytest.mark.parametrize("key", LLM_FLAGS)
+@pytest.mark.parametrize("raw", [None, [], {}, 0.5, 1.0, 2, -1, "maybe", "nan"])
+def test_llm_flag_rejects_weird_types(key, raw):
+    with pytest.raises(ValueError):
+        webui._normalize_value(key, raw)
+
+
+@pytest.mark.parametrize("raw,expected", [(0, "0"), (20, "20"), (100, "100"),
+    (20.0, "20"), (" 37 ", "37")])
+def test_liked_size_strict_valid_values(raw, expected):
+    assert webui._normalize_value("FNMUSIC_LIKED_SIZE", raw) == expected
+
+
+@pytest.mark.parametrize("key,raw", [
+    ("FNMUSIC_LIKED_SIZE", raw) for raw in
+    (-1, 101, 1.5, "20.5", "20junk", "", " ", None, True, False, [], {}, "nan", "inf")
+] + [
+    ("FNMUSIC_LIKED_REFRESH_HOURS", raw) for raw in
+    (0, -1, 0.49, "", " ", "0.5junk", None, True, False, [], {}, "nan", "inf", "-inf", "1e9999")
+])
+def test_liked_invalid_api_edit_is_rejected_atomically(env_file, key, raw):
+    before = env_file.read_bytes()
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_LIKED_ENABLED": True, key: raw,
+        }})
+    assert response.status_code == 400
+    assert key in response.json()["error"]
+    assert env_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("key", ["FNMUSIC_LIKED_SIZE", "FNMUSIC_LIKED_REFRESH_HOURS"])
+@pytest.mark.parametrize("raw", [float("nan"), float("inf"), -float("inf")])
+def test_liked_rejects_nonfinite_numbers(key, raw):
+    with pytest.raises(ValueError):
+        webui._normalize_value(key, raw)
+
+
+@pytest.mark.parametrize("raw", [0.5, 0.51, 2, " 2.75 ", 100000.25, 1e100])
+def test_liked_hours_finite_minimum_no_arbitrary_maximum(raw):
+    assert float(webui._normalize_value("FNMUSIC_LIKED_REFRESH_HOURS", raw)) == float(raw)
+
+
 # ------------------------------------------------------------------ 切源动作 ---
 
 def test_provider_switch_stops_old_starts_new(env_file, svctl):
@@ -223,7 +355,7 @@ def test_provider_switch_stops_old_starts_new(env_file, svctl):
         assert r.status_code == 200
         actions = r.json()["actions"]
         assert ("stop", "musicbox") in svctl.calls
-        assert ("start", "lxmusic") in svctl.calls
+        assert ("start", "lxmusic") not in svctl.calls  # 已由就绪步骤负责，不重复启动
         assert all(a["ok"] for a in actions if a["kind"] == "process")
 
 
@@ -467,7 +599,7 @@ def test_lx_multi_source_save_blocked_when_no_active(env_file, svctl, monkeypatc
     assert "LX_SOURCE_LIST" not in env_file.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("failure", ["verify", "verify_http", "verify_timeout", "activate", "activate_timeout", "runtime_failed"])
+@pytest.mark.parametrize("failure", ["verify", "verify_http", "activate", "runtime_failed"])
 @pytest.mark.parametrize("already_active", [False, True])
 def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, monkeypatch, failure, already_active):
     """失效项自动停用；健康项、其它设置和提示都保留，重新加载不恢复失效项。"""
@@ -494,8 +626,6 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         calls.append((req.url.path, body))
         is_bad = url in (bad, "bad.js")
         if req.url.path.endswith("/verify"):
-            if is_bad and failure == "verify_timeout":
-                raise httpx.ReadTimeout("校验超时", request=req)
             if is_bad and failure == "verify_http":
                 return httpx.Response(503, json={"ok": True})
             if is_bad and failure == "verify":
@@ -507,8 +637,6 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
             return httpx.Response(200, json={"ok": True})
         # 已激活项不重复 verify，但实际激活失败仍应取消。
         if is_bad:
-            if failure == "activate_timeout":
-                raise httpx.ReadTimeout("激活超时", request=req)
             if failure == "runtime_failed":
                 enabled[bad] = True
                 return httpx.Response(200, json={"ok": True, "source_id": "bad.js", "data": {
@@ -830,10 +958,40 @@ def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
         assert rj["version"] == "2.0.0"
         assert rj["current_provider"] == "musicbox"
         assert rj["processes"]["musicbox"]["state"] == "RUNNING"
+        # lxserver 与 lxmusic 并列出现在进程概览，便于定位洛雪链路哪一环故障
+        assert rj["processes"]["lxserver"]["state"] == "STOPPED"
         assert rj["processes"]["lxmusic"]["state"] == "STOPPED"
+        assert set(rj["processes"]) == {"musicdl", "musicbox", "lxserver", "lxmusic", "webui"}
         assert rj["services"]["musicbox"]["reachable"] is True
         assert rj["services"]["lxmusic"]["note"]  # 未启用提示
         assert rj["lx_source"] is None
+
+
+def test_status_lxmusic_unreachable_exposes_health_detail(env_file, svctl, monkeypatch):
+    """当前音源为洛雪且 lxserver 挂掉：/api/status 透出 healthz 的失败原因。"""
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+        .replace("FNMUSIC_LX_ENABLED='false'", "FNMUSIC_LX_ENABLED='true'"),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    svctl.status_output["lxserver"] = "lxserver                       FATAL     Exited too quickly"
+    svctl.status_output["lxmusic"] = "lxmusic                        RUNNING   pid 9, uptime 0:01:00"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"initialized": False}})
+        return httpx.Response(503, json={"ok": False, "error": "lxserver unreachable"})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        r = client.get("/api/status")
+        assert r.status_code == 200
+        rj = r.json()
+        assert rj["current_provider"] == "lxmusic"
+        assert rj["processes"]["lxserver"]["state"] == "FATAL"
+        assert rj["services"]["lxmusic"]["reachable"] is False
+        assert rj["services"]["lxmusic"]["detail"] == "lxserver unreachable"
 
 
 def test_platforms_from_musicdl(env_file, monkeypatch):
@@ -885,6 +1043,34 @@ def test_public_playlist_proxy_routes_and_strips_provider(env_file, monkeypatch)
         assert captured == {}
     key = next(iter(webui._public_discovery_cache))
     assert key == ("musicbox", "", (("channel", "charts"),))
+
+
+def test_public_playlist_proxy_forwards_keyword_and_caches_by_keyword(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    calls: list[dict] = []
+    payload = {"ok": True, "items": [], "raw_count": 20, "total": 99999, "has_more": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(dict(request.url.params))
+        return httpx.Response(200, json=payload)
+
+    _mock_http(handler)
+    with authed_client() as client:
+        first = client.get("/api/public-playlists", params={
+            "provider": "musicbox", "channel": "search", "keyword": "华语", "page": "1",
+        })
+        other = client.get("/api/public-playlists", params={
+            "provider": "musicbox", "channel": "search", "keyword": "周杰伦", "page": "1",
+        })
+        again = client.get("/api/public-playlists", params={
+            "provider": "musicbox", "channel": "search", "keyword": "华语", "page": "1",
+        })
+    assert all(r.status_code == 200 and r.json() == payload for r in (first, other, again))
+    # 关键词进入上游参数与缓存键：不同关键词分别请求，相同关键词命中缓存
+    assert calls == [
+        {"channel": "search", "keyword": "华语", "page": "1"},
+        {"channel": "search", "keyword": "周杰伦", "page": "1"},
+    ]
 
 # musicbox CLI（auth ... --json）的真实输出契约：{ok, data:{...}} 信封结构。
 # 前端 static/app.js pollQr/checkQrStatus 与 netease_login.sh 均按此解析（code 在 data 里），
@@ -1468,6 +1654,38 @@ def test_fs_check_endpoint_placeholder(env_file):
         assert denied.status_code == 403
 
 
+@pytest.mark.parametrize("method,path,payload", [
+    ("POST", "/api/maintenance/cleanup", {"confirm_beta": True}),
+    ("POST", "/api/maintenance/cleanup", {}),
+    ("GET", "/api/maintenance/cleanup/job-1", None),
+])
+def test_cleanup_endpoint_placeholder(env_file, method, path, payload):
+    """直连始终 501（不执行清理）；两个端点仍需管理员，兼容桌面路径前缀。"""
+    before = env_file.read_bytes()
+    for prefix in ("", "/app/fnmusic-ext"):
+        with authed_client() as client:
+            response = client.request(method, prefix + path, json=payload)
+            assert response.status_code == 501
+            assert response.json()["detail"] == "直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台"
+        with TestClient(webui.app) as client:
+            denied = client.request(method, prefix + path, json=payload)
+            assert denied.status_code == 403
+    assert env_file.read_bytes() == before
+
+
+def test_cleanup_beta_markup():
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    tee = html.split('id="page-tee"', 1)[1].split("</section>", 1)[0]
+    assert 'id="cleanup-open-btn"' in tee
+    assert "清理垃圾文件" in tee and "Beta" in tee
+    assert "下载完整即保存" in tee
+    assert "不必听完整首" in tee
+    assert "完整试听在线歌后" not in html
+    assert 'id="cleanup-modal" hidden' in html
+    assert 'aria-describedby="cleanup-warning"' in html
+    assert "此功能为 Beta，可能误删歌曲、封面、歌词等文件，删除后无法自动恢复。是否确认执行？" in html
+
+
 # ------------------------------------------------------------------ 网关管理员 ---
 
 def test_api_requires_admin(env_file):
@@ -1487,24 +1705,12 @@ def test_api_requires_admin(env_file):
 
 
 def test_preview_endpoint_cleans_up_on_partial_start_failure(env_file, monkeypatch):
-    """多进程音源（如 lxmusic 的 lxserver + lxmusic）如果后一进程启动失败，应回滚停止已启动的前置进程。"""
-    calls: list[tuple[str, str]] = []
-
-    def fake_supervisorctl(cmd, prog, timeout=20.0):
-        calls.append((cmd, prog))
-        if cmd == "start" and prog == "lxmusic":
-            return 1, "failed to start lxmusic"
-        return 0, "ok"
-
-    monkeypatch.setattr(webui, "supervisorctl", fake_supervisorctl)
+    """其它单进程源启动失败不登记预览；洛雪依赖回滚见 test_lx_ready。"""
+    monkeypatch.setattr(webui, "supervisorctl", lambda *a, **k: (1, "failed to start"))
     with authed_client() as client:
-        r = client.post("/api/preview", json={"provider": "lxmusic"})
+        r = client.post("/api/preview", json={"provider": "musicdl"})
         assert r.status_code == 500
-        assert "lxmusic" not in webui._preview_until
-    # 验证 lxserver 被拉起后又被停止回滚
-    assert ("start", "lxserver") in calls
-    assert ("start", "lxmusic") in calls
-    assert ("stop", "lxserver") in calls
+        assert "musicdl" not in webui._preview_until
 
 
 def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):

@@ -161,11 +161,12 @@ async def test_fetch_lx_search_mapping():
 
 
 @pytest.mark.anyio
-async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
-    """verified 条目（服务端已探活实证）绕过收费元数据拦截（逐曲探活开启时）。"""
-    monkeypatch.setitem(CONF, "search_probe", True)
+async def test_fetch_lx_search_ignores_probe_and_allows_unverified_vip():
+    """搜索不再预探活；第三方 VIP 候选直接展示，播放时再按需解析。"""
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(
             200,
             json={
@@ -194,7 +195,7 @@ async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
                         "ext": "mp3",
                         "cover_url": "",
                         "file_size": 0,
-                        "fee": 1,  # VIP 且未 verified → 仍被拦截
+                            "fee": 1,  # VIP 元数据保留，候选仍直接展示
                     },
                 ],
                 "errors": {},
@@ -203,45 +204,9 @@ async def test_fetch_lx_search_verified_vip_passes(monkeypatch):
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
     items = await fetch_lx_search(client, "晴天", 20)
-    assert [it["id"] for it in items] == ["lx:kw:228908"]
-    assert items[0]["verified"] is True  # 字段透传
-    await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_fetch_lx_search_probe_disabled_allows_unverified_vip(monkeypatch):
-    """逐曲探活未开启时，lx 候选曲目跳过收费拦截直出（由客户端播放时按需解析）。"""
-    monkeypatch.setitem(CONF, "search_probe", False)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "ok": True,
-                "items": [
-                    {
-                        "id": "lx:kw:228908",
-                        "lx_source": "kw",
-                        "title": "晴天",
-                        "artist": "周杰伦",
-                        "album": "叶惠美",
-                        "duration_s": 269.0,
-                        "ext": "flac",
-                        "cover_url": "",
-                        "file_size": 38210000,
-                        "pay_type": 1,
-                        "verified": False,
-                    },
-                ],
-                "errors": {},
-            },
-        )
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
-    items = await fetch_lx_search(client, "晴天", 20)
-    assert len(items) == 1
-    assert items[0]["id"] == "lx:kw:228908"
-    assert items[0]["verified"] is False
+    assert requests[0].url.params.get("probe") is None
+    assert [it["id"] for it in items] == ["lx:kw:228908", "lx:wy:999999"]
+    assert [it["verified"] for it in items] == [True, False]
     await client.aclose()
 
 
@@ -355,6 +320,31 @@ async def test_resolve_lx_url_pin_consistent_within_ttl():
     # 钉链返回副本：调用方改动不得污染钉链
     second["url"] = "mutated"
     assert (await resolve_lx_url(client, "lx:kg:PINTEST1"))["url"] == "http://audio.test/v1.flac"
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_max_quality_bypasses_lossless_pin_and_downgrades():
+    """max_quality=high 时旁路无损钉链，且请求 quality=high。"""
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params.get("quality")
+        hits.append(q)
+        if q == "lossless":
+            return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": "http://audio.test/lossless.flac", "ext": "flac", "actual_tier": "lossless"}})
+        return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": "http://audio.test/320.mp3", "ext": "mp3", "actual_tier": "high"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
+    first = await resolve_lx_url(client, "lx:kg:PINTEST_DOWN")
+    assert first and first["ext"] == "flac"
+    assert hits == ["lossless"]
+
+    # 再次解析但指定 max_quality="high"：必须旁路无损钉链，重新请求 high
+    downgraded = await resolve_lx_url(client, "lx:kg:PINTEST_DOWN", max_quality="high")
+    assert downgraded and downgraded["ext"] == "mp3"
+    assert downgraded["url"] == "http://audio.test/320.mp3"
+    assert hits == ["lossless", "high"]
     await client.aclose()
 
 
@@ -917,3 +907,140 @@ def test_register_online_meta_capacity_eviction(monkeypatch):
     assert _ONLINE_META["online:lx:kw:2"]["title"] == "t2-new"
     assert "online:lx:kw:1" not in _ONLINE_META  # 2 移到末尾后 1 成为最旧被淘汰
     _ONLINE_META.clear()
+
+
+@pytest.mark.asyncio
+async def test_mobile_cancelled_resolve_rejoins_same_cold_lx_task(monkeypatch):
+    import asyncio
+    import proxy.app as pa
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def slow(*args, **kwargs):
+        calls.append(kwargs)
+        started.set()
+        await release.wait()
+        return {"url": "http://audio.test/pinned.mp3", "ext": "mp3"}
+    monkeypatch.setattr(pa, "resolve_lx_url", slow)
+    first = asyncio.create_task(pa.resolve_lx_url_shared(None, "lx:kw:75"))
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second = asyncio.create_task(pa.resolve_lx_url_shared(None, "lx:kw:75"))
+    await asyncio.sleep(0)
+    release.set()
+    result = await second
+    assert result["url"].endswith("pinned.mp3")
+    assert len(calls) == 1
+    await asyncio.sleep(0)
+    assert not pa._LX_URL_INFLIGHT
+
+
+@pytest.mark.asyncio
+async def test_shared_lx_scopes_quality_fresh_and_bounds_work(monkeypatch):
+    import asyncio
+    import proxy.app as pa
+    release = asyncio.Event()
+    calls = []
+    async def slow(*args, **kwargs):
+        calls.append(kwargs)
+        await release.wait()
+        return {"url": "http://audio.test/a.mp3"}
+    monkeypatch.setattr(pa, "resolve_lx_url", slow)
+    tasks = [asyncio.create_task(pa.resolve_lx_url_shared(None, "lx:kw:75", **scope))
+             for scope in ({}, {"max_quality": "high"}, {"fresh": True})]
+    tasks += [asyncio.create_task(pa.resolve_lx_url_shared(None, f"lx:kw:{n}"))
+              for n in range(20)]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert len(pa._LX_URL_INFLIGHT) == 16
+    release.set()
+    results = await asyncio.gather(*tasks)
+    assert len(calls) == 16
+    assert all(result for result in results[:3])
+    assert sum(result is None for result in results) == 7
+
+
+@pytest.mark.asyncio
+async def test_lx_source_change_cannot_publish_old_resolution_or_pin(monkeypatch):
+    import asyncio
+    import proxy.app as pa
+    started, release = asyncio.Event(), asyncio.Event()
+    async def handler(request):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            # A backend can finish while cancellation is already in flight.
+            pass
+        return httpx.Response(200, json={"ok": True, "data": {
+            "url": "http://audio.test/old.mp3", "ext": "mp3"}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lx.test") as client:
+        old = asyncio.create_task(pa.resolve_lx_url_shared(client, "lx:kw:75"))
+        await started.wait()
+        monkeypatch.setitem(CONF, "lx_source_url", "https://source.test/new.js")
+        pa._sync_lx_config_epoch()
+        release.set()
+        await asyncio.gather(old, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert "lx:kw:75" not in pa._LX_URL_PIN
+        assert not pa._LX_URL_INFLIGHT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,expected_fresh", [(TimeoutError, False), (httpx.ConnectError, True)])
+async def test_lx_stream_retry_only_refreshes_confirmed_link_failure(monkeypatch, failure, expected_fresh):
+    import proxy.app as pa
+    monkeypatch.setattr(pa, "resolve_local_play", _no_local)
+    monkeypatch.setattr(pa, "find_cache_file", lambda *a, **k: None)
+    monkeypatch.setattr(pa, "_retained_track", lambda *a: (None, None))
+    flags = []
+    async def open_stream(request, guid, range_header, **kwargs):
+        flags.append(kwargs["fresh_url"])
+        raise failure("simulated")
+    monkeypatch.setattr(pa, "_open_online_stream", open_stream)
+    request = pa.Request({"type": "http", "method": "GET", "path": "/music/api/v1/track/stream",
+                          "query_string": b"guid=online:lx:kw:75", "headers": [], "app": app})
+    await pa.stream_track(request)
+    assert flags == [False, expected_fresh]
+
+
+async def _no_local(*args, **kwargs):
+    return None
+
+
+def test_lx_config_epoch_can_be_invalidated_without_running_loop(monkeypatch):
+    import proxy.app as pa
+    pa._sync_lx_config_epoch()
+    pa._LX_URL_PIN["lx:kw:75"] = ({"url": "old"}, 999999999999)
+    monkeypatch.setitem(CONF, "lx_source_url", "https://source.test/changed.js")
+    pa._sync_lx_config_epoch()
+    assert not pa._LX_URL_PIN
+
+
+@pytest.mark.asyncio
+async def test_lx_prefetch_is_bounded_shared_and_shutdown_drained(monkeypatch):
+    import asyncio
+    import proxy.app as pa
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def slow(*args, **kwargs):
+        calls.append(args[1])
+        started.set()
+        await release.wait()
+        return {"url": "http://audio.test/a.mp3"}
+    monkeypatch.setattr(pa, "resolve_lx_url", slow)
+    monkeypatch.setattr(pa, "find_cache_file", lambda *a, **k: None)
+    monkeypatch.setattr(pa, "_online_meta_for_request", lambda *a: None)
+    monkeypatch.setattr(pa, "get_lx_client", lambda *a: None)
+    request = pa.Request({"type": "http", "headers": [], "app": app})
+    for n in range(10):
+        pa._prefetch_lx(request, f"online:lx:kw:{n}")
+    assert len(pa._LX_URL_PREFETCH) == 2
+    await started.wait()
+    joined = asyncio.create_task(pa.resolve_lx_url_shared(None, "lx:kw:0"))
+    await asyncio.sleep(0)
+    drained = pa._cancel_lx_resolutions()
+    await asyncio.gather(*drained, joined, return_exceptions=True)
+    assert calls.count("lx:kw:0") == 1
+    assert not pa._LX_URL_INFLIGHT and not pa._LX_URL_PREFETCH

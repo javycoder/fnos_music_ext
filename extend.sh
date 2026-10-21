@@ -173,7 +173,14 @@ run_docker() {
     if docker info >/dev/null 2>&1; then
         docker "$@"
     elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
-        sudo docker "$@"
+        local key
+        local -a build_env=()
+        for key in FNMUSIC_BUILD_FINGERPRINT FNMUSIC_BASE_IMAGE FNMUSIC_PIP_INDEX FNMUSIC_APT_MIRROR; do
+            if [[ -v "${key}" ]]; then
+                build_env+=("${key}=${!key}")
+            fi
+        done
+        sudo env "${build_env[@]}" docker "$@"
     else
         return 1
     fi
@@ -286,8 +293,11 @@ verify_acceptance() {
     fi
     log_info "验收 6a 通过：未登录拒绝正确透传，耗时 ${time_total}s (< 3s)。"
 
-    # 6b. 在线音频取流与全链路测试 (Range: bytes=0-1048575 -> 200/206)
-    log_info "验收 6b: 验证在线播放全链路取流 (Range 200/206 及数据流传输)..."
+    # 6b. 音源搜索连通性检查（issue #62）。
+    # 不再经代理播放接口自动取流验收：取流会触发边听边存，让《晴天》等探针
+    # 歌曲在用户未播放、未收藏的情况下被自动下载进曲库。实际播放由用户在
+    # 客户端手动触发，这里只确认音源搜索链路可用。
+    log_info "验收 6b: 验证音源搜索连通性（在线取流不自动验收，由用户手动试播）..."
 
     local probe_keywords=("晴天" "海阔天空" "稻香")
     local search_any_result=0
@@ -344,64 +354,19 @@ except Exception:
         fi
     }
 
-    # 对指定 guid 尝试全链路取流，成功返回 0
-    try_probe_stream() {
-        local probe_id="$1"
-        local stream_guid="online:${probe_id}"
-        local stream_sock="http://localhost/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_https="https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_http="http://127.0.0.1:${GW_HTTP_PORT}/music/api/v1/track/stream?guid=${stream_guid}"
-        local stream_443="https://127.0.0.1/music/api/v1/track/stream?guid=${stream_guid}"
-        local out_file http_code recv_size=0
-        out_file="$(mktemp)"
-        log_info "试播 guid=${stream_guid}"
-        http_code="$(curl -s -o "${out_file}" -w "%{http_code}" --unix-socket "${TARGET_SOCK}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_sock}" 2>/dev/null || echo "000")"
-        if [ "${http_code}" = "000" ]; then
-            log_warn "socket 取流异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT}) 取流..."
-            http_code="$(curl -sk -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_https}" 2>/dev/null || echo "000")"
-        fi
-        if [ "${http_code}" = "000" ]; then
-            log_warn "网关 https 端口取流异常，尝试 fallback 访问网关 http 端口 (${GW_HTTP_PORT}) 取流..."
-            http_code="$(curl -s -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_http}" 2>/dev/null || echo "000")"
-        fi
-        if [ "${http_code}" = "000" ]; then
-            log_warn "网关 http 端口取流异常，尝试 fallback 访问 443 端口取流..."
-            http_code="$(curl -skL -o "${out_file}" -w "%{http_code}" -H "Range: bytes=0-1048575" --max-time 90 "${stream_443}" 2>/dev/null || echo "000")"
-        fi
-        if [ -f "${out_file}" ]; then
-            recv_size="$(wc -c < "${out_file}" | tr -d ' ')"
-            rm -f "${out_file}"
-        fi
-        if { [ "${http_code}" = "206" ] || [ "${http_code}" = "200" ]; } && [ "${recv_size}" -gt 10000 ]; then
-            if [ "${recv_size}" -lt 500000 ]; then
-                log_warn "在线音频流接收大小为 ${recv_size} 字节 (偏小但已收到有效数据)。"
-            else
-                log_info "在线音频流接收大小为 ${recv_size} 字节 (≈1MB)。"
-            fi
-            return 0
-        fi
-        log_warn "取流未成功: guid=${stream_guid} HTTP=${http_code} recv=${recv_size}B"
-        return 1
-    }
-
     local sources=()
     [ "${ENABLE_MUSICDL}" -eq 1 ] && sources+=("musicdl")
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
     [ "${ENABLE_LX}" -eq 1 ] && sources+=("lxmusic")
 
-    local src kw id first_failed_lx_id=""
+    local src kw id
     for src in "${sources[@]}"; do
         for kw in "${probe_keywords[@]}"; do
             while IFS= read -r id; do
                 [ -z "${id}" ] && continue
                 search_any_result=1
-                if [ "${src}" = "lxmusic" ] && [ -z "${first_failed_lx_id}" ]; then
-                    first_failed_lx_id="${id}"
-                fi
-                if try_probe_stream "${id}"; then
-                    log_info "验收 6b 通过：音源 ${src} 在线播放流取流成功。"
-                    return 0
-                fi
+                log_info "验收 6b 通过：音源 ${src} 搜索链路可用 (关键词「${kw}」返回结果)。"
+                return 0
             done < <(search_probe_ids "${src}" "${kw}")
         done
     done
@@ -409,17 +374,8 @@ except Exception:
     # 外部音源网络波动不阻断部署：仅输出警告，绝不触发 return 1 / rollback
     if [ "${search_any_result}" -eq 0 ]; then
         log_warn "所有已启用音源 (${sources[*]}) 搜索结果均为空：可能是外部网络异常或第三方平台限流。"
-    else
-        log_warn "所有候选歌曲均未能成功取流 (外部音源网络波动，不阻断部署)。"
-        if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${first_failed_lx_id}" ]; then
-            local lx_diag
-            lx_diag="$(curl -s --max-time 5 "${LX_URL}/api/v1/track/url?id=${first_failed_lx_id}&quality=standard" 2>/dev/null || echo "")"
-            if [ -n "${lx_diag}" ]; then
-                log_warn "洛雪音源直链诊断返回数据（正文已隐藏）。"
-            fi
-        fi
     fi
-    log_warn "跳过在线播放自动验收，建议稍后在飞牛音乐 Web 端手动搜索试播验证。"
+    log_warn "在线播放取流不做自动验收（避免自动触发边听边存下载），请稍后在飞牛音乐 Web 端手动搜索试播验证。"
     return 0
 }
 
@@ -428,16 +384,10 @@ except Exception:
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 1/5: 环境预检... (fnmusic-ext v${FNMUSIC_VERSION})"
 
-# 1.1 检查 Python 3 与 venv 模块
-if ! command -v python3 >/dev/null 2>&1; then
-    log_err "【缺少基础依赖】系统未检测到 python3。"
-    log_err "请先执行以下命令安装基础组件：sudo apt-get update && sudo apt-get install -y python3 python3-venv"
-    exit 1
-fi
-
-if ! python3 -c "import venv" >/dev/null 2>&1; then
-    log_err "【缺少基础依赖】系统 Python 缺少 venv 模块。"
-    log_err "请先执行以下命令安装基础组件：sudo apt-get update && sudo apt-get install -y python3-venv"
+# 1.1 与安装脚本共用运行时探测，不要求系统 Python 额外提供 venv。
+if ! choose_python_bin; then
+    log_err "【缺少基础依赖】未找到合格的 Python 3.11+（需包含 venv/ensurepip/ssl/sqlite3）。"
+    log_err "请在飞牛应用中心安装 python312，或设置 FNMUSIC_PYTHON_BIN 指向合格解释器。"
     exit 1
 fi
 
@@ -541,24 +491,16 @@ if [ "${DEPLOY_MODE}" = "native" ]; then
     ensure_native_sources
 else
 
-# 构建并确保容器与当前代码同步。compose up -d --build 幂等：镜像与配置均未变时
-# 不动运行中的容器（仅秒级缓存校验）；镜像有变（git pull 升级后）则自动换新容器。
-ensure_image_current() {
-    # 基础镜像源保障（国内镜像优先/官方兜底，见 ensure_base_image.sh），整次运行只执行一次
-    if [ "${BASE_IMAGE_ENSURED:-0}" -ne 1 ]; then
-        if bash "${BASE_DIR}/ensure_base_image.sh"; then
-            BASE_IMAGE_ENSURED=1
-        else
-            log_err "基础镜像源探测失败，无法构建容器。"
-            exit 1
-        fi
+# 镜像与容器保障：ensure_image_current 已移入 proxy/install_common.sh 并按构建
+# 指纹复用（issue #70）——构建输入未变时直接复用本地应用镜像，不探测/拉取基础
+# 镜像；代码或构建参数变化（git pull 升级后）、镜像缺失时才探测基础镜像并重建。
+ensure_sources_container() {
+    if [ "${ADOPT:-0}" -eq 1 ]; then
+        reclaim_container "${CONTAINER_NAME}" --adopt || exit 1
+    else
+        reclaim_container "${CONTAINER_NAME}" || exit 1
     fi
-    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默）
-    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
-        log_err "构建/启动 ${CONTAINER_NAME} 失败。"
-        exit 1
-    fi
+    ensure_image_current || exit 1
 }
 
 # .env 比容器新时需重启让 entrypoint 重读开关：env_newer_than_container 已移入
@@ -567,32 +509,25 @@ ensure_image_current() {
 if [ "${need_start}" -eq 0 ]; then
     # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
     if run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-        if [ "${ADOPT:-0}" -eq 1 ]; then
-            reclaim_container "${CONTAINER_NAME}" --adopt || exit 1
-        else
-            reclaim_container "${CONTAINER_NAME}" || exit 1
-        fi
         log_info "音源容器 ${CONTAINER_NAME} 已就绪（按需加载：仅所选音源进程驻留内存）。"
-        # 升级同步：服务健康也要重建镜像，否则 git pull 后新代码永远不生效
+        # 升级同步：服务健康也要对齐镜像，否则 git pull 后新代码永远不生效
         img_before="$(run_docker inspect -f '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
-        ensure_image_current
+        ensure_sources_container
         img_after="$(run_docker inspect -f '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
         if [ "${img_before}" = "${img_after}" ] && env_newer_than_container; then
             log_info "检测到 .env 更新，重启容器使音源开关生效..."
             run_docker restart "${CONTAINER_NAME}" || exit 1
         fi
     else
+        # 健康端口在响应但容器不在（疑似 v1.x 宿主机服务残留）：同样进入容器保障
+        # 流程，按当前应用镜像把容器拉起来；端口被占等异常由 compose 原样报错。
         log_warn "音源 healthz 已就绪，但未发现 ${CONTAINER_NAME} 容器（疑似 v1.x 宿主机服务残留）。"
-        log_warn "建议重新运行 ./install.sh 完成 v2.0.0 单容器迁移。"
+        log_info "按当前应用镜像重建 ${CONTAINER_NAME} 容器..."
+        ensure_sources_container
     fi
 else
     log_info "音源服务未全部就绪，拉起单容器 ${CONTAINER_NAME}..."
-    if [ "${ADOPT:-0}" -eq 1 ]; then
-        reclaim_container "${CONTAINER_NAME}" --adopt || exit 1
-    else
-        reclaim_container "${CONTAINER_NAME}" || exit 1
-    fi
-    ensure_image_current
+    ensure_sources_container
     # compose 对配置未变的运行中容器不会重启：手动 restart 让 entrypoint 按最新 .env 重选进程集
     run_docker restart "${CONTAINER_NAME}" || exit 1
 fi
@@ -657,11 +592,9 @@ else:
     esac
 fi
 
-# 1.5 检查 Python 虚拟环境与依赖（缺失时经多源回退安装，见 ensure_proxy_deps.sh）
-if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
-    log_info "创建 .venv-proxy 虚拟环境..."
-    PIP_INDEX="${PIP_INDEX:-}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
-fi
+# 1.5 检查 Python 虚拟环境与依赖（依赖未变化且校验通过时秒级跳过，见 ensure_proxy_deps.sh）
+log_info "检查 .venv-proxy 虚拟环境与依赖状态..."
+PIP_INDEX="${PIP_INDEX:-}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
 
 # 1.6 编译与语法检查
 takeover preflight --base "${BASE_DIR}"
