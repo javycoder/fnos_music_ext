@@ -324,3 +324,63 @@ def test_release_cleanup_no_previous_release(tmp_path):
     assert result.returncode == 0, result.stderr
     assert _deletions(calls) == []
     assert _published(calls)[0][:3] == ['release', 'create', 'v2.10.0b']
+
+
+# === Gitee 发行版发布：大文件上传不得整段重发 ===
+
+GITEE_STEP = 'Publish release to Gitee'
+
+
+def _gitee_step_script():
+    """取出 Gitee 步骤的 run 脚本（含函数定义），供 bash 语法与内容断言。"""
+    workflow = RELEASE_WORKFLOW.read_text()
+    block = workflow.split(f'      - name: {GITEE_STEP}\n', 1)[1]
+    block = block.split('\n      - name:', 1)[0]
+    return block.split('        run: |\n', 1)[1]
+
+
+def _unindent_run(script):
+    return '\n'.join(line[10:] if line.startswith(' ' * 10) else line
+                     for line in script.splitlines())
+
+
+def _upload_function_body(script):
+    """upload_attach 的函数体（到独占一行的右花括号为止）。"""
+    return script.split('upload_attach() {', 1)[1].split('\n}\n', 1)[0]
+
+
+def test_gitee_step_script_is_valid_bash():
+    script = _unindent_run(_gitee_step_script())
+    path = Path('/tmp/gitee-step.sh')
+    path.write_text(script)
+    subprocess.run(['bash', '-n', str(path)], check=True)
+
+
+def test_gitee_large_upload_never_uses_body_replaying_retry():
+    """v2.10.0 事故根因：gcurl --retry 会把 28MB 请求体整段重发。
+
+    curl 的 --retry 在 --max-time 600 下最坏 6×600s 才以 exit 28 失败，
+    实测单个附件烧掉 65 分钟。上传必须走独立函数，且不得复用带 --retry 的封装。
+    """
+    script = _unindent_run(_gitee_step_script())
+    assert 'upload_attach()' in script
+    upload_body = _upload_function_body(script)
+    assert 'gcurl' not in upload_body, '附件上传不得复用带 --retry 的 gcurl'
+    assert '--retry' not in upload_body
+    # 每次尝试自身仍要有明确上界
+    assert '--max-time' in upload_body
+    # 上传调用点必须走 upload_attach，而不是直接 curl -F
+    assert 'upload_attach "${f}"' in script
+    assert 'attach_files"' in script
+
+
+def test_gitee_step_has_bounded_wall_clock_and_idempotent_recovery():
+    """重试必须能识别"服务端已落盘但响应丢失"，避免重复传输大文件。"""
+    script = _unindent_run(_gitee_step_script())
+    assert 'timeout-minutes:' in RELEASE_WORKFLOW.read_text()
+    upload_body = _upload_function_body(script)
+    # 失败后先查附件列表再决定是否重试（幂等复用）
+    assert 'attach_files?access_token=' in upload_body
+    assert '复用现有附件' in upload_body
+    # 尝试次数有上界
+    assert 'for attempt in 1 2 3' in upload_body

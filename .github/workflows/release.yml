@@ -169,6 +169,9 @@ jobs:
       # API 调用必须带重试。
       - name: Publish release to Gitee
         if: env.GITEE_TOKEN != ''
+        # 整体上界：tag 轮询 ≤10min + 查询/创建 + 附件 3×(300s+60s) + PATCH。
+        # 没有它时单个请求的重试会把 job 拖到一小时以上。
+        timeout-minutes: 30
         env:
           GITEE_REPO: javycoder/fnos_music_ext
         run: |
@@ -185,7 +188,10 @@ jobs:
           api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
 
           gcurl() {
-            curl -sS --connect-timeout 15 --retry 5 --retry-all-errors --retry-delay 4 "$@"
+            # 仅用于小请求（查询/创建/PATCH）。大文件上传走 upload_attach，
+            # 因为 --retry 会整段重发请求体。
+            curl -sS --connect-timeout 15 --max-time 120 \
+              --retry 3 --retry-all-errors --retry-delay 4 "$@"
           }
 
           # 镜像同步有延迟，轮询等 tag 出现在 Gitee（公开仓库 ls-remote 无需认证）
@@ -242,21 +248,49 @@ jobs:
           fi
 
           # 上传 fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
-          # 保留数组/对象兼容解析以防变动）；fpk 体积大，放宽单次上传时限
+          # 保留数组/对象兼容解析以防变动）。
+          #
+          # 大文件上传不能用 gcurl 的 --retry：那会把 28MB 请求体整段重发，叠加
+          # --max-time 600 时最坏 6×600s 才以 curl exit 28 失败（v2.10.0 实测
+          # 单个文件烧掉 65 分钟）。这里改为小步重试：每次尝试独立限时，失败后
+          # 先查附件是否已落盘（Gitee 可能已接收但响应超时），已存在则直接复用，
+          # 避免重复上传；只有确实缺失才重试，总尝试次数与总耗时都有上界。
+          upload_attach() {
+            local file="$1" name attempt http url
+            name="$(basename "${file}")"
+            for attempt in 1 2 3; do
+              http="$(curl -sS --connect-timeout 15 --max-time 300 \
+                -o /tmp/gitee-att-one.json -w '%{http_code}' \
+                "${api}/releases/${release_id}/attach_files" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${file}")" || http="000"
+              if [ "${http}" = 200 ] || [ "${http}" = 201 ]; then
+                url="$(jq -r 'if type == "array" then .[0].url else (.url // .browser_download_url) end' /tmp/gitee-att-one.json 2>/dev/null || true)"
+                if [ -n "${url}" ] && [ "${url}" != "null" ]; then
+                  printf '%s' "${url}"
+                  return 0
+                fi
+              fi
+              echo "[gitee] 第 ${attempt} 次上传 ${name} 未完成（HTTP ${http}）" >&2
+              # 响应丢失但附件其实已落盘时，直接复用，绝不重传大文件
+              url="$(curl -sS --connect-timeout 15 --max-time 60 \
+                "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}" \
+                | jq -r --arg n "${name}" '.[]? | select(.name == $n) | .url' 2>/dev/null | head -n1 || true)"
+              if [ -n "${url}" ] && [ "${url}" != "null" ]; then
+                echo "[gitee] ${name} 已在服务端，复用现有附件" >&2
+                printf '%s' "${url}"
+                return 0
+              fi
+              [ "${attempt}" -lt 3 ] && sleep $((attempt * 10))
+            done
+            return 1
+          }
+
           attach_links=""
           for f in "${fpk_file}" "${fpk_file}.sha256"; do
-            att_http="$(gcurl --max-time 600 -o /tmp/gitee-att-one.json -w '%{http_code}' \
-              "${api}/releases/${release_id}/attach_files" \
-              -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${f}")"
-            if [ "${att_http}" != 201 ] && [ "${att_http}" != 200 ]; then
-              echo "ERROR: 上传附件 ${f} 失败 HTTP ${att_http}" >&2
+            if ! url="$(upload_attach "${f}")"; then
+              echo "ERROR: 上传附件 $(basename "${f}") 失败（已重试 3 次）" >&2
               cat /tmp/gitee-att-one.json >&2 || true
-              exit 1
-            fi
-            url="$(jq -r 'if type == "array" then .[0].url else (.url // .browser_download_url) end' /tmp/gitee-att-one.json)"
-            if [ -z "${url}" ] || [ "${url}" = "null" ]; then
-              echo "ERROR: Gitee 附件上传后未解析到下载 URL（响应形态可能变了）" >&2
               exit 1
             fi
             attach_links="${attach_links}- [$(basename "${f}")](${url})"$'\n'
