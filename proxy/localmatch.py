@@ -158,6 +158,8 @@ def resolve_guid(guid: str, needle_fn, db_path: str) -> "dict | None":
             current = _readable_audio_file(hit[0]["path"])
             # Re-query flags and candidate ordering as the read-only DB may change.
             if current is None:
+                if len(_FAULTS) > _ENTRY_CAP:
+                    _FAULTS.clear()
                 _FAULTS[guid] = (hit[0]["path"], hit[0]["size"], hit[0]["mtime"],
                                  now + FAULT_TTL_S)
             _HITS.pop(guid, None)

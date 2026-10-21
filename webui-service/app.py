@@ -1412,8 +1412,10 @@ async def api_config_put(body: ConfigBody, request: Request):
                     if actions[-1].get("category") == "service_unavailable":
                         activation_service_failed = True
                         # 服务故障保留 active，且禁止后续清理实际源。
+                        # category 让前端区分「已自动取消激活」的真实停用路径。
                         warnings.append({"source": str(item.get("name") or "") or url,
-                                         "url": url, "message": actions[-1]["error"]})
+                                         "url": url, "message": actions[-1]["error"],
+                                         "category": "service_unavailable"})
                     else:
                         disable_failed_source(url, actions[-1]["error"])
                         actions[-1]["auto_disabled"] = True

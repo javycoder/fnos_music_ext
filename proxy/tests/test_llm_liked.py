@@ -542,6 +542,26 @@ async def test_atomic_failure_keeps_previous_batch(setup, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_transient_db_error_keeps_cached_llm_batch(setup, monkeypatch):
+    """瞬时 SQLite 错误（checkpoint/恢复窗口）不得删除有效 LLM 批次缓存。"""
+    first = await build(setup)
+    flaky = {"fail": True}
+    original = lr._eligible_guids
+
+    def unavailable(*args, **kwargs):
+        if flaky["fail"]:
+            raise sqlite3.OperationalError("database is locked")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(lr, "_eligible_guids", unavailable)
+    assert lr.load_llm_bundle("u1") is None
+    assert Path(lr._liked_path("u1")).exists()
+    assert not lr.llm_build_due("u1", lr.liked_config_fingerprint(), setup[1][0])
+    flaky["fail"] = False
+    assert lr.load_llm_bundle("u1") == first
+
+
+@pytest.mark.asyncio
 async def test_all_database_connections_are_read_only(setup, monkeypatch):
     original = sqlite3.connect
     connections = []

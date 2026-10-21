@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -327,6 +328,10 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         elif reused_source is not None and reused_was_enabled is False:
             try:
                 await temp_client.toggle_custom_source(str(reused_source.get("id")), False)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # lxserver 不可达时无法还原（测试中途掉线即走到这里）：留着启用态
+                # 不算成功验证，必须留下痕迹供定位，而非静默泄漏。
+                logging.getLogger("lxmusic_service").warning(
+                    "verify_source failed to re-disable reused source %s: %s",
+                    reused_source.get("name"), type(exc).__name__)
         await temp_client.close()

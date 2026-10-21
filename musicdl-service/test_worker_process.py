@@ -8,7 +8,8 @@ import time
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hardening import SourceBulkhead, SourceBusy, WorkerDead, SingleFlight, spawn_subprocess_worker
+from hardening import (SourceBulkhead, SourceBusy, WorkerDead, WorkerTaskError,
+                       SingleFlight, spawn_subprocess_worker)
 
 
 # Cold interpreter/import time is not part of the protocol-failure assertions.
@@ -33,7 +34,10 @@ for line in sys.stdin:
         print(json.dumps({"type":"unexpected"}), flush=True)
         continue
     if mode == "bad_entry":
-        print(json.dumps({"type":"entry", "entry": []}), flush=True)
+        print(json.dumps({"type": "entry", "entry": []}), flush=True)
+        continue
+    if mode == "error":
+        print(json.dumps({"type": "error", "error": "task failed"}), flush=True)
         continue
     if mode in ("partial_block", "partial", "hold", "ignore"):
         if mode == "ignore": signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -103,6 +107,26 @@ def test_bad_worker_reaped_then_next_request_recovers(process_factory, mode, err
     assert any(f"count={expected_count} " in message for message in task_logs)
     assert "SECRET" not in caplog.text
     assert "credential.invalid" not in caplog.text
+
+
+def test_task_level_error_keeps_worker_reusable(process_factory):
+    """任务级失败只上报不断进程：坑位保留复用，不回收不计崩溃。"""
+    spawn, procs = process_factory
+    async def main():
+        pool = SourceBulkhead(["source"], spawn=spawn)
+        try:
+            await pool.run("source", {}, timeout=STARTUP_TIMEOUT)
+            with pytest.raises(WorkerTaskError):
+                await pool.run("source", {"mode": "error"}, timeout=STARTUP_TIMEOUT)
+            assert (await pool.run("source", {}, timeout=STARTUP_TIMEOUT))["count"] == 0
+            assert len(procs) == 1
+            stats = pool.stats()["sources"]["source"]
+            assert stats["task_failed"] == 1
+            assert stats["crashed"] == 0
+            assert stats["recycled"] == 0
+        finally:
+            await pool.aclose()
+    asyncio.run(main())
 
 
 def test_clean_reuse_partial_recycles_and_stderr_cannot_block(process_factory):

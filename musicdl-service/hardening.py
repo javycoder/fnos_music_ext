@@ -25,6 +25,10 @@ class WorkerDead(RuntimeError):
     """worker 进程异常退出或协议流损坏；坑位已回收，下一次请求自动重建。"""
 
 
+class WorkerTaskError(RuntimeError):
+    """任务级失败：worker 上报后仍健康存活，坑位保留复用，仅本次任务失败。"""
+
+
 class SearchProgress:
     """Bounded per-request handoff, never a cache; close rejects late results."""
 
@@ -82,7 +86,9 @@ async def spawn_subprocess_worker(source, on_worker_line=None, script=None):
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
                 pass
-        cleanup.result()
+        # 待处理的取消必须原样传播：清理失败只降级为吞掉，不得顶替 CancelledError。
+        with suppress(Exception):
+            cleanup.result()
         raise
     worker = _SubprocessWorker(proc, source, on_worker_line)
     worker.start_stderr_pump()
@@ -134,7 +140,7 @@ class _SubprocessWorker:
         """执行一个任务直到 result/error；确认条目经 on_entry 即时上交。
 
         超时抛 asyncio.TimeoutError；进程死亡/流损坏抛 WorkerDead；
-        任务级失败（worker 仍健康，可复用）抛 RuntimeError。
+        任务级失败（worker 仍健康，可复用）抛 WorkerTaskError。
         """
         if deadline - time.monotonic() <= 0:
             raise asyncio.TimeoutError("worker task budget already exhausted")
@@ -178,7 +184,7 @@ class _SubprocessWorker:
                         "count": int(msg.get("count") or len(entries)),
                         "partial": bool(msg.get("partial"))}
             elif kind == "error":
-                raise WorkerDead("worker task failed")
+                raise WorkerTaskError(str(msg.get("error") or "worker task failed"))
             else:
                 raise WorkerDead("unknown worker message")
 
@@ -205,7 +211,7 @@ class _SourceSlot:
     def __init__(self):
         self.busy = False
         self.worker = None
-        self.stats = {"admitted": 0, "ok": 0, "timeouts": 0, "crashed": 0,
+        self.stats = {"admitted": 0, "ok": 0, "timeouts": 0, "crashed": 0, "task_failed": 0,
                       "recycled": 0, "last_recycle_reason": ""}
 
 
@@ -276,6 +282,12 @@ class SourceBulkhead:
             else:
                 slot.stats["ok"] += 1
             return result
+        except WorkerTaskError:
+            # 任务级失败：worker 上报后仍健康（worker.py 协议），保留坑位复用，
+            # 不回收不计崩溃；由调用方按源失败处理本次任务。
+            reason = "task_failed"
+            slot.stats["task_failed"] += 1
+            raise
         except BaseException as exc:
             reason = ("cancelled" if isinstance(exc, asyncio.CancelledError) else
                       "timeout" if isinstance(exc, asyncio.TimeoutError) else "worker_failed")
@@ -345,6 +357,7 @@ class SourceBulkhead:
                     "ok": sum(s["ok"] for s in sources.values()),
                     "timeouts": sum(s["timeouts"] for s in sources.values()),
                     "crashed": sum(s["crashed"] for s in sources.values()),
+                    "task_failed": sum(s["task_failed"] for s in sources.values()),
                     "recycled": sum(s["recycled"] for s in sources.values()),
                 },
                 "term_grace_s": self._term_grace_s,

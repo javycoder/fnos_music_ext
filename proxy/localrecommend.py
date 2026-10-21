@@ -457,7 +457,10 @@ def load_llm_bundle(user_guid: str, source_fingerprint: str | None = None, *,
                 return None
             if _valid_batch(cached, user_guid, fingerprint, db_path or rec.music_db_path()):
                 return cached
-        except (sqlite3.Error, ValueError, TypeError):
+        except sqlite3.Error:
+            # 瞬时库读失败（checkpoint/恢复窗口）：保留缓存，待库恢复后再校验。
+            return None
+        except (ValueError, TypeError):
             if cached and cached.get("engine") == _LLM_ENGINE:
                 _unlink(path)
             return None
@@ -500,7 +503,10 @@ def llm_build_due(user_guid: str, fingerprint: str, now: float, *, db_path: str 
                 _unlink(_liked_state_path(user_guid))
                 return False
             valid = _valid_batch(cached, user_guid, fingerprint, db_path or rec.music_db_path())
-        except (sqlite3.Error, ValueError, TypeError):
+        except sqlite3.Error:
+            # 瞬时库读失败：保留缓存，不触发重建，待库恢复后再校验。
+            return False
+        except (ValueError, TypeError):
             if cached and cached.get("engine") == _LLM_ENGINE:
                 _unlink(path)
             return False

@@ -511,6 +511,42 @@ test("saveConfig：自动取消失效源后提示保存成功并刷新激活状�
   assert.strictEqual(els.get("#save-btn").disabled, false);
 });
 
+test("saveConfig：服务故障的源保留激活并如实提示，不谎报已取消激活", async () => {
+  reset();
+  const items = [
+    { name: "故障源", url: "file:///down.js", active: true },
+  ];
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_LIST: JSON.stringify(items),
+  } });
+  await global.loadConfig();
+  global.markDirty();
+  enqueue("/app/fnmusic-ext/api/config", {
+    ok: true, changed: ["LX_SOURCE_LIST"],
+    actions: [
+      { kind: "lx_activate", op: "activate", source: "故障源", ok: false,
+        error: "服务未就绪", category: "service_unavailable" },
+    ],
+    warnings: [{ source: "故障源", url: "file:///down.js", message: "服务未就绪",
+                 category: "service_unavailable" }],
+  }, { values: {
+    FNMUSIC_LX_ENABLED: "true", LX_SOURCE_URL: "file:///down.js",
+    LX_SOURCE_LIST: JSON.stringify(items),
+  } });
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    await global.saveConfig();
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+  const message = els.get("#toast").textContent;
+  assert.ok(message.includes("「故障源」服务暂不可用，激活配置已保留（服务未就绪）"));
+  assert.ok(!message.includes("已自动取消激活"));
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
 test("collectConfig：全部源自动停用后仍可保存其它设置且不恢复旧激活标记", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: {

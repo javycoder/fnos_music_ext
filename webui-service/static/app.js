@@ -436,7 +436,11 @@ async function saveConfig() {
       }
     });
     warnings.forEach((w) => {
-      parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
+      if (w.category === "service_unavailable") {
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」服务暂不可用，激活配置已保留${w.message ? `（${w.message}）` : ""}`);
+      } else {
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
+      }
     });
     if (failed.length) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");

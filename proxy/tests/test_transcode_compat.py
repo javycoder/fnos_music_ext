@@ -1329,7 +1329,7 @@ def test_check_audio_file_passes_when_stderr_has_warnings(env, fake_ffmpeg, monk
 
 
 def test_check_audio_file_timeout_does_not_blacklist(env, fake_ffmpeg, monkeypatch, tmp_path):
-    """解码校验超时仅标记超时，不拉黑歌曲为坏流。"""
+    """解码校验超时仅标记超时，不拉黑歌曲为坏流；完整字节也绝不销毁。"""
     import subprocess
     guid = "online:kuwo:99007"
     appmod._LOSSLESS_BAD.clear()
@@ -1343,6 +1343,8 @@ def test_check_audio_file_timeout_does_not_blacklist(env, fake_ffmpeg, monkeypat
     meta = appmod._tee_finalize(part, guid, "flac", {"title": "t", "artist": "a"}, True)
     assert meta is None
     assert not appmod._lossless_is_blacklisted(guid)
+    # 超时不能证明内容损坏：长度已校验完整的 part 必须留在磁盘上
+    assert os.path.exists(part)
 
 
 def test_tee_finalize_skips_check_when_already_verified(env, fake_ffmpeg, monkeypatch, tmp_path):

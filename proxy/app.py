@@ -506,9 +506,15 @@ def _search_ttl(entry: dict) -> float:
 
 def _clean_search_cache() -> None:
     now = time.time()
-    expired = [k for k, v in _SEARCH_CACHE.items() if now - v.get("accessed", v.get("ts", 0)) >= 900]
-    if len(_SEARCH_CACHE) > 2000:
-        expired += sorted(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k].get("accessed", 0))[:1000]
+    try:
+        expired = [k for k, v in _SEARCH_CACHE.items() if now - v.get("accessed", v.get("ts", 0)) >= 900]
+        if len(_SEARCH_CACHE) > 2000:
+            expired += sorted(_SEARCH_CACHE,
+                              key=lambda k: _SEARCH_CACHE.get(k, {}).get("accessed", 0))[:1000]
+    except RuntimeError:
+        # 本地优先匹配的工作线程会经回查链并发触碰同一缓存（asyncio.to_thread），
+        # 迭代竞态时放弃本轮机会性清理即可，无需重试。
+        return
     for key in expired:
         entry = _SEARCH_CACHE.pop(key, {})
         task = entry.get("task")
@@ -5258,11 +5264,16 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
         if not ok:
             if reason == "decode_error":
                 _lossless_blacklist(guid)
-            logger.warning("tee finalize rejected corrupt lossless for %s", guid)
-            try:
-                os.remove(part)
-            except OSError:
-                pass
+                logger.warning("tee finalize rejected corrupt lossless for %s", guid)
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+                return None
+            # 超时/执行异常不能证明内容损坏：part 字节数已完整校验，绝不销毁，
+            # 不拉黑也不转正；遗留 .part 由垃圾清理回收，后续播放/绑定会重新
+            # 下载并重新校验。
+            logger.warning("tee finalize deferred lossless verify for %s (%s)", guid, reason)
             return None
     src = dict(info or {})
     title, artist, album = _tag_fields(src)
@@ -6158,6 +6169,10 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         ext = ext or (info or {}).get("ext") or "mp3"
         if ext in _LOSSLESS_EXTS:
             ok, reason = await asyncio.to_thread(_check_audio_file, part)
+            if not ok and reason in ("timeout", "exec_error"):
+                # 瞬时负载/fork 失败不代表流损坏：后台任务无等待方，稍候重验一次
+                await asyncio.sleep(5)
+                ok, reason = await asyncio.to_thread(_check_audio_file, part)
             if not ok:
                 if reason == "decode_error":
                     _lossless_blacklist(guid)
@@ -6173,6 +6188,10 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
                     logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
                     await _full_fetch_download(guid, cred_headers, force_mp3=True, fresh_url=True)
                     return
+                if reason in ("timeout", "exec_error"):
+                    # 两次校验仍无定论：完整字节不销毁（遗留 .part 交由垃圾清理），
+                    # 本次按失败计，等待下次触发重新下载校验。
+                    part = None
                 raise RuntimeError("corrupt stream even at mp3 tier" if force_mp3 else f"decode check failed: {reason}")
         meta = await asyncio.to_thread(_tee_finalize, part, guid, ext, info or {}, True, already_verified=True)
         part = None

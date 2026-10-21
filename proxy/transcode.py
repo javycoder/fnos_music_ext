@@ -30,6 +30,7 @@ import re
 import shutil
 import time
 import uuid
+import weakref
 from functools import wraps
 from dataclasses import dataclass, field
 
@@ -74,13 +75,18 @@ _SLOT_COND: asyncio.Condition | None = None
 _ACTIVE = 0
 # Playback outlives ffmpeg: completed disk sessions need a heartbeat/quit lease too.
 _PLAYBACK_LEASES: dict[str, tuple[Session, float, float]] = {}
-_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+# guid → Lock；弱值字典：持锁协程的局部引用维持条目存活，全部结束后自动回收，
+# 常驻进程不随历史 guid 无界累积。
+_SESSION_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
 
 
 def _serialized(fn):
     @wraps(fn)
     async def locked(guid, *args, **kwargs):
-        lock = _SESSION_LOCKS.setdefault(guid, asyncio.Lock())
+        lock = _SESSION_LOCKS.get(guid)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SESSION_LOCKS[guid] = lock
         async with lock:
             return await fn(guid, *args, **kwargs)
     return locked
@@ -402,7 +408,9 @@ def peek_cached(guid: str, root: str) -> Session | None:
     if not state:
         return None
     if not state.get("rendition"):
-        state["rendition"] = uuid.uuid4().hex
+        # 升级遗留缓存无 rendition：按目录确定性铸造，并发首播的两次触碰得到
+        # 同一值，不再各持不同 rendition 互踢导致其中一方分片 404。
+        state["rendition"] = uuid.uuid5(uuid.NAMESPACE_URL, f"fnmusic-legacy:{directory}").hex
         sess = _reused_session_from_state(guid, directory, state, 0, 10.0, "128k")
         _write_state(sess)
         return sess
