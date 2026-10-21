@@ -110,9 +110,10 @@ def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path
         assert notes.read_text().strip() == 'Corrected published notes.'
 
 
-def test_first_210_prerelease_documents_changes_since_290():
-    notes = (ROOT / 'CHANGELOG.md').read_text().split('## [2.10.0a]', 1)[1].split('\n## [', 1)[0]
-    for required in ('v2.9.0', '猜你喜欢', '30 分钟', 'ARM64', '503', '#67', '封面', '只读'):
+def test_formal_210_documents_changes_since_290():
+    notes = (ROOT / 'CHANGELOG.md').read_text().split('## [2.10.0]', 1)[1].split('\n## [', 1)[0]
+    for required in ('2.9.0', '猜你喜欢', '深浅色主题', '公共歌单', '垃圾清理', 'ARM64',
+                     '#82', '无损', '红心', '搜索超时'):
         assert required in notes
 
 
