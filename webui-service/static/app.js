@@ -45,6 +45,25 @@ function updateLlmLikedSettings() {
   $("#llm-api-warning").hidden = !selected || !!($("#llm-base").value.trim() && $("#llm-key").value.trim());
 }
 
+async function refreshLlmUsage() {
+  const el = $("#llm-usage-line");
+  if (!el) return;
+  try {
+    const { usage: u } = await api("/api/llm/usage");
+    const used = Number(u.total) || 0;
+    const limit = Number(u.dailyLimit) || 0;
+    let text = `今日 token 用量 ${used.toLocaleString()}`;
+    text += limit > 0 ? ` / 上限 ${limit.toLocaleString()}` : "（未设上限）";
+    text += `，已请求 ${Number(u.requests) || 0} 次`;
+    if (u.withinLimit === false) text += "，已达上限：今日暂停调用，次日自动重置";
+    const f = u.lastFailure;
+    if (f && f.reason) text += `；最近失败：${f.reason}${f.detail ? `（${String(f.detail).slice(0, 120)}）` : ""}`;
+    el.textContent = text;
+  } catch (_) {
+    el.textContent = "今日 token 用量：暂不可用";
+  }
+}
+
 function likedNumber(selector, label, min, max, integer = false) {
   const text = $(selector).value.trim();
   const num = Number(text);
@@ -288,11 +307,16 @@ function applyConfigToForm() {
   $("#llm-base").value = v.FNMUSIC_LLM_BASE_URL || "";
   $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
+  $("#llm-protocol").value = v.FNMUSIC_LLM_PROTOCOL === "responses" ? "responses" : "chat";
+  $("#llm-max-tokens").value = v.FNMUSIC_LLM_MAX_TOKENS || "8192";
+  $("#llm-daily-limit").value = v.FNMUSIC_LLM_DAILY_TOKEN_LIMIT ?? "1000000";
+  $("#llm-extra-body").value = v.FNMUSIC_LLM_EXTRA_BODY || "";
   $("#llm-liked").checked = v.FNMUSIC_LLM_LIKED_ENABLED === "true";
   $("#llm-daily").checked = v.FNMUSIC_LLM_DAILY_ENABLED === "true";
   $("#liked-refresh-hours").value = v.FNMUSIC_LIKED_REFRESH_HOURS ?? "0.5";
   $("#liked-size").value = v.FNMUSIC_LIKED_SIZE ?? "20";
   updateLlmLikedSettings();
+  refreshLlmUsage();
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
@@ -345,6 +369,10 @@ function collectConfig() {
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
     FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
+    FNMUSIC_LLM_PROTOCOL: $("#llm-protocol").value === "responses" ? "responses" : "chat",
+    FNMUSIC_LLM_MAX_TOKENS: parseInt($("#llm-max-tokens").value || "8192", 10) || 8192,
+    FNMUSIC_LLM_DAILY_TOKEN_LIMIT: parseInt($("#llm-daily-limit").value ?? "1000000", 10),
+    FNMUSIC_LLM_EXTRA_BODY: $("#llm-extra-body").value.trim(),
     FNMUSIC_LLM_LIKED_ENABLED: $("#llm-liked").checked,
     FNMUSIC_LLM_DAILY_ENABLED: $("#llm-daily").checked,
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
@@ -450,6 +478,7 @@ async function saveConfig() {
     clearDirty();
     await loadConfig();
     await loadStatus();
+    refreshLlmUsage();
   } catch (exc) {
     toast("保存失败：" + exc.message, "fail");
   } finally {

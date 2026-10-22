@@ -32,6 +32,11 @@ from uuid import uuid4
 
 import httpx
 
+try:
+    from . import llm_usage
+except ImportError:  # 直跑场景（非包导入）
+    import llm_usage
+
 logger = logging.getLogger("fnmusic_proxy.recommend")
 
 DAILY_GUID_PREFIX = "online:playlist:daily:"
@@ -41,6 +46,10 @@ LIKED_GUID_PREFIX = "online:playlist:liked:"
 KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
 DEFAULT_MODEL = "gpt-4o-mini"
 SEED_LIMIT = 20
+# issue #83：协议与输出预算可配，DeepSeek 等推理模型不再吃死 4096 上限
+DEFAULT_PROTOCOL = "chat"
+DEFAULT_MAX_TOKENS = 8192
+DEFAULT_DAILY_TOKEN_LIMIT = 1_000_000
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -118,6 +127,47 @@ def llm_candidate_count() -> int:
 
 def llm_timeout_s() -> float:
     return _env_float("FNMUSIC_LLM_TIMEOUT_S", LLM_TIMEOUT_S, 5.0, 60.0)
+
+
+def llm_protocol() -> str:
+    """接口协议：chat（OpenAI 兼容 /chat/completions，默认）或 responses（/responses）。"""
+    raw = (os.environ.get("FNMUSIC_LLM_PROTOCOL") or DEFAULT_PROTOCOL).strip().lower()
+    return raw if raw in ("chat", "responses") else DEFAULT_PROTOCOL
+
+
+def llm_max_tokens() -> int:
+    """单次输出上限（含推理 token）：默认 8192，范围 256-131072。"""
+    return _env_int("FNMUSIC_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS, 256, 131072)
+
+
+def llm_daily_token_limit() -> int:
+    """每日 token 总量上限：默认 100 万，0=不限制（记账见 llm_usage）。"""
+    return llm_usage.daily_limit()
+
+
+_EXTRA_BODY_WARNED = ""
+
+
+def llm_extra_body() -> dict:
+    """附加请求参数（JSON 对象，逐键合并进请求体顶层）。
+
+    给服务商专属参数一个通用出口（如 DeepSeek 关思考 {"thinking":{"type":"disabled"}}），
+    不对任何厂商硬编码。非法值告警一次并忽略，不阻断推荐。
+    """
+    global _EXTRA_BODY_WARNED
+    raw = (os.environ.get("FNMUSIC_LLM_EXTRA_BODY") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and data:
+            return data
+    except ValueError:
+        pass
+    if _EXTRA_BODY_WARNED != raw:
+        _EXTRA_BODY_WARNED = raw
+        logger.warning("FNMUSIC_LLM_EXTRA_BODY 不是非空 JSON 对象，已忽略: %.120s", raw)
+    return {}
 
 
 def verify_playable_enabled() -> bool:
@@ -199,6 +249,11 @@ def llm_liked_refresh_hours() -> float:
     except (ValueError, TypeError):
         return 0.5
     return value if math.isfinite(value) and value >= 0.5 else 0.5
+
+
+def llm_usage_summary() -> dict:
+    """当日 token 用量概览（healthz recommend 段与 WebUI 共用）。"""
+    return llm_usage.summary()
 
 
 def recommend_cache_dir() -> str:
@@ -882,78 +937,196 @@ def parse_llm_recommendations(text: str) -> list[dict]:
     return out
 
 
-async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
+class LLMFailure(Exception):
+    """LLM 调用失败，携带稳定 reason 码（issue #83）。
+
+    reason 进入 tierFailures（如 "llm:empty-content"）与 WebUI 用量面板的
+    最近失败展示：token-limit / not-configured / timeout / network /
+    http-<status> / bad-response / empty-content / parse。
+    """
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = (detail or reason)[:500]
+
+
+def _llm_endpoint(base: str) -> tuple[str, str]:
+    """按协议返回 (protocol, url)；base 已带对应路径后缀时不重复拼接。"""
+    protocol = llm_protocol()
+    suffix = "/responses" if protocol == "responses" else "/chat/completions"
+    return protocol, (base if base.endswith(suffix) else f"{base}{suffix}")
+
+
+def _llm_usage(protocol: str, body: dict) -> dict:
+    """归一化 usage：chat 与 responses 两套字段名统一成 prompt/completion 口径。"""
+    usage = body.get("usage") if isinstance(body, dict) else None
+    if not isinstance(usage, dict):
+        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0}
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens")) or 0
+    completion = usage.get("completion_tokens", usage.get("output_tokens")) or 0
+    details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else 0
+    total = usage.get("total_tokens")
+    if total is None:
+        total = (prompt or 0) + (completion or 0)
+    return {"prompt": int(prompt or 0), "completion": int(completion or 0),
+            "total": int(total or 0), "reasoning": int(reasoning or 0)}
+
+
+def _extract_llm_text(protocol: str, body: dict) -> tuple[str, str, str]:
+    """提取正文，返回 (content, finish_reason, status)。
+
+    chat：choices[0].message.content；responses：output[] 中 message 项的
+    content[].output_text 拼接（兼容 output_text 直出与 text 部分）。
+    """
+    status = str(body.get("status") or "") if protocol == "responses" else ""
+    if protocol == "responses":
+        texts: list[str] = []
+        output = body.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") and item.get("type") != "message":
+                    continue  # reasoning 等非正文项
+                content = item.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                            texts.append(str(part.get("text") or ""))
+                elif isinstance(content, str):
+                    texts.append(content)
+        if not texts and isinstance(body.get("output_text"), str):
+            texts.append(body["output_text"])
+        return "".join(texts), "", status
+    choices = body.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        finish = str(choices[0].get("finish_reason") or "")
+        msg = choices[0].get("message") or {}
+        return str(msg.get("content") or ""), finish, status
+    return "", "", status
+
+
+def _empty_content_detail(protocol: str, finish: str, status: str, usage: dict) -> str:
+    parts = []
+    if protocol == "responses":
+        if status and status != "completed":
+            parts.append(f"status={status}")
+    elif finish and finish != "stop":
+        parts.append(f"finish_reason={finish}")
+    if usage.get("reasoning"):
+        parts.append(f"reasoning_tokens={usage['reasoning']}")
+    parts.append(f"completion_tokens={usage.get('completion', 0)}")
+    if finish == "length" or status == "incomplete" or usage.get("reasoning"):
+        hint = ("推理/长度耗尽输出预算：可换非推理模型、调大 FNMUSIC_LLM_MAX_TOKENS，"
+                "或用 FNMUSIC_LLM_EXTRA_BODY 关闭思考（如 DeepSeek {\"thinking\":{\"type\":\"disabled\"}}）")
+    else:
+        hint = "模型未返回正文"
+    return f"{'; '.join(parts)}（{hint}）"
+
+
+async def _llm_complete(
+    http_client: httpx.AsyncClient, prompt: str, *, temperature: float, system: str,
+) -> str:
+    """chat/responses 双协议共享的请求与解析核心（issue #83）。
+
+    返回模型正文；失败抛 LLMFailure（稳定 reason 码），由调用方转成
+    tierFailures / None，不再静默空列表。token 用量与失败都记入当日账本，
+    达到每日上限时请求前即拦截。
+    """
     base = llm_base_url()
     key = llm_api_key()
     if not base or not key:
-        return []
-    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-    payload = {
-        "model": llm_model(),
-        "temperature": 0.8,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": "你只输出合法 JSON 数组，不要 markdown。"},
+        raise LLMFailure("not-configured")
+    limit = llm_daily_token_limit()
+    if not llm_usage.within_limit(limit):
+        detail = f"当日 token 已达上限 {limit}，明日自动重置"
+        llm_usage.record(None, "token-limit", detail)
+        raise LLMFailure("token-limit", detail)
+    protocol, url = _llm_endpoint(base)
+    payload: dict = {"model": llm_model()}
+    if protocol == "responses":
+        # 推理系模型（o 系/gpt-5 等）只接受默认 temperature，默认不发；
+        # 确需控制时经 FNMUSIC_LLM_EXTRA_BODY 显式覆盖
+        payload["input"] = [
+            {"role": "system", "content": system},
             {"role": "user", "content": prompt},
-        ],
-    }
+        ]
+        payload["max_output_tokens"] = llm_max_tokens()
+    else:
+        payload["temperature"] = temperature
+        payload["max_tokens"] = llm_max_tokens()
+        payload["messages"] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+    extra = llm_extra_body()
+    if extra:
+        payload.update(extra)
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
     try:
         resp = await http_client.post(url, json=payload, headers=headers, timeout=llm_timeout_s())
-        if resp.status_code >= 400:
-            logger.warning("llm http %s", resp.status_code)
-            return []
-        body = resp.json()
-        content = ""
-        if isinstance(body, dict):
-            choices = body.get("choices") or []
-            if choices and isinstance(choices[0], dict):
-                msg = choices[0].get("message") or {}
-                content = str(msg.get("content") or "")
-        return parse_llm_recommendations(content)
+    except LLMFailure:
+        raise
+    except httpx.TimeoutException as e:
+        llm_usage.record(None, "timeout", str(e))
+        raise LLMFailure("timeout", str(e)) from e
     except Exception as e:
-        logger.warning("llm call failed: %s", e)
-        return []
+        llm_usage.record(None, "network", str(type(e).__name__))
+        raise LLMFailure("network", str(e)) from e
+    if resp.status_code >= 400:
+        snippet = (resp.text or "").strip()[:300]
+        llm_usage.record(None, f"http-{resp.status_code}", snippet)
+        raise LLMFailure(f"http-{resp.status_code}", snippet)
+    try:
+        body = resp.json()
+    except ValueError as e:
+        llm_usage.record(None, "bad-response", "响应不是合法 JSON")
+        raise LLMFailure("bad-response", "响应不是合法 JSON") from e
+    if not isinstance(body, dict):
+        llm_usage.record(None, "bad-response", "响应不是 JSON 对象")
+        raise LLMFailure("bad-response", "响应不是 JSON 对象")
+    usage = _llm_usage(protocol, body)
+    content, finish, status = _extract_llm_text(protocol, body)
+    llm_usage.record(usage)
+    if not content.strip():
+        # issue #83 核心：HTTP 200 但正文为空（推理 token 耗尽预算）必须显式失败，
+        # 不能静默返回空列表让每日推荐无声退回本地
+        detail = _empty_content_detail(protocol, finish, status, usage)
+        llm_usage.record(None, "empty-content", detail)
+        raise LLMFailure("empty-content", detail)
+    logger.debug("llm %s ok: finish=%s status=%s usage=%s",
+                 protocol, finish or "-", status or "-", usage)
+    return content
+
+
+async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
+    content = await _llm_complete(
+        http_client, prompt,
+        temperature=0.8, system="你只输出合法 JSON 数组，不要 markdown。",
+    )
+    recs = parse_llm_recommendations(content)
+    if not recs:
+        raise LLMFailure("parse", "正文未解析出候选歌曲")
+    return recs
 
 
 async def call_llm_json(http_client: httpx.AsyncClient, prompt: str) -> list | dict | None:
-    base = llm_base_url()
-    key = llm_api_key()
-    if not base or not key:
-        return None
-    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-    payload = {
-        "model": llm_model(),
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": "你只输出合法 JSON，不要 markdown。"},
-            {"role": "user", "content": prompt},
-        ],
-    }
+    content = (await _llm_complete(
+        http_client, prompt,
+        temperature=0.2, system="你只输出合法 JSON，不要 markdown。",
+    )).strip()
+    fenced = _JSON_BLOCK.search(content)
+    if fenced:
+        content = fenced.group(1).strip()
     try:
-        response = await http_client.post(
-            url, json=payload,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            timeout=llm_timeout_s(),
-        )
-        if response.status_code >= 400:
-            logger.warning("llm http %s", response.status_code)
-            return None
-        body = response.json()
-        choices = body.get("choices") or [] if isinstance(body, dict) else []
-        message = choices[0].get("message") or {} if choices and isinstance(choices[0], dict) else {}
-        content = str(message.get("content") or "").strip()
-        fenced = _JSON_BLOCK.search(content)
-        if fenced:
-            content = fenced.group(1).strip()
         return json.loads(content)
-    except Exception as error:
-        logger.warning("llm json call failed: %s", error)
-        return None
+    except ValueError as error:
+        raise LLMFailure("parse", f"正文不是合法 JSON: {error}") from error
 
 
 # ------------------------------------------------------- 音源原生推荐（平台 ID 直连） ---
@@ -2008,6 +2181,14 @@ async def get_or_build_daily(
             logger.warning(
                 "daily recommend tier %s timeout (remaining=%.1fs, 已渐进入列 %d 首)", name, remaining, added,
             )
+            if added:
+                _save_checkpoint()
+            return
+        except LLMFailure as e:
+            # issue #83：LLM 失败不再静默，稳定原因码进入 tierFailures 落盘 + healthz
+            tier_failures.append(f"{name}:{e.reason}")
+            logger.warning("daily recommend tier %s llm failure %s: %s（已渐进入列 %d 首）",
+                           name, e.reason, e.detail, added)
             if added:
                 _save_checkpoint()
             return

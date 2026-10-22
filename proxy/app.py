@@ -580,6 +580,11 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LLM_BASE_URL": ("llm_base_url", "llm_url"),
     "FNMUSIC_LLM_API_KEY": ("", "str"),
     "FNMUSIC_LLM_MODEL": ("llm_model", "llm_model"),
+    # issue #83：协议/输出上限/每日限额/附加参数运行期读取，热重载即生效
+    "FNMUSIC_LLM_PROTOCOL": ("", "str"),
+    "FNMUSIC_LLM_MAX_TOKENS": ("", "runtime_int"),
+    "FNMUSIC_LLM_DAILY_TOKEN_LIMIT": ("", "runtime_int"),
+    "FNMUSIC_LLM_EXTRA_BODY": ("", "str"),
     "FNMUSIC_LLM_DAILY_ENABLED": ("llm_daily_enabled", "strict_bool"),
     "FNMUSIC_LLM_LIKED_ENABLED": ("llm_liked_enabled", "strict_bool"),
     "FNMUSIC_LIKED_REFRESH_HOURS": ("liked_refresh_hours", "liked_hours"),
@@ -969,7 +974,8 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
     global _LIKED_EPOCH
     changes = set(changed)
     source_changed = bool(_SOURCE_CONF_KEYS & changes)
-    connection_changed = bool({"llm_base_url", "llm_model", "FNMUSIC_LLM_API_KEY"} & changes)
+    connection_changed = bool({"llm_base_url", "llm_model", "FNMUSIC_LLM_API_KEY",
+                               "FNMUSIC_LLM_PROTOCOL", "FNMUSIC_LLM_EXTRA_BODY"} & changes)
     liked_changed = source_changed or connection_changed or bool(
         {"llm_liked_enabled", "liked_size"} & changes
     )
@@ -4577,6 +4583,8 @@ async def ext_healthz(request: Request):
                 "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
                 "source_slot_claimed": dailyrec.source_slot_claimed(),
                 "recent": dailyrec.last_recommend_summary(),
+                # issue #83：每日 token 用量与最近失败原因（llm_usage 账本）
+                "llm_usage": dailyrec.llm_usage_summary(),
             },
             "degraded": bool(failed), "failures": failed, "details": details}
 

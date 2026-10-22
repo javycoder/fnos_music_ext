@@ -32,3 +32,14 @@ def _isolate_cover_state(monkeypatch):
     monkeypatch.setattr(pa, "_LX_URL_PREFETCH", set())
     monkeypatch.setattr(pa, "_LX_CONFIG_SIG", None)
     monkeypatch.setattr(pa, "_LX_RESOLVE_EPOCH", 0)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_usage_state(tmp_path, monkeypatch):
+    """LLM token 账本指到临时文件并清空进程内当日缓存，
+    防止用例把 llm_usage.json 写进真实仓库、或跨用例串账。"""
+    from proxy import llm_usage
+
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(tmp_path / "llm_usage.json"))
+    monkeypatch.setattr(llm_usage, "_STATE", None)
+    monkeypatch.setattr(llm_usage, "_STATE_DAY", "")

@@ -289,12 +289,23 @@
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+          <label class="field"><span>接口协议</span>
+            <select class="input" id="llm-protocol">
+              <option value="chat">Chat Completions（/chat/completions）</option>
+              <option value="responses">Responses（/responses）</option>
+            </select>
+          </label>
+          <label class="field"><span>单次输出上限（token）</span><input class="input" id="llm-max-tokens" type="number" min="256" max="131072" step="1" value="8192"></label>
+          <label class="field"><span>每日 token 上限（0=不限制）</span><input class="input" id="llm-daily-limit" type="number" min="0" step="1" value="1000000"></label>
+          <label class="field"><span>附加请求参数（JSON 对象，选填）</span><input class="input" id="llm-extra-body" placeholder='{"thinking":{"type":"disabled"}}'></label>
+          <p class="hint" id="llm-usage-line" role="status">今日 token 用量：加载中…</p>
           <div class="switch-grid">
             <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
             <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
           </div>
           <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
           <p class="hint">每日推荐仍受「每日推荐」总开关控制：音源原生推荐优先 → 已勾选且接口完整时的大模型 → 本地曲库兜底。取消大模型每日推荐不会关闭每日推荐歌单。</p>
+          <p class="hint">接口协议默认 Chat Completions；选 Responses 时请求「Base URL/responses」（OpenAI 新版接口）。DeepSeek 等推理模型若出现"正文为空、只走本地推荐"，可在附加请求参数里填 {"thinking":{"type":"disabled"}} 关闭思考，或调大单次输出上限（含推理 token）。每日 token 上限达到后当天不再调用大模型（推荐自动走本地兜底），次日自动重置；0 表示不限制。单次输出上限范围 256–131072，默认 8192。</p>
           <div id="llm-liked-settings" hidden>
             <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
             <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>

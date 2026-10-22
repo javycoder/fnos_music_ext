@@ -255,6 +255,72 @@ def test_llm_opt_in_defaults_and_schema(env_file):
     assert view["schema"]["FNMUSIC_LIKED_SIZE"]["max"] == 100
 
 
+def test_llm_protocol_and_token_limit_schema(env_file):
+    # issue #83：协议选择、输出上限、每日限额、附加参数均可配置
+    with authed_client() as client:
+        view = client.get("/api/config").json()
+    assert view["schema"]["FNMUSIC_LLM_PROTOCOL"]["values"] == ["chat", "responses"]
+    assert view["schema"]["FNMUSIC_LLM_PROTOCOL"]["default"] == "chat"
+    assert view["values"]["FNMUSIC_LLM_MAX_TOKENS"] == "8192"
+    assert view["values"]["FNMUSIC_LLM_DAILY_TOKEN_LIMIT"] == "1000000"
+    assert view["values"]["FNMUSIC_LLM_EXTRA_BODY"] == ""
+
+
+def test_llm_protocol_roundtrip_and_rejects_bad_enum(env_file):
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_LLM_PROTOCOL": "responses"}})
+        assert saved.status_code == 200
+        assert client.get("/api/config").json()["values"]["FNMUSIC_LLM_PROTOCOL"] == "responses"
+        bad = client.put("/api/config", json={"values": {"FNMUSIC_LLM_PROTOCOL": "graphql"}})
+        assert bad.status_code == 400
+        assert "chat/responses" in bad.json()["error"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ('{"thinking":{"type":"disabled"}}', '{"thinking":{"type":"disabled"}}'),
+    (' {"user": "u1", "k": "中文"} ', '{"user":"u1","k":"中文"}'),
+    ("", ""),
+])
+def test_llm_extra_body_normalization(env_file, raw, expected):
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_LLM_EXTRA_BODY": raw}})
+        assert saved.status_code == 200, saved.json()
+        assert client.get("/api/config").json()["values"]["FNMUSIC_LLM_EXTRA_BODY"] == expected
+
+
+@pytest.mark.parametrize("raw", ["not-json", "[]", '"text"', '{"a":1}{"b":2}', "{broken}"])
+def test_llm_extra_body_rejects_invalid_json(env_file, raw):
+    with authed_client() as client:
+        bad = client.put("/api/config", json={"values": {"FNMUSIC_LLM_EXTRA_BODY": raw}})
+        assert bad.status_code == 400
+        assert "JSON" in bad.json()["error"]
+
+
+def test_llm_token_limit_clamped_not_rejected(env_file):
+    # int 非 strict：越界静默钳制（与 FNMUSIC_TEE_CACHE_MAX 同口径）
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_MAX_TOKENS": 1, "FNMUSIC_LLM_DAILY_TOKEN_LIMIT": -10}})
+        assert saved.status_code == 200
+        values = client.get("/api/config").json()["values"]
+    assert values["FNMUSIC_LLM_MAX_TOKENS"] == "256"
+    assert values["FNMUSIC_LLM_DAILY_TOKEN_LIMIT"] == "0"
+
+
+def test_llm_usage_endpoint(tmp_path, monkeypatch):
+    from proxy import llm_usage as lu
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(tmp_path / "llm_usage.json"))
+    monkeypatch.setattr(lu, "_STATE", None)
+    monkeypatch.setattr(lu, "_STATE_DAY", "")
+    lu.record({"prompt": 10, "completion": 5, "total": 15})
+    with authed_client() as client:
+        r = client.get("/api/llm/usage")
+    assert r.status_code == 200
+    usage = r.json()["usage"]
+    assert usage["total"] == 15 and usage["requests"] == 1
+    assert usage["dailyLimit"] == 1_000_000 and usage["withinLimit"] is True
+
+
 def test_llm_credentials_do_not_opt_in_and_incomplete_opt_in_is_preserved(env_file):
     with authed_client() as client:
         saved = client.put("/api/config", json={"values": {

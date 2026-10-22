@@ -49,6 +49,7 @@ from proxy.fnlog import (  # noqa: E402
     redact,
     setup_logging,
 )
+from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -130,6 +131,10 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_BASE_URL": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "OpenAI 兼容 Base URL"},
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
+    "FNMUSIC_LLM_PROTOCOL": {"kind": "enum", "values": ["chat", "responses"], "default": "chat", "group": "llm", "reload": "hot", "label": "接口协议"},
+    "FNMUSIC_LLM_MAX_TOKENS": {"kind": "int", "default": "8192", "min": 256, "max": 131072, "group": "llm", "reload": "hot", "label": "单次输出上限（token）"},
+    "FNMUSIC_LLM_DAILY_TOKEN_LIMIT": {"kind": "int", "default": "1000000", "min": 0, "max": 1000000000, "group": "llm", "reload": "hot", "label": "每日 token 上限（0=不限制）"},
+    "FNMUSIC_LLM_EXTRA_BODY": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "附加请求参数（JSON 对象）"},
     "FNMUSIC_LLM_LIKED_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于猜你喜欢"},
     "FNMUSIC_LLM_DAILY_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于每日推荐"},
     "FNMUSIC_LIKED_REFRESH_HOURS": {"kind": "float", "default": "0.5", "min": 0.5, "step": "any", "group": "llm", "reload": "hot", "label": "猜你喜欢生成间隔（小时）"},
@@ -869,6 +874,19 @@ def validate_updates(values: dict) -> dict[str, str]:
         raise ValueError(f"音源三选一：{'、'.join(enabled)} 同时启用，请只保留一个")
     if updates.keys() & _PROVIDER_KEYS and not enabled:
         raise ValueError("至少需要启用一个音源")
+    if "FNMUSIC_LLM_EXTRA_BODY" in updates:
+        # 附加请求参数必须是可解析的 JSON 对象；归一成紧凑串保证 .env 值稳定
+        raw = updates["FNMUSIC_LLM_EXTRA_BODY"].strip()
+        if raw:
+            try:
+                extra = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(f"附加请求参数不是合法 JSON: {exc}") from exc
+            if not isinstance(extra, dict) or not extra:
+                raise ValueError("附加请求参数必须是形如 {\"thinking\":{\"type\":\"disabled\"}} 的非空 JSON 对象")
+            updates["FNMUSIC_LLM_EXTRA_BODY"] = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
+        else:
+            updates["FNMUSIC_LLM_EXTRA_BODY"] = ""
     if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" in updates:
         try:
             selection = json.loads(str(updates["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] or "[]"))
@@ -1475,6 +1493,12 @@ async def api_config_put(body: ConfigBody, request: Request):
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
     return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys,
             "warnings": warnings}
+
+
+@app.get("/api/llm/usage")
+async def api_llm_usage():
+    """当日大模型 token 用量与最近失败原因（issue #83）。"""
+    return {"ok": True, "usage": llm_usage.summary()}
 
 
 @app.post("/api/lx/verify")

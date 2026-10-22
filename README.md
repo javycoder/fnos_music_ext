@@ -132,6 +132,9 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | 网易账号歌单 / 常驻 | `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 默认关闭；账号歌单仍需登录 |
 | 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | 默认关闭，显式收藏或加入歌单后下载并等待官方入库再绑定；浏览列表不触发音频下载 |
 | 大模型接口 | `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL` | 接口地址和密钥须完整；模型默认 `gpt-4o-mini`，仅填写接口不启用用途 |
+| 大模型接口协议 | `FNMUSIC_LLM_PROTOCOL` | `chat`（默认，`/chat/completions`）或 `responses`（`/responses`），两种协议均完整实现 |
+| 大模型单次输出上限 | `FNMUSIC_LLM_MAX_TOKENS` | 256–131072（默认 8192，含推理 token）；DeepSeek 等推理模型吃满预算导致正文为空时调大，或用 `FNMUSIC_LLM_EXTRA_BODY` 关闭思考（如 `{"thinking":{"type":"disabled"}}`） |
+| 大模型每日 token 上限 | `FNMUSIC_LLM_DAILY_TOKEN_LIMIT` | 默认 1000000，0=不限制；达到后当天不再调用、次日自动重置，用量与最近失败见管理页及 `/_ext/healthz` |
 | 大模型猜你喜欢 / 每日推荐 | `FNMUSIC_LLM_LIKED_ENABLED` / `FNMUSIC_LLM_DAILY_ENABLED` | 两项默认 `false`，需独立明确勾选；接口不完整时不调用模型 |
 | 大模型猜你喜欢间隔 / 数量 | `FNMUSIC_LIKED_REFRESH_HOURS` / `FNMUSIC_LIKED_SIZE` | 间隔为有限数字且 ≥0.5 小时（默认 0.5，无上限）；数量为 0–100 整数（默认 20）；不是缓存失效时间 |
 
