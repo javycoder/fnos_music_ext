@@ -169,9 +169,10 @@ jobs:
       # API 调用必须带重试。
       - name: Publish release to Gitee
         if: env.GITEE_TOKEN != ''
-        # 整体上界：tag 轮询 ≤10min + 查询/创建 + 附件 3×(300s+60s) + PATCH。
-        # 没有它时单个请求的重试会把 job 拖到一小时以上。
-        timeout-minutes: 30
+        # 整体上界：tag 轮询 ≤10min + 查询/创建 + fpk 2×(1200s+60s 复用检查) +
+        # 小附件 3×(300s+退避) + PATCH，最坏约 70min。没有它时单个请求的重试
+        # 会把 job 拖到一小时以上。
+        timeout-minutes: 75
         env:
           GITEE_REPO: javycoder/fnos_music_ext
         run: |
@@ -255,11 +256,22 @@ jobs:
           # 单个文件烧掉 65 分钟）。这里改为小步重试：每次尝试独立限时，失败后
           # 先查附件是否已落盘（Gitee 可能已接收但响应超时），已存在则直接复用，
           # 避免重复上传；只有确实缺失才重试，总尝试次数与总耗时都有上界。
+          #
+          # 单次限时必须按体积分级：v2.10.1 实测 fpk（28MB）3×300s 全部在
+          # max-time 处超时——runner→gitee 链路慢时不足 93KB/s，300s 内根本传
+          # 不完，再多的尝试也只是必然超时。大文件放宽到 1200s×2（最低 ~23KB/s
+          # 即可单次传完）；小文件（sha256）保持 300s×3 应对 TLS 抖动。
           upload_attach() {
-            local file="$1" name attempt http url
+            local file="$1" name size max_time attempts attempt http url
             name="$(basename "${file}")"
-            for attempt in 1 2 3; do
-              http="$(curl -sS --connect-timeout 15 --max-time 300 \
+            size="$(stat -c%s "${file}")"
+            if [ "${size}" -gt 5242880 ]; then
+              max_time=1200; attempts=2
+            else
+              max_time=300; attempts=3
+            fi
+            for attempt in $(seq 1 "${attempts}"); do
+              http="$(curl -sS --connect-timeout 15 --max-time "${max_time}" \
                 -o /tmp/gitee-att-one.json -w '%{http_code}' \
                 "${api}/releases/${release_id}/attach_files" \
                 -F "access_token=${GITEE_TOKEN}" \
@@ -281,7 +293,7 @@ jobs:
                 printf '%s' "${url}"
                 return 0
               fi
-              [ "${attempt}" -lt 3 ] && sleep $((attempt * 10))
+              [ "${attempt}" -lt "${attempts}" ] && sleep $((attempt * 10))
             done
             return 1
           }
@@ -289,7 +301,7 @@ jobs:
           attach_links=""
           for f in "${fpk_file}" "${fpk_file}.sha256"; do
             if ! url="$(upload_attach "${f}")"; then
-              echo "ERROR: 上传附件 $(basename "${f}") 失败（已重试 3 次）" >&2
+              echo "ERROR: 上传附件 $(basename "${f}") 失败（已达重试上限）" >&2
               cat /tmp/gitee-att-one.json >&2 || true
               exit 1
             fi

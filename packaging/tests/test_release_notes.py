@@ -375,12 +375,18 @@ def test_gitee_large_upload_never_uses_body_replaying_retry():
 
 
 def test_gitee_step_has_bounded_wall_clock_and_idempotent_recovery():
-    """重试必须能识别"服务端已落盘但响应丢失"，避免重复传输大文件。"""
+    """重试必须能识别"服务端已落盘但响应丢失"，避免重复传输大文件。
+
+    单次限时按体积分级（v2.10.1 实测：28MB fpk 在 300s 上限下 3 次尝试
+    全部必然超时），大文件 1200s×2、小文件 300s×3，次数与时长都有上界。
+    """
     script = _unindent_run(_gitee_step_script())
     assert 'timeout-minutes:' in RELEASE_WORKFLOW.read_text()
     upload_body = _upload_function_body(script)
     # 失败后先查附件列表再决定是否重试（幂等复用）
     assert 'attach_files?access_token=' in upload_body
     assert '复用现有附件' in upload_body
-    # 尝试次数有上界
-    assert 'for attempt in 1 2 3' in upload_body
+    # 尝试次数有上界：按体积分级，但只允许下面两个字面量组合
+    assert 'for attempt in $(seq 1 "${attempts}")' in upload_body
+    assert 'max_time=1200; attempts=2' in upload_body
+    assert 'max_time=300; attempts=3' in upload_body
