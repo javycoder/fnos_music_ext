@@ -6,6 +6,8 @@ HTTP 一律走 httpx.MockTransport，不出网。
 """
 import asyncio
 import json
+import os
+import stat
 import time
 
 import httpx
@@ -256,6 +258,34 @@ async def test_call_llm_json_both_protocols(monkeypatch):
 
 
 # ---------------------------------------------------------------- token 限额 --
+
+def test_usage_state_path_webui_repo_dir_fallback(tmp_path, monkeypatch):
+    """issue #85：容器内 webui 没有 FNMUSIC_HOME，靠 WEBUI_REPO_DIR 对齐
+    宿主 proxy 写在仓库根的账本；FNMUSIC_HOME 仍优先。"""
+    monkeypatch.delenv("FNMUSIC_LLM_USAGE_FILE", raising=False)
+    monkeypatch.delenv("FNMUSIC_HOME", raising=False)
+    monkeypatch.setenv("WEBUI_REPO_DIR", str(tmp_path))
+    assert llm_usage._state_path() == str(tmp_path / "llm_usage.json")
+    monkeypatch.setenv("FNMUSIC_HOME", "/custom/home")
+    assert llm_usage._state_path() == "/custom/home/llm_usage.json"
+
+
+def test_usage_file_world_readable_under_strict_umask(tmp_path, monkeypatch):
+    """issue #85：宿主 proxy 在 UMask=0077 下落盘，账本必须显式 0644，
+    容器 webui（uid=1000）才读得到；内容无密钥，放宽是安全的。"""
+    usage_file = tmp_path / "llm_usage.json"
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    monkeypatch.setattr(llm_usage, "_STATE", None)
+    monkeypatch.setattr(llm_usage, "_STATE_DAY", "")
+    old_umask = os.umask(0o077)
+    try:
+        llm_usage.record({"prompt": 1, "completion": 2, "total": 3})
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(usage_file.stat().st_mode) == 0o644
+    data = json.loads(usage_file.read_text(encoding="utf-8"))
+    assert data["total"] == 3
+
 
 def test_getters_bounds(monkeypatch):
     monkeypatch.setenv("FNMUSIC_LLM_PROTOCOL", "RESPONSES")
