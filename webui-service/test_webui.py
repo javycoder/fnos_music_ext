@@ -1780,6 +1780,20 @@ def test_organize_endpoint_placeholder(env_file, method, path, payload):
     assert env_file.read_bytes() == before
 
 
+def test_download_layout_enum_roundtrip_rejects_invalid_values(env_file, svctl):
+    with authed_client() as client:
+        for layout in ("flat", "artist", "album", "artist_album"):
+            response = client.put("/api/config", json={"values": {"FNMUSIC_DOWNLOAD_LAYOUT": layout}})
+            assert response.status_code == 200
+            assert response.json()["actions"] == []
+            assert client.get("/api/config").json()["values"]["FNMUSIC_DOWNLOAD_LAYOUT"] == layout
+        before = env_file.read_bytes()
+        response = client.put("/api/config", json={"values": {"FNMUSIC_DOWNLOAD_LAYOUT": "../escape"}})
+        assert response.status_code == 400
+        assert env_file.read_bytes() == before
+    assert svctl.calls == []
+
+
 def test_cleanup_beta_markup():
     html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
     tee = html.split('id="page-tee"', 1)[1].split("</section>", 1)[0]

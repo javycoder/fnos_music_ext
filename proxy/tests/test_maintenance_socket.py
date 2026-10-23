@@ -22,6 +22,13 @@ def request(method="POST", target=m.CLEANUP_PATH, body=b'{"confirm_beta":true}',
             + extra + b"\r\n" + body)
 
 
+@pytest.mark.parametrize("layout", [[], {}, None, 1, "../escape"])
+def test_organize_body_rejects_invalid_layout_type(layout):
+    with pytest.raises(ValueError, match="confirmation"):
+        m._validate_body("POST", m.ORGANIZE_PATH,
+                         {"confirm_beta": True, "root": "/music", "layout": layout})
+
+
 async def exchange(path, raw):
     reader, writer = await asyncio.open_unix_connection(str(path))
     writer.write(raw)

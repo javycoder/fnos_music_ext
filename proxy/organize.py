@@ -251,13 +251,17 @@ def _database_metadata(runtime) -> dict[str, tuple[str, str]]:
 def _detail(job: dict, category: str, action: str, path: str, reason: str) -> None:
     if len(job["details"]) < DETAIL_LIMIT:
         job["details"].append({"category": category, "action": action,
-                               "path": path, "reason": reason})
+                               "path": _limited(path), "reason": _limited(reason)})
+
+
+def _limited(value: str) -> str:
+    return str(value).encode("utf-8")[:768].decode("utf-8", errors="ignore")
 
 
 def _error(job: dict, category: str, path: str, exc: Exception) -> None:
     job["failed"] += 1
     if len(job["errors"]) < DETAIL_LIMIT:
-        job["errors"].append({"category": category, "path": path, "error": str(exc)[:500]})
+        job["errors"].append({"category": category, "path": _limited(path), "error": _limited(str(exc))})
 
 
 def _scan(root: str, job: dict) -> tuple[list[dict], dict[str, list[str]]]:
@@ -312,8 +316,14 @@ def _refs(runtime) -> list[tuple[str, str]]:
                 if not name.endswith(".ref"):
                     continue
                 try:
-                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+                    before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if not stat.S_ISREG(before.st_mode):
+                        continue
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory)
                     with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                        if _identity(os.fstat(handle.fileno())) != _identity(before):
+                            continue
                         stem = handle.read(8192).strip()
                     if os.path.isabs(stem):
                         result.append((os.path.join(cache, name), os.path.realpath(stem)))
@@ -342,6 +352,16 @@ def _write_ref(path: str, stem: str) -> None:
                 os.unlink(temporary, dir_fd=directory)
             except FileNotFoundError:
                 pass
+
+
+def _read_ref(path: str) -> str:
+    with _directory(os.path.dirname(path)) as directory:
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW |
+                     os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OSError("引用不是普通文件")
+            return handle.read(8192).strip()
 
 
 def _journal(path: str | None, event: dict) -> None:
@@ -389,8 +409,8 @@ def _move_group(source_audio: str, companions: list[str], target_directory: str,
             created[target] = _stat(target)
         _journal(journal, {**record, "state": "installed"})
         for ref_path, old, new in updates:
-            _write_ref(ref_path, new)
             rewritten.append((ref_path, old, new))
+            _write_ref(ref_path, new)
         for source, _ in targets:
             _remove_owned(source, snapshots[source])
             removed.append(source)
@@ -410,9 +430,9 @@ def _move_group(source_audio: str, companions: list[str], target_directory: str,
                     recovery_errors.append(str(exc))
         for ref_path, old, new in rewritten:
             try:
-                if all(os.path.exists(source) for source in removed):
+                if all(os.path.exists(source) for source in removed) and _read_ref(ref_path) != old:
                     _write_ref(ref_path, old)
-            except OSError as exc:
+            except (OSError, UnicodeError) as exc:
                 recovery_errors.append(str(exc))
         for source, target in targets:
             if target in created and not recovery_errors:
@@ -433,8 +453,12 @@ def _same_bytes(left: str, right: str) -> bool:
     try:
         for path in (left, right):
             with _directory(os.path.dirname(path)) as directory:
-                fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-            handles.append(os.fdopen(fd, "rb"))
+                fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW |
+                             os.O_NONBLOCK, dir_fd=directory)
+            handle = os.fdopen(fd, "rb")
+            handles.append(handle)
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OSError("图片不是普通文件")
         return _digest(handles[0]) == _digest(handles[1])
     finally:
         for handle in handles:
@@ -445,7 +469,7 @@ def _copy_cover(source: str, target: str, job: dict, root: str) -> None:
     if source == target:
         return
     if os.path.lexists(target):
-        if os.path.islink(target) or not _same_bytes(source, target):
+        if not stat.S_ISREG(_stat(target).st_mode) or not _same_bytes(source, target):
             job["skipped"] += 1
             _detail(job, "cover", "skipped", source, f"目标已有不同内容，保留原图片: {target}")
         return
@@ -569,6 +593,11 @@ async def run_organize(runtime, job: dict) -> None:
                 _detail(job, "move", "skipped", path, str(exc))
             except Exception as exc:
                 _error(job, "move", path, exc)
+            finally:
+                try:
+                    runtime.localmatch.reset_caches()
+                except AttributeError:
+                    pass
 
         job["phase"] = "处理封面"
         for directory, paths in covers.items():

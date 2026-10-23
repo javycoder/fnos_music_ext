@@ -115,3 +115,56 @@ async def test_organize_confirmation_conflict_dedup_and_status(tmp_path, monkeyp
     _, result = await runtime._maintenance_request(
         "GET", "/api/maintenance/organize/" + first["job"]["id"], {})
     assert result["job"]["status"] == "completed"
+
+
+def test_organize_refuses_unavailable_explicit_directory_and_cache_fallback(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(cache))
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", str(tmp_path / "missing"))
+    monkeypatch.setattr(runtime, "detect_library_dir", lambda: str(cache))
+    with pytest.raises(ValueError, match="不可用"):
+        runtime._organize_target()
+    assert not (tmp_path / "missing").exists()
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", "")
+    with pytest.raises(ValueError, match="缓存目录"):
+        runtime._organize_target()
+
+
+@pytest.mark.anyio
+async def test_organize_and_cleanup_exclude_each_other_and_job_keeps_snapshot(tmp_path, monkeypatch):
+    gate = asyncio.Event()
+
+    async def run(rt, job):
+        await gate.wait()
+
+    monkeypatch.setitem(sys.modules, "proxy.organize", types.SimpleNamespace(run_organize=run))
+    monkeypatch.setattr(runtime, "_organize_jobs", {})
+    monkeypatch.setattr(runtime, "_organize_task", None)
+    monkeypatch.setattr(runtime, "_last_organize_job", None)
+    monkeypatch.setattr(runtime, "_maintenance_task", None)
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", str(tmp_path))
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(tmp_path.parent / "cache"))
+    monkeypatch.setitem(runtime.CONF, "download_layout", "artist")
+    body = {"confirm_beta": True, "root": str(tmp_path), "layout": "artist"}
+    cleanup = asyncio.create_task(gate.wait())
+    monkeypatch.setattr(runtime, "_maintenance_task", cleanup)
+    try:
+        assert (await runtime._maintenance_request(
+            "POST", "/api/maintenance/organize", body))[0] == 409
+    finally:
+        cleanup.cancel()
+        await asyncio.gather(cleanup, return_exceptions=True)
+    _, response = await runtime._maintenance_request("POST", "/api/maintenance/organize", body)
+    task = runtime._organize_task
+    try:
+        assert (await runtime._maintenance_request(
+            "POST", "/api/maintenance/cleanup", {"confirm_beta": True}))[0] == 409
+        monkeypatch.setitem(runtime.CONF, "download_layout", "album")
+        _, current = await runtime._maintenance_request(
+            "GET", "/api/maintenance/organize/" + response["job"]["id"], {})
+        assert current["job"]["root"] == str(tmp_path)
+        assert current["job"]["layout"] == "artist"
+    finally:
+        gate.set()
+        await task

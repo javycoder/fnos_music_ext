@@ -754,6 +754,13 @@ def _migrate_media_refs(old_dir: str, new_dir: str) -> int:
 
 
 def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
+    # Cache-root changes must move .ref records after an in-flight organization
+    # group has published its new paths, never halfway through that group.
+    with _LIBRARY_FILE_LOCK:
+        return _apply_env_hot_reload(env_path)
+
+
+def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     """解析 .env 应用白名单键；返回变化的 CONF 键（仅环境项返回环境键）。
 
     先验证再同步环境原始字符串；recommend 等模块直接读 os.environ。
@@ -1054,8 +1061,15 @@ async def _env_watch_loop() -> None:
             settled = _env_watch_stat()
             if settled != cur:
                 continue  # 仍在写入，下一轮再看
-            last = settled
-            changed = apply_env_hot_reload()
+            # A large audio copy must not block the event loop while waiting
+            # for its thread lock. Retry this same file revision next tick.
+            if not _LIBRARY_FILE_LOCK.acquire(blocking=False):
+                continue
+            try:
+                changed = apply_env_hot_reload()
+                last = settled
+            finally:
+                _LIBRARY_FILE_LOCK.release()
             if changed:
                 _reset_search_cache()
                 _refresh_recommend_config(changed)
@@ -1793,6 +1807,11 @@ def _path_stem(path: str) -> str:
 
 def remember_media_path(guid: str, media_path: str) -> None:
     """记住曲库里的文件词干（不含扩展名），音频和 .lrc 共用。"""
+    with _LIBRARY_FILE_LOCK:
+        _remember_media_path_locked(guid, media_path)
+
+
+def _remember_media_path_locked(guid: str, media_path: str) -> None:
     stem = _path_stem(media_path)
     try:
         os.makedirs(CONF["cache_dir"], exist_ok=True)
@@ -4368,7 +4387,10 @@ async def _lyric_orphan_sweeper() -> None:
             for d in (tee_save_dir(), detect_library_dir()):
                 if d and d not in dirs and d != CONF["cache_dir"]:
                     dirs.append(d)
-            removed = await asyncio.to_thread(sweep_orphan_lyrics, CONF["cache_dir"], dirs)
+            def sweep_locked():
+                with _LIBRARY_FILE_LOCK:
+                    return sweep_orphan_lyrics(CONF["cache_dir"], dirs)
+            removed = await asyncio.to_thread(sweep_locked)
             if removed:
                 logger.info("orphan lyric sweep removed %d file(s): %s", len(removed), removed)
         except asyncio.CancelledError:

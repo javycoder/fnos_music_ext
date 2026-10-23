@@ -211,3 +211,113 @@ def test_move_waits_for_file_lock_without_blocking_event_loop(tmp_path, monkeypa
 
     asyncio.run(run())
     assert (root / "artist" / audio.name).exists()
+
+
+def test_reference_replaced_before_fsync_failure_is_rolled_back(tmp_path, monkeypatch):
+    root, cache, audio, runtime = setup_audio(tmp_path)
+    reference = cache / "track.ref"
+    original = str(audio.with_suffix(""))
+    reference.write_text(original)
+    write = organize._write_ref
+    calls = []
+
+    def fail_after_replace(path, value):
+        write(path, value)
+        calls.append(value)
+        if len(calls) == 1:
+            raise OSError("injected directory fsync failure after ref replacement")
+
+    monkeypatch.setattr(organize, "_write_ref", fail_after_replace)
+    with pytest.raises(OSError, match="fsync failure"):
+        organize._move_group(str(audio), [], str(root), organize._refs(runtime), str(root))
+    assert audio.read_bytes() == b"audio bytes"
+    assert reference.read_text() == original
+    assert not (root / audio.name).exists()
+    assert calls == [str((root / audio.name).with_suffix("")), original]
+
+
+def test_reference_scan_skips_fifo_and_symlink(tmp_path):
+    root, cache, audio, runtime = setup_audio(tmp_path)
+    os.mkfifo(cache / "fifo.ref")
+    (cache / "symlink.ref").symlink_to(audio)
+    assert organize._refs(runtime) == []
+
+
+def test_special_files_never_enter_copy_or_cover_comparison(tmp_path):
+    root, cache, audio, runtime = setup_audio(tmp_path)
+    fifo = root / "cover.jpg"
+    os.mkfifo(fifo)
+    with pytest.raises(OSError, match="source changed"):
+        organize._install_copy(str(fifo), str(root / "copied.jpg"), fifo.stat(), str(root))
+    cover = audio.with_name("cover.jpg")
+    cover.write_bytes(b"cover")
+    current = job(root, "flat")
+    organize._copy_cover(str(cover), str(fifo), current, str(root))
+    assert current["skipped"] == 1
+    assert cover.read_bytes() == b"cover"
+
+
+def test_path_caches_are_invalidated_between_groups(tmp_path, monkeypatch):
+    root, cache, audio, runtime = setup_audio(tmp_path, "one.mp3")
+    audio.with_name("two.mp3").write_bytes(b"two")
+    invalidations = []
+    runtime.localmatch.reset_caches = lambda: invalidations.append(True)
+    metadata_calls = []
+
+    def metadata(path):
+        if metadata_calls:
+            assert invalidations, "first group must invalidate paths before second group"
+        metadata_calls.append(path)
+        return "artist", "album"
+
+    monkeypatch.setattr(organize, "_tag_metadata", metadata)
+    current = job(root, "artist")
+    asyncio.run(organize.run_organize(runtime, current))
+    assert current["moved"] == 2 and current["failed"] == 0
+
+
+def test_activity_started_after_scan_prevents_move(tmp_path, monkeypatch):
+    root, cache, audio, runtime = setup_audio(tmp_path)
+    monkeypatch.setattr(organize, "_tag_metadata", lambda _: ("artist", "album"))
+    checks = iter((False, True))
+    monkeypatch.setattr(organize, "_busy", lambda *args: next(checks))
+    current = job(root, "artist")
+    asyncio.run(organize.run_organize(runtime, current))
+    assert current["moved"] == 0 and current["skipped"] == 1
+    assert audio.read_bytes() == b"audio bytes"
+
+
+def test_cache_hot_reload_waits_for_group_before_copying_references(tmp_path, monkeypatch):
+    from proxy import app
+
+    root, cache, audio, runtime = setup_audio(tmp_path)
+    new_cache = tmp_path / "new-cache"
+    reference = cache / "known.ref"
+    reference.write_text(str(audio.with_suffix("")))
+    env = tmp_path / ".env"
+    env.write_text(f"FNMUSIC_CACHE_DIR={new_cache}\n")
+    monkeypatch.setitem(app.CONF, "cache_dir", str(cache))
+    monkeypatch.setenv("FNMUSIC_CACHE_DIR", str(cache))
+    entered, release = threading.Event(), threading.Event()
+    new_stem = str(root / "new-song")
+
+    def migration_group():
+        with app._LIBRARY_FILE_LOCK:
+            entered.set()
+            assert release.wait(5)
+            organize._write_ref(str(reference), new_stem)
+
+    async def run():
+        group = asyncio.create_task(asyncio.to_thread(migration_group))
+        assert await asyncio.to_thread(entered.wait, 2)
+        reload = asyncio.create_task(asyncio.to_thread(app.apply_env_hot_reload, str(env)))
+        try:
+            await asyncio.sleep(0.02)
+            assert not reload.done()
+            assert app.CONF["cache_dir"] == str(cache)
+        finally:
+            release.set()
+        await asyncio.gather(group, reload)
+
+    asyncio.run(run())
+    assert (new_cache / "known.ref").read_text() == new_stem

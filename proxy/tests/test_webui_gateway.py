@@ -367,6 +367,14 @@ def test_maintenance_requires_only_explicit_confirmation(tmp_path, body):
     assert _request(sock, _maintenance_request(body=body)).startswith(b"HTTP/1.1 400")
 
 
+@pytest.mark.parametrize("layout", [[], {}, None, 1, "../escape"])
+def test_organize_invalid_layout_is_rejected_before_socket(tmp_path, layout):
+    sock = _start_gateway(tmp_path, 1)
+    body = json.dumps({"confirm_beta": True, "root": "/music", "layout": layout}).encode()
+    assert _request(sock, _maintenance_request(
+        path="/api/maintenance/organize", body=body)).startswith(b"HTTP/1.1 400")
+
+
 @pytest.mark.parametrize("method,path", [
     ("GET", "/api/maintenance/cleanup/" + "g" * 32),
     ("GET", "/api/maintenance/cleanup/" + "a" * 31),
