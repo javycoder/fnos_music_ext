@@ -73,3 +73,39 @@ async def test_expired_resolution_failure_never_returns_old_link(monkeypatch):
     with pytest.raises(service.HTTPException) as error:
         await service._direct_resolve_entry("kuwo:1")
     assert error.value.status_code == 502
+
+
+def test_selected_background_stream_never_resolves_or_changes_encoding(monkeypatch):
+    monkeypatch.setattr(service, "_INTERNAL_TOKEN", "fixture-secret")
+    monkeypatch.setattr(service, "_DIRECT_SELECTIONS", {})
+    async def resolve(_song):
+        return {"ts": service.time.time(), "item": {
+            "id": "kuwo:1", "download_url": "https://cdn.example/original.flac", "ext": "flac",
+        }, "download_headers": {"Referer": "https://source.example"}}
+    monkeypatch.setattr(service, "_direct_resolve_entry", resolve)
+    opened = []
+    class Upstream:
+        status_code = 200
+        headers = {"Content-Type": "audio/flac"}
+        def iter_content(self, _size):
+            yield b"selected bytes"
+        def close(self):
+            pass
+    async def fetch(url, headers):
+        opened.append((url, headers))
+        return Upstream()
+    monkeypatch.setattr(service, "_fetch_upstream_stream", fetch)
+    with TestClient(service.app) as client:
+        headers = {"X-Internal-Token": "fixture-secret"}
+        selected = client.get("/internal/resolve", params={"id": "kuwo:1"}, headers=headers).json()
+        async def forbidden(*_args):
+            raise AssertionError("selected stream must not resolve again")
+        monkeypatch.setattr(service, "_direct_resolve_entry", forbidden)
+        stream = client.get("/internal/stream", params={"selection": selected["selection_id"]}, headers=headers)
+        assert stream.content == b"selected bytes"
+        assert opened == [("https://cdn.example/original.flac", {
+            "Referer": "https://source.example", "Accept-Encoding": "identity"})]
+        denied = client.get("/internal/stream", params={"selection": selected["selection_id"]})
+        assert denied.status_code == 503
+        expired = client.get("/internal/stream", params={"selection": "unknown"}, headers=headers)
+        assert expired.status_code == 409

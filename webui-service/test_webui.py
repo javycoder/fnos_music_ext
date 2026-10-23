@@ -176,13 +176,15 @@ def test_put_hot_keys_roundtrip_preserves_custom(env_file):
     assert env_file.with_name(env_file.name + ".webui.bak").stat().st_mode & 0o777 == 0o600  # 备份含密钥，与 .env 同权限
 
 
-def test_put_direct_play_keys_are_independent_hot_settings(env_file, svctl):
+@pytest.mark.parametrize("combination", range(8))
+def test_put_direct_play_keys_are_independent_hot_settings(env_file, svctl, combination):
+    expected = {
+        key: bool(combination & (1 << index))
+        for index, key in enumerate((
+            "FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"))
+    }
     with authed_client() as client:
-        r = client.put("/api/config", json={"values": {
-            "FNMUSIC_NETEASE_DIRECT_PLAY": True,
-            "FNMUSIC_MUSICDL_DIRECT_PLAY": "yes",
-            "FNMUSIC_LX_DIRECT_PLAY": False,
-        }})
+        r = client.put("/api/config", json={"values": expected})
         assert r.status_code == 200
         assert set(r.json()["changed"]) == {
             "FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"
@@ -190,9 +192,7 @@ def test_put_direct_play_keys_are_independent_hot_settings(env_file, svctl):
         assert r.json()["actions"] == []
         assert svctl.calls == []
         values = webui.read_env()
-        assert values["FNMUSIC_NETEASE_DIRECT_PLAY"] == "true"
-        assert values["FNMUSIC_MUSICDL_DIRECT_PLAY"] == "true"
-        assert values["FNMUSIC_LX_DIRECT_PLAY"] == "false"
+        assert all(values[key] == str(value).lower() for key, value in expected.items())
 
 
 def test_put_noop_returns_empty_change(env_file):

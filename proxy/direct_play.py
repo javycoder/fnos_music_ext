@@ -1,6 +1,7 @@
 """State for short-lived direct-play targets."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -22,6 +23,7 @@ class DirectMediaTarget:
     expiry_source: str = "unknown"
     source_generation: int = 0
     representation_key: str = ""
+    selection_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class DirectTargetBindings:
     def __init__(self, max_entries: int = 512):
         self.max_entries = max_entries
         self._entries: dict[str, DirectPlayBinding] = {}
+        self._known: dict[str, None] = {}
 
     def get(self, scope: str, guid: str) -> DirectPlayBinding | None:
         key = f"{scope}\0{guid}"
@@ -44,32 +47,66 @@ class DirectTargetBindings:
         if binding is None:
             return None
         if time.monotonic() >= binding.expires_at or binding.generation != binding.target.source_generation:
+            self._entries.pop(key, None)
             return None
         return binding
 
     def known(self, scope: str, guid: str) -> bool:
-        return f"{scope}\0{guid}" in self._entries
+        return f"{scope}\0{guid}" in self._known
+
+    def forget(self, scope: str, guid: str) -> None:
+        key = f"{scope}\0{guid}"
+        self._entries.pop(key, None)
+        self._known.pop(key, None)
 
     def put(self, scope: str, guid: str, target: DirectMediaTarget, generation: int, ttl: float) -> DirectPlayBinding:
         now = time.monotonic()
         self.invalidate_source(target.provider, generation)
+        for expired in [key for key, value in self._entries.items() if value.expires_at <= now]:
+            self._entries.pop(expired, None)
         binding = DirectPlayBinding(target, min(now + max(0.0, ttl), target.reuse_deadline), generation)
-        self._entries[f"{scope}\0{guid}"] = binding
-        if len(self._entries) > self.max_entries:
-            expired = [key for key, value in self._entries.items() if value.expires_at <= now]
-            for key in expired:
-                self._entries.pop(key, None)
-            while len(self._entries) > self.max_entries:
-                oldest = min(self._entries, key=lambda key: self._entries[key].expires_at)
-                self._entries.pop(oldest)
+        key = f"{scope}\0{guid}"
+        self._entries[key] = binding
+        self._known.pop(key, None)
+        self._known[key] = None
+        while len(self._known) > self.max_entries:
+            oldest = next(iter(self._known))
+            self._known.pop(oldest, None)
+            self._entries.pop(oldest, None)
         return binding
 
     def invalidate_source(self, provider: str, generation: int) -> None:
         for key in list(self._entries):
             binding = self._entries[key]
             if binding.target.provider == provider and binding.generation != generation:
-                self._entries[key] = DirectPlayBinding(binding.target, 0.0, binding.generation)
+                self._entries.pop(key, None)
 
 
-def target_still_valid(target: DirectMediaTarget, *, provider: str, generation: int) -> bool:
-    return target.provider == provider and target.source_generation == generation
+class FileTargetBindings:
+    def __init__(self, max_entries: int = 512):
+        self.max_entries = max_entries
+        self._entries: dict[tuple[str, str], tuple] = {}
+
+    @staticmethod
+    def fingerprint(path: str) -> tuple:
+        stat = os.stat(path)
+        return path, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    def remember(self, scope: str, guid: str, path: str) -> None:
+        key = (scope, guid)
+        self._entries.pop(key, None)
+        self._entries[key] = (time.monotonic() + 300.0, self.fingerprint(path))
+        while len(self._entries) > self.max_entries:
+            self._entries.pop(next(iter(self._entries)), None)
+
+    def forget(self, scope: str, guid: str) -> None:
+        self._entries.pop((scope, guid), None)
+
+    def matches(self, scope: str, guid: str, path: str | None = None) -> bool:
+        entry = self._entries.get((scope, guid))
+        if entry is None or entry[0] <= time.monotonic():
+            return False
+        try:
+            return entry[1] == self.fingerprint(path or entry[1][0])
+        except OSError:
+            return False

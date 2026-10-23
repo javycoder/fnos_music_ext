@@ -1291,6 +1291,17 @@ def fresh_url_cache():
     lxapp._CHAIN_HEALTH.clear()
 
 
+def test_track_url_description_reports_remaining_cache_lifetime(test_app_client, fresh_url_cache):
+    lxapp._URL_CACHE[("lx:kw:123", "lossless")] = {
+        "data": {"url": "https://cdn.example/fixture.flac", "ext": "flac"},
+        "ts": lxapp.time.monotonic() - float(lxapp.CONF["url_cache_ttl"]) + 8,
+    }
+    response = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:123"})
+    assert response.status_code == 200
+    assert 0 < response.json()["data"]["reuse_for_s"] <= 8
+    assert response.json()["data"]["expiry_source"] == "policy"
+
+
 def test_track_url_success_cache_reuses_resolution(test_app_client, fresh_url_cache, fake_lx):
     """同曲同音质连续请求：第二次命中缓存，音源仅解析一次（issue #45 主诉求）。"""
     orig_client = lxapp.app.state.client

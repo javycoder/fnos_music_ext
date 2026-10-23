@@ -6,7 +6,7 @@ import httpx
 
 from fastapi import FastAPI, Request
 
-from proxy.direct_play import DirectMediaTarget, DirectTargetBindings
+from proxy.direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
 from proxy.media_url import MediaURLDecision
 
 from proxy import app as proxy_app
@@ -72,6 +72,8 @@ def configure_direct(monkeypatch):
     monkeypatch.setitem(proxy_app.CONF, "lx_enabled", True)
     monkeypatch.setitem(proxy_app.CONF, "lx_direct_play", True)
     monkeypatch.setattr(proxy_app, "_DIRECT_TARGET_BINDINGS", DirectTargetBindings(max_entries=8))
+    monkeypatch.setattr(proxy_app, "_DIRECT_FILE_BINDINGS", FileTargetBindings(max_entries=8))
+    monkeypatch.setattr(proxy_app, "_DIRECT_PLAY_GENERATIONS", dict(proxy_app._DIRECT_PLAY_GENERATIONS))
     monkeypatch.setattr(proxy_app, "_source_enabled", lambda _guid: True)
     async def auth(_request):
         return True
@@ -176,8 +178,10 @@ async def test_old_range_cannot_fall_through_to_another_representation(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_head_cache_has_priority_over_direct_resolver(monkeypatch):
+async def test_head_cache_has_priority_over_direct_resolver(monkeypatch, tmp_path):
     configure_direct(monkeypatch)
+    cached = tmp_path / "audio.flac"
+    cached.write_bytes(b"temporary fixture")
     async def no_local(*_args):
         return None
     async def cached_head(*_args):
@@ -185,7 +189,7 @@ async def test_head_cache_has_priority_over_direct_resolver(monkeypatch):
     async def forbidden(*_args):
         raise AssertionError("cached HEAD must not resolve a CDN URL")
     monkeypatch.setattr(proxy_app, "resolve_local_play", no_local)
-    monkeypatch.setattr(proxy_app, "find_cache_file", lambda *_args, **_kwargs: "/cache/audio.flac")
+    monkeypatch.setattr(proxy_app, "find_cache_file", lambda *_args, **_kwargs: str(cached))
     monkeypatch.setattr(proxy_app, "_stream_head_response", cached_head)
     monkeypatch.setattr(proxy_app, "_resolve_direct_target", forbidden)
     response = await proxy_app.stream_track(make_request("HEAD"), "online:lx:kg:1")
@@ -238,6 +242,73 @@ async def test_direct_save_is_deduplicated_and_retains_target(monkeypatch):
     assert received == [selected]
     release.set()
     await asyncio.gather(*proxy_app._full_fetch_tasks.values())
+
+
+def test_hot_reload_changes_direct_generation_and_handles_boolean_aliases(monkeypatch, tmp_path):
+    monkeypatch.setattr(proxy_app, "_DIRECT_PLAY_GENERATIONS", {"netease": 0, "musicdl": 0, "lx": 0})
+    monkeypatch.setattr(proxy_app, "_DIRECT_TARGET_BINDINGS", DirectTargetBindings())
+    monkeypatch.setitem(proxy_app.CONF, "lx_direct_play", False)
+    config = tmp_path / "direct.env"
+    config.write_text("FNMUSIC_LX_DIRECT_PLAY=ON\n")
+    proxy_app.apply_env_hot_reload(str(config))
+    assert proxy_app.CONF["lx_direct_play"] is True
+    assert proxy_app._DIRECT_PLAY_GENERATIONS["lx"] == 1
+    config.write_text("FNMUSIC_LX_DIRECT_PLAY=false\n")
+    proxy_app.apply_env_hot_reload(str(config))
+    assert proxy_app.CONF["lx_direct_play"] is False
+    assert proxy_app._DIRECT_PLAY_GENERATIONS["lx"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "track_"])
+async def test_registered_path_guid_is_resolved_before_direct_policy(monkeypatch, prefix):
+    configure_direct(monkeypatch)
+    monkeypatch.setattr(proxy_app, "_FAKE_GUID_REVERSE", {"a" * 32: "online:lx:kg:1"})
+    async def no_local(*_args):
+        return None
+    monkeypatch.setattr(proxy_app, "resolve_local_play", no_local)
+    monkeypatch.setattr(proxy_app, "find_cache_file", lambda *_args, **_kwargs: None)
+    response = await proxy_app.stream_track(make_request("HEAD"), prefix + "a" * 32)
+    assert response.status_code == 302
+
+
+@pytest.mark.asyncio
+async def test_hls_stub_never_enters_direct_resolution(monkeypatch):
+    configure_direct(monkeypatch)
+    request = make_request()
+    request.scope["query_string"] = b"_ext_hls_stub=1"
+    assert await proxy_app._direct_redirect_response(request, "online:lx:kg:1") is None
+    assert b"_ext_hls_stub=1" in proxy_app._legacy_hls_stub("online:lx:kg:1", {}).body
+
+
+@pytest.mark.asyncio
+async def test_disabled_direct_policy_returns_to_existing_stream_path(monkeypatch):
+    configure_direct(monkeypatch)
+    monkeypatch.setitem(proxy_app.CONF, "lx_direct_play", False)
+    assert await proxy_app._direct_redirect_response(make_request(), "online:lx:kg:1") is None
+
+
+@pytest.mark.asyncio
+async def test_evicted_direct_target_cannot_switch_range_to_new_cache(monkeypatch, tmp_path):
+    configure_direct(monkeypatch)
+    monkeypatch.setattr(proxy_app, "_DIRECT_TARGET_BINDINGS", DirectTargetBindings(max_entries=1))
+    await proxy_app._direct_redirect_response(make_request(), "online:lx:kg:1")
+    await proxy_app._direct_redirect_response(make_request(), "online:lx:kg:2")
+    cached = tmp_path / "tagged.flac"
+    cached.write_bytes(b"different representation")
+    monkeypatch.setattr(proxy_app, "find_cache_file", lambda *_args, **_kwargs: str(cached))
+    response = await proxy_app.stream_track(make_request(headers={"Range": "bytes=99-"}), "online:lx:kg:1")
+    assert response.status_code == 409
+
+
+def test_file_range_binding_rejects_rewritten_audio(tmp_path):
+    bindings = FileTargetBindings()
+    path = tmp_path / "audio.flac"
+    path.write_bytes(b"original")
+    bindings.remember("user", "song", str(path))
+    assert bindings.matches("user", "song", str(path))
+    path.write_bytes(b"rewritten tags and bytes")
+    assert not bindings.matches("user", "song", str(path))
 
 
 @pytest.mark.asyncio

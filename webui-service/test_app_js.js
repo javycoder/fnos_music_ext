@@ -1778,13 +1778,33 @@ test("播放直连：新后端回填、收集并可兼容旧 schema", async () =
   assert.ok(!("FNMUSIC_DOWNLOAD_LAYOUT" in vm.runInThisContext("collectConfig()")));
 });
 
-test("帮助弹窗：打开、回焦、关闭且不修改配置", async () => {
+test("播放直连：八种组合与手工布尔别名独立回填", async () => {
+  const keys = ["FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"];
+  const schema = Object.fromEntries(keys.map((key) => [key, {}]));
+  for (let combination = 0; combination < 8; combination += 1) {
+    const expected = keys.map((key, index) => Boolean(combination & (1 << index)));
+    const aliases = ["YES", "1", "on"];
+    const values = Object.fromEntries(keys.map((key, index) => [key, expected[index] ? aliases[index] : "false"]));
+    enqueue("/app/fnmusic-ext/api/config", { values, schema });
+    await global.loadConfig();
+    const result = vm.runInThisContext("collectConfig()");
+    assert.deepStrictEqual(keys.map((key) => result[key]), expected);
+  }
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, true);
+  assert.ok(!("FNMUSIC_NETEASE_DIRECT_PLAY" in vm.runInThisContext("collectConfig()")));
+});
+
+test("帮助弹窗：滚动恢复、焦点往返且不标脏", async () => {
   const template = stubEl();
   template.dataset.helpId = "direct-play";
   global.helpTemplates = [template];
   els.get("#help-modal").hidden = true;
   const trigger = stubEl();
   trigger.getAttribute = () => "播放直连帮助";
+  document.body.style.overflow = "auto";
+  const before = vm.runInThisContext("dirty");
   global.openHelp("direct-play", trigger);
   assert.strictEqual(els.get("#help-modal").hidden, false);
   assert.strictEqual(els.get("#help-title").textContent, "播放直连");
@@ -1792,9 +1812,10 @@ test("帮助弹窗：打开、回焦、关闭且不修改配置", async () => {
   assert.strictEqual(document.body.style.overflow, "hidden");
   global.closeHelp();
   assert.strictEqual(els.get("#help-modal").hidden, true);
-  assert.strictEqual(document.body.style.overflow, "");
+  assert.strictEqual(document.body.style.overflow, "auto");
   assert.strictEqual(els.get("#help-body")._children.length, 0);
   assert.strictEqual(document.activeElement, trigger);
+  assert.strictEqual(vm.runInThisContext("dirty"), before);
 });
 
 const ORGANIZE_PATH = "/app/fnmusic-ext/api/maintenance/organize";

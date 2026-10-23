@@ -19,6 +19,11 @@ def resolver(address):
         ("https://[::1]/a.mp3", "host_not_public"),
         ("https://169.254.169.254/a.mp3", "host_not_public"),
         ("https://100.64.0.1/a.mp3", "host_not_public"),
+        ("https://[::ffff:127.0.0.1]/a.mp3", "host_not_public"),
+        ("https://[fe80::1]/a.mp3", "host_not_public"),
+        ("file:///music/a.mp3", "invalid_scheme"),
+        ("https://media.example.com/a\r\nLocation:evil", "control_characters"),
+        ("https://media.example.com\\@127.0.0.1/a", "ambiguous_url"),
     ],
 )
 def test_rejects_unsafe_targets(url, reason):
@@ -39,3 +44,11 @@ def test_accepts_https_public_dns_answers():
     )
     assert decision.ok
     assert decision.host == "media.example.com"
+
+
+def test_mixed_public_and_private_dns_answers_are_rejected():
+    decision = validate_media_url(
+        "https://media.example.com/a.flac",
+        resolver=lambda *_: resolver("93.184.216.34") + resolver("192.168.1.1"),
+    )
+    assert decision.reason == "resolved_address_not_public"

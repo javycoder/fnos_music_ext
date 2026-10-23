@@ -9,12 +9,12 @@
 !proxy/
 proxy/*
 !proxy/__init__.py
+!proxy/direct_play.py
 !proxy/env_merge.py
 !proxy/fnlog.py
 !proxy/publicplaylists.py
 !proxy/version.py
 !proxy/llm_usage.py
-!proxy/direct_play.py
 !proxy/media_url.py
 **/__pycache__/
 **/*.pyc

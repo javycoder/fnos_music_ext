@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,7 @@ def _startup_internal_token() -> str:
 
 _INTERNAL_TOKEN = _startup_internal_token()
 _DIRECT_RESOLVE_INFLIGHT: dict[tuple, asyncio.Task] = {}
+_DIRECT_SELECTIONS: dict[str, dict] = {}
 
 CONF = {
     "sources": _CONF_SOURCES,
@@ -437,7 +439,8 @@ async def _resolve_entry(song_id: str, auto_refresh: bool = True):
 
 def _internal_authorized(x_internal_token: str | None) -> bool:
     supplied = str(x_internal_token or "").strip()
-    return bool(_INTERNAL_TOKEN and supplied and hmac.compare_digest(supplied, _INTERNAL_TOKEN))
+    return bool(_INTERNAL_TOKEN and supplied and hmac.compare_digest(
+        supplied.encode("utf-8"), _INTERNAL_TOKEN.encode("utf-8")))
 
 
 async def _direct_resolve_entry(song_id: str) -> dict:
@@ -455,7 +458,8 @@ async def _direct_resolve_entry(song_id: str) -> dict:
             if entry["item"].get("download_url") and time.time() - entry["ts"] < CONF["url_ttl"]:
                 return entry
             refreshed = await asyncio.wait_for(_refresh_by_keyword(song_id), timeout=16.0)
-            if not refreshed or not refreshed["item"].get("download_url"):
+            if (not refreshed or not refreshed["item"].get("download_url")
+                    or time.time() - refreshed["ts"] >= CONF["url_ttl"]):
                 raise HTTPException(502, "direct resolution failed")
             return refreshed
 
@@ -539,6 +543,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        direct_tasks = [task for task in _DIRECT_RESOLVE_INFLIGHT.values()
+                        if task.get_loop() is asyncio.get_running_loop()]
+        for task in direct_tasks:
+            task.cancel()
+        if direct_tasks:
+            await asyncio.gather(*direct_tasks, return_exceptions=True)
         await SINGLE_FLIGHT.aclose()
         try:
             await SOURCE_WORKERS.aclose()
@@ -877,8 +887,8 @@ async def internal_resolve(
     if not url:
         raise HTTPException(502, "playable URL unavailable")
     now = time.time()
-    reuse_deadline = now + max(1.0, float(CONF["url_ttl"]) - max(0.0, now - float(entry.get("ts") or now)))
-    return {
+    reuse_deadline = now + max(0.0, float(CONF["url_ttl"]) - max(0.0, now - float(entry.get("ts") or now)))
+    description = {
         "ok": True,
         "provider": "musicdl",
         "platform": str(item.get("source") or ""),
@@ -894,3 +904,43 @@ async def internal_resolve(
         "upstream_expires_at": None,
         "expiry_source": "policy",
     }
+    for selection in list(_DIRECT_SELECTIONS):
+        if _DIRECT_SELECTIONS[selection]["reuse_deadline"] <= now:
+            _DIRECT_SELECTIONS.pop(selection, None)
+    while len(_DIRECT_SELECTIONS) >= 512:
+        _DIRECT_SELECTIONS.pop(next(iter(_DIRECT_SELECTIONS)))
+    selection = secrets.token_urlsafe(24)
+    description["selection_id"] = selection
+    _DIRECT_SELECTIONS[selection] = description
+    return description
+
+
+@app.get("/internal/stream")
+async def internal_stream(
+    selection: str = Query(..., min_length=1),
+    x_internal_token: str | None = Header(None, alias="X-Internal-Token"),
+):
+    if not _internal_authorized(x_internal_token):
+        raise HTTPException(503, "internal authentication unavailable")
+    selected = _DIRECT_SELECTIONS.get(selection)
+    if selected is None or selected["reuse_deadline"] <= time.time():
+        raise HTTPException(409, "selection expired; restart required")
+    headers = {key: value for key, value in selected["server_headers"].items() if key.lower() != "range"}
+    headers["Accept-Encoding"] = "identity"
+    try:
+        upstream = await _fetch_upstream_stream(selected["url"], headers)
+    except Exception:
+        raise HTTPException(502, "selected media unavailable") from None
+    if upstream.status_code != 200:
+        upstream.close()
+        raise HTTPException(502, "selected media unavailable")
+    output = {key: value for key, value in upstream.headers.items()
+              if key.lower() in ("content-type", "content-length", "content-encoding")}
+
+    def body():
+        try:
+            yield from upstream.iter_content(256 * 1024)
+        finally:
+            upstream.close()
+
+    return StreamingResponse(body(), headers=output)

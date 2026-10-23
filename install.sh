@@ -1186,8 +1186,10 @@ WEBUI_FLAG="false"
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
 INTERNAL_TOKEN="$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[2]); from proxy.env_merge import parse_env_file; print(dict(parse_env_file(Path(sys.argv[1]))[0]).get("FNMUSIC_INTERNAL_TOKEN", ""))' "${ENV_PATH}" "${BASE_DIR}")"
+INTERNAL_TOKEN_GENERATED=0
 if [ -z "${INTERNAL_TOKEN}" ]; then
     INTERNAL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    INTERNAL_TOKEN_GENERATED=1
 fi
 
 # 逗号分隔 URL → LX_SOURCE_LIST JSON（[{name,url,active:true},...]，name 取 URL 尾段，装好后可在 WebUI 改名）
@@ -1260,6 +1262,9 @@ ENV_DESIRED="$(mktemp)"
 
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
+if [ "${INTERNAL_TOKEN_GENERATED}" -eq 1 ]; then
+    ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_INTERNAL_TOKEN"
+fi
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
 # lx 源种子（校验通过后会再写一次推导出的 LX_SOURCE_LIST/LX_SOURCES）
 [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_LIST,LX_SOURCE_URL"

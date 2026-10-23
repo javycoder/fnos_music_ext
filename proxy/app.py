@@ -40,7 +40,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 
 try:
     from . import recommend as dailyrec
-    from .direct_play import DirectMediaTarget, DirectTargetBindings
+    from .direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
     from . import localrecommend as localrec
     from . import localmatch
     from .organize import target_dir as layout_target_dir, safe_part as safe_layout_part
@@ -56,7 +56,7 @@ try:
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
-    from direct_play import DirectMediaTarget, DirectTargetBindings  # type: ignore
+    from direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
     from organize import target_dir as layout_target_dir, safe_part as safe_layout_part
@@ -129,9 +129,9 @@ CONF = {
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
-    "netease_direct_play": os.environ.get("FNMUSIC_NETEASE_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes"),
-    "musicdl_direct_play": os.environ.get("FNMUSIC_MUSICDL_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes"),
-    "lx_direct_play": os.environ.get("FNMUSIC_LX_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes"),
+    "netease_direct_play": os.environ.get("FNMUSIC_NETEASE_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
+    "musicdl_direct_play": os.environ.get("FNMUSIC_MUSICDL_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
+    "lx_direct_play": os.environ.get("FNMUSIC_LX_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
@@ -557,9 +557,9 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
-    "FNMUSIC_NETEASE_DIRECT_PLAY": ("netease_direct_play", "bool"),
-    "FNMUSIC_MUSICDL_DIRECT_PLAY": ("musicdl_direct_play", "bool"),
-    "FNMUSIC_LX_DIRECT_PLAY": ("lx_direct_play", "bool"),
+    "FNMUSIC_NETEASE_DIRECT_PLAY": ("netease_direct_play", "direct_bool"),
+    "FNMUSIC_MUSICDL_DIRECT_PLAY": ("musicdl_direct_play", "direct_bool"),
+    "FNMUSIC_LX_DIRECT_PLAY": ("lx_direct_play", "direct_bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
     "LX_SOURCE_URL": ("lx_source_url", "str"),
@@ -633,6 +633,8 @@ def _env_watch_path() -> str:
 
 def _env_watch_parse(raw: str, kind: str):
     raw = str(raw or "").strip()
+    if kind == "direct_bool":
+        return raw.lower() in ("true", "1", "yes", "on")
     if kind in ("bool", "strict_bool"):
         if kind == "strict_bool" and raw.lower() not in ("true", "1", "yes", "false", "0", "no", ""):
             return None
@@ -832,6 +834,7 @@ _DIRECT_PLAY_CONF_KEYS = {
 }
 _DIRECT_PLAY_GENERATIONS = {provider: 0 for provider in _DIRECT_PLAY_CONF_KEYS}
 _DIRECT_TARGET_BINDINGS = DirectTargetBindings()
+_DIRECT_FILE_BINDINGS = FileTargetBindings()
 _LIKED_TASKS: dict[str, asyncio.Task] = {}
 _LIKED_WAKEUP: asyncio.Event | None = None
 _LIKED_BUILD_LOCK: asyncio.Lock | None = None
@@ -6271,7 +6274,7 @@ async def _strict_direct_play_auth(request: Request) -> bool:
     try:
         probe = get_upstream_client(request.app).build_request(
             "GET", "/music/api/v1/user/me", headers=copy_incoming_headers(request))
-        response = await get_upstream_client(request.app).send(probe)
+        response = await asyncio.wait_for(get_upstream_client(request.app).send(probe), timeout=4.0)
         try:
             payload = response.json()
         except Exception:
@@ -6298,6 +6301,13 @@ def _pin_deadline(value: float | None) -> float:
     if not value:
         return time.monotonic() + 60.0
     return value
+
+
+def _direct_internal_token() -> str:
+    token = os.environ.get("FNMUSIC_INTERNAL_TOKEN", "").strip()
+    if not token:
+        token = str(dict(parse_env_file(_env_watch_path())[0]).get("FNMUSIC_INTERNAL_TOKEN") or "").strip()
+    return token
 
 
 async def _resolve_direct_target(request: Request, guid: str, source: str) -> DirectMediaTarget:
@@ -6330,15 +6340,14 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
         quality = str(resolved.get("actual_tier") or resolved.get("quality") or "")
         return DirectMediaTarget(
             provider=provider, platform=(guid.split(":")[2:3] or [""])[0], canonical_id=song_id,
-            url=str(resolved["url"]), server_headers=_lx_media_headers(resolved), ext=ext,
+            url=str(resolved["url"]), protocol=str(resolved.get("protocol") or "https"),
+            server_headers=_lx_media_headers(resolved), ext=ext,
             actual_quality=quality, resolved_at=now,
             reuse_deadline=_pin_deadline(pin[1] if pin else None), expiry_source="policy",
             source_generation=generation, representation_key=_representation_key(resolved["url"], ext, quality),
         )
 
-    token = os.environ.get("FNMUSIC_INTERNAL_TOKEN", "").strip()
-    if not token:
-        token = str(dict(parse_env_file(_env_watch_path())[0]).get("FNMUSIC_INTERNAL_TOKEN") or "").strip()
+    token = _direct_internal_token()
     if not token:
         raise PermissionError("internal_authentication_missing")
     response = await get_musicdl_client(request.app).get(
@@ -6367,7 +6376,8 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
     deadline = float(payload.get("reuse_deadline") or 0.0)
     return DirectMediaTarget(
         provider=provider, platform=str(payload.get("platform") or ""), canonical_id=str(payload.get("canonical_id") or ""),
-        url=str(payload["url"]), server_headers=dict(payload.get("server_headers") or {}), ext=ext,
+        url=str(payload["url"]), protocol=str(payload.get("protocol") or "https"),
+        server_headers=dict(payload.get("server_headers") or {}), ext=ext,
         actual_quality=quality, file_size=file_size,
         resolved_at=float(payload.get("resolved_at") or now),
         reuse_deadline=deadline - time.time() + time.monotonic(),
@@ -6375,6 +6385,7 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
         expiry_source=str(payload.get("expiry_source") or "unknown"),
         source_generation=generation,
         representation_key=_representation_key(payload["url"], ext, quality, payload.get("canonical_id")),
+        selection_id=str(payload.get("selection_id") or ""),
     )
 
 
@@ -6387,6 +6398,31 @@ def _direct_scope(request: Request) -> str:
     return _representation_key(_credential_scope(request), request.headers.get("authx", "")
                                if not any(request.headers.get(key) for key in (
                                    "cookie", "authorization", "x-trim-music-temp-token")) else "")
+
+
+def _direct_source_config() -> str:
+    return json.dumps([_source_config(), CONF.get("quality_mode"), CONF.get("lx_source_list")],
+                      sort_keys=True, default=str)
+
+
+def _direct_file_response_guard(request: Request, guid: str, path: str) -> Response | None:
+    if request.query_params.get("_ext_hls_stub") == "1":
+        return None
+    source = source_from_online_guid(guid)
+    provider = source if source in ("netease", "lx") else "musicdl"
+    if not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]):
+        return None
+    scope = _direct_scope(request)
+    if _nonzero_range(request.headers.get("range")):
+        if not _DIRECT_FILE_BINDINGS.matches(scope, guid, path):
+            return _direct_error(409, "range_identity_unavailable")
+    else:
+        try:
+            _DIRECT_FILE_BINDINGS.remember(scope, guid, path)
+        except OSError:
+            return _direct_error(409, "file_identity_unavailable")
+        _DIRECT_TARGET_BINDINGS.forget(scope, guid)
+    return None
 
 
 def _direct_error(status: int, reason: str) -> JSONResponse:
@@ -6415,7 +6451,7 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
         fn_diag(logger, "direct_rejected", guid=guid, reason="source_unavailable")
         return _direct_error(503, "source_unavailable")
     generation = _DIRECT_PLAY_GENERATIONS[provider]
-    config = _source_config()
+    config = _direct_source_config()
     if not await _strict_direct_play_auth(request):
         fn_diag(logger, "direct_rejected", guid=guid, reason="authorization_failed")
         return _direct_error(401, "authorization_failed")
@@ -6427,6 +6463,9 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
         if binding is None:
             fn_diag(logger, "direct_rejected", guid=guid, reason="range_identity_unavailable")
             return _direct_error(409, "range_identity_unavailable")
+        decision = await asyncio.to_thread(validate_media_url, binding.target.url)
+        if not decision.ok:
+            return _direct_error(502, decision.reason)
     elif binding is None:
         try:
             target = await _resolve_direct_target(request, guid, source)
@@ -6441,14 +6480,20 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
             return _direct_error(409, "generation_changed")
         if target.reuse_deadline <= time.monotonic():
             return _direct_error(502, "target_expired")
+        if target.ext.lower() in ("m3u8", "m3u") or target.protocol.lower() in ("hls", "m3u8"):
+            return _direct_error(502, "original_file_required")
         decision = await asyncio.to_thread(validate_media_url, target.url)
         if not decision.ok:
             fn_diag(logger, "direct_rejected", guid=guid, reason=decision.reason, host=decision.host)
             return _direct_error(502, decision.reason)
+        if (generation != _DIRECT_PLAY_GENERATIONS[provider] or config != _direct_source_config()
+                or not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]) or not _source_enabled(guid)):
+            return _direct_error(409, "generation_changed")
         binding = _DIRECT_TARGET_BINDINGS.put(
             scope, guid, target, generation,
             min(300.0, target.reuse_deadline - time.monotonic()),
         )
+        _DIRECT_FILE_BINDINGS.forget(scope, guid)
     else:
         decision = await asyncio.to_thread(validate_media_url, binding.target.url)
         if not decision.ok:
@@ -6456,7 +6501,7 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
             return _direct_error(502, decision.reason)
 
     if (not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]) or _DIRECT_PLAY_GENERATIONS[provider] != generation
-            or config != _source_config() or not _source_enabled(guid)):
+            or config != _direct_source_config() or not _source_enabled(guid)):
         fn_diag(logger, "direct_rejected", guid=guid, reason="disabled_after_resolve")
         return _direct_error(409, "disabled_after_resolve")
     if time.monotonic() >= binding.expires_at:
@@ -6542,7 +6587,19 @@ async def _open_direct_save(request: Request, guid: str, target: DirectMediaTarg
     try:
         headers = {**target.server_headers, "Accept-Encoding": "identity"}
         headers = {key: value for key, value in headers.items() if key.lower() != "range"}
-        response = await owned.send(owned.build_request("GET", target.url, headers=headers), stream=True)
+        if target.provider == "musicdl":
+            if not target.selection_id or not _direct_internal_token():
+                return None
+            await owned.aclose()
+            owned = None
+            client = get_musicdl_client(request.app)
+            outgoing = client.build_request(
+                "GET", "/internal/stream", params={"selection": target.selection_id},
+                headers={"X-Internal-Token": _direct_internal_token()})
+        else:
+            client = owned
+            outgoing = client.build_request("GET", target.url, headers=headers)
+        response = await client.send(outgoing, stream=True)
         content_type = response.headers.get("content-type", "").lower()
         if (response.status_code != 200 or any(value in content_type for value in ("text/", "json"))
                 or response.headers.get("content-encoding", "identity").lower() not in ("", "identity")):
@@ -7583,15 +7640,28 @@ async def stream_track(request: Request, subpath: str = ""):
     if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
             and _DIRECT_TARGET_BINDINGS.known(_direct_scope(request), guid)):
         return await _direct_redirect_response(request, guid)
+    source = source_from_online_guid(guid)
+    provider = source if source in ("netease", "lx") else "musicdl"
+    if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
+            and CONF.get(_DIRECT_PLAY_CONF_KEYS[provider])
+            and not _DIRECT_FILE_BINDINGS.matches(_direct_scope(request), guid)):
+        return _direct_error(409, "range_identity_unavailable")
     if request.method == "HEAD":
         local_head = await resolve_local_play(request, guid)
         if local_head is not None:
+            guarded = _direct_file_response_guard(request, guid, local_head["path"])
+            if guarded is not None:
+                return guarded
             head = _local_head_response(guid, local_head, range_header)
             if head is not None:
+                fn_diag(logger, "direct_bypassed", guid=guid, reason="local_hit")
                 return head
         range_header = _sanitize_stale_local_range(guid, range_header)
         cached = find_cache_file(guid, playback=True)
         if cached:
+            guarded = _direct_file_response_guard(request, guid, cached)
+            if guarded is not None:
+                return guarded
             fn_diag(logger, "direct_bypassed", guid=guid, reason="cache_hit")
             return await _stream_head_response(request, guid, cached, range_header)
         direct = await _direct_redirect_response(request, guid)
@@ -7601,14 +7671,22 @@ async def stream_track(request: Request, subpath: str = ""):
     # 本地曲库命中优先于普通试听缓存（规格）：命中且可播则完全不触在线链路
     local = await resolve_local_play(request, guid)
     if local is not None:
+        guarded = _direct_file_response_guard(request, guid, local["path"])
+        if guarded is not None:
+            return guarded
         local_resp = await _serve_local_stream(guid, local, range_header)
         if local_resp is not None:
+            fn_diag(logger, "direct_bypassed", guid=guid, reason="local_hit")
             return local_resp
     # 本地起播失败或因故障跳过：客户端续拉偏移可能指向本地布局，不能套到在线文件上
     range_header = _sanitize_stale_local_range(guid, range_header)
     cached = find_cache_file(guid, playback=True)
     log_stream_probe(request.method, guid, range_header, bool(cached))
     if cached:
+        guarded = _direct_file_response_guard(request, guid, cached)
+        if guarded is not None:
+            return guarded
+        fn_diag(logger, "direct_bypassed", guid=guid, reason="cache_hit")
         if request.method != "HEAD" and _is_deferred_cache_file(guid, cached):
             # 元数据缺失暂存 cache 的曲目（issue #52）：重播时补齐元数据转正进曲库。
             # retained/headers 在请求上下文内先取好，重活放后台任务不阻塞出流。
