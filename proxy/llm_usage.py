@@ -1,9 +1,13 @@
 """每日大模型 token 记账与限额（issue #83）。
 
-状态文件 llm_usage.json（0600 原子写）按日记录 prompt/completion/total
+状态文件 llm_usage.json（0644 原子写）按日记录 prompt/completion/total
 token 与请求数、最近一次失败原因；跨日读取自动清零。proxy 推荐链路在每次
 LLM 调用前查额度、响应后记账，WebUI 管理页读取展示。纯 stdlib，记账失败
 绝不阻断推荐。
+
+宿主 proxy 以 root（UMask=0077）写、容器 webui 以 uid=1000 只读同一账本
+（issue #85）：路径靠 WEBUI_REPO_DIR 对齐到 /repo，权限靠显式 chmod 0644
+放宽——内容只有当日日期、token 计数与截断后的失败摘要，不含任何密钥。
 """
 from __future__ import annotations
 
@@ -25,6 +29,10 @@ def _state_path() -> str:
     if env:
         return env
     home = (os.environ.get("FNMUSIC_HOME") or "").strip()
+    if not home:
+        # 容器内 webui 没有 FNMUSIC_HOME：宿主仓库挂载在 /repo，
+        # WEBUI_REPO_DIR 是定位宿主 proxy 所写账本的唯一线索（issue #85）。
+        home = (os.environ.get("WEBUI_REPO_DIR") or "").strip()
     if not home:
         home = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     return os.path.join(home, "llm_usage.json")
@@ -81,7 +89,9 @@ def _save(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False)
         os.replace(part, path)
         try:
-            os.chmod(path, 0o600)
+            # 显式 0644 而非 0600：宿主 proxy 在 UMask=0077 下写出的账本必须
+            # 保持全局可读，容器 webui（uid=1000）才读得到（issue #85）。
+            os.chmod(path, 0o644)
         except OSError:
             pass
     except OSError:

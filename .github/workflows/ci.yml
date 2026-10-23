@@ -107,11 +107,20 @@ jobs:
           fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
           test -s "$fpk_file"
           test -s "${fpk_file}.sha256"
-          # fpk 为 tar.gz，内层 app.tgz + cmd/config/wizard/manifest/ICON 齐全
-          tar -tzf "$fpk_file" | grep -E '^app\.tgz$'
-          tar -tzf "$fpk_file" | grep -E '^cmd/main$'
-          tar -tzf "$fpk_file" | grep -E '^manifest$'
-          tar -tzf "$fpk_file" | grep -E '^ICON\.PNG$'
+          # fpk 为 tar.gz；app.tgz 承载 target/ 内容，应用骨架留在 fpk 顶层。
+          for path in app.tgz cmd/main config/privilege config/resource \
+            wizard/install manifest ICON.PNG ICON_256.PNG; do
+            tar -tzf "$fpk_file" | grep -qx "$path" || {
+              echo "ERROR: fpk 缺少顶层 $path" >&2; exit 1; }
+          done
+          app_tmp="$(mktemp -d)"
+          trap 'rm -rf "$app_tmp"' EXIT
+          tar -xzf "$fpk_file" -C "$app_tmp" app.tgz
+          for path in ui/config ui/images/icon_64.png ui/images/icon_256.png \
+            config/privilege config/resource repo/proxy/llm_usage.py; do
+            tar -tzf "$app_tmp/app.tgz" | grep -qx "$path" || {
+              echo "ERROR: app.tgz 缺少 $path" >&2; exit 1; }
+          done
           ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
 
 
@@ -199,6 +208,27 @@ jobs:
             sleep 1
           done
           test "$ready" = 1
+      - name: Verify WebUI startup and healthz
+        if: matrix.arch == 'x64'
+        run: |
+          mkdir -p /tmp/fnrepo-webui
+          printf '%s\n' 'FNMUSIC_WEBUI_ENABLED=true' > /tmp/fnrepo-webui/.env
+          name="fnmusic-ci-webui"
+          cleanup() { docker logs "$name" 2>&1 | tail -100; docker rm -f "$name"; }
+          trap cleanup EXIT
+          docker run -d --name "$name" --network none \
+            -v /tmp/fnrepo-webui:/repo fnmusic-sources:ci
+          docker exec "$name" test -s /srv/proxy/llm_usage.py
+          docker exec -w /srv/webui-service "$name" python -c 'import app'
+          ready=0
+          for attempt in $(seq 1 40); do
+            if docker exec "$name" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8004/healthz", timeout=2)'; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1 || { echo "ERROR: WebUI 未就绪"; exit 1; }
       - name: Smoke lxmusic chain on ${{ matrix.platform }}
         run: |
           mkdir -p /tmp/fnrepo

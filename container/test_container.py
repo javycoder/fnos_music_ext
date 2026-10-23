@@ -2,6 +2,7 @@
 
 不依赖 docker：entrypoint 用假的 supervisord/supervisorctl 走真 shell 逻辑。
 """
+import ast
 import configparser
 import os
 import re
@@ -385,6 +386,30 @@ def test_dockerignore_whitelist_build_context():
         assert keep in code_lines
 
 
+def _imported_proxy_modules(path: Path, *, relative_to_proxy: bool = False) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = alias.name.split(".")
+                if parts[0] == "proxy" and len(parts) > 1:
+                    modules.add(parts[1])
+        elif isinstance(node, ast.ImportFrom):
+            if relative_to_proxy and node.level == 1:
+                if node.module:
+                    modules.add(node.module.split(".")[0])
+                else:
+                    modules.update(alias.name for alias in node.names)
+            elif node.module:
+                parts = node.module.split(".")
+                if parts[0] == "proxy" and len(parts) > 1:
+                    modules.add(parts[1])
+                elif parts[0] == "proxy":
+                    modules.update(alias.name for alias in node.names)
+    return modules
+
+
 def test_dockerfile_copies_proxy_modules_imported_by_services():
     """镜像内服务允许 import proxy.*（webui 复用 .env 安全合并）。
 
@@ -395,15 +420,32 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
     ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
-    assert "proxy/publicplaylists.py" in copied
-    assert "!proxy/publicplaylists.py" in ignore
+    required = {"publicplaylists"}
+    origins: dict[str, str] = {"publicplaylists": "动态导入（proxy/app.py）"}
     for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
             # 测试文件（test_*/conftest）不进镜像、不随服务运行：其跨目录 import
             # （如 lxmusic 测试比对 proxy 的 UA 常量）不构成镜像依赖
             if py.name.startswith("test_") or py.name == "conftest.py":
                 continue
-            for m in re.finditer(r"^\s*from proxy\.([A-Za-z_][\w]*)", py.read_text(encoding="utf-8"), re.M):
-                mod = f"proxy/{m.group(1)}.py"
-                assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"
-                assert f"!{mod}" in ignore, f"{mod} 被 .dockerignore 排除，构建上下文拿不到"
+            for module_name in _imported_proxy_modules(py):
+                required.add(module_name)
+                origins.setdefault(module_name, f"{service_dir}/{py.name}")
+
+    pending = set(required)
+    while pending:
+        module_name = pending.pop()
+        proxy_file = REPO_ROOT / "proxy" / f"{module_name}.py"
+        if not proxy_file.is_file():
+            continue
+        for dependency in _imported_proxy_modules(proxy_file, relative_to_proxy=True):
+            if dependency not in required:
+                required.add(dependency)
+                origins.setdefault(dependency, f"proxy/{module_name}.py")
+                pending.add(dependency)
+
+    for module_name in sorted(required):
+        module = f"proxy/{module_name}.py"
+        origin = origins[module_name]
+        assert module in copied, f"{origin} 依赖 {module}，Dockerfile 需 COPY 进镜像"
+        assert f"!{module}" in ignore, f"{origin} 依赖 {module}，.dockerignore 需放行构建上下文"

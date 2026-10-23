@@ -5,7 +5,7 @@
 !lxmusic-service/
 !webui-service/
 !container/
-# webui 复用 .env 安全合并模块：只放行这两个文件（目录先放行再收窄，父目录被排除时无法重新包含）
+# 服务复用的公共 proxy 模块逐文件放行（目录先放行再收窄，父目录被排除时无法重新包含）
 !proxy/
 proxy/*
 !proxy/__init__.py
@@ -13,6 +13,7 @@ proxy/*
 !proxy/fnlog.py
 !proxy/publicplaylists.py
 !proxy/version.py
+!proxy/llm_usage.py
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/
