@@ -82,3 +82,36 @@ def test_failed_cover_write_cleans_actual_temp(tmp_path, monkeypatch, kind):
     else:
         runtime._cover_guid_url_persist("online:kuwo:test", "https://example.invalid/cover")
     assert list((tmp_path / "covers").iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_organize_confirmation_conflict_dedup_and_status(tmp_path, monkeypatch):
+    gate = asyncio.Event()
+
+    async def organize_run(rt, job):
+        assert rt is runtime
+        await gate.wait()
+        job["moved"] = 1
+
+    monkeypatch.setitem(sys.modules, "proxy.organize",
+                        types.SimpleNamespace(run_organize=organize_run))
+    monkeypatch.setattr(runtime, "_organize_jobs", {})
+    monkeypatch.setattr(runtime, "_organize_task", None)
+    monkeypatch.setattr(runtime, "_last_organize_job", None)
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", str(tmp_path))
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(tmp_path.parent / "cache"))
+    monkeypatch.setitem(runtime.CONF, "download_layout", "artist_album")
+    body = {"confirm_beta": True, "root": str(tmp_path), "layout": "artist_album"}
+    assert (await runtime._maintenance_request(
+        "POST", "/api/maintenance/organize", {**body, "layout": "flat"}))[0] == 409
+    _, first = await runtime._maintenance_request("POST", "/api/maintenance/organize", body)
+    _, second = await runtime._maintenance_request("POST", "/api/maintenance/organize", body)
+    assert first["job"]["id"] == second["job"]["id"]
+    _, current = await runtime._maintenance_request("GET", "/api/maintenance/organize", {})
+    assert current["root"] == str(tmp_path)
+    assert current["layout"] == "artist_album"
+    gate.set()
+    await runtime._organize_task
+    _, result = await runtime._maintenance_request(
+        "GET", "/api/maintenance/organize/" + first["job"]["id"], {})
+    assert result["job"]["status"] == "completed"

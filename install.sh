@@ -1185,6 +1185,10 @@ WEBUI_FLAG="false"
 # 三源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
+INTERNAL_TOKEN="$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[2]); from proxy.env_merge import parse_env_file; print(dict(parse_env_file(Path(sys.argv[1]))[0]).get("FNMUSIC_INTERNAL_TOKEN", ""))' "${ENV_PATH}" "${BASE_DIR}")"
+if [ -z "${INTERNAL_TOKEN}" ]; then
+    INTERNAL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+fi
 
 # 逗号分隔 URL → LX_SOURCE_LIST JSON（[{name,url,active:true},...]，name 取 URL 尾段，装好后可在 WebUI 改名）
 lx_source_list_json() {
@@ -1208,6 +1212,9 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"
     echo "FNMUSIC_MUSICDL_ENABLED='${MUSICDL_FLAG}'"
     echo "FNMUSIC_NETEASE_ENABLED='${MUSICBOX_FLAG}'"
+    echo "FNMUSIC_NETEASE_DIRECT_PLAY='false'"
+    echo "FNMUSIC_MUSICDL_DIRECT_PLAY='false'"
+    echo "FNMUSIC_LX_DIRECT_PLAY='false'"
     echo "FNMUSIC_MUSICDL_URL='http://127.0.0.1:8768'"
     echo "FNMUSIC_MUSICBOX_URL='http://127.0.0.1:8770'"
     if [ "${MDL_EXPLICIT}" -eq 1 ]; then
@@ -1219,9 +1226,11 @@ ENV_DESIRED="$(mktemp)"
     fi
     echo "FNMUSIC_TEE_SAVE_ENABLED='true'"
     echo "FNMUSIC_TEE_SAVE_DIR=''"
+    echo "FNMUSIC_DOWNLOAD_LAYOUT='flat'"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
+    if [ -n "${INTERNAL_TOKEN}" ]; then echo "FNMUSIC_INTERNAL_TOKEN='$(dotenv_escape "${INTERNAL_TOKEN}")'"; fi
     if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ]; then
         # 源种子（全部标记激活）：容器首启/重启时按此自愈恢复多源激活；
         # LX_SOURCE_URL 为派生兼容字段 = 第一个激活源

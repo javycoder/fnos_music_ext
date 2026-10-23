@@ -18,7 +18,7 @@ function stubEl() {
   const listeners = {};
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
-    checked: false, disabled: false, src: "", dataset: {}, _t: null,
+    checked: false, disabled: false, src: "", dataset: {}, _t: null, style: {},
     classList: {
       add(...c) { c.forEach((x) => classes.add(x)); },
       remove(...c) { c.forEach((x) => classes.delete(x)); },
@@ -31,6 +31,7 @@ function stubEl() {
     },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
     appendChild(child) { (this._children = this._children || []).push(child); return child; },
+    replaceChildren(...children) { this._children = children; },
     removeChild(child) { return child; },
     remove() {},
     // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
@@ -48,6 +49,7 @@ function stubEl() {
       this.disabled = false; this.src = ""; this.dataset = {}; this._t = null;
     },
     querySelectorAll() { return []; },
+    get content() { return { cloneNode: () => ({ nodeName: "help-content" }) }; },
   };
 }
 
@@ -58,6 +60,10 @@ const qsaRegistry = new Map();
 
 global.document = {
   querySelector(sel) {
+    if (sel.startsWith("template[data-help-id=")) {
+      const wanted = sel.slice('template[data-help-id="'.length, -2);
+      return (global.helpTemplates || []).find((tpl) => tpl.dataset.helpId === wanted) || null;
+    }
     if (!els.has(sel)) els.set(sel, stubEl());
     return els.get(sel);
   },
@@ -134,6 +140,7 @@ function reset() {
   els.forEach((el) => el._resetState && el._resetState());
   routes = new Map();
   fetchCalls.length = 0;
+  global.helpTemplates = [];
 }
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
@@ -1733,6 +1740,166 @@ test("已选名称：瞬时失败缓存到期可恢复，不永久保留失败",
   await global.ensurePublicSelectionDetails();
   assert.strictEqual(fetchCalls.length, 2);
   assert.ok(els.get("#public-selected").innerHTML.includes("到期恢复"));
+});
+
+test("播放直连：新后端回填、收集并可兼容旧 schema", async () => {
+  const schema = {
+    FNMUSIC_NETEASE_DIRECT_PLAY: {},
+    FNMUSIC_MUSICDL_DIRECT_PLAY: {},
+    FNMUSIC_LX_DIRECT_PLAY: {},
+    FNMUSIC_DOWNLOAD_LAYOUT: {},
+  };
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_NETEASE_DIRECT_PLAY: "true",
+    FNMUSIC_MUSICDL_DIRECT_PLAY: "false",
+    FNMUSIC_LX_DIRECT_PLAY: "true",
+    FNMUSIC_DOWNLOAD_LAYOUT: "artist_album",
+  }, schema });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, false);
+  assert.strictEqual(els.get("#direct-netease").checked, true);
+  assert.strictEqual(els.get("#direct-musicdl").checked, false);
+  assert.strictEqual(els.get("#direct-lx").checked, true);
+  let collected = vm.runInThisContext("collectConfig()");
+  assert.strictEqual(els.get("#download-layout").disabled, false);
+  assert.strictEqual(collected.FNMUSIC_DOWNLOAD_LAYOUT, "artist_album");
+  assert.deepStrictEqual(
+    ["FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"].map(key => collected[key]),
+    [true, false, true]
+  );
+
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, true);
+  assert.strictEqual(els.get("#direct-musicdl").disabled, true);
+  assert.strictEqual(els.get("#direct-lx").disabled, true);
+  assert.ok(!("FNMUSIC_NETEASE_DIRECT_PLAY" in vm.runInThisContext("collectConfig()")));
+  assert.strictEqual(els.get("#download-layout").disabled, true);
+  assert.ok(!("FNMUSIC_DOWNLOAD_LAYOUT" in vm.runInThisContext("collectConfig()")));
+});
+
+test("帮助弹窗：打开、回焦、关闭且不修改配置", async () => {
+  const template = stubEl();
+  template.dataset.helpId = "direct-play";
+  global.helpTemplates = [template];
+  els.get("#help-modal").hidden = true;
+  const trigger = stubEl();
+  trigger.getAttribute = () => "播放直连帮助";
+  global.openHelp("direct-play", trigger);
+  assert.strictEqual(els.get("#help-modal").hidden, false);
+  assert.strictEqual(els.get("#help-title").textContent, "播放直连");
+  assert.deepStrictEqual(els.get("#help-body")._children, [{ nodeName: "help-content" }]);
+  assert.strictEqual(document.body.style.overflow, "hidden");
+  global.closeHelp();
+  assert.strictEqual(els.get("#help-modal").hidden, true);
+  assert.strictEqual(document.body.style.overflow, "");
+  assert.strictEqual(els.get("#help-body")._children.length, 0);
+  assert.strictEqual(document.activeElement, trigger);
+});
+
+const ORGANIZE_PATH = "/app/fnmusic-ext/api/maintenance/organize";
+function resetOrganize() {
+  vm.runInThisContext("clearTimeout(organizeTimer); organizeTimer=null; organizeJob=null; organizeInfo=null; organizeConfirmation=null;");
+  els.get("#organize-modal").hidden = true;
+}
+
+test("下载存放方式：新 schema 回填保存，旧 schema 不提交未知字段", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { FNMUSIC_DOWNLOAD_LAYOUT: "artist_album" },
+    schema: { FNMUSIC_DOWNLOAD_LAYOUT: {} },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#download-layout").value, "artist_album");
+  assert.strictEqual(els.get("#download-layout").disabled, false);
+  els.get("#download-layout").value = "album";
+  assert.strictEqual(global.collectConfig().FNMUSIC_DOWNLOAD_LAYOUT, "album");
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#download-layout").disabled, true);
+  assert.ok(!("FNMUSIC_DOWNLOAD_LAYOUT" in global.collectConfig()));
+});
+
+const organizeResponse = (status, extra = {}) => ({ ok: true, root: "/vol1/music", layout: "flat", job: {
+  id: "organize-1", status, phase: "scan", layout: "flat", scanned: 3, moved: 2,
+  unchanged: 1, skipped: 0, failed: 0, errors: [], details: [], ...extra,
+} });
+
+test("整理 Beta：目录或方式未保存时不弹窗、不提交", async () => {
+  reset();
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_TEE_SAVE_DIR: "/vol1/new", FNMUSIC_DOWNLOAD_LAYOUT: "artist",
+  } });
+  await global.loadConfig();
+  enqueue(ORGANIZE_PATH, { ok: true, root: "/vol1/music", layout: "flat", job: null });
+  els.get("#organize-modal").hidden = true;
+  await global.openOrganizeModal();
+  assert.strictEqual(els.get("#organize-modal").hidden, true);
+  const posts = fetchCalls.filter((call) => call.path === ORGANIZE_PATH && call.method === "POST");
+  assert.strictEqual(posts.length, 0);
+});
+
+test("整理 Beta：显示实际目录和风险，确认提交并提示重扫", async () => {
+  reset();
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  enqueue(ORGANIZE_PATH, { ...organizeResponse("running"), job: null });
+  els.get("#organize-modal").hidden = true;
+  await global.openOrganizeModal();
+  assert.strictEqual(els.get("#organize-modal").hidden, false);
+  assert.ok(els.get("#organize-warning").textContent.includes("/vol1/music"));
+  assert.ok(els.get("#organize-warning").textContent.includes("可能导致歌曲暂时无法播放"));
+  assert.strictEqual(document.activeElement, els.get("#organize-cancel-btn"));
+  enqueue(ORGANIZE_PATH, organizeResponse("running"));
+  const first = global.startOrganize();
+  await global.startOrganize();
+  await first;
+  const posts = fetchCalls.filter((call) => call.path === ORGANIZE_PATH && call.method === "POST");
+  assert.strictEqual(posts.length, 1);
+  assert.deepStrictEqual(JSON.parse(posts[0].body), {
+    confirm_beta: true, root: "/vol1/music", layout: "flat",
+  });
+  assert.ok(els.get("#organize-status").textContent.includes("整理中"));
+  enqueue(ORGANIZE_PATH + "/organize-1", organizeResponse("completed", { moved: 2 }));
+  await tick(1100);
+  assert.ok(els.get("#organize-status").textContent.includes("请在飞牛音乐中重新扫描曲库"));
+});
+
+test("整理 Beta：检测表单未保存编辑及取消，不提交任务", async () => {
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  for (const [field, edited] of [["#download-layout", "artist"], ["#dir-download", "/new"]]) {
+    const input = els.get(field);
+    const old = input.value;
+    input.value = edited;
+    enqueue(ORGANIZE_PATH, { ok: true, root: "/vol1/music", layout: "flat", job: null });
+    await global.openOrganizeModal();
+    assert.strictEqual(els.get("#organize-modal").hidden, true);
+    input.value = old;
+  }
+  enqueue(ORGANIZE_PATH, { ok: true, root: "/vol1/music", layout: "flat", job: null });
+  await global.openOrganizeModal();
+  assert.strictEqual(els.get("#organize-modal").hidden, false);
+  global.closeOrganizeModal();
+  await global.startOrganize();
+  assert.strictEqual(fetchCalls.filter(call => call.method === "POST").length, 0);
+});
+
+test("整理 Beta：刷新恢复及重复点击只查询已有任务", async () => {
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  enqueue(ORGANIZE_PATH, organizeResponse("running"));
+  await global.loadOrganizeStatus();
+  enqueue(ORGANIZE_PATH + "/organize-1", organizeResponse("completed"));
+  await global.openOrganizeModal();
+  await tick(5);
+  assert.strictEqual(fetchCalls.filter(call => call.method === "POST").length, 0);
+  assert.strictEqual(els.get("#organize-modal").hidden, true);
+  assert.ok(els.get("#organize-status").textContent.includes("整理完成"));
+  resetOrganize();
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

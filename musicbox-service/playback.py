@@ -238,11 +238,16 @@ async def get_song_url_async(song_id: int, quality: str, fresh: bool = False) ->
     task = _tasks.get(key)
     if task is None or task.done():
         if not fresh and cached and cached[1] > time.monotonic():
-            return cached[0]
+            return {**cached[0], "reuse_for_s": max(0.0, cached[1] - time.monotonic()),
+                    "expiry_source": "policy"}
         task = asyncio.create_task(_resolve(song_id, quality, generation))
         _tasks[key] = task
         task.add_done_callback(lambda done: _finish(done, key))
-    return await asyncio.shield(task)
+    result = await asyncio.shield(task)
+    with _lock:
+        selected = _cache.get((generation, song_id, quality))
+        remaining = max(0.0, selected[1] - time.monotonic()) if selected else 0.0
+    return {**result, "reuse_for_s": remaining, "expiry_source": "policy"}
 
 
 async def shutdown() -> None:

@@ -107,6 +107,9 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_MUSICDL_ENABLED": {"kind": "bool", "default": "false", "group": "provider", "reload": "process", "label": "musicdl 聚合音源"},
     "FNMUSIC_NETEASE_ENABLED": {"kind": "bool", "default": "false", "group": "provider", "reload": "process", "label": "网易云音乐盒子"},
     "FNMUSIC_LX_ENABLED": {"kind": "bool", "default": "false", "group": "provider", "reload": "process", "label": "洛雪自定义源"},
+    "FNMUSIC_NETEASE_DIRECT_PLAY": {"kind": "bool", "default": "false", "group": "direct", "reload": "hot", "label": "网易云播放直连"},
+    "FNMUSIC_MUSICDL_DIRECT_PLAY": {"kind": "bool", "default": "false", "group": "direct", "reload": "hot", "label": "musicdl 播放直连"},
+    "FNMUSIC_LX_DIRECT_PLAY": {"kind": "bool", "default": "false", "group": "direct", "reload": "hot", "label": "洛雪播放直连"},
     "FNMUSIC_ONLINE_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 启用平台"},
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
     "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
@@ -120,6 +123,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
+    "FNMUSIC_DOWNLOAD_LAYOUT": {"kind": "enum", "values": ["flat", "artist", "album", "artist_album"], "default": "flat", "group": "storage", "reload": "hot", "label": "存放方式（beta）"},
     "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
     "FNMUSIC_FAV_AUTO_BIND": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "收藏自动绑定本地"},
@@ -1732,6 +1736,14 @@ async def api_fs_check():
 async def api_maintenance_cleanup(job_id: str = ""):
     """与 fs-check 一致：真实清理由宿主网关处理，直连不得访问或删除文件。"""
     raise HTTPException(status_code=501, detail="直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台")
+
+
+@app.get("/api/maintenance/organize")
+@app.get("/api/maintenance/organize/{job_id}")
+@app.post("/api/maintenance/organize")
+async def api_maintenance_organize(job_id: str = ""):
+    """真实整理同样只经宿主网关执行，直连 WebUI 不接触宿主文件。"""
+    raise HTTPException(status_code=501, detail="直连模式不支持整理下载目录，请在飞牛桌面内打开管理台")
 
 
 # ------------------------------------------------------------------ 关于页 --

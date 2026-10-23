@@ -420,7 +420,7 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
     ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
-    required = {"publicplaylists"}
+    required = {"publicplaylists"} | set(re.findall(r"\bproxy/([A-Za-z_]\w*)\.py\b", copied))
     origins: dict[str, str] = {"publicplaylists": "动态导入（proxy/app.py）"}
     for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
@@ -446,6 +446,6 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
 
     for module_name in sorted(required):
         module = f"proxy/{module_name}.py"
-        origin = origins[module_name]
+        origin = origins.get(module_name, "Dockerfile COPY")
         assert module in copied, f"{origin} 依赖 {module}，Dockerfile 需 COPY 进镜像"
         assert f"!{module}" in ignore, f"{origin} 依赖 {module}，.dockerignore 需放行构建上下文"

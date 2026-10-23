@@ -47,6 +47,8 @@ MAINTENANCE_ROOT = "/api/maintenance"
 MAINTENANCE_MAX_HEADER = 16 * 1024
 MAINTENANCE_MAX_BODY = 4096
 MAINTENANCE_TIMEOUT = 35
+ORGANIZE_PATH = MAINTENANCE_ROOT + "/organize"
+ORGANIZE_LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
 
 
 def socket_path_for(base: Path) -> Path:
@@ -338,8 +340,12 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
             client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可执行维护"}))
             return
         cleanup = MAINTENANCE_ROOT + "/cleanup"
-        if not ((method == "POST" and target == cleanup) or
-                (method == "GET" and re.fullmatch(cleanup + r"/[0-9a-fA-F]{32}", target))):
+        cleanup_route = ((method == "POST" and target == cleanup) or
+                         (method == "GET" and re.fullmatch(cleanup + r"/[0-9a-fA-F]{32}", target)))
+        organize_route = ((method == "POST" and target == ORGANIZE_PATH) or
+                          (method == "GET" and (target == ORGANIZE_PATH or
+                           re.fullmatch(ORGANIZE_PATH + r"/[0-9a-fA-F]{32}", target) is not None)))
+        if not (cleanup_route or organize_route):
             client.sendall(_json_response(404, {"ok": False, "error": "未知维护接口"}))
             return
         if "transfer-encoding" in headers:
@@ -360,9 +366,25 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
             body += chunk
         if method == "POST":
             req = json.loads(body)
-            if req != {"confirm_beta": True} or type(req.get("confirm_beta")) is not bool:
-                raise ValueError("仅允许 confirm_beta: true 确认字段")
-            body = b'{"confirm_beta":true}'
+            if target == cleanup:
+                if req != {"confirm_beta": True} or type(req.get("confirm_beta")) is not bool:
+                    raise ValueError("仅允许 confirm_beta: true 确认字段")
+                body = b'{"confirm_beta":true}'
+            else:
+                if (not isinstance(req, dict) or
+                        set(req) != {"confirm_beta", "root", "layout"} or
+                        type(req.get("confirm_beta")) is not bool or
+                        req.get("confirm_beta") is not True or
+                        not isinstance(req.get("layout"), str) or
+                        req.get("layout") not in ORGANIZE_LAYOUTS or
+                        not isinstance(req.get("root"), str)):
+                    raise ValueError("整理确认参数无效")
+                root = req["root"]
+                if (not root.startswith("/") or ".." in root.split("/") or
+                        any(char in root for char in "\r\n\x00")):
+                    raise ValueError("整理目录无效")
+                body = json.dumps({"confirm_beta": True, "root": root,
+                                   "layout": req["layout"]}, separators=(",", ":")).encode("utf-8")
         elif body:
             raise ValueError("查询不允许请求体")
         remote = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

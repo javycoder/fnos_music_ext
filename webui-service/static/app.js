@@ -13,8 +13,15 @@ const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserv
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
+let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
+const DOWNLOAD_LAYOUT_LABELS = {
+  flat: "歌曲",
+  artist: "歌手/歌曲",
+  album: "专辑/歌曲",
+  artist_album: "歌手/专辑/歌曲",
+};
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 let lxSourceList = [];    // 洛雪源列表 [{ name, url, active }]，active 可多开
@@ -97,6 +104,68 @@ function clearDirty() {
   const noteEl = $("#save-note");
   if (noteEl) noteEl.textContent = "";
 }
+
+/* -------------------------------------------------------------- 帮助弹窗 */
+let helpReturnFocus = null;
+let helpPreviousOverflow = "";
+let helpBackgroundState = [];
+
+function helpFocusables() {
+  return $$("#help-modal button, #help-modal [href], #help-modal input, #help-modal select, #help-modal textarea")
+    .filter((el) => !el.disabled);
+}
+
+function openHelp(helpId, trigger = null) {
+  const template = document.querySelector(`template[data-help-id="${helpId}"]`);
+  if (!template) return;
+  if (!$("#help-modal").hidden) return;
+  const title = (trigger && trigger.getAttribute && trigger.getAttribute("aria-label")) || "帮助";
+  helpReturnFocus = trigger || document.activeElement;
+  $("#help-title").textContent = title.replace(/帮助$/, "");
+  $("#help-body").replaceChildren(template.content.cloneNode(true));
+  $("#help-modal").hidden = false;
+  helpPreviousOverflow = document.body.style.overflow || "";
+  helpBackgroundState = $$(".layout, #save-bar").map((element) => [element, element.inert]);
+  helpBackgroundState.forEach(([element]) => { element.inert = true; });
+  document.body.style.overflow = "hidden";
+  $("#help-close-btn").focus();
+}
+
+function closeHelp() {
+  if ($("#help-modal").hidden) return;
+  $("#help-modal").hidden = true;
+  $("#help-body").replaceChildren();
+  document.body.style.overflow = helpPreviousOverflow;
+  helpBackgroundState.forEach(([element, inert]) => { element.inert = inert; });
+  helpBackgroundState = [];
+  if (helpReturnFocus && typeof helpReturnFocus.focus === "function") helpReturnFocus.focus();
+  helpReturnFocus = null;
+}
+
+$$("[data-help]").forEach((btn) => btn.addEventListener("click", () => openHelp(btn.dataset.help, btn)));
+$("#help-close-btn").addEventListener("click", closeHelp);
+$("#help-modal").addEventListener("click", (ev) => {
+  if (ev.target === ev.currentTarget) closeHelp();
+});
+window.addEventListener("keydown", (ev) => {
+  if ($("#help-modal").hidden || !$("#cleanup-modal").hidden) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeHelp();
+  } else if (ev.key === "Tab") {
+    const items = helpFocusables();
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (ev.shiftKey && document.activeElement === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
+});
 
 /* -------------------------------------------------------------- 导航 */
 function switchPage(page) {
@@ -265,6 +334,7 @@ async function loadConfig() {
   const cfg = await api("/api/config");
   configValues = cfg.values;
   configPresence = cfg.presence || {};
+  configSchema = cfg.schema || {};
   applyConfigToForm();
   clearDirty();
 }
@@ -279,6 +349,15 @@ function applyConfigToForm() {
   if (provider === "musicbox") syncNeteaseAccount();
   const quality = v.FNMUSIC_QUALITY_MODE || "high";
   $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
+  [
+    ["#direct-netease", "FNMUSIC_NETEASE_DIRECT_PLAY"],
+    ["#direct-musicdl", "FNMUSIC_MUSICDL_DIRECT_PLAY"],
+    ["#direct-lx", "FNMUSIC_LX_DIRECT_PLAY"],
+  ].forEach(([selector, key]) => {
+    const el = $(selector);
+    el.disabled = !configSchema[key];
+    el.checked = configSchema[key] ? ["true", "1", "yes", "on"].includes(String(v[key] || "").trim().toLowerCase()) : false;
+  });
   const dlQuality = v.FNMUSIC_DL_QUALITY || "app";
   $$("input[name=dl-quality]").forEach((el) => { el.checked = el.value === dlQuality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
@@ -297,6 +376,8 @@ function applyConfigToForm() {
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
   $("#dir-download").value = v.FNMUSIC_TEE_SAVE_DIR || "";
+  $("#download-layout").value = v.FNMUSIC_DOWNLOAD_LAYOUT || "flat";
+  $("#download-layout").disabled = !configSchema.FNMUSIC_DOWNLOAD_LAYOUT;
   $("#dir-cache").value = v.FNMUSIC_CACHE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   $("#bind-timeout").value = v.FNMUSIC_OFFICIAL_BIND_TIMEOUT_S || "120";
@@ -351,6 +432,9 @@ function collectConfig() {
     FNMUSIC_MUSICDL_ENABLED: provider === "musicdl",
     FNMUSIC_NETEASE_ENABLED: provider === "musicbox",
     FNMUSIC_LX_ENABLED: provider === "lxmusic",
+    ...(configSchema.FNMUSIC_NETEASE_DIRECT_PLAY ? { FNMUSIC_NETEASE_DIRECT_PLAY: $("#direct-netease").checked } : {}),
+    ...(configSchema.FNMUSIC_MUSICDL_DIRECT_PLAY ? { FNMUSIC_MUSICDL_DIRECT_PLAY: $("#direct-musicdl").checked } : {}),
+    ...(configSchema.FNMUSIC_LX_DIRECT_PLAY ? { FNMUSIC_LX_DIRECT_PLAY: $("#direct-lx").checked } : {}),
     FNMUSIC_QUALITY_MODE: ($$("input[name=quality]").find((el) => el.checked) || {}).value || "high",
     FNMUSIC_DL_QUALITY: ($$("input[name=dl-quality]").find((el) => el.checked) || {}).value || "app",
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
@@ -361,6 +445,7 @@ function collectConfig() {
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
     FNMUSIC_TEE_SAVE_DIR: $("#dir-download").value.trim(),
+    ...(configSchema.FNMUSIC_DOWNLOAD_LAYOUT ? { FNMUSIC_DOWNLOAD_LAYOUT: $("#download-layout").value } : {}),
     FNMUSIC_CACHE_DIR: $("#dir-cache").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,
@@ -1573,6 +1658,9 @@ const DIR_FIELDS = [
   { input: "#dir-cache", pick: "#dir-cache-pick", check: "#dir-cache-check", label: "歌曲缓存目录" },
   { input: "#dir-download", pick: "#dir-download-pick", check: "#dir-download-check", label: "下载目录" },
 ];
+$("#download-layout").addEventListener("change", () => {
+  markDirty("存放方式需保存后生效；已有歌曲可稍后点击「整理」调整");
+});
 let _fsCheckSeq = 0;                // 防抖竞态：只采纳最后一次输入的校验结果
 const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试一次，避免重复弹授权框
 
@@ -1681,6 +1769,8 @@ $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => ma
 $$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("下载音质需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
+["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>
+  $(sel).addEventListener("change", () => markDirty("播放直连策略需保存后生效")));
 
 function updateTeeCountLabel() {
   const n = $("#tee-max").value || configValues.FNMUSIC_TEE_CACHE_MAX || "2";
@@ -1926,16 +2016,175 @@ $("#cleanup-modal").addEventListener("click", (ev) => {
   if (ev.target === ev.currentTarget) closeCleanupModal();
 });
 window.addEventListener("keydown", (ev) => {
-  if ($("#cleanup-modal").hidden) return;
+  const modal = $("#cleanup-modal").hidden ? $("#organize-modal") : $("#cleanup-modal");
+  if (modal.hidden) return;
   if (ev.key === "Escape") {
     ev.preventDefault();
-    closeCleanupModal();
+    if (modal === $("#cleanup-modal")) closeCleanupModal();
+    else closeOrganizeModal();
   } else if (ev.key === "Tab") {
     // 对话框仅有两个按钮，将键盘焦点限制在其中，默认落在取消。
     ev.preventDefault();
-    const cancel = $("#cleanup-cancel-btn");
-    (document.activeElement === cancel ? $("#cleanup-confirm-btn") : cancel).focus();
+    const cancel = modal === $("#cleanup-modal") ? $("#cleanup-cancel-btn") : $("#organize-cancel-btn");
+    const confirm = modal === $("#cleanup-modal") ? $("#cleanup-confirm-btn") : $("#organize-confirm-btn");
+    (document.activeElement === cancel ? confirm : cancel).focus();
   }
+});
+
+/* ------------------------------------------------------ 下载目录整理 Beta */
+let organizeInfo = null;
+let organizeConfirmation = null;
+let organizeJob = null;
+let organizeSubmitting = false;
+let organizePolling = false;
+let organizeTimer = null;
+const ORGANIZE_PATH = "/api/maintenance/organize";
+
+function renderOrganizeJob(job) {
+  const labels = { running: "整理中", completed: "整理完成", failed: "整理失败" };
+  const layout = DOWNLOAD_LAYOUT_LABELS[job.layout] || job.layout || "-";
+  let text = `任务 ${job.id} · ${labels[job.status]} · 阶段：${job.phase || "-"}` +
+    ` · 已扫描 ${job.scanned ?? 0} · 已移动 ${job.moved ?? 0}` +
+    ` · 未变化 ${job.unchanged ?? 0} · 已跳过 ${job.skipped ?? 0} · 失败 ${job.failed ?? 0}`;
+  if (job.status === "completed") {
+    text += "。整理后请在飞牛音乐中重新扫描曲库";
+  }
+  $("#organize-status").textContent = text;
+  $("#organize-status").dataset.layout = layout;
+  const lines = [];
+  if (job.journal) lines.push(`迁移日志：${job.journal}`);
+  for (const item of (Array.isArray(job.details) ? job.details : [])) {
+    lines.push(`详情：${typeof item === "string" ? item : JSON.stringify(item)}`);
+  }
+  for (const item of (Array.isArray(job.errors) ? job.errors : [])) {
+    lines.push(`错误：${typeof item === "string" ? item : JSON.stringify(item)}`);
+  }
+  $("#organize-details").textContent = lines.join("\n");
+  $("#organize-details").hidden = !lines.length;
+  $("#organize-open-btn").textContent = job.status === "running" ? "查看当前整理任务" : "整理";
+}
+
+function acceptOrganizeJob(response) {
+  const job = response && response.job;
+  if (!response || response.ok !== true || !job || !job.id ||
+      !["running", "completed", "failed"].includes(job.status)) {
+    throw new Error("整理任务响应格式无效");
+  }
+  organizeJob = job;
+  renderOrganizeJob(job);
+  clearTimeout(organizeTimer);
+  organizeTimer = null;
+  if (job.status === "running") organizeTimer = setTimeout(pollOrganizeJob, 1000);
+}
+
+async function loadOrganizeStatus() {
+  try {
+    const response = await api(ORGANIZE_PATH);
+    if (!response || response.ok !== true || typeof response.root !== "string" ||
+        !DOWNLOAD_LAYOUT_LABELS[response.layout]) throw new Error("整理状态响应格式无效");
+    organizeInfo = { root: response.root, layout: response.layout };
+    if (response.job) acceptOrganizeJob(response);
+  } catch (exc) {
+    organizeInfo = null;
+    $("#organize-status").textContent = `整理不可用：${exc.message}`;
+  }
+}
+
+async function pollOrganizeJob() {
+  if (organizePolling || !organizeJob || organizeJob.status !== "running") return;
+  clearTimeout(organizeTimer);
+  organizeTimer = null;
+  organizePolling = true;
+  try {
+    acceptOrganizeJob(await api(ORGANIZE_PATH + "/" + encodeURIComponent(organizeJob.id)));
+  } catch (exc) {
+    $("#organize-status").textContent =
+      `任务 ${organizeJob.id} · 查询失败：${exc.message}；点击整理重试查询，不会重复提交。`;
+  } finally {
+    organizePolling = false;
+  }
+}
+
+function closeOrganizeModal() {
+  $("#organize-modal").hidden = true;
+  organizeConfirmation = null;
+  $("#organize-open-btn").focus();
+}
+
+function organizeSettingsSaved() {
+  const savedLayout = configValues.FNMUSIC_DOWNLOAD_LAYOUT || "flat";
+  const savedDir = (configValues.FNMUSIC_TEE_SAVE_DIR || "").trim();
+  return ($("#download-layout").value || "flat") === savedLayout &&
+    $("#dir-download").value.trim() === savedDir &&
+    organizeInfo && organizeInfo.layout === savedLayout;
+}
+
+async function openOrganizeModal() {
+  if (organizeSubmitting) return;
+  if (organizeJob && organizeJob.status === "running") {
+    renderOrganizeJob(organizeJob);
+    pollOrganizeJob();
+    return;
+  }
+  await loadOrganizeStatus();
+  if (!organizeInfo) return;
+  if (organizeJob && organizeJob.status === "running") return;
+  if (!organizeSettingsSaved()) {
+    toast("请先保存下载目录和存放方式，再执行整理", "fail");
+    return;
+  }
+  const label = DOWNLOAD_LAYOUT_LABELS[organizeInfo.layout];
+  $("#organize-warning").textContent =
+    `将按“${label}”整理“${organizeInfo.root}”内的全部歌曲，并同步处理可识别的歌词和封面。` +
+    "此功能为 Beta，移动文件可能导致歌曲暂时无法播放，收藏或歌单关联也可能受影响，" +
+    "整理后可能需要在飞牛音乐中重新扫描曲库。建议先备份，是否继续？";
+  $("#organize-modal").hidden = false;
+  organizeConfirmation = { ...organizeInfo };
+  $("#organize-cancel-btn").focus();
+}
+
+async function startOrganize() {
+  if ($("#organize-modal").hidden || organizeSubmitting || !organizeConfirmation) return;
+  if (!organizeSettingsSaved()) {
+    closeOrganizeModal();
+    toast("请先保存下载目录和存放方式，再执行整理", "fail");
+    return;
+  }
+  if (organizeJob && organizeJob.status === "running") {
+    closeOrganizeModal();
+    renderOrganizeJob(organizeJob);
+    return;
+  }
+  organizeSubmitting = true;
+  const confirmed = organizeConfirmation;
+  $("#organize-open-btn").disabled = true;
+  closeOrganizeModal();
+  $("#organize-status").textContent = "正在提交整理任务…";
+  $("#organize-details").textContent = "";
+  $("#organize-details").hidden = true;
+  try {
+    acceptOrganizeJob(await api(ORGANIZE_PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm_beta: true,
+        root: confirmed.root,
+        layout: confirmed.layout,
+      }),
+    }));
+  } catch (exc) {
+    $("#organize-status").textContent = "整理请求失败：" + exc.message;
+  } finally {
+    organizeSubmitting = false;
+    $("#organize-open-btn").disabled = false;
+  }
+}
+
+$("#organize-open-btn").addEventListener("click", openOrganizeModal);
+$("#organize-cancel-btn").addEventListener("click", closeOrganizeModal);
+$("#organize-confirm-btn").addEventListener("click", startOrganize);
+$("#organize-modal").addEventListener("click", (ev) => {
+  if (ev.target === ev.currentTarget) closeOrganizeModal();
 });
 
 /* -------------------------------------------------------------- 启动 */
@@ -1943,6 +2192,7 @@ window.addEventListener("keydown", (ev) => {
   initTheme().catch(() => {});  // 外观先应用（内部等宿主 SDK，不阻塞配置加载）
   await loadConfig();
   await loadStatus();
+  await loadOrganizeStatus();
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   if ($("#public-playlists-enabled").checked) await showPublicBrowser();

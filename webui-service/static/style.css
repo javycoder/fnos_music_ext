@@ -115,6 +115,7 @@ body {
   padding: 24px var(--main-pad-x) 96px;
 }
 h2 { margin: 4px 0 14px; font-size: 20px; }
+h2 { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .page { display: none; width: 100%; }
 .page.active { display: block; }
 
@@ -122,7 +123,7 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
   background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 16px 18px; margin-bottom: 14px; box-shadow: var(--shadow);
 }
-.card-title { font-weight: 600; margin-bottom: 10px; }
+.card-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-weight: 600; margin-bottom: 10px; }
 
 .hint { color: var(--muted); font-size: 13px; margin: 6px 0; }
 .hint.warning { color: var(--warn); }
@@ -172,6 +173,16 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 .btn-row { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
 
 .radio-list { display: flex; flex-direction: column; gap: 8px; }
+.direct-list { display: grid; gap: 8px; }
+.direct-option {
+  display: grid; grid-template-columns: 1fr auto 44px; align-items: center; gap: 10px;
+  min-height: 44px; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px;
+}
+.help-btn {
+  width: 44px; height: 44px; flex: none; border: 1px solid var(--line); border-radius: 50%;
+  background: var(--surface-2); color: var(--accent); font-size: 16px; font-weight: 700; cursor: pointer;
+}
+.help-btn:focus { outline: 2px solid var(--focus-ring); border-color: var(--accent); }
 .radio-list label {
   display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
   border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
@@ -336,6 +347,13 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   max-height: 40vh; overflow: auto;
 }
 .modal-actions { justify-content: flex-end; margin-bottom: 0; }
+.help-body { font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
+.help-modal[hidden] { display: none; }
+.help-body p + p { margin-top: 10px; }
+.help-modal .modal-card { display: flex; flex-direction: column; max-height: min(82vh, 720px); }
+.help-modal .modal-title { flex: none; }
+.help-modal .help-body { flex: 1 1 auto; overflow: auto; }
+.help-modal .modal-actions { flex: none; }
 
 /* -------------------------------------------------- 保存条/Toast */
 .save-bar {

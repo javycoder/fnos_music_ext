@@ -51,6 +51,12 @@ def test_private_permissions_delegation_and_stop(tmp_path):
             status, data = await exchange(path, request())
             assert status == 202 and data["state"] == "real proxy state"
             assert calls == [("POST", m.CLEANUP_PATH, {"confirm_beta": True})]
+            organize_body = b'{"confirm_beta":true,"root":"/vol1/music","layout":"artist_album"}'
+            status, _ = await exchange(path, request(
+                "POST", m.ORGANIZE_PATH, organize_body))
+            assert status == 202
+            assert calls[-1] == ("POST", m.ORGANIZE_PATH, {
+                "confirm_beta": True, "root": "/vol1/music", "layout": "artist_album"})
             status, _ = await exchange(path, request("GET", m.CLEANUP_PATH + "/" + "a" * 32, b""))
             assert status == 202
             assert calls[-1][2] == {}

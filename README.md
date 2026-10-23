@@ -19,6 +19,7 @@
 - **本地优先的在线搜索**：本地曲库结果排在前面，当前所选音源的在线结果随后展示，并标注来源。网易与洛雪支持按需深分页，musicdl 仅参与首屏，详见[搜索分页说明](docs/SEARCH_PAGINATION.md)。
 - **播放、歌词与封面适配**：在线歌曲可直接点播，优先复用曲库中已核对的本地文件；支持歌词与封面补全，在线封面默认通过同源代理返回，兼顾官方手机 App。
 - **在线播放与下载分别选音质**：播放提供「高音质 / 平衡 / 流畅」偏好；App 下载提供「跟随 App / 无损原文件 / MP3 320k」。原文件交付不代表音源一定提供无损，实际品质受源站、账号权益与歌曲资源限制。
+- **播放直连（beta）**：可按网易盒子、musicdl、洛雪独立开启 302 原文件播放；本地与完整缓存仍优先由 NAS 供流，HLS 与 App 下载不受影响。直连兼容性受客户端出口 IP、UA、Referer、CORS 与临时链接限制，失败后关闭开关重新起播即可恢复代理。
 - **标准档转码**：为 App 的在线歌曲播放提供 AAC/HLS 分片，为标准档下载提供 MP3 320k，相关能力依赖 ffmpeg。网易无 VIP 权益时，部分歌曲会标记 `[VIP]`，可能仅能试听，扩展不会绕过账号权限。
 
 ### 推荐与歌单
@@ -122,9 +123,11 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | 常用设置 | 配置项 | 说明 |
 | :--- | :--- | :--- |
 | 播放音质 | `FNMUSIC_QUALITY_MODE` | `high` / `balanced` / `smooth` |
+| 播放直连（beta） | `FNMUSIC_NETEASE_DIRECT_PLAY` / `FNMUSIC_MUSICDL_DIRECT_PLAY` / `FNMUSIC_LX_DIRECT_PLAY` | 三项默认 `false`，独立控制原文件在线播放是否返回音乐源 HTTPS 302 |
 | App 下载音质 | `FNMUSIC_DL_QUALITY` | `app` / `original` / `standard`；跟随 App 时仅显式标准档转 MP3，否则交付原文件 |
 | 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | 默认开启 |
 | 下载 / 缓存目录 | `FNMUSIC_TEE_SAVE_DIR` / `FNMUSIC_CACHE_DIR` | 留空分别自动探测共享曲库 / 使用安装目录 `cache` |
+| 下载存放方式 | `FNMUSIC_DOWNLOAD_LAYOUT` | `flat`（默认）、`artist`、`album`、`artist_album`；仅影响后续下载 |
 | 落库文件名 | `FNMUSIC_LIBRARY_NAME_PATTERN` | 默认 `{artist} - {title}` |
 | 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 默认开启封面、关闭歌词 |
 | 每日 / 热门推荐 | `FNMUSIC_RECOMMEND_DAILY` / `FNMUSIC_RECOMMEND_HOT` | 默认开启，可分别关闭 |
@@ -137,6 +140,20 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | 大模型每日 token 上限 | `FNMUSIC_LLM_DAILY_TOKEN_LIMIT` | 默认 1000000，0=不限制；达到后当天不再调用、次日自动重置，用量与最近失败见管理页及 `/_ext/healthz` |
 | 大模型猜你喜欢 / 每日推荐 | `FNMUSIC_LLM_LIKED_ENABLED` / `FNMUSIC_LLM_DAILY_ENABLED` | 两项默认 `false`，需独立明确勾选；接口不完整时不调用模型 |
 | 大模型猜你喜欢间隔 / 数量 | `FNMUSIC_LIKED_REFRESH_HOURS` / `FNMUSIC_LIKED_SIZE` | 间隔为有限数字且 ≥0.5 小时（默认 0.5，无上限）；数量为 0–100 整数（默认 20）；不是缓存失效时间 |
+
+在「存储 → 目录设置 → 下载目录」中选择「存放方式(beta)」，点击「保存并生效」后，
+后续下载和缓存转正使用新目录结构，已有歌曲继续复用原位置。默认「歌曲」为平铺，
+其余选项为「歌手/歌曲」「专辑/歌曲」「歌手/专辑/歌曲」；新下载缺少元数据时使用
+「未知歌手」「未知专辑」，歌词跟随音频，封面继续内嵌。
+
+「整理」会在二次确认后递归处理当前下载目录中的全部歌曲，包括自行放入的文件。
+它按音频标签、官方曲库只读记录和扩展已有记录补充信息；不根据文件名猜测歌手或专辑，
+缺少必要信息、无法识别或被占用的歌曲会跳过。原文件名和标签保持不变，重名增加序号，
+可识别的同词干歌词、封面随迁；目录封面仅在关联明确时复制，原图片保留。
+任务在后台执行，页面可查看进度和原因，刷新后继续查询。迁移记录保存在歌曲缓存目录的
+`organize-journal/<任务ID>.jsonl`，包含源路径、目标路径和扩展 `.ref` 更新，供中断后核对。
+建议先备份；移动文件可能影响播放、收藏和歌单关联，完成后请在飞牛音乐中重新扫描曲库。
+整理不会修改官方数据库，也不保证官方收藏和歌单关联自动恢复。该维护功能需从管理员网关访问。
 
 在管理页「高级 · 大模型」填写接口后，按需勾选对应用途并「保存并生效」。已勾选但 Base URL 或 API Key 不完整时会明确警告，不会调用模型，也不会丢失勾选状态。猜你喜欢参数仅在该用途勾选时显示、校验并保存，空白、小数数量、非有限值或越界编辑不会被截断或静默恢复默认；取消勾选不会覆盖已保存参数。数量 0 仅在大模型猜你喜欢用途实际生效时禁用该歌单，未勾选时不改变原本的纯本地链路。
 

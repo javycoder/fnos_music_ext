@@ -427,6 +427,14 @@ def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
             assert json.loads(data.split(b"\r\n\r\n")[1]) == {"job_id": job, "state": "done", "deleted": 7}
             assert calls == [("POST", "/api/maintenance/cleanup", {"confirm_beta": True}),
                              ("GET", "/api/maintenance/cleanup/" + job, {})]
+            organize_body = json.dumps({
+                "confirm_beta": True, "root": "/vol1/music", "layout": "artist"
+            }).encode("utf-8")
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                path=prefix + "/api/maintenance/organize", body=organize_body))
+            assert data.startswith(b"HTTP/1.1 202")
+            assert calls[-1] == ("POST", "/api/maintenance/organize", {
+                "confirm_beta": True, "root": "/vol1/music", "layout": "artist"})
         finally:
             await maintenance.stop(server)
     asyncio.run(run())

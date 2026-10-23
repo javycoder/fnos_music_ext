@@ -4,6 +4,7 @@
 两个消费方（fnmusic-ext 代理、music-box）都以该 ID 串通信。
 """
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -86,6 +87,21 @@ def _startup_sources() -> "tuple[list[str], str]":
 
 
 _CONF_SOURCES, _SOURCES_ORIGIN = _startup_sources()
+
+
+def _startup_internal_token() -> str:
+    token = os.environ.get("FNMUSIC_INTERNAL_TOKEN", "").strip()
+    if token or parse_env_file is None:
+        return token
+    try:
+        pairs, _ = parse_env_file(Path(os.environ.get("FNMUSIC_ENV_FILE", "/repo/.env")))
+        return str(dict(pairs).get("FNMUSIC_INTERNAL_TOKEN") or "").strip()
+    except Exception:
+        return ""
+
+
+_INTERNAL_TOKEN = _startup_internal_token()
+_DIRECT_RESOLVE_INFLIGHT: dict[tuple, asyncio.Task] = {}
 
 CONF = {
     "sources": _CONF_SOURCES,
@@ -417,6 +433,43 @@ async def _resolve_entry(song_id: str, auto_refresh: bool = True):
         if refreshed:
             return refreshed
     raise HTTPException(502, f"playable URL expired for {song_id!r}; bounded refresh failed, re-search keyword and source")
+
+
+def _internal_authorized(x_internal_token: str | None) -> bool:
+    supplied = str(x_internal_token or "").strip()
+    return bool(_INTERNAL_TOKEN and supplied and hmac.compare_digest(supplied, _INTERNAL_TOKEN))
+
+
+async def _direct_resolve_entry(song_id: str) -> dict:
+    """Resolve a cached known ID without opening a foreground audio stream."""
+    key = (asyncio.get_running_loop(), str(song_id))
+    task = _DIRECT_RESOLVE_INFLIGHT.get(key)
+    if task is None or task.done():
+        if len(_DIRECT_RESOLVE_INFLIGHT) >= 16:
+            raise HTTPException(503, "direct resolution busy")
+
+        async def resolve():
+            entry = _cache_get(song_id)
+            if entry is None:
+                raise HTTPException(404, "unknown song id; re-search required")
+            if entry["item"].get("download_url") and time.time() - entry["ts"] < CONF["url_ttl"]:
+                return entry
+            refreshed = await asyncio.wait_for(_refresh_by_keyword(song_id), timeout=16.0)
+            if not refreshed or not refreshed["item"].get("download_url"):
+                raise HTTPException(502, "direct resolution failed")
+            return refreshed
+
+        task = asyncio.create_task(resolve())
+        _DIRECT_RESOLVE_INFLIGHT[key] = task
+
+        def finish(done):
+            if _DIRECT_RESOLVE_INFLIGHT.get(key) is done:
+                _DIRECT_RESOLVE_INFLIGHT.pop(key, None)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finish)
+    return await asyncio.shield(task)
 
 
 def _fetch_upstream_stream_sync(url: str, headers: dict):
@@ -808,3 +861,36 @@ async def stream(
         status_code=206 if "Content-Range" in out_headers or resp.status_code == 206 else 200,
         headers=out_headers,
     )
+
+
+@app.get("/internal/resolve")
+async def internal_resolve(
+    id: str = Query(..., min_length=1),
+    x_internal_token: str | None = Header(None, alias="X-Internal-Token"),
+):
+    """Return a protected URL description for proxy-side direct playback."""
+    if not _internal_authorized(x_internal_token):
+        raise HTTPException(503, "internal authentication unavailable")
+    entry = await _direct_resolve_entry(id)
+    item = entry.get("item") or {}
+    url = str(item.get("download_url") or "")
+    if not url:
+        raise HTTPException(502, "playable URL unavailable")
+    now = time.time()
+    reuse_deadline = now + max(1.0, float(CONF["url_ttl"]) - max(0.0, now - float(entry.get("ts") or now)))
+    return {
+        "ok": True,
+        "provider": "musicdl",
+        "platform": str(item.get("source") or ""),
+        "canonical_id": str(item.get("id") or id),
+        "url": url,
+        "server_headers": dict(entry.get("download_headers") or {}),
+        "protocol": str(item.get("protocol") or ""),
+        "ext": str(item.get("ext") or ""),
+        "actual_quality": str(item.get("quality") or ""),
+        "file_size": item.get("file_size"),
+        "resolved_at": now,
+        "reuse_deadline": reuse_deadline,
+        "upstream_expires_at": None,
+        "expiry_source": "policy",
+    }
