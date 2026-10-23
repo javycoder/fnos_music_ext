@@ -60,7 +60,7 @@
 
       <!-- 音乐源 -->
       <section class="page" id="page-source">
-        <h2>音乐源（三选一）</h2>
+        <h2><span>音乐源（三选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
         <div class="provider-grid">
           <label class="provider-card" data-provider="musicbox">
             <input type="radio" name="provider" value="musicbox">
@@ -82,8 +82,7 @@
         <!-- musicbox：扫码登录 -->
         <div class="subpanel" id="panel-musicbox" hidden>
           <div class="card">
-            <div class="card-title">网易扫码登录</div>
-            <p class="hint">手机网易云音乐 App 扫码授权。登录态保存在数据卷，重启不丢失。</p>
+            <div class="card-title"><span>网易扫码登录</span><button class="help-btn" type="button" data-help="netease-login" aria-label="网易扫码登录帮助">?</button></div>
             <div class="qr-area">
               <img id="qr-img" alt="登录二维码" hidden>
               <div id="qr-status" class="muted">点击下方按钮生成二维码</div>
@@ -94,16 +93,16 @@
             </div>
           </div>
           <div class="card">
-            <div class="card-title">网易账号歌单</div>
-            <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
-            <label class="switch-row"><span>网易云歌单常驻<div class="sub">勾选后即使切换到其它音乐源，网易账号歌单和网易公共歌单仍可显示播放，网易盒子进程保持常驻运行。账号歌单仍需扫码登录；公共歌单可匿名常驻。搜索结果仍仅在选中「网易云音乐盒子」音源时使用网易，不与其它音源聚合。</div></span><input type="checkbox" id="netease-playlist-resident"></label>
+            <div class="card-title"><span>网易账号歌单</span><button class="help-btn" type="button" data-help="netease-playlists" aria-label="网易账号歌单帮助">?</button></div>
+            <label class="switch-row"><span>音乐页显示网易账号歌单</span><input type="checkbox" id="netease-my-playlists"></label>
+            <label class="switch-row"><span>网易云歌单常驻</span><input type="checkbox" id="netease-playlist-resident"></label>
           </div>
         </div>
 
         <!-- musicdl：平台多选 -->
         <div class="subpanel" id="panel-musicdl" hidden>
           <div class="card">
-            <div class="card-title">启用平台（多选）</div>
+            <div class="card-title"><span>启用平台（多选）</span><button class="help-btn" type="button" data-help="musicdl-platforms" aria-label="musicdl 平台帮助">?</button></div>
             <div class="btn-row">
               <input class="input grow" id="platform-search" placeholder="搜索平台…">
               <button class="btn" id="platform-reload">刷新列表</button>
@@ -116,8 +115,7 @@
         <!-- lx：源 URL / 文件上传 -->
         <div class="subpanel" id="panel-lxmusic" hidden>
           <div class="card">
-            <div class="card-title">洛雪自定义源</div>
-            <p class="hint">三种方式任选：粘贴源脚本地址（http/https）、上传电脑上的 .js 文件、从 NAS 文件选择（桌面内可用）。可填写自定义名称后点击「添加」加入音乐源列表保存管理。</p>
+            <div class="card-title"><span>洛雪自定义源</span><button class="help-btn" type="button" data-help="lx-source-add" aria-label="洛雪源添加帮助">?</button></div>
             <div class="btn-row">
               <input class="input grow" id="lx-name" placeholder="名称（可选，留空将自动提取或使用文件名）">
             </div>
@@ -135,8 +133,7 @@
             <div id="lx-report" class="report" hidden></div>
           </div>
           <div class="card">
-            <div class="card-title">lx音乐源列表</div>
-            <p class="hint">可保存多个洛雪自定义源脚本，并支持多个源同时激活（解析时自动在启用的源之间接力切换）。点击源条目的「激活」/「取消激活」做好标记后，点下方「保存并生效」统一校验并应用；新激活的源会先做一次可用性校验（每个约需 1 分钟）。</p>
+            <div class="card-title"><span>lx音乐源列表</span><button class="help-btn" type="button" data-help="lx-source-list" aria-label="洛雪源列表帮助">?</button></div>
             <div id="lx-source-list" class="stack"></div>
           </div>
         </div>
@@ -147,28 +144,47 @@
       <section class="page" id="page-quality">
         <h2>播放与推荐</h2>
         <div class="card">
-          <div class="card-title">音质偏好</div>
+          <div class="card-title"><span>播放直连（beta）</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></div>
+          <div class="direct-list">
+            <div class="direct-option">
+              <label for="direct-netease">网易云音乐盒子</label>
+              <input type="checkbox" id="direct-netease">
+              <button class="help-btn" type="button" data-help="direct-netease" aria-label="网易云音乐盒子播放直连帮助">?</button>
+            </div>
+            <div class="direct-option">
+              <label for="direct-musicdl">musicdl 聚合音源</label>
+              <input type="checkbox" id="direct-musicdl">
+              <button class="help-btn" type="button" data-help="direct-musicdl" aria-label="musicdl 播放直连帮助">?</button>
+            </div>
+            <div class="direct-option">
+              <label for="direct-lx">洛雪自定义源</label>
+              <input type="checkbox" id="direct-lx">
+              <button class="help-btn" type="button" data-help="direct-lx" aria-label="洛雪播放直连帮助">?</button>
+            </div>
+          </div>
+          <p class="hint">默认关闭；开启后保存生效。三个音源互不联动。</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>音质偏好</span><button class="help-btn" type="button" data-help="quality" aria-label="音质偏好帮助">?</button></div>
           <div class="radio-list" id="quality-list">
             <label><input type="radio" name="quality" value="high"><div><b>高音质</b><span>优先最高档，失败逐级向下</span></div></label>
             <label><input type="radio" name="quality" value="balanced"><div><b>平衡</b><span>取中间档（偶数档取中间偏高），失败先降后升</span></div></label>
             <label><input type="radio" name="quality" value="smooth"><div><b>流畅</b><span>优先最低档，最快出声</span></div></label>
           </div>
-          <p class="hint">音质偏好只影响在线播放/搜索时按什么档位取歌（高音质=优先无损原文件）。</p>
         </div>
         <div class="card">
-          <div class="card-title">下载音质</div>
+          <div class="card-title"><span>下载音质</span><button class="help-btn" type="button" data-help="download-quality" aria-label="下载音质帮助">?</button></div>
           <div class="radio-list" id="dl-quality-list">
             <label><input type="radio" name="dl-quality" value="app"><div><b>跟随 App</b><span>App 明确选"标准"才交 MP3，其余一律无损原文件（FLAC 等）</span></div></label>
             <label><input type="radio" name="dl-quality" value="original"><div><b>无损原文件</b><span>下载一律交付原文件，App 选"标准"也不转码</span></div></label>
             <label><input type="radio" name="dl-quality" value="standard"><div><b>MP3 320k</b><span>一律按官方"标准"档交 MP3 320kbps（省空间，与官方一致）</span></div></label>
           </div>
-          <p class="hint">只影响在 App 里点"下载"拿到的文件。默认"跟随 App"：无损歌曲不再被擅自转成 MP3（2.7.0 及以前的标准档缺省行为已修正）。保存后立即生效。</p>
         </div>
         <div class="card">
-          <div class="card-title">推荐</div>
-          <label class="switch-row"><span>热门榜单推荐<div class="sub">独立「热门推荐」歌单：热歌榜/飙升榜原味</div></span><input type="checkbox" id="recommend-hot"></label>
-          <label class="switch-row"><span>每日推荐<div class="sub">独立「每日推荐」歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
-          <label class="switch-row"><span>公共歌单<div class="sub">浏览并勾选网易/洛雪的原生推荐、分类歌单和榜单；勾选后作为独立只读歌单显示。musicdl 没有统一的推荐歌单发现接口。</div></span><input type="checkbox" id="public-playlists-enabled"></label>
+          <div class="card-title"><span>推荐与公共歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
+          <label class="switch-row"><span>热门榜单推荐</span><input type="checkbox" id="recommend-hot"></label>
+          <label class="switch-row"><span>每日推荐</span><input type="checkbox" id="recommend-daily"></label>
+          <label class="switch-row"><span>公共歌单</span><input type="checkbox" id="public-playlists-enabled"></label>
           <div id="public-playlists-browser" class="stack" hidden>
             <div class="btn-row">
               <select class="input" id="public-provider" aria-label="歌单音源"></select>
@@ -205,17 +221,16 @@
       <section class="page" id="page-search">
         <h2>搜索</h2>
         <div class="card">
-          <label class="switch-row"><span>搜索深分页<div class="sub">搜索结果翻页时，若在线歌曲不够填满一页，自动向音源继续取下一页补齐（本地歌曲始终排在最前）；musicdl 音源不支持分页，仅参与首屏。关闭后在线结果只显示首次搜索拿到的部分。</div></span><input type="checkbox" id="search-deep"></label>
+          <div class="card-title"><span>搜索设置</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></div>
+          <label class="switch-row"><span>搜索深分页</span><input type="checkbox" id="search-deep"></label>
         </div>
         <div class="card">
           <label class="field"><span>搜索超时时间</span>
             <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
           </label>
-          <p class="hint">单位为秒，默认 15。在线结果一返回就交给播放页，本地歌曲在前；到时还没有就放弃这次在线结果，只返回本地歌曲。保存后立即生效。</p>
           <label class="field"><span>深分页页数上限</span>
             <input class="input" id="search-deep-max" type="number" min="1" max="50" step="1" inputmode="numeric">
           </label>
-          <p class="hint">每个关键词最多向单个音源取多少页（含首屏），默认 10，防止无限翻页打爆音源。保存后立即生效。</p>
         </div>
       </section>
 
@@ -223,27 +238,27 @@
       <section class="page" id="page-tee">
         <h2>边听边存</h2>
         <div class="card">
-          <label class="switch-row"><span>边听边存<div class="sub">在线试听时，歌曲下载完整即保存到本地曲库，不必听完整首</div></span><input type="checkbox" id="tee-enabled"></label>
-          <label class="switch-row"><span>自动下载封面<div class="sub">自动保存到本地的歌曲会顺带把封面一起下回来，直接嵌进音频文件里；飞牛音乐认的就是内嵌封面，这样官方 App 里下载的歌就有图。歌曲保存成功后才会去下封面，不会出现只有封面没有歌的垃圾文件。默认开启。</div></span><input type="checkbox" id="auto-cover"></label>
-          <label class="switch-row"><span>自动下载歌词<div class="sub">自动保存到本地的歌曲在完整下载成功后，自动下载同名 .lrc 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放就能显示歌词。歌曲下载成功后才会去下歌词，不会出现只有歌词没有歌的垃圾文件。酷我源的歌词接口已失效，暂无歌词。默认关闭。</div></span><input type="checkbox" id="lyric-auto-dl"></label>
+          <div class="card-title"><span>保存与素材</span><button class="help-btn" type="button" data-help="tee-save" aria-label="保存与素材帮助">?</button></div>
+          <p class="hint">在线试听下载完整即保存，不必听完整首；关闭后仅保留滚动缓存。</p>
+          <label class="switch-row"><span>边听边存</span><input type="checkbox" id="tee-enabled"></label>
+          <label class="switch-row"><span>自动下载封面</span><input type="checkbox" id="auto-cover"></label>
+          <label class="switch-row"><span>自动下载歌词</span><input type="checkbox" id="lyric-auto-dl"></label>
           <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
             <input class="input" id="tee-max" type="number" min="1" max="100">
           </label>
-          <p class="hint">缓存数仅在关闭边听边存时生效；restore 还原时会一并清理这些滚动缓存。</p>
         </div>
         <div class="card">
-          <label class="switch-row"><span>收藏自动绑定本地<div class="sub">显式收藏或加入歌单后，在后台下载并绑定本地歌曲。浏览列表不会触发音频下载；已有文件仍会重试绑定。默认关闭。</div></span><input type="checkbox" id="fav-autobind"></label>
+          <div class="card-title"><span>收藏绑定与续传</span><button class="help-btn" type="button" data-help="tee-binding" aria-label="收藏绑定与续传帮助">?</button></div>
+          <label class="switch-row"><span>收藏自动绑定本地</span><input type="checkbox" id="fav-autobind"></label>
           <label class="field"><span>官方绑定等待（秒） <b id="bind-timeout-label"></b></span>
             <input class="input" id="bind-timeout" type="number" min="10" max="3600">
           </label>
-          <p class="hint">下载落库后等待官方曲库收录并完成官方写入的时间上限，超时保留本地映射、打开列表时自动重试。</p>
           <label class="field"><span>切歌续传并行数</span>
             <input class="input" id="handoff-max" type="number" min="0" max="20">
           </label>
           <label class="field"><span>曲库重扫接口（选填）</span>
             <input class="input" id="scan-path" placeholder="留空=官方自动扫描入库">
           </label>
-          <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口无公开文档，可从 FNMUSIC_TRACE_FORWARD=detail 取证日志捕获后填入以加速官方入库。</p>
         </div>
         <div class="card">
           <div class="card-title">清理垃圾文件 <span class="badge">Beta</span></div>
@@ -258,8 +273,7 @@
       <section class="page" id="page-dirs">
         <h2>目录设置</h2>
         <div class="card">
-          <div class="card-title">歌曲缓存目录</div>
-          <p class="hint">在线试听的滚动缓存、转码缓存、去重标记等临时文件存放目录，留空使用安装目录下的 cache。更换目录后旧缓存文件不自动迁移（已保存进本地曲库的歌曲不受影响，去重标记会自动带到新目录）。</p>
+          <div class="card-title"><span>歌曲缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>
           <label class="field"><span>缓存目录</span>
             <input class="input" id="dir-cache" placeholder="留空=安装目录 cache">
           </label>
@@ -269,8 +283,7 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-title">下载目录</div>
-          <p class="hint">边听边存、收藏/加入歌单自动下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库目录。建议选择官方共享曲库目录，官方 App 扫描入库后即可在本地列表播放。</p>
+          <div class="card-title"><span>下载目录</span><button class="help-btn" type="button" data-help="download-dir" aria-label="下载目录帮助">?</button></div>
           <label class="field"><span>下载目录</span>
             <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
           </label>
@@ -283,9 +296,8 @@
 
       <!-- LLM -->
       <section class="page" id="page-llm">
-        <h2>高级 · 大模型</h2>
+        <h2><span>高级 · 大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
         <div class="card">
-          <p class="hint">配置 OpenAI 兼容接口不会自动启用推荐用途。以下两个用途默认关闭，需明确勾选；保存后代理热重载生效。模型留空使用 gpt-4o-mini。</p>
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
@@ -304,15 +316,10 @@
             <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
           </div>
           <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
-          <p class="hint">每日推荐仍受「每日推荐」总开关控制：音源原生推荐优先 → 已勾选且接口完整时的大模型 → 本地曲库兜底。取消大模型每日推荐不会关闭每日推荐歌单。</p>
-          <p class="hint">接口协议默认 Chat Completions；选 Responses 时请求「Base URL/responses」（OpenAI 新版接口）。DeepSeek 等推理模型若出现"正文为空、只走本地推荐"，可在附加请求参数里填 {"thinking":{"type":"disabled"}} 关闭思考，或调大单次输出上限（含推理 token）。每日 token 上限达到后当天不再调用大模型（推荐自动走本地兜底），次日自动重置；0 表示不限制。单次输出上限范围 256–131072，默认 8192。</p>
           <div id="llm-liked-settings" hidden>
             <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
             <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
-            <p class="hint">间隔默认 0.5 小时，须为有限数字且至少 0.5，无上限；数量默认 20，须为 0–100 的整数，不可留空。数量 0 在此用途生效时停止生成且不展示猜你喜欢。</p>
-            <p class="hint">启用并保存生效后后台预生成首批，不必先打开歌单。每批首次被客户端获取后才开始计时，到间隔后后台被动预生成下一批；尚未获取的批次不会到期或轮换。间隔不是缓存失效时间。</p>
           </div>
-          <p class="hint">取消勾选会隐藏猜你喜欢参数并保留已保存值，恢复原本的纯本地猜你喜欢；本地有效、未收藏候选至少 20 首的门槛不变，不随上述数量调整。</p>
         </div>
       </section>
 
@@ -354,8 +361,7 @@
             <ul class="about-disclaimer" id="about-disclaimer"></ul>
           </div>
           <div class="card">
-            <div class="card-title">运行日志</div>
-            <p class="hint">日志在本地滚动保留 3 天，卸载时随应用一并删除。导出包含近 3 天全部日志与环境快照，问题反馈时可一并附上。</p>
+            <div class="card-title"><span>运行日志</span><button class="help-btn" type="button" data-help="logs" aria-label="运行日志帮助">?</button></div>
             <div id="about-logs" class="stack"></div>
             <div class="btn-row">
               <button class="btn" id="log-export-btn">导出日志</button>
@@ -390,6 +396,89 @@
   <div class="save-bar" id="save-bar">
     <span id="save-note" class="muted"></span>
     <button class="btn primary" id="save-btn">保存并生效</button>
+  </div>
+
+  <template data-help-id="providers">
+    <p>主音源三选一：保存后 WebUI 会切换对应音源进程。musicdl 面向多平台聚合，网易盒子适合账号曲库与每日推荐，洛雪使用你自己的源脚本解析播放。</p>
+  </template>
+  <template data-help-id="netease-login">
+    <p>手机网易云音乐 App 扫码授权。登录态保存在数据卷，重启不丢失。</p>
+  </template>
+  <template data-help-id="netease-playlists">
+    <p>账号歌单需要网易盒子启用并扫码登录；开启后自己创建的歌单会出现在热门推荐和官方歌单之间，收藏的他人歌单不显示。歌单只读，不会写回网易。</p>
+    <p>歌单常驻开启后，即使切换到其它音源，账号歌单和公共歌单仍可显示播放，网易盒子进程保持常驻。搜索结果仍只在网易盒子为主音源时使用网易。</p>
+  </template>
+  <template data-help-id="musicdl-platforms">
+    <p>按需勾选 musicdl 平台。平台列表来自当前服务注册项，搜索与播放只使用已启用集合；平台不可达时可能返回空结果或播放失败。</p>
+  </template>
+  <template data-help-id="lx-source-add">
+    <p>可粘贴 http/https 源脚本地址、上传 .js 文件，或在桌面环境从 NAS 选择。可填写自定义名称后点击“添加”，保存时统一校验并加入源列表。</p>
+  </template>
+  <template data-help-id="lx-source-list">
+    <p>支持多个洛雪源同时激活，解析失败时自动接力。新激活的源会先做可用性校验，每个约需 1 分钟；保存并生效后按列表配置热更新。</p>
+  </template>
+  <template data-help-id="direct-play">
+    <p>开启后，本地曲库和完整缓存未命中的原文件在线播放会由扩展代理返回音乐源 HTTPS 地址的 302，不再由 NAS 前台转发音频正文。默认关闭，保存后经代理热重载生效；关闭文件监听时需重启代理。</p>
+    <p>标准音质 HLS、App 下载、收藏和歌单协议不改为直连。本地或完整缓存命中仍从 NAS 文件供流。边听边存开启时，客户端直连的同时 NAS 仍会去重启动后台保存。</p>
+    <p>302 不能让播放器自动带上 NAS 使用的 UA、Referer、Cookie 或 TLS 指纹；手机与 NAS 不同公网出口、CORS 或临时链接限制都可能导致失败。NAS 取链或探活成功不代表客户端一定能播。失败时关闭对应开关并重新起播，即可恢复代理流程。</p>
+    <p>客户端 IP 和播放请求会直接暴露给音乐源。NAS 仍承担搜索、鉴权、取链及有限探活，不是完全不访问音源。</p>
+    <p>已交付的临时链接无法撤回，关闭开关影响后续经过 NAS 的请求。相同凭证同时播放同一歌曲时，客户端没有独立会话标识，短期目标可能共享；续传失效需重新起播。</p>
+  </template>
+  <template data-help-id="direct-netease">
+    <p>登录、会员权益和取链仍由 NAS 上的网易盒子完成；302 只交付解析后的媒体 URL。链接到期时间、跨出口有效性和源站限制取决于网易 CDN。</p>
+  </template>
+  <template data-help-id="direct-musicdl">
+    <p>不同平台的兼容性差异较大。NAS 使用的下载头和 TLS 模拟不能通过 302 传给客户端；某些平台可能拒绝其它 UA、Referer 或出口 IP。解析失败或目标不安全时不会回退成代理成功。</p>
+  </template>
+  <template data-help-id="direct-lx">
+    <p>实际兼容性取决于洛雪脚本和目标 CDN，部分平台依赖 UA/Referer 或 Cookie。更换脚本后需要重新验证；脚本选出的原文件表示不会被伪装成客户端已可播。</p>
+  </template>
+  <template data-help-id="quality">
+    <p>只影响在线播放/搜索时按什么档位取歌：高音质优先无损原文件；平衡取中间档；流畅优先低档。保存后热更新生效。</p>
+  </template>
+  <template data-help-id="download-quality">
+    <p>只影响 App 内点“下载”拿到的文件。默认“跟随 App”：只有 App 明确选标准才交 MP3，其余保持原文件；无损歌曲不会擅自转成 MP3。</p>
+  </template>
+  <template data-help-id="recommend">
+    <p>热门榜单与每日推荐是两个独立歌单。公共歌单可浏览并勾选网易/洛雪的原生榜单和分类歌单，作为只读歌单展示；musicdl 没有统一推荐歌单发现接口。</p>
+  </template>
+  <template data-help-id="search">
+    <p>深分页在在线歌曲不够填满当前页时继续取下一页，本地歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>
+    <p>搜索超时默认 15 秒，到时未返回就只交本地结果。深分页页数上限默认 10，防止无限翻页打爆音源。</p>
+  </template>
+  <template data-help-id="tee-save">
+    <p>边听边存开启时，代理完整获取的在线歌曲会自动保存到本地曲库，不必听完整首。关闭后仅保留滚动缓存；restore 会一并清理这些滚动缓存。</p>
+    <p>封面仅在歌曲保存成功后下载并嵌入音频；歌词仅在歌曲成功后下载为同名 .lrc。不会产生只有素材没有歌曲的垃圾文件。酷我歌词接口当前不可用。</p>
+  </template>
+  <template data-help-id="tee-binding">
+    <p>显式收藏或加入歌单后，后台下载并绑定本地歌曲；浏览列表不会触发音频下载，已有文件会重试绑定。默认关闭。</p>
+    <p>绑定等待是下载落库后等待官方收录并完成写入的上限，超时保留映射并自动重试。切歌续传让未完成下载转后台；并行数 0 表示关闭续传。重扫接口可用日志取证后填写以加速入库。</p>
+  </template>
+  <template data-help-id="cache-dir">
+    <p>存放在线试听滚动缓存、转码缓存和去重标记等临时文件，留空使用安装目录 cache。更换目录后旧缓存不迁移，去重标记会带到新目录。</p>
+  </template>
+  <template data-help-id="download-dir">
+    <p>边听边存、收藏或歌单自动下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库。建议使用官方共享曲库目录，便于官方扫描后进入本地列表。</p>
+  </template>
+  <template data-help-id="llm">
+    <p>配置 OpenAI 兼容接口不会自动启用推荐用途；“猜你喜欢”和“每日推荐”需分别勾选。每日推荐仍受总开关控制：原生推荐优先，其次模型，最后本地曲库兜底。</p>
+    <p>协议默认 Chat Completions；Responses 请求 Base URL/responses。单次输出上限 256–131072，每日 token 限额达到后当天暂停调用。附加参数可关闭推理模型的思考或传服务商专属字段。</p>
+    <p>猜你喜欢间隔至少 0.5 小时，数量 0–100；数量 0 在此用途生效时停止生成且不展示猜你喜欢。第一批生成后，从首次被客户端获取开始计时；尚未获取的批次不会到期或轮换，间隔不是缓存失效时间。取消用途会保留参数并回到本地推荐，本地有效、未收藏候选至少 20 首的门槛不变。</p>
+    <p>保存后代理热重载生效。模型留空使用 gpt-4o-mini；每日 token 限额 0 表示不限制，达到限额后当日走本地兜底，次日重置。单次输出上限默认 8192，包含推理 token。</p>
+    <p>DeepSeek 等推理模型若正文为空，可在附加请求参数中填写 {"thinking":{"type":"disabled"}} 关闭思考，或调大单次输出上限。猜你喜欢默认间隔 0.5 小时、数量 20，间隔须为有限数字且无上限，数量须为整数且不可留空。启用并保存后后台预生成首批，不必先打开歌单。</p>
+  </template>
+  <template data-help-id="logs">
+    <p>日志本地滚动保留 3 天，卸载时随应用删除。导出包含近 3 天全部日志与环境快照；密钥会脱敏，但仍建议只在需要排查问题时提供给可信对象。</p>
+  </template>
+
+  <div class="modal-mask help-modal" id="help-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="help-title">
+      <div class="modal-title" id="help-title">帮助</div>
+      <div class="help-body" id="help-body"></div>
+      <div class="btn-row modal-actions">
+        <button class="btn" id="help-close-btn" type="button">关闭</button>
+      </div>
+    </div>
   </div>
 
   <div class="modal-mask" id="cleanup-modal" hidden>

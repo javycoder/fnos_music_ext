@@ -59,6 +59,20 @@ def test_ensure_xdg_dirs_creates_all_directories(tmp_path, monkeypatch):
     assert (runtime_dir / "netease-musicbox").is_dir()
 
 
+@pytest.mark.asyncio
+async def test_cached_playback_description_reports_remaining_lifetime(monkeypatch):
+    playback = musicbox_app.playback
+    cached_item = {"code": 200, "url": "https://cdn.example/fixture.flac", "expi": 1800}
+    monkeypatch.setattr(playback, "_cache", {
+        (playback._generation, 123, "lossless"): (cached_item, time.monotonic() + 8)})
+    monkeypatch.setattr(playback, "_tasks", {})
+    first = await playback.get_song_url_async(123, "lossless")
+    second = await playback.get_song_url_async(123, "lossless")
+    assert 0 < second["reuse_for_s"] <= first["reuse_for_s"] <= 8
+    assert first["expiry_source"] == "policy"
+    assert "reuse_for_s" not in cached_item
+
+
 def test_auth_login_qr_with_upstream_qr_ascii(monkeypatch):
     test_ascii = "█▀▀▀▀▀▀▀█\n█ █▀▀▀█ █\n▀▀▀▀▀▀▀▀▀"
 

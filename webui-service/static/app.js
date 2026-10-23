@@ -13,6 +13,7 @@ const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserv
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
+let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let qrTimer = null;
@@ -97,6 +98,68 @@ function clearDirty() {
   const noteEl = $("#save-note");
   if (noteEl) noteEl.textContent = "";
 }
+
+/* -------------------------------------------------------------- 帮助弹窗 */
+let helpReturnFocus = null;
+let helpPreviousOverflow = "";
+let helpBackgroundState = [];
+
+function helpFocusables() {
+  return $$("#help-modal button, #help-modal [href], #help-modal input, #help-modal select, #help-modal textarea")
+    .filter((el) => !el.disabled);
+}
+
+function openHelp(helpId, trigger = null) {
+  const template = document.querySelector(`template[data-help-id="${helpId}"]`);
+  if (!template) return;
+  if (!$("#help-modal").hidden) return;
+  const title = (trigger && trigger.getAttribute && trigger.getAttribute("aria-label")) || "帮助";
+  helpReturnFocus = trigger || document.activeElement;
+  $("#help-title").textContent = title.replace(/帮助$/, "");
+  $("#help-body").replaceChildren(template.content.cloneNode(true));
+  $("#help-modal").hidden = false;
+  helpPreviousOverflow = document.body.style.overflow || "";
+  helpBackgroundState = $$(".layout, #save-bar").map((element) => [element, element.inert]);
+  helpBackgroundState.forEach(([element]) => { element.inert = true; });
+  document.body.style.overflow = "hidden";
+  $("#help-close-btn").focus();
+}
+
+function closeHelp() {
+  if ($("#help-modal").hidden) return;
+  $("#help-modal").hidden = true;
+  $("#help-body").replaceChildren();
+  document.body.style.overflow = helpPreviousOverflow;
+  helpBackgroundState.forEach(([element, inert]) => { element.inert = inert; });
+  helpBackgroundState = [];
+  if (helpReturnFocus && typeof helpReturnFocus.focus === "function") helpReturnFocus.focus();
+  helpReturnFocus = null;
+}
+
+$$("[data-help]").forEach((btn) => btn.addEventListener("click", () => openHelp(btn.dataset.help, btn)));
+$("#help-close-btn").addEventListener("click", closeHelp);
+$("#help-modal").addEventListener("click", (ev) => {
+  if (ev.target === ev.currentTarget) closeHelp();
+});
+window.addEventListener("keydown", (ev) => {
+  if ($("#help-modal").hidden || !$("#cleanup-modal").hidden) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeHelp();
+  } else if (ev.key === "Tab") {
+    const items = helpFocusables();
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (ev.shiftKey && document.activeElement === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
+});
 
 /* -------------------------------------------------------------- 导航 */
 function switchPage(page) {
@@ -265,6 +328,7 @@ async function loadConfig() {
   const cfg = await api("/api/config");
   configValues = cfg.values;
   configPresence = cfg.presence || {};
+  configSchema = cfg.schema || {};
   applyConfigToForm();
   clearDirty();
 }
@@ -279,6 +343,15 @@ function applyConfigToForm() {
   if (provider === "musicbox") syncNeteaseAccount();
   const quality = v.FNMUSIC_QUALITY_MODE || "high";
   $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
+  [
+    ["#direct-netease", "FNMUSIC_NETEASE_DIRECT_PLAY"],
+    ["#direct-musicdl", "FNMUSIC_MUSICDL_DIRECT_PLAY"],
+    ["#direct-lx", "FNMUSIC_LX_DIRECT_PLAY"],
+  ].forEach(([selector, key]) => {
+    const el = $(selector);
+    el.disabled = !configSchema[key];
+    el.checked = configSchema[key] ? ["true", "1", "yes", "on"].includes(String(v[key] || "").trim().toLowerCase()) : false;
+  });
   const dlQuality = v.FNMUSIC_DL_QUALITY || "app";
   $$("input[name=dl-quality]").forEach((el) => { el.checked = el.value === dlQuality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
@@ -351,6 +424,9 @@ function collectConfig() {
     FNMUSIC_MUSICDL_ENABLED: provider === "musicdl",
     FNMUSIC_NETEASE_ENABLED: provider === "musicbox",
     FNMUSIC_LX_ENABLED: provider === "lxmusic",
+    ...(configSchema.FNMUSIC_NETEASE_DIRECT_PLAY ? { FNMUSIC_NETEASE_DIRECT_PLAY: $("#direct-netease").checked } : {}),
+    ...(configSchema.FNMUSIC_MUSICDL_DIRECT_PLAY ? { FNMUSIC_MUSICDL_DIRECT_PLAY: $("#direct-musicdl").checked } : {}),
+    ...(configSchema.FNMUSIC_LX_DIRECT_PLAY ? { FNMUSIC_LX_DIRECT_PLAY: $("#direct-lx").checked } : {}),
     FNMUSIC_QUALITY_MODE: ($$("input[name=quality]").find((el) => el.checked) || {}).value || "high",
     FNMUSIC_DL_QUALITY: ($$("input[name=dl-quality]").find((el) => el.checked) || {}).value || "app",
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
@@ -1681,6 +1757,8 @@ $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => ma
 $$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("下载音质需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
+["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>
+  $(sel).addEventListener("change", () => markDirty("播放直连策略需保存后生效")));
 
 function updateTeeCountLabel() {
   const n = $("#tee-max").value || configValues.FNMUSIC_TEE_CACHE_MAX || "2";

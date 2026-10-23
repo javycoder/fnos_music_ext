@@ -18,7 +18,7 @@ function stubEl() {
   const listeners = {};
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
-    checked: false, disabled: false, src: "", dataset: {}, _t: null,
+    checked: false, disabled: false, src: "", dataset: {}, _t: null, style: {},
     classList: {
       add(...c) { c.forEach((x) => classes.add(x)); },
       remove(...c) { c.forEach((x) => classes.delete(x)); },
@@ -31,6 +31,7 @@ function stubEl() {
     },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
     appendChild(child) { (this._children = this._children || []).push(child); return child; },
+    replaceChildren(...children) { this._children = children; },
     removeChild(child) { return child; },
     remove() {},
     // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
@@ -48,6 +49,7 @@ function stubEl() {
       this.disabled = false; this.src = ""; this.dataset = {}; this._t = null;
     },
     querySelectorAll() { return []; },
+    get content() { return { cloneNode: () => ({ nodeName: "help-content" }) }; },
   };
 }
 
@@ -58,6 +60,10 @@ const qsaRegistry = new Map();
 
 global.document = {
   querySelector(sel) {
+    if (sel.startsWith("template[data-help-id=")) {
+      const wanted = sel.slice('template[data-help-id="'.length, -2);
+      return (global.helpTemplates || []).find((tpl) => tpl.dataset.helpId === wanted) || null;
+    }
     if (!els.has(sel)) els.set(sel, stubEl());
     return els.get(sel);
   },
@@ -134,6 +140,7 @@ function reset() {
   els.forEach((el) => el._resetState && el._resetState());
   routes = new Map();
   fetchCalls.length = 0;
+  global.helpTemplates = [];
 }
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
@@ -1733,6 +1740,44 @@ test("已选名称：瞬时失败缓存到期可恢复，不永久保留失败",
   await global.ensurePublicSelectionDetails();
   assert.strictEqual(fetchCalls.length, 2);
   assert.ok(els.get("#public-selected").innerHTML.includes("到期恢复"));
+});
+
+test("播放直连：八种组合与手工布尔别名独立回填", async () => {
+  const keys = ["FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"];
+  const schema = Object.fromEntries(keys.map((key) => [key, {}]));
+  for (let combination = 0; combination < 8; combination += 1) {
+    const expected = keys.map((key, index) => Boolean(combination & (1 << index)));
+    const aliases = ["YES", "1", "on"];
+    const values = Object.fromEntries(keys.map((key, index) => [key, expected[index] ? aliases[index] : "false"]));
+    enqueue("/app/fnmusic-ext/api/config", { values, schema });
+    await global.loadConfig();
+    const result = vm.runInThisContext("collectConfig()");
+    assert.deepStrictEqual(keys.map((key) => result[key]), expected);
+  }
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, true);
+  assert.ok(!("FNMUSIC_NETEASE_DIRECT_PLAY" in vm.runInThisContext("collectConfig()")));
+});
+
+test("帮助弹窗：滚动恢复、焦点往返且不标脏", async () => {
+  const template = stubEl();
+  template.dataset.helpId = "direct-play";
+  global.helpTemplates = [template];
+  els.get("#help-modal").hidden = true;
+  const trigger = stubEl();
+  trigger.getAttribute = () => "播放直连帮助";
+  document.body.style.overflow = "auto";
+  const before = vm.runInThisContext("dirty");
+  global.openHelp("direct-play", trigger);
+  assert.strictEqual(els.get("#help-modal").hidden, false);
+  assert.strictEqual(els.get("#help-title").textContent, "播放直连");
+  assert.deepStrictEqual(els.get("#help-body")._children, [{ nodeName: "help-content" }]);
+  assert.strictEqual(document.body.style.overflow, "hidden");
+  global.closeHelp();
+  assert.strictEqual(document.body.style.overflow, "auto");
+  assert.strictEqual(document.activeElement, trigger);
+  assert.strictEqual(vm.runInThisContext("dirty"), before);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

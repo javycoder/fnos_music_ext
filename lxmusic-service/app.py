@@ -1470,6 +1470,7 @@ async def track_url(
         or {"id": canonical_id, "lx_source": src}
     client = get_http(app)
 
+    generation = _URL_CACHE_GEN
     try:
         result = await _resolve_url_cached(
             client, src, cached, quality, budget=CONF["url_timeout"], fresh=bool(fresh)
@@ -1481,6 +1482,12 @@ async def track_url(
 
     if not result:
         return _err("no playable url", 404)
+    if generation != _URL_CACHE_GEN:
+        return _err("source changed during resolution", 409)
+    tiers = _quality_tiers(quality)
+    selection = _URL_CACHE.get((cached.get("id") or canonical_id, tiers[0] if tiers else "standard"))
+    remaining = (max(0.0, CONF["url_cache_ttl"] - (time.monotonic() - selection["ts"]))
+                 if selection and selection.get("data") == result else 0.0)
 
     return {
         "ok": True,
@@ -1488,6 +1495,8 @@ async def track_url(
             "id": track_id,
             "quality": quality,
             **{k: v for k, v in result.items() if k != "probed"},
+            "reuse_for_s": remaining,
+            "expiry_source": "policy",
         },
     }
 
