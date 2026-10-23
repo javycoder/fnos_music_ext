@@ -377,8 +377,10 @@ def test_gitee_large_upload_never_uses_body_replaying_retry():
 def test_gitee_step_has_bounded_wall_clock_and_idempotent_recovery():
     """重试必须能识别"服务端已落盘但响应丢失"，避免重复传输大文件。
 
-    单次限时按体积分级（v2.10.1 实测：28MB fpk 在 300s 上限下 3 次尝试
-    全部必然超时），大文件 1200s×2、小文件 300s×3，次数与时长都有上界。
+    时限按体积分级并设文件级总预算（v2.10.1 实测：28MB fpk 在 3×300s 下全部
+    必然超时；v2.10.2 实测：2×1200s 同样 2400s 零产出）。因此改为文件级
+    总预算 + 停滞检测：大文件 1800s / 小文件 600s，且大文件只要 90s 内低于
+    20KB/s 就断开换连接，不再靠放大单次时限硬扛。
     """
     script = _unindent_run(_gitee_step_script())
     assert 'timeout-minutes:' in RELEASE_WORKFLOW.read_text()
@@ -386,7 +388,33 @@ def test_gitee_step_has_bounded_wall_clock_and_idempotent_recovery():
     # 失败后先查附件列表再决定是否重试（幂等复用）
     assert 'attach_files?access_token=' in upload_body
     assert '复用现有附件' in upload_body
-    # 尝试次数有上界：按体积分级，但只允许下面两个字面量组合
-    assert 'for attempt in $(seq 1 "${attempts}")' in upload_body
-    assert 'max_time=1200; attempts=2' in upload_body
-    assert 'max_time=300; attempts=3' in upload_body
+    # 文件级总预算按体积分级
+    assert 'budget=1800; stall=20480' in upload_body
+    assert 'budget=600; stall=0' in upload_body
+    # 总预算必须在循环里被真正约束（剩余预算为底部退出条件）
+    assert 'deadline=$(( $(date +%s) + budget ))' in upload_body
+    assert '[ "${left}" -ge 60 ] || break' in upload_body
+    # 停滞连接必须被主动切断，而不是等满单次上限；小文件不传 0 值给 curl
+    assert 'throttle=(--speed-limit "${stall}" --speed-time 90)' in upload_body
+    assert '"${throttle[@]}"' in upload_body
+
+
+def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():
+    """moo 索引必须早于 Gitee 镜像同步。
+
+    Gitee 仓库镜像按 main 的分支状态同步，索引提交推到 main 之后镜像才会带上
+    新 moo.json；两者并行时 Gitee 可能停在旧索引上。同时镜像失败不得连累
+    moo 回填（v2.10.2 实测：Gitee 附件上传失败让 release job 变红，
+    update-moo-index 被整体跳过，索引停在 2.10.1）。
+    """
+    workflow = RELEASE_WORKFLOW.read_text()
+    assert '  publish-gitee:\n' in workflow
+    assert 'needs: [release, update-moo-index]' in workflow
+    # 独立 job 后仍需容忍 moo 失败，只在 release 成功时发布镜像
+    assert "always() && needs.release.result == 'success'" in workflow
+    # fpk 由 artifact 传递，避免两个 job 各自重打包导致 sha256 不一致
+    assert 'actions/upload-artifact@v4' in workflow
+    assert 'actions/download-artifact@v4' in workflow
+    # 上传失败降级为 warning，不整 job 失败
+    assert 'mirrored=1' in workflow
+    assert '::warning::Gitee 附件' in workflow
