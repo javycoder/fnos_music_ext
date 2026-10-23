@@ -155,7 +155,7 @@ COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_cli
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui/lxmusic/musicbox 复用 proxy 模块（.env 安全合并 + 统一日志 fnlog），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py proxy/fnlog.py proxy/publicplaylists.py proxy/version.py /srv/proxy/
+COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py proxy/fnlog.py proxy/publicplaylists.py proxy/version.py proxy/llm_usage.py /srv/proxy/
 RUN find /srv -name "*.py" -exec chmod 0644 {} + \
     && mkdir -p /repo \
     && chmod 0755 /repo /data
