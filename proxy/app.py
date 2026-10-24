@@ -36,6 +36,11 @@ import anyio
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
+try:  # 飞牛卷本地/远程判定：staged 落盘的开关依据
+    from .tee_save_mode import should_stage as _should_stage
+except ImportError:  # 兼容脚本式启动（无包上下文）
+    from tee_save_mode import should_stage as _should_stage
+
 try:
     from . import recommend as dailyrec
     from . import localrecommend as localrec
@@ -5216,6 +5221,240 @@ def _tee_metadata_fallback(
     return title, artist, album
 
 
+# ---------------------------------------------------------------- staged 落盘
+# 目标目录挂在 WebDAV/rclone/davfs 等网络文件系统上时，直接流式写 .part 再在
+# 远程改名既慢又易失败，中断还会在远程留下半截中间文件被音乐库误认成正常曲目。
+# staged 模式改为：下载、定名、权限、标签、封面、歌词全部在本地 cache/staging
+# 内完成，最后只向目标目录写一次完整文件——远程不出现 .part，也不需要远程改名。
+
+_TEE_STAGED_CACHE = {}          # (mode, target, cache) -> bool
+_STAGING_SWEEP_AT = [0.0]       # 上次清扫时间戳
+_STAGING_SWEEP_INTERVAL = 3600.0
+_STAGING_PART_TTL = 86400.0
+
+
+def tee_save_mode() -> str:
+    """解析落盘模式：CONF 优先，其次环境变量，非法值回落 auto。"""
+    mode = str(CONF.get("tee_save_mode") or "").strip().lower()
+    if not mode:
+        mode = str(os.environ.get("FNMUSIC_TEE_SAVE_MODE", "auto")).strip().lower()
+    if mode not in ("auto", "direct", "staged"):
+        mode = "auto"
+    return mode
+
+
+def _sweep_stale_parts(directory: str, ttl: float = _STAGING_PART_TTL) -> int:
+    """清理目录下超龄的 .part 中间文件。
+
+    缓存目录的回收只按 `online_*.<音频扩展名>` 匹配，`.part` 没有回收路径，
+    中断下载的碎片会永久堆积，这里一并兜底。
+    """
+    import time as _time
+
+    removed = 0
+    now = _time.time()
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_file() or not entry.name.endswith(".part"):
+                continue
+            if now - entry.stat().st_mtime <= ttl:
+                continue
+            os.unlink(entry.path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def staged_dir() -> str:
+    """本地暂存区，恒定落在 cache_dir 之下，从不触碰目标目录。"""
+    import time as _time
+
+    path = os.path.join(CONF["cache_dir"], "staging")
+    os.makedirs(path, exist_ok=True)
+    now = _time.time()
+    if now - _STAGING_SWEEP_AT[0] > _STAGING_SWEEP_INTERVAL:
+        _STAGING_SWEEP_AT[0] = now
+        try:
+            swept = _sweep_stale_parts(path) + _sweep_stale_parts(CONF["cache_dir"])
+            if swept:
+                logger.info("staged: purged %d stale .part files", swept)
+        except Exception as e:  # 清扫失败不影响主流程
+            logger.debug("staged: sweep skipped: %s", e)
+    return path
+
+
+def use_staged_save() -> bool:
+    """当前目标目录是否需要「本地加工完整 → 一次性上传」。"""
+    mode = tee_save_mode()
+    target = tee_save_dir()
+    cache = CONF["cache_dir"]
+    key = (mode, target, cache)
+    if key in _TEE_STAGED_CACHE:
+        return _TEE_STAGED_CACHE[key]
+    staged, reason = _should_stage(target, cache, mode)
+    _TEE_STAGED_CACHE[key] = staged
+    logger.info("[tee_save] target=%s cache=%s -> %s (%s)",
+                target, cache, "staged" if staged else "direct", reason)
+    return staged
+
+
+def _upload_staged_file(src_path: str, dest: str) -> bool:
+    """把本地已加工完的文件整体写入目标目录；网络挂载时即一次完整上传。
+
+    网络文件系统没有「以终名原子写入」能力，写入中断可能在目标目录留下同名
+    截断文件，因此写完必须核对大小，不符立即删残件。目标已存在且大小一致时
+    按既有语义复用，绝不覆盖用户文件。
+    """
+    try:
+        size = os.path.getsize(src_path)
+    except OSError as e:
+        logger.warning("staged: source missing %s: %s", src_path, e)
+        return False
+
+    if os.path.exists(dest):
+        try:
+            if os.path.getsize(dest) == size:
+                return True
+        except OSError:
+            pass
+        logger.warning("staged: %s exists with different size, keep it", dest)
+        return False
+
+    created = False
+    try:
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(src_path, dest)
+        created = True
+        if os.path.getsize(dest) != size:
+            os.unlink(dest)
+            logger.warning("staged: size mismatch after upload, removed %s", dest)
+            return False
+        return True
+    except OSError as e:
+        logger.warning("staged: upload failed for %s: %s", dest, e)
+        if created:
+            _remove_quiet(dest)
+        return False
+
+
+def _staged_write_lyric(dest_audio: str, text: str) -> bool:
+    """staged 模式歌词落盘：本地写全 → 目标目录单次完整写入。
+
+    write_lyric_cache 走「先写 .part 再 rename」的原子策略；网络挂载上 rename
+    本身也是一次远程改名，且中断会留下 .part。这里改为本地成文后整文件单次
+    写入，曲库已有同内容 sidecar 则跳过、已有不同内容则绝不覆盖。
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    lrc_dst = os.path.splitext(dest_audio)[0] + ".lrc"
+    if os.path.exists(lrc_dst):
+        try:
+            with open(lrc_dst, encoding="utf-8") as f:
+                if f.read().strip() == text:
+                    return True
+        except Exception:
+            pass
+        logger.info("staged: lyric exists, keep it: %s", lrc_dst)
+        return True
+    stage = staged_dir()
+    tmp = os.path.join(stage, f"{uuid4().hex[:8]}.lrc")
+    try:
+        os.makedirs(stage, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n")
+        adopt_library_perms(tmp)
+        if _upload_staged_file(tmp, lrc_dst):
+            logger.info("staged: lyric written %s", lrc_dst)
+            return True
+    except Exception as e:
+        logger.warning("staged: lyric write failed for %s: %s", lrc_dst, e)
+    finally:
+        _remove_quiet(tmp)
+    return False
+
+
+def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
+                                  artist: str, album: str, src: dict):
+    """staged 落盘：本地定名加工完整 → 目标目录单次写入。"""
+    stage = staged_dir()
+
+    # 1) 本地定终名（沿用 library_name_pattern，默认「歌手 - 歌名」）
+    final_name = os.path.basename(
+        library_media_path(guid, title, ext, artist=artist, directory=stage)
+    )
+    staged = os.path.join(stage, final_name)
+    if os.path.abspath(part) != os.path.abspath(staged):
+        try:
+            os.replace(part, staged)
+        except OSError:
+            shutil.move(part, staged)
+
+    # 2) 本地完成权限/标签/封面：全本地盘操作，无网络往返
+    adopt_library_perms(staged)
+    write_audio_tags(staged, title, artist, album)
+    cover_url = _cover_url_of(src)
+    if cover_url and CONF.get("auto_cover", True):
+        try:
+            fetched = download_cover_bytes(cover_url)
+            if fetched and embed_audio_cover(staged, fetched[0], fetched[1]):
+                logger.info("cover embedded for %s: %s", guid, staged)
+        except Exception as e:
+            logger.debug("cover embed step skipped for %s: %s", guid, e)
+
+    # 3) 目标目录定终名 → 单次完整写入
+    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+    reused = os.path.exists(dest)
+    if reused:
+        # 已有同名文件：只有大小与本次完全一致才认定同一份内容并丢弃本地副本；
+        # 大小不符说明是另一份文件（截断/旧版本），绝不删除本地成品字节。
+        try:
+            reuse_ok = os.path.getsize(dest) == os.path.getsize(staged)
+        except OSError:
+            reuse_ok = False
+        if not reuse_ok:
+            logger.warning("staged: %s exists with different size, kept local %s",
+                           dest, staged)
+            return dest, reused
+        ok = True
+    else:
+        ok = _upload_staged_file(staged, dest)
+    if ok:
+        _remove_quiet(staged)
+        if not reused:
+            logger.info("staged: uploaded %s -> %s", final_name, dest)
+    else:
+        # 上传失败：字节仍完整留在本地暂存区（绝不在远程留半成品），也不记录
+        # 媒体路径——否则后续播放会命中一个并不存在的远程文件。
+        logger.warning("staged: upload failed, kept local copy %s", staged)
+        return dest, reused
+
+    remember_media_path(guid, dest)
+
+    # 4) 此前只下了歌词（无音频时的影子歌词）随音频贴身进目标目录；
+    # 同样本地成文后单次上传，避免 promote_shadow_lyric 的远程改名
+    if CONF.get("lyric_auto_dl"):
+        shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
+        if os.path.exists(shadow):
+            try:
+                with open(shadow, encoding="utf-8") as f:
+                    shadow_text = f.read()
+            except OSError:
+                shadow_text = ""
+            if shadow_text.strip() and _staged_write_lyric(dest, shadow_text):
+                _remove_quiet(shadow)
+
+    return dest, reused
+
+
 def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: str,
                            album: str, src: dict) -> "tuple[str, bool]":
     """把已校验完整的音频转正进曲库：定名/落位/权限/标签/封面/影子歌词随迁。
@@ -5225,6 +5464,14 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
     后续播放命中本地。跨文件系统（缓存目录与曲库不同挂载点）退化为复制+删除。
     返回 (dest, reused)。
     """
+    if use_staged_save():
+        # 目标目录是 WebDAV/rclone 等网络挂载：定名、权限、标签、封面、歌词全在
+        # 本地暂存区完成，最后只向目标目录写一次完整文件——远程不出现 .part 中间
+        # 文件，也不需要在远程改名。
+        return _install_library_audio_staged(
+            part, guid, ext, title, artist, album, src
+        )
+
     dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
     reused = os.path.exists(dest)
     if reused:
@@ -5330,7 +5577,11 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
     if tee_enabled and CONF.get("lyric_auto_dl"):
         lyric = str(src.get("lyric") or src.get("lrc") or "")
         if lyric.strip():
-            write_lyric_cache(guid, lyric, title, artist)
+            if use_staged_save():
+                # 远程目标目录：歌词同样本地成文后单次上传，不产生 .part/不远程改名
+                _staged_write_lyric(dest, lyric)
+            else:
+                write_lyric_cache(guid, lyric, title, artist)
     if not tee_enabled:
         try:
             purge_rolling(CONF["cache_dir"], keep=int(CONF.get("tee_cache_max", 2)))
@@ -6159,7 +6410,8 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         length = resp.headers.get("content-length", "")
         if length.isdigit():
             expected = int(length)
-        directory = tee_save_dir()
+        # staged 模式下先落本地暂存区，完整下载并加工后再一次性写入目标目录
+        directory = staged_dir() if use_staged_save() else tee_save_dir()
         os.makedirs(directory, exist_ok=True)
         part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
         written = 0
