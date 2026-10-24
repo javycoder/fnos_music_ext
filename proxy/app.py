@@ -5387,6 +5387,17 @@ def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
     """staged 落盘：本地定名加工完整 → 目标目录单次写入。"""
     stage = staged_dir()
 
+    # 0) 复用判定先行：目标已有同名文件（重复落盘/同曲跨 guid/用户自有文件）
+    # 一律复用、丢弃本次下载，不做标签改写、不下载封面——与 direct 路径
+    # 「复用即不动」语义一致（issue #52），用户自有文件的字节绝不被动。
+    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
+    reused = os.path.exists(dest)
+    if reused:
+        _remove_quiet(part)
+        logger.info("staged: library file already exists for %s, reuse %s", guid, dest)
+        remember_media_path(guid, dest)
+        return dest, reused
+
     # 1) 本地定终名（沿用 library_name_pattern，默认「歌手 - 歌名」）
     final_name = os.path.basename(
         library_media_path(guid, title, ext, artist=artist, directory=stage)
@@ -5410,27 +5421,11 @@ def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
         except Exception as e:
             logger.debug("cover embed step skipped for %s: %s", guid, e)
 
-    # 3) 目标目录定终名 → 单次完整写入
-    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-    reused = os.path.exists(dest)
-    if reused:
-        # 已有同名文件：只有大小与本次完全一致才认定同一份内容并丢弃本地副本；
-        # 大小不符说明是另一份文件（截断/旧版本），绝不删除本地成品字节。
-        try:
-            reuse_ok = os.path.getsize(dest) == os.path.getsize(staged)
-        except OSError:
-            reuse_ok = False
-        if not reuse_ok:
-            logger.warning("staged: %s exists with different size, kept local %s",
-                           dest, staged)
-            return dest, reused
-        ok = True
-    else:
-        ok = _upload_staged_file(staged, dest)
+    # 3) 单次完整写入目标目录
+    ok = _upload_staged_file(staged, dest)
     if ok:
         _remove_quiet(staged)
-        if not reused:
-            logger.info("staged: uploaded %s -> %s", final_name, dest)
+        logger.info("staged: uploaded %s -> %s", final_name, dest)
     else:
         # 上传失败：字节仍完整留在本地暂存区（绝不在远程留半成品），也不记录
         # 媒体路径——否则后续播放会命中一个并不存在的远程文件。
