@@ -297,6 +297,7 @@ function applyConfigToForm() {
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
   $("#dir-download").value = v.FNMUSIC_TEE_SAVE_DIR || "";
+  $("#tee-save-mode").value = ["auto", "direct", "staged"].includes(v.FNMUSIC_TEE_SAVE_MODE) ? v.FNMUSIC_TEE_SAVE_MODE : "auto";
   $("#dir-cache").value = v.FNMUSIC_CACHE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   $("#bind-timeout").value = v.FNMUSIC_OFFICIAL_BIND_TIMEOUT_S || "120";
@@ -361,6 +362,7 @@ function collectConfig() {
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
     FNMUSIC_TEE_SAVE_DIR: $("#dir-download").value.trim(),
+    FNMUSIC_TEE_SAVE_MODE: ["auto", "direct", "staged"].includes($("#tee-save-mode").value) ? $("#tee-save-mode").value : "auto",
     FNMUSIC_CACHE_DIR: $("#dir-cache").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,

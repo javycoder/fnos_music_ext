@@ -120,6 +120,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
+    "FNMUSIC_TEE_SAVE_MODE": {"kind": "enum", "values": ["auto", "direct", "staged"], "default": "auto", "group": "storage", "reload": "hot", "label": "落盘方式"},
     "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
     "FNMUSIC_FAV_AUTO_BIND": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "收藏自动绑定本地"},

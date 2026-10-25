@@ -2474,3 +2474,45 @@ def test_hidden_toggled_elements_not_defeated_by_display():
                 f"#{el_id} 靠 hidden 属性切换，但 .{cls} 的 display 声明会压过 UA 的 "
                 f"[hidden] 规则导致常显——需补 .{cls}[hidden] 或 #{el_id}[hidden] "
                 f"{{ display: none; }} 兜底")
+
+
+# ---------------------------------------------------------------- 落盘方式 ----
+
+def test_tee_save_mode_schema_and_default(env_file):
+    """落盘方式进 /api/config 视图：enum 三值、默认 auto。"""
+    with authed_client() as client:
+        r = client.get("/api/config")
+        assert r.status_code == 200
+        rj = r.json()
+        assert rj["values"]["FNMUSIC_TEE_SAVE_MODE"] == "auto"
+        assert rj["schema"]["FNMUSIC_TEE_SAVE_MODE"]["values"] == ["auto", "direct", "staged"]
+        assert rj["schema"]["FNMUSIC_TEE_SAVE_MODE"]["default"] == "auto"
+        assert rj["schema"]["FNMUSIC_TEE_SAVE_MODE"]["group"] == "storage"
+
+
+def test_tee_save_mode_roundtrip_rejects_bad(env_file):
+    """合法值落盘回读一致；非法值 400 拒绝。"""
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_TEE_SAVE_MODE": "staged"}})
+        assert r.status_code == 200
+        r = client.get("/api/config")
+        assert r.json()["values"]["FNMUSIC_TEE_SAVE_MODE"] == "staged"
+        for bad in ("ultra", "AUTO ", "", "direct;rm"):
+            r = client.put("/api/config", json={"values": {"FNMUSIC_TEE_SAVE_MODE": bad}})
+            assert r.status_code == 400, bad
+
+
+def test_tee_save_mode_ui_bindings():
+    """前端下拉框存在、三选项齐全、读写两处与后端键名对上。"""
+    import re
+    html = open("webui-service/static/index.html", encoding="utf-8").read()
+    js = open("webui-service/static/app.js", encoding="utf-8").read()
+    assert 'id="tee-save-mode"' in html
+    for val in ("auto", "direct", "staged"):
+        assert f'value="{val}"' in html
+    # 位于下载目录卡片内（dir-download 与 tee-save-mode 同卡片）
+    card = re.search(r'下载目录.*?</div>\s*</div>', html, re.S)
+    assert card and "tee-save-mode" in card.group(0)
+    # JS 读 + 写都有，且键名正确
+    assert js.count("tee-save-mode") >= 2
+    assert "FNMUSIC_TEE_SAVE_MODE" in js

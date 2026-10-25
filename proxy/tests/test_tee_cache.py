@@ -760,3 +760,43 @@ def test_lyric_part_cleanup_failure_is_logged(monkeypatch, tmp_path, caplog):
         p.write_lyric_cache(guid, "[00:00.00]词")
     assert any(".part" in r.getMessage() and "gone" in r.getMessage()
                for r in caplog.records)
+
+
+def test_tee_save_mode_hot_reload_invalidates_judgment_cache(tmp_path, monkeypatch):
+    """热重载改 FNMUSIC_TEE_SAVE_MODE 后：CONF 同步新值、staged 判定缓存清空
+    （否则旧判定复用到重启，改 direct/staged 不生效）。"""
+    import importlib as _il
+    env_file = str(tmp_path / ".env")
+
+    def _apply(mode):
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.write(f"FNMUSIC_TEE_SAVE_MODE={mode}\n")
+        return p.apply_env_hot_reload(env_file)
+
+    p._TEE_STAGED_CACHE[("auto", "/some/remote/dir")] = True
+    changed = _apply("direct")
+    assert "tee_save_mode" in changed
+    assert p.CONF["tee_save_mode"] == "direct"
+    assert p.tee_save_mode() == "direct"
+    assert ("auto", "/some/remote/dir") not in p._TEE_STAGED_CACHE  # 缓存已清
+
+    # 非法值被校验器拒绝：CONF 不动、无变更报告
+    p._TEE_STAGED_CACHE[("direct", "/x")] = False
+    changed = _apply("ultra")
+    assert changed == []
+    assert p.CONF["tee_save_mode"] == "direct"
+    assert p._TEE_STAGED_CACHE[("direct", "/x")] is False  # 未误清
+
+
+def test_lyric_judgment_uses_lyric_target_dir_not_tee_dir(tmp_path, monkeypatch):
+    """歌词 staged 判定以歌词落点目录为基准：tee_save_dir 是本地而歌词落点
+    （音频旁）在别处时，按歌词落点自身判定，不跟 tee_save_dir 走。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    other = tmp_path / "other_lib"
+    (other).mkdir()
+    lrc = os.path.join(str(other), "x.lrc")
+
+    assert p._dir_is_remote_mount(os.path.dirname(lrc)) is True
+    # cache_dir 内恒直写
+    cache_lrc = os.path.join(p.CONF["cache_dir"], "a.lrc")
+    assert p._dir_is_remote_mount(os.path.dirname(cache_lrc)) is False

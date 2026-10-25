@@ -278,6 +278,14 @@
             <button class="btn" id="dir-download-pick" hidden>从 NAS 选择</button>
             <span id="dir-download-check" class="dir-check" hidden></span>
           </div>
+          <label class="field"><span>落盘方式</span>
+            <select class="input" id="tee-save-mode">
+              <option value="auto">自动判定（推荐）</option>
+              <option value="direct">直接写入</option>
+              <option value="staged">本地中转</option>
+            </select>
+          </label>
+          <p class="hint">保存歌曲（边听边存、收藏绑定本地两种方式均适用）到上面下载目录时的写入方式：<b>自动判定</b>——本地盘直接写入，网盘/WebDAV 等远程目录先在本地缓存区完成加工再一次写入，远程目录不留下载中间文件，拿不准时按远程处理；<b>直接写入</b>——全程写下载目录，速度最快，仅建议本地盘使用，远程目录中断会留下半截文件；<b>本地中转</b>——一律先在本地加工完整再一次写入下载目录，网盘目录建议选这个。保存后立即生效。</p>
         </div>
       </section>
 

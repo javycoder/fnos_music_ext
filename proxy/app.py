@@ -149,6 +149,9 @@ CONF = {
     # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
+    # 落盘方式（WebUI「目录设置」可改）：auto 按目标目录自动判定，direct 直写，
+    # staged 本地中转；非法值回落 auto（tee_save_mode() 内兜底）
+    "tee_save_mode": os.environ.get("FNMUSIC_TEE_SAVE_MODE", "auto").strip().lower(),
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
     # 收藏/加入歌单自动绑定本地：默认关；在线歌曲收藏后后台自动整轨下载并绑定本地文件，
     # 官方曲库收录后再把收藏/歌单写进官方（成功后删本地映射，避免双列表重复显示）
@@ -555,6 +558,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_DL_QUALITY": ("dl_quality", "dl_quality"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
+    "FNMUSIC_TEE_SAVE_MODE": ("tee_save_mode", "tee_save_mode"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
     # 歌曲缓存目录（WebUI「储存 → 目录设置」可改）：变更时把已落库歌曲的
     # .ref 去重标记迁到新目录，避免换目录后同一首歌重新出网、曲库重复
@@ -644,6 +648,8 @@ def _env_watch_parse(raw: str, kind: str):
             return None
     if kind == "quality_mode":
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
+    if kind == "tee_save_mode":
+        return raw.lower() if raw.lower() in ("auto", "direct", "staged") else None
     if kind == "dl_quality":
         return raw.lower() if raw.lower() in ("app", "original", "standard") else None
     if kind == "netease_quality":
@@ -760,6 +766,10 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
             changed.append(env_key)
     if "cache_dir" in changed:
         _migrate_media_refs(old_cache_dir or "", CONF["cache_dir"])
+    if set(changed) & {"tee_save_mode", "cache_dir", "tee_save_dir"}:
+        # 落盘方式/目标目录/缓存目录任一变化，此前的 staged 判定全部作废，
+        # 不清空的话旧判定会一直复用到重启
+        _TEE_STAGED_CACHE.clear()
     if set(changed) & {"quality_mode", "netease_quality"}:
         _sync_netease_quality()
     if set(changed) & _LX_CONFIG_KEYS:
