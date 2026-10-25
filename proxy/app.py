@@ -2447,6 +2447,15 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
     if text == read_lyric_cache(guid):
         return
     path = lyric_cache_path(guid, title=title, artist=artist)
+
+    # 目标目录是远程挂载（staged 场景）时本地成文后单次上传——绝不远程写 .part
+    # 再 rename：网络挂载上中断会留残件，改名也是一次远程 IO。_staged_write_lyric
+    # 对 .lrc 路径幂等（splitext 不再截断），且自带「同内容跳过/不同内容不覆盖」。
+    if _dir_is_remote_mount(os.path.dirname(path)):
+        if _staged_write_lyric(path, text):
+            remember_media_path(guid, path)
+        return
+
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     part_path = f"{path}.{uuid4().hex[:8]}.part"
     try:
@@ -2461,8 +2470,8 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
         if os.path.exists(part_path):
             try:
                 os.remove(part_path)
-            except Exception:
-                pass
+            except Exception as e2:
+                logger.warning("Failed to remove lyric .part %s: %s", part_path, e2)
 
 
 def promote_shadow_lyric(guid: str, audio_path: str) -> None:
@@ -5300,6 +5309,27 @@ def use_staged_save() -> bool:
     _TEE_STAGED_CACHE[key] = staged
     logger.info("[tee_save] target=%s cache=%s -> %s (%s)",
                 target, cache, "staged" if staged else "direct", reason)
+    return staged
+
+
+def _dir_is_remote_mount(directory: str) -> bool:
+    """目录是否在本地缓存目录之外、且被判定为远程挂载（staged 场景）。
+
+    以目标目录自身为判定基准，而非 tee_save_dir()——歌词等旁路文件的落点
+    可能与音频目标不同（无音频时落 cache）。cache_dir 内恒为本地直写：
+    暂存区宿主目录按定义就是本地盘，判 staged 只会引入无谓拷贝。
+    """
+    directory = os.path.abspath(directory or "")
+    cache = os.path.abspath(CONF["cache_dir"] or "")
+    if directory == cache or directory.startswith(cache + os.sep):
+        return False
+    key = (tee_save_mode(), directory)
+    if key in _TEE_STAGED_CACHE:
+        return _TEE_STAGED_CACHE[key]
+    staged, reason = _should_stage(directory, cache, tee_save_mode())
+    _TEE_STAGED_CACHE[key] = staged
+    logger.info("[staged] %s -> %s (%s)", directory,
+                "staged" if staged else "direct", reason)
     return staged
 
 

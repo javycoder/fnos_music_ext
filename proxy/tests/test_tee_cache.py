@@ -638,3 +638,125 @@ async def test_deferred_promotion_yields_before_moving_file(monkeypatch):
     assert install_at[0] - t0 >= 0.4, "promotion must yield to serving before touching files"
     assert not os.path.exists(cached)
     assert audio_files(p.CONF["library_dir"]) == ["周杰伦 - 晴天.flac"]
+
+
+# ---------------------------------------------------------------- 歌词 staged 分流
+
+def _audio_into_library(guid, title="晴天", artist="周杰伦", ext="flac"):
+    """往曲库目录放一个音频文件并记住媒体路径，让 lyric_cache_path 走「音频旁」。"""
+    dest = os.path.join(p.CONF["library_dir"], f"{artist} - {title}.{ext}")
+    with open(dest, "wb") as f:
+        f.write(b"A" * 64)
+    p.remember_media_path(guid, dest)
+    return dest
+
+
+@pytest.mark.anyio
+async def test_lyric_write_to_remote_library_leaves_no_part(monkeypatch):
+    """staged 场景（tee_save_dir 判定远程）：歌词接口直写路径分流到本地成文
+    单次上传，曲库目录零 .part 残件（issue：*.lrc.<hex>.part 残留）。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:2"
+    _audio_into_library(guid)
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+
+    p.write_lyric_cache(guid, "[00:00.00]测试歌词", title="晴天", artist="周杰伦")
+
+    assert os.path.isfile(lrc)
+    with open(lrc, encoding="utf-8") as f:
+        assert f.read().strip() == "[00:00.00]测试歌词"
+    leftovers = [n for n in os.listdir(p.CONF["library_dir"]) if n.endswith(".part")]
+    assert leftovers == []
+    # 上传成功后 guid 引用已刷新
+    assert p.recalled_media_stem(guid) == os.path.splitext(lrc)[0]
+
+
+@pytest.mark.anyio
+async def test_lyric_write_remote_same_content_second_call_no_op(monkeypatch):
+    """staged 场景同内容二次写入（模拟并发/短间隔重复请求）：不再产生任何
+    远程 IO 与暂存副本，曲库目录零 .part。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:3"
+    _audio_into_library(guid, title="晴天", artist="周杰伦")
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+
+    for _ in range(3):
+        p.write_lyric_cache(guid, "[00:00.00]测试歌词", title="晴天", artist="周杰伦")
+
+    assert os.path.isfile(lrc)
+    leftovers = [n for n in os.listdir(p.CONF["library_dir"]) if n.endswith(".part")]
+    assert leftovers == []
+    staged = os.listdir(os.path.join(p.CONF["cache_dir"], "staging"))
+    assert staged == []
+
+
+@pytest.mark.anyio
+async def test_lyric_write_remote_never_overwrites_existing(monkeypatch):
+    """staged 场景曲库已有不同内容歌词：绝不覆盖（与 _staged_write_lyric 语义
+    一致，保护用户自有歌词）。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:4"
+    dest = _audio_into_library(guid)
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+    with open(lrc, "w", encoding="utf-8") as f:
+        f.write("[00:00.00]用户自有歌词")
+
+    p.write_lyric_cache(guid, "[00:00.00]线上歌词", title="晴天", artist="周杰伦")
+
+    with open(lrc, encoding="utf-8") as f:
+        assert f.read().strip() == "[00:00.00]用户自有歌词"
+    assert os.path.getsize(dest) == 64  # 音频也不受影响
+
+
+@pytest.mark.anyio
+async def test_lyric_write_local_library_keeps_part_rename(monkeypatch):
+    """本地盘（direct 判定）行为与修复前一致：.part + rename 原子写，
+    覆盖更新语义保留。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "direct")
+    guid = "online:kuwo:5"
+    _audio_into_library(guid)
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+
+    p.write_lyric_cache(guid, "[00:00.00]第一版", title="晴天", artist="周杰伦")
+    assert os.path.isfile(lrc)
+    p.write_lyric_cache(guid, "[00:00.00]第二版", title="晴天", artist="周杰伦")
+
+    with open(lrc, encoding="utf-8") as f:
+        assert f.read().strip() == "[00:00.00]第二版"
+    leftovers = [n for n in os.listdir(p.CONF["library_dir"]) if n.endswith(".part")]
+    assert leftovers == []
+
+
+@pytest.mark.anyio
+async def test_lyric_write_no_audio_falls_into_cache_without_staging(monkeypatch):
+    """第三档（无音频落 cache）：cache_dir 内恒为本地直写，即使 mode=staged
+    也不引入 staging 拷贝，文件以 guid 命名。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:6"
+
+    p.write_lyric_cache(guid, "[00:00.00]影子歌词", title="晴天", artist="周杰伦")
+
+    shadow = os.path.join(p.CONF["cache_dir"], f"{p.cache_safe_guid(guid)}.lrc")
+    assert os.path.isfile(shadow)
+    staged_dir = os.path.join(p.CONF["cache_dir"], "staging")
+    assert not os.path.isdir(staged_dir) or os.listdir(staged_dir) == []
+
+
+def test_lyric_part_cleanup_failure_is_logged(monkeypatch, tmp_path, caplog):
+    """本地直写路径清理残件失败不再静默吞掉：warning 带残件路径。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "direct")
+    monkeypatch.setitem(p.CONF, "tee_save_dir", str(tmp_path / "lib"))
+    os.makedirs(p.CONF["tee_save_dir"], exist_ok=True)
+    guid = "online:kuwo:7"
+    monkeypatch.setattr(p, "read_lyric_cache", lambda g: "")
+    monkeypatch.setattr(p, "lyric_cache_path",
+                        lambda g, title="", artist="": str(tmp_path / "lib" / "x.lrc"))
+    monkeypatch.setattr(p.os, "replace",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(p.os.path, "exists", lambda pp: "part" in str(pp))
+    monkeypatch.setattr(p.os, "remove",
+                        lambda pp: (_ for _ in ()).throw(OSError("gone")))
+    with caplog.at_level(logging.WARNING):
+        p.write_lyric_cache(guid, "[00:00.00]词")
+    assert any(".part" in r.getMessage() and "gone" in r.getMessage()
+               for r in caplog.records)
