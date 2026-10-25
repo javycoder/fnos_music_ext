@@ -9083,26 +9083,28 @@ async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> 
     return target
 
 
-def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
-    """本地边听边存缓存文件的内嵌专辑图（mutagen 读 ID3/FLAC/MP4 封面）。"""
-    path = find_cache_file(guid)
-    if not path:
-        return None
+def _extract_embedded_cover(path: str) -> "tuple[bytes, str] | None":
+    """从音频文件提取内嵌专辑图（mutagen 读 ID3/FLAC/MP4 封面）。
+
+    FLAC 的 pictures 挂在 MutagenFile 对象上而非 tags 上（VCFLACDict 无
+    pictures 属性），两者都要查。
+    """
     try:
         from mutagen import File as MutagenFile
 
         mf = MutagenFile(path)
         tags = getattr(mf, "tags", None)
-        if tags is None:
-            return None
         pics: list = []
-        if hasattr(tags, "pictures"):  # FLAC/APE
-            pics = list(tags.pictures or [])
-        elif hasattr(tags, "getall"):  # ID3
-            pics = list(tags.getall("APIC") or [])
-        elif hasattr(tags, "get"):
-            covr = tags.get("covr")  # MP4
-            pics = list(covr) if covr else []
+        if hasattr(mf, "pictures"):  # FLAC：对象属性（不在 tags 上）
+            pics = list(mf.pictures or [])
+        if not pics and tags is not None:
+            if hasattr(tags, "pictures"):  # APE
+                pics = list(tags.pictures or [])
+            elif hasattr(tags, "getall"):  # ID3
+                pics = list(tags.getall("APIC") or [])
+            elif hasattr(tags, "get"):
+                covr = tags.get("covr")  # MP4
+                pics = list(covr) if covr else []
         for pic in pics:
             data = getattr(pic, "data", None)
             if not data:
@@ -9112,8 +9114,16 @@ def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
                 mime = "image/jpeg"
             return bytes(data), mime
     except Exception as e:
-        logger.debug("embedded cover extract failed for %s: %s", guid, e)
+        logger.debug("embedded cover extract failed for %s: %s", path, e)
     return None
+
+
+def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
+    """本地边听边存缓存文件的内嵌专辑图。"""
+    path = find_cache_file(guid)
+    if not path:
+        return None
+    return _extract_embedded_cover(path)
 
 
 def _placeholder_cover_response(guid: str) -> Response:
@@ -9162,6 +9172,81 @@ def _official_cover_root() -> str | None:
             _OFFICIAL_COVER_ROOT_CACHE = cand
             return cand
     return None
+
+
+def _local_audio_path_by_cover_guid(cover_guid: str) -> str | None:
+    """官方库按封面资源 guid（track.cover_guid）反查磁盘音频文件路径。
+
+    官方扫描器只认音频内嵌专辑图，cover_guid 存在但封面资源文件缺失时
+    （代理落盘新歌官方尚未收录封面、或无内嵌图），官方 App 列表查无图、
+    代理透传必 400。这里按 guid 反查到音频文件本体，供内嵌封面提取兜底。
+    库不可用/查不到返回 None（调用方走原链路）。
+    """
+    raw = str(cover_guid or "").strip().lower()
+    for prefix in ("track_", "album_", "artist_", "playlist_"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    if not re.fullmatch(r"[0-9a-f]{32}", raw):
+        return None
+    db = dailyrec.music_db_path()
+    if not db or not os.path.exists(db):
+        return None
+    sql = """
+        SELECT af.path FROM track t
+        JOIN audio_file af ON af.id = t.audio_file_id
+        WHERE (t.cover_guid = ? OR t.guid = ?)
+          AND t.is_audio_file_deleted = 0 AND t.is_admin_deleted = 0
+          AND af.is_physical_file_deleted = 0
+        LIMIT 1
+    """
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as con:
+            row = con.execute(sql, (raw, raw)).fetchone()
+    except Exception as e:
+        logger.debug("local cover lookup failed for %s: %s", raw, e)
+        return None
+    path = str(row[0]) if row else ""
+    if path and os.path.isfile(path) and os.access(path, os.R_OK):
+        return path
+    return None
+
+
+_LOCAL_COVER_CACHE: dict[str, "tuple[bytes, str] | None"] = {}
+
+
+def _local_cover_response(cover_id: str) -> Response | None:
+    """官方封面文件未命中时的本地兜底：按 cover_guid 反查音频文件提取内嵌封面。
+
+    结果持久缓存（含阴性），同一 coverId 只提取一次；提取失败返回 None，
+    调用方继续走原透传链路。
+    """
+    raw = str(cover_id or "").strip().lower()
+    for prefix in ("track_", "album_", "artist_", "playlist_"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    if not re.fullmatch(r"[0-9a-f]{32}", raw):
+        return None
+    if raw in _LOCAL_COVER_CACHE:
+        hit = _LOCAL_COVER_CACHE[raw]
+        if hit is None:
+            return None
+        return Response(content=hit[0], media_type=hit[1],
+                        headers={"Cache-Control": "public, max-age=86400"})
+    result = None
+    path = _local_audio_path_by_cover_guid(raw)
+    if path:
+        extracted = _extract_embedded_cover(path)
+        if extracted:
+            result = extracted
+    if len(_LOCAL_COVER_CACHE) > 4096:
+        _LOCAL_COVER_CACHE.clear()
+    _LOCAL_COVER_CACHE[raw] = result
+    if result is None:
+        return None
+    return Response(content=result[0], media_type=result[1],
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 def _official_cover_file_response(cover_id: str, size: str | None = None) -> Response | None:
@@ -9266,6 +9351,10 @@ async def _playlist_cover_response(request: Request, guid: str, tracks: list,
                     size = request.query_params.get("size")
                     response = _official_cover_file_response(value, size)
                     if response is None:
+                        # 官方封面资源未命中：本地内嵌封面兜底（上游对无效
+                        # coverId 必 400，请求它纯属浪费）
+                        response = _local_cover_response(value)
+                    if response is None:
                         params = {"coverId": value}
                         if size:
                             params["size"] = size
@@ -9344,6 +9433,12 @@ async def static_cover(request: Request, subpath: str = ""):
             request, guid, nmpl.cached_tracks(nm_pl_id) or [], nmpl.cover_url_for(nm_pl_id))
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
+        if local_resp is not None:
+            return local_resp
+        # 官方封面文件未命中：cover_guid 指向的资源不存在（代理落盘新歌官方
+        # 尚未收录封面）。按 guid 反查官方库音频文件提取内嵌封面直接出图，
+        # 不再把注定失败的请求透传给官方（官方对无效资源 id 回 400）。
+        local_resp = _local_cover_response(guid)
         if local_resp is not None:
             return local_resp
         # 32hex 且不在伪装反查表、官方封面文件也未命中：伪装 id 反解失败取证
