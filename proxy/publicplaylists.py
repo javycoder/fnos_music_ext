@@ -161,10 +161,86 @@ def parse_selection(raw: object, conf: dict | None = None, default_provider: str
     return out
 
 
-def configured_selection(conf: dict) -> list[dict]:
+def parse_user_selections(raw: object) -> dict[str, list[dict]]:
+    """Parse and normalize the GUID -> selection mapping used for per-user playlists."""
+    if raw is None or str(raw).strip() == "":
+        return {}
+    try:
+        rows = json.loads(str(raw))
+    except json.JSONDecodeError:
+        logger.warning("invalid per-user public playlist selection")
+        return {}
+    if not isinstance(rows, dict):
+        return {}
+    result: dict[str, list[dict]] = {}
+    for user_guid, selection in rows.items():
+        guid = str(user_guid or "").strip()
+        if not guid or guid == "shared" or not isinstance(selection, list):
+            continue
+        normalized = parse_selection(json.dumps(selection, ensure_ascii=False))
+        result[guid] = normalized
+    return result
+
+
+def user_selections(conf: dict) -> dict[str, list[dict]]:
+    mapping = parse_user_selections(conf.get("public_playlists_by_user"))
+    if str(conf.get("public_playlists_by_user") or "").strip():
+        return mapping
+    legacy = configured_selection(conf)
+    return {"__legacy__": legacy} if legacy else {}
+
+
+def configured_selection(conf: dict, user_guid: str | None = None) -> list[dict]:
     if not conf.get("public_playlists_enabled"):
         return []
-    return parse_selection(conf.get("public_playlists_selection"), conf)
+    if user_guid is None:
+        return parse_selection(conf.get("public_playlists_selection"), conf)
+    mapping = parse_user_selections(conf.get("public_playlists_by_user"))
+    return mapping.get(str(user_guid), [])
+
+
+def all_configured_selections(conf: dict) -> list[dict]:
+    if not conf.get("public_playlists_enabled"):
+        return []
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for selection in user_selections(conf).values():
+        for entry in selection:
+            if _selection_runtime_usable(entry, conf):
+                key = _entry_key(entry)
+                if key not in seen:
+                    seen.add(key)
+                    entries.append(entry)
+    return entries
+
+
+def selection_allows(conf: dict, user_guid: str, entry: dict) -> bool:
+    if not user_guid or user_guid == "shared":
+        return False
+    return any(playlist_guid(item) == playlist_guid(entry)
+               for item in configured_selection(conf, user_guid))
+
+
+def validate_user_selections(raw: object) -> dict[str, list[dict]]:
+    try:
+        mapping = json.loads(str(raw))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("用户公共歌单配置必须是 JSON 对象") from exc
+    if not isinstance(mapping, dict):
+        raise ValueError("用户公共歌单配置必须是 JSON 对象")
+    for user_guid, selection in mapping.items():
+        if (not user_guid.strip() or user_guid != user_guid.strip()
+                or user_guid == "shared" or len(user_guid) > 256):
+            raise ValueError("公共歌单用户 GUID 无效")
+        if not isinstance(selection, list) or len(selection) > _MAX_SELECTION:
+            raise ValueError("每位用户的公共歌单必须是数组且最多选择 50 份")
+        for entry in selection:
+            if (not isinstance(entry, dict) or entry.get("provider") not in ("musicbox", "lx")
+                    or entry.get("kind") not in ("playlist", "chart")
+                    or not str(entry.get("source") or "").strip()
+                    or not str(entry.get("id") or "").strip()):
+                raise ValueError("公共歌单条目无效")
+    return parse_user_selections(json.dumps(mapping, ensure_ascii=False))
 
 
 def _selection_runtime_usable(entry: dict, conf: dict) -> bool:
@@ -295,8 +371,9 @@ async def load_summary(app_state, entry: dict) -> "dict | None":
     return await asyncio.shield(task)
 
 
-async def peek_cards(app_state, conf: dict, build_track) -> list[dict]:
-    entries = [entry for entry in configured_selection(conf) if _selection_runtime_usable(entry, conf)]
+async def peek_cards(app_state, conf: dict, build_track, user_guid: str = "") -> list[dict]:
+    entries = [entry for entry in configured_selection(conf, user_guid)
+               if _selection_runtime_usable(entry, conf)]
     if not entries:
         return []
     tasks = [asyncio.create_task(load_summary(app_state, entry)) for entry in entries]
@@ -312,7 +389,7 @@ async def peek_cards(app_state, conf: dict, build_track) -> list[dict]:
         else:
             logger.debug("public playlist list card failed: %s", result)
     if cards:
-        schedule_prefetch(app_state, conf, cards, build_track)
+        schedule_prefetch(app_state, conf, cards, build_track, user_guid)
     return cards
 
 
@@ -453,10 +530,12 @@ def cached_tracks(guid: str) -> "list | None":
     return _load_disk_tracks(guid)
 
 
-def schedule_prefetch(app_state, conf: dict, cards: list[dict], build_track) -> None:
+def schedule_prefetch(app_state, conf: dict, cards: list[dict], build_track,
+                      user_guid: str = "") -> None:
     if any(not task.done() for task in _prefetch_tasks):
         return
-    available = {_entry_key(entry) for entry in configured_selection(conf) if _selection_runtime_usable(entry, conf)}
+    selections = all_configured_selections(conf)
+    available = {_entry_key(entry) for entry in selections}
     pending = []
     now = time.monotonic()
     for card in cards or []:
@@ -473,7 +552,7 @@ def schedule_prefetch(app_state, conf: dict, cards: list[dict], build_track) -> 
             break
     if not pending:
         return
-    by_guid = {playlist_guid(entry): entry for entry in configured_selection(conf)}
+    by_guid = {playlist_guid(entry): entry for entry in selections}
 
     async def runner() -> None:
         for guid in pending:

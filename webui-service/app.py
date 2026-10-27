@@ -36,6 +36,7 @@ from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
 from proxy.env_merge import (  # noqa: E402
+    env_file_lock,
     parse_env_file,
     preserve_user_comments,
     render_env,
@@ -50,6 +51,7 @@ from proxy.fnlog import (  # noqa: E402
     setup_logging,
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
+from proxy import publicplaylists as pubpl
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -121,6 +123,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
+    "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "各用户公共歌单"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
     "FNMUSIC_DOWNLOAD_LAYOUT": {"kind": "enum", "values": ["flat", "artist", "album", "artist_album"], "default": "flat", "group": "storage", "reload": "hot", "label": "存放方式（beta）"},
@@ -169,6 +172,20 @@ def current_provider(values: dict[str, str]) -> str:
 
 
 def write_env(updates: dict[str, str]) -> list[str]:
+    with env_file_lock(ENV_PATH):
+        updates = dict(updates)
+        if "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER" in updates:
+            current = read_env()
+            if not str(current.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
+                raise ValueError("公共歌单用户配置尚未迁移，请先刷新飞牛音乐用户列表")
+            mapping = pubpl.validate_user_selections(current["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])
+            mapping.update(pubpl.validate_user_selections(updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]))
+            updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"] = json.dumps(
+                mapping, ensure_ascii=False, separators=(",", ":"))
+        return _write_env_unlocked(updates)
+
+
+def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
     """把 updates 合并进 .env（显式覆盖），原子写 + 备份 + 保留用户自定义键与注释。
 
     返回实际发生变化的键列表。
@@ -531,6 +548,11 @@ def _resident_active(values: dict[str, str]) -> bool:
 
 
 def _public_selection_rows(values: dict[str, str]) -> list:
+    if str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
+        return [
+            entry for selection in pubpl.parse_user_selections(
+                values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]).values() for entry in selection
+        ]
     if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" not in values:
         return [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
     try:
@@ -909,6 +931,10 @@ def validate_updates(values: dict) -> dict[str, str]:
                 raise ValueError("公共歌单类型无效")
             if not str(item.get("source") or "").strip() or not str(item.get("id") or "").strip():
                 raise ValueError("公共歌单条目缺少平台或 ID")
+    if "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER" in updates:
+        mapping = pubpl.validate_user_selections(updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])
+        updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"] = json.dumps(
+            mapping, ensure_ascii=False, separators=(",", ":"))
     return updates
 
 
@@ -1348,7 +1374,10 @@ async def api_config_put(body: ConfigBody, request: Request):
         updates["LX_SOURCES"] = ""
 
     old_provider = current_provider(before)
-    changed = write_env(updates)
+    try:
+        changed = write_env(updates)
+    except ValueError as exc:
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=409)
     after = read_env()
     new_provider = current_provider(after)
     # 网易云歌单常驻：切源 musicbox→其它时保留其进程，交由收尾对账校验登录并保活
@@ -1737,6 +1766,12 @@ async def api_fs_check():
 async def api_maintenance_cleanup(job_id: str = ""):
     """与 fs-check 一致：真实清理由宿主网关处理，直连不得访问或删除文件。"""
     raise HTTPException(status_code=501, detail="直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台")
+
+
+@app.get("/api/maintenance/music-users")
+async def api_maintenance_music_users():
+    """Music users are read by the host proxy through the desktop gateway."""
+    raise HTTPException(status_code=501, detail="直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台")
 
 
 @app.get("/api/maintenance/organize")

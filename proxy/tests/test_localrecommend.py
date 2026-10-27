@@ -296,7 +296,9 @@ def test_playlist_cover_and_no_cover_fallback(client, library, monkeypatch):
     assert response.content == b"\xff\xd8\xffcover"
     assert response.headers["content-type"] == "image/jpeg"
     state["user"] = "u2"
-    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 200
+    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 404
+    own_guid = rec.recommend_playlist_guid("liked", user_guid="u2")
+    assert test_client.get("/music/api/v1/static/cover", params={"coverId": own_guid}).status_code == 200
     state["user"] = "u1"
     edit(library, "UPDATE track SET cover_guid = NULL")
     with open(cache_path(), "w", encoding="utf-8") as cache_file:

@@ -62,6 +62,8 @@ def _parse_manifest(text: str) -> dict:
 
 class TestManifest:
     def test_required_fields(self, stage: Path):
+        assert json.loads((stage / "app/repo/FNMUSIC_COMPAT.json").read_text())["extension_version"] == (
+            REPO_ROOT / "VERSION").read_text().strip()
         m = _parse_manifest((stage / "manifest").read_text())
         assert m["appname"] == APPNAME
         assert m["source"] == "thirdparty"

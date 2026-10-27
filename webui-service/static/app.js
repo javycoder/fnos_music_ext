@@ -27,6 +27,12 @@ let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校�
 let lxSourceList = [];    // 洛雪源列表 [{ name, url, active }]，active 可多开
 let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
 let publicSelection = [];
+let publicUsers = [];
+let publicUsersReady = false;
+let publicUsersSeq = 0;
+let publicUserGuid = "";
+let publicSelectionMap = {};
+const publicUserChanges = new Set();
 let publicCapabilities = null;
 let publicState = {
   provider: "musicbox", channel: "charts", source: "netease", category: "", sort: "",
@@ -337,6 +343,7 @@ async function loadConfig() {
   configSchema = cfg.schema || {};
   applyConfigToForm();
   clearDirty();
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) await loadMusicUsers();
 }
 
 function applyConfigToForm() {
@@ -363,11 +370,20 @@ function applyConfigToForm() {
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
-  try {
+  publicSelectionDetailSeq++;
+  publicUserChanges.clear();
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    try {
+      const mapping = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || "{}");
+      publicSelectionMap = mapping && typeof mapping === "object" && !Array.isArray(mapping) ? mapping : {};
+    } catch (_) { publicSelectionMap = {}; }
+    publicSelection = Array.isArray(publicSelectionMap[publicUserGuid]) ? publicSelectionMap[publicUserGuid] : [];
+  } else try {
     publicSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
     if (!Array.isArray(publicSelection)) publicSelection = [];
   } catch (_) { publicSelection = []; }
   $("#public-playlists-browser").hidden = !$("#public-playlists-enabled").checked;
+  renderMusicUsers();
   renderPublicSelected();
   // 刷新/保存后重建的 publicSelection 只有身份字段：浏览器可见时补回展示名称
   void ensurePublicSelectionDetails();
@@ -475,7 +491,17 @@ function collectConfig() {
     values.FNMUSIC_LIKED_REFRESH_HOURS = likedNumber("#liked-refresh-hours", "猜你喜欢生成间隔", 0.5, null);
     values.FNMUSIC_LIKED_SIZE = likedNumber("#liked-size", "猜你喜欢歌曲数量", 0, 100, true);
   }
-  if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    stashPublicUser();
+    if (publicUsersReady && publicUserChanges.size) {
+      const changes = {};
+      for (const user of publicUserChanges) {
+        changes[user] = (publicSelectionMap[user] || []).map(({ provider, source, kind, id }) =>
+          ({ provider, source, kind, id }));
+      }
+      values.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = JSON.stringify(changes);
+    }
+  } else if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
     values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
       publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))
     );
@@ -673,6 +699,84 @@ const PUBLIC_PROVIDER_OPTIONS = [
 ];
 const PUBLIC_SOURCE_LABEL = { netease: "网易", wy: "网易", kw: "酷我", kg: "酷狗", tx: "QQ", mg: "咪咕" };
 
+function stashPublicUser(changed = false) {
+  if (!configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || !publicUserGuid) return;
+  publicSelectionMap[publicUserGuid] = publicSelection;
+  if (changed) publicUserChanges.add(publicUserGuid);
+}
+
+function renderMusicUsers() {
+  const panel = $("#public-users-panel");
+  if (!panel) return;
+  const perUser = !!configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER;
+  panel.hidden = !perUser || !$("#public-playlists-enabled").checked;
+  if (!perUser) return;
+  const selector = $("#public-user");
+  selector.innerHTML = '<option value="">请先选择飞牛音乐用户</option>' + publicUsers.map((user) =>
+    `<option value="${escapeHtml(user.guid)}">${escapeHtml(user.name || user.guid)}${user.role === "admin" ? "（管理员）" : ""}</option>`).join("");
+  selector.value = publicUserGuid;
+  selector.disabled = !publicUsersReady || !publicUsers.length;
+  $("#public-playlists-browser").hidden = panel.hidden || !publicUsersReady || !publicUserGuid;
+}
+
+async function loadMusicUsers() {
+  const seq = ++publicUsersSeq;
+  $("#public-users-retry").disabled = true;
+  $("#public-users-note").textContent = "正在读取飞牛音乐用户…";
+  try {
+    const data = await api("/api/maintenance/music-users");
+    if (seq !== publicUsersSeq) return;
+    if (data.ok === false || !Array.isArray(data.users)) throw new Error(data.error || "用户列表响应无效");
+    publicUsers = data.users;
+    publicUsersReady = true;
+    if (!publicUserChanges.size && data.public_playlists_by_user) {
+      publicSelectionMap = data.public_playlists_by_user;
+    }
+    if (!publicUsers.some((user) => user.guid === publicUserGuid)) publicUserGuid = "";
+    publicSelection = publicSelectionMap[publicUserGuid] || [];
+    $("#public-users-note").textContent = publicUsers.length
+      ? `共 ${publicUsers.length} 位有效用户。先选择用户，再配置歌单；新用户默认没有公共歌单。`
+      : "飞牛音乐中还没有有效用户。请先登录飞牛音乐，再刷新用户。";
+  } catch (exc) {
+    if (seq !== publicUsersSeq) return;
+    publicUsersReady = false;
+    invalidatePublicBrowse();
+    publicSelectionDetailSeq++;
+    $("#public-users-note").textContent = "读取用户失败：" + exc.message + "。请点击刷新用户重试。";
+  } finally {
+    if (seq === publicUsersSeq) {
+      $("#public-users-retry").disabled = false;
+      renderMusicUsers();
+      renderPublicSelected();
+      updateResidentAvailability();
+    }
+  }
+}
+
+async function selectPublicUser(guid) {
+  stashPublicUser();
+  invalidatePublicBrowse();
+  publicSelectionDetailSeq++;
+  publicUserGuid = publicUsersReady && publicUsers.some((user) => user.guid === guid) ? guid : "";
+  publicSelection = publicSelectionMap[publicUserGuid] || [];
+  renderMusicUsers();
+  renderPublicSelected();
+  if (publicUserGuid && $("#public-playlists-enabled").checked) await showPublicBrowser();
+}
+
+$("#public-user").addEventListener("change", () => selectPublicUser($("#public-user").value));
+$("#public-users-retry").addEventListener("click", async () => {
+  await loadMusicUsers();
+  if (publicUsersReady && publicUserGuid) await showPublicBrowser();
+});
+
+function anyPublicMusicboxSelection() {
+  stashPublicUser();
+  const selections = configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER
+    ? Object.values(publicSelectionMap) : [publicSelection];
+  return selections.some((selection) => Array.isArray(selection) && selection.some((item) => item.provider === "musicbox"));
+}
+
 function publicEntryKey(item) {
   return [item.provider, item.source, item.provider === "musicbox" ? "playlist" : item.kind, item.id].join("|");
 }
@@ -682,6 +786,7 @@ function selectedPublicEntry(item) {
 }
 
 function setPublicSelection(item, selected) {
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) return false;
   if (selected) {
     if (selectedPublicEntry(item)) return true;
     if (publicSelection.length >= 50) {
@@ -695,6 +800,7 @@ function setPublicSelection(item, selected) {
   } else {
     publicSelection = publicSelection.filter((it) => publicEntryKey(it) !== publicEntryKey(item));
   }
+  stashPublicUser(true);
   renderPublicSelected();
   updateResidentAvailability();
   markDirty("公共歌单选择已修改");
@@ -707,6 +813,7 @@ function movePublicSelection(index, delta) {
   if (next < 0 || next >= publicSelection.length) return;
   const items = publicSelection.splice(index, 1);
   publicSelection.splice(next, 0, items[0]);
+  stashPublicUser(true);
   renderPublicSelected();
   markDirty("公共歌单顺序已修改");
 }
@@ -748,6 +855,7 @@ function renderPublicSelected() {
   box.querySelectorAll("[data-public-remove]").forEach((btn) =>
     btn.addEventListener("click", () => {
       publicSelection.splice(Number(btn.dataset.publicRemove), 1);
+      stashPublicUser(true);
       updateResidentAvailability();
       renderPublicSelected(); renderPublicList(); markDirty("公共歌单选择已修改");
     }));
@@ -1207,6 +1315,10 @@ async function initPublicDefaults() {
 }
 
 async function showPublicBrowser() {
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) {
+    renderMusicUsers();
+    return;
+  }
   $("#public-playlists-browser").hidden = false;
   const saved = savedProvider();
   publicState.provider = currentUiProvider() === "lxmusic" ? "lxmusic" : "musicbox";
@@ -1218,6 +1330,7 @@ $("#public-playlists-enabled").addEventListener("change", async () => {
   const enabled = $("#public-playlists-enabled").checked;
   updateResidentAvailability();
   markDirty(enabled ? "公共歌单已开启" : "公共歌单已关闭");
+  renderMusicUsers();
   if (!enabled) {
     invalidatePublicBrowse();
     publicState.loading = false;
@@ -1225,7 +1338,9 @@ $("#public-playlists-enabled").addEventListener("change", async () => {
     $("#public-playlists-browser").hidden = true;
     return;
   }
-  if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    if (!publicUsersReady) await loadMusicUsers();
+  } else if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
   await showPublicBrowser();
 });
 function runPublicSearch() {
@@ -1295,7 +1410,7 @@ let neteaseLoggedIn = false;
 function updateResidentAvailability() {
   // 账号歌单仍需登录；公共网易歌单可匿名常驻，因此仅在两者都无需求时置灰。
   const publicNeedsMusicbox = $("#public-playlists-enabled").checked
-    && publicSelection.some((item) => item.provider === "musicbox");
+    && anyPublicMusicboxSelection();
   $("#netease-playlist-resident").disabled = !neteaseLoggedIn && !publicNeedsMusicbox;
 }
 
@@ -1377,7 +1492,7 @@ $("#qr-btn").addEventListener("click", startQrLogin);
 
 $("#netease-playlist-resident").addEventListener("change", () => {
   // 常驻为账号/公共歌单供数；仅在没有公共选择时自动带出账号歌单开关。
-  const publicNeedsMusicbox = publicSelection.some((item) => item.provider === "musicbox");
+  const publicNeedsMusicbox = anyPublicMusicboxSelection();
   if ($("#netease-playlist-resident").checked && !$("#netease-my-playlists").checked && !publicNeedsMusicbox) {
     $("#netease-my-playlists").checked = true;
   }

@@ -21,9 +21,43 @@ import os
 import re
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 _LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+_ENV_LOCK = threading.RLock()
+
+
+@contextmanager
+def env_file_lock(path: str | Path):
+    """Serialize read/merge/replace across the host proxy and WebUI."""
+    with _ENV_LOCK:
+        lock_path = Path(str(Path(path).resolve()) + ".lock")
+        with lock_path.open("a+b") as lock:
+            if os.name == "posix":
+                import fcntl
+                if Path(path).exists() and os.geteuid() == 0:
+                    owner = Path(path).stat()
+                    os.fchown(lock.fileno(), owner.st_uid, owner.st_gid)
+                os.fchmod(lock.fileno(), 0o600)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            else:
+                import msvcrt
+                lock.seek(0)
+                if not lock.read(1):
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                if os.name == "posix":
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                else:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 # 第三音源 lxmusic（洛雪音乐源）默认配置：合并时自动识别并安全补齐
 LX_COMMENT = "洛雪音乐源 lxmusic（第三音源，宿主机端口 8772 -> 容器 8000）"
@@ -203,9 +237,10 @@ def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
             f.write(content)
             # Native WebUI runs as root, but the installer user's private .env
             # must remain readable by that user after an atomic replacement.
-            if existing is not None and os.geteuid() == 0:
+            if existing is not None and os.name == "posix" and os.geteuid() == 0:
                 os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
-            os.fchmod(f.fileno(), mode)
+            if os.name == "posix":
+                os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, str(path))
     finally:
         if os.path.exists(tmp_name):

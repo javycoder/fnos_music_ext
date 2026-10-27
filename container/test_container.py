@@ -252,6 +252,21 @@ def test_entrypoint_resident_skips_without_cookie(entrypoint_env, tmp_path):
     assert entrypoint_env(env_text) == ["start musicdl"]
 
 
+@pytest.mark.parametrize("mapping,needs_musicbox", [
+    ({"a": [], "b": [{"provider": "musicbox", "source": "netease",
+                     "kind": "chart", "id": "3778678"}]}, True),
+    ({"a": [], "b": []}, False),
+    ({}, False),
+])
+def test_entrypoint_public_resident_considers_every_user(entrypoint_env, mapping, needs_musicbox):
+    import json
+    env_text = ("FNMUSIC_MUSICDL_ENABLED=true\n"
+                "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+                "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED=true\n"
+                "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='" + json.dumps(mapping) + "'\n")
+    assert entrypoint_env(env_text) == ["start musicdl"] + (["start musicbox"] if needs_musicbox else [])
+
+
 def test_entrypoint_resident_requires_my_playlists_flag(entrypoint_env, tmp_path):
     """常驻为账号歌单供数：账号歌单开关未开时不空跑 musicbox。"""
     _seed_musicbox_cookie(tmp_path)

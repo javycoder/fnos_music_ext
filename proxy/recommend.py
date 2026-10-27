@@ -2,6 +2,7 @@
 
 两个独立歌单，各自受开关门控（见 .env FNMUSIC_RECOMMEND_*）：
   - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：按账户隔离，逐级补齐至 PLAYLIST_SIZE 首：
+      明确启用大模型用途且接口完整时，所有用户均跳过第 1 层，个人 LLM → 本地补齐。
       1. netease-daily  网易真·每日推荐（musicbox）。音源每天只有一份内容，
                         当天仅第一个构建的用户可用（占用"音源名额"，见 source-slot）
       2. llm            大模型候选 + 搜索匹配（接口完整且勾选每日推荐用途，种子按用户）
@@ -226,6 +227,11 @@ def llm_daily_enabled() -> bool:
     )
 
 
+def daily_strategy() -> str:
+    """Daily cache compatibility key: LLM-personal or upstream-source."""
+    return "llm-personal" if llm_daily_enabled() else "source"
+
+
 def llm_liked_selected() -> bool:
     return (os.environ.get("FNMUSIC_LLM_LIKED_ENABLED", "false").strip().lower()
             in ("true", "1", "yes"))
@@ -279,7 +285,7 @@ def recommend_playlist_guid(kind: str, day: str | None = None, user_guid: str = 
         return LIKED_GUID_PREFIX + hashlib.sha256(user_guid.encode("utf-8")).hexdigest()
     prefix = HOT_GUID_PREFIX if kind == "hot" else DAILY_GUID_PREFIX
     day = day or today_key()
-    suffix = re.sub(r"[^A-Za-z0-9]", "", user_guid)[:12]
+    suffix = hashlib.sha256(user_guid.encode("utf-8")).hexdigest() if user_guid else ""
     if suffix:
         return f"{prefix}{day}:{suffix}"
     return f"{prefix}{day}"
@@ -1677,7 +1683,7 @@ def fallback_cache_path(user_guid: str, day: str, kind: str = "daily") -> str:
     return cache_path(user_guid, day, kind)[:-len(".json")] + ".fallback.json"
 
 
-def _load_bundle_file(path: str, day: str) -> dict | None:
+def _load_bundle_file(path: str, day: str, expected_strategy: str | None = None) -> dict | None:
     if not os.path.exists(path):
         return None
     try:
@@ -1689,6 +1695,9 @@ def _load_bundle_file(path: str, day: str) -> dict | None:
             return None
         if data.get("status") not in ("ready", "partial"):
             return None
+        if (expected_strategy is not None
+                and str(data.get("strategy") or "source") != expected_strategy):
+            return None
         tracks = data.get("tracks")
         if not isinstance(tracks, list) or not tracks:
             return None
@@ -1699,12 +1708,14 @@ def _load_bundle_file(path: str, day: str) -> dict | None:
 
 
 def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
-    return _load_bundle_file(cache_path(user_guid, day, kind), day)
+    strategy = daily_strategy() if kind == "daily" else None
+    return _load_bundle_file(cache_path(user_guid, day, kind), day, strategy)
 
 
 def load_fallback_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
     """读取升级过渡兜底 bundle（新版当日缓存建成前的新旧衔接数据源）。"""
-    return _load_bundle_file(fallback_cache_path(user_guid, day, kind), day)
+    strategy = daily_strategy() if kind == "daily" else None
+    return _load_bundle_file(fallback_cache_path(user_guid, day, kind), day, strategy)
 
 
 def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily") -> None:
@@ -1944,8 +1955,11 @@ async def get_or_build_daily(
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
 
+    strategy = daily_strategy()
+
     def current() -> bool:
-        return publication_guard is None or publication_guard() is True
+        return ((kind != "daily" or daily_strategy() == strategy)
+                and (publication_guard is None or publication_guard() is True))
 
     if not current():
         return empty_daily_bundle(user_guid, kind)
@@ -2051,8 +2065,7 @@ async def get_or_build_daily(
             day_shifted(items, day, "lx-charts"), build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
-        # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源
-        # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
+        # 明确启用时所有用户的第一优先级；否则作为网易日推不可用后的个人化补充。
         if llm_http is None or not llm_daily_enabled() or not recommend_daily:
             return []
         recs = await call_llm(
@@ -2107,6 +2120,7 @@ async def get_or_build_daily(
             "seedCount": len(play_seeds),
             "favoriteCount": len(fav_seeds),
             "builtAt": int(time.time()),
+            "strategy": strategy if kind == "daily" else None,
         }
         save_daily_cache(user_guid, day, cp, kind)
 
@@ -2208,15 +2222,16 @@ async def get_or_build_daily(
                     contributing.append(name)
                 _save_checkpoint()
 
-    # 每日推荐链（按账户隔离）：网易真每日推荐（每天仅第一个用户，占用音源名额）
-    # -> LLM（配置即用，种子按用户）-> 本地曲库随机兜底（最近没听过优先）；
+    # 每日推荐链（按账户隔离）：LLM 明确启用且接口完整时所有用户优先生成个人
+    # 推荐；否则网易真每日推荐（每天仅第一个用户，占用音源名额）-> LLM ->
+    # 本地曲库随机兜底（最近没听过优先）；
     # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。
     # FNMUSIC_RECOMMEND_DAILY / FNMUSIC_RECOMMEND_HOT 分别门控两条链的构建。
     if kind == "hot":
         await run_tier("netease-charts", from_netease_charts)
         await run_tier("lx-charts", from_lx_charts)
     elif recommend_daily:
-        if not source_slot_claimed(day):
+        if strategy != "llm-personal" and not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
         await run_tier("llm", from_llm)
         if current() and len(tracks) < PLAYLIST_SIZE:
@@ -2253,6 +2268,7 @@ async def get_or_build_daily(
         "tracks": tracks,
         "tiers": contributing,
         "tierFailures": list(tier_failures),
+        "strategy": strategy if kind == "daily" else None,
         "seedCount": len(play_seeds),
         "favoriteCount": len(fav_seeds),
         "builtAt": int(time.time()),

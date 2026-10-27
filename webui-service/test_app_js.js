@@ -1942,6 +1942,75 @@ test("整理 Beta：刷新恢复及重复点击只查询已有任务", async () 
   resetOrganize();
 });
 
+test("公共歌单用户：切换保留草稿、仅提交修改用户、新用户为空", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} },
+    values: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: "{}" },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true, users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }, { guid: "new" }],
+    public_playlists_by_user: {},
+  });
+  await global.loadConfig();
+  await global.selectPublicUser("a");
+  vm.runInThisContext(`publicSelection = [
+    {provider:"musicbox",source:"netease",kind:"chart",id:"3778678"}
+  ]; stashPublicUser(true);`);
+  await global.selectPublicUser("b");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+  vm.runInThisContext("stashPublicUser(true)");
+  await global.selectPublicUser("new");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+  assert.strictEqual(global.anyPublicMusicboxSelection(), true);
+  await global.selectPublicUser("a");
+  assert.strictEqual(vm.runInThisContext("publicSelection[0].id"), "3778678");
+  const changes = JSON.parse(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER);
+  assert.deepStrictEqual(Object.keys(changes).sort(), ["a", "b"]);
+  assert.deepStrictEqual(changes.b, []);
+  enqueue("/app/fnmusic-ext/api/config", {values:{}});
+  await global.loadConfig();
+});
+
+test("公共歌单用户：查询失败禁用配置，重试恢复", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} }, values: {},
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", new Error("数据库不可读"));
+  await global.loadConfig();
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  assert.strictEqual(els.get("#public-playlists-browser").hidden, true);
+  assert.ok(els.get("#public-users-note").textContent.includes("失败"));
+  assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {ok:true, users:[{guid:"a"}]});
+  await global.loadMusicUsers();
+  assert.strictEqual(els.get("#public-user").disabled, false);
+  enqueue("/app/fnmusic-ext/api/config", {values:{}});
+  await global.loadConfig();
+});
+
+test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
+  vm.runInThisContext(`
+    configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = {};
+    publicUsersReady = true; publicUsers = [{guid:"a"},{guid:"b"}];
+    publicUserGuid = "a"; publicSelectionMap = {a:[
+      {provider:"musicbox",source:"netease",kind:"playlist",id:"7108"}
+    ],b:[]}; publicSelection = publicSelectionMap.a;
+  `);
+  let finish;
+  enqueue("/app/fnmusic-ext/api/public-playlists/7108", {
+    __rawResponse: true, resp: {ok:true, status:200, json:()=>new Promise(resolve=>{finish=resolve;})},
+  });
+  const pending = global.ensurePublicSelectionDetails();
+  await tick(0);
+  await global.selectPublicUser("b");
+  if (finish) finish({ok:true, item:{id:"7108",name:"旧用户详情"}});
+  await pending;
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+  assert.ok(!els.get("#public-selected").innerHTML.includes("旧用户详情"));
+  enqueue("/app/fnmusic-ext/api/config", {values:{}});
+  await global.loadConfig();
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

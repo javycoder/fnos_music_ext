@@ -48,6 +48,31 @@ CUSTOM_KEY='keepme'
 """
 
 
+def test_public_user_save_waits_for_migration(env_file):
+    with pytest.raises(ValueError, match="迁移"):
+        webui.write_env({"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": '{"a":[]}'})
+
+
+def test_public_user_save_merges_and_preserves_explicit_empty(env_file):
+    from concurrent.futures import ThreadPoolExecutor
+    env_file.write_text(BASE_ENV + "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{}'\n")
+    selection = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda user: webui.write_env({
+            "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": json.dumps({user: selection})
+        }), ["a", "b"]))
+    webui.write_env({"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": '{"a":[]}'})
+    assert json.loads(webui.read_env()["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": [], "b": selection}
+    assert webui.read_env()["CUSTOM_KEY"] == "keepme"
+    assert webui._public_selection_rows(webui.read_env()) == selection
+
+
+@pytest.mark.parametrize("value", ['[]', '{"shared":[]}', '{"a":"bad"}', '{"a":[{}]}'])
+def test_invalid_public_user_mapping(value):
+    with pytest.raises(ValueError):
+        webui.validate_updates({"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": value})
+
+
 @pytest.fixture(autouse=True)
 def lx_ready_mock(monkeypatch):
     """业务测试仅 mock 就绪；真实恢复行为由 test_lx_ready.py 覆盖。"""

@@ -55,7 +55,7 @@ try:
     from . import publicplaylists as pubpl
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
-    from .env_merge import parse_env_file
+    from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic
     from .fnlog import diag as fn_diag
     from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
     from .version import get_version
@@ -71,7 +71,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
-    from env_merge import parse_env_file  # type: ignore
+    from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic  # type: ignore
     from fnlog import diag as fn_diag  # type: ignore
     from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
     from version import get_version  # type: ignore
@@ -243,6 +243,7 @@ CONF = {
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     "public_playlists_enabled": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
     "public_playlists_selection": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""),
+    "public_playlists_by_user": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", ""),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
@@ -595,6 +596,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
+    "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": ("netease_playlist_resident", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
@@ -1068,9 +1070,17 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
 
 async def _env_watch_loop() -> None:
     last = _env_watch_stat()
+    migration_retry_at = 0.0
     while True:
         try:
             await asyncio.sleep(_ENV_WATCH_INTERVAL_S)
+            if not CONF.get("public_playlists_by_user") and time.monotonic() >= migration_retry_at:
+                migration_retry_at = time.monotonic() + 30
+                try:
+                    await asyncio.to_thread(migrate_public_playlist_users)
+                    _refresh_recommend_config(apply_env_hot_reload())
+                except Exception as exc:
+                    logger.debug("public playlist migration pending: %s", exc)
             cur = _env_watch_stat()
             if cur is None or cur == last:
                 last = cur
@@ -4429,6 +4439,56 @@ _organize_task: asyncio.Task | None = None
 _last_organize_job: dict | None = None
 
 
+def list_music_users(db_path: str = "") -> list[dict]:
+    """Read active users from the official music database without mutating it."""
+    path = db_path or str(CONF.get("music_db") or dailyrec.music_db_path())
+    if not path or not os.path.exists(path):
+        raise ValueError(f"飞牛音乐数据库不可用: {path}")
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
+            rows = con.execute(
+                """SELECT guid, name, role
+                     FROM user
+                    WHERE status != 'deleted' AND TRIM(guid) != ''
+                    ORDER BY id"""
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"读取飞牛音乐用户失败: {exc}") from exc
+    users = [
+        {"guid": str(row[0]), "name": str(row[1] or ""), "role": str(row[2] or "")}
+        for row in rows
+    ]
+    return users
+
+
+def migrate_public_playlist_users(users: list[dict] | None = None) -> None:
+    path = _env_watch_path()
+    if not os.path.isfile(path):
+        return
+    with env_file_lock(path):
+        existing, comments = parse_env_file(path)
+        values = dict(existing)
+        if str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
+            pubpl.validate_user_selections(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])
+            return
+        users = list_music_users() if users is None else users
+        selection = pubpl.parse_selection(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""))
+        mapping = {user["guid"]: selection for user in users}
+        raw = json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
+        updated = [(key, value) for key, value in existing if key != "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]
+        updated.append(("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", raw))
+        write_env_atomic(path, render_env(updated, trailing=comments))
+
+
+async def _try_migrate_public_playlist_users() -> None:
+    try:
+        await asyncio.to_thread(migrate_public_playlist_users)
+        changes = apply_env_hot_reload()
+        _refresh_recommend_config(changes)
+    except (ValueError, OSError) as exc:
+        logger.warning("公共歌单用户配置迁移未完成，将重试: %s", exc)
+
+
 def _organize_target() -> tuple[str, str]:
     explicit = str(CONF.get("tee_save_dir") or "").strip()
     root = os.path.realpath(os.path.abspath(explicit if explicit else detect_library_dir()))
@@ -4454,6 +4514,16 @@ async def _run_cleanup_locked(job: dict) -> None:
 async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int, dict]:
     global _maintenance_task, _organize_task, _last_organize_job
     if method == "GET":
+        if path == "/api/maintenance/music-users":
+            try:
+                users = await asyncio.to_thread(list_music_users)
+                await asyncio.to_thread(migrate_public_playlist_users, users)
+                _refresh_recommend_config(apply_env_hot_reload())
+            except (ValueError, OSError) as exc:
+                return 503, {"ok": False, "error": str(exc)}
+            return 200, {"ok": True, "users": users, "total": len(users),
+                         "public_playlists_by_user": pubpl.parse_user_selections(
+                             CONF.get("public_playlists_by_user"))}
         if path == "/api/maintenance/organize":
             job = _last_organize_job
             try:
@@ -4566,6 +4636,8 @@ async def lifespan(fastapi_app: FastAPI):
     # 版本变化失效当日推荐缓存（issue #49）：升级重启后旧歌单曲目的音源侧
     # songInfo 反查全冷，重建才能进持久层，不留"第二天才好"的空窗
     _sync_recommend_version_marker()
+    if _background_jobs_enabled():
+        await _try_migrate_public_playlist_users()
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
     log_task = asyncio.create_task(_log_retention_loop()) if _background_jobs_enabled() else None
@@ -4776,7 +4848,8 @@ async def ext_healthz(request: Request):
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
-                "mode": "per-user: source-slot -> llm -> local-random",
+                "mode": ("per-user: llm -> local-random" if dailyrec.llm_daily_enabled()
+                         else "per-user: source-slot -> llm -> local-random"),
                 # 推荐口径：每日/热门仍只随当前音源构建（常驻不并入网易），
                 # 与上方 musicbox 探活口径（_netease_runtime_usable）区分
                 "netease": bool(CONF.get("netease_enabled")),
@@ -9158,19 +9231,27 @@ async def static_cover(request: Request, subpath: str = ""):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
+        if not _recommend_request_owned(user_guid, playlist_kind, guid):
+            return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
         if playlist_kind == "liked":
             cached = await _load_requested_playlist_bundle(request, user_guid, playlist_kind, guid)
         else:
             cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
-        return await _playlist_cover_response(request, guid, tracks)
+        response = await _playlist_cover_response(request, guid, tracks)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     if pubpl.is_public_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        return await _playlist_cover_response(
+        if not pubpl.selection_allows(CONF, user_guid, pubpl.entry_from_guid(guid)):
+            return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
+        response = await _playlist_cover_response(
             request, guid, pubpl.cached_tracks(guid) or [], pubpl.cover_url_for(guid))
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     # 网易账号歌单封面：登记的封面直链同源直出（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
@@ -9864,7 +9945,7 @@ def _recommend_kinds_enabled() -> list[str]:
 
 def _is_shared_user_guid(user_guid: str) -> bool:
     """身份探测未解析到真实用户 guid（保守回落 shared）的会话。"""
-    return str(user_guid or "").strip() == "shared"
+    return str(user_guid or "").strip() in ("", "shared")
 
 
 def _recommend_injectable_kinds(user_guid: str) -> list[str]:
@@ -10039,9 +10120,17 @@ async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "dail
 
 
 async def _load_requested_playlist_bundle(request: Request, user_guid: str, kind: str, guid: str) -> dict:
-    if kind == "liked" and guid != dailyrec.recommend_playlist_guid("liked", user_guid=user_guid):
-        return dailyrec.empty_daily_bundle(user_guid, "liked")
+    if kind in ("liked", "daily") and not _recommend_request_owned(user_guid, kind, guid):
+        return dailyrec.empty_daily_bundle(user_guid, kind)
     return await _load_daily_bundle(request, user_guid, kind)
+
+
+def _recommend_request_owned(user_guid: str, kind: str, guid: str) -> bool:
+    if kind not in _recommend_injectable_kinds(user_guid):
+        return False
+    if kind == "hot":
+        return True
+    return guid == dailyrec.recommend_playlist_guid(kind, user_guid=user_guid)
 
 
 # === playlist tracks（官方歌单内的在线附加条目）===
@@ -10386,7 +10475,7 @@ async def playlist_list(request: Request):
     public_cards: list[dict] = []
     if public_on:
         try:
-            public_cards = await pubpl.peek_cards(request.app.state, CONF, build_online_track)
+            public_cards = await pubpl.peek_cards(request.app.state, CONF, build_online_track, user_guid)
             for card in public_cards:
                 g = str(card.get("guid") or "")
                 if is_online_guid(g):
@@ -10434,9 +10523,11 @@ async def playlist_detail(request: Request):
     guid = resolve_real_guid(str(request.query_params.get("guid") or "").strip())
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
     if public_entry:
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
         if not is_authed:
             return auth_resp or JSONResponse(content={"code": -1, "msg": "unauthorized", "data": None}, status_code=401)
+        if not pubpl.selection_allows(CONF, user_guid, public_entry):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             card = await pubpl.load_summary(request.app.state, public_entry)
         except Exception:
@@ -10570,7 +10661,7 @@ async def playlist_batch_detail(request: Request):
             recs.append(card)
     for g in public_ids:
         entry = pubpl.entry_from_guid(g)
-        if entry is None:
+        if entry is None or not pubpl.selection_allows(CONF, user_guid, entry):
             continue
         try:
             card = await pubpl.load_summary(request.app.state, entry)
@@ -10603,6 +10694,8 @@ async def playlist_track_list(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
+        if not pubpl.selection_allows(CONF, user_guid, public_entry):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             tracks = dailyrec.stamp_playlist_tracks(
                 await pubpl.load_tracks(request.app.state, public_entry, build_online_track)

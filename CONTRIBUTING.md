@@ -9,6 +9,11 @@
 
 ## Dev loop
 
+每次正式版或预发布版发布前，核对官方 `trim.music` 的版本和适配依据，更新根目录
+`FNMUSIC_COMPAT.json` 的扩展版本、适配音乐版本、核对日期和说明，并运行
+`python scripts/check_music_compat.py`。官方版本未变化时保留音乐版本号，更新本次核对记录。
+该文件只用于记录，不触发运行时版本限制。
+
 每次 push 前本地跑一遍全量检查（与 CI `.github/workflows/ci.yml` 一致）：
 
 ```bash

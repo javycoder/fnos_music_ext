@@ -41,6 +41,7 @@ def _parent(path: Path) -> None:
 
 def _route(method: str, path: str) -> bool:
     return ((method == "POST" and path == CLEANUP_PATH)
+            or (method == "GET" and path == "/api/maintenance/music-users")
             or (method == "GET" and re.fullmatch(CLEANUP_PATH + r"/[0-9a-fA-F]{32}", path) is not None)
             or (method == "POST" and path == ORGANIZE_PATH)
             or (method == "GET" and (path == ORGANIZE_PATH or

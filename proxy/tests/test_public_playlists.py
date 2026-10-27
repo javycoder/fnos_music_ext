@@ -70,6 +70,9 @@ def setup_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "netease_playlist_resident", False)
     monkeypatch.setitem(CONF, "public_playlists_enabled", True)
     monkeypatch.setitem(CONF, "public_playlists_selection", json.dumps(SELECTION))
+    monkeypatch.setitem(CONF, "public_playlists_by_user", json.dumps({
+        user: SELECTION for user in ("user-public-1", "user-a", "user-b")
+    }))
     yield
     pubpl.reset_for_test()
     app.state.upstream_client = None
@@ -94,6 +97,18 @@ def test_selection_guid_and_default_initialization():
 
 def test_explicit_empty_selection_does_not_restore_defaults():
     assert pubpl.parse_selection("[]", {"netease_enabled": True}) == []
+
+
+def test_unconfigured_user_cannot_read_public_playlist(monkeypatch):
+    handler = _wire()
+    monkeypatch.setitem(CONF, "public_playlists_by_user", '{"other":[]}')
+    guid = pubpl.playlist_guid(SELECTION[0])
+    with TestClient(app) as client:
+        assert client.get("/music/api/v1/playlist/detail", params={"guid": guid}).json()["code"] != 0
+        assert client.get("/music/api/v1/track/playlist-detail/list",
+                          params={"playlistGUID": guid}).json()["code"] != 0
+        assert client.get("/music/api/v1/static/cover", params={"id": guid}).status_code == 404
+    assert handler.state["calls"] == 0
 
 
 @pytest.mark.anyio
@@ -181,7 +196,7 @@ def test_cached_card_remains_visible_while_another_summary_loads(monkeypatch):
         state.musicbox_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://musicbox")
         monkeypatch.setattr(pubpl, "schedule_prefetch", lambda *args: None)
         try:
-            cards = await pubpl.peek_cards(state, CONF, lambda item: item)
+            cards = await pubpl.peek_cards(state, CONF, lambda item: item, "user-public-1")
             assert [card["guid"] for card in cards] == [pubpl.playlist_guid(SELECTION[0])]
             gate.set()
             await asyncio.gather(*list(pubpl._summary_tasks.values()))

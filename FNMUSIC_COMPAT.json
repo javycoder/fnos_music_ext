@@ -1,0 +1,6 @@
+{
+  "extension_version": "2.11.0a",
+  "music_versions": ["1.0.10"],
+  "checked_at": "2026-10-27",
+  "notes": "依据实机 trim.music manifest 和随包 SQL 结构核对。仅记录适配基线，不控制运行时行为。"
+}

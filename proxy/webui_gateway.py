@@ -345,7 +345,9 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
         organize_route = ((method == "POST" and target == ORGANIZE_PATH) or
                           (method == "GET" and (target == ORGANIZE_PATH or
                            re.fullmatch(ORGANIZE_PATH + r"/[0-9a-fA-F]{32}", target) is not None)))
-        if not (cleanup_route or organize_route):
+        # 音乐用户列表只读，走同一条管理员维护通道（GET，无请求体）
+        users_route = method == "GET" and target == MAINTENANCE_ROOT + "/music-users"
+        if not (cleanup_route or organize_route or users_route):
             client.sendall(_json_response(404, {"ok": False, "error": "未知维护接口"}))
             return
         if "transfer-encoding" in headers:

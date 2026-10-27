@@ -112,7 +112,12 @@ public_musicbox_selected() {
     python3 -c 'import json, os, sys
 raw = os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", "")
 try:
-    rows = json.loads(raw) if raw.strip() else [{"provider": "musicbox", "id": "3778678"}]
+    per_user = os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "").strip()
+    if per_user:
+        mapping = json.loads(per_user)
+        rows = [item for selection in mapping.values() if isinstance(selection, list) for item in selection] if isinstance(mapping, dict) else []
+    else:
+        rows = json.loads(raw) if raw.strip() else [{"provider": "musicbox", "id": "3778678"}]
     needed = isinstance(rows, list) and any(isinstance(x, dict) and x.get("provider") == "musicbox" and x.get("id") for x in rows)
 except (ValueError, TypeError):
     needed = False

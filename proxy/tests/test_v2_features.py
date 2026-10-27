@@ -731,7 +731,7 @@ def test_static_cover_playlist_without_covers_returns_placeholder(tmp_path, monk
     with TestClient(app) as client:
         resp = client.get(f"/music/api/v1/static/cover?coverId={pl_guid}&size=120", follow_redirects=False)
     assert resp.status_code == 200
-    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["cache-control"] == "private, no-store"
     assert resp.content.startswith(b"\x89PNG")
 
 

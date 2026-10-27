@@ -19,6 +19,7 @@ if [ -z "${VERSION}" ]; then
     echo "ERROR: 无法读取 ${REPO_ROOT}/VERSION" >&2
     exit 1
 fi
+python3 "${REPO_ROOT}/scripts/check_music_compat.py" --root "${REPO_ROOT}"
 
 FNPACK_BIN="${FNPACK:-}"
 STAGE=""
