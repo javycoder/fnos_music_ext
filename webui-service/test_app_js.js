@@ -1995,6 +1995,7 @@ test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
     publicUserGuid = "a"; publicSelectionMap = {a:[
       {provider:"musicbox",source:"netease",kind:"playlist",id:"7108"}
     ],b:[]}; publicSelection = publicSelectionMap.a;
+    publicDetailCache.clear(); $("#public-playlists-browser").hidden = false;
   `);
   let finish;
   enqueue("/app/fnmusic-ext/api/public-playlists/7108", {
@@ -2002,6 +2003,7 @@ test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   });
   const pending = global.ensurePublicSelectionDetails();
   await tick(0);
+  assert.strictEqual(typeof finish, "function");
   await global.selectPublicUser("b");
   if (finish) finish({ok:true, item:{id:"7108",name:"旧用户详情"}});
   await pending;

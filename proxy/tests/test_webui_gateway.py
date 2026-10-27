@@ -354,9 +354,10 @@ def _maintenance_request(method="POST", path="/api/maintenance/cleanup",
 
 
 @pytest.mark.parametrize("admin", ["false", "", "1"])
-def test_maintenance_requires_admin(tmp_path, admin):
+@pytest.mark.parametrize("path", ["/api/maintenance/cleanup", "/api/maintenance/music-users"])
+def test_maintenance_requires_admin(tmp_path, admin, path):
     sock = _start_gateway(tmp_path, 1)
-    data = _request(sock, _maintenance_request(admin=admin))
+    data = _request(sock, _maintenance_request(admin=admin, path=path))
     assert data.startswith(b"HTTP/1.1 403")
 
 
@@ -443,6 +444,10 @@ def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
             assert data.startswith(b"HTTP/1.1 202")
             assert calls[-1] == ("POST", "/api/maintenance/organize", {
                 "confirm_beta": True, "root": "/vol1/music", "layout": "artist"})
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                "GET", prefix + "/api/maintenance/music-users", b""))
+            assert data.startswith(b"HTTP/1.1 200")
+            assert calls[-1] == ("GET", "/api/maintenance/music-users", {})
         finally:
             await maintenance.stop(server)
     asyncio.run(run())

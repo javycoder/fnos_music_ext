@@ -193,7 +193,7 @@ def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
 
     返回实际发生变化的键列表。
     """
-    existing_kv, others = parse_env_file(ENV_PATH)
+    existing_kv, others = parse_env_file(ENV_PATH, strict=ENV_PATH.exists())
     existing_map = dict(existing_kv)
     changed: list[str] = []
     for key, value in updates.items():

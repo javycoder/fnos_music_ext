@@ -70,6 +70,32 @@ def test_private_guid_uses_whole_identity_and_rejects_foreign():
         assert not music._recommend_request_owned("", kind, guid)
 
 
+def test_failed_migration_write_keeps_legacy_for_retry(tmp_path, monkeypatch):
+    path = tmp_path / ".env"
+    original = "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='[]'\n"
+    path.write_text(original)
+    monkeypatch.setattr(music, "_env_watch_path", lambda: str(path))
+    writer = music.write_env_atomic
+    monkeypatch.setattr(music, "write_env_atomic", lambda *_: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(OSError):
+        music.migrate_public_playlist_users([{"guid": "a"}])
+    assert path.read_text() == original
+    monkeypatch.setattr(music, "write_env_atomic", writer)
+    music.migrate_public_playlist_users([{"guid": "a"}])
+    assert json.loads(dict(parse_env_file(path)[0])["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": []}
+
+
+def test_legacy_short_identity_cache_is_rebuilt(tmp_path, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path))
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "false")
+    day = recommend.today_key()
+    recommend.save_daily_cache("a", day, {
+        "day": day, "guid": f"online:playlist:daily:{day}:a",
+        "status": "ready", "tracks": [{"guid": "old"}],
+    })
+    assert recommend.load_daily_cache("a", day) is None
+
+
 def test_daily_strategy_invalidates_primary_and_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path))
     monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "false")

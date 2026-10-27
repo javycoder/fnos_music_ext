@@ -89,7 +89,7 @@ def quote_env_value(value: str) -> str:
     return "'" + escape_single_quoted(value) + "'"
 
 
-def parse_env_file(path: str | Path) -> "tuple[list[tuple[str, str]], list[str]]":
+def parse_env_file(path: str | Path, *, strict: bool = False) -> "tuple[list[tuple[str, str]], list[str]]":
     """解析 .env 文件。
 
     返回 (kv_list, other_lines)：kv_list 为按出现顺序的 (key, value) 元组，
@@ -100,6 +100,8 @@ def parse_env_file(path: str | Path) -> "tuple[list[tuple[str, str]], list[str]]
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError:
+        if strict:
+            raise
         return kv, others
     for line in text.splitlines():
         m = _LINE_RE.match(line)

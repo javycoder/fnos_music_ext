@@ -4484,7 +4484,7 @@ def migrate_public_playlist_users(users: list[dict] | None = None) -> None:
     if not os.path.isfile(path):
         return
     with env_file_lock(path):
-        existing, comments = parse_env_file(path)
+        existing, comments = parse_env_file(path, strict=True)
         values = dict(existing)
         if str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
             pubpl.validate_user_selections(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])

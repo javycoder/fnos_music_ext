@@ -1709,13 +1709,19 @@ def _load_bundle_file(path: str, day: str, expected_strategy: str | None = None)
 
 def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
     strategy = daily_strategy() if kind == "daily" else None
-    return _load_bundle_file(cache_path(user_guid, day, kind), day, strategy)
+    data = _load_bundle_file(cache_path(user_guid, day, kind), day, strategy)
+    if data and data.get("guid") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
+        return None
+    return data
 
 
 def load_fallback_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
     """读取升级过渡兜底 bundle（新版当日缓存建成前的新旧衔接数据源）。"""
     strategy = daily_strategy() if kind == "daily" else None
-    return _load_bundle_file(fallback_cache_path(user_guid, day, kind), day, strategy)
+    data = _load_bundle_file(fallback_cache_path(user_guid, day, kind), day, strategy)
+    if data and data.get("guid") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
+        return None
+    return data
 
 
 def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily") -> None:
