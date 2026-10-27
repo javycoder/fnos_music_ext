@@ -247,6 +247,9 @@ CONF = {
     "public_playlists_enabled": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
     "public_playlists_selection": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""),
     "public_playlists_by_user": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", ""),
+    # 歌单搜索含未添加公开歌单（2.11.5）：默认关；开启后歌单搜索按关键词
+    # 向洛雪源在线搜公共歌单，未收藏的命中卡片带 🔍 前缀，点击可打开详情
+    "public_search_enabled": os.environ.get("FNMUSIC_PUBLIC_SEARCH", "false").lower() in ("true", "1", "yes"),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
@@ -603,6 +606,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
+    "FNMUSIC_PUBLIC_SEARCH": ("public_search_enabled", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": ("netease_playlist_resident", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
@@ -11531,6 +11535,93 @@ async def _online_album_search(request: Request, keyword: str, limit: int) -> li
 
 
 _EXT_PLAYLIST_SEARCH_MAX = 5
+# 在线歌单搜索（未添加公开歌单）：每源取 1 页、整体预算、关键词结果短缓存
+_PUBLIC_SEARCH_PAGE_SIZE = 20
+_PUBLIC_SEARCH_BUDGET_S = 2.5
+_PUBLIC_SEARCH_CACHE_TTL_S = 600.0
+_public_search_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+async def _search_public_playlists_online(request: Request, keyword: str) -> list[dict]:
+    """向启用的洛雪源在线搜公共歌单（未添加进 selection 的也能发现）。
+
+    与 track 搜索同款预算控制：各源并发、整体超时放弃，失败不影响主响应。
+    结果按关键词短 TTL 缓存，翻页/回退不重复打源站。卡片名带 🔍 前缀
+    （与已添加歌单区分，提示可去管理页添加收藏）。
+    """
+    if not CONF.get("public_search_enabled") or not CONF.get("lx_enabled"):
+        return []
+    kw = str(keyword or "").strip()
+    if not kw:
+        return []
+    cached = _public_search_cache.get(kw.lower())
+    if cached and time.monotonic() - cached[0] < _PUBLIC_SEARCH_CACHE_TTL_S:
+        return cached[1]
+    selected = CONF.get("lx_sources") or []
+    if not selected:
+        return []
+
+    client = get_lx_client(request.app)
+
+    async def search_source(source: str) -> list[dict]:
+        try:
+            r = await client.get(
+                "/api/v1/public-playlists",
+                params={"source": source, "channel": "search", "keyword": kw,
+                        "page": 1, "limit": _PUBLIC_SEARCH_PAGE_SIZE},
+                timeout=_PUBLIC_SEARCH_BUDGET_S,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            items = data.get("items") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                return []
+            return [
+                {"provider": "lx", "source": source, "kind": "playlist",
+                 "id": str(it.get("id") or ""), "name": str(it.get("name") or ""),
+                 "cover_url": str(it.get("cover_url") or ""),
+                 "track_count": int(it.get("track_count") or 0)}
+                for it in items
+                if isinstance(it, dict) and it.get("id") and it.get("name")
+            ]
+        except Exception:
+            return []
+
+    deadline = time.monotonic() + _PUBLIC_SEARCH_BUDGET_S
+    tasks = {asyncio.create_task(search_source(s)): s for s in selected}
+    results: list[dict] = []
+    for task in asyncio.as_completed(list(tasks)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            for t in tasks:
+                t.cancel()
+            break
+        try:
+            results.extend(await asyncio.wait_for(task, timeout=remaining))
+        except (TimeoutError, Exception):
+            continue
+
+    cards: list[dict] = []
+    seen: set[str] = set()
+    for item in results:
+        guid = pubpl.playlist_guid(item)
+        if guid in seen:
+            continue
+        seen.add(guid)
+        cards.append({
+            "guid": guid,
+            "name": f"🔍 [{pubpl._source_label(item['source'])}] {item['name']}",
+            "coverId": "track_" + pubpl.fake_guid(guid),
+            "createdAt": int(time.time()),
+            "updatedAt": int(time.time()),
+            "trackCount": item.get("track_count") or 0,
+            "isDaily": True,
+        })
+    if len(_public_search_cache) > 64:
+        _public_search_cache.clear()
+    _public_search_cache[kw.lower()] = (time.monotonic(), cards)
+    return cards
 
 
 def _ext_playlist_search_hits(request: Request, keyword: str, user_guid: str = "") -> list[dict]:
@@ -11602,6 +11693,14 @@ async def search_playlist(request: Request, subpath: str = ""):
     # 自己的 guid 才能点进去看到自己的歌单（shared 变体会落空详情）
     is_authed, user_guid, _auth_resp = await _probe_upstream_auth(request, upstream_client)
     hits = _ext_playlist_search_hits(request, keyword, user_guid if is_authed else "")
+    # 在线层（未添加公开歌单）：独立预算并发洛雪源，失败不影响已得结果
+    try:
+        online_cards = await _search_public_playlists_online(request, keyword)
+    except Exception as e:
+        logger.warning("online public playlist search failed: %s", e)
+        online_cards = []
+    seen_guids = {str(h.get("guid") or "") for h in hits}
+    hits = hits + [c for c in online_cards if str(c.get("guid") or "") not in seen_guids]
     if hits:
         data = envelope.get("data")
         if not isinstance(data, dict):

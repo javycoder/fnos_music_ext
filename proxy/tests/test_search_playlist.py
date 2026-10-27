@@ -134,3 +134,97 @@ def test_official_error_envelope_passthrough(client, monkeypatch):
     r = client.get("/music/api/v1/search/playlist?q=每日推荐")
     assert r.status_code == 200
     assert r.json()["code"] == 99999
+
+
+# ------------------------------------------------ 在线公开歌单搜索层 ----
+
+@pytest.fixture
+def online_env(client, monkeypatch):
+    """在线层环境：开关开、lx 源可用、清缓存。"""
+    monkeypatch.setitem(p.CONF, "public_search_enabled", True)
+    monkeypatch.setitem(p.CONF, "lx_enabled", True)
+    monkeypatch.setitem(p.CONF, "lx_sources", ["kw"])
+    p._public_search_cache.clear()
+    yield client
+    p._public_search_cache.clear()
+
+
+def _mock_lx_search(monkeypatch, items, source="kw"):
+    async def fake_get(url, params=None, timeout=None):
+        class R:
+            status_code = 200
+            def json(self):
+                return {"ok": True, "items": items, "total": len(items)}
+        return R()
+    class FakeClient:
+        def get(self, *a, **k):
+            return fake_get(*a, **k)
+    monkeypatch.setattr(p, "get_lx_client", lambda app: FakeClient())
+
+
+@pytest.mark.anyio
+async def test_online_search_finds_unadded_playlists(online_env, monkeypatch):
+    """未添加的公开歌单经在线搜索参与匹配，卡片带 🔍 前缀。"""
+    _mock_lx_search(monkeypatch, [
+        {"id": "999", "name": "网络热歌华流", "cover_url": "", "track_count": 50},
+    ])
+    from starlette.testclient import TestClient
+    r = online_env.get("/music/api/v1/search/playlist?q=华流")
+    assert r.status_code == 200
+    data = r.json()["data"]
+    hit = next((x for x in data["list"] if "华流" in x["name"]), None)
+    assert hit is not None
+    assert hit["name"].startswith("🔍")
+    assert hit["trackCount"] == 50
+    # guid 可被 entry_from_guid 反解（详情端点按它在线拉摘要）
+    entry = p.pubpl.entry_from_guid(p.resolve_real_guid(hit["guid"]))
+    assert entry is not None
+    assert entry["id"] == "999"
+    # coverId 经伪装（disguise 出口处理 online: → 32hex）
+
+
+@pytest.mark.anyio
+async def test_online_search_keyword_cached(online_env, monkeypatch):
+    """同一关键词短 TTL 缓存：第二次请求不再打源站。"""
+    calls = []
+    async def fake_get(url, params=None, timeout=None):
+        calls.append(params)
+        class R:
+            status_code = 200
+            def json(self):
+                return {"ok": True, "items": [{"id": "1", "name": "x"}], "total": 1}
+        return R()
+    class FakeClient:
+        def get(self, *a, **k):
+            return fake_get(*a, **k)
+    monkeypatch.setattr(p, "get_lx_client", lambda app: FakeClient())
+    online_env.get("/music/api/v1/search/playlist?q=cached")
+    online_env.get("/music/api/v1/search/playlist?q=cached")
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_online_search_switch_off(online_env, monkeypatch):
+    """开关关闭：不发起在线搜索（未添加歌单不出现）。"""
+    monkeypatch.setitem(p.CONF, "public_search_enabled", False)
+    called = []
+    _mock_lx_search(monkeypatch, [])
+    monkeypatch.setattr(p, "get_lx_client", lambda app: called.append(1) or (_ for _ in ()).throw(AssertionError("should not call")))
+    r = online_env.get("/music/api/v1/search/playlist?q=anything")
+    assert r.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_online_search_timeout_does_not_break(online_env, monkeypatch):
+    """在线层超时/异常不影响主响应（官方结果 + 缓存命中照常）。"""
+    class SlowClient:
+        async def get(self, *a, **k):
+            await asyncio.sleep(30)
+    monkeypatch.setattr(p, "get_lx_client", lambda app: SlowClient())
+    r = online_env.get("/music/api/v1/search/playlist?q=slow")
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert any(x["name"] == "我的最爱" for x in data["list"])
+
+
+import asyncio  # noqa: E402  (测试文件尾部，供超时用例使用)
