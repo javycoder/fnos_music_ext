@@ -56,10 +56,10 @@ def test_extension_card_fields_match_official_shape(client):
     hit = next(x for x in data["list"] if x["name"] == "猜你喜欢")
     for key in ("guid", "name", "coverId", "createdAt", "updatedAt", "trackCount"):
         assert key in hit, key
-    # disguise 出口把 online: guid 伪装成官方 32hex（liked 是 sha256(user) 的确定性映射）
-    assert len(hit["guid"]) == 32
-    assert hit["guid"] == p.fake_official_guid(
-        p.dailyrec.recommend_playlist_guid("liked", user_guid="user-abc"))
+    # 修复1：扩展卡片豁免伪装，guid 保留 online: 原文（与歌单列表注入同构，
+    # 不依赖内存反解表，重启后详情仍可达）
+    assert hit["guid"].startswith("online:playlist:liked:")
+    assert hit["guid"] == p.dailyrec.recommend_playlist_guid("liked", user_guid="user-abc")
     # coverId 伪装成官方形态（track_ 前缀 + 32hex）
     assert hit["coverId"].startswith("track_")
 
@@ -228,3 +228,97 @@ async def test_online_search_timeout_does_not_break(online_env, monkeypatch):
 
 
 import asyncio  # noqa: E402  (测试文件尾部，供超时用例使用)
+
+
+# ------------------------------------------------ 修复1/2/3/4 回归 ----
+
+@pytest.mark.anyio
+async def test_online_card_raw_guid_survives_restart(online_env, monkeypatch):
+    """修复1：在线层卡片 guid 原文下发（不经伪装），详情端点直接反解。
+    同时验证重启场景：清空伪装反解表后原文 guid 仍可解析。"""
+    _mock_lx_search(monkeypatch, [
+        {"id": "888", "name": "修复验证歌单", "cover_url": "http://img.example/x.jpg",
+         "track_count": 9},
+    ])
+    r = online_env.get("/music/api/v1/search/playlist?q=修复验证")
+    hit = next(x for x in r.json()["data"]["list"] if "修复验证" in x["name"])
+    assert hit["guid"].startswith("online:playlist:public:lx:kw:playlist:888")
+    # 反解表清空（模拟重启）：原文 guid 不依赖表，详情端点 entry_from_guid 直接命中
+    saved = dict(p._FAKE_GUID_REVERSE)
+    p._FAKE_GUID_REVERSE.clear()
+    try:
+        assert p.pubpl.entry_from_guid(hit["guid"]) is not None
+    finally:
+        p._FAKE_GUID_REVERSE.update(saved)
+
+
+@pytest.mark.anyio
+async def test_online_card_cover_url_registered(online_env, monkeypatch):
+    """修复3：搜索结果自带封面直链登记进 _cover_urls，封面端点可同源直出。"""
+    _mock_lx_search(monkeypatch, [
+        {"id": "777", "name": "带封面歌单", "cover_url": "http://img.example/c.jpg",
+         "track_count": 3},
+    ])
+    entry = {"provider": "lx", "source": "kw", "kind": "playlist", "id": "777"}
+    guid = p.pubpl.playlist_guid(entry)
+    try:
+        r = online_env.get("/music/api/v1/search/playlist?q=带封面")
+        assert any("带封面" in x["name"] for x in r.json()["data"]["list"])
+        assert p.pubpl.cover_url_for(guid) == "http://img.example/c.jpg"
+    finally:
+        p.pubpl._cover_urls.pop(guid, None)
+
+
+@pytest.mark.anyio
+async def test_online_card_no_cover_marked_unavailable(online_env, monkeypatch):
+    """修复4：源搜索结果无封面（源不可用征兆）时名字后缀（暂不可用）。"""
+    _mock_lx_search(monkeypatch, [
+        {"id": "666", "name": "无封面歌单", "cover_url": "", "track_count": 0},
+    ])
+    r = online_env.get("/music/api/v1/search/playlist?q=无封面")
+    hit = next(x for x in r.json()["data"]["list"] if "无封面" in x["name"])
+    assert hit["name"].endswith("（暂不可用）")
+    assert hit["name"].startswith("🔍")
+
+
+@pytest.mark.anyio
+async def test_track_list_failure_degrades_to_empty(client, monkeypatch):
+    """修复2：公开歌单曲目拉取失败返回空列表（code 0），不再 code -1 空白页。"""
+    guid = "online:playlist:public:lx:kw:playlist:1"
+    entry = p.pubpl.entry_from_guid(guid)
+
+    async def fail_tracks(state, entry_, build_track):
+        raise RuntimeError("source unavailable")
+
+    monkeypatch.setattr(p.pubpl, "load_tracks", fail_tracks)
+    # detail 端点响应不受影响
+    r = client.get(f"/music/api/v1/track/playlist-detail/list?guid={guid}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["code"] == 0
+    assert body["data"]["list"] == []
+    assert body["data"]["total"] == 0
+
+
+@pytest.mark.anyio
+async def test_online_card_coverid_resolvable_for_cover_endpoint(online_env, monkeypatch):
+    """搜索页封面修复：卡片 coverId 的 fake 注册进反解表，封面端点
+    track_<fake> → 原文 guid → 公开歌单封面分支（cover_url_for 直出）。"""
+    _mock_lx_search(monkeypatch, [
+        {"id": "555", "name": "封面反解歌单", "cover_url": "http://img.example/s.jpg",
+         "track_count": 4},
+    ])
+    entry = {"provider": "lx", "source": "kw", "kind": "playlist", "id": "555"}
+    guid = p.pubpl.playlist_guid(entry)
+    try:
+        r = online_env.get("/music/api/v1/search/playlist?q=封面反解")
+        hit = next(x for x in r.json()["data"]["list"] if "封面反解" in x["name"])
+        cover_id = hit["coverId"]
+        assert cover_id == "track_" + p.fake_official_guid(guid)
+        # 反解表已注册（卡片下发时副作用）：封面端点同款解析链可达原文 guid
+        resolved = p.resolve_real_guid(cover_id)
+        assert resolved == guid
+        assert p.pubpl.is_public_playlist_guid(resolved)
+        assert p.pubpl.cover_url_for(guid) == "http://img.example/s.jpg"
+    finally:
+        p.pubpl._cover_urls.pop(guid, None)

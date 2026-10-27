@@ -10881,8 +10881,16 @@ async def playlist_track_list(request: Request):
                 await pubpl.load_tracks(request.app.state, public_entry, build_online_track)
             )
         except Exception as e:
+            # 拉取失败降级空列表而非 code -1：客户端对 -1 渲染空白页（歌单卡片
+            # 也没有），空列表至少保住详情页与"暂无曲目"语义；失败按源冷却，
+            # 稍后重试仍有机会成功
             logger.warning("public playlist track list failed (%s): %s", guid, e)
-            return JSONResponse(content={"code": -1, "msg": "public playlist load failed", "data": None})
+            return JSONResponse(
+                content=disguise_client_json({
+                    "code": 0, "msg": "ok", "data": {"list": [], "total": 0,
+                                                     "sort": request.query_params.get("sort") or ""},
+                })
+            )
         register_online_meta(tracks)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
@@ -11604,17 +11612,29 @@ async def _search_public_playlists_online(request: Request, keyword: str) -> lis
 
     cards: list[dict] = []
     seen: set[str] = set()
+    now_ts = int(time.time())
     for item in results:
         guid = pubpl.playlist_guid(item)
         if guid in seen:
             continue
         seen.add(guid)
+        # 搜索结果自带封面直链：登记后封面端点同源直出，未添加歌单不再占位图
+        cover_url = str(item.get("cover_url") or "").strip()
+        if cover_url and _KW_TEXT_COVER_HOST not in cover_url:
+            pubpl._cover_urls[guid] = cover_url
+        name = f"🔍 [{pubpl._source_label(item['source'])}] {item['name']}"
+        if not cover_url:
+            # 源搜索结果无封面（多为源不可用/风控）：名字提示，避免点了空白无解释
+            name += "（暂不可用）"
+        # coverId 必须走 fake_official_guid（带反解表注册副作用）：搜索页封面请求
+        # 带 track_<fake>，封面端点靠反解回原文 guid 才能进公开歌单封面分支；
+        # pubpl.fake_guid 值相同但无注册，搜索页封面会 400（详情页拉过摘要才有图）
         cards.append({
             "guid": guid,
-            "name": f"🔍 [{pubpl._source_label(item['source'])}] {item['name']}",
-            "coverId": "track_" + pubpl.fake_guid(guid),
-            "createdAt": int(time.time()),
-            "updatedAt": int(time.time()),
+            "name": name,
+            "coverId": "track_" + fake_official_guid(guid),
+            "createdAt": now_ts,
+            "updatedAt": now_ts,
             "trackCount": item.get("track_count") or 0,
             "isDaily": True,
         })
@@ -11719,7 +11739,27 @@ async def search_playlist(request: Request, subpath: str = ""):
             data["total"] = data["total"] + len(add)
         elif "total" not in data:
             data["total"] = len(data["list"])
-    return JSONResponse(content=disguise_client_json(envelope))
+    # 扩展歌单卡片豁免伪装：guid 保留 online: 原文下发（与歌单列表注入同构）。
+    # 走 disguise 会把 guid 换成确定性 md5，反解依赖内存表——未添加歌单没有任何
+    # 持久化锚点（摘要/曲目从未拉过），代理重启后反解失败，详情永久空白；
+    # 原文 guid 与已添加歌单行为完全一致，Web 端已验证可正常消费。
+    ext_guids = {str(h.get("guid") or "") for h in hits}
+    return JSONResponse(content=_disguise_except_guids(envelope, ext_guids))
+
+
+def _disguise_except_guids(obj, keep_guids: set[str]):
+    """disguise_client_json 的局部豁免版：guid/coverId 命中 keep_guids 的条目
+    整体原样保留（其余照常伪装）。搜索响应里官方条目继续走伪装。"""
+    if not keep_guids:
+        return disguise_client_json(obj)
+    if isinstance(obj, dict):
+        guid = str(obj.get("guid") or "")
+        if guid in keep_guids:
+            return obj
+        return {k: _disguise_except_guids(v, keep_guids) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_disguise_except_guids(x, keep_guids) for x in obj]
+    return disguise_client_json(obj)
 
 
 @app.api_route("/music/api/v1/search/album", methods=["GET", "HEAD"])
