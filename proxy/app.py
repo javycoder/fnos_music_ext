@@ -215,6 +215,8 @@ CONF = {
     "lx_source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
     "lx_source_list": os.environ.get("LX_SOURCE_LIST", "[]"),
     "lx_url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "15.0")),
+    "lx_resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "8.0")),
+    "lx_probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
@@ -575,6 +577,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "LX_SOURCE_URL": ("lx_source_url", "str"),
     "LX_SOURCE_LIST": ("lx_source_list", "str"),
     "LX_URL_TIMEOUT": ("lx_url_timeout", "lx_timeout"),
+    "LX_RESOLVER_TIMEOUT": ("lx_resolver_timeout", "lx_timeout"),
+    "LX_PROBE_TIMEOUT": ("lx_probe_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
@@ -709,7 +713,8 @@ def _env_watch_parse(raw: str, kind: str):
             return None
     if kind == "lx_timeout":
         try:
-            return max(1.0, min(300.0, float(raw)))
+            value = float(raw)
+            return value if 1.0 <= value <= 300.0 else None
         except (TypeError, ValueError):
             return None
     if kind == "bind_timeout":
@@ -816,7 +821,10 @@ def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         _sync_netease_quality()
     if set(changed) & _LX_CONFIG_KEYS:
         _sync_lx_config_epoch()
-    if "lx_url_timeout" in changed:
+    if set(changed) & {"lx_url_timeout", "lx_resolver_timeout", "lx_probe_timeout"}:
+        # New callers must not join a task still using the previous timeout budget.
+        global _LX_RESOLVE_EPOCH
+        _LX_RESOLVE_EPOCH += 1
         _LX_FRESH_COOLDOWN.clear()
     for provider, conf_name in _DIRECT_PLAY_CONF_KEYS.items():
         if conf_name in changed or set(changed) & (

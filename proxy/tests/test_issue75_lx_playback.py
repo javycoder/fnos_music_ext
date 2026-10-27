@@ -755,3 +755,48 @@ def test_lx_stream_head_wait_uses_scaled_timeout(monkeypatch):
 
     anyio.run(appmod._stream_head_response, fake_req, "online:lx:kg:WAIT_TEST", None, None)
     assert 40.0 in recorded_timeouts
+
+
+@pytest.mark.parametrize("env_key,conf_key,initial", [
+    ("LX_URL_TIMEOUT", "lx_url_timeout", 15.0),
+    ("LX_RESOLVER_TIMEOUT", "lx_resolver_timeout", 8.0),
+    ("LX_PROBE_TIMEOUT", "lx_probe_timeout", 3.0),
+])
+@pytest.mark.anyio
+async def test_timeout_change_starts_new_resolution_without_joining_old(
+    tmp_path, monkeypatch, env_key, conf_key, initial,
+):
+    monkeypatch.setitem(CONF, conf_key, initial)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"{env_key}=25.0\n")
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    calls = []
+
+    async def resolve(*args, **kwargs):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            started.set()
+            await gate.wait()
+            return {"url": "https://media.test/old"}
+        return {"url": "https://media.test/new"}
+
+    monkeypatch.setattr(appmod, "resolve_lx_url", resolve)
+    old = asyncio.create_task(resolve_lx_url_shared(None, "lx:kg:timeout-reload"))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        appmod._LX_FRESH_COOLDOWN["lx:kg:timeout-reload"] = time.monotonic() + 60
+        assert conf_key in appmod.apply_env_hot_reload(str(env_file))
+        assert not appmod._lx_fresh_cooldown_active("lx:kg:timeout-reload")
+        assert await asyncio.wait_for(
+            resolve_lx_url_shared(None, "lx:kg:timeout-reload"), 1,
+        ) == {"url": "https://media.test/new"}
+        assert len(calls) == 2
+    finally:
+        gate.set()
+        assert await old is None
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "301", "bad"])
+def test_invalid_lx_timeout_is_ignored(value):
+    assert appmod._env_watch_parse(value, "lx_timeout") is None
