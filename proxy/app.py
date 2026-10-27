@@ -11530,6 +11530,99 @@ async def _online_album_search(request: Request, keyword: str, limit: int) -> li
     return out[:limit]
 
 
+_EXT_PLAYLIST_SEARCH_MAX = 5
+
+
+def _ext_playlist_search_hits(request: Request, keyword: str, user_guid: str = "") -> list[dict]:
+    """扩展歌单卡片按名字匹配搜索关键词（子串、大小写不敏感）。
+
+    只读本地缓存，绝不触发歌单构建/网络拉取：推荐歌单用 display name 构造
+    （构建仍只在 _peek_daily_bundle 发生）；网易/公开歌单读既有摘要缓存，
+    公开歌单冷缓存时以 cached_card 磁盘兜底、不等待在线刷新。
+    命中按 _playlist_public_fields 归一化（与歌单列表注入同一形态），
+    上限 _EXT_PLAYLIST_SEARCH_MAX 防大量公开歌单时刷屏。
+    user_guid 供 liked 卡片 guid 构造（带用户段，详情端点按它回自己的歌单）。
+    """
+    kw = str(keyword or "").strip().lower()
+    if not kw:
+        return []
+    hits: list[dict] = []
+    seen: set[str] = set()
+
+    def consider(card: dict) -> None:
+        name = str(card.get("name") or "")
+        guid = str(card.get("guid") or "")
+        if not name or not guid or guid in seen:
+            return
+        seen.add(guid)
+        if kw in name.lower():
+            hits.append(_playlist_public_fields(card, []))
+
+    # 推荐歌单（daily/liked/hot，按各自开关）：display name 与用户无关，
+    # 无需身份探测（构建仍只在 _peek/_load 发生，这里只取名字）
+    for kind in _recommend_kinds_enabled():
+        bundle = dailyrec.empty_daily_bundle(user_guid or "shared", kind)
+        consider(bundle.get("playlist") or {})
+
+    # 网易账号歌单：内存摘要 + 磁盘兜底（懒加载），无网络
+    for card in nmpl._iter_known_cards():
+        consider(card)
+
+    # 公开歌单：仅内存/磁盘缓存，不发起在线刷新（peek_cards 会拉网络，不用）
+    conf = CONF
+    for entry in pubpl.configured_selection(conf):
+        guid = pubpl.playlist_guid(entry)
+        card = pubpl.cached_card(guid)
+        if isinstance(card, dict):
+            consider(card)
+
+    return hits[:_EXT_PLAYLIST_SEARCH_MAX]
+
+
+@app.api_route("/music/api/v1/search/playlist", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/search/playlist/{subpath:path}", methods=["GET", "HEAD"])
+async def search_playlist(request: Request, subpath: str = ""):
+    """歌单搜索：官方自建歌单照常返回，名字命中关键词的扩展歌单追加在尾部。
+
+    官方搜索只有官方库，扩展歌单（推荐/网易账号/公开）搜不到；拦截后按歌单
+    名子串匹配注入（不做歌内曲目反查）。guid/coverId 伪装走 disguise 出口，
+    详情/曲目/封面端点对这几类歌单的专用分支全部已存在，点击即达。
+    """
+    upstream_client = get_upstream_client(request.app)
+    envelope = await fetch_upstream_envelope(request, upstream_client)
+    if not isinstance(envelope, dict) or envelope.get("code") != 0:
+        # 官方错误（含未登录 401 信封）原样透传，不吞官方语义
+        return envelope if not isinstance(envelope, dict) else JSONResponse(content=envelope)
+
+    keyword = str(request.query_params.get("q") or request.query_params.get("keyword") or request.query_params.get("wd") or "").strip()
+    if not keyword:
+        return JSONResponse(content=disguise_client_json(envelope))
+
+    # 每请求探测一次身份：liked 卡片的 guid 带 user 段（sha256），用请求者
+    # 自己的 guid 才能点进去看到自己的歌单（shared 变体会落空详情）
+    is_authed, user_guid, _auth_resp = await _probe_upstream_auth(request, upstream_client)
+    hits = _ext_playlist_search_hits(request, keyword, user_guid if is_authed else "")
+    if hits:
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            data = {}
+            envelope["data"] = data
+        lst = data.get("list") if isinstance(data.get("list"), list) else None
+        if lst is None:
+            data["list"] = lst = []
+        official_names = {
+            str(x.get("name") or "").strip().lower()
+            for x in lst if isinstance(x, dict)
+        }
+        add = [h for h in hits if str(h.get("name") or "").strip().lower() not in official_names]
+        data["list"] = lst + add
+        if isinstance(data.get("total"), int):
+            data["total"] = data["total"] + len(add)
+        elif "total" not in data:
+            data["total"] = len(data["list"])
+    return JSONResponse(content=disguise_client_json(envelope))
+
+
 @app.api_route("/music/api/v1/search/album", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/search/album/{subpath:path}", methods=["GET", "HEAD"])
 async def search_album(request: Request, subpath: str = ""):
