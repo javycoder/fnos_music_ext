@@ -108,6 +108,8 @@ def test_unconfigured_user_cannot_read_public_playlist(monkeypatch):
         assert client.get("/music/api/v1/track/playlist-detail/list",
                           params={"playlistGUID": guid}).json()["code"] != 0
         assert client.get("/music/api/v1/static/cover", params={"id": guid}).status_code == 404
+        batch = client.get("/music/api/v1/playlist/batch-detail", params={"guids": guid}).json()
+        assert batch["data"]["list"] == []
     assert handler.state["calls"] == 0
 
 

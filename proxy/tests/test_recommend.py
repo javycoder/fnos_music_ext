@@ -1212,6 +1212,14 @@ def test_playlist_list_daily_isolated_between_users(tmp_path, monkeypatch):
 
         tracks_b = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid_b, "page": 1, "size": 50}).json()
         assert {t["title"] for t in tracks_b["data"]["list"]} == {"乙歌1", "乙歌2"}
+        foreign = client.get("/music/api/v1/track/playlist-detail/list",
+                             params={"playlistGUID": guid_a, "size": 50}).json()
+        assert foreign["data"]["list"] == []
+        detail = client.get("/music/api/v1/playlist/detail", params={"guid": guid_a}).json()
+        assert detail["data"]["trackCount"] == 0
+        batch = client.get("/music/api/v1/playlist/batch-detail", params={"guids": guid_a}).json()
+        assert all(card["guid"] != guid_a for card in batch["data"]["list"])
+        assert client.get("/music/api/v1/static/cover", params={"coverId": guid_a}).status_code == 404
 
 
 def test_playlist_list_shared_user_skips_daily_keeps_hot(tmp_path, monkeypatch):
