@@ -1087,7 +1087,6 @@ async def _env_watch_loop() -> None:
                 migration_retry_at = time.monotonic() + 30
                 try:
                     await asyncio.to_thread(migrate_public_playlist_users)
-                    _refresh_recommend_config(apply_env_hot_reload())
                 except Exception as exc:
                     logger.debug("public playlist migration pending: %s", exc)
             cur = _env_watch_stat()
@@ -4536,7 +4535,8 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
             try:
                 users = await asyncio.to_thread(list_music_users)
                 await asyncio.to_thread(migrate_public_playlist_users, users)
-                _refresh_recommend_config(apply_env_hot_reload())
+                values = dict(parse_env_file(_env_watch_path(), strict=True)[0])
+                CONF["public_playlists_by_user"] = values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "")
             except (ValueError, OSError) as exc:
                 return 503, {"ok": False, "error": str(exc)}
             return 200, {"ok": True, "users": users, "total": len(users),

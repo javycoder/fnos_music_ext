@@ -110,18 +110,23 @@ musicbox_cookie_present() {
 public_musicbox_selected() {
     [ "$(env_flag FNMUSIC_PUBLIC_PLAYLISTS_ENABLED)" = "true" ] || return 1
     python3 -c 'import json, os, sys
-raw = os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", "")
+sys.path[:0] = [sys.argv[2], "/srv"]
+from proxy.env_merge import parse_env_file
 try:
-    per_user = os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "").strip()
+    values = dict(os.environ)
+    if os.path.isfile(sys.argv[1]):
+        values.update(dict(parse_env_file(sys.argv[1], strict=True)[0]))
+    raw = values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", "")
+    per_user = values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "").strip()
     if per_user:
         mapping = json.loads(per_user)
         rows = [item for selection in mapping.values() if isinstance(selection, list) for item in selection] if isinstance(mapping, dict) else []
     else:
         rows = json.loads(raw) if raw.strip() else [{"provider": "musicbox", "id": "3778678"}]
     needed = isinstance(rows, list) and any(isinstance(x, dict) and x.get("provider") == "musicbox" and x.get("id") for x in rows)
-except (ValueError, TypeError):
+except (ValueError, TypeError, OSError):
     needed = False
-sys.exit(0 if needed else 1)'
+sys.exit(0 if needed else 1)' "$ENV_FILE" "$(dirname "$0")/.."
 }
 
 if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
