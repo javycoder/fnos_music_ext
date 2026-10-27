@@ -1840,6 +1840,25 @@ test("下载存放方式：新 schema 回填保存，旧 schema 不提交未知�
   assert.ok(!("FNMUSIC_DOWNLOAD_LAYOUT" in global.collectConfig()));
 });
 
+test("落盘方式：三种模式回填保存，非法值回落，旧后端不提交未知字段", async () => {
+  for (const mode of ["auto", "direct", "staged"]) {
+    enqueue("/app/fnmusic-ext/api/config", {
+      values: { FNMUSIC_TEE_SAVE_MODE: mode },
+      schema: { FNMUSIC_TEE_SAVE_MODE: {} },
+    });
+    await global.loadConfig();
+    assert.strictEqual(els.get("#tee-save-mode").disabled, false);
+    assert.strictEqual(els.get("#tee-save-mode").value, mode);
+    assert.strictEqual(global.collectConfig().FNMUSIC_TEE_SAVE_MODE, mode);
+  }
+  els.get("#tee-save-mode").value = "invalid";
+  assert.strictEqual(global.collectConfig().FNMUSIC_TEE_SAVE_MODE, "auto");
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#tee-save-mode").disabled, true);
+  assert.ok(!("FNMUSIC_TEE_SAVE_MODE" in global.collectConfig()));
+});
+
 const organizeResponse = (status, extra = {}) => ({ ok: true, root: "/vol1/music", layout: "flat", job: {
   id: "organize-1", status, phase: "scan", layout: "flat", scanned: 3, moved: 2,
   unchanged: 1, skipped: 0, failed: 0, errors: [], details: [], ...extra,

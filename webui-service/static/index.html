@@ -305,6 +305,14 @@
           </div>
           <p id="organize-status" role="status" aria-live="polite"></p>
           <pre class="update-changelog" id="organize-details" hidden></pre>
+          <label class="field"><span>落盘方式</span>
+            <select class="input" id="tee-save-mode">
+              <option value="auto">自动判定（推荐）</option>
+              <option value="direct">直接写入</option>
+              <option value="staged">本地中转</option>
+            </select>
+          </label>
+          <p class="hint">边听边存与收藏绑定共用此设置。自动判定会让本地盘直接写入，远程目录先在缓存区下载和加工，再写入目标文件；也可手动选择本地中转。中转模式不在下载目录创建 .part 文件，上传失败会尽力清理本次创建的残件并保留本地缓存。直接写入仅建议用于本地盘。保存后立即生效。</p>
         </div>
       </section>
 
