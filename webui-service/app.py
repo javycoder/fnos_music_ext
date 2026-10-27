@@ -52,6 +52,7 @@ from proxy.fnlog import (  # noqa: E402
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
 from proxy import publicplaylists as pubpl
+from proxy.version import display_version
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -1022,8 +1023,8 @@ async def _fetch_json(request: Request, url: str, *, timeout: float = 4.0) -> "t
 
 def _read_version() -> str:
     try:
-        return VERSION_PATH.read_text(encoding="utf-8").strip()
-    except OSError:
+        return display_version(VERSION_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
         return SERVICE_VERSION
 
 
@@ -1043,7 +1044,7 @@ def _version_newer(latest: str, current: str) -> bool:
 
     正式发布只有纯数字版本号（如 2.9.0）：latest 带字母等尾巴（如 2.8.0a
     迭代预发布）一律不视为更新——检查更新不检测非正式版本。current 侧尾巴
-    仅截断参与数值比较（存量迭代安装也能被更新的正式版命中）。任一侧解析
+    参与基础数字比较；同一基础版本的正式版也比预发布新。任一侧解析
     不出数字视为不更新。"""
     latest = (latest or "").strip().lstrip("vV")
     if not re.fullmatch(r"\d+(?:\.\d+)*", latest):
@@ -1055,7 +1056,10 @@ def _version_newer(latest: str, current: str) -> bool:
     size = max(len(lnums), len(cnums))
     lnums += [0] * (size - len(lnums))
     cnums += [0] * (size - len(cnums))
-    return lnums > cnums
+    return lnums > cnums or (
+        lnums == cnums
+        and re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[0-9]+|[a-z])", (current or "").strip()) is not None
+    )
 
 
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s*")

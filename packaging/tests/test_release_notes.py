@@ -34,6 +34,7 @@ def test_notes_correction_only_updates_existing_release_body(tmp_path):
     ('changed-runtime', False, False),
     ('correction-only', True, True),
     ('missing-section', False, False),
+    ('numeric-migration', True, False),
 ])
 def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path, case, success, edited):
     if not shutil.which('jq'):
@@ -48,6 +49,8 @@ def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path
     git('init', '-q')
     git('config', 'user.name', 'Release Test')
     git('config', 'user.email', 'release@example.invalid')
+    (repo / 'proxy').mkdir()
+    shutil.copyfile(ROOT / 'proxy/version.py', repo / 'proxy/version.py')
     (repo / 'VERSION').write_text('2.10.0b\n')
     initial = ('# Changelog\n\n## [未发布]\n\n## [2.10.0b]\n\nPublished notes.\n'
                '\n## [2.9.0]\n' + 'Historical notes.\n' * 10000)
@@ -61,6 +64,9 @@ def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path
         updated = updated.replace('Published notes.', 'Corrected published notes.')
     elif case == 'missing-section':
         updated = updated.split('## [2.10.0b]')[0]
+    elif case == 'numeric-migration':
+        (repo / 'VERSION').write_text('2.10.0-1\n')
+        updated = updated.replace('Published notes.', 'New package notes.')
     if case != 'correction-only':
         (repo / 'runtime.py').write_text('value = 2\n')
     (repo / 'CHANGELOG.md').write_text(updated)
@@ -120,6 +126,37 @@ def test_formal_210_documents_changes_since_290():
 RELEASE_WORKFLOW = ROOT / '.github/workflows/release.yml'
 CLEANUP_STEP = 'Remove previous published prereleases'
 PUBLISH_STEP = 'Create or update GitHub Release'
+
+
+@pytest.mark.parametrize("version,tag,formal,success", [
+    ("2.11.0-0", "v2.11.0a", "false", True),
+    ("2.11.0-1", "v2.11.0b", "false", True),
+    ("2.11.0", "v2.11.0", "true", True),
+    ("2.11.0-0", "v2.11.0", "", False),
+    ("2.11.0", "v2.11.0a", "", False),
+    ("2.11.0-0", "v2.11.0-0", "", False),
+    ("2.11.0-26", "v2.11.0z", "", False),
+    ("2.11.0a", "v2.11.0a", "", False),
+])
+def test_release_ci_validates_tag_and_derives_kind(tmp_path, version, tag, formal, success):
+    (tmp_path / "proxy").mkdir()
+    shutil.copyfile(ROOT / "proxy/version.py", tmp_path / "proxy/version.py")
+    (tmp_path / "VERSION").write_text(version)
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", _release_step("Verify tag matches VERSION")],
+        cwd=tmp_path, env=dict(os.environ, TAG=tag, GITHUB_OUTPUT=str(output)),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert (result.returncode == 0) is success, result.stdout + result.stderr
+    if success:
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert values["version"] == version
+        assert values["tag"] == tag
+        assert values["display_version"] == tag[1:]
+        assert values["formal"] == formal
+    else:
+        assert not output.exists()
 
 
 def _release_step(name):

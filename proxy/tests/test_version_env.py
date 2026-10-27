@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from proxy import env_merge
-from proxy.version import FALLBACK_VERSION, get_version
+from proxy.version import FALLBACK_VERSION, display_version, get_version, release_info
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -22,10 +22,35 @@ def test_version_file_exists_with_semver():
     version_file = REPO_ROOT / "VERSION"
     assert version_file.is_file(), "仓库根目录必须存在 VERSION 文件"
     ver = _read_repo_version()
-    base = re.sub(r"[a-z]$", "", ver)
-    parts = base.split(".")
-    assert len(parts) == 3 and all(p.isdigit() for p in parts), \
-        f"VERSION 必须是 x.y.z 形式（自动迭代构建可加单字母后缀），当前为 {ver!r}"
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:-\d+)?", ver), \
+        f"VERSION 必须是 x.y.z 或 x.y.z-N，当前为 {ver!r}"
+    assert release_info(ver)["version"] == ver
+
+
+@pytest.mark.parametrize("version,display,formal", [
+    ("2.11.0", "2.11.0", "true"),
+    ("2.11.0-0", "2.11.0a", "false"),
+    ("2.11.0-1", "2.11.0b", "false"),
+    ("2.11.0-25", "2.11.0z", "false"),
+])
+def test_release_version_mapping(version, display, formal):
+    assert release_info(version) == {
+        "version": version, "display_version": display, "tag": f"v{display}", "formal": formal,
+    }
+    assert display_version(version) == display
+
+
+@pytest.mark.parametrize("version", [
+    "2.11.0a", "v2.11.0", "2.11", "2.11.0-26", "2.11.0--1", "2.11.0-01",
+    "2.11.0-rc1", "2.11.0\ninjected=value", "",
+])
+def test_invalid_package_version_is_rejected(version):
+    with pytest.raises(ValueError):
+        release_info(version)
+
+
+def test_existing_letter_version_still_displays():
+    assert display_version("2.10.0b") == "2.10.0b"
 
 
 def test_get_version_reads_file(monkeypatch):

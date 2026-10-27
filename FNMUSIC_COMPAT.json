@@ -1,6 +1,6 @@
 {
-  "extension_version": "2.11.0a",
+  "extension_version": "2.11.0-1",
   "music_versions": ["1.0.10"],
   "checked_at": "2026-10-27",
-  "notes": "依据实机 trim.music manifest 和随包 SQL 结构核对。仅记录适配基线，不控制运行时行为。"
+  "notes": "2026-10-27 发布前重新读取实机 /var/apps/trim.music/manifest，确认为 1.0.10；歌单用户隔离依据该版 user 表与随包 SQL 结构核对。仅记录适配基线，不控制运行时行为。"
 }

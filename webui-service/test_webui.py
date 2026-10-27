@@ -2419,6 +2419,18 @@ def update_cache_clean():
     webui._update_cache.clear()
 
 
+@pytest.mark.parametrize("version,display", [
+    ("2.11.0-0", "2.11.0a"), ("2.11.0-1", "2.11.0b"),
+    ("2.11.0", "2.11.0"), ("2.10.0b", "2.10.0b"),
+])
+def test_webui_derives_display_version(env_file, tmp_path, monkeypatch, version, display):
+    path = tmp_path / "VERSION"
+    path.write_text(version)
+    monkeypatch.setattr(webui, "VERSION_PATH", path)
+    with authed_client() as client:
+        assert client.get("/api/about").json()["version"] == display
+
+
 def test_version_newer():
     assert webui._version_newer("2.9.0", "2.8.3")
     assert not webui._version_newer("2.8.3", "2.9.0")
@@ -2428,6 +2440,9 @@ def test_version_newer():
     assert not webui._version_newer("2.9.0", "2.10.0")
     assert webui._version_newer("v2.9.0", "2.8.3")      # tag 的 v 前缀
     assert webui._version_newer("2.9.0", "2.8.0e")      # 存量迭代安装可被正式版命中
+    assert webui._version_newer("2.11.0", "2.11.0a")
+    assert webui._version_newer("2.11.0", "2.11.0-0")
+    assert not webui._version_newer("2.10.2", "2.11.0a")
     # 正式发布只有纯数字版本号：带字母尾巴的迭代预发布不检测
     assert not webui._version_newer("2.8.0a", "2.8.0")
     assert not webui._version_newer("2.9.0-rc1", "2.8.3")

@@ -36,24 +36,12 @@ jobs:
           ref: ${{ env.TAG }}
 
       - name: Verify tag matches VERSION
+        id: release-kind
         run: |
-          tag="${TAG#v}"
-          version="$(head -n1 VERSION | tr -d '[:space:]')"
-          if [ "$tag" != "$version" ]; then
-            echo "tag ${TAG} 与 VERSION 文件 ${version} 不一致" >&2
-            exit 1
-          fi
+          python3 proxy/version.py --tag "$TAG" --github-output "$GITHUB_OUTPUT"
 
       - name: Verify official music compatibility record
         run: python3 scripts/check_music_compat.py
-
-      - name: Classify release
-        id: release-kind
-        run: |
-          case "${TAG#v}" in
-            *[a-z]) echo "formal=false" >> "$GITHUB_OUTPUT" ;;
-            *) echo "formal=true" >> "$GITHUB_OUTPUT" ;;
-          esac
 
       - name: Run packaging tests
         run: |
@@ -88,9 +76,9 @@ jobs:
 
       - name: Extract changelog for this version
         run: |
-          version="${TAG#v}"
+          version="${{ steps.release-kind.outputs.display_version }}"
           awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            index($0, "## [" ver "]") == 1 { found = 1; next }
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md > /tmp/release-notes.md
