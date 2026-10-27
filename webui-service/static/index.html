@@ -136,6 +136,19 @@
             <div class="card-title"><span>lx音乐源列表</span><button class="help-btn" type="button" data-help="lx-source-list" aria-label="洛雪源列表帮助">?</button></div>
             <div id="lx-source-list" class="stack"></div>
           </div>
+          <div class="card">
+            <div class="card-title"><span>超时设置</span><button class="help-btn" type="button" data-help="lx-timeouts" aria-label="洛雪超时设置帮助">?</button></div>
+            <label class="field"><span>单次解析超时（秒）</span>
+              <input class="input" id="lx-resolver-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
+            </label>
+            <label class="field"><span>取链总超时（秒）</span>
+              <input class="input" id="lx-url-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
+            </label>
+            <label class="field"><span>直链探活超时（秒）</span>
+              <input class="input" id="lx-probe-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
+            </label>
+            <p class="hint">单次解析控制一次取链尝试；总超时覆盖缓存续期、解析、换源和降档；探活验证返回的直链。实际等待始终受剩余总预算限制。</p>
+          </div>
         </div>
 
       </section>
@@ -438,6 +451,9 @@
   </template>
   <template data-help-id="lx-source-list">
     <p>支持多个洛雪源同时激活，解析失败时自动接力。新激活的源会先做可用性校验，每个约需 1 分钟；保存并生效后按列表配置热更新。</p>
+  </template>
+  <template data-help-id="lx-timeouts">
+    <p>慢源可调大超时。建议总超时至少覆盖一次解析和一次探活；调大后保存即生效，无需重启服务。</p>
   </template>
   <template data-help-id="direct-play">
     <p>开启后，本地曲库和完整缓存未命中的原文件在线播放会由扩展代理返回音乐源 HTTPS 地址的 302，不再由 NAS 前台转发音频正文。默认关闭，保存后经代理热重载生效；关闭文件监听时需重启代理。</p>

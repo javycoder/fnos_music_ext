@@ -203,9 +203,10 @@ def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
             f.write(content)
             # Native WebUI runs as root, but the installer user's private .env
             # must remain readable by that user after an atomic replacement.
-            if existing is not None and os.geteuid() == 0:
+            if existing is not None and getattr(os, "geteuid", lambda: -1)() == 0 and hasattr(os, "fchown"):
                 os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
-            os.fchmod(f.fileno(), mode)
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, str(path))
     finally:
         if os.path.exists(tmp_name):

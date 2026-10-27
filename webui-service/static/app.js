@@ -80,6 +80,14 @@ function likedNumber(selector, label, min, max, integer = false) {
   return num;
 }
 
+function lxTimeoutNumber(selector, label) {
+  const value = Number.parseFloat($(selector).value);
+  if (!Number.isFinite(value) || value < 1 || value > 300) {
+    throw new Error(`${label}必须是 1–300 秒的数字`);
+  }
+  return value;
+}
+
 function toast(message, kind) {
   const el = $("#toast");
   el.textContent = message;
@@ -407,6 +415,9 @@ function applyConfigToForm() {
   $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
   $("#lx-url").value = "";
   lxVerifiedUrl = null;
+  $("#lx-resolver-timeout").value = v.LX_RESOLVER_TIMEOUT || "8.0";
+  $("#lx-url-timeout").value = v.LX_URL_TIMEOUT || "15.0";
+  $("#lx-probe-timeout").value = v.LX_PROBE_TIMEOUT || "3.0";
   try {
     const rawList = v.LX_SOURCE_LIST;
     lxSourceList = rawList ? JSON.parse(rawList) : [];
@@ -470,6 +481,11 @@ function collectConfig() {
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
+  if (!$("#panel-lxmusic").hidden) {
+    values.LX_RESOLVER_TIMEOUT = lxTimeoutNumber("#lx-resolver-timeout", "单次解析超时");
+    values.LX_URL_TIMEOUT = lxTimeoutNumber("#lx-url-timeout", "取链总超时");
+    values.LX_PROBE_TIMEOUT = lxTimeoutNumber("#lx-probe-timeout", "直链探活超时");
+  }
   // 隐藏的参数不提交：关闭用途不清空已保存值，也不让隐藏的无效编辑阻塞保存。
   if (values.FNMUSIC_LLM_LIKED_ENABLED) {
     values.FNMUSIC_LIKED_REFRESH_HOURS = likedNumber("#liked-refresh-hours", "猜你喜欢生成间隔", 0.5, null);
@@ -1754,7 +1770,7 @@ DIR_FIELDS.forEach(bindDirField);
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
+["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path", "#lx-resolver-timeout", "#lx-url-timeout", "#lx-probe-timeout"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 ["#llm-liked", "#llm-daily"].forEach((sel) => $(sel).addEventListener("change", () => {
   updateLlmLikedSettings();

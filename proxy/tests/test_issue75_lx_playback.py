@@ -10,6 +10,7 @@
 import asyncio
 import os
 import shutil
+import sys
 import tempfile
 import time
 from unittest.mock import AsyncMock
@@ -63,7 +64,6 @@ def _clean_lx_state(tmp_path, monkeypatch):
 @pytest.fixture
 def fake_ffmpeg(tmp_path, monkeypatch):
     """安装假 ffmpeg 供转码测试使用。"""
-    script_path = tmp_path / "fake_ffmpeg"
     script_content = """#!/usr/bin/env python3
 import sys, os, time
 args = sys.argv[1:]
@@ -75,8 +75,15 @@ with open(out_file, "wb") as f:
     f.write(b"M4ADATA_SEGMENT")
 sys.exit(0)
 """
-    script_path.write_text(script_content)
-    script_path.chmod(0o755)
+    if sys.platform == "win32":
+        py_script = tmp_path / "fake_ffmpeg.py"
+        py_script.write_text(script_content, encoding="utf-8")
+        script_path = tmp_path / "fake_ffmpeg.bat"
+        script_path.write_text(f'@"{sys.executable}" "{py_script}" %*\n', encoding="utf-8")
+    else:
+        script_path = tmp_path / "fake_ffmpeg"
+        script_path.write_text(script_content)
+        script_path.chmod(0o755)
     monkeypatch.setattr(tc, "FFMPEG_BIN", str(script_path))
     return str(script_path)
 
@@ -221,7 +228,8 @@ def test_lx_stream_and_head_wait_beyond_legacy_limits(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(appmod, "_STREAM_STARTUP_S", 0.01)
-    monkeypatch.setattr(appmod, "_LX_STREAM_STARTUP_S", 0.1)
+    monkeypatch.setitem(CONF, "lx_url_timeout", 15.0)
+    monkeypatch.setattr(appmod, "_LX_STREAM_STARTUP_SLACK_S", -14.9)
     real_wait_for = asyncio.wait_for
     first_byte_budgets = []
     async def record_budget(awaitable, timeout):
@@ -277,7 +285,8 @@ def test_lx_stream_timeout_exceeded_no_fresh_no_leak(monkeypatch, tmp_path):
     )
 
     # 设定短超时 0.1s
-    monkeypatch.setattr(appmod, "_LX_STREAM_STARTUP_S", 0.1)
+    monkeypatch.setitem(CONF, "lx_url_timeout", 15.0)
+    monkeypatch.setattr(appmod, "_LX_STREAM_STARTUP_SLACK_S", -14.9)
 
     with TestClient(app) as test_client:
         resp = test_client.get("/music/api/v1/track/stream?guid=online:lx:kg:TIMEOUT1")
@@ -684,3 +693,65 @@ def test_playback_regressions_cached_range_netease_local(monkeypatch, tmp_path):
         assert r_local.status_code == 200
         assert r_local.content == b"UPSTREAM_OFFICIAL"
         assert len(upstream_hits) == 1
+
+
+def test_lx_url_timeout_slack_scaling(monkeypatch):
+    """总超时联动：取链等待为总超时 + 1s，起播/共享解析等待为总超时 + 5s。"""
+    monkeypatch.setitem(CONF, "lx_url_timeout", 15.0)
+    assert appmod._lx_url_request_timeout_s() == 16.0
+    assert appmod._lx_stream_startup_timeout_s() == 20.0
+
+    monkeypatch.setitem(CONF, "lx_url_timeout", 25.0)
+    assert appmod._lx_url_request_timeout_s() == 26.0
+    assert appmod._lx_stream_startup_timeout_s() == 30.0
+
+    monkeypatch.setitem(CONF, "lx_url_timeout", 1.0)
+    assert appmod._lx_url_request_timeout_s() == 2.0
+    assert appmod._lx_stream_startup_timeout_s() == 6.0
+
+
+def test_lx_url_timeout_hot_reload_clears_fresh_cooldown(tmp_path, monkeypatch):
+    """热重载 LX_URL_TIMEOUT 时清空 _LX_FRESH_COOLDOWN，避免调大后同曲重试直接失败。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LX_URL_TIMEOUT=15.0\n", encoding="utf-8")
+    monkeypatch.setitem(CONF, "lx_url_timeout", 15.0)
+
+    appmod._LX_FRESH_COOLDOWN["online:lx:kg:COOLDOWN1"] = time.monotonic() + 100
+    assert "online:lx:kg:COOLDOWN1" in appmod._LX_FRESH_COOLDOWN
+
+    env_file.write_text("LX_URL_TIMEOUT=25.0\n", encoding="utf-8")
+    changed = appmod._apply_env_hot_reload(str(env_file))
+    assert "lx_url_timeout" in changed
+    assert CONF["lx_url_timeout"] == 25.0
+    assert "online:lx:kg:COOLDOWN1" not in appmod._LX_FRESH_COOLDOWN
+    assert appmod._lx_url_request_timeout_s() == 26.0
+    assert appmod._lx_stream_startup_timeout_s() == 30.0
+
+
+def test_lx_stream_head_wait_uses_scaled_timeout(monkeypatch):
+    """_stream_head_response 探活等待时长跟随 _lx_stream_startup_timeout_s 伸缩。"""
+    monkeypatch.setitem(CONF, "lx_url_timeout", 35.0)
+    assert appmod._lx_stream_startup_timeout_s() == 40.0
+
+    recorded_timeouts = []
+
+    async def fake_wait_for(fut, timeout=None):
+        recorded_timeouts.append(timeout)
+        if hasattr(fut, "close"):
+            fut.close()
+        raise TimeoutError()
+
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+
+    fake_scope = {
+        "type": "http",
+        "method": "HEAD",
+        "path": "/music/api/v1/track/stream",
+        "headers": [],
+        "query_string": b"guid=online:lx:kg:WAIT_TEST",
+        "app": app,
+    }
+    fake_req = appmod.Request(fake_scope)
+
+    anyio.run(appmod._stream_head_response, fake_req, "online:lx:kg:WAIT_TEST", None, None)
+    assert 40.0 in recorded_timeouts

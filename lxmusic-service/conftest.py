@@ -73,6 +73,7 @@ class FakeLxServerClient:
         self.deleted_ids: list[str] = []
         # get_music_url 调用记录 (songmid, quality)：缓存/在途合并测试统计实际解析次数用
         self.url_calls: list[tuple[str, str]] = []
+        self.url_timeouts: list[float | None] = []
         # 同步记录每次调用的 excludeApiSources（换源轮换测试断言用）
         self.url_excludes: list[list[str] | None] = []
         # 非空时按序弹出作为 get_music_url 返回值（先于 url_result 判定），耗尽后返回 None
@@ -118,9 +119,11 @@ class FakeLxServerClient:
         return res
 
     async def get_music_url(self, song_info: dict, quality: str = "128k",
-                            exclude_api_sources: list[str] | None = None) -> dict | None:
+                            exclude_api_sources: list[str] | None = None,
+                            request_timeout: float | None = None) -> dict | None:
         self.url_calls.append((str(song_info.get("songmid") or ""), quality))
         self.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
+        self.url_timeouts.append(request_timeout)
         if self.url_gate is not None:
             await self.url_gate.wait()
         if self.url_script:
@@ -253,4 +256,5 @@ def test_app_client(fake_lx):
     # 模拟外部调用 app 的客户端
     from starlette.testclient import TestClient
 
+    lxapp.get_http(lxapp.app)
     return TestClient(lxapp.app)
