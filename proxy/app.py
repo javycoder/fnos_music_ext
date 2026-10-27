@@ -214,6 +214,7 @@ CONF = {
     # 洛雪多源管理（WebUI 维护）：当前激活源地址与源列表 JSON，搜索结果来源标记用
     "lx_source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
     "lx_source_list": os.environ.get("LX_SOURCE_LIST", "[]"),
+    "lx_url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "15.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
@@ -573,6 +574,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "LX_SOURCES": ("lx_sources", "lx_sources"),
     "LX_SOURCE_URL": ("lx_source_url", "str"),
     "LX_SOURCE_LIST": ("lx_source_list", "str"),
+    "LX_URL_TIMEOUT": ("lx_url_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
@@ -705,6 +707,11 @@ def _env_watch_parse(raw: str, kind: str):
             return max(1.0, min(60.0, float(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "lx_timeout":
+        try:
+            return max(1.0, min(300.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
     if kind == "bind_timeout":
         try:
             return max(10.0, min(3600.0, float(raw)))
@@ -809,6 +816,8 @@ def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         _sync_netease_quality()
     if set(changed) & _LX_CONFIG_KEYS:
         _sync_lx_config_epoch()
+    if "lx_url_timeout" in changed:
+        _LX_FRESH_COOLDOWN.clear()
     for provider, conf_name in _DIRECT_PLAY_CONF_KEYS.items():
         if conf_name in changed or set(changed) & (
                 _SOURCE_CONF_KEYS | {"quality_mode", "netease_quality", "lx_quality", "netease_playlist_resident"}):
@@ -1720,8 +1729,17 @@ def title_from_track(item: dict) -> str:
 # issue #75：在线曲目首播总预算。lxmusic 端点总预算（LX_URL_TIMEOUT）默认 15s，
 # 网易/洛雪之外的音源维持原有 12s。单次尝试不再另设 6s 上限，冷播放等待解析结果
 # 而不提前放弃——App 首播失败的核心成因即"音源还在解析，代理已经超时放弃"。
-_LX_STREAM_STARTUP_S = 20.0
+_LX_STREAM_STARTUP_SLACK_S = 5.0
+_LX_URL_REQUEST_SLACK_S = 1.0
 _STREAM_STARTUP_S = 12.0
+
+
+def _lx_url_request_timeout_s() -> float:
+    return max(1.0, float(CONF.get("lx_url_timeout") or 15.0)) + _LX_URL_REQUEST_SLACK_S
+
+
+def _lx_stream_startup_timeout_s() -> float:
+    return max(1.0, float(CONF.get("lx_url_timeout") or 15.0)) + _LX_STREAM_STARTUP_SLACK_S
 
 
 def should_cache(range_header: str | None) -> bool:
@@ -3279,7 +3297,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                 params=params,
                 # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 15s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
-                timeout=16.0,
+                timeout=_lx_url_request_timeout_s(),
             )
             if r.status_code == 200:
                 data = r.json()
@@ -3354,7 +3372,7 @@ async def resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: 
             try:
                 result = await asyncio.wait_for(
                     resolve_lx_url(client, song_id, fresh=fresh, meta=meta, max_quality=max_quality),
-                    _LX_STREAM_STARTUP_S)
+                    _lx_stream_startup_timeout_s())
             except TimeoutError:
                 return None
             return result if epoch == _LX_RESOLVE_EPOCH else None
@@ -7755,7 +7773,7 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
         return Response(status_code=full.status_code, headers=dict(full.headers))
     opened = None
-    budget = _LX_STREAM_STARTUP_S if source_from_online_guid(guid) == "lx" else 4.0
+    budget = _lx_stream_startup_timeout_s() if source_from_online_guid(guid) == "lx" else 4.0
     try:
         opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=budget)
     except Exception:
@@ -8070,7 +8088,7 @@ async def stream_track(request: Request, subpath: str = ""):
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
     deadline = asyncio.get_running_loop().time() + (
-        _LX_STREAM_STARTUP_S if source_from_online_guid(guid) == "lx" else _STREAM_STARTUP_S)
+        _lx_stream_startup_timeout_s() if source_from_online_guid(guid) == "lx" else _STREAM_STARTUP_S)
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
             continue

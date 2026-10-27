@@ -1594,7 +1594,7 @@ async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cach
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def flaky_resolve(client, src, item, quality="lossless", budget=20.0):
+    async def flaky_resolve(client, src, item, quality="lossless", budget=20.0, **kwargs):
         started.set()
         await release.wait()
         raise RuntimeError("boom")
@@ -1614,7 +1614,7 @@ async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cach
     assert lxapp._URL_INFLIGHT == {}
     assert lxapp._URL_CACHE == {}
 
-    async def ok_resolve(client, src, item, quality="lossless", budget=20.0):
+    async def ok_resolve(client, src, item, quality="lossless", budget=20.0, **kwargs):
         return {"id": item.get("id"), "url": "https://media.test/song.flac"}
 
     monkeypatch.setattr(lxapp, "resolve_and_probe", ok_resolve)
@@ -1836,9 +1836,10 @@ def _install_probe_client():
     lxapp.app.state.client = mock_client(handler)
 
     def restore():
-        lxapp.app.state._state.pop("client", None)
         if had_client:
             lxapp.app.state.client = orig_client
+        else:
+            lxapp.get_http(lxapp.app)
 
     return restore
 
@@ -1846,9 +1847,9 @@ def _install_probe_client():
 def _spy_get_music_url(fake_lx, seen):
     original = fake_lx.get_music_url
 
-    async def spy(song_info, quality="128k", exclude_api_sources=None):
+    async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
         seen.append(dict(song_info))
-        return await original(song_info, quality, exclude_api_sources)
+        return await original(song_info, quality, exclude_api_sources, request_timeout)
 
     fake_lx.get_music_url = spy
 
@@ -1963,3 +1964,88 @@ def test_proxy_media_ua_matches_lx_probe_ua():
         sys.path.insert(0, repo_root)
     from proxy.app import _LX_MEDIA_UA
     assert _LX_MEDIA_UA == lxapp.UA_PC
+
+
+def test_lx_timeouts_hot_reload_clears_negative_cache_and_circuit_breaker(tmp_path, monkeypatch, fresh_url_cache):
+    """热重载配置时清空失败负缓存与熔断状态，保留成功缓存。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LX_RESOLVER_TIMEOUT=8.0\nLX_URL_TIMEOUT=15.0\nLX_PROBE_TIMEOUT=3.0\n", encoding="utf-8")
+    monkeypatch.setenv("LX_ENV_PATH", str(env_file))
+
+    lxapp._reload_timeout_settings()
+    assert lxapp.CONF["resolver_timeout"] == 8.0
+    assert lxapp.CONF["url_timeout"] == 15.0
+    assert lxapp.CONF["probe_timeout"] == 3.0
+
+    # 填充正缓存、负缓存与熔断状态
+    lxapp._URL_CACHE[("lx:kg:good", "high")] = {"data": {"url": "https://ok.test"}, "ts": 1000.0}
+    lxapp._URL_CACHE[("lx:kg:bad", "high")] = {"data": None, "ts": 1000.0}
+    lxapp._CHAIN_HEALTH["user_source:kg"] = {"state": "open", "failures": 5}
+    old_gen = lxapp._URL_CACHE_GEN
+
+    # 修改配置
+    env_file.write_text("LX_RESOLVER_TIMEOUT=12.0\nLX_URL_TIMEOUT=25.0\nLX_PROBE_TIMEOUT=5.0\n", encoding="utf-8")
+    lxapp._reload_timeout_settings()
+
+    assert lxapp.CONF["resolver_timeout"] == 12.0
+    assert lxapp.CONF["url_timeout"] == 25.0
+    assert lxapp.CONF["probe_timeout"] == 5.0
+    # 负缓存清除，正缓存保留
+    assert ("lx:kg:bad", "high") not in lxapp._URL_CACHE
+    assert ("lx:kg:good", "high") in lxapp._URL_CACHE
+    # 熔断清空，代数递增
+    assert lxapp._CHAIN_HEALTH == {}
+    assert lxapp._URL_CACHE_GEN > old_gen
+
+
+@pytest.mark.anyio
+async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_enlarged_timeout(fake_lx, monkeypatch, fresh_url_cache):
+    """慢源解析超时保护：超出单次解析超时放弃/接力，调大参数后成功取链。"""
+    async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
+        fake_lx.url_timeouts.append(request_timeout)
+        await asyncio.sleep(0.1)
+        return {"url": "https://media.test/slow.mp3", "type": "128k"}
+
+    monkeypatch.setattr(fake_lx, "get_music_url", slow_get_music_url)
+
+    def probe_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            206,
+            content=b"\xff\xfb\x90\x44" + b"\x00" * 4096,
+            headers={"Content-Range": "bytes 0-4099/50000", "Content-Type": "audio/mpeg"},
+        )
+
+    client = mock_client(probe_handler)
+
+    # 1. resolver_timeout 设为 0.03s（小于 0.1s），应该超时失败
+    res1 = await lxapp.resolve_and_probe(
+        client, "kw", {"id": "lx:kw:SLOW", "songmid": "SLOW"}, quality="128k",
+        budget=1.0, resolver_timeout=0.03, probe_timeout=0.5,
+    )
+    assert res1 is None
+    assert fake_lx.url_timeouts[-1] == 0.03
+
+    # 2. 调大 resolver_timeout 到 0.5s（大于 0.1s），成功返回
+    res2 = await lxapp.resolve_and_probe(
+        client, "kw", {"id": "lx:kw:SLOW", "songmid": "SLOW"}, quality="128k",
+        budget=1.0, resolver_timeout=0.5, probe_timeout=0.5,
+    )
+    assert res2 is not None
+    assert res2["url"] == "https://media.test/slow.mp3"
+    assert fake_lx.url_timeouts[-1] == 0.5
+
+
+def test_track_url_endpoint_uses_hot_reloaded_timeouts(test_app_client, fake_lx, tmp_path, monkeypatch, fresh_url_cache):
+    """GET /api/v1/track/url 每次请求使用配置快照透传单次解析超时。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LX_RESOLVER_TIMEOUT=11.5\nLX_URL_TIMEOUT=22.0\nLX_PROBE_TIMEOUT=4.5\n", encoding="utf-8")
+    monkeypatch.setenv("LX_ENV_PATH", str(env_file))
+
+    restore = _install_probe_client()
+    try:
+        resp = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:5886682", "quality": "128k"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert fake_lx.url_timeouts[-1] == 11.5
+    finally:
+        restore()

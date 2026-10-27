@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import math
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from lxserver_client import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 仓库根：复用 proxy/fnlog
 from proxy.fnlog import diag as fn_diag  # noqa: E402
 from proxy.fnlog import setup_logging  # noqa: E402
+from proxy.env_merge import parse_env_file  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fnmusic.lxmusic")
@@ -68,6 +70,64 @@ CONF: dict[str, Any] = {
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
+
+_TIMEOUT_ENV_KEYS: tuple[tuple[str, str, float], ...] = (
+    ("url_timeout", "LX_URL_TIMEOUT", 15.0),
+    ("resolver_timeout", "LX_RESOLVER_TIMEOUT", 8.0),
+    ("probe_timeout", "LX_PROBE_TIMEOUT", 3.0),
+)
+_PERSISTED_ENV_CACHE: "tuple[tuple[str, int, int], dict[str, str]] | None" = None
+
+
+def _persisted_env_paths() -> list[Path]:
+    configured_path = os.environ.get("LX_ENV_PATH")
+    if configured_path:
+        return [Path(configured_path)]
+    return [
+        Path(os.environ.get("WEBUI_REPO_DIR", "/repo")) / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+
+
+def _persisted_env_values() -> dict[str, str]:
+    global _PERSISTED_ENV_CACHE
+    for path in _persisted_env_paths():
+        try:
+            stat = path.stat()
+            fingerprint = (str(path), stat.st_mtime_ns, stat.st_size)
+            if _PERSISTED_ENV_CACHE and _PERSISTED_ENV_CACHE[0] == fingerprint:
+                return dict(_PERSISTED_ENV_CACHE[1])
+            entries, _ = parse_env_file(path)
+            values = dict(entries)
+            _PERSISTED_ENV_CACHE = (fingerprint, values)
+            return dict(values)
+        except OSError:
+            continue
+    return dict(os.environ)
+
+
+def _reload_timeout_settings() -> dict[str, float]:
+    values = _persisted_env_values()
+    changed = False
+    for conf_key, env_key, default in _TIMEOUT_ENV_KEYS:
+        raw = values.get(env_key, os.environ.get(env_key, str(default)))
+        try:
+            parsed = float(str(raw).strip())
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(parsed) or not 1.0 <= parsed <= 300.0:
+            continue
+        if CONF[conf_key] != parsed:
+            CONF[conf_key] = parsed
+            changed = True
+    if changed:
+        global _URL_CACHE_GEN
+        for key, entry in list(_URL_CACHE.items()):
+            if entry.get("data") is None:
+                _URL_CACHE.pop(key, None)
+        _CHAIN_HEALTH.clear()
+        _URL_CACHE_GEN += 1
+    return {key: float(CONF[key]) for key, _, _ in _TIMEOUT_ENV_KEYS}
 
 # 全局客户端实例
 LXSERVER = LxServerClient(
@@ -134,7 +194,9 @@ def _url_cache_reset() -> None:
     _URL_CACHE_GEN += 1
 
 
-async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | None:
+async def _refresh_cached_url(
+    client: httpx.AsyncClient, data: dict, probe_timeout: float | None = None,
+) -> dict | None:
     """对过期的缓存直链做 Range 前缀探活续期。
 
     仅请求 CDN 少量前缀字节、不消耗按次计量的音源解析额度；仍可用则返回
@@ -147,7 +209,7 @@ async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | N
     headers = dict(data.get("headers") or {})
     headers.setdefault("User-Agent", UA_PC)
     try:
-        ok, final_url, _ct, size = await probe_url(client, url, headers)
+        ok, final_url, _ct, size = await probe_url(client, url, headers, timeout=probe_timeout)
     except Exception:
         return None
     if not ok:
@@ -166,8 +228,9 @@ async def _resolve_url_cached(
     src: str,
     item: dict,
     quality: str = "lossless",
-    budget: float = 20.0,
+    budget: float | None = None,
     fresh: bool = False,
+    timeout_settings: "dict[str, float] | None" = None,
 ) -> dict | None:
     """带成功缓存/失败负缓存/同键在途合并的播放直链解析。
 
@@ -177,10 +240,12 @@ async def _resolve_url_cached(
     - fresh=True 显式旁路缓存强制重新解析（代理重试路径确认旧链失效后使用）；
     - 同键并发共享一次实际解析；源代计数变化后代间结果不回写。"""
     canonical_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
+    settings = timeout_settings or _reload_timeout_settings()
     tiers = _quality_tiers(quality)
     key = (canonical_id, tiers[0] if tiers else "standard")
     gen = _URL_CACHE_GEN
-    deadline = time.monotonic() + max(float(budget), 1.0)
+    effective_budget = settings["url_timeout"] if budget is None else float(budget)
+    deadline = time.monotonic() + max(effective_budget, 1.0)
 
     if not fresh:
         entry = _URL_CACHE.get(key)
@@ -200,7 +265,8 @@ async def _resolve_url_cached(
                 return data
 
     remaining = deadline - time.monotonic()
-    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen, fresh)
+    return await _resolve_url_inflight(
+        client, src, item, quality, max(remaining, 1.0), key, gen, fresh, settings)
 
 
 async def _resolve_url_inflight(
@@ -212,6 +278,7 @@ async def _resolve_url_inflight(
     key: tuple[str, str],
     gen: int,
     fresh: bool = False,
+    timeout_settings: "dict[str, float] | None" = None,
 ) -> dict | None:
     """探活及解析整体合并；不同源代和强制刷新不共享旧探活任务。"""
     inflight_key = (gen, *key, fresh)
@@ -223,6 +290,7 @@ async def _resolve_url_inflight(
 
     fut = asyncio.get_running_loop().create_future()
     _URL_INFLIGHT[inflight_key] = fut
+    settings = timeout_settings or _reload_timeout_settings()
     try:
         deadline = time.monotonic() + budget
         result = None
@@ -233,14 +301,21 @@ async def _resolve_url_inflight(
                 remaining = deadline - time.monotonic()
                 try:
                     async with asyncio.timeout(max(remaining, 0.001)):
-                        result = await _refresh_cached_url(client, entry["data"])
+                        result = await _refresh_cached_url(
+                            client, entry["data"], settings["probe_timeout"])
                 except TimeoutError:
                     result = None
                 refreshed_hit = result is not None
         if not refreshed_hit:
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                result = await resolve_and_probe(client, src, item, quality, budget=remaining)
+                result = await resolve_and_probe(
+                    client, src, item, quality,
+                    budget=remaining,
+                    resolver_timeout=settings["resolver_timeout"],
+                    probe_timeout=settings["probe_timeout"],
+                    generation=gen,
+                )
         else:
             _STATS["url_cache_hits"] += 1
     except BaseException as exc:
@@ -334,17 +409,19 @@ async def probe_url(
     client: httpx.AsyncClient,
     url: str,
     headers: dict | None = None,
+    timeout: float | None = None,
 ) -> tuple[bool, str, str, int]:
     """有界流式前缀探活。返回 (是否有效, 最终URL, MIME/扩展名, 总大小)。"""
     h = {k: v for k, v in (headers or {}).items() if k.lower() not in ("range", "accept-encoding")}
     h.setdefault("User-Agent", UA_PC)
     h.update({"Range": f"bytes=0-{_PROBE_BYTES - 1}", "Accept-Encoding": "identity"})
     try:
-        async with asyncio.timeout(CONF["probe_timeout"]):
+        probe_timeout = float(CONF["probe_timeout"] if timeout is None else timeout)
+        async with asyncio.timeout(probe_timeout):
             curr_url = url
             for _ in range(6):  # 最多 5 次重定向
                 async with client.stream(
-                    "GET", curr_url, headers=h, follow_redirects=False, timeout=CONF["probe_timeout"]
+                    "GET", curr_url, headers=h, follow_redirects=False, timeout=probe_timeout
                 ) as r:
                     if r.status_code in (301, 302, 303, 307, 308):
                         location = r.headers.get("location")
@@ -609,6 +686,9 @@ async def resolve_and_probe(
     item: dict,
     quality: str = "lossless",
     budget: float = 20.0,
+    resolver_timeout: float | None = None,
+    probe_timeout: float | None = None,
+    generation: int | None = None,
 ) -> dict | None:
     """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。
 
@@ -617,6 +697,9 @@ async def resolve_and_probe(
     同档位直链探活失败或脚本静默空返回（200 无 url）时，按 excludeApiSources 排除
     已试脚本换下一个激活源重试。"""
     src = normalize_source(source)
+    active_generation = _URL_CACHE_GEN if generation is None else generation
+    effective_resolver_timeout = float(CONF["resolver_timeout"] if resolver_timeout is None else resolver_timeout)
+    effective_probe_timeout = float(CONF["probe_timeout"] if probe_timeout is None else probe_timeout)
     track_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
     chain_key = f"user_source:{src}" if src else "user_source"
 
@@ -645,9 +728,10 @@ async def resolve_and_probe(
             if remaining <= 0:
                 break
             try:
-                async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
+                async with asyncio.timeout(min(remaining, effective_resolver_timeout)):
                     res = await LXSERVER.get_music_url(song_info, lx_q,
-                                                       exclude_api_sources=excluded or None)
+                                                       exclude_api_sources=excluded or None,
+                                                       request_timeout=effective_resolver_timeout)
             except Exception as exc:
                 logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
                 res = None
@@ -680,7 +764,8 @@ async def resolve_and_probe(
                 break
             try:
                 async with asyncio.timeout(remaining_probe):
-                    ok, final_url, ct, size = await probe_url(client, raw_url, headers)
+                    ok, final_url, ct, size = await probe_url(
+                        client, raw_url, headers, timeout=effective_probe_timeout)
             except Exception:
                 ok = False
 
@@ -708,7 +793,8 @@ async def resolve_and_probe(
             if res.get("hasMoreSources") is False or not tried:
                 break
 
-    _chain_record_failure(chain_key)
+    if active_generation == _URL_CACHE_GEN:
+        _chain_record_failure(chain_key)
     return None
 
 
@@ -1469,11 +1555,13 @@ async def track_url(
     cached = _cache_get(canonical_id) or _item_from_song_info(canonical_id, src) \
         or {"id": canonical_id, "lx_source": src}
     client = get_http(app)
+    timeout_settings = _reload_timeout_settings()
 
     generation = _URL_CACHE_GEN
     try:
         result = await _resolve_url_cached(
-            client, src, cached, quality, budget=CONF["url_timeout"], fresh=bool(fresh)
+            client, src, cached, quality,
+            budget=timeout_settings["url_timeout"], fresh=bool(fresh), timeout_settings=timeout_settings
         )
     except Exception as e:
         _STATS["errors"] += 1
@@ -1804,18 +1892,29 @@ async def source_set(body: SourceBody):
                     )
         else:
             # file:// URL 或裸 id/名称：取最后一段作为 lxserver 源 id（与上传时返回的 id 一致）
-            parsed = urllib.parse.urlparse(url)
-            path_part = urllib.parse.unquote(parsed.path) if parsed.scheme else url
-            source_id = path_part.rsplit("/", 1)[-1]
+            if url.startswith("file://"):
+                raw = urllib.parse.unquote(url[len("file://"):])
+                if os.name == "nt":
+                    if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+                        raw = raw[1:]
+                    elif raw.startswith("///") and len(raw) > 4 and raw[4] == ":":
+                        raw = raw[3:]
+                path_part = raw
+            else:
+                parsed = urllib.parse.urlparse(url)
+                path_part = urllib.parse.unquote(parsed.path) if parsed.scheme else url
+            norm_path = path_part.replace("\\", "/")
+            source_id = norm_path.rsplit("/", 1)[-1]
             if not await LXSERVER.set_source_enabled(source_id, body.enabled):
                 # 列表中无此 id：激活语义下，若本地确有脚本文件（如旧数据卷 /data/lxmusic/uploads），
                 # 自动补导入 lxserver 后激活，保证历史配置可继续使用；停用语义不做补导入，
                 # 但 file:// 的 basename（用户自己的文件名）不是 lxserver 按 @name 派生的
                 # id——先按名称反查，再读本地脚本按 @name 反查真实 id 后停用
                 resolved = False
+                has_file = os.path.isfile(path_part)
                 if not body.enabled:
                     existing = await _find_lxserver_source(by_name=source_id.removesuffix(".js"))
-                    if not existing and path_part.startswith("/") and os.path.isfile(path_part):
+                    if not existing and has_file:
                         try:
                             with open(path_part, "r", encoding="utf-8", errors="replace") as f:
                                 script = f.read()
@@ -1827,7 +1926,7 @@ async def source_set(body: SourceBody):
                     if existing:
                         source_id = str(existing.get("id") or source_id)
                         resolved = True
-                if body.enabled and path_part.startswith("/") and os.path.isfile(path_part):
+                if body.enabled and has_file:
                     with open(path_part, "r", encoding="utf-8", errors="replace") as f:
                         script = f.read()
                     try:

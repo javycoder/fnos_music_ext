@@ -117,6 +117,9 @@ SCHEMA: dict[str, dict] = {
     "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
     "LX_SOURCE_LIST": {"kind": "str", "default": "[]", "group": "lx", "reload": "hot", "label": "洛雪源列表（JSON 数组）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
+    "LX_RESOLVER_TIMEOUT": {"kind": "float", "default": "8.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "单次解析超时（秒）"},
+    "LX_URL_TIMEOUT": {"kind": "float", "default": "15.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "取链总超时（秒）"},
+    "LX_PROBE_TIMEOUT": {"kind": "float", "default": "3.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "直链探活超时（秒）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
     "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
@@ -1861,7 +1864,8 @@ def _write_log_archive(directory: Path, target: Path) -> None:
         for item, listed in _export_log_files(directory):
             try:
                 # lstat 后文件仍可能被换成链接/FIFO；打开时也拒绝跟随/阻塞。
-                fd = os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                fd = os.open(item, open_flags)
                 with os.fdopen(fd, "rb") as source:
                     opened = os.fstat(source.fileno())
                     if (not stat.S_ISREG(opened.st_mode)

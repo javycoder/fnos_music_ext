@@ -87,8 +87,13 @@ async def download_script(url: str, timeout: float = 20.0) -> str:
     """下载或读取脚本内容。支持 http(s):// 与 file://"""
     url = url.strip()
     if url.startswith("file://"):
-        parsed = urllib.parse.urlparse(url)
-        path = urllib.parse.unquote(parsed.path)
+        raw = urllib.parse.unquote(url[len("file://"):])
+        if os.name == "nt":
+            if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+                raw = raw[1:]
+            elif raw.startswith("///") and len(raw) > 4 and raw[4] == ":":
+                raw = raw[3:]
+        path = raw
         if not os.path.isfile(path):
             raise ValueError(f"本地文件不存在: {path}")
         with open(path, "r", encoding="utf-8", errors="replace") as f:

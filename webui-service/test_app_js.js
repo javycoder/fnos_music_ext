@@ -2011,6 +2011,107 @@ test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   await global.loadConfig();
 });
 
+test("洛雪超时设置：loadConfig 回填默认与已存参数 + 输入标脏", async () => {
+  reset();
+  // 缺省回填默认值
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lx-resolver-timeout").value, "8.0");
+  assert.strictEqual(els.get("#lx-url-timeout").value, "15.0");
+  assert.strictEqual(els.get("#lx-probe-timeout").value, "3.0");
+
+  // 回填持久化自定义值
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    LX_RESOLVER_TIMEOUT: "12.5",
+    LX_URL_TIMEOUT: "25.0",
+    LX_PROBE_TIMEOUT: "4.5",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lx-resolver-timeout").value, "12.5");
+  assert.strictEqual(els.get("#lx-url-timeout").value, "25.0");
+  assert.strictEqual(els.get("#lx-probe-timeout").value, "4.5");
+
+  // 输入标脏
+  els.get("#save-bar").classList.remove("show");
+  els.get("#lx-resolver-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+
+  els.get("#save-bar").classList.remove("show");
+  els.get("#lx-url-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+
+  els.get("#save-bar").classList.remove("show");
+  els.get("#lx-probe-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+});
+
+test("洛雪超时设置：collectConfig 校验小数/整数范围（1–300），非法输入提示并拒绝", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_LIST: JSON.stringify([{ name: "甲", url: "file:///a.js", active: true }]),
+    },
+  });
+  await global.loadConfig();
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  els.get("#panel-lxmusic").hidden = false;
+
+  try {
+    // 正常取值与小数支持
+    els.get("#lx-resolver-timeout").value = "12.5";
+    els.get("#lx-url-timeout").value = "25.0";
+    els.get("#lx-probe-timeout").value = "4.5";
+    let cfg = global.collectConfig();
+    assert.strictEqual(cfg.LX_RESOLVER_TIMEOUT, 12.5);
+    assert.strictEqual(cfg.LX_URL_TIMEOUT, 25.0);
+    assert.strictEqual(cfg.LX_PROBE_TIMEOUT, 4.5);
+
+    // 边界值 1 与 300 通过
+    els.get("#lx-resolver-timeout").value = "1";
+    els.get("#lx-url-timeout").value = "300";
+    els.get("#lx-probe-timeout").value = "1.0";
+    cfg = global.collectConfig();
+    assert.strictEqual(cfg.LX_RESOLVER_TIMEOUT, 1);
+    assert.strictEqual(cfg.LX_URL_TIMEOUT, 300);
+    assert.strictEqual(cfg.LX_PROBE_TIMEOUT, 1);
+
+    // 非法值（<1, >300, 非数, 空白）抛错
+    for (const bad of ["0.9", "0", "-5", "300.1", "500", "abc", "", "   "]) {
+      els.get("#lx-resolver-timeout").value = bad;
+      assert.throws(() => global.collectConfig(), /单次解析超时必须是 1–300 秒的数字/);
+      els.get("#lx-resolver-timeout").value = "8.0";
+
+      els.get("#lx-url-timeout").value = bad;
+      assert.throws(() => global.collectConfig(), /取链总超时必须是 1–300 秒的数字/);
+      els.get("#lx-url-timeout").value = "15.0";
+
+      els.get("#lx-probe-timeout").value = bad;
+      assert.throws(() => global.collectConfig(), /直链探活超时必须是 1–300 秒的数字/);
+      els.get("#lx-probe-timeout").value = "3.0";
+    }
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+});
+
+test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保存且不提交超时参数", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#panel-lxmusic").hidden = true;
+  els.get("#lx-resolver-timeout").value = "invalid";
+  els.get("#lx-url-timeout").value = "0";
+  els.get("#lx-probe-timeout").value = "999";
+
+  const cfg = global.collectConfig();
+  assert.strictEqual("LX_RESOLVER_TIMEOUT" in cfg, false);
+  assert.strictEqual("LX_URL_TIMEOUT" in cfg, false);
+  assert.strictEqual("LX_PROBE_TIMEOUT" in cfg, false);
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

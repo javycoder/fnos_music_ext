@@ -453,6 +453,7 @@ class LxServerClient:
         song_info: dict,
         quality: str = "128k",
         exclude_api_sources: list[str] | None = None,
+        request_timeout: float | None = None,
     ) -> dict | None:
         """调用 lxserver /api/music/url 解析直链。
 
@@ -470,7 +471,10 @@ class LxServerClient:
         }
         if exclude_api_sources:
             body["excludeApiSources"] = exclude_api_sources
-        resp = await client.post("/api/music/url", json=body, timeout=self.timeout)
+        resp = await client.post(
+            "/api/music/url", json=body,
+            timeout=self.timeout if request_timeout is None else request_timeout,
+        )
         if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
             resp.raise_for_status()
         if resp.status_code != 200:

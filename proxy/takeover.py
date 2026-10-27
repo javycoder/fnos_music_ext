@@ -4,7 +4,10 @@ import argparse
 import contextlib
 import ctypes
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 from pathlib import Path
