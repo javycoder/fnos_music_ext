@@ -2496,6 +2496,29 @@ def _find_reusable_library_file(root: str, basename: str) -> str | None:
     return None
 
 
+def _within_dir(path: str, root: str) -> bool:
+    """path 是否位于 root 目录之内（realpath + 大小写规整；两侧不存在亦可判定）。"""
+    try:
+        rp = os.path.normcase(os.path.realpath(path))
+        rr = os.path.normcase(os.path.realpath(root))
+        return bool(rr) and (rp == rr or rp.startswith(rr + os.sep))
+    except (OSError, ValueError):
+        return False
+
+
+def _stem_in_current_roots(stem: str) -> bool:
+    """旧 .ref 词干是否仍落在当前任一保存根之内。
+
+    用户切换保存目录（tee_save_dir / 曲库目录）后，指向旧目录的词干属过期引用；
+    沿用它会把实际落点带离当前配置目录，staged 判定随之错配。仅当词干目录仍在
+    iter_media_dirs() 任一根内（换音质/改布局等同根场景）才继续沿旧词干新建。
+    """
+    stem_dir = os.path.dirname(stem)
+    if not stem_dir:
+        return False
+    return any(_within_dir(stem_dir, root) for root in iter_media_dirs() if root)
+
+
 def library_media_path(guid: str, title: str, ext: str, artist: str = "", album: str = "",
                        directory: str | None = None) -> str:
     lib = directory or detect_library_dir()
@@ -2512,7 +2535,15 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "", album:
         existing = _existing_library_file(os.path.dirname(stem), os.path.basename(stem))
         if existing:
             return existing
-        return dest
+        # 词干文件已不存在：仅当词干目录仍在当前保存根内才沿旧词干新建（换音质/
+        # 改布局的同根场景）。切过保存目录的旧词干是过期引用——继续返回旧目录
+        # 会让实际落点脱离 staged 判定基准，在旧（远程）目录重现 .part 与改名。
+        if _stem_in_current_roots(stem):
+            return dest
+        logger.info(
+            "stale media ref for %s ignored: %s outside current save roots, fall back to %s",
+            guid, stem, lib,
+        )
     download_root = os.path.abspath(directory or detect_library_dir())
     lib = download_subdir(download_root, artist, album)
     os.makedirs(lib, exist_ok=True)
@@ -2605,13 +2636,24 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
 
 def promote_shadow_lyric(guid: str, audio_path: str) -> None:
     """音频落曲库后，把 cache 里的影子歌词（无音频时代的 guid 命名副本）提升为
-    音频旁 sidecar，词曲贴身；曲库已有 sidecar 时不覆盖。跨文件系统时退化为复制。
+    音频旁 sidecar，词曲贴身；曲库已有 sidecar 时不覆盖。跨文件系统时退化为复制；
+    落点目录判定为远程挂载时改走 staged 单次写入——不在远程目录写 .part、
+    不在远程改名（与 write_lyric_cache 的目录分流策略一致）。
     """
     dest = os.path.splitext(audio_path)[0] + ".lrc"
     if os.path.exists(dest):
         return
     shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
-    if not os.path.exists(shadow):
+    try:
+        with open(shadow, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return
+    if not text.strip():
+        return
+    if _dir_is_remote_mount(os.path.dirname(audio_path) or "."):
+        if _staged_write_lyric(audio_path, text):
+            _remove_quiet(shadow)
         return
     try:
         os.replace(shadow, dest)
@@ -5583,10 +5625,15 @@ def staged_dir() -> str:
     return path
 
 
-def use_staged_save() -> bool:
-    """当前目标目录是否需要「本地加工完整 → 一次性上传」。"""
+def _staged_decision(directory: str) -> bool:
+    """按实际落点目录判定是否需要「本地加工完整 → 一次性上传」。
+
+    判定基准必须与最终写入目录一致：按配置目录判 direct、实际却写旧引用指向
+    的远程目录，会在远程目录重现 .part 与远程改名（issue #88 要根除的行为）。
+    显式 direct/staged 配置在 _should_stage 内仍是最高优先级，契约不变。
+    """
     mode = tee_save_mode()
-    target = tee_save_dir()
+    target = os.path.abspath(directory or ".")
     cache = CONF["cache_dir"]
     key = (mode, target, cache)
     if key in _TEE_STAGED_CACHE:
@@ -5596,6 +5643,11 @@ def use_staged_save() -> bool:
     logger.info("[tee_save] target=%s cache=%s -> %s (%s)",
                 target, cache, "staged" if staged else "direct", reason)
     return staged
+
+
+def use_staged_save() -> bool:
+    """当前配置的保存目录是否需要 staged（下载侧 .part 选址等预判场景使用）。"""
+    return _staged_decision(tee_save_dir())
 
 
 def _dir_is_remote_mount(directory: str) -> bool:
@@ -5711,35 +5763,14 @@ def _staged_write_lyric(dest_audio: str, text: str) -> bool:
     return False
 
 
-def _promote_staged_shadow_lyric(guid: str, dest: str) -> None:
-    if not CONF.get("lyric_auto_dl"):
-        return
-    shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
-    try:
-        with open(shadow, encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
-        return
-    if text.strip() and _staged_write_lyric(dest, text):
-        _remove_quiet(shadow)
-
-
 def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
-                                  artist: str, album: str, src: dict):
-    """staged 落盘：本地定名加工完整 → 目标目录单次写入。"""
-    stage = staged_dir()
+                                  artist: str, album: str, src: dict, dest: str):
+    """staged 落盘：本地定名加工完整 → 目标目录单次写入。
 
-    # 0) 复用判定先行：目标已有同名文件（重复落盘/同曲跨 guid/用户自有文件）
-    # 一律复用、丢弃本次下载，不做标签改写、不下载封面——与 direct 路径
-    # 「复用即不动」语义一致（issue #52），用户自有文件的字节绝不被动。
-    dest = library_media_path(guid, title, ext, artist=artist, album=album, directory=tee_save_dir())
-    reused = os.path.exists(dest)
-    if reused:
-        _remove_quiet(part)
-        logger.info("staged: library file already exists for %s, reuse %s", guid, dest)
-        remember_media_path(guid, dest)
-        _promote_staged_shadow_lyric(guid, dest)
-        return dest, reused
+    dest 由调用方按当前保存根算出并已确认不存在（复用分支在外层统一处理），
+    保证 staged 判定与实际落点目录一致。
+    """
+    stage = staged_dir()
 
     # 每个任务独立加工副本，原始下载在上传成功前保持完整，失败可重试。
     fd, staged = tempfile.mkstemp(prefix="audio-", suffix=f".{ext}", dir=stage)
@@ -5765,9 +5796,10 @@ def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
 
     remember_media_path(guid, dest)
 
-    _promote_staged_shadow_lyric(guid, dest)
+    if CONF.get("lyric_auto_dl"):
+        promote_shadow_lyric(guid, dest)
 
-    return dest, reused
+    return dest, False
 
 
 def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: str,
@@ -5777,38 +5809,45 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
     目标文件已存在（同 guid 重复落盘或同曲跨 guid，issue #52）一律复用已有文件：
     丢弃本次字节绝不覆盖（用户自有文件与已有标签都不动），只刷新 guid 引用让
     后续播放命中本地。跨文件系统（缓存目录与曲库不同挂载点）退化为复制+删除。
-    返回 (dest, reused)。
+    staged/direct 按实际落点目录判定（use_staged_save 只看配置目录，旧引用把
+    落点带离配置目录时会错配）。返回 (dest, reused)。
     """
     with _LIBRARY_FILE_LOCK:
-        if use_staged_save():
-            return _install_library_audio_staged(
-                part, guid, ext, title, artist, album, src
-            )
         dest = library_media_path(guid, title, ext, artist=artist, album=album, directory=tee_save_dir())
         reused = os.path.exists(dest)
         if reused:
+            # 复用判定先行（双模式共用）：不做标签改写、不下载封面——
+            # 用户自有文件的字节绝不动（issue #52）。
             _remove_quiet(part)
             logger.info("library file already exists for %s, reuse %s", guid, dest)
-        else:
+            remember_media_path(guid, dest)
+            # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+            if CONF.get("lyric_auto_dl"):
+                promote_shadow_lyric(guid, dest)
+            return dest, reused
+        if _staged_decision(os.path.dirname(dest) or "."):
+            return _install_library_audio_staged(
+                part, guid, ext, title, artist, album, src, dest
+            )
+        try:
+            os.replace(part, dest)
+        except OSError:
+            tmp = f"{dest}.{uuid4().hex[:8]}.part"
+            shutil.copyfile(part, tmp)
+            os.replace(tmp, dest)
+            _remove_quiet(part)
+        adopt_library_perms(dest)
+        write_audio_tags(dest, title, artist, album)
+        # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
+        # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
+        cover_url = _cover_url_of(src)
+        if cover_url and CONF.get("auto_cover", True):
             try:
-                os.replace(part, dest)
-            except OSError:
-                tmp = f"{dest}.{uuid4().hex[:8]}.part"
-                shutil.copyfile(part, tmp)
-                os.replace(tmp, dest)
-                _remove_quiet(part)
-            adopt_library_perms(dest)
-            write_audio_tags(dest, title, artist, album)
-            # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
-            # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
-            cover_url = _cover_url_of(src)
-            if cover_url and CONF.get("auto_cover", True):
-                try:
-                    fetched = download_cover_bytes(cover_url)
-                    if fetched and embed_audio_cover(dest, fetched[0], fetched[1]):
-                        logger.info("cover embedded for %s: %s", guid, dest)
-                except Exception as e:
-                    logger.debug("cover embed step skipped for %s: %s", guid, e)
+                fetched = download_cover_bytes(cover_url)
+                if fetched and embed_audio_cover(dest, fetched[0], fetched[1]):
+                    logger.info("cover embedded for %s: %s", guid, dest)
+            except Exception as e:
+                logger.debug("cover embed step skipped for %s: %s", guid, e)
         remember_media_path(guid, dest)
         # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
         if CONF.get("lyric_auto_dl"):
