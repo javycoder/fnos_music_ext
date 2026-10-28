@@ -257,9 +257,9 @@ def llm_liked_refresh_hours() -> float:
     return value if math.isfinite(value) and value >= 0.5 else 0.5
 
 
-def llm_usage_summary() -> dict:
+def llm_usage_summary(limit: int | None = None, history_limit: int = 0, history_offset: int = 0) -> dict:
     """当日 token 用量概览（healthz recommend 段与 WebUI 共用）。"""
-    return llm_usage.summary()
+    return llm_usage.summary(limit=limit, history_limit=history_limit, history_offset=history_offset)
 
 
 def recommend_cache_dir() -> str:
@@ -967,17 +967,24 @@ def _llm_endpoint(base: str) -> tuple[str, str]:
 def _llm_usage(protocol: str, body: dict) -> dict:
     """归一化 usage：chat 与 responses 两套字段名统一成 prompt/completion 口径。"""
     usage = body.get("usage") if isinstance(body, dict) else None
-    if not isinstance(usage, dict):
-        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0}
-    prompt = usage.get("prompt_tokens", usage.get("input_tokens")) or 0
-    completion = usage.get("completion_tokens", usage.get("output_tokens")) or 0
+    if not isinstance(usage, dict) or not usage:
+        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True}
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+    completion = usage.get("completion_tokens", usage.get("output_tokens"))
     details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
     reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else 0
     total = usage.get("total_tokens")
+    if prompt is None and completion is None and total is None:
+        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True}
     if total is None:
-        total = (prompt or 0) + (completion or 0)
-    return {"prompt": int(prompt or 0), "completion": int(completion or 0),
-            "total": int(total or 0), "reasoning": int(reasoning or 0)}
+        total = (int(prompt or 0)) + (int(completion or 0))
+    return {
+        "prompt": int(prompt or 0),
+        "completion": int(completion or 0),
+        "total": int(total or 0),
+        "reasoning": int(reasoning or 0),
+        "unknown": False,
+    }
 
 
 def _extract_llm_text(protocol: str, body: dict) -> tuple[str, str, str]:
@@ -1048,7 +1055,7 @@ async def _llm_complete(
     limit = llm_daily_token_limit()
     if not llm_usage.within_limit(limit):
         detail = f"当日 token 已达上限 {limit}，明日自动重置"
-        llm_usage.record(None, "token-limit", detail)
+        llm_usage.record(None, "token-limit", detail, actual_request=False)
         raise LLMFailure("token-limit", detail)
     protocol, url = _llm_endpoint(base)
     payload: dict = {"model": llm_model()}
@@ -1079,32 +1086,35 @@ async def _llm_complete(
     except LLMFailure:
         raise
     except httpx.TimeoutException as e:
-        llm_usage.record(None, "timeout", str(e))
+        llm_usage.record(None, "timeout", str(e), actual_request=True)
         raise LLMFailure("timeout", str(e)) from e
     except Exception as e:
-        llm_usage.record(None, "network", str(type(e).__name__))
+        llm_usage.record(None, "network", str(type(e).__name__), actual_request=True)
         raise LLMFailure("network", str(e)) from e
     if resp.status_code >= 400:
         snippet = (resp.text or "").strip()[:300]
-        llm_usage.record(None, f"http-{resp.status_code}", snippet)
+        llm_usage.record(None, f"http-{resp.status_code}", snippet, actual_request=True)
         raise LLMFailure(f"http-{resp.status_code}", snippet)
     try:
         body = resp.json()
     except ValueError as e:
-        llm_usage.record(None, "bad-response", "响应不是合法 JSON")
+        llm_usage.record(None, "bad-response", "响应不是合法 JSON", actual_request=True)
         raise LLMFailure("bad-response", "响应不是合法 JSON") from e
     if not isinstance(body, dict):
-        llm_usage.record(None, "bad-response", "响应不是 JSON 对象")
+        llm_usage.record(None, "bad-response", "响应不是 JSON 对象", actual_request=True)
         raise LLMFailure("bad-response", "响应不是 JSON 对象")
     usage = _llm_usage(protocol, body)
+    is_unknown = bool(usage.get("unknown", False))
     content, finish, status = _extract_llm_text(protocol, body)
-    llm_usage.record(usage)
     if not content.strip():
         # issue #83 核心：HTTP 200 但正文为空（推理 token 耗尽预算）必须显式失败，
-        # 不能静默返回空列表让每日推荐无声退回本地
+        # 不能静默返回空列表让每日推荐无声退回本地。
+        # empty-content 时 actual HTTP 尝试已发生，且消耗了 token，
+        # 一次性记录 usage 与 failure，绝不重复记账 (actual_request=True)。
         detail = _empty_content_detail(protocol, finish, status, usage)
-        llm_usage.record(None, "empty-content", detail)
+        llm_usage.record(usage, "empty-content", detail, actual_request=True, is_unknown_usage=is_unknown)
         raise LLMFailure("empty-content", detail)
+    llm_usage.record(usage, actual_request=True, is_unknown_usage=is_unknown)
     logger.debug("llm %s ok: finish=%s status=%s usage=%s",
                  protocol, finish or "-", status or "-", usage)
     return content

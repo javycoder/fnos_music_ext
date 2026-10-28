@@ -46,12 +46,23 @@ let publicState = {
 // 补齐时复用，避免每次渲染都打详情接口
 const publicDetailCache = new Map();
 let publicSelectionDetailSeq = 0;
+const PUBLIC_METADATA_STORAGE_KEY = "fnmusic_public_metadata_cache_v1";
+const PUBLIC_METADATA_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PUBLIC_FAILED_TTL_MS = 30 * 1000;
+const MAX_PUBLIC_DETAIL_CONCURRENCY = 2;
+const publicDetailAbortControllers = new Set();
+const publicDetailInflight = new Map();
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
   let body = {};
   try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
-  if (!resp.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
+    err.status = resp.status;
+    err.body = body;
+    throw err;
+  }
   return body;
 }
 
@@ -61,24 +72,73 @@ function updateLlmLikedSettings() {
   $("#llm-api-warning").hidden = !selected || !!($("#llm-base").value.trim() && $("#llm-key").value.trim());
 }
 
+let llmUsageOffset = 0;
+let llmUsageTimer = null;
+let llmUsageActive = false;
+let llmUsageSequence = 0;
+let llmUsageLast = null;
+const LLM_USAGE_PAGE_SIZE = 30;
+const usageNumber = (value) => Math.max(0, Number(value) || 0).toLocaleString();
+const usageDate = (value) => /^\d{8}$/.test(String(value || ""))
+  ? `${String(value).slice(0, 4)}-${String(value).slice(4, 6)}-${String(value).slice(6, 8)}` : "未知";
+
+function renderLlmUsage(u) {
+  const el = $("#llm-usage-line");
+  if (!el) return;
+  const available = !u.status || u.status === "ok";
+  let text = available ? `今日 token：输入 ${usageNumber(u.prompt)} / 输出 ${usageNumber(u.completion)} / 总计 ${usageNumber(u.total)}`
+    : `账本${u.status === "missing" ? "尚无记录" : "不可用"}：${u.statusMessage || u.status}（不能视为已用 0）`;
+  text += Number(u.dailyLimit) > 0 ? `；每日上限 ${usageNumber(u.dailyLimit)}` : "；每日不限额";
+  if (available) text += `；实际请求 ${usageNumber(u.requests)} 次`;
+  if (u.withinLimit === false) text += "；已达上限，次日重置";
+  if (Number(u.unknownUsageRequests)) text += `；${usageNumber(u.unknownUsageRequests)} 次未返回用量，未计入 token`;
+  if (u.lastFailure?.reason) text += `；最近失败：${u.lastFailure.reason}${u.lastFailure.detail ? `（${String(u.lastFailure.detail).slice(0, 120)}）` : ""}`;
+  text += `；北京时间 UTC+08:00；更新于 ${new Date().toLocaleTimeString()}`;
+  el.textContent = text;
+  el.dataset.lastUsageText = text;
+  const summary = $("#llm-usage-summary");
+  if (summary) summary.textContent = !available ? "累计与历史数据暂不可读取，不能视为零用量；请检查账本状态后重试。" : `累计 token ${usageNumber(u.allTime?.total)}（输入 ${usageNumber(u.allTime?.prompt)} / 输出 ${usageNumber(u.allTime?.completion)}），实际请求 ${usageNumber(u.allTime?.requests)} 次。统计起点 ${usageDate(u.statsStartedAt)}。${u.historyIncomplete ? "历史不完整：旧版已丢失的记录无法恢复。" : "仅统计本扩展记录到的调用。"}`;
+  const history = $("#llm-usage-history");
+  if (history) history.innerHTML = available && (u.history || []).length
+    ? `<table class="usage-table"><thead><tr><th>日期（北京时间）</th><th>输入</th><th>输出</th><th>总 token</th><th>请求</th></tr></thead><tbody>${u.history.map((day) => `<tr><td>${usageDate(day.date)}</td><td>${usageNumber(day.prompt)}</td><td>${usageNumber(day.completion)}</td><td>${usageNumber(day.total)}</td><td>${usageNumber(day.requests)}${Number(day.unknownUsageRequests) ? `（${usageNumber(day.unknownUsageRequests)} 次用量未知）` : ""}</td></tr>`).join("")}</tbody></table>`
+    : `<p class="hint">${available ? "暂无历史记录。" : "历史记录暂不可读取。"}</p>`;
+  if ($("#llm-usage-prev")) $("#llm-usage-prev").disabled = llmUsageOffset === 0;
+  if ($("#llm-usage-next")) $("#llm-usage-next").disabled = llmUsageOffset + LLM_USAGE_PAGE_SIZE >= Number(u.totalDays || 0);
+  if ($("#llm-usage-page")) $("#llm-usage-page").textContent = `第 ${Math.floor(llmUsageOffset / LLM_USAGE_PAGE_SIZE) + 1} 页，共 ${usageNumber(u.totalDays)} 个记录日`;
+}
+
 async function refreshLlmUsage() {
   const el = $("#llm-usage-line");
   if (!el) return;
+  const seq = ++llmUsageSequence;
   try {
-    const { usage: u } = await api("/api/llm/usage");
-    const used = Number(u.total) || 0;
-    const limit = Number(u.dailyLimit) || 0;
-    let text = `今日 token 用量 ${used.toLocaleString()}`;
-    text += limit > 0 ? ` / 上限 ${limit.toLocaleString()}` : "（未设上限）";
-    text += `，已请求 ${Number(u.requests) || 0} 次`;
-    if (u.withinLimit === false) text += "，已达上限：今日暂停调用，次日自动重置";
-    const f = u.lastFailure;
-    if (f && f.reason) text += `；最近失败：${f.reason}${f.detail ? `（${String(f.detail).slice(0, 120)}）` : ""}`;
-    el.textContent = text;
+    const { usage: u } = await api(`/api/llm/usage?limit=${LLM_USAGE_PAGE_SIZE}&offset=${llmUsageOffset}`);
+    if (seq !== llmUsageSequence) return;
+    if (!u || typeof u !== "object") throw new Error("账本响应无效");
+    llmUsageLast = u;
+    renderLlmUsage(u);
   } catch (_) {
-    el.textContent = "今日 token 用量：暂不可用";
+    if (seq !== llmUsageSequence) return;
+    if (llmUsageLast) {
+      const previousText = el.dataset.lastUsageText || "";
+      el.textContent = `刷新失败，显示上次成功结果（可能已过期）：${previousText}`;
+    } else el.textContent = "Token 用量暂不可用，请重试（不能视为已用 0）。";
   }
 }
+
+function setLlmUsageActive(active) {
+  llmUsageActive = active;
+  clearInterval(llmUsageTimer);
+  llmUsageTimer = null;
+  if (active && !document.hidden) {
+    void refreshLlmUsage();
+    llmUsageTimer = setInterval(refreshLlmUsage, 30000);
+  }
+}
+if (typeof document.addEventListener === "function") document.addEventListener("visibilitychange", () => setLlmUsageActive(llmUsageActive));
+$("#llm-usage-refresh")?.addEventListener("click", () => refreshLlmUsage());
+$("#llm-usage-prev")?.addEventListener("click", () => { llmUsageOffset = Math.max(0, llmUsageOffset - LLM_USAGE_PAGE_SIZE); void refreshLlmUsage(); });
+$("#llm-usage-next")?.addEventListener("click", () => { if (llmUsageOffset + LLM_USAGE_PAGE_SIZE < Number(llmUsageLast?.totalDays || 0)) { llmUsageOffset += LLM_USAGE_PAGE_SIZE; void refreshLlmUsage(); } });
 
 function likedNumber(selector, label, min, max, integer = false) {
   const text = $(selector).value.trim();
@@ -185,17 +245,139 @@ window.addEventListener("keydown", (ev) => {
 });
 
 /* -------------------------------------------------------------- 导航 */
+let activeBottomMenu = null;
+let activeBottomTrigger = null;
+
+function isNavGroupExpanded(group) {
+  try {
+    return typeof window !== "undefined" && window.localStorage
+      ? window.localStorage.getItem("fnmusic-nav-" + group + "-expanded") === "true"
+      : false;
+  } catch (_) { return false; }
+}
+
+function setNavGroupExpanded(group, expanded, save = true) {
+  const titleBtn = $("#nav-" + group + "-title");
+  const subsEl = $("#nav-" + group + "-subs");
+  if (titleBtn && typeof titleBtn.setAttribute === "function") {
+    titleBtn.setAttribute("aria-expanded", String(expanded));
+  }
+  if (subsEl) subsEl.hidden = !expanded;
+  if (save) {
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem("fnmusic-nav-" + group + "-expanded", String(expanded));
+      }
+    } catch (_) {}
+  }
+}
+
+function closeBottomSubMenu(restoreFocus = true) {
+  if (!activeBottomMenu) return;
+  activeBottomMenu.hidden = true;
+  if (activeBottomTrigger) {
+    if (typeof activeBottomTrigger.setAttribute === "function") {
+      activeBottomTrigger.setAttribute("aria-expanded", "false");
+    }
+    if (restoreFocus && typeof activeBottomTrigger.focus === "function") {
+      activeBottomTrigger.focus();
+    }
+  }
+  activeBottomMenu = null;
+  activeBottomTrigger = null;
+}
+
+function openBottomSubMenu(trigger, menu) {
+  if (activeBottomMenu === menu) {
+    closeBottomSubMenu(false);
+    return;
+  }
+  closeBottomSubMenu(false);
+  activeBottomMenu = menu;
+  activeBottomTrigger = trigger;
+  menu.hidden = false;
+  if (typeof trigger.setAttribute === "function") {
+    trigger.setAttribute("aria-expanded", "true");
+  }
+  const firstItem = menu.querySelector ? menu.querySelector(".bottom-sub-item") : null;
+  if (firstItem && typeof firstItem.focus === "function") firstItem.focus();
+}
+
 function switchPage(page) {
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === "page-" + page));
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
-  // 储存父标题：边听边存/目录设置任一子页激活时强调（子项保持各自的实心高亮）
+
+  const isStorageSub = page === "tee" || page === "dirs";
+  const isAdvancedSub = page === "llm";
+
   const storageTitle = $("#nav-storage-title");
-  if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs");
+  if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
+  const advancedTitle = $("#nav-advanced-title");
+  if (advancedTitle) advancedTitle.classList.toggle("active", isAdvancedSub);
+
+  const bottomStorage = $("#bottom-storage-trigger");
+  if (bottomStorage) bottomStorage.classList.toggle("active", isStorageSub);
+  const bottomAdvanced = $("#bottom-advanced-trigger");
+  if (bottomAdvanced) bottomAdvanced.classList.toggle("active", isAdvancedSub);
+
+  if (isStorageSub) setNavGroupExpanded("storage", true, true);
+  if (isAdvancedSub) setNavGroupExpanded("advanced", true, true);
+
+  closeBottomSubMenu(false);
+
+  if (typeof setLlmUsageActive === "function") {
+    setLlmUsageActive(page === "llm");
+  }
+
   if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
 }
+
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
-const storageTitleBtn = $("#nav-storage-title");
-if (storageTitleBtn) storageTitleBtn.addEventListener("click", () => switchPage("tee"));
+
+// 一级菜单纯折叠：不跳页、不标脏、首访收起、记忆到 localStorage
+["storage", "advanced"].forEach((group) => {
+  const expanded = isNavGroupExpanded(group);
+  setNavGroupExpanded(group, expanded, false);
+  const titleBtn = $("#nav-" + group + "-title");
+  if (titleBtn) {
+    titleBtn.addEventListener("click", (ev) => {
+      if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+      const cur = titleBtn.getAttribute ? titleBtn.getAttribute("aria-expanded") === "true" : false;
+      setNavGroupExpanded(group, !cur, true);
+    });
+  }
+});
+
+// 移动端底导航父项弹子菜单：外点、Escape、focus 返回
+[
+  ["#bottom-storage-trigger", "#bottom-storage-menu"],
+  ["#bottom-advanced-trigger", "#bottom-advanced-menu"],
+].forEach(([triggerSel, menuSel]) => {
+  const trigger = $(triggerSel);
+  const menu = $(menuSel);
+  if (!trigger || !menu) return;
+  trigger.addEventListener("click", (ev) => {
+    if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
+    openBottomSubMenu(trigger, menu);
+  });
+});
+
+window.addEventListener("click", (ev) => {
+  if (!activeBottomMenu || activeBottomMenu.hidden) return;
+  const target = ev.target;
+  const inMenu = activeBottomMenu.contains ? activeBottomMenu.contains(target) : false;
+  const inTrigger = activeBottomTrigger && activeBottomTrigger.contains ? activeBottomTrigger.contains(target) : false;
+  if (!inMenu && !inTrigger) {
+    closeBottomSubMenu(true);
+  }
+});
+
+window.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && activeBottomMenu && !activeBottomMenu.hidden) {
+    if (typeof ev.preventDefault === "function") ev.preventDefault();
+    closeBottomSubMenu(true);
+  }
+});
 
 /* -------------------------------------------------------------- 主题 / 外观
    默认「跟随系统」：飞牛 Web 宿主里以宿主主题为准（getPlatformConfig 取初值，
@@ -771,7 +953,18 @@ async function loadMusicUsers() {
     publicUsersReady = false;
     invalidatePublicBrowse();
     publicSelectionDetailSeq++;
-    $("#public-users-note").textContent = "读取用户失败：" + exc.message + "。请点击刷新用户重试。";
+    abortActivePublicDetailRequests();
+    const isDirectRestricted = (exc && (exc.status === 403 || exc.status === 501))
+      || String(exc && exc.message || "").includes("403")
+      || String(exc && exc.message || "").includes("501")
+      || String(exc && exc.message || "").includes("直连模式")
+      || String(exc && exc.message || "").includes("安全架构")
+      || String(exc && exc.message || "").includes("管理员");
+    if (isDirectRestricted) {
+      $("#public-users-note").textContent = "安全架构限制：直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台。";
+    } else {
+      $("#public-users-note").textContent = "读取用户失败：" + exc.message + "。请点击刷新用户重试。";
+    }
   } finally {
     if (seq === publicUsersSeq) {
       $("#public-users-retry").disabled = false;
@@ -786,6 +979,7 @@ async function selectPublicUser(guid) {
   stashPublicUser();
   invalidatePublicBrowse();
   publicSelectionDetailSeq++;
+  abortActivePublicDetailRequests();
   publicUserGuid = publicUsersReady && publicUsers.some((user) => user.guid === guid) ? guid : "";
   publicSelection = publicSelectionMap[publicUserGuid] || [];
   renderMusicUsers();
@@ -847,17 +1041,121 @@ function movePublicSelection(index, delta) {
   markDirty("公共歌单顺序已修改");
 }
 
+function loadPublicMetadataStorage() {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(PUBLIC_METADATA_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function savePublicMetadataStorage(data) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(PUBLIC_METADATA_STORAGE_KEY, JSON.stringify(data));
+  } catch (_) {}
+}
+
+function initPublicDetailCacheFromStorage() {
+  const stored = loadPublicMetadataStorage();
+  const now = Date.now();
+  let changed = false;
+  for (const [key, record] of Object.entries(stored)) {
+    if (!record || typeof record !== "object") continue;
+    if (record.failed) {
+      if (record.failedAt && (now - record.failedAt < PUBLIC_FAILED_TTL_MS)) {
+        publicDetailCache.set(key, { failed: true, failedAt: record.failedAt });
+      } else {
+        delete stored[key];
+        changed = true;
+      }
+    } else if (record.name && String(record.name).trim() && record.cachedAt && (now - record.cachedAt < PUBLIC_METADATA_TTL_MS)) {
+      publicDetailCache.set(key, {
+        name: String(record.name).trim(),
+        cover_url: record.cover_url || "",
+        track_count: Number(record.track_count) || 0,
+        cachedAt: record.cachedAt,
+      });
+    } else {
+      delete stored[key];
+      changed = true;
+    }
+  }
+  if (changed) {
+    savePublicMetadataStorage(stored);
+  }
+}
+initPublicDetailCacheFromStorage();
+
+function setPublicDetailCache(key, entry, isFromNetwork = false) {
+  const existing = publicDetailCache.get(key);
+  const now = Date.now();
+  if (entry.failed) {
+    const failedAt = entry.failedAt || now;
+    // 失败只保留在内存缓存中（30s 瞬时失败），绝不写入 localStorage 持久化
+    publicDetailCache.set(key, { failed: true, failedAt });
+    return;
+  }
+  const name = String(entry.name || "").trim();
+  if (!name) return;
+  const cachedAt = (isFromNetwork || !existing?.cachedAt) ? now : existing.cachedAt;
+  const itemData = {
+    name,
+    cover_url: entry.cover_url || "",
+    track_count: Number(entry.track_count) || 0,
+    cachedAt,
+  };
+  publicDetailCache.set(key, itemData);
+
+  // 仅在网络返回或新元数据时写入 localStorage，避免每次 render 频繁读写
+  if (isFromNetwork || !existing) {
+    const parts = key.split("|");
+    const stored = loadPublicMetadataStorage();
+    stored[key] = {
+      provider: parts[0] || "",
+      source: parts[1] || "",
+      kind: parts[2] || "",
+      id: parts[3] || "",
+      name: itemData.name,
+      cover_url: itemData.cover_url,
+      track_count: itemData.track_count,
+      cachedAt: itemData.cachedAt,
+    };
+    savePublicMetadataStorage(stored);
+  }
+}
+
 function renderPublicSelected() {
   const box = $("#public-selected");
   if (!box) return;
   box.innerHTML = publicSelection.length ? publicSelection.map((item, index) => {
-    // 浏览/默认榜单已提供的元数据同样进缓存，保存回填后无需依赖音源仍在运行。
-    if (item._name) publicDetailCache.set(publicEntryKey(item), {
-      name: item._name, cover_url: item._cover_url || "", track_count: item._track_count || 0,
-    });
-    // 名称是展示元数据不进配置：未取到时给出状态而不是把数字 ID 当标题
-    const title = item._name ? escapeHtml(item._name)
-      : item._detail_failed ? "名称获取失败" : "正在获取歌单名称…";
+    // 浏览/默认榜单已提供的元数据仅在内存中缓存，避免每次 render 频繁读写 localStorage
+    if (item._name) {
+      const key = publicEntryKey(item);
+      if (!publicDetailCache.has(key)) {
+        publicDetailCache.set(key, {
+          name: item._name, cover_url: item._cover_url || "", track_count: item._track_count || 0,
+          cachedAt: Date.now(),
+        });
+      }
+    }
+    // 状态判定：idle / loading / success / error / unavailable
+    // 只在 inflight 显示 loading，空 name 失败、缓存不当成功；兼容原有 _detail_failed 断言
+    let title = "";
+    if (item._name) {
+      title = escapeHtml(item._name);
+    } else if (item._detail_status === "unavailable") {
+      title = "音源不可用";
+    } else if (item._detail_status === "error" || item._detail_failed) {
+      title = "名称获取失败";
+    } else {
+      title = "正在获取歌单名称…";
+    }
+    const showRetry = item._detail_failed || item._detail_status === "error" || item._detail_status === "unavailable";
     return `
     <div class="public-selected">
       <img src="${escapeHtml(item._cover_url || "")}" alt="" ${item._cover_url ? "" : "hidden"}>
@@ -868,7 +1166,7 @@ function renderPublicSelected() {
         ${Number(item._track_count || 0) > 1000 ? '<small>超过 1,000 首，仅载入前 1,000 首。</small>' : ""}
       </div>
       <div class="btn-row">
-        ${item._detail_failed ? `<button class="btn small" data-public-retry="${index}">重试</button>` : ""}
+        ${showRetry ? `<button class="btn small" data-public-retry="${index}">重试</button>` : ""}
         <button class="btn small" data-public-up="${index}" ${index === 0 ? "disabled" : ""}>↑</button>
         <button class="btn small" data-public-down="${index}" ${index === publicSelection.length - 1 ? "disabled" : ""}>↓</button>
         <button class="btn small danger" data-public-remove="${index}">移除</button>
@@ -934,64 +1232,201 @@ function publicUiProviderOf(item) {
 // 已选条目的展示元数据补齐：按条目自身的 provider 请求，不依赖当前浏览的音源；
 // 配置只保存身份四字段，刷新/保存后靠这里把名称补回来。不经过 startPreview
 // 重试——不为取名称单独拉起另一个音源的进程，失败交给手动重试。
-async function fetchPublicItemDetail(item) {
+async function fetchPublicItemDetail(item, signal) {
   const query = new URLSearchParams({
     provider: publicUiProviderOf(item), source: item.source, kind: item.kind,
   });
-  const data = await api(`/api/public-playlists/${encodeURIComponent(item.id)}?${query.toString()}`);
+  const data = await api(`/api/public-playlists/${encodeURIComponent(item.id)}?${query.toString()}`, { signal });
   if (data.ok === false) throw new Error(data.error || "歌单详情请求失败");
-  return data;
+  const detail = data.data || {};
+  const name = typeof detail.name === "string" ? detail.name.trim() : "";
+  if (!name) throw new Error("歌单名称为空");
+  return { ...detail, name };
 }
 
 function applyPublicDetailCache(item) {
-  const cached = publicDetailCache.get(publicEntryKey(item));
+  const key = publicEntryKey(item);
+  const cached = publicDetailCache.get(key);
   if (!cached) return false;
   if (cached.failed) {
-    if (Date.now() - cached.failedAt < 30000) { item._detail_failed = true; return true; }
-    publicDetailCache.delete(publicEntryKey(item));
+    if (Date.now() - cached.failedAt < PUBLIC_FAILED_TTL_MS) {
+      item._detail_failed = true;
+      item._detail_status = "error";
+      return true;
+    }
+    publicDetailCache.delete(key);
+    const stored = loadPublicMetadataStorage();
+    delete stored[key];
+    savePublicMetadataStorage(stored);
     return false;
   }
-  item._name = cached.name || "";
+  if (cached.cachedAt && (Date.now() - cached.cachedAt > PUBLIC_METADATA_TTL_MS)) {
+    publicDetailCache.delete(key);
+    const stored = loadPublicMetadataStorage();
+    delete stored[key];
+    savePublicMetadataStorage(stored);
+    return false;
+  }
+  const name = String(cached.name || "").trim();
+  if (!name) return false;
+  item._name = name;
   item._cover_url = cached.cover_url || "";
-  item._track_count = cached.track_count || 0;
+  item._track_count = Number(cached.track_count) || 0;
   item._detail_failed = false;
+  item._detail_status = "success";
   return true;
+}
+
+function abortActivePublicDetailRequests() {
+  for (const ctrl of publicDetailAbortControllers) {
+    try { ctrl.abort(); } catch (_) {}
+  }
+  publicDetailAbortControllers.clear();
+  publicDetailInflight.clear();
 }
 
 async function ensurePublicSelectionDetails() {
   const browser = $("#public-playlists-browser");
   if (!browser || browser.hidden) return;
   const seq = ++publicSelectionDetailSeq;
+  const currentUserGuid = publicUserGuid;
+  abortActivePublicDetailRequests();
+
+  let hasCacheHit = false;
   for (const item of publicSelection) {
-    if (seq !== publicSelectionDetailSeq) return;
-    if (item._name) continue;
-    if (applyPublicDetailCache(item)) { renderPublicSelected(); continue; }
-    item._detail_failed = false;
-    renderPublicSelected();
-    try {
-      const response = await fetchPublicItemDetail(item);
-      if (seq !== publicSelectionDetailSeq) return;
-      const detail = response.data || {};
-      publicDetailCache.set(publicEntryKey(item), {
-        name: detail.name || "", cover_url: detail.cover_url || "", track_count: detail.track_count || 0,
-      });
-    } catch (_) {
-      if (seq !== publicSelectionDetailSeq) return;
-      publicDetailCache.set(publicEntryKey(item), { failed: true, failedAt: Date.now() });
+    if (item._name) {
+      item._detail_status = "success";
+      item._detail_failed = false;
+      continue;
     }
-    // 等待期间条目可能被移除/重排：按身份键重新定位后再落值
-    const target = publicSelection.find((it) => publicEntryKey(it) === publicEntryKey(item));
-    if (target) applyPublicDetailCache(target);
-    renderPublicSelected();
+    if (applyPublicDetailCache(item)) {
+      hasCacheHit = true;
+    } else {
+      item._detail_status = "idle";
+      item._detail_failed = false;
+    }
   }
+  if (hasCacheHit) renderPublicSelected();
+
+  const toFetch = [];
+  for (const item of publicSelection) {
+    if (item._name || item._detail_failed || item._detail_status === "error" || item._detail_status === "unavailable") continue;
+    toFetch.push(item);
+  }
+  if (!toFetch.length) return;
+
+  let queueIndex = 0;
+  let activeWorkers = 0;
+
+  return new Promise((resolve) => {
+    function scheduleNext() {
+      if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) {
+        resolve();
+        return;
+      }
+      if (queueIndex >= toFetch.length && activeWorkers === 0) {
+        resolve();
+        return;
+      }
+      while (activeWorkers < MAX_PUBLIC_DETAIL_CONCURRENCY && queueIndex < toFetch.length) {
+        if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) {
+          resolve();
+          return;
+        }
+        const item = toFetch[queueIndex++];
+        const key = publicEntryKey(item);
+
+        if (publicDetailInflight.has(key)) {
+          activeWorkers++;
+          item._detail_status = "loading";
+          renderPublicSelected();
+          publicDetailInflight.get(key).then(() => {
+            activeWorkers--;
+            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+              for (const it of publicSelection) {
+                if (publicEntryKey(it) === key) applyPublicDetailCache(it);
+              }
+              renderPublicSelected();
+            }
+            scheduleNext();
+          }).catch(() => {
+            activeWorkers--;
+            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+              for (const it of publicSelection) {
+                if (publicEntryKey(it) === key) applyPublicDetailCache(it);
+              }
+              renderPublicSelected();
+            }
+            scheduleNext();
+          });
+          continue;
+        }
+
+        activeWorkers++;
+        item._detail_status = "loading";
+        renderPublicSelected();
+
+        const controller = new AbortController();
+        publicDetailAbortControllers.add(controller);
+        const timer = setTimeout(() => {
+          try { controller.abort(); } catch (_) {}
+        }, 10000);
+        if (timer && typeof timer.unref === "function") timer.unref();
+
+        const fetchPromise = (async () => {
+          try {
+            const detail = await fetchPublicItemDetail(item, controller.signal);
+            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) return;
+            setPublicDetailCache(key, {
+              name: detail.name || "",
+              cover_url: detail.cover_url || "",
+              track_count: detail.track_count || 0,
+            }, true);
+          } catch (_) {
+            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) return;
+            setPublicDetailCache(key, { failed: true, failedAt: Date.now() });
+          } finally {
+            clearTimeout(timer);
+            publicDetailAbortControllers.delete(controller);
+            publicDetailInflight.delete(key);
+            activeWorkers--;
+            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+              for (const it of publicSelection) {
+                if (publicEntryKey(it) === key) applyPublicDetailCache(it);
+              }
+              renderPublicSelected();
+            }
+            scheduleNext();
+          }
+        })();
+
+        publicDetailInflight.set(key, fetchPromise);
+      }
+    }
+
+    scheduleNext();
+  });
 }
 
 async function retryPublicDetail(index) {
   const item = publicSelection[index];
   if (!item) return;
-  publicDetailCache.delete(publicEntryKey(item));
+  const key = publicEntryKey(item);
+  publicDetailCache.delete(key);
+  try {
+    const stored = loadPublicMetadataStorage();
+    delete stored[key];
+    savePublicMetadataStorage(stored);
+  } catch (_) {}
   delete item._detail_failed;
+  delete item._cap_retried;
+  item._detail_status = "idle";
   renderPublicSelected();
+  // explicit retry 可通过现有 startPreview 拉起 item provider 再重试，自动补名不启动预览
+  const uiProvider = publicUiProviderOf(item);
+  try {
+    await startPreview(uiProvider);
+  } catch (_) {}
   await ensurePublicSelectionDetails();
 }
 
@@ -1001,6 +1436,10 @@ function annotatePublicSelectionAvailability() {
     if (publicUiProviderOf(item) !== browsingProvider) continue;
     const cap = ((publicCapabilities || {}).sources || []).find((source) => source.id === item.source);
     item._reason = cap && !cap.playback_available ? cap.reason || "当前平台没有播放能力" : "";
+    if (cap && !cap.playback_available) {
+      item._detail_status = "unavailable";
+      item._detail_failed = true;
+    }
   }
 }
 
@@ -1014,13 +1453,18 @@ async function loadPublicCapabilities(seq = publicState.seq) {
     const data = await publicApi("capabilities", {}, true, provider);
     if (seq !== publicState.seq || provider !== publicState.provider) return;
     publicCapabilities = data;
-    // 配置回填可能早于预览启动；就绪后只清除本音源的瞬时失败。
-    publicSelectionDetailSeq++;
+    annotatePublicSelectionAvailability();
+    // 音源就绪时自动恢复先于预览启动的失败条目，但通过 _cap_retried 防止后续 capabilities 刷新反复清失败
     for (const item of publicSelection) {
       if (publicUiProviderOf(item) !== provider) continue;
+      if (item._cap_retried) continue;
       const key = publicEntryKey(item);
-      if (publicDetailCache.get(key)?.failed) publicDetailCache.delete(key);
-      delete item._detail_failed;
+      if (publicDetailCache.get(key)?.failed) {
+        publicDetailCache.delete(key);
+        delete item._detail_failed;
+        item._detail_status = "idle";
+        item._cap_retried = true;
+      }
     }
   } catch (exc) {
     if (seq !== publicState.seq || provider !== publicState.provider) return;
@@ -1364,6 +1808,7 @@ $("#public-playlists-enabled").addEventListener("change", async () => {
     invalidatePublicBrowse();
     publicState.loading = false;
     publicSelectionDetailSeq++;
+    abortActivePublicDetailRequests();
     $("#public-playlists-browser").hidden = true;
     return;
   }
@@ -1924,7 +2369,7 @@ if ($("#lx-name")) {
   $("#lx-name").addEventListener("input", () => markDirty());
 }
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-$$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("下载音质需保存后生效")));
+$$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("APP下载音质需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 ["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>

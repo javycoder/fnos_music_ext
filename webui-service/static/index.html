@@ -25,11 +25,22 @@
         <button class="nav-item" data-page="quality">播放与推荐</button>
         <button class="nav-item" data-page="search">搜索</button>
         <div class="nav-group">
-          <button class="nav-item nav-group-title" id="nav-storage-title">储存</button>
-          <button class="nav-item nav-sub" data-page="tee">边听边存</button>
-          <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
+          <button class="nav-item nav-group-title" id="nav-storage-title" type="button" aria-expanded="false" aria-controls="nav-storage-subs">
+            <span>储存</span><span class="nav-arrow" aria-hidden="true">▾</span>
+          </button>
+          <div class="nav-group-subs" id="nav-storage-subs" hidden>
+            <button class="nav-item nav-sub" data-page="tee">边听边存</button>
+            <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
+          </div>
         </div>
-        <button class="nav-item" data-page="llm">高级 · 大模型</button>
+        <div class="nav-group">
+          <button class="nav-item nav-group-title" id="nav-advanced-title" type="button" aria-expanded="false" aria-controls="nav-advanced-subs">
+            <span>高级</span><span class="nav-arrow" aria-hidden="true">▾</span>
+          </button>
+          <div class="nav-group-subs" id="nav-advanced-subs" hidden>
+            <button class="nav-item nav-sub" data-page="llm">大模型</button>
+          </div>
+        </div>
         <button class="nav-item" data-page="settings">设置</button>
         <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
       </nav>
@@ -186,7 +197,7 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-title"><span>下载音质</span><button class="help-btn" type="button" data-help="download-quality" aria-label="下载音质帮助">?</button></div>
+          <div class="card-title"><span>APP下载音质</span><button class="help-btn" type="button" data-help="download-quality" aria-label="APP下载音质帮助">?</button></div>
           <div class="radio-list" id="dl-quality-list">
             <label><input type="radio" name="dl-quality" value="app"><div><b>跟随 App</b><span>App 明确选"标准"才交 MP3，其余一律无损原文件（FLAC 等）</span></div></label>
             <label><input type="radio" name="dl-quality" value="original"><div><b>无损原文件</b><span>下载一律交付原文件，App 选"标准"也不转码</span></div></label>
@@ -340,7 +351,7 @@
 
       <!-- LLM -->
       <section class="page" id="page-llm">
-        <h2><span>高级 · 大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
+        <h2><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
         <div class="card">
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
@@ -354,7 +365,6 @@
           <label class="field"><span>单次输出上限（token）</span><input class="input" id="llm-max-tokens" type="number" min="256" max="131072" step="1" value="8192"></label>
           <label class="field"><span>每日 token 上限（0=不限制）</span><input class="input" id="llm-daily-limit" type="number" min="0" step="1" value="1000000"></label>
           <label class="field"><span>附加请求参数（JSON 对象，选填）</span><input class="input" id="llm-extra-body" placeholder='{"thinking":{"type":"disabled"}}'></label>
-          <p class="hint" id="llm-usage-line" role="status">今日 token 用量：加载中…</p>
           <div class="switch-grid">
             <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
             <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
@@ -363,6 +373,20 @@
           <div id="llm-liked-settings" hidden>
             <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
             <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
+          </div>
+        </div>
+        <div class="card" id="llm-usage-card">
+          <div class="card-title">
+            <span>大模型用量与记录</span>
+            <button class="btn small" id="llm-usage-refresh" type="button">刷新</button>
+          </div>
+          <p class="hint" id="llm-usage-line" role="status">今日 token 用量：加载中…</p>
+          <div id="llm-usage-summary" class="stack"></div>
+          <div id="llm-usage-history" class="stack"></div>
+          <div class="btn-row">
+            <button class="btn small" id="llm-usage-prev" type="button">上一页</button>
+            <span id="llm-usage-page" class="muted">1</span>
+            <button class="btn small" id="llm-usage-next" type="button">下一页</button>
           </div>
         </div>
       </section>
@@ -437,9 +461,19 @@
     <button class="nav-item" data-page="source">音源</button>
     <button class="nav-item" data-page="quality">播放</button>
     <button class="nav-item" data-page="search">搜索</button>
-    <button class="nav-item" data-page="tee">边听</button>
-    <button class="nav-item" data-page="dirs">目录</button>
-    <button class="nav-item" data-page="llm">高级</button>
+    <div class="bottom-nav-group">
+      <button class="nav-item bottom-nav-trigger" id="bottom-storage-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-storage-menu">储存</button>
+      <div class="bottom-sub-menu" id="bottom-storage-menu" role="menu" hidden>
+        <button class="bottom-sub-item nav-item" data-page="tee" role="menuitem">边听边存</button>
+        <button class="bottom-sub-item nav-item" data-page="dirs" role="menuitem">目录设置</button>
+      </div>
+    </div>
+    <div class="bottom-nav-group">
+      <button class="nav-item bottom-nav-trigger" id="bottom-advanced-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-advanced-menu">高级</button>
+      <div class="bottom-sub-menu" id="bottom-advanced-menu" role="menu" hidden>
+        <button class="bottom-sub-item nav-item" data-page="llm" role="menuitem">大模型</button>
+      </div>
+    </div>
     <button class="nav-item" data-page="settings">设置</button>
     <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
   </nav>

@@ -1,6 +1,6 @@
 {
-  "extension_version": "2.11.0-2",
+  "extension_version": "2.11.0-3",
   "music_versions": ["1.0.10"],
   "checked_at": "2026-10-28",
-  "notes": "2026-10-28 发布前复核：官方论坛 club.fnnas.com 与帮助中心未见音乐应用新版本公告（最新应用更新通告停留在 2026-10-22），沿用 2026-10-27 实机 /var/apps/trim.music/manifest 核对的 1.0.10。仅记录适配基线，不控制运行时行为。"
+  "notes": "2026-10-28 发布前通过已信任 SSH 只读复核实机 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10。验证既存网易登录、三个公共榜单详情与网易/musicdl 的有界 CDN Range；未执行生产音频 GET、收藏或曲库写入，真实 Web/iOS/Android 完整播放未验收，LX 未配置激活源。离线回归另见测试报告。仅记录适配基线，不控制运行时行为。"
 }

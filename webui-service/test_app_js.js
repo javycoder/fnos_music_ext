@@ -36,6 +36,7 @@ function stubEl() {
       },
       contains(c) { return classes.has(c); },
     },
+    contains(child) { return child === this || !!(this._children && this._children.includes(child)); },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
     appendChild(child) { (this._children = this._children || []).push(child); return child; },
     replaceChildren(...children) { this._children = children; },
@@ -86,6 +87,13 @@ global.document = {
   body: stubEl(),
 };
 global.window = stubEl();
+const localStore = new Map();
+global.window.localStorage = {
+  getItem: (k) => (localStore.has(k) ? localStore.get(k) : null),
+  setItem: (k, v) => localStore.set(k, String(v)),
+  removeItem: (k) => localStore.delete(k),
+  clear: () => localStore.clear(),
+};
 // 日志导出的 blob 下载链路（URL.createObjectURL + a[download]）
 const createdUrls = [];
 global.URL.createObjectURL = (blob) => { createdUrls.push(blob); return `blob:fake-${createdUrls.length}`; };
@@ -149,6 +157,10 @@ function reset() {
   routes = new Map();
   fetchCalls.length = 0;
   global.helpTemplates = [];
+  localStore.clear();
+  try {
+    vm.runInThisContext("if (typeof publicDetailInflight !== 'undefined') publicDetailInflight.clear(); if (typeof publicDetailAbortControllers !== 'undefined') publicDetailAbortControllers.clear();");
+  } catch (_) {}
 }
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
@@ -2330,6 +2342,184 @@ test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保�
   assert.strictEqual("LX_RESOLVER_TIMEOUT" in cfg, false);
   assert.strictEqual("LX_URL_TIMEOUT" in cfg, false);
   assert.strictEqual("LX_PROBE_TIMEOUT" in cfg, false);
+});
+
+test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆状态", async () => {
+  reset();
+  const storageTitle = els.get("#nav-storage-title");
+  const storageSubs = els.get("#nav-storage-subs");
+  const advancedTitle = els.get("#nav-advanced-title");
+  const advancedSubs = els.get("#nav-advanced-subs");
+
+  // 首访收起
+  global.setNavGroupExpanded("storage", false, false);
+  global.setNavGroupExpanded("advanced", false, false);
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(storageSubs.hidden, true);
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(advancedSubs.hidden, true);
+
+  // 点击展开储存
+  await storageTitle.dispatch("click");
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(storageSubs.hidden, false);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-storage-expanded"), "true");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+
+  // 再次点击收起
+  await storageTitle.dispatch("click");
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(storageSubs.hidden, true);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-storage-expanded"), "false");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+
+  // 点击展开高级
+  await advancedTitle.dispatch("click");
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(advancedSubs.hidden, false);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-advanced-expanded"), "true");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
+test("导航切页：切子页自动展开一级分组并联动高亮", () => {
+  reset();
+  const storageTitle = els.get("#nav-storage-title");
+  const storageSubs = els.get("#nav-storage-subs");
+  const advancedTitle = els.get("#nav-advanced-title");
+  const advancedSubs = els.get("#nav-advanced-subs");
+  const bottomStorage = els.get("#bottom-storage-trigger");
+  const bottomAdvanced = els.get("#bottom-advanced-trigger");
+
+  // 切到 tee（边听边存）
+  global.switchPage("tee");
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(storageSubs.hidden, false);
+  assert.strictEqual(storageTitle.classList.contains("active"), true);
+  assert.strictEqual(bottomStorage.classList.contains("active"), true);
+  assert.strictEqual(advancedTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+
+  // 切到 llm（大模型）
+  global.switchPage("llm");
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(advancedSubs.hidden, false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), true);
+  assert.strictEqual(bottomAdvanced.classList.contains("active"), true);
+  assert.strictEqual(storageTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomStorage.classList.contains("active"), false);
+
+  // 切到 settings（常规页）
+  global.switchPage("settings");
+  assert.strictEqual(storageTitle.classList.contains("active"), false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomStorage.classList.contains("active"), false);
+  assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+});
+
+test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", async () => {
+  reset();
+  els.get("#cleanup-modal").hidden = true;
+  els.get("#organize-modal").hidden = true;
+  const trigger = els.get("#bottom-storage-trigger");
+  const menu = els.get("#bottom-storage-menu");
+  const otherEl = stubEl();
+
+  // 初始收起（对应 HTML 上的 hidden 属性与 aria-expanded="false"）
+  menu.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+
+  assert.strictEqual(menu.hidden, true);
+
+  // 点击触发项弹出菜单并获得焦点
+  await trigger.dispatch("click");
+  assert.strictEqual(menu.hidden, false);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "true");
+
+  // 按 Escape 关闭并 focus 返回 trigger
+  await global.window.dispatch("keydown", { key: "Escape", preventDefault: () => {} });
+  assert.strictEqual(menu.hidden, true);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(global.document.activeElement, trigger);
+
+  // 再次打开
+  await trigger.dispatch("click");
+  assert.strictEqual(menu.hidden, false);
+
+  // 外点关闭并 focus 返回 trigger
+  await global.window.dispatch("click", { target: otherEl });
+  assert.strictEqual(menu.hidden, true);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(global.document.activeElement, trigger);
+});
+
+test("公共歌单用户：直连 403/501 明确显示安全架构限制与飞牛桌面引导，失败不当空列表覆写", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} },
+    values: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({ u1: [{ provider: "musicbox", id: "100" }] }) },
+  });
+
+  // 直连 403
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    __rawResponse: true,
+    resp: { ok: false, status: 403, json: async () => ({ ok: false, error: "需要管理员" }) },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  const note403 = els.get("#public-users-note").textContent;
+  assert.ok(note403.includes("安全架构限制"), `应包含安全架构限制: ${note403}`);
+  assert.ok(note403.includes("飞牛桌面"), `应引导飞牛桌面: ${note403}`);
+  assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
+
+  // 直连 501
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    __rawResponse: true,
+    resp: { ok: false, status: 501, json: async () => ({ detail: "直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台" }) },
+  });
+  await global.loadMusicUsers();
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  const note501 = els.get("#public-users-note").textContent;
+  assert.ok(note501.includes("安全架构限制"), `应包含安全架构限制: ${note501}`);
+  assert.ok(note501.includes("飞牛桌面"), `应引导飞牛桌面: ${note501}`);
+  assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
+});
+
+test("HTML/CSS 规范：?视觉与触屏规范、大模型页面标题、APP下载音质及LLM卡片完整接口", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
+
+  // 页面标题大模型
+  assert.ok(html.includes('<h2><span>大模型</span><button class="help-btn"'), "大模型标题需符合规范");
+
+  // 所有下载音质显示改APP下载音质
+  assert.ok(html.includes("APP下载音质"), "需包含 APP下载音质 显示");
+  assert.ok(html.includes('aria-label="APP下载音质帮助"'), "帮助按钮 aria-label 需为 APP下载音质帮助");
+
+  // LLM卡片HTML接口与IDs
+  const requiredIds = [
+    "llm-usage-line",
+    "llm-usage-summary",
+    "llm-usage-history",
+    "llm-usage-refresh",
+    "llm-usage-prev",
+    "llm-usage-next",
+    "llm-usage-page",
+  ];
+  for (const id of requiredIds) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 必须包含 id="${id}"`);
+  }
+  assert.ok(html.includes('<div id="llm-usage-history"'), "#llm-usage-history 必须为 div 元素");
+
+  // ?视觉22px桌面占28px触屏点击44px
+  assert.ok(css.includes("width: 22px"), ".help-btn 需为 22px 视觉大小");
+  assert.ok(css.includes("height: 22px"), ".help-btn 需为 22px 视觉大小");
+  assert.ok(css.includes("margin: 3px"), ".help-btn 需设置 margin 3px (占 28px 空间)");
+  assert.ok(css.includes("width: 44px") && css.includes("height: 44px"), ".help-btn 需具备 44px 触屏点击尺寸");
+
+  // LLM历史表规范
+  assert.ok(css.includes(".usage-table"), "需包含 .usage-table 样式");
+  assert.ok(css.includes("border-collapse: collapse"), ".usage-table 需 collapse");
+  assert.ok(css.includes("tabular-nums"), "数字列需使用 tabular-nums");
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

@@ -6743,10 +6743,15 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
     generation = _DIRECT_PLAY_GENERATIONS[provider]
     now = time.time()
     if source == "netease":
+        try:
+            from .netease_direct import upgrade_netease_media_url
+        except ImportError:
+            from netease_direct import upgrade_netease_media_url  # type: ignore
         song_id = song_id_from_online_guid(guid).split(":")[-1]
         url = await resolve_netease_url(get_musicbox_client(request.app), song_id)
         if not url:
             raise RuntimeError("resolve_failed")
+        url = await upgrade_netease_media_url(url)
         pin = _NETEASE_URL_PIN.get(song_id)
         info = _online_meta_for_request(request, guid) or {}
         return DirectMediaTarget(

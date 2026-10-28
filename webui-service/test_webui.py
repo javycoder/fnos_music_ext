@@ -55,7 +55,7 @@ def test_public_user_save_waits_for_migration(env_file):
 
 def test_public_user_save_merges_and_preserves_explicit_empty(env_file):
     from concurrent.futures import ThreadPoolExecutor
-    env_file.write_text(BASE_ENV + "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{}'\n")
+    env_file.write_text(BASE_ENV + "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{}'\n", encoding="utf-8")
     selection = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda user: webui.write_env({

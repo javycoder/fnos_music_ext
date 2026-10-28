@@ -689,10 +689,13 @@ def public_playlists(
 
 def public_playlist(playlist_id: int, kind: str = "playlist") -> dict[str, Any]:
     if kind == "chart":
-        rows = public_playlists("charts").get("items") or []
-        for row in rows:
-            if row.get("id") == str(playlist_id):
-                return {"ok": True, "data": row}
+        try:
+            rows = public_playlists("charts").get("items") or []
+            for row in rows:
+                if row.get("id") == str(playlist_id):
+                    return {"ok": True, "data": row}
+        except Exception as exc:
+            logger.warning("public_playlist charts lookup failed for %s, falling back to detail: %s", playlist_id, exc)
     with _api_lock:
         api = _get_api_locked()
         raw = api.eapi_request("/api/v6/playlist/detail", {

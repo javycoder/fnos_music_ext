@@ -43,3 +43,7 @@ def _isolate_llm_usage_state(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(tmp_path / "llm_usage.json"))
     monkeypatch.setattr(llm_usage, "_STATE", None)
     monkeypatch.setattr(llm_usage, "_STATE_DAY", "")
+    monkeypatch.setattr(llm_usage, "_MEM_LEDGER", None)
+    monkeypatch.setattr(llm_usage, "_LAST_PATH", None)
+    monkeypatch.setattr(llm_usage, "_STATUS", "ok")
+    monkeypatch.setattr(llm_usage, "_STATUS_MSG", "正常")

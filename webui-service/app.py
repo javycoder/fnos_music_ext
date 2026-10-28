@@ -122,7 +122,7 @@ SCHEMA: dict[str, dict] = {
     "LX_URL_TIMEOUT": {"kind": "float", "default": "15.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "取链总超时（秒）"},
     "LX_PROBE_TIMEOUT": {"kind": "float", "default": "3.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "直链探活超时（秒）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
-    "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "下载音质"},
+    "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "APP下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
@@ -1585,9 +1585,17 @@ async def api_config_put(body: ConfigBody, request: Request):
 
 
 @app.get("/api/llm/usage")
-async def api_llm_usage():
-    """当日大模型 token 用量与最近失败原因（issue #83）。"""
-    return {"ok": True, "usage": llm_usage.summary()}
+async def api_llm_usage(limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0)):
+    """读取新鲜账本快照；额度来自已保存配置，而不是容器启动时的旧环境。"""
+    key = "FNMUSIC_LLM_DAILY_TOKEN_LIMIT"
+    try:
+        daily_limit = int(read_env().get(key, SCHEMA[key]["default"]))
+    except (TypeError, ValueError):
+        daily_limit = llm_usage.DEFAULT_DAILY_TOKEN_LIMIT
+    daily_limit = max(0, min(1_000_000_000, daily_limit))
+    usage = await run_in_threadpool(
+        llm_usage.summary, limit=daily_limit, history_limit=limit, history_offset=offset, read_only=True)
+    return {"ok": True, "usage": usage}
 
 
 @app.post("/api/lx/verify")
@@ -1722,26 +1730,51 @@ async def api_public_playlists(target: str = "", request: Request = None):
     cached = _public_discovery_cache.get(cache_key)
     if cacheable and cached and cached[0] > time.monotonic():
         return Response(content=cached[1], media_type=cached[2])
-    try:
+    is_detail = bool(target and target not in ("capabilities", "categories") and not target.endswith("/tracks"))
+
+    async def _fetch_upstream():
         lock = _public_discovery_locks.setdefault(cache_key, asyncio.Lock())
         async with lock:
             cached = _public_discovery_cache.get(cache_key)
             if cacheable and cached and cached[0] > time.monotonic():
                 return Response(content=cached[1], media_type=cached[2])
-            resp = await get_http(request).get(
+            req_timeout = httpx.Timeout(8.0, connect=3.0) if is_detail else httpx.Timeout(65.0, connect=3.0)
+            upstream_resp = await get_http(request).get(
                 f"{base}{upstream_path}", params=params,
-                timeout=httpx.Timeout(65.0, connect=3.0),
+                timeout=req_timeout,
             )
-            if cacheable and resp.status_code == 200 and _resp_json(resp).get("ok") is True:
-                ttl = 86400 if target == "categories" or params.get("channel") == "charts" else 1800
-                if len(_public_discovery_cache) >= 256:
-                    _public_discovery_cache.pop(next(iter(_public_discovery_cache)))
-                _public_discovery_cache[cache_key] = (time.monotonic() + ttl, resp.content, resp.headers.get("content-type", "application/json"))
+            if cacheable and upstream_resp.status_code == 200:
+                resp_payload = _resp_json(upstream_resp)
+                if resp_payload.get("ok") is True:
+                    data_obj = resp_payload.get("data")
+                    has_empty_name = is_detail and (
+                        not isinstance(data_obj, dict) or not str(data_obj.get("name") or "").strip()
+                    )
+                    if not has_empty_name:
+                        ttl = 86400 if target == "categories" or params.get("channel") == "charts" else 1800
+                        if len(_public_discovery_cache) >= 256:
+                            _public_discovery_cache.pop(next(iter(_public_discovery_cache)))
+                        _public_discovery_cache[cache_key] = (time.monotonic() + ttl, upstream_resp.content, upstream_resp.headers.get("content-type", "application/json"))
+            return upstream_resp
+
+    try:
+        if is_detail:
+            async with asyncio.timeout(8.0):
+                resp = await _fetch_upstream()
+        else:
+            resp = await _fetch_upstream()
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        return JSONResponse(
+            content={"ok": False, "error": "歌单详情获取超时", "hint": "上游响应过慢，请稍后重试"},
+            status_code=503,
+        )
     except httpx.HTTPError as exc:
         return JSONResponse(
             content={"ok": False, "error": f"音源服务不可达: {exc}", "hint": "请先在管理页预览或启用该音源"},
             status_code=503,
         )
+    if isinstance(resp, Response):
+        return resp
     return Response(
         content=resp.content,
         status_code=resp.status_code,
