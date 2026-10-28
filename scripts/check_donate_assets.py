@@ -46,6 +46,8 @@ def main() -> None:
     args = parser.parse_args()
     expected = [name for key, name in CHANNELS.items() if os.environ.get(key, "").strip()]
     try:
+        if not args.archive.is_file():
+            raise FileNotFoundError(f"FPK 归档不存在：{args.archive}")
         verify(args.archive, expected)
     except (OSError, ValueError, tarfile.TarError, KeyError):
         parser.exit(1, "ERROR: FPK 收款码资源校验失败\n")

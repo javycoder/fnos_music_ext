@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1474,9 +1475,22 @@ async def api_config_put(body: ConfigBody, request: Request):
             err = "" if ok else (api_payload.get("error") or data.get("message") or f"HTTP {resp.status_code}")
             if op == "activate":
                 sid = str(api_payload.get("source_id") or "")
-                target = next((entry for entry in data.get("sources") or []
-                               if isinstance(entry, dict) and ((sid and str(entry.get("id") or "") == sid)
-                                  or entry.get("url") == payload.get("url"))), None)
+                req_url = str(payload.get("url") or "")
+                req_base = urllib.parse.unquote(req_url).replace("\\", "/").rsplit("/", 1)[-1] if req_url.startswith("file://") else ""
+                req_stem = req_base[:-3] if req_base.lower().endswith(".js") else req_base
+                entries = [entry for entry in data.get("sources") or [] if isinstance(entry, dict)]
+                # 强身份优先；文件名/名称兜底只接受唯一候选，不能误用同名源状态。
+                for matches in (
+                    [entry for entry in entries if sid and str(entry.get("id") or "") == sid],
+                    [entry for entry in entries if req_url and entry.get("url") == req_url],
+                    [entry for entry in entries if (
+                        (req_base and str(entry.get("id") or "") in (req_base, req_stem))
+                        or (req_stem and str(entry.get("name") or "") == req_stem)
+                    )],
+                ):
+                    if matches:
+                        target = matches[0] if len(matches) == 1 else None
+                        break
                 if target and target.get("status") == "failed" and category not in (
                         "service_unavailable", "source_operation_busy", "initialization_pending", "internal"):
                     ok, category = False, "runtime"

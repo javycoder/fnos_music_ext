@@ -1974,7 +1974,7 @@ $("#netease-playlist-resident").addEventListener("change", () => {
 
 /* -------------------------------------------------------------- lx 源测试 */
 function escapeHtml(str) {
-  return String(str || "")
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -2022,6 +2022,28 @@ function lxPendingActivationCount() {
   return lxSourceList.filter((i) => i.active && !saved.has(i.url)).length;
 }
 
+function findLxRuntimeSource(item, sources) {
+  const list = Array.isArray(sources) ? sources : [];
+  const itemUrl = (item && item.url) || "";
+  if (itemUrl) {
+    const exact = list.find((s) => s && s.url && s.url === itemUrl);
+    if (exact) return exact;
+  }
+  if (itemUrl.toLowerCase().startsWith("file://")) {
+    let base = itemUrl.replace(/\\/g, "/").split("/").pop() || "";
+    try { base = decodeURIComponent(base); } catch (_) { /* 忽略 */ }
+    const stem = base.replace(/\.js$/i, "");
+    const byFile = list.filter((s) => s && (
+      (base && (s.id === base || s.name === base))
+      || (stem && (s.id === stem || s.name === stem))
+    ));
+    if (byFile.length) return byFile.length === 1 ? byFile[0] : undefined;
+    const byName = list.filter((s) => s && item.name && (s.name === item.name || s.id === item.name));
+    if (byName.length === 1) return byName[0];
+  }
+  return undefined;
+}
+
 function renderLxSourceList() {
   const container = $("#lx-source-list");
   if (!container) return;
@@ -2037,7 +2059,7 @@ function renderLxSourceList() {
     const wasActive = saved.has(item.url);
     const configLabel = isActive !== wasActive
       ? (isActive ? "待保存激活" : "待保存取消") : wasActive ? "已配置启用" : "未启用";
-    const runtime = ((lxRuntimeSnapshot || {}).sources || []).find((s) => s.url === item.url);
+    const runtime = findLxRuntimeSource(item, (lxRuntimeSnapshot || {}).sources);
     const status = runtime?.status || "unknown";
     const runtimeLabel = lxRuntimeSnapshot?.state === "unavailable" ? "服务不可用"
       : runtime ? (LX_SOURCE_STATUS_LABEL[status] || status) : wasActive ? "运行状态未知" : "未运行";
@@ -2431,20 +2453,41 @@ async function loadAbout() {
     ? Boolean(info.donate_alipay)
     : Boolean(info.donate);
 
-  donate.hidden = !hasWechat && !hasAlipay;
-  wechatWrap.hidden = !hasWechat;
-  if (hasWechat) {
-    wechatImg.src = `${APP_BASE}/static/wechat.png`;
-  } else {
-    wechatImg.removeAttribute("src");
+  const syncDonateCard = () => {
+    if (!donate) return;
+    const wechatVisible = wechatWrap ? !wechatWrap.hidden : hasWechat;
+    const alipayVisible = alipayWrap ? !alipayWrap.hidden : hasAlipay;
+    donate.hidden = !wechatVisible && !alipayVisible;
+  };
+
+  if (wechatWrap) wechatWrap.hidden = !hasWechat;
+  if (wechatImg) {
+    wechatImg.onerror = () => {
+      if (wechatWrap) wechatWrap.hidden = true;
+      wechatImg.removeAttribute("src");
+      syncDonateCard();
+    };
+    if (hasWechat) {
+      wechatImg.src = `${APP_BASE}/static/wechat.png`;
+    } else {
+      wechatImg.removeAttribute("src");
+    }
   }
 
-  alipayWrap.hidden = !hasAlipay;
-  if (hasAlipay) {
-    alipayImg.src = `${APP_BASE}/static/alipay.png`;
-  } else {
-    alipayImg.removeAttribute("src");
+  if (alipayWrap) alipayWrap.hidden = !hasAlipay;
+  if (alipayImg) {
+    alipayImg.onerror = () => {
+      if (alipayWrap) alipayWrap.hidden = true;
+      alipayImg.removeAttribute("src");
+      syncDonateCard();
+    };
+    if (hasAlipay) {
+      alipayImg.src = `${APP_BASE}/static/alipay.png`;
+    } else {
+      alipayImg.removeAttribute("src");
+    }
   }
+  syncDonateCard();
   // 进入关于页顺带刷新检查更新（后端有 TTL 缓存，命中不出网）
   checkUpdate();
 }

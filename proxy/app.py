@@ -2506,17 +2506,26 @@ def _within_dir(path: str, root: str) -> bool:
         return False
 
 
-def _stem_in_current_roots(stem: str) -> bool:
-    """旧 .ref 词干是否仍落在当前任一保存根之内。
+def _current_save_roots() -> list[str]:
+    """当前有效的曲库保存根目录（排除不可写的 tee_save_dir 与纯滚动缓存目录）。"""
+    roots: list[str] = []
+    for d in (tee_save_dir(), detect_library_dir()):
+        if d and d not in roots:
+            roots.append(d)
+    return roots
 
-    用户切换保存目录（tee_save_dir / 曲库目录）后，指向旧目录的词干属过期引用；
-    沿用它会把实际落点带离当前配置目录，staged 判定随之错配。仅当词干目录仍在
-    iter_media_dirs() 任一根内（换音质/改布局等同根场景）才继续沿旧词干新建。
+
+def _stem_in_current_roots(stem: str) -> bool:
+    """旧 .ref 词干是否仍落在当前任一有效保存根之内。
+
+    用户切换保存目录（tee_save_dir / 曲库目录）后，指向旧目录或不可写目录的词干属
+    过期引用；沿用它会把实际落点带离当前配置目录，staged 判定随之错配。仅当词干目录
+    仍在 _current_save_roots() 任一根内（换音质/改布局等同根场景）才继续沿旧词干新建。
     """
     stem_dir = os.path.dirname(stem)
     if not stem_dir:
         return False
-    return any(_within_dir(stem_dir, root) for root in iter_media_dirs() if root)
+    return any(_within_dir(stem_dir, root) for root in _current_save_roots())
 
 
 def library_media_path(guid: str, title: str, ext: str, artist: str = "", album: str = "",
@@ -2645,11 +2654,12 @@ def promote_shadow_lyric(guid: str, audio_path: str) -> None:
         return
     shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
     try:
-        with open(shadow, encoding="utf-8") as f:
+        with open(shadow, encoding="utf-8", errors="replace") as f:
             text = f.read()
     except OSError:
         return
     if not text.strip():
+        _remove_quiet(shadow)
         return
     if _dir_is_remote_mount(os.path.dirname(audio_path) or "."):
         if _staged_write_lyric(audio_path, text):
@@ -5829,6 +5839,7 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
             return _install_library_audio_staged(
                 part, guid, ext, title, artist, album, src, dest
             )
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         try:
             os.replace(part, dest)
         except OSError:

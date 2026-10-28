@@ -814,15 +814,18 @@ def _source_supported_platforms(s: dict) -> list[str]:
 
 def _describe_source_snapshot(sources: list[dict]) -> dict:
     """配置启用与运行就绪分离；缺失状态表示尚未获得初始化结果，而非成功。"""
-    enabled = [s for s in sources if s.get("enable") or s.get("enabled")]
+    enabled = [s for s in (sources or []) if isinstance(s, dict) and (s.get("enable") or s.get("enabled"))]
     active_sources = []
     for s in enabled:
+        sid = str(s.get("id") or "")
+        raw_url = str(s.get("sourceUrl") or "").strip()
+        resolved_url = raw_url or (f"file://{_lx_source_fs_path(sid)}" if sid else "")
         status = str(s.get("status") or "loading")
         active_sources.append({
-            "id": str(s.get("id") or ""),
+            "id": sid,
             "name": str(s.get("name") or ""),
             "version": str(s.get("version") or "1.0.0"),
-            "url": str(s.get("sourceUrl") or ""),
+            "url": resolved_url,
             "status": status,
             "error": redact(str(s.get("error") or "")),
             "initialized": status == "success",
@@ -868,7 +871,7 @@ def _describe_source_snapshot(sources: list[dict]) -> dict:
 
 
 def _source_capabilities_snapshot(sources: list[dict], *, alive: bool = True, error: str = "") -> dict[str, dict]:
-    enabled = [s for s in sources if s.get("enable") or s.get("enabled")]
+    enabled = [s for s in (sources or []) if isinstance(s, dict) and (s.get("enable") or s.get("enabled"))]
     supported: set[str] = set()
     for s in enabled:
         if s.get("status") == "success":

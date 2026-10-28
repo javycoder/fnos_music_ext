@@ -371,13 +371,13 @@ def test_health_requires_exact_success(code, payload):
 
 
 def test_first_upload_without_active_source(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
     _ok_upload(lx_http)
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.post("/api/lx/upload", json={"filename": "first.js", "script": "// first"})
     assert r.status_code == 200
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert webui.preview_seconds_left("lxmusic") > 0
     assert [c for c in procs["calls"] if c[0] == "start"] == [
         ("start", "lxserver"), ("start", "lxmusic")]
@@ -520,18 +520,18 @@ def test_health_wait_uses_deadline(env_file, procs, lx_http, monkeypatch):
 
 
 def test_save_ready_success_but_validation_failure_keeps_preview(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.put("/api/config", json={"values": {
         "FNMUSIC_LX_ENABLED": "true", "LX_SOURCE_LIST": "[]"}})
     assert r.status_code == 400
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert webui.preview_seconds_left("lxmusic") > 0
 
 
 def test_save_switch_does_not_start_ready_processes_twice(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
     r = client.put("/api/config", json={"values": {
         "FNMUSIC_LX_ENABLED": "true", "LX_SOURCE_LIST": json.dumps([
@@ -633,16 +633,38 @@ def test_activation_uncertain_keeps_config_and_skips_cleanup(env_file, procs, lx
     assert posted == [{"url": url}]
 
 
+@pytest.mark.parametrize("identity", ["source_id", "unique_file", "ambiguous"])
+def test_local_upload_identity_without_url(env_file, procs, lx_http, client, identity):
+    url = "file:///data/lxmusic/uploads/xinghai.js"
+    def source(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        entries = [{"id": "xinghai.js", "name": "星海", "status": "success"}]
+        if identity == "ambiguous":
+            entries.append({"id": "other", "name": "xinghai", "status": "failed"})
+        return httpx.Response(200, json={"ok": True,
+            "source_id": "xinghai.js" if identity == "source_id" else "",
+            "data": {"sources": entries}})
+    lx_http["business"]["/api/v1/source"] = source
+    response = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
+        {"url": url, "name": "星海", "active": True}])}})
+    assert response.status_code == 200, response.text
+    action = next(a for a in response.json()["actions"] if a["kind"] == "lx_activate" and a.get("op") == "activate")
+    assert action["ok"] is (identity != "ambiguous")
+    assert not action.get("auto_disabled")
+    assert webui._list_active_urls(webui.read_env()) == {url}
+
+
 @pytest.mark.parametrize("category,code", [("source_operation_busy", 409), ("initialization_pending", 504)])
 def test_verify_nonterminal_does_not_write_or_disable(env_file, procs, lx_http, client, category, code):
     lx_http["business"]["/api/v1/source/verify"] = lambda request: httpx.Response(code, json={
         "ok": False, "data": {"category": category, "message": "try later"}})
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
         {"url": "https://s/new.js", "active": True}])}})
     assert r.status_code == code
     assert r.json()["category"] == category
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert lx_http["calls"] == ["/api/v1/source/verify"]
 
 

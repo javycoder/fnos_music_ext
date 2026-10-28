@@ -98,11 +98,16 @@ def generate(link: str, out_path: str | Path = DEFAULT_OUT) -> Path:
 
 
 def main(argv: list[str]) -> int:
-    link = argv[1] if len(argv) > 1 else os.environ.get("ALIPAY_QRCODE", "").strip()
+    link = (argv[1] if len(argv) > 1 else os.environ.get("ALIPAY_QRCODE", "")).strip()
     if not link:
         print("ERROR: 缺少收款链接（argv[1] 或环境变量 ALIPAY_QRCODE）", file=sys.stderr)
         return 2
-    out = generate(link, argv[2] if len(argv) > 2 else DEFAULT_OUT)
+    try:
+        out = generate(link, argv[2] if len(argv) > 2 else DEFAULT_OUT)
+    except Exception:
+        # 不回显异常详情，避免依赖库的错误消息泄漏收款链接。
+        print("ERROR: 支付宝二维码生成失败，请检查依赖、字体和输入长度", file=sys.stderr)
+        return 1
     print(f"alipay.png generated: {out} ({out.stat().st_size} bytes)")
     return 0
 
