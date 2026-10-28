@@ -85,7 +85,9 @@ jobs:
           ls -la dist/
 
       - name: Verify donation assets in fpk
-        run: python3 scripts/check_donate_assets.py dist/fnmusic-ext-*.fpk
+        run: |
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          python3 scripts/check_donate_assets.py "$fpk_file"
 
       - name: Extract changelog for this version
         run: |

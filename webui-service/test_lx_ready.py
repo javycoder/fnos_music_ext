@@ -371,13 +371,13 @@ def test_health_requires_exact_success(code, payload):
 
 
 def test_first_upload_without_active_source(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
     _ok_upload(lx_http)
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.post("/api/lx/upload", json={"filename": "first.js", "script": "// first"})
     assert r.status_code == 200
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert webui.preview_seconds_left("lxmusic") > 0
     assert [c for c in procs["calls"] if c[0] == "start"] == [
         ("start", "lxserver"), ("start", "lxmusic")]
@@ -520,18 +520,18 @@ def test_health_wait_uses_deadline(env_file, procs, lx_http, monkeypatch):
 
 
 def test_save_ready_success_but_validation_failure_keeps_preview(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.put("/api/config", json={"values": {
         "FNMUSIC_LX_ENABLED": "true", "LX_SOURCE_LIST": "[]"}})
     assert r.status_code == 400
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert webui.preview_seconds_left("lxmusic") > 0
 
 
 def test_save_switch_does_not_start_ready_processes_twice(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
     r = client.put("/api/config", json={"values": {
         "FNMUSIC_LX_ENABLED": "true", "LX_SOURCE_LIST": json.dumps([
@@ -637,12 +637,12 @@ def test_activation_uncertain_keeps_config_and_skips_cleanup(env_file, procs, lx
 def test_verify_nonterminal_does_not_write_or_disable(env_file, procs, lx_http, client, category, code):
     lx_http["business"]["/api/v1/source/verify"] = lambda request: httpx.Response(code, json={
         "ok": False, "data": {"category": category, "message": "try later"}})
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
         {"url": "https://s/new.js", "active": True}])}})
     assert r.status_code == code
     assert r.json()["category"] == category
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert lx_http["calls"] == ["/api/v1/source/verify"]
 
 

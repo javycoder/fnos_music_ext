@@ -182,3 +182,65 @@ def test_shadow_lyric_promotion_is_staged_for_remote_dest(tmp_path, monkeypatch)
     assert not os.path.exists(shadow)
     assert not any(name.endswith(".part") for name in os.listdir(lib_root))
     assert os.listdir(p.staged_dir()) == []
+
+
+def test_shadow_lyric_tolerates_non_utf8_and_cleans_empty_shadow(tmp_path, monkeypatch):
+    """影子歌词包含非 UTF-8 字节时不抛 UnicodeDecodeError，空白影子文件自动清理。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "direct")
+    monkeypatch.setenv("FNMUSIC_TEE_SAVE_MODE", "direct")
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    lib_root = p.CONF["library_dir"]
+
+    # 1) 非 UTF-8 字节影子歌词不得中断音频落盘
+    guid1 = "online:kuwo:gbk-shadow"
+    shadow1 = os.path.join(p.CONF["cache_dir"], f"{p.cache_safe_guid(guid1)}.lrc")
+    with open(shadow1, "wb") as f:
+        f.write(b"[00:00.00]\xc7\xe7\xcc\xec")  # GBK 字节
+    part1 = os.path.join(p.CONF["cache_dir"], "gbk.part")
+    with open(part1, "wb") as f:
+        f.write(b"A" * 128)
+    dest1, reused1 = _install(part1, guid1, ext="mp3")
+    assert reused1 is False
+    assert os.path.exists(dest1)
+    assert os.path.exists(os.path.splitext(dest1)[0] + ".lrc")
+    assert not os.path.exists(shadow1)
+
+    # 2) 空白影子歌词不生成空 sidecar 且清理残留 shadow
+    guid2 = "online:kuwo:empty-shadow"
+    shadow2 = os.path.join(p.CONF["cache_dir"], f"{p.cache_safe_guid(guid2)}.lrc")
+    with open(shadow2, "w", encoding="utf-8") as f:
+        f.write("   \n  ")
+    part2 = os.path.join(p.CONF["cache_dir"], "empty.part")
+    with open(part2, "wb") as f:
+        f.write(b"B" * 128)
+    dest2, reused2 = _install(part2, guid2, ext="mp3", title="江南", artist="林俊杰")
+    assert reused2 is False
+    assert os.path.exists(dest2)
+    assert not os.path.exists(os.path.splitext(dest2)[0] + ".lrc")
+    assert not os.path.exists(shadow2)
+
+
+def test_direct_mode_recreates_missing_subdir_and_ignores_cache_root_stem(tmp_path, monkeypatch):
+    """同根旧词干的子目录已被删时 direct 模式自动补建父目录；cache_dir 内的非滚动词干不视作保存根。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "direct")
+    monkeypatch.setenv("FNMUSIC_TEE_SAVE_MODE", "direct")
+    lib_root = p.CONF["library_dir"]
+
+    # cache_dir 内的非滚动词干（文件已不存在）不应被视作曲库保存根，应回落到 library_dir
+    guid_cache = "online:kuwo:cache-stem"
+    p.remember_media_path(guid_cache, os.path.join(p.CONF["cache_dir"], "orphan", "周杰伦 - 晴天"))
+    part_a = tmp_path / "a.part"
+    part_a.write_bytes(b"A" * 512)
+    dest_a, _ = _install(str(part_a), guid_cache, ext="mp3")
+    assert dest_a == os.path.join(lib_root, "周杰伦 - 晴天.mp3")
+
+    # 曲库根内的旧词干子目录已被用户删除 → direct 落盘应自动补建父目录而非抛 FileNotFoundError
+    guid_sub = "online:kuwo:missing-sub"
+    missing_sub = os.path.join(lib_root, "deleted-artist", "deleted-album")
+    p.remember_media_path(guid_sub, os.path.join(missing_sub, "林俊杰 - 江南"))
+    part_b = tmp_path / "b.part"
+    part_b.write_bytes(b"B" * 512)
+    dest_b, _ = _install(str(part_b), guid_sub, ext="mp3", title="江南", artist="林俊杰")
+    assert dest_b == os.path.join(missing_sub, "林俊杰 - 江南.mp3")
+    assert os.path.exists(dest_b)
+

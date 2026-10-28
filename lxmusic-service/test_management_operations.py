@@ -82,7 +82,7 @@ def test_child_task_cannot_inherit_reentry_and_gets_bounded_busy():
     async def run():
         async with management_operation():
             elapsed = await asyncio.create_task(contender())
-            assert elapsed <= 0.3
+            assert 0.08 <= elapsed <= 0.3
             # 冲突不应释放父任务的锁。
             async with management_operation():
                 pass
@@ -513,3 +513,40 @@ def test_verify_client_close_timeout_is_bounded_and_logged(verification, monkeyp
 
     asyncio.run(run())
     assert "verify_source client close failed: TimeoutError" in caplog.text
+
+
+def test_describe_source_snapshot_derives_file_url_and_ignores_non_dict_entries():
+    import app as lx_app
+
+    snap = lx_app._describe_source_snapshot([
+        None,
+        "bad-entry",
+        {
+            "id": "local_uploaded.js",
+            "name": "本地上传源",
+            "version": "1.2.0",
+            "enabled": True,
+            "status": "success",
+            "supportedSources": ["kw", "tx"],
+        },
+        {
+            "id": "remote_src.js",
+            "name": "远程导入源",
+            "sourceUrl": "https://example.test/remote.js",
+            "enabled": True,
+            "status": "failed",
+            "error": "init err",
+        },
+    ])
+    assert snap["state"] == "degraded"
+    assert snap["ready_count"] == 1
+    assert snap["failed_count"] == 1
+    assert snap["pending_count"] == 0
+    assert len(snap["sources"]) == 2
+    assert snap["sources"][0]["url"] == f"file://{lx_app._lx_source_fs_path('local_uploaded.js')}"
+    assert snap["sources"][0]["initialized"] is True
+    assert snap["sources"][1]["url"] == "https://example.test/remote.js"
+    assert snap["sources"][1]["initialized"] is False
+    caps = lx_app._source_capabilities_snapshot([None, "bad", {"id": "a.js", "enabled": True, "status": "success"}])
+    assert caps["kw"]["playback_available"] is True
+

@@ -481,6 +481,39 @@ test("洛雪源列表：轮询只同步运行徽标，不覆盖待保存激活�
   assert.ok(!html.includes("运行就绪"), "缺少 status 不可用 initialized=true 假报成功");
   assert.ok(html.includes("运行状态未知"));
   assert.ok(html.includes("待保存激活"));
+  const ovHtml = els.get("#ov-lx").innerHTML;
+  assert.ok(ovHtml.includes("就绪 0 · 失败 0 · 待定 1"), "escapeHtml(0) 不得把数字 0 抹空");
+});
+
+test("洛雪源列表：本地上传源缺失 sourceUrl 时按 id/文件名兜底匹配运行状态", async () => {
+  reset();
+  const items = [
+    { name: "本地源甲", url: "file:///data/lxserver/users/source/_open/local_a.js", active: true },
+    { name: "历史上传源乙", url: "file:///data/lxmusic/uploads/legacy_b.js", active: true },
+  ];
+  enqueue("/app/fnmusic-ext/api/config", { values: { LX_SOURCE_LIST: JSON.stringify(items) } });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t",
+    current_provider: "lxmusic",
+    processes: {},
+    services: {},
+    lx_source: {
+      state: "degraded",
+      ready_count: 1,
+      failed_count: 1,
+      pending_count: 0,
+      sources: [
+        { id: "local_a.js", name: "本地源甲", url: "", status: "success" },
+        { id: "legacy_b", name: "历史上传源乙", url: "", status: "failed", error: "脚本语法错误" },
+      ],
+    },
+  });
+  await global.loadStatus();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.ok(html.includes("运行就绪"), "空 url 的本地上传源应通过 id 匹配运行就绪");
+  assert.ok(html.includes("运行失败"), "历史 uploads 路径本地源应通过文件名/名称匹配运行失败");
+  assert.ok(html.includes("脚本语法错误"), "本地上传源错误详情应正常渲染");
 });
 
 test("collectConfig：lxmusic 下无激活源时拒绝提交", async () => {
@@ -2330,6 +2363,39 @@ test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保�
   assert.strictEqual("LX_RESOLVER_TIMEOUT" in cfg, false);
   assert.strictEqual("LX_URL_TIMEOUT" in cfg, false);
   assert.strictEqual("LX_PROBE_TIMEOUT" in cfg, false);
+});
+
+test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐藏对应项与外层卡片", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true,
+    version: "2.11.0c",
+    donate: true,
+    donate_alipay: true,
+    donate_wechat: true,
+    logs: [],
+  });
+  enqueue("/app/fnmusic-ext/api/update-check", { ok: true, has_update: false });
+  await global.loadAbout();
+  const donateCard = els.get("#about-donate");
+  const wechatWrap = els.get("#about-donate-wechat");
+  const alipayWrap = els.get("#about-donate-alipay");
+  const wechatImg = els.get("#about-donate-wechat-img");
+  const alipayImg = els.get("#about-donate-img");
+  assert.strictEqual(donateCard.hidden, false);
+  assert.strictEqual(wechatWrap.hidden, false);
+  assert.strictEqual(alipayWrap.hidden, false);
+
+  // 微信二维码图片加载失败 → 仅隐藏微信项，保留支付宝与外层卡片
+  wechatImg.onerror();
+  assert.strictEqual(wechatWrap.hidden, true);
+  assert.strictEqual(alipayWrap.hidden, false);
+  assert.strictEqual(donateCard.hidden, false);
+
+  // 支付宝二维码也加载失败 → 隐藏支付宝项并收起外层打赏卡片
+  alipayImg.onerror();
+  assert.strictEqual(alipayWrap.hidden, true);
+  assert.strictEqual(donateCard.hidden, true);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

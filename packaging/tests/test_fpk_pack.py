@@ -62,9 +62,9 @@ def _parse_manifest(text: str) -> dict:
 
 class TestManifest:
     def test_required_fields(self, stage: Path):
-        assert json.loads((stage / "app/repo/FNMUSIC_COMPAT.json").read_text())["extension_version"] == (
-            REPO_ROOT / "VERSION").read_text().strip()
-        m = _parse_manifest((stage / "manifest").read_text())
+        assert json.loads((stage / "app/repo/FNMUSIC_COMPAT.json").read_text(encoding="utf-8"))["extension_version"] == (
+            REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        m = _parse_manifest((stage / "manifest").read_text(encoding="utf-8"))
         assert m["appname"] == APPNAME
         assert m["source"] == "thirdparty"
         assert m["platform"] == "all"
@@ -77,20 +77,20 @@ class TestManifest:
         assert m["micro_app"] == "true"
 
     def test_version_matches_repo(self, stage: Path):
-        m = _parse_manifest((stage / "manifest").read_text())
-        repo_version = (REPO_ROOT / "VERSION").read_text().strip()
+        m = _parse_manifest((stage / "manifest").read_text(encoding="utf-8"))
+        repo_version = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
         assert re.fullmatch(r"\d+\.\d+\.\d+(?:-\d+)?", repo_version), \
             f"VERSION 必须是 x.y.z 或 x.y.z-N，当前为 {repo_version!r}"
         assert m["version"] == repo_version
-        assert (stage / "app/repo/VERSION").read_text().strip() == repo_version
+        assert (stage / "app/repo/VERSION").read_text(encoding="utf-8").strip() == repo_version
 
     def test_template_has_placeholder(self):
-        assert "@VERSION@" in (FPK_DIR / "manifest.in").read_text()
+        assert "@VERSION@" in (FPK_DIR / "manifest.in").read_text(encoding="utf-8")
 
 
 class TestUiConfig:
     def test_entry(self, stage: Path):
-        cfg = json.loads((stage / "app" / "ui" / "config").read_text())
+        cfg = json.loads((stage / "app" / "ui" / "config").read_text(encoding="utf-8"))
         entry = cfg[".url"][ENTRY_ID]
         assert entry["type"] == "iframe"
         # 空端口 + 网关路径：桌面是 HTTPS，不能把管理页嵌成 http://主机:8774
@@ -107,18 +107,18 @@ class TestUiConfig:
 
 class TestConfig:
     def test_privilege_run_as_root(self, stage: Path):
-        priv = json.loads((stage / "config" / "privilege").read_text())
+        priv = json.loads((stage / "config" / "privilege").read_text(encoding="utf-8"))
         assert priv["defaults"]["run-as"] == "root"
 
     def test_resource_is_json(self, stage: Path):
-        resource = json.loads((stage / "config" / "resource").read_text())
+        resource = json.loads((stage / "config" / "resource").read_text(encoding="utf-8"))
         # NAS 文件选择（pickUserFile）需要声明的开放 API scope
         assert resource.get("api-scope") == ["trim.file.userAccess"]
 
 
 class TestWizard:
     def test_install_wizard(self, stage: Path):
-        steps = json.loads((stage / "wizard" / "install").read_text())
+        steps = json.loads((stage / "wizard" / "install").read_text(encoding="utf-8"))
         assert steps, "install 向导不能为空"
         items = steps[0]["items"]
         fields = {it["field"] for it in items if "field" in it}
@@ -132,7 +132,7 @@ class TestWizard:
     def test_fnpack_quirks(self, stage: Path):
         """fnpack 实测逆向出的两条硬规则（布尔 initValue / tips 用 text 会打包失败）。"""
         for name in ("install",):
-            steps = json.loads((stage / "wizard" / name).read_text())
+            steps = json.loads((stage / "wizard" / name).read_text(encoding="utf-8"))
             for step in steps:
                 for it in step["items"]:
                     if "initValue" in it:
@@ -151,7 +151,7 @@ class TestWizard:
 
     def test_field_names_prefixed(self, stage: Path):
         for name in ("install",):
-            steps = json.loads((stage / "wizard" / name).read_text())
+            steps = json.loads((stage / "wizard" / name).read_text(encoding="utf-8"))
             for st in steps:
                 for it in st["items"]:
                     if "field" in it:
@@ -214,7 +214,7 @@ class TestPayload:
         stage = tmp_path / "stage"
         target = stage / "app" / "repo"
         target.mkdir(parents=True)
-        text = (FPK_DIR / "build.sh").read_text()
+        text = (FPK_DIR / "build.sh").read_text(encoding="utf-8")
         start = text.index("rsync -a --delete")
         end = text.index('"${REPO_ROOT}/" "${STAGE}/app/repo/"', start)
         block = text[start:end] + '"${REPO_ROOT}/" "${STAGE}/app/repo/"'
@@ -266,7 +266,7 @@ class TestPayload:
             path = target / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("stale")
-        text = (FPK_DIR / "build.sh").read_text()
+        text = (FPK_DIR / "build.sh").read_text(encoding="utf-8")
         start = text.index("rsync -a --delete")
         end_marker = '"${REPO_ROOT}/" "${STAGE}/app/repo/"'
         end = text.index(end_marker, start) + len(end_marker)
@@ -293,7 +293,7 @@ class TestPayload:
     def test_arm64_native_binding_is_embedded(self, stage: Path):
         repo = stage / "app" / "repo"
         version = {}
-        for line in (repo / "container/lxserver.version").read_text().splitlines():
+        for line in (repo / "container/lxserver.version").read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
             if key and not key.startswith("#"):
                 version[key] = value
