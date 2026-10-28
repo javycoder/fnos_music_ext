@@ -412,7 +412,8 @@ test("洛雪源列表：旧数据（无 active 标记）按 LX_SOURCE_URL 推导
   });
   await global.loadConfig();
   const html = els.get("#lx-source-list").innerHTML;
-  assert.ok(html.includes("已激活"), "匹配 LX_SOURCE_URL 的项应显示已激活徽标");
+  assert.ok(html.includes("已配置启用"), "匹配 LX_SOURCE_URL 只代表已配置启用，而非运行就绪");
+  assert.ok(html.includes("运行状态未知"));
   assert.ok(html.includes("取消激活"), "激活项应有取消激活按钮");
   assert.ok(html.includes("激活"), "未激活项应有激活按钮");
   // 恰好一处已激活
@@ -435,6 +436,43 @@ test("洛雪源列表：多源同时激活共存渲染", async () => {
   assert.strictEqual((html.match(/lx-badge/g) || []).length, 2, "两个已激活徽标");
   assert.strictEqual((html.match(/lx-btn-deactivate/g) || []).length, 2, "两个取消激活按钮");
   assert.strictEqual((html.match(/lx-btn-activate/g) || []).length, 1, "一个激活按钮");
+});
+
+test("洛雪源列表：轮询只同步运行徽标，不覆盖待保存激活与取消", async () => {
+  reset();
+  const items = [{ name: "甲", url: "file:///a.js", active: true },
+    { name: "乙", url: "file:///b.js", active: false }];
+  enqueue("/app/fnmusic-ext/api/config", { values: { LX_SOURCE_LIST: JSON.stringify(items) } });
+  await global.loadConfig();
+  global.deactivateLxSource(0);
+  global.activateLxSource(1);
+  const sourceStatus = (sources) => ({ version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: { state: "degraded", sources } });
+  enqueue("/app/fnmusic-ext/api/status", sourceStatus([
+    { url: "file:///a.js", status: "success" },
+    { url: "file:///b.js", status: "failed", error: '<img src=x onerror="bad">' },
+  ]));
+  await global.loadStatus();
+  let html = els.get("#lx-source-list").innerHTML;
+  assert.ok(html.includes("待保存取消"));
+  assert.ok(html.includes("待保存激活"));
+  assert.ok(html.includes("运行就绪"));
+  assert.ok(html.includes("运行失败"));
+  assert.ok(html.includes("&lt;img"));
+  assert.ok(!html.includes("<img src=x"));
+  assert.ok(els.get("#save-bar").classList.contains("show"));
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) => sel === "input[name=provider]"
+    ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    assert.deepStrictEqual(JSON.parse(global.collectConfig().LX_SOURCE_LIST).map((s) => s.active), [false, true]);
+  } finally { global.document.querySelectorAll = qsa; }
+  enqueue("/app/fnmusic-ext/api/status", sourceStatus([{ url: "file:///b.js", initialized: true }]));
+  await global.loadStatus();
+  html = els.get("#lx-source-list").innerHTML;
+  assert.ok(!html.includes("运行就绪"), "缺少 status 不可用 initialized=true 假报成功");
+  assert.ok(html.includes("运行状态未知"));
+  assert.ok(html.includes("待保存激活"));
 });
 
 test("collectConfig：lxmusic 下无激活源时拒绝提交", async () => {
@@ -552,6 +590,29 @@ test("saveConfig：服务故障的源保留激活并如实提示，不谎报已�
   assert.ok(message.includes("「故障源」服务暂不可用，激活配置已保留（服务未就绪）"));
   assert.ok(!message.includes("已自动取消激活"));
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
+test("saveConfig：忙与初始化待定保留配置提示，不谎报停用", async () => {
+  for (const [category, label] of [["source_operation_busy", "源操作忙碌"], ["initialization_pending", "初始化待定"]]) {
+    reset();
+    const values = { FNMUSIC_LX_ENABLED: "true", LX_SOURCE_LIST: JSON.stringify([
+      { name: "源", url: "file:///pending.js", active: true }]) };
+    enqueue("/app/fnmusic-ext/api/config", { values });
+    await global.loadConfig();
+    enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: [],
+      actions: [{ kind: "lx_activate", op: "activate", source: "源", ok: false, category, error: "稍后重试" }],
+      warnings: [{ source: "源", category, message: "稍后重试" }],
+    }, { values });
+    const qsa = global.document.querySelectorAll;
+    global.document.querySelectorAll = (sel) => sel === "input[name=provider]"
+      ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+    try { await global.saveConfig(); } finally { global.document.querySelectorAll = qsa; }
+    const message = els.get("#toast").textContent;
+    assert.ok(message.includes(`${label}，激活配置已保留`));
+    assert.ok(!message.includes("已自动取消激活"));
+    assert.strictEqual(els.get("#toast").className, "toast fail");
+    assert.ok(els.get("#lx-source-list").innerHTML.includes("已配置启用"));
+  }
 });
 
 test("collectConfig：全部源自动停用后仍可保存其它设置且不恢复旧激活标记", async () => {
@@ -1023,6 +1084,27 @@ test("loadStatus：概览进程含 lxserver，不可达透出 healthz 详情并�
   assert.ok(svcHtml.includes("lxserver unreachable"), "healthz 失败详情应透出，便于定位底层进程故障");
   assert.ok(!svcHtml.includes("<script>"), "错误详情必须 HTML 转义");
   assert.ok(svcHtml.includes("&lt;script&gt;"));
+});
+
+test("loadStatus：洛雪六态与统计、逐源错误原值安全展示", async () => {
+  for (const [state, label] of Object.entries({ unconfigured: "未配置", loading: "初始化中", ready: "可用",
+    degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" })) {
+    reset();
+    enqueue("/app/fnmusic-ext/api/status", { version: "t", current_provider: "lxmusic", processes: {}, services: {},
+      lx_source: { state, ready_count: 1, failed_count: 2, pending_count: 3, sources: [
+        { name: "<b>源</b>", status: "failed", error: "<script>bad</script>" },
+        { name: "unknown", status: "<img src=x>" },
+      ] } });
+    await global.loadStatus();
+    const html = els.get("#ov-lx").innerHTML;
+    assert.ok(html.includes(label));
+    assert.ok(html.includes("就绪 1 · 失败 2 · 待定 3"));
+    assert.ok(html.includes("&lt;b&gt;源&lt;/b&gt;"));
+    assert.ok(html.includes("运行失败：&lt;script&gt;bad&lt;/script&gt;"));
+    assert.ok(html.includes("&lt;img src=x&gt;"));
+    assert.ok(!html.includes("<script>"));
+    assert.ok(!html.includes("<img src=x>"));
+  }
 });
 
 test("loadStatus：洛雪卡片源信息与错误文本转义", async () => {

@@ -603,7 +603,8 @@ def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, m
             }})
         if request.url.host == "lx.test" and request.method == "POST":
             hits["activate"] += 1
-            return httpx.Response(200, json={"ok": True, "data": {"url": "https://s/1.js"}})
+            return httpx.Response(200, json={"ok": True, "source_id": "1.js", "data": {
+                "sources": [{"id": "1.js", "url": "https://s/1.js", "status": "success"}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -669,7 +670,8 @@ def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svc
             return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
-            return httpx.Response(200, json={"ok": True, "data": {}})
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success"}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -741,7 +743,8 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         is_bad = url in (bad, "bad.js")
         if req.url.path.endswith("/verify"):
             if is_bad and failure == "verify_http":
-                return httpx.Response(503, json={"ok": True})
+                return httpx.Response(503, json={"ok": False, "data": {
+                    "category": "download", "message": "下载失败: 503"}})
             if is_bad and failure == "verify":
                 return httpx.Response(200, json={"ok": False, "data": {"message": "下载失败: 404"}})
             return httpx.Response(200, json={"ok": True, "data": {
@@ -756,9 +759,10 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
                 return httpx.Response(200, json={"ok": True, "source_id": "bad.js", "data": {
                     "sources": [{"id": "bad.js", "url": bad, "initialized": False,
                                  "status": "failed", "error": "脚本初始化失败"}]}})
-            return httpx.Response(500, text="Internal Server Error")
+            return httpx.Response(400, json={"ok": False, "category": "runtime", "error": "脚本初始化失败"})
         enabled[good] = True
-        return httpx.Response(200, json={"ok": True, "source_id": "good.js"})
+        return httpx.Response(200, json={"ok": True, "source_id": "good.js", "data": {
+            "sources": [{"id": "good.js", "url": good, "status": "success"}]}})
 
     _mock_http(handler)
     with authed_client() as client:
@@ -799,7 +803,7 @@ def test_lx_all_failed_sources_save_inactive_and_allow_future_saves(env_file, sv
             return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         if req.url.path.endswith("/verify") and failure == "activate":
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
-        return httpx.Response(200, json={"ok": False, "error": "源已失效"})
+        return httpx.Response(400, json={"ok": False, "category": "runtime", "error": "源已失效"})
 
     _mock_http(handler)
     with authed_client() as client:
@@ -844,7 +848,8 @@ def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
             ]}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
-            return httpx.Response(200, json={"ok": True, "data": {}})
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success"}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -1932,7 +1937,8 @@ def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
     def mock_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/source":
             activate_calls.append(json.loads(request.content.decode()))
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": "source.js", "url": "http://lx.test/source.js", "status": "success"}]}})
         return httpx.Response(404, json={"ok": False})
 
     webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
@@ -1974,7 +1980,8 @@ def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch)
             ]}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
-            return httpx.Response(200, json={"ok": True, "data": {}})
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success"}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -2028,7 +2035,8 @@ def test_lx_failed_deactivation_retries_actual_enabled_set(env_file, svctl, monk
             if not allow_disable:
                 return httpx.Response(500, json={"ok": False, "error": "temporarily failed"})
         enabled[sid] = body.get("enabled", True)
-        return httpx.Response(200, json={"ok": True, "source_id": sid})
+        return httpx.Response(200, json={"ok": True, "source_id": sid, "data": {"sources": [
+            {"id": sid, "url": a if sid == "a.js" else b, "status": "success"}]}})
     _mock_http(handler)
     payload = {"values": {"LX_SOURCE_LIST": json.dumps([{"url": a, "active": True}])}}
     with authed_client() as client:

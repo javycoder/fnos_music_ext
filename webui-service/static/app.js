@@ -24,7 +24,10 @@ const DOWNLOAD_LAYOUT_LABELS = {
 };
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
-let lxSourceList = [];    // 洛雪源列表 [{ name, url, active }]，active 可多开
+let lxSourceList = [];    // 本地待保存配置；运行状态轮询不可覆盖 active
+let lxRuntimeSnapshot = null; // /api/status 的只读运行快照
+const LX_STATE_LABEL = { unconfigured: "未配置", loading: "初始化中", ready: "可用", degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" };
+const LX_SOURCE_STATUS_LABEL = { success: "运行就绪", failed: "运行失败", loading: "初始化中", unknown: "运行状态未知" };
 let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
 let publicSelection = [];
 let publicUsers = [];
@@ -316,16 +319,25 @@ async function loadStatus() {
       }
       return `<span class="state-line"><span class="dot ok"></span>${escapeHtml(PROC_LABEL[name])}：正常</span>`;
     }).join("");
+    lxRuntimeSnapshot = st.lx_source || null;
+    renderLxSourceList(); // 只同步运行徽标，不重载配置或丢弃尚未保存的编辑。
     const lxCard = $("#ov-lx-card");
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
       const ls = st.lx_source;
       const rows = [];
-      rows.push(`<div class="kv"><b>状态</b>${ls.initialized ? "已加载" : "未加载"}</div>`);
       const sources = ls.sources || [];
+      const ready = sources.filter((s) => s.status === "success").length;
+      const failed = sources.filter((s) => s.status === "failed").length;
+      const state = ls.state || (ls.error ? "unavailable" : sources.length ? "loading" : "unconfigured");
+      rows.push(`<div class="kv"><b>状态</b>${escapeHtml(LX_STATE_LABEL[state] || state)}</div>`);
+      rows.push(`<div class="kv"><b>源统计</b>就绪 ${escapeHtml(ls.ready_count ?? ready)} · 失败 ${escapeHtml(ls.failed_count ?? failed)} · 待定 ${escapeHtml(ls.pending_count ?? (sources.length - ready - failed))}</div>`);
       if (sources.length) {
-        rows.push(`<div class="kv"><b>已激活源</b>${sources.length} 个：${sources.map((s) =>
-          `${escapeHtml(s.name || "-")}${s.version ? " v" + escapeHtml(s.version) : ""}`).join("、")}</div>`);
+        rows.push(`<div class="kv"><b>已配置源</b>${sources.length} 个</div>`);
+        sources.forEach((s) => {
+          const status = s.status || "unknown";
+          rows.push(`<div class="kv"><b>${escapeHtml(s.name || s.id || "-")}${s.version ? " v" + escapeHtml(s.version) : ""}</b>${escapeHtml(LX_SOURCE_STATUS_LABEL[status] || status)}${s.error ? "：" + escapeHtml(s.error) : ""}</div>`);
+        });
         const plats = new Set();
         sources.forEach((s) => (s.platforms || []).forEach((p) => plats.add(p)));
         rows.push(`<div class="kv"><b>平台</b>${escapeHtml([...plats].join("、")) || "-"}</div>`);
@@ -333,7 +345,7 @@ async function loadStatus() {
         rows.push(`<div class="kv"><b>源名称</b>${escapeHtml(ls.source.name || "-")} ${ls.source.version ? "v" + escapeHtml(ls.source.version) : ""}</div>`);
         rows.push(`<div class="kv"><b>平台</b>${escapeHtml(Object.keys(ls.source.platforms || {}).join("、")) || "-"}</div>`);
       }
-      if (ls.last_error) rows.push(`<div class="kv"><b>错误</b>${escapeHtml(ls.last_error)}</div>`);
+      if (ls.last_error || ls.error) rows.push(`<div class="kv"><b>错误</b>${escapeHtml(ls.last_error || ls.error)}</div>`);
       $("#ov-lx").innerHTML = rows.join("");
     } else {
       lxCard.hidden = true;
@@ -594,8 +606,9 @@ async function saveConfig() {
       }
     });
     warnings.forEach((w) => {
-      if (w.category === "service_unavailable") {
-        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」服务暂不可用，激活配置已保留${w.message ? `（${w.message}）` : ""}`);
+      if (w.category && !["runtime", "runtime_error"].includes(w.category)) {
+        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌" }[w.category] || "状态暂不可确认";
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，激活配置已保留${w.message ? `（${w.message}）` : ""}`);
       } else {
         parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
       }
@@ -1573,8 +1586,17 @@ function renderLxSourceList() {
     return;
   }
 
+  const saved = lxSavedActiveUrls();
   container.innerHTML = lxSourceList.map((item, idx) => {
     const isActive = !!item.active;
+    const wasActive = saved.has(item.url);
+    const configLabel = isActive !== wasActive
+      ? (isActive ? "待保存激活" : "待保存取消") : wasActive ? "已配置启用" : "未启用";
+    const runtime = ((lxRuntimeSnapshot || {}).sources || []).find((s) => s.url === item.url);
+    const status = runtime?.status || "unknown";
+    const runtimeLabel = lxRuntimeSnapshot?.state === "unavailable" ? "服务不可用"
+      : runtime ? (LX_SOURCE_STATUS_LABEL[status] || status) : wasActive ? "运行状态未知" : "未运行";
+    const runtimeError = runtime?.error || "";
     const displayName = escapeHtml(item.name || lxDefaultName(item.url));
     const safeUrl = escapeHtml(item.url);
     const btns = isActive
@@ -1587,9 +1609,11 @@ function renderLxSourceList() {
         <div class="lx-item-main">
           <div class="lx-item-header">
             <span class="lx-item-name">${displayName}</span>
-            ${isActive ? `<span class="lx-badge">已激活</span>` : ""}
+            ${isActive || wasActive ? `<span class="lx-badge">${configLabel}</span>` : `<span class="muted">${configLabel}</span>`}
+            <span class="chip"><span class="dot ${runtime && status === "success" ? "ok" : runtime && status === "failed" ? "err" : ""}"></span>${escapeHtml(runtimeLabel)}</span>
           </div>
           <div class="lx-item-url" title="${safeUrl}">${safeUrl}</div>
+          ${runtimeError ? `<div class="muted">${escapeHtml(runtimeError)}</div>` : ""}
         </div>
         <div class="lx-item-btns">${btns}</div>
       </div>`;

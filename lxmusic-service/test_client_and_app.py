@@ -1117,8 +1117,8 @@ def test_source_capabilities_union_of_enabled_sources():
 
             async def list_custom_sources(self):
                 return [
-                    {"id": "a.js", "name": "a", "enabled": True, "supportedSources": ["kw", "kg"]},
-                    {"id": "b.js", "name": "b", "enabled": True, "supportedSources": ["wy", "tx"]},
+                    {"id": "a.js", "name": "a", "enabled": True, "status": "success", "supportedSources": ["kw", "kg"]},
+                    {"id": "b.js", "name": "b", "enabled": True, "status": "success", "supportedSources": ["wy", "tx"]},
                     {"id": "c.js", "name": "c", "enabled": False, "supportedSources": ["mg"]},
                 ]
 
@@ -1144,9 +1144,9 @@ def test_describe_user_source_lists_all_enabled():
         class MultiClient:
             async def list_custom_sources(self):
                 return [
-                    {"id": "a.js", "name": "src-a", "enabled": True, "version": "1.0",
+                    {"id": "a.js", "name": "src-a", "enabled": True, "status": "success", "version": "1.0",
                      "supportedSources": ["kw", "kg"]},
-                    {"id": "b.js", "name": "src-b", "enabled": True, "version": "2.0",
+                    {"id": "b.js", "name": "src-b", "enabled": True, "status": "success", "version": "2.0",
                      "supportedSources": ["wy"]},
                     {"id": "c.js", "name": "src-c", "enabled": False, "version": "1.0",
                      "supportedSources": ["mg"]},
@@ -1191,6 +1191,129 @@ def test_source_capabilities_reflects_failed_status():
             assert "failed" in info["reason"]
     finally:
         lxapp.LXSERVER = orig_lx
+
+
+# ------------------------------------------------- issue #96：状态语义回归 --
+
+_BAD = {"id": "bad.js", "name": "bad", "enabled": True, "status": "failed",
+        "error": "script crashed", "supportedSources": ["kw"]}
+_GOOD = {"id": "good.js", "name": "good", "enabled": True, "status": "success",
+         "supportedSources": ["kw", "wy"]}
+
+
+def test_describe_aggregates_any_ready_source(monkeypatch):
+    """坏源排在首位也不能把其余健康源整体拖成"未加载"（issue #96 核心）。"""
+    from app import describe_user_source
+    import app as lxapp
+
+    class Fixed:
+        def __init__(self, sources):
+            self._sources = sources
+
+        async def list_custom_sources(self):
+            return self._sources
+
+    orig = lxapp.LXSERVER
+    try:
+        for label, sources in (("bad-first", [_BAD, _GOOD]), ("good-first", [_GOOD, _BAD])):
+            lxapp.LXSERVER = Fixed([dict(s) for s in sources])
+            desc = asyncio.run(describe_user_source())
+            assert desc["configured"] is True, label
+            assert desc["initialized"] is True, label
+            assert desc["state"] == "degraded", label
+            assert desc["ready_count"] == 1 and desc["failed_count"] == 1, label
+            assert "script crashed" in desc["last_error"], label
+            by_id = {s["id"]: s for s in desc["sources"]}
+            assert by_id["good.js"]["initialized"] is True, label
+            assert by_id["bad.js"]["initialized"] is False, label
+    finally:
+        lxapp.LXSERVER = orig
+
+
+def test_describe_reports_loading_when_status_missing():
+    """上游重载窗口缺 status：不得默认成功，应显示加载中。"""
+    from app import describe_user_source
+    import app as lxapp
+
+    class Reloading:
+        async def list_custom_sources(self):
+            return [{"id": "p.js", "name": "p", "enabled": True, "supportedSources": ["kw"]}]
+
+    orig = lxapp.LXSERVER
+    try:
+        lxapp.LXSERVER = Reloading()
+        desc = asyncio.run(describe_user_source())
+        assert desc["initialized"] is False
+        assert desc["state"] == "loading"
+        assert desc["pending_count"] == 1
+        assert desc["sources"][0]["status"] == "loading"
+    finally:
+        lxapp.LXSERVER = orig
+
+
+def test_source_info_reports_service_failure(test_app_client, fake_lx):
+    """源列表查询失败必须按服务故障返回，不能伪装成"未配置源"。"""
+    async def dead():
+        raise httpx.ConnectError("lxserver down")
+
+    fake_lx.list_custom_sources = dead
+    res = test_app_client.get("/api/v1/source")
+    assert res.status_code == 503
+    body = res.json()
+    assert body["category"] == "service_unavailable"
+    assert body["stage"] == "lxmusic_to_lxserver"
+    assert body["data"]["state"] == "unavailable"
+
+
+def test_activate_confirms_target_initialization_failure(test_app_client, fake_lx):
+    """toggle 成功但目标源初始化失败：不得返回激活成功。"""
+    async def failing(target, enabled):
+        s = fake_lx._find(target)
+        if s and enabled:
+            s["enabled"] = True
+            s["status"] = "failed"
+            s["error"] = "init timeout after 3000ms"
+            fake_lx.toggle_calls.append((s["id"], True))
+            return True
+        return await FakeLxServerClient.set_source_enabled(fake_lx, target, enabled)
+
+    fake_lx.set_source_enabled = failing
+    res = test_app_client.post("/api/v1/source", json={"url": "source2"})
+    assert res.status_code == 500
+    body = res.json()
+    assert body["category"] == "runtime"
+    assert "init timeout" in body["error"]
+
+
+def test_activate_pending_target_returns_504(test_app_client, fake_lx, monkeypatch):
+    """目标初始化结果一直待定：返回待确认而非假成功，也不误报脚本失败。"""
+    import app as lxapp
+    monkeypatch.setattr(lxapp, "SOURCE_INIT_CONFIRM_TIMEOUT", 0.3)
+    monkeypatch.setattr(lxapp, "SOURCE_INIT_POLL_INTERVAL", 0.05)
+
+    async def pending(target, enabled):
+        s = fake_lx._find(target)
+        if s and enabled:
+            s["enabled"] = True  # 保持无 status：模拟上游重载/初始化中
+            fake_lx.toggle_calls.append((s["id"], True))
+            return True
+        return await FakeLxServerClient.set_source_enabled(fake_lx, target, enabled)
+
+    fake_lx.set_source_enabled = pending
+    res = test_app_client.post("/api/v1/source", json={"url": "source2"})
+    assert res.status_code == 504
+    body = res.json()
+    assert body["category"] == "initialization_pending"
+    assert body["source_id"] == "source2"
+
+
+def test_reactivate_ready_source_skips_toggle(test_app_client, fake_lx):
+    """已启用且初始化成功的源重复激活：幂等直达确认，不再触发 toggle。"""
+    before = list(fake_lx.toggle_calls)
+    res = test_app_client.post("/api/v1/source", json={"url": "source1"})
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert fake_lx.toggle_calls == before
 
 
 

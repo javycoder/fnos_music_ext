@@ -46,9 +46,10 @@ class FakeLxServerClient:
     def __init__(self):
         self.alive = True
         # 模拟 lxserver users/source/_open/sources.json 的列表项字段（默认两个源、其一启用）
+        # status 语义与上游 v2.1.2 对齐：初始化完成后为 success/failed，重载窗口期缺失。
         self.sources = [
             {"id": "source1", "name": "test-src", "enabled": True, "version": "1.0.0",
-             "supportedSources": ["kw", "kg", "wy"]},
+             "status": "success", "supportedSources": ["kw", "kg", "wy"]},
             {"id": "source2", "name": "test-src-2", "enabled": False, "version": "1.0.0",
              "supportedSources": ["kw", "wy"]},
         ]
@@ -211,11 +212,19 @@ class FakeLxServerClient:
         }
 
     async def set_source_enabled(self, target_id_or_name: str, enabled: bool) -> bool:
-        """多源叠加语义：只改目标源启用态，不动其他源。目标不存在返回 False。"""
+        """多源叠加语义：只改目标源启用态，不动其他源。目标不存在返回 False。
+
+        与真实客户端契约对齐：已启用且初始化成功的源重复启用是幂等操作，
+        不重复下发 toggle（避免触发上游全组重载）。"""
         target = self._find(target_id_or_name)
         if not target:
             return False
+        if enabled and target.get("enabled") and target.get("status") == "success":
+            return True
         target["enabled"] = bool(enabled)
+        if enabled:
+            # 模拟上游初始化完成（真实实现需要轮询等待，这里立即置终态）
+            target["status"] = "success"
         self.toggle_calls.append((target["id"], bool(enabled)))
         return True
 

@@ -12,6 +12,9 @@ lxserver (XCQ0607/lxserver) HTTP API 客户端与数据映射层。
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from functools import wraps
+import inspect
 import json
 import logging
 import os
@@ -19,6 +22,7 @@ import re
 import tempfile
 import time
 from typing import Any
+import weakref
 
 import httpx
 
@@ -58,6 +62,95 @@ def is_lxserver_unreachable(exc: BaseException) -> bool:
         isinstance(exc, httpx.HTTPStatusError)
         and exc.response.status_code in _LXSERVER_UNAVAILABLE_STATUSES
     )
+
+
+class SourceOperationBusy(RuntimeError):
+    """另一任务正在修改或校验音源；调用方可映射为 HTTP 409。"""
+
+
+_SOURCE_OPERATION_WAIT_S = 0.1
+
+
+class _SourceManagementLock:
+    """当前事件循环内共享、按 Task 身份重入的管理锁。
+
+    不使用 ContextVar 记录 owner：新建 Task 会继承上下文，但不应继承锁权限。
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    async def acquire(self) -> bool:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("source management requires an asyncio task")
+        if self._owner is task:
+            self._depth += 1
+            return True
+        try:
+            # 在原 Task 中等待，保持 owner 身份；超时/取消不会遗留占锁任务。
+            async with asyncio.timeout(_SOURCE_OPERATION_WAIT_S):
+                await self._lock.acquire()
+        except TimeoutError as exc:
+            raise SourceOperationBusy("音源管理或校验正在进行，请稍后重试") from exc
+        self._owner = task
+        self._depth = 1
+        return True
+
+    def release(self) -> None:
+        if self._owner is not asyncio.current_task():
+            raise RuntimeError("source management lock can only be released by its owner")
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.release()
+
+
+# 弱引用同时避免 loop -> lock -> asyncio.Lock._loop 的保活环。
+# 上下文/调用栈在持锁和等待期间持有锁的强引用，空闲锁可安全回收。
+_MANAGEMENT_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _management_lock() -> _SourceManagementLock:
+    loop = asyncio.get_running_loop()
+    ref = _MANAGEMENT_LOCKS.get(loop)
+    lock = ref() if ref is not None else None
+    if lock is None:
+        lock = _SourceManagementLock()
+        _MANAGEMENT_LOCKS[loop] = weakref.ref(lock)
+    return lock
+
+
+@asynccontextmanager
+async def management_operation():
+    """串行化一次完整管理操作（含嵌套客户端调用和最终恢复）。"""
+    async with _management_lock():
+        yield
+
+
+def serialize_source_operation(operation):
+    """为 async 管理入口提供与客户端相同的 task 可重入锁域。"""
+    @wraps(operation)
+    async def serialized(*args, **kwargs):
+        async with management_operation():
+            return await operation(*args, **kwargs)
+
+    # FastAPI 会在 wrapper 的模块中解析字符串注解；提前在原函数作用域解析，
+    # 避免 app.Request 等类型只在 app 中导入时注册路由失败。
+    serialized.__signature__ = inspect.signature(operation, eval_str=True)
+    return serialized
 
 
 def normalize_source(src: str | None) -> str:
@@ -202,7 +295,6 @@ class LxServerClient:
         self.admin_password = admin_password
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
-        self._mgmt_lock: asyncio.Lock | None = None
         # songInfo 反查缓存: track_id -> songInfo dict
         self._song_info_cache: dict[str, dict] = {}
         self._cache_max = 2000
@@ -293,10 +385,9 @@ class LxServerClient:
                 self._song_info_cache.pop(k, None)
 
     @property
-    def mgmt_lock(self) -> asyncio.Lock:
-        if self._mgmt_lock is None:
-            self._mgmt_lock = asyncio.Lock()
-        return self._mgmt_lock
+    def mgmt_lock(self) -> _SourceManagementLock:
+        # 不缓存到实例：同一客户端可在多个 pytest/服务事件循环中复用。
+        return _management_lock()
 
     def song_list_lock(self, source: str) -> asyncio.Lock:
         src = normalize_source(source)
@@ -680,8 +771,9 @@ class LxServerClient:
             return data
         if isinstance(data, dict) and isinstance(data.get("sources"), list):
             return data["sources"]
-        return []
+        raise ValueError("lxserver custom-source/list returned invalid payload")
 
+    @serialize_source_operation
     async def import_custom_source(self, url: str) -> dict:
         """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。
 
@@ -697,6 +789,7 @@ class LxServerClient:
         data = self._parse_admin_resp(resp, "导入自定义源")
         return data
 
+    @serialize_source_operation
     async def upload_custom_source(self, filename: str, script_content: str) -> dict:
         """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。
 
@@ -711,6 +804,7 @@ class LxServerClient:
         )
         return self._parse_admin_resp(resp, "上传自定义源")
 
+    @serialize_source_operation
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
         """启用或禁用某音源（lxserver 端点键名为 enabled）。"""
         client = await self.get_client()
@@ -722,6 +816,7 @@ class LxServerClient:
         data = self._parse_admin_resp(resp, f"切换自定义源 {source_id}")
         return bool(data.get("success", True))
 
+    @serialize_source_operation
     async def delete_custom_source(self, source_id: str) -> bool:
         """删除某音源。"""
         client = await self.get_client()
@@ -763,5 +858,8 @@ class LxServerClient:
             target_id = str(target.get("id") or "")
             if not target_id:
                 return False
+            # enabled 仅表示配置；failed/error 源即使 enabled 仍须显式重试初始化。
+            if enabled and target.get("enabled") and target.get("status") == "success":
+                return True
             await self.toggle_custom_source(target_id, enabled)
             return True

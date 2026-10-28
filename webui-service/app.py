@@ -764,6 +764,32 @@ def _dumps_lx_list(items: list[dict]) -> str:
     return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
 
 
+def _lx_source_snapshot(snapshot: dict, *, unavailable: bool = False, error: str = "") -> dict:
+    """旧服务响应保守归一化；只有明确 success 才算源已初始化。"""
+    result = dict(snapshot)
+    sources = []
+    for entry in snapshot.get("sources") or []:
+        if not isinstance(entry, dict):
+            continue
+        source = dict(entry)
+        source["status"] = source.get("status") or "unknown"
+        source["initialized"] = source["status"] == "success"
+        sources.append(source)
+    ready = sum(s["status"] == "success" for s in sources)
+    failed = sum(s["status"] == "failed" for s in sources)
+    pending = len(sources) - ready - failed
+    state = ("unavailable" if unavailable else "degraded" if ready and (failed or pending)
+             else "ready" if ready else "loading" if pending else "failed" if failed
+             else "unconfigured")
+    result.update(sources=sources, initialized=bool(ready), ready_count=ready,
+                  failed_count=failed, pending_count=pending,
+                  state="unavailable" if unavailable else snapshot.get("state") or state)
+    if error:
+        result["error"] = error
+        result["last_error"] = snapshot.get("last_error") or error
+    return result
+
+
 async def _lx_enabled_sources(request: Request) -> list[dict]:
     resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
     data = _resp_json(resp)
@@ -1133,6 +1159,7 @@ async def api_status(request: Request):
     provider = current_provider(values)
     processes = supervisor_status()
     services: dict[str, dict] = {}
+    lx_snapshot = None
     for name, base in (("musicdl", CONF["musicdl_url"]), ("musicbox", CONF["musicbox_url"]),
                        ("lxmusic", CONF["lx_url"])):
         if name in PROVIDERS and name != provider:
@@ -1146,10 +1173,18 @@ async def api_status(request: Request):
             continue
         ok, data = await _fetch_json(request, f"{base}/healthz")
         services[name] = {"reachable": ok, "detail": data if ok else data.get("error", "")}
+        if name == "lxmusic" and isinstance(data.get("user_source"), dict):
+            lx_snapshot = data["user_source"]
     lx_source = None
     if provider == "lxmusic":
-        ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source")
-        lx_source = data.get("data") if ok else {"error": data.get("error", "unreachable")}
+        # healthz 已带同轮源快照时直接复用，避免再次 query 产生重复负载或状态竞态。
+        if lx_snapshot is not None:
+            lx_source = _lx_source_snapshot(lx_snapshot)
+        else:
+            ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source")
+            snapshot = data.get("data") if isinstance(data.get("data"), dict) else {}
+            lx_source = _lx_source_snapshot(snapshot, unavailable=not ok,
+                                             error=data.get("error", "unreachable") if not ok else "")
     return {
         "ok": True,
         "version": _read_version(),
@@ -1346,13 +1381,16 @@ async def api_config_put(body: ConfigBody, request: Request):
                       "category": "service_unavailable", "stage": "webui_to_lxmusic"}
         if not verify_ok:
             message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
-            if _is_service_unavailable(verify_status, report):
+            category = report.get("category") or (report.get("data") or {}).get("category")
+            protected = category in ("initialization_pending", "source_operation_busy", "internal")
+            if _is_service_unavailable(verify_status, report) or protected or verify_status >= 500 and not category:
+                category = category if protected and category != "internal" else "service_unavailable"
                 return JSONResponse(
-                    content={"ok": False, "error": f"洛雪音源服务不可用，未改动配置：{message}",
-                             "category": "service_unavailable",
+                    content={"ok": False, "error": f"洛雪音源暂未就绪，未改动配置：{message}",
+                             "category": category,
                              "stage": report.get("stage") or (report.get("data") or {}).get("stage")
                                       or "webui_to_lxmusic"},
-                    status_code=503,
+                    status_code=409 if category == "source_operation_busy" else 504 if category == "initialization_pending" else 503,
                 )
             if lx_reconcile:
                 disable_failed_source(url, message)
@@ -1422,34 +1460,45 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     async def _lx_source_post(payload: dict, source: str, op: str) -> str:
         api_payload: dict = {}
+        category = ""
         status_code = 0
+        target = None
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
                                      json=payload, timeout=130.0)
             api_payload = _resp_json(resp)
             status_code = resp.status_code
-            ok = resp.status_code == 200 and api_payload.get("ok", False)
-            err = "" if ok else (api_payload.get("error") or f"HTTP {resp.status_code}")
-            if ok and op == "activate":
+            data = api_payload.get("data") or {}
+            category = api_payload.get("category") or data.get("category") or ""
+            ok = resp.status_code == 200 and api_payload.get("ok") is True
+            err = "" if ok else (api_payload.get("error") or data.get("message") or f"HTTP {resp.status_code}")
+            if op == "activate":
                 sid = str(api_payload.get("source_id") or "")
-                for entry in (api_payload.get("data") or {}).get("sources") or []:
-                    if (sid and str(entry.get("id") or "") == sid) or entry.get("url") == payload.get("url"):
-                        if entry.get("initialized") is False or entry.get("status") == "failed":
-                            ok = False
-                            err = entry.get("error") or "源初始化失败"
-                        break
+                target = next((entry for entry in data.get("sources") or []
+                               if isinstance(entry, dict) and ((sid and str(entry.get("id") or "") == sid)
+                                  or entry.get("url") == payload.get("url"))), None)
+                if target and target.get("status") == "failed" and category not in (
+                        "service_unavailable", "source_operation_busy", "initialization_pending", "internal"):
+                    ok, category = False, "runtime"
+                    err = target.get("error") or err or "源初始化失败"
+                elif ok and (not target or target.get("status") != "success"):
+                    # source_id、initialized=true 或另一个成功源都不能证明目标已就绪。
+                    ok, category = False, "initialization_pending"
+                    err = "源初始化结果待定，请稍后查看运行状态"
+                elif not ok and not category:
+                    category = "service_unavailable" if status_code >= 500 else "initialization_pending"
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
-            api_payload = {"category": "service_unavailable", "stage": "webui_to_lxmusic"}
+            category = "service_unavailable"
+            api_payload = {"stage": "webui_to_lxmusic"}
         actions.append({"kind": "lx_activate", "op": op, "source": source,
                         "ok": ok, "error": err or ""})
-        if not ok and _is_service_unavailable(status_code, api_payload):
-            # 服务故障不代表脚本失效。
-            actions[-1]["category"] = "service_unavailable"
+        if not ok:
+            actions[-1]["category"] = category or "service_unavailable"
             actions[-1]["stage"] = (api_payload.get("stage")
                                      or (api_payload.get("data") or {}).get("stage")
                                      or "webui_to_lxmusic")
-        return str(api_payload.get("source_id") or "") if ok else ""
+        return str(api_payload.get("source_id") or (target or {}).get("id") or "") if ok else ""
 
     # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
     if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
@@ -1460,7 +1509,7 @@ async def api_config_put(body: ConfigBody, request: Request):
                                       str(item.get("name") or "") or url, "deactivate")
             target_ids: set[str] = set()
             activation_service_failed = any(
-                a.get("category") == "service_unavailable" for a in actions)
+                not a.get("ok") and a.get("category") not in ("runtime", "runtime_error") for a in actions)
             for item in active_items:
                 url = str(item["url"]).strip()
                 sid = await _lx_source_post({"url": url},
@@ -1468,13 +1517,12 @@ async def api_config_put(body: ConfigBody, request: Request):
                 if sid:
                     target_ids.add(sid)
                 if not actions[-1]["ok"]:
-                    if actions[-1].get("category") == "service_unavailable":
+                    if actions[-1].get("category") not in ("runtime", "runtime_error"):
                         activation_service_failed = True
-                        # 服务故障保留 active，且禁止后续清理实际源。
-                        # category 让前端区分「已自动取消激活」的真实停用路径。
+                        # 忙、初始化待定、通信故障均保留配置，不误删正在运行的源。
                         warnings.append({"source": str(item.get("name") or "") or url,
                                          "url": url, "message": actions[-1]["error"],
-                                         "category": "service_unavailable"})
+                                         "category": actions[-1].get("category") or "initialization_pending"})
                     else:
                         disable_failed_source(url, actions[-1]["error"])
                         actions[-1]["auto_disabled"] = True
