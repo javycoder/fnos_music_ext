@@ -2110,6 +2110,8 @@ def test_about_fields_and_disclaimer(about_env):
     assert rj["repo_url"] == "https://github.com/javycoder/fnos_music_ext"
     assert rj["issues_url"] == "https://github.com/javycoder/fnos_music_ext/issues"
     assert rj["donate"] is False  # 无 alipay.png 时不展示打赏
+    assert rj["donate_alipay"] is False
+    assert rj["donate_wechat"] is False
     assert rj["log_retention_days"] == 3
     # 免责声明解析：只取「免责与版权声明」小节的 bullet，到下一节截止
     titles = [d["title"] for d in rj["disclaimer"]]
@@ -2118,11 +2120,39 @@ def test_about_fields_and_disclaimer(about_env):
     assert all("[" not in t for t in titles)  # markdown 链接已剥离
 
 
+@pytest.mark.parametrize("wechat_exists,alipay_exists,expected_donate,expected_alipay,expected_wechat", [
+    (False, False, False, False, False),
+    (True, True, True, True, True),
+    (True, False, False, False, True),
+    (False, True, True, True, False),
+])
+def test_about_donate_four_combinations(about_env, wechat_exists, alipay_exists, expected_donate, expected_alipay, expected_wechat):
+    alipay_file = about_env / "static" / "alipay.png"
+    wechat_file = about_env / "static" / "wechat.png"
+    if alipay_exists:
+        alipay_file.write_bytes(b"\x89PNG fake_alipay")
+    elif alipay_file.exists():
+        alipay_file.unlink()
+    if wechat_exists:
+        wechat_file.write_bytes(b"\x89PNG fake_wechat")
+    elif wechat_file.exists():
+        wechat_file.unlink()
+
+    with authed_client() as client:
+        r = client.get("/api/about")
+    assert r.status_code == 200
+    rj = r.json()
+    assert rj["donate"] is expected_donate
+    assert rj["donate_alipay"] is expected_alipay
+    assert rj["donate_wechat"] is expected_wechat
+
+
 def test_about_donate_true_when_qr_exists(about_env):
     (about_env / "static" / "alipay.png").write_bytes(b"\x89PNG fake")
     with authed_client() as client:
         r = client.get("/api/about")
     assert r.json()["donate"] is True
+    assert r.json()["donate_alipay"] is True
 
 
 def test_about_requires_admin(about_env):

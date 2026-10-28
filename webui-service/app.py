@@ -1948,15 +1948,19 @@ class _LogExportResponse(FileResponse):
 @app.get("/api/about")
 async def api_about():
     values = read_env()
+    donate_alipay = (STATIC_DIR / "alipay.png").is_file()
+    donate_wechat = (STATIC_DIR / "wechat.png").is_file()
     return {
         "ok": True,
         "version": _read_version(),
         "deploy_mode": values.get("FNMUSIC_DEPLOY_MODE", "docker"),
         **ABOUT,
         "disclaimer": _read_disclaimer(),
-        # 打赏二维码是包内可选资源（CI 从 ALIPAY_QRCODE secret 生成）；
+        # 打赏二维码是包内可选资源（CI 从 ALIPAY_QRCODE / WECHAT_QRCODE secret 生成）；
         # 开源发布包不带此文件，此时不展示打赏卡片
-        "donate": (STATIC_DIR / "alipay.png").is_file(),
+        "donate": donate_alipay,
+        "donate_alipay": donate_alipay,
+        "donate_wechat": donate_wechat,
         "logs": _log_files_info(),
         "log_retention_days": RETENTION_DAYS,
     }

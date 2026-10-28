@@ -254,6 +254,7 @@ class TestPayload:
         retained = (
             "lxmusic-service/verify_source.py", "container/lxserver_compat.py",
             "proxy/app.py", "webui-service/static/app.js", ".env.example",
+            "webui-service/static/wechat.png", "webui-service/static/alipay.png",
             "container/config.json",
         )
         for rel in (*excluded, *retained):

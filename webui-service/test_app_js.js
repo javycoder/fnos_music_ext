@@ -16,9 +16,16 @@ const vm = require("node:vm");
 function stubEl() {
   const classes = new Set();
   const listeners = {};
+  const attrs = new Map();
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
-    checked: false, disabled: false, src: "", dataset: {}, _t: null, style: {},
+    checked: false, disabled: false, dataset: {}, _t: null, style: {},
+    get src() { return attrs.get("src") || ""; },
+    set src(v) { attrs.set("src", String(v)); },
+    hasAttribute(name) { return attrs.has(name); },
+    getAttribute(name) { return attrs.has(name) ? attrs.get(name) : null; },
+    setAttribute(name, v) { attrs.set(name, String(v)); },
+    removeAttribute(name) { attrs.delete(name); },
     classList: {
       add(...c) { c.forEach((x) => classes.add(x)); },
       remove(...c) { c.forEach((x) => classes.delete(x)); },
@@ -44,9 +51,10 @@ function stubEl() {
     // 绑到元素上，元素必须终身同一个对象（真实 DOM 亦如此），不能整体换新
     _resetState() {
       classes.clear();
+      attrs.clear();
       this.hidden = false; this.textContent = ""; this.innerHTML = "";
       this.className = ""; this.value = ""; this.checked = false;
-      this.disabled = false; this.src = ""; this.dataset = {}; this._t = null;
+      this.disabled = false; this.dataset = {}; this._t = null;
     },
     querySelectorAll() { return []; },
     get content() { return { cloneNode: () => ({ nodeName: "help-content" }) }; },
@@ -839,6 +847,134 @@ test("loadAbout：donate=true 展示打赏卡片并指向静态二维码", async
   );
   // 解析不到免责声明时隐藏该卡片
   assert.strictEqual(global.document.querySelector("#about-disclaimer-card").hidden, true);
+});
+
+test("loadAbout：旧接口兼容 donate=true（仅支付宝，微信不请求）", async () => {
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "native",
+    disclaimer: [], donate: true, logs: [], log_retention_days: 3,
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, false);
+  assert.strictEqual(global.document.querySelector("#about-donate-alipay").hidden, false);
+  assert.strictEqual(
+    global.document.querySelector("#about-donate-img").getAttribute("src"),
+    "/app/fnmusic-ext/static/alipay.png",
+  );
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat-img").hasAttribute("src"), false);
+});
+
+test("loadAbout：四组合显隐与二维码请求行为", async () => {
+  const cases = [
+    {
+      name: "双无：无码全隐藏且不请求任何图片",
+      payload: { donate: false, donate_alipay: false, donate_wechat: false },
+      expectCard: true, expectWechat: true, expectAlipay: true,
+      wechatHasSrc: false, alipayHasSrc: false,
+    },
+    {
+      name: "双有：双码均显示且指向对应静态图片",
+      payload: { donate: true, donate_alipay: true, donate_wechat: true },
+      expectCard: false, expectWechat: false, expectAlipay: false,
+      wechatHasSrc: true, alipayHasSrc: true,
+      expectWechatSrc: "/app/fnmusic-ext/static/wechat.png",
+      expectAlipaySrc: "/app/fnmusic-ext/static/alipay.png",
+    },
+    {
+      name: "仅微信：微信显示有码，支付宝隐藏且不请求",
+      payload: { donate: false, donate_alipay: false, donate_wechat: true },
+      expectCard: false, expectWechat: false, expectAlipay: true,
+      wechatHasSrc: true, alipayHasSrc: false,
+      expectWechatSrc: "/app/fnmusic-ext/static/wechat.png",
+    },
+    {
+      name: "仅支付宝：支付宝显示有码，微信隐藏且不请求",
+      payload: { donate: true, donate_alipay: true, donate_wechat: false },
+      expectCard: false, expectWechat: true, expectAlipay: false,
+      wechatHasSrc: false, alipayHasSrc: true,
+      expectAlipaySrc: "/app/fnmusic-ext/static/alipay.png",
+    },
+  ];
+
+  for (const c of cases) {
+    enqueue("/app/fnmusic-ext/api/about", {
+      ok: true, version: "2.8.0e", deploy_mode: "native",
+      disclaimer: [], ...c.payload, logs: [], log_retention_days: 3,
+    });
+    await global.loadAbout();
+    assert.strictEqual(
+      global.document.querySelector("#about-donate").hidden,
+      c.expectCard,
+      `${c.name} - #about-donate hidden 期望 ${c.expectCard}`,
+    );
+    assert.strictEqual(
+      global.document.querySelector("#about-donate-wechat").hidden,
+      c.expectWechat,
+      `${c.name} - #about-donate-wechat hidden 期望 ${c.expectWechat}`,
+    );
+    assert.strictEqual(
+      global.document.querySelector("#about-donate-alipay").hidden,
+      c.expectAlipay,
+      `${c.name} - #about-donate-alipay hidden 期望 ${c.expectAlipay}`,
+    );
+    const wechatImg = global.document.querySelector("#about-donate-wechat-img");
+    const alipayImg = global.document.querySelector("#about-donate-img");
+    assert.strictEqual(
+      wechatImg.hasAttribute("src"),
+      c.wechatHasSrc,
+      `${c.name} - 微信图片 src 属性存在性期望 ${c.wechatHasSrc}`,
+    );
+    if (c.wechatHasSrc) {
+      assert.strictEqual(wechatImg.getAttribute("src"), c.expectWechatSrc);
+    }
+    assert.strictEqual(
+      alipayImg.hasAttribute("src"),
+      c.alipayHasSrc,
+      `${c.name} - 支付宝图片 src 属性存在性期望 ${c.alipayHasSrc}`,
+    );
+    if (c.alipayHasSrc) {
+      assert.strictEqual(alipayImg.getAttribute("src"), c.expectAlipaySrc);
+    }
+  }
+});
+
+test("loadAbout：重复 load 清除隐藏图片 src 防止无效请求或残留", async () => {
+  const wechatImg = global.document.querySelector("#about-donate-wechat-img");
+  const alipayImg = global.document.querySelector("#about-donate-img");
+
+  // 1. 第一次 load：双码全有
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: true, donate_alipay: true, donate_wechat: true, logs: [],
+  });
+  await global.loadAbout();
+  assert.strictEqual(wechatImg.getAttribute("src"), "/app/fnmusic-ext/static/wechat.png");
+  assert.strictEqual(alipayImg.getAttribute("src"), "/app/fnmusic-ext/static/alipay.png");
+
+  // 2. 第二次 load：仅微信，支付宝隐藏并清除 src（无 src 属性）
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: false, donate_alipay: false, donate_wechat: true, logs: [],
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, false);
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat").hidden, false);
+  assert.strictEqual(wechatImg.getAttribute("src"), "/app/fnmusic-ext/static/wechat.png");
+  assert.strictEqual(global.document.querySelector("#about-donate-alipay").hidden, true);
+  assert.strictEqual(alipayImg.hasAttribute("src"), false, "支付宝二维码隐藏时必须移除 src 属性以防发起请求");
+
+  // 3. 第三次 load：双无，全部隐藏且两者 src 均被清除
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: false, donate_alipay: false, donate_wechat: false, logs: [],
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-donate-alipay").hidden, true);
+  assert.strictEqual(wechatImg.hasAttribute("src"), false, "双无时微信图片不得保留 src 属性");
+  assert.strictEqual(alipayImg.hasAttribute("src"), false, "双无时支付宝图片不得保留 src 属性");
 });
 
 test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async () => {

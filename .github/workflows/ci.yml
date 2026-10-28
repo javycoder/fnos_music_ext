@@ -36,7 +36,7 @@ jobs:
         run: >
           python -m pip install -r proxy/requirements.txt
           -r webui-service/requirements.txt
-          pytest pytest-asyncio mutagen qrcode pillow PyYAML pytest-cov
+          pytest pytest-asyncio mutagen qrcode pillow zxing-cpp PyYAML pytest-cov
 
       - name: Shell script syntax check
         run: |
@@ -76,6 +76,7 @@ jobs:
     env:
       # secrets 不能用于 steps.if，先映射到 job 级 env（同 release.yml GITEE_TOKEN 模式）
       ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
+      WECHAT_QRCODE: ${{ secrets.WECHAT_QRCODE }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,9 +88,12 @@ jobs:
         env:
           FNPACK_VERSION: "1.2.3"
 
-      # 打赏二维码不入库：配置了 ALIPAY_QRCODE secret（收款链接）时现场生成
-      # PNG 打进包里（二维码中心叠加支付宝徽标，scripts/gen_alipay_qr.py）；
-      # 未配置则跳过，运行时 WebUI 自动隐藏打赏卡片
+      # 二维码图片不入库：按各自 Secret 独立生成，未配置的渠道在 WebUI 隐藏。
+      # 微信中心复用 FPK 图标，不需要中文字体。
+      - name: Install donation QR dependencies (optional)
+        if: env.ALIPAY_QRCODE != '' || env.WECHAT_QRCODE != ''
+        run: python3 -m pip install --quiet qrcode pillow
+
       - name: Install CJK font for QR badge (best-effort)
         if: env.ALIPAY_QRCODE != ''
         run: sudo apt-get install -y --no-install-recommends fonts-noto-cjk || true
@@ -97,8 +101,14 @@ jobs:
       - name: Generate Alipay QR code (optional)
         if: env.ALIPAY_QRCODE != ''
         run: |
-          python3 -m pip install --quiet qrcode pillow
           python3 scripts/gen_alipay_qr.py
+          test -s webui-service/static/alipay.png
+
+      - name: Generate WeChat QR code (optional)
+        if: env.WECHAT_QRCODE != ''
+        run: |
+          python3 scripts/gen_wechat_qr.py
+          test -s webui-service/static/wechat.png
 
       - name: Build fpk package
         run: |
@@ -124,6 +134,7 @@ jobs:
             tar -tzf "$app_tmp/app.tgz" | grep -qx "$path" || {
               echo "ERROR: app.tgz 缺少 $path" >&2; exit 1; }
           done
+          python3 scripts/check_donate_assets.py "$fpk_file"
           ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
 
 

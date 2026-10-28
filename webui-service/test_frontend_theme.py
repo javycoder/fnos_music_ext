@@ -123,3 +123,39 @@ def test_pages_share_centered_content_width_and_save_bar_alignment():
 @pytest.mark.parametrize("filename", ["theme-boot.js", "app.js"])
 def test_theme_preference_key_matches_boot_and_app(filename):
     assert '"fnmusic-theme"' in (STATIC / filename).read_text(encoding="utf-8")
+
+
+def test_about_donate_dom_order_and_ids():
+    """关于页打赏区 DOM 顺序微信在先，ID 兼容与徽章契约。"""
+    tags = elements()
+    wechat_idx = next(i for i, (tag, attrs) in enumerate(tags)
+                      if tag == "div" and attrs.get("id") == "about-donate-wechat")
+    alipay_idx = next(i for i, (tag, attrs) in enumerate(tags)
+                      if tag == "div" and attrs.get("id") == "about-donate-alipay")
+    assert wechat_idx < alipay_idx, "DOM 顺序必须微信在先、支付宝在后"
+
+    ids = {attrs.get("id") for _, attrs in tags if "id" in attrs}
+    assert "about-donate-wechat-img" in ids
+    assert "about-donate-img" in ids, "支付宝图片必须保持原 about-donate-img 以保证向后兼容"
+
+    wechat_badge = next(attrs for tag, attrs in tags
+                        if attrs.get("class") and "about-donate-badge" in attrs["class"] and "wechat" in attrs["class"])
+    assert wechat_badge is not None
+
+
+def test_about_donate_css_constraints():
+    """双码左右不换行、弹性不溢出、微信绿徽章与二维码白底不受主题反色约束。"""
+    grid = blocks(".about-donate-grid")[0]
+    assert "display: flex" in grid
+    assert "justify-content: center" in grid
+    assert "flex-wrap: wrap" not in grid, "双码窄屏必须保持左右并排不换行"
+
+    item = blocks(".about-donate-item")[0]
+    assert "min-width: 0" in item, "必须声明 min-width: 0 防止窄屏内容溢出"
+    assert "flex:" in item
+
+    badge_wechat = blocks(".about-donate-badge.wechat")[0]
+    assert "#07c160" in badge_wechat, "微信徽章必须使用绿色"
+
+    donate_img = blocks(".about-donate-img")[0]
+    assert "background: #fff" in donate_img, "二维码图片必须保持白底不受主题反色"

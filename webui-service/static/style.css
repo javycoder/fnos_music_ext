@@ -299,18 +299,33 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 .about-disclaimer b { color: var(--text); font-weight: 600; }
 #about-logs { margin: 8px 0; }
 .about-donate { text-align: center; }
+.about-donate-grid {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 20px;
+  max-width: 100%;
+}
+.about-donate-item {
+  flex: 0 1 300px;
+  min-width: 0;
+  text-align: center;
+}
 .about-donate-img {
   /* 收款码同样保持白底 */
-  width: 300px; max-width: 82vw; height: auto; display: block; margin: 8px auto 0;
+  width: 100%; max-width: 300px; height: auto; display: block; margin: 8px auto 0;
   border: 1px solid var(--line); border-radius: 8px; background: #fff;
+  box-sizing: border-box;
 }
-/* 收款渠道标注：裸二维码曾被反馈无法辨认是支付宝（徽标配色随支付宝品牌蓝） */
-.about-donate-note { margin: 10px 0 2px; color: var(--muted); font-size: 13px; }
+/* 收款渠道标注：徽标配色微信绿与支付宝蓝 */
+.about-donate-note { margin: 10px 0 2px; color: var(--muted); font-size: 13px; word-break: break-word; }
 .about-donate-badge {
   display: inline-block; padding: 2px 12px; margin-right: 8px;
   border-radius: 999px; background: #1677ff; color: #fff;
   font-size: 13px; font-weight: 600; line-height: 20px; vertical-align: 1px;
 }
+.about-donate-badge.wechat { background: #07c160; }
+.about-donate-badge.alipay { background: #1677ff; }
 
 /* -------------------------------------------------- 新版本提示/弹窗 */
 /* 有新版本时"关于"入口红点常亮，不因查看而清除 */
@@ -326,7 +341,7 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 /* 这些元素靠 hidden 属性切换显隐：类规则里的 display 声明会压过 UA 样式表的
    [hidden]{display:none}（作者样式优先于 UA 样式），必须显式补回，否则弹窗常显
    遮罩盖住整页、点取消也关不掉。 */
-#about-new[hidden], .nav-dot[hidden], .modal-mask[hidden] { display: none; }
+#about-new[hidden], .nav-dot[hidden], .modal-mask[hidden], .about-donate-item[hidden] { display: none; }
 .modal-mask {
   position: fixed; inset: 0; z-index: 50;  /* 低于 toast(60)，报错可见 */
   background: var(--overlay);
@@ -428,4 +443,7 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   .lx-item { flex-direction: column; align-items: stretch; gap: 8px; }
   .lx-item-btns { justify-content: flex-end; }
   #qr-img { width: min(220px, 72vw); height: auto; aspect-ratio: 1; }
+  .about-donate-grid { gap: 10px; }
+  .about-donate-note { font-size: 12px; }
+  .about-donate-badge { padding: 1px 8px; font-size: 12px; margin-right: 4px; }
 }

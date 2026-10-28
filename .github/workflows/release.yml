@@ -26,8 +26,9 @@ jobs:
     outputs:
       formal: ${{ steps.release-kind.outputs.formal }}
     env:
-      # 打赏收款链接（可选）：配置后发布包内自动生成支付宝二维码
+      # 打赏二维码文本（可选）：两个渠道独立生成，不把文本或图片提交到仓库
       ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
+      WECHAT_QRCODE: ${{ secrets.WECHAT_QRCODE }}
       # push 触发时为被推的 tag；dispatch 补发时为输入的 tag
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
@@ -45,7 +46,7 @@ jobs:
 
       - name: Run packaging tests
         run: |
-          python -m pip install pytest qrcode pillow
+          python -m pip install pytest qrcode pillow zxing-cpp PyYAML
           python -m pytest packaging/tests/
 
       - name: Download fnpack
@@ -56,9 +57,12 @@ jobs:
         env:
           FNPACK_VERSION: "1.2.3"
 
-      # 打赏二维码不入库：配置了 ALIPAY_QRCODE secret（收款链接）时现场生成
-      # PNG 打进发布包（二维码中心叠加支付宝徽标，scripts/gen_alipay_qr.py）；
-      # 未配置则跳过（开源发布形态，运行时自动隐藏打赏卡片）
+      # 二维码图片不入库：按各自 Secret 独立生成，未配置的渠道在 WebUI 隐藏。
+      # 微信中心复用 FPK 图标，不需要中文字体。
+      - name: Install donation QR dependencies (optional)
+        if: env.ALIPAY_QRCODE != '' || env.WECHAT_QRCODE != ''
+        run: python3 -m pip install --quiet qrcode pillow
+
       - name: Install CJK font for QR badge (best-effort)
         if: env.ALIPAY_QRCODE != ''
         run: sudo apt-get install -y --no-install-recommends fonts-noto-cjk || true
@@ -66,13 +70,22 @@ jobs:
       - name: Generate Alipay QR code (optional)
         if: env.ALIPAY_QRCODE != ''
         run: |
-          python3 -m pip install --quiet qrcode pillow
           python3 scripts/gen_alipay_qr.py
+          test -s webui-service/static/alipay.png
+
+      - name: Generate WeChat QR code (optional)
+        if: env.WECHAT_QRCODE != ''
+        run: |
+          python3 scripts/gen_wechat_qr.py
+          test -s webui-service/static/wechat.png
 
       - name: Build fpk package
         run: |
           ./packaging/fpk/build.sh
           ls -la dist/
+
+      - name: Verify donation assets in fpk
+        run: python3 scripts/check_donate_assets.py dist/fnmusic-ext-*.fpk
 
       - name: Extract changelog for this version
         run: |

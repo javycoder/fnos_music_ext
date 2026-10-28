@@ -1974,13 +1974,31 @@ async function loadAbout() {
   logs.innerHTML = files.length
     ? files.map((f) => `<span class="state-line"><span class="dot ok"></span>${escapeHtml(f.name)} · ${fmtBytes(f.size)}</span>`).join("")
     : '<span class="muted">暂无日志文件</span>';
-  // 打赏二维码是打包时的可选资源（CI 从 ALIPAY_QRCODE 生成）；开源发布包里没有则不展示
+  // 打赏二维码是打包时的可选资源（CI 从 WECHAT_QRCODE / ALIPAY_QRCODE 生成）；开源发布包里没有则不展示
   const donate = $("#about-donate");
-  if (info.donate) {
-    donate.hidden = false;
-    $("#about-donate-img").src = `${APP_BASE}/static/alipay.png`;
+  const wechatWrap = $("#about-donate-wechat");
+  const alipayWrap = $("#about-donate-alipay");
+  const wechatImg = $("#about-donate-wechat-img");
+  const alipayImg = $("#about-donate-img");
+
+  const hasWechat = Boolean(info.donate_wechat);
+  const hasAlipay = info.donate_alipay !== undefined
+    ? Boolean(info.donate_alipay)
+    : Boolean(info.donate);
+
+  donate.hidden = !hasWechat && !hasAlipay;
+  wechatWrap.hidden = !hasWechat;
+  if (hasWechat) {
+    wechatImg.src = `${APP_BASE}/static/wechat.png`;
   } else {
-    donate.hidden = true;
+    wechatImg.removeAttribute("src");
+  }
+
+  alipayWrap.hidden = !hasAlipay;
+  if (hasAlipay) {
+    alipayImg.src = `${APP_BASE}/static/alipay.png`;
+  } else {
+    alipayImg.removeAttribute("src");
   }
   // 进入关于页顺带刷新检查更新（后端有 TTL 缓存，命中不出网）
   checkUpdate();
