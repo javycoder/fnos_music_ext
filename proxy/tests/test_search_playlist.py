@@ -290,6 +290,10 @@ async def test_track_list_failure_degrades_to_empty(client, monkeypatch):
     async def fail_tracks(state, entry_, build_track):
         raise RuntimeError("source unavailable")
 
+    # dev 的按用户 selection 门槛：空 selection 对任何用户返回 False → 提前 -1；
+    # 本用例只关注"拉取失败降级"，放行 selection
+    monkeypatch.setattr(p.pubpl, "selection_allows",
+                        lambda conf, user_guid, entry_: True)
     monkeypatch.setattr(p.pubpl, "load_tracks", fail_tracks)
     # detail 端点响应不受影响
     r = client.get(f"/music/api/v1/track/playlist-detail/list?guid={guid}")
