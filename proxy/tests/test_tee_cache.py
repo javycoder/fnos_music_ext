@@ -24,10 +24,6 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setitem(p.CONF, "music_db", str(tmp_path / "missing.db"))
     monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
     monkeypatch.setitem(p.CONF, "tee_save_dir", "")
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "auto")
-    monkeypatch.setitem(p.CONF, "download_layout", "flat")
-    monkeypatch.setenv("FNMUSIC_TEE_SAVE_MODE", "auto")
-    monkeypatch.setattr(p, "_TEE_STAGED_CACHE", {})
     monkeypatch.setitem(p.CONF, "tee_cache_max", 2)
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", False)
     monkeypatch.setattr(p, "_TEE_SAVE_DIR_WARNED", False)
@@ -807,203 +803,278 @@ def test_lyric_judgment_uses_lyric_target_dir_not_tee_dir(tmp_path, monkeypatch)
 
 
 @pytest.mark.anyio
-async def test_staged_stream_downloads_only_into_local_staging(monkeypatch):
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    guid = "online:kuwo:staged-stream"
+async def test_library_scan_config_body_and_headers(monkeypatch):
+    """「路径|JSON体」配置：请求带 JSON body 与 content-type；凭证头（含
+    authx 新鲜签名）原样透传。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path",
+                        '/music/api/v1/shared-library/scan|{"guid":"64d1b8ca"}')
+    posts = []
 
-    class InspectAudio(Audio):
-        async def __aiter__(self):
-            remote_parts = [name for name in os.listdir(p.CONF["library_dir"])
-                            if name.endswith(".part")]
-            assert remote_parts == []
-            stage = p.staged_dir()
-            assert any(name.endswith(".part") for name in os.listdir(stage))
-            yield self.payload
+    class ScanTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({
+                "path": request.url.path,
+                "body": request.content.decode("utf-8"),
+                "ctype": request.headers.get("content-type"),
+                "cookie": request.headers.get("cookie"),
+                "authx": request.headers.get("authx"),
+            })
+            return httpx.Response(200, json={"code": 0})
 
-    await listen(guid, ext="mp3", response=httpx.Response(200, stream=InspectAudio()))
-    dest = p.recalled_media_path(guid)
-    assert dest and open(dest, "rb").read() == b"A" * 4096
-    assert os.listdir(p.staged_dir()) == []
-
-
-@pytest.mark.parametrize("interrupted", [False, True])
-def test_staged_upload_cleans_partial_final_name(tmp_path, monkeypatch, interrupted):
-    source, target = tmp_path / "source.mp3", tmp_path / "target.mp3"
-    source.write_bytes(b"A" * 4096)
-
-    def partial_copy(source_file, target_file):
-        target_file.write(source_file.read(10))
-        if interrupted:
-            raise OSError("connection lost")
-
-    monkeypatch.setattr(p.shutil, "copyfileobj", partial_copy)
-    assert p._upload_staged_file(str(source), str(target)) is False
-    assert not target.exists()
-    assert source.read_bytes() == b"A" * 4096
-
-
-def test_staged_upload_never_overwrites_racing_user_file(tmp_path, monkeypatch):
-    import builtins
-
-    source, target = tmp_path / "source.mp3", tmp_path / "target.mp3"
-    source.write_bytes(b"A" * 4096)
-    real_open = builtins.open
-
-    def racing_open(path, mode="r", *args, **kwargs):
-        if str(path) == str(target) and mode == "xb":
-            target.write_bytes(b"user-owned")
-        return real_open(path, mode, *args, **kwargs)
-
-    monkeypatch.setattr(p, "open", racing_open, raising=False)
-    assert p._upload_staged_file(str(source), str(target)) is False
-    assert target.read_bytes() == b"user-owned"
+    client = httpx.AsyncClient(transport=ScanTransport(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        headers = {"cookie": "music-token=tok123", "authx": "nonce=1&timestamp=2&sign=abc"}
+        p._schedule_library_scan(headers)
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert len(posts) == 1
+        sent = posts[0]
+        assert sent["path"] == "/music/api/v1/shared-library/scan"
+        assert sent["body"] == '{"guid":"64d1b8ca"}'
+        assert sent["ctype"] == "application/json"
+        assert sent["cookie"] == "music-token=tok123"
+        assert sent["authx"] == "nonce=1&timestamp=2&sign=abc"
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.anyio
-async def test_staged_failure_retains_cache_and_retries_without_false_success(monkeypatch):
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    guid = "online:kuwo:retry-staged"
-    metadata = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}
-    original_upload = p._upload_staged_file
-    monkeypatch.setattr(p, "_upload_staged_file", lambda *args: False)
-    scans, bindings, finalized = [], [], []
-    monkeypatch.setattr(p, "_schedule_library_scan", lambda *a: scans.append(a))
-    monkeypatch.setattr(p, "_dispatch_official_binding", lambda *a: bindings.append(a))
+async def test_library_scan_legacy_path_without_body(monkeypatch):
+    """旧格式（纯路径无竖线）：POST 无 body，不设 content-type。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/shared-library/scan")
+    posts = []
 
-    async def post_finalize(meta):
-        finalized.append(meta)
+    class ScanTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({"body": request.content, "ctype": request.headers.get("content-type")})
+            return httpx.Response(200, json={"code": 0})
 
-    await listen(guid, ext="mp3", info=metadata, post_finalize=post_finalize)
-    cached = p.find_cache_file(guid)
-    assert cached and open(cached, "rb").read() == b"A" * 4096
-    assert p._is_deferred_cache_file(guid, cached)
-    assert audio_files(p.CONF["library_dir"]) == []
-    assert scans == bindings == finalized == []
-    assert os.listdir(p.staged_dir()) == []
+    client = httpx.AsyncClient(transport=ScanTransport(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert posts[0]["body"] == b""
+        assert posts[0]["ctype"] is None
+    finally:
+        await client.aclose()
 
-    monkeypatch.setattr(p, "_upload_staged_file", original_upload)
-    monkeypatch.setattr(p, "_tee_metadata_fallback",
-                        lambda *a, **kw: ("晴天", "周杰伦", "叶惠美"))
-    await p._promote_deferred_cache({}, guid, cached)
-    dest = p.recalled_media_path(guid)
-    assert dest and dest != cached and open(dest, "rb").read() == b"A" * 4096
-    assert not os.path.exists(cached)
-    assert len(scans) == len(bindings) == 1
+
+def test_scan_config_parsing():
+    """配置解析：三态（空/纯路径/路径|JSON），空白容错。"""
+    monkey = p.CONF
+    monkey["library_scan_path"] = ""
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "/music/api/v1/x"
+    assert p._scan_config() == ("/music/api/v1/x", "")
+    monkey["library_scan_path"] = ' /music/api/v1/x | {"guid":"g1"} '
+    assert p._scan_config() == ("/music/api/v1/x", '{"guid":"g1"}')
+    monkey["library_scan_path"] = "/p|"
+    assert p._scan_config() == ("/p", "")
 
 
 @pytest.mark.anyio
-async def test_staged_background_upload_failure_enters_retry_cooldown(monkeypatch):
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    guid = "online:kuwo:background-failure"
-    payload = b"F" * 4096
+async def test_scan_delay_zero_fires_immediately(monkeypatch):
+    """延迟 0=立即发（不等合并窗口）；冷却 0=仅本请求不重复。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x|{}")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 0)
+    posts = []
 
-    async def fake_open(*args, **kwargs):
-        resp = httpx.Response(200, stream=Whole(payload),
-                              headers={"content-length": str(len(payload))})
-        return resp, None, "mp3", {"title": "晴天", "artist": "周杰伦"}, Done(), payload
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
 
-    monkeypatch.setattr(p, "_open_online_stream", fake_open)
-    monkeypatch.setattr(p, "_upload_staged_file", lambda *args: False)
-    monkeypatch.setattr(p, "_schedule_library_scan",
-                        lambda *args: pytest.fail("failed upload must not trigger scan"))
-    monkeypatch.setattr(p, "_dispatch_official_binding",
-                        lambda *args: pytest.fail("failed upload must not bind"))
-    await p._full_fetch_download(guid, {})
-    assert guid in p._full_fetch_failed
-    cached = p.find_cache_file(guid)
-    assert cached and open(cached, "rb").read() == payload
-    assert audio_files(p.CONF["library_dir"]) == []
-    assert os.listdir(p.staged_dir()) == []
-
-
-@pytest.mark.parametrize("layout", ["flat", "artist", "album", "artist_album"])
-def test_staged_install_respects_download_layout_and_reuses_file(tmp_path, monkeypatch, layout):
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    monkeypatch.setitem(p.CONF, "download_layout", layout)
-    parts = {
-        "flat": (),
-        "artist": ("周杰伦",),
-        "album": ("叶惠美",),
-        "artist_album": ("周杰伦", "叶惠美"),
-    }
-    original = tmp_path / "original.part"
-    original.write_bytes(b"A" * 4096)
-    dest, reused = p._install_library_audio(
-        str(original), "online:kuwo:layout", "mp3", "晴天", "周杰伦", "叶惠美", {})
-    assert dest == os.path.join(p.CONF["library_dir"], *parts[layout], "周杰伦 - 晴天.mp3")
-    assert not reused
-    assert not original.exists()
-    original.write_bytes(b"B" * 8192)
-    monkeypatch.setattr(p, "write_audio_tags",
-                        lambda *args: pytest.fail("reused audio must not be retagged"))
-    again, reused = p._install_library_audio(
-        str(original), "online:netease:layout", "mp3", "晴天", "周杰伦", "叶惠美", {})
-    assert again == dest and reused
-    assert open(dest, "rb").read() == b"A" * 4096
-    assert not original.exists()
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        t0 = time.monotonic()
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        elapsed = time.monotonic() - t0
+        assert posts == ["/music/api/v1/x"]
+        assert elapsed < 1.0  # 立即发，未等 3 秒默认延迟
+    finally:
+        await client.aclose()
 
 
-def test_staged_tasks_use_independent_work_files_and_preserve_failed_source(tmp_path, monkeypatch):
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    first, second = tmp_path / "first.part", tmp_path / "second.part"
-    first.write_bytes(b"A" * 4096)
-    second.write_bytes(b"B" * 8192)
-    staged_paths = []
+@pytest.mark.anyio
+async def test_scan_custom_delay_and_cooldown(monkeypatch):
+    """自定义延迟与冷却窗口生效（热重载后的 CONF 值直接读取）。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 1.0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 5.0)
+    posts = []
 
-    def overlapping_tags(path, *args):
-        staged_paths.append(path)
-        if len(staged_paths) == 1:
-            p._install_library_audio(
-                str(second), "online:kuwo:overlap", "mp3", "晴天", "周杰伦", "叶惠美", {})
-            assert open(path, "rb").read() == b"A" * 4096
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
 
-    monkeypatch.setattr(p, "write_audio_tags", overlapping_tags)
-    with pytest.raises(p._StagedSaveError):
-        p._install_library_audio(
-            str(first), "online:netease:overlap", "mp3", "晴天", "周杰伦", "叶惠美", {})
-    assert len(set(staged_paths)) == 2
-    assert first.read_bytes() == b"A" * 4096
-    assert not second.exists()
-    assert os.listdir(p.staged_dir()) == []
-    assert p.recalled_media_path("online:netease:overlap") is None
-
-
-def test_staged_install_holds_organization_lock(tmp_path, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
-
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    original = tmp_path / "download.part"
-    original.write_bytes(b"A" * 4096)
-
-    def check_lock(*args):
-        def probe():
-            acquired = p._LIBRARY_FILE_LOCK.acquire(blocking=False)
-            if acquired:
-                p._LIBRARY_FILE_LOCK.release()
-            return acquired
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            assert pool.submit(probe).result(timeout=3) is False
-
-    monkeypatch.setattr(p, "write_audio_tags", check_lock)
-    p._install_library_audio(
-        str(original), "online:kuwo:locked", "mp3", "晴天", "周杰伦", "叶惠美", {})
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        t0 = time.monotonic()
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert time.monotonic() - t0 >= 0.9  # 等 1 秒延迟
+        assert posts == ["/music/api/v1/x"]
+        # 冷却 5 秒内不重发
+        p._schedule_library_scan({"cookie": "sid=y"})
+        await asyncio.sleep(0.1)
+        assert posts == ["/music/api/v1/x"]
+    finally:
+        await client.aclose()
 
 
-def test_staged_reuse_promotes_shadow_lyric_without_touching_audio(tmp_path, monkeypatch):
-    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
-    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
-    guid = "online:kuwo:shadow-reuse"
-    dest = _audio_into_library(guid)
-    os.makedirs(p.CONF["cache_dir"], exist_ok=True)
-    shadow = os.path.join(p.CONF["cache_dir"], f"{p.cache_safe_guid(guid)}.lrc")
-    with open(shadow, "w", encoding="utf-8") as f:
-        f.write("[00:00.00]影子歌词")
-    original = tmp_path / "download.part"
-    original.write_bytes(b"B" * 4096)
-    result, reused = p._install_library_audio(
-        str(original), guid, "flac", "晴天", "周杰伦", "叶惠美", {})
-    assert result == dest and reused
-    assert open(dest, "rb").read() == b"A" * 64
-    assert not os.path.exists(shadow)
-    with open(os.path.splitext(dest)[0] + ".lrc", encoding="utf-8") as f:
-        assert "影子歌词" in f.read()
+def test_scan_number_defaults_on_invalid():
+    """非法/越界时间窗回落默认（0 允许）。"""
+    assert p._safe_scan_number("abc", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("-5", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("9999", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("0", 3.0, 0.0, 600.0) == 0.0
+    assert p._safe_scan_number("45.5", 3.0, 0.0, 600.0) == 45.5
+    # 热重载校验器同口径
+    assert p._env_watch_parse("0", "scan_number") == 0.0
+    assert p._env_watch_parse("7200", "scan_number") is None
+    assert p._env_watch_parse("2.5", "scan_number") == 2.5
+
+
+@pytest.mark.anyio
+async def test_library_scan_config_body_and_headers(monkeypatch):
+    """「路径|JSON体」配置：请求带 JSON body 与 content-type；凭证头（含
+    authx 新鲜签名）原样透传。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path",
+                        '/music/api/v1/shared-library/scan|{"guid":"64d1b8ca"}')
+    posts = []
+
+    class ScanTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({
+                "path": request.url.path,
+                "body": request.content.decode("utf-8"),
+                "ctype": request.headers.get("content-type"),
+                "cookie": request.headers.get("cookie"),
+                "authx": request.headers.get("authx"),
+            })
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=ScanTransport(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        headers = {"cookie": "music-token=tok123", "authx": "nonce=1&timestamp=2&sign=abc"}
+        p._schedule_library_scan(headers)
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert len(posts) == 1
+        sent = posts[0]
+        assert sent["path"] == "/music/api/v1/shared-library/scan"
+        assert sent["body"] == '{"guid":"64d1b8ca"}'
+        assert sent["ctype"] == "application/json"
+        assert sent["cookie"] == "music-token=tok123"
+        assert sent["authx"] == "nonce=1&timestamp=2&sign=abc"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_library_scan_legacy_path_without_body(monkeypatch):
+    """旧格式（纯路径无竖线）：POST 无 body，不设 content-type。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/shared-library/scan")
+    posts = []
+
+    class ScanTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({"body": request.content, "ctype": request.headers.get("content-type")})
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=ScanTransport(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert posts[0]["body"] == b""
+        assert posts[0]["ctype"] is None
+    finally:
+        await client.aclose()
+
+
+def test_scan_config_parsing():
+    """配置解析：三态（空/纯路径/路径|JSON），空白容错。"""
+    monkey = p.CONF
+    monkey["library_scan_path"] = ""
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "/music/api/v1/x"
+    assert p._scan_config() == ("/music/api/v1/x", "")
+    monkey["library_scan_path"] = ' /music/api/v1/x | {"guid":"g1"} '
+    assert p._scan_config() == ("/music/api/v1/x", '{"guid":"g1"}')
+    monkey["library_scan_path"] = "/p|"
+    assert p._scan_config() == ("/p", "")
+
+
+@pytest.mark.anyio
+async def test_scan_delay_zero_fires_immediately(monkeypatch):
+    """延迟 0=立即发（不等合并窗口）；冷却 0=仅本请求不重复。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x|{}")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 0)
+    posts = []
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        t0 = time.monotonic()
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        elapsed = time.monotonic() - t0
+        assert posts == ["/music/api/v1/x"]
+        assert elapsed < 1.0  # 立即发，未等 3 秒默认延迟
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_scan_custom_delay_and_cooldown(monkeypatch):
+    """自定义延迟与冷却窗口生效（热重载后的 CONF 值直接读取）。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 1.0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 5.0)
+    posts = []
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        t0 = time.monotonic()
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert time.monotonic() - t0 >= 0.9  # 等 1 秒延迟
+        assert posts == ["/music/api/v1/x"]
+        # 冷却 5 秒内不重发
+        p._schedule_library_scan({"cookie": "sid=y"})
+        await asyncio.sleep(0.1)
+        assert posts == ["/music/api/v1/x"]
+    finally:
+        await client.aclose()
+
+
+def test_scan_number_defaults_on_invalid():
+    """非法/越界时间窗回落默认（0 允许）。"""
+    assert p._safe_scan_number("abc", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("-5", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("9999", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("0", 3.0, 0.0, 600.0) == 0.0
+    assert p._safe_scan_number("45.5", 3.0, 0.0, 600.0) == 45.5
+    # 热重载校验器同口径
+    assert p._env_watch_parse("0", "scan_number") == 0.0
+    assert p._env_watch_parse("7200", "scan_number") is None
+    assert p._env_watch_parse("2.5", "scan_number") == 2.5
