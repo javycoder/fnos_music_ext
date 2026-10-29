@@ -123,6 +123,19 @@ def _safe_liked_number(raw: str, default: float | int, *, integer: bool = False)
         if integer:
             return value if 0 <= value <= 100 else default
         return value if value >= 0.5 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_scan_number(raw: str, default: float, lo: float, hi: float):
+    """扫描时间窗配置的安全解析：非法/越界回落默认（0 允许，语义=不等待）。"""
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value < lo or value > hi:
+            return default
+        return value
+    except (TypeError, ValueError):
+        return default
     except (TypeError, ValueError, OverflowError):
         return default
 
@@ -204,8 +217,13 @@ CONF = {
     # 下载"标准"档目标码率：官方实测 MP3 320k（prepare quality=standard, FLAC 源 → 320067bps）
     "transcode_dl_bitrate": os.environ.get("FNMUSIC_TRANSCODE_DL_BITRATE", "320k"),
     # 落盘进曲库后通知官方重扫的接口路径（POST）；空=禁用。官方无公开文档，
-    # 真机在官方 App 手动点一次扫描、从代理请求日志捕获真实路径后填入启用
+    # 真机在官方 App 手动点一次扫描、从代理请求日志捕获真实路径后填入启用。
+    # 支持「路径|JSON体」形态（如 /music/api/v1/shared-library/scan|{"guid":"..."}）
     "library_scan_path": (os.environ.get("FNMUSIC_LIBRARY_SCAN_PATH", "") or "").strip(),
+    # 落盘后延迟触发扫库的合并窗口（秒）：连续落盘多首合并为一次扫描，0=立即发
+    "scan_delay_s": _safe_scan_number(os.environ.get("FNMUSIC_SCAN_DELAY_S", "3"), 3.0, 0.0, 600.0),
+    # 扫库冷却窗口（秒）：触发一次后 N 秒内不再触发（成功失败都算），0=仅合并窗口兜底
+    "scan_cooldown_s": _safe_scan_number(os.environ.get("FNMUSIC_SCAN_COOLDOWN_S", "90"), 90.0, 0.0, 3600.0),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     # lx 平台白名单（同 .env 的 LX_SOURCES；install.sh --sources lx-<平台> 写入）；
@@ -598,6 +616,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_AUTO_COVER": ("auto_cover", "bool"),
     "FNMUSIC_LYRIC_AUTO_DL": ("lyric_auto_dl", "bool"),
     "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
+    "FNMUSIC_SCAN_DELAY_S": ("scan_delay_s", "scan_number"),
+    "FNMUSIC_SCAN_COOLDOWN_S": ("scan_cooldown_s", "scan_number"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
@@ -720,6 +740,14 @@ def _env_watch_parse(raw: str, kind: str):
     if kind == "bind_timeout":
         try:
             return max(10.0, min(3600.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "scan_number":
+        # 扫描时间窗（延迟/冷却）：0 允许（延迟 0=立即发、冷却 0=仅合并窗口），
+        # 上限与默认值各自语义内收敛
+        try:
+            value = float(raw)
+            return value if math.isfinite(value) and 0 <= value <= 3600.0 else None
         except (TypeError, ValueError):
             return None
     if kind == "ttl_seconds":
@@ -6096,31 +6124,55 @@ _scan_last_attempt = 0.0
 _scan_task: "asyncio.Task | None" = None
 
 
+def _scan_config() -> "tuple[str, str]":
+    """解析重扫配置「路径|JSON体」：竖线分隔，JSON 段可选（兼容旧纯路径格式）。
+
+    返回 (path, body)；body 为空串表示无请求体。
+    """
+    raw = str(CONF.get("library_scan_path") or "").strip()
+    if not raw:
+        return "", ""
+    if "|" in raw:
+        path, _, body = raw.partition("|")
+        return path.strip(), body.strip()
+    return raw, ""
+
+
 def _schedule_library_scan(headers: dict | None) -> None:
     """落盘进曲库后通知官方重扫（FNMUSIC_LIBRARY_SCAN_PATH 为空=禁用）。
 
-    官方扫描接口无公开资料：路径可配置、默认禁用；3 秒合并窗口（连续落盘多首
-    只发一次）+ 90 秒 TTL（成功与失败都节流，路径配错不会风暴）。凭证头取自
-    触发请求（copy_incoming_headers），只在任务内一次性使用，不落盘。
+    官方扫描接口无公开资料：配置「路径|JSON体」（如
+    /music/api/v1/shared-library/scan|{"guid":"..."}），JSON 段可选；
+    3 秒合并窗口（连续落盘多首只发一次）+ 90 秒 TTL（成功与失败都节流，
+    路径配错不会风暴）。凭证头取自触发请求（copy_incoming_headers，含
+    Authx 新鲜签名原样透传），只在任务内一次性使用，不落盘。
     """
     global _scan_task, _scan_last_attempt
     if not str(CONF.get("library_scan_path") or "").strip() or not headers:
         return
-    if time.monotonic() - _scan_last_attempt < _SCAN_TTL_S:
+    if time.monotonic() - _scan_last_attempt < float(CONF.get("scan_cooldown_s") or _SCAN_TTL_S):
         return
     if _scan_task is not None and not _scan_task.done():
         return
 
     async def _run() -> None:
         global _scan_last_attempt
-        await asyncio.sleep(_SCAN_MERGE_S)
-        scan_path = str(CONF.get("library_scan_path") or "").strip()
+        delay = max(float(CONF.get("scan_delay_s") or 0.0), 0.0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        scan_path, scan_body = _scan_config()
         if not scan_path:
             return
         _scan_last_attempt = time.monotonic()
         try:
             client = get_upstream_client(app)
-            req = client.build_request("POST", scan_path, headers=dict(headers))
+            req_headers = dict(headers)
+            if scan_body:
+                req_headers["content-type"] = "application/json"
+            req = client.build_request(
+                "POST", scan_path, headers=req_headers,
+                content=scan_body.encode("utf-8") if scan_body else None,
+            )
             resp = await client.send(req)
             if resp.status_code == 200:
                 logger.info("Library scan triggered via %s", scan_path)

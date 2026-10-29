@@ -426,6 +426,26 @@ print_featured_mdl_menu() {
 
 parse_sources() {
     local raw="${1:-}"
+    # 覆盖安装（升级）：存量 .env 已有音源开关时以存量为准——向导默认值/安装参数
+    # 只该影响全新安装，否则每次覆盖装都会把用户已切换的源重置回初次选择
+    if [ -f "${BASE_DIR}/.env" ] && grep -q "^FNMUSIC_LX_ENABLED=" "${BASE_DIR}/.env" 2>/dev/null; then
+        local keep_mdl keep_box keep_lx
+        keep_mdl="$(sed -n "s/^FNMUSIC_MUSICDL_ENABLED=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")"
+        keep_box="$(sed -n "s/^FNMUSIC_NETEASE_ENABLED=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")"
+        keep_lx="$(sed -n "s/^FNMUSIC_LX_ENABLED=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")"
+        if [ -n "${keep_mdl}${keep_box}${keep_lx}" ]; then
+            ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
+            [ "${keep_mdl}" = "true" ] || [ "${keep_mdl}" = "1" ] && ENABLE_MUSICDL=1
+            [ "${keep_box}" = "true" ] || [ "${keep_box}" = "1" ] && ENABLE_MUSICBOX=1
+            [ "${keep_lx}" = "true" ] || [ "${keep_lx}" = "1" ] && ENABLE_LX=1
+            KEEP_SOURCES_FROM_ENV=1
+            MDL_EXPLICIT=0
+            MDL_PLATFORMS=""
+            LX_PLATFORMS=""
+            log_info "检测到存量音源配置 (musicdl=${ENABLE_MUSICDL} musicbox=${ENABLE_MUSICBOX} lx=${ENABLE_LX})，覆盖安装保留现有音源选择"
+            return 0
+        fi
+    fi
     ENABLE_MUSICDL=0
     ENABLE_MUSICBOX=0
     ENABLE_LX=0
@@ -1223,6 +1243,10 @@ ENV_DESIRED="$(mktemp)"
         # 显式平台选择：代理请求级白名单（短名）+ 容器级白名单（全名）
         echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "${MDL_PLATFORMS}")'"
         echo "MUSICDL_SOURCES='$(dotenv_escape "$(mdl_short_to_full "${MDL_PLATFORMS}")")'"
+    elif [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
+        # 存量音源保留：musicdl 平台白名单也沿用 .env 既有值，不被默认重置
+        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "$(sed -n "s/^FNMUSIC_ONLINE_SOURCES=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")")'"
+        echo "MUSICDL_SOURCES='$(dotenv_escape "$(sed -n "s/^MUSICDL_SOURCES=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")")'"
     else
         echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     fi
@@ -1260,8 +1284,14 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
-# 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
+# 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）。
+# 例外：覆盖安装且存量 .env 已有音源配置（KEEP_SOURCES_FROM_ENV=1）时，三开关不进
+# explicit——env 合并按"非 explicit 键保留已有值"处理，音源选择以用户存量为准，
+# 向导默认值只影响全新安装。
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
+if [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
+    ENV_EXPLICIT="FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
+fi
 if [ "${INTERNAL_TOKEN_GENERATED}" -eq 1 ]; then
     ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_INTERNAL_TOKEN"
 fi

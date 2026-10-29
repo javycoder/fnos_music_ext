@@ -658,7 +658,10 @@ def build_local_track(row: dict) -> dict:
             "updatedAt": ts,
         })
     album_name = str(row.get("album") or "").strip() or "未知专辑"
-    cover_guid = str(row.get("cover_guid") or "")
+    # 官方惯例：本地曲目封面引用 album_<cover_guid> 形态（与官方自建歌单一致）；
+    # 代理封面端点对四种前缀统一剥除归一化，读取行为与裸 hex 完全相同
+    cover_guid = f"album_{str(row.get('cover_guid') or '').strip()}" if str(row.get("cover_guid") or "").strip() else ""
+    cover_guid = cover_guid or str(row.get("guid") or "")
     duration_ms = int(row.get("duration_ms") or 0)
     suffix = str(row.get("suffix") or "").lstrip(".").lower()
     fmt = suffix or "mp3"

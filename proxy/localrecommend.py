@@ -197,7 +197,8 @@ def select_tracks(
         artists.update(chosen["features"]["artist"])
         albums.update(chosen["features"]["album"])
         track = rec.build_local_track(chosen)
-        track["coverId"] = str(chosen.get("cover_guid") or "")
+        # coverId 沿用 build_local_track 的 album_ 前缀形态（官方惯例），
+        # 不再回写裸 cover_guid
         track["genres"] = list(chosen["features"]["genre"])
         track["recommendDimension"] = "explore" if index >= 16 else "preference"
         track["recommendReason"] = "发现本地曲库中少听的歌曲" if index >= 16 else "根据你的收听与收藏偏好推荐"
@@ -649,8 +650,8 @@ async def _await_value(value):
 
 
 def _local_track(row: dict) -> dict:
-    return {**rec.build_local_track(row), "coverId": str(row.get("cover_guid") or ""),
-            "genres": list(row["features"]["genre"])}
+    # coverId 沿用 build_local_track 的 album_ 前缀形态（官方惯例）
+    return {**rec.build_local_track(row), "genres": list(row["features"]["genre"])}
 
 
 async def build_llm_bundle(
