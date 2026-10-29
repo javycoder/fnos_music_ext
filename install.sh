@@ -427,12 +427,14 @@ print_featured_mdl_menu() {
 parse_sources() {
     local raw="${1:-}"
     # 覆盖安装（升级）：存量 .env 已有音源开关时以存量为准——向导默认值/安装参数
-    # 只该影响全新安装，否则每次覆盖装都会把用户已切换的源重置回初次选择
-    if [ -f "${BASE_DIR}/.env" ] && grep -q "^FNMUSIC_LX_ENABLED=" "${BASE_DIR}/.env" 2>/dev/null; then
+    # 只该影响全新安装，否则每次覆盖装都会把用户已切换的源重置回初次选择。
+    # BASE_DIR 用默认空值：单测单独抽取本函数在 set -u 下裸跑，不定义 BASE_DIR
+    local env_file="${BASE_DIR:-}/.env"
+    if [ -n "${BASE_DIR:-}" ] && [ -f "${env_file}" ] && grep -q "^FNMUSIC_LX_ENABLED=" "${env_file}" 2>/dev/null; then
         local keep_mdl keep_box keep_lx
-        keep_mdl="$(sed -n "s/^FNMUSIC_MUSICDL_ENABLED=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")"
-        keep_box="$(sed -n "s/^FNMUSIC_NETEASE_ENABLED=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")"
-        keep_lx="$(sed -n "s/^FNMUSIC_LX_ENABLED=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")"
+        keep_mdl="$(sed -n "s/^FNMUSIC_MUSICDL_ENABLED=//p" "${env_file}" | tail -n1 | tr -d "\"'[:space:]")"
+        keep_box="$(sed -n "s/^FNMUSIC_NETEASE_ENABLED=//p" "${env_file}" | tail -n1 | tr -d "\"'[:space:]")"
+        keep_lx="$(sed -n "s/^FNMUSIC_LX_ENABLED=//p" "${env_file}" | tail -n1 | tr -d "\"'[:space:]")"
         if [ -n "${keep_mdl}${keep_box}${keep_lx}" ]; then
             ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
             [ "${keep_mdl}" = "true" ] || [ "${keep_mdl}" = "1" ] && ENABLE_MUSICDL=1
@@ -1245,8 +1247,9 @@ ENV_DESIRED="$(mktemp)"
         echo "MUSICDL_SOURCES='$(dotenv_escape "$(mdl_short_to_full "${MDL_PLATFORMS}")")'"
     elif [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
         # 存量音源保留：musicdl 平台白名单也沿用 .env 既有值，不被默认重置
-        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "$(sed -n "s/^FNMUSIC_ONLINE_SOURCES=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")")'"
-        echo "MUSICDL_SOURCES='$(dotenv_escape "$(sed -n "s/^MUSICDL_SOURCES=//p" "${BASE_DIR}/.env" | tail -n1 | tr -d "\"'[:space:]")")'"
+        local keep_env="${BASE_DIR:-}/.env"
+        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "$(sed -n "s/^FNMUSIC_ONLINE_SOURCES=//p" "${keep_env}" 2>/dev/null | tail -n1 | tr -d "\"'[:space:]")")'"
+        echo "MUSICDL_SOURCES='$(dotenv_escape "$(sed -n "s/^MUSICDL_SOURCES=//p" "${keep_env}" 2>/dev/null | tail -n1 | tr -d "\"'[:space:]")")'"
     else
         echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     fi
