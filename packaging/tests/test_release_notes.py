@@ -416,6 +416,38 @@ def test_gitee_step_script_is_valid_bash():
     subprocess.run(['bash', '-n', str(path)], check=True)
 
 
+def test_gitee_existing_asset_cleanup_uses_install_revision(tmp_path):
+    """补发只能选择真实 -N 安装包附件，不能从展示 tag 拼裸版本名。"""
+    if not shutil.which('jq'):
+        pytest.skip('release shell sandbox requires jq')
+    assets = tmp_path / 'assets.json'
+    assets.write_text(json.dumps([
+        {'id': 11, 'name': 'fnmusic-ext-2.11.0-4.fpk'},
+        {'id': 12, 'name': 'fnmusic-ext-2.11.0-4.fpk.sha256'},
+        {'id': 21, 'name': 'fnmusic-ext-2.11.0.fpk'},
+        {'id': 22, 'name': 'fnmusic-ext-2.10.2.fpk'},
+        {'id': 23, 'name': 'Source code.zip'},
+    ]))
+    script = _unindent_run(_gitee_step_script())
+    selector = script.split('for attach_id in $(', 1)[1].split('); do', 1)[0]
+    selector = selector.replace('/tmp/gitee-att-list.json', f'"{assets}"')
+    result = subprocess.run(
+        ['bash', '-e', '-o', 'pipefail', '-c', selector],
+        env=dict(os.environ, fpk_file='dist/fnmusic-ext-2.11.0-4.fpk', ver='2.11.0'),
+        capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == ['11', '12']
+
+
+def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
+    workflow = (ROOT / '.github/workflows/release.yml').read_text()
+    guard = workflow.split('- name: Verify stable release is merged into main', 1)[1]
+    guard = guard.split('- name:', 1)[0]
+    assert "if: steps.release-kind.outputs.formal == 'true'" in guard
+    assert 'git fetch origin main' in guard
+    assert 'git merge-base --is-ancestor HEAD origin/main' in guard
+    assert 'pre_flags="--prerelease=false"' in workflow
+
+
 def test_gitee_large_upload_never_uses_body_replaying_retry():
     """v2.10.0 事故根因：gcurl --retry 会把 28MB 请求体整段重发。
 
