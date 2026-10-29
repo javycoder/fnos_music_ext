@@ -83,6 +83,8 @@ class TestManifest:
             f"VERSION 必须是 x.y.z 或 x.y.z-N，当前为 {repo_version!r}"
         assert m["version"] == repo_version
         assert (stage / "app/repo/VERSION").read_text(encoding="utf-8").strip() == repo_version
+        assert (stage / "app/repo/RELEASE_CHANNEL").read_text().strip() == (
+            REPO_ROOT / "RELEASE_CHANNEL").read_text().strip()
 
     def test_template_has_placeholder(self):
         assert "@VERSION@" in (FPK_DIR / "manifest.in").read_text(encoding="utf-8")

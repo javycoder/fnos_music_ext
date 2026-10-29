@@ -123,10 +123,12 @@ def test_formal_210_documents_changes_since_290():
         assert required in notes
 
 
-def test_prerelease_2110e_documents_cumulative_changes_since_2100():
+def test_formal_2110_documents_cumulative_changes_since_2100():
     notes = (ROOT / 'CHANGELOG.md').read_text(encoding='utf-8').split(
-        '## [2.11.0e]', 1)[1].split('\n## [', 1)[0]
-    for required in ('v2.10.0', '2.10.1', '2.10.2', '2.11.0-4', 'Pre-release',
+        '## [2.11.0]', 1)[1].split('\n## [', 1)[0]
+    assert 'Pre-release' not in notes
+    assert '非正式预发布' not in notes
+    for required in ('v2.10.0', 'v2.11.0', '2.10.1', '2.10.2', '2.11.0-4',
                      '### 新增', '### 修复', '### 安装与维护', '播放直连', '远程目录',
                      '洛雪', 'Chat Completions', 'Responses', 'token', '飞牛用户',
                      '公共歌单', '#83', '#84', '#85', '#96', '1.0.10'):
@@ -139,21 +141,28 @@ CLEANUP_STEP = 'Remove previous published prereleases'
 PUBLISH_STEP = 'Create or update GitHub Release'
 
 
-@pytest.mark.parametrize("version,tag,formal,success", [
-    ("2.11.0-0", "v2.11.0a", "false", True),
-    ("2.11.0-1", "v2.11.0b", "false", True),
-    ("2.11.0-4", "v2.11.0e", "false", True),
-    ("2.11.0", "v2.11.0", "true", True),
-    ("2.11.0-0", "v2.11.0", "", False),
-    ("2.11.0", "v2.11.0a", "", False),
-    ("2.11.0-0", "v2.11.0-0", "", False),
-    ("2.11.0-26", "v2.11.0z", "", False),
-    ("2.11.0a", "v2.11.0a", "", False),
+@pytest.mark.parametrize("version,channel,tag,formal,success", [
+    ("2.11.0-4", "stable", "v2.11.0", "true", True),
+    ("2.11.0-26", "stable", "v2.11.0", "true", True),
+    ("2.11.0-0", "prerelease", "v2.11.0a", "false", True),
+    ("2.11.0-1", "prerelease", "v2.11.0b", "false", True),
+    ("2.11.0-4", "prerelease", "v2.11.0e", "false", True),
+    ("2.11.0-4", None, "v2.11.0", "", False),
+    ("2.11.0-4", "", "v2.11.0", "", False),
+    ("2.11.0-4", "formal", "v2.11.0", "", False),
+    ("2.11.0-4", "stable", "v2.11.0e", "", False),
+    ("2.11.0-4", "prerelease", "v2.11.0", "", False),
+    ("2.11.0", "stable", "v2.11.0", "", False),
+    ("2.11.0-0", "prerelease", "v2.11.0-0", "", False),
+    ("2.11.0-26", "prerelease", "v2.11.0z", "", False),
+    ("2.11.0a", "prerelease", "v2.11.0a", "", False),
 ])
-def test_release_ci_validates_tag_and_derives_kind(tmp_path, version, tag, formal, success):
+def test_release_ci_validates_tag_and_derives_kind(tmp_path, version, channel, tag, formal, success):
     (tmp_path / "proxy").mkdir()
     shutil.copyfile(ROOT / "proxy/version.py", tmp_path / "proxy/version.py")
     (tmp_path / "VERSION").write_text(version)
+    if channel is not None:
+        (tmp_path / "RELEASE_CHANNEL").write_text(channel)
     output = tmp_path / "output"
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", _release_step("Verify tag matches VERSION")],
@@ -166,6 +175,8 @@ def test_release_ci_validates_tag_and_derives_kind(tmp_path, version, tag, forma
         assert values["version"] == version
         assert values["tag"] == tag
         assert values["display_version"] == tag[1:]
+        assert values["ui_version"] == tag
+        assert values["channel"] == channel
         assert values["formal"] == formal
     else:
         assert not output.exists()

@@ -53,7 +53,7 @@ from proxy.fnlog import (  # noqa: E402
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
 from proxy import publicplaylists as pubpl
-from proxy.version import display_version
+from proxy.version import read_release_channel, ui_version
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -1050,7 +1050,8 @@ async def _fetch_json(request: Request, url: str, *, timeout: float = 4.0) -> "t
 
 def _read_version() -> str:
     try:
-        return display_version(VERSION_PATH.read_text(encoding="utf-8").strip())
+        channel = read_release_channel(VERSION_PATH.with_name("RELEASE_CHANNEL"), allow_legacy=True)
+        return ui_version(VERSION_PATH.read_text(encoding="utf-8").strip(), channel=channel)
     except (OSError, ValueError):
         return SERVICE_VERSION
 

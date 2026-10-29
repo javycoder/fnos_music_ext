@@ -853,6 +853,27 @@ test("saveConfig：fs-check 不可用（直连 501/网络错误）→ 降级放�
   assert.ok(fetchCalls.some((c) => c.method === "PUT" && c.path === "/app/fnmusic-ext/api/config"));
 });
 
+test("版本标签：正式/预发布新旧API均只显示一个v前缀", async () => {
+  for (const version of ["2.11.0", "v2.11.0", "2.11.0e", "v2.11.0e"]) {
+    const expected = `v${version.replace(/^v/, "")}`;
+    enqueue("/app/fnmusic-ext/api/status", {
+      version, current_provider: "none", processes: {}, services: {}, lx_source: null,
+    });
+    await global.loadStatus();
+    assert.strictEqual(els.get("#brand-version").textContent, expected);
+    enqueue("/app/fnmusic-ext/api/about", { ok: true, version, logs: [], disclaimer: [] });
+    await global.loadAbout();
+    assert.strictEqual(els.get("#about-version").textContent, expected);
+    enqueue("/app/fnmusic-ext/api/update-check", {
+      ...UPDATE_PAYLOAD, current_version: version,
+      latest: { ...UPDATE_PAYLOAD.latest, version },
+    });
+    await global.checkUpdate();
+    global.openUpdateModal();
+    assert.strictEqual(els.get("#update-modal-version").textContent, expected);
+  }
+});
+
 /* ------------------------------------------------ 关于页 ------------------- */
 test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=false 隐藏打赏", async () => {
   enqueue("/app/fnmusic-ext/api/about", {

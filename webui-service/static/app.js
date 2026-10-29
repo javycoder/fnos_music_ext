@@ -478,11 +478,15 @@ async function initTheme() {
   } catch (_) { /* 宿主不支持事件推送时退回媒体查询 */ }
 }
 
+function formatVersionLabel(version) {
+  return `v${String(version || "-").replace(/^v/i, "")}`;
+}
+
 /* -------------------------------------------------------------- 概览 */
 async function loadStatus() {
   try {
     const st = await api("/api/status");
-    $("#brand-version").textContent = `v${st.version}`;
+    $("#brand-version").textContent = formatVersionLabel(st.version);
     $("#sidebar-foot").textContent = `${PROVIDER_LABEL[st.current_provider] || st.current_provider}`;
     $("#ov-provider-body").innerHTML =
       `<span class="state-line"><span class="dot ok"></span>${PROVIDER_LABEL[st.current_provider] || st.current_provider}</span>`;
@@ -2423,7 +2427,7 @@ function fmtBytes(n) {
 
 async function loadAbout() {
   const info = await api("/api/about");
-  $("#about-version").textContent = `v${info.version}`;
+  $("#about-version").textContent = formatVersionLabel(info.version);
   $("#about-deploy").textContent = info.deploy_mode === "native" ? "原生部署" : "Docker 部署";
   // 免责声明来自 README「免责与版权声明」小节；解析失败时后端返回空数组，隐藏卡片
   const card = $("#about-disclaimer-card");
@@ -2549,7 +2553,7 @@ function fmtDate(iso) {
 function openUpdateModal() {
   if (!updateInfo || !updateInfo.has_update) return;
   const latest = updateInfo.latest || {};
-  $("#update-modal-version").textContent = `v${latest.version || updateInfo.current_version}`;
+  $("#update-modal-version").textContent = formatVersionLabel(latest.version || updateInfo.current_version);
   $("#update-modal-date").textContent = fmtDate(latest.published_at);
   // release 说明来自外部仓库，textContent 注入防 XSS
   $("#update-modal-changelog").textContent = latest.changelog || "暂无更新说明";

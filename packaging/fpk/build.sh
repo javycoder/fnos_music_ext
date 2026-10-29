@@ -134,7 +134,7 @@ if [ -f "${REPO_ROOT}/container/lxserver.version" ]; then
     fi
 fi
 
-# FPK manifest、包内 VERSION 和文件名共用数字版本（预发布保留 -N 修订号）。
+# 正式和预发布的 manifest、包内 VERSION、文件名均保留数字 -N；通道另存 RELEASE_CHANNEL。
 sed "s/@VERSION@/${VERSION}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/"
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"

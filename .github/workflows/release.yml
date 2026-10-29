@@ -35,11 +35,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
+          fetch-depth: 0
 
       - name: Verify tag matches VERSION
         id: release-kind
         run: |
           python3 proxy/version.py --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify stable release is merged into main
+        if: steps.release-kind.outputs.formal == 'true'
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
 
       - name: Verify official music compatibility record
         run: python3 scripts/check_music_compat.py
@@ -149,7 +156,7 @@ jobs:
           title="fnmusic-ext ${ver}"
           # 字母后缀 = 自动迭代预发布：标记 Pre-release（/releases/latest 与应用内
           # 检查更新都会跳过它，最新正式版不受影响），标题明示未经完整测试
-          pre_flags=""
+          pre_flags="--prerelease=false"
           case "$ver" in
             *[a-z])
               pre_flags="--prerelease"

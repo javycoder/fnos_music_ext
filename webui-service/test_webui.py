@@ -1074,7 +1074,7 @@ def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
         r = client.get("/api/status")
         assert r.status_code == 200
         rj = r.json()
-        assert rj["version"] == "2.0.0"
+        assert rj["version"] == "v2.0.0"
         assert rj["current_provider"] == "musicbox"
         assert rj["processes"]["musicbox"]["state"] == "RUNNING"
         # lxserver 与 lxmusic 并列出现在进程概览，便于定位洛雪链路哪一环故障
@@ -2104,7 +2104,7 @@ def test_about_fields_and_disclaimer(about_env):
         r = client.get("/api/about")
     assert r.status_code == 200
     rj = r.json()
-    assert rj["version"] == "2.0.0"
+    assert rj["version"] == "v2.0.0"
     assert rj["author"] == "javycoder"
     assert rj["author_url"] == "https://github.com/javycoder"
     assert rj["repo_url"] == "https://github.com/javycoder/fnos_music_ext"
@@ -2457,13 +2457,19 @@ def update_cache_clean():
     webui._update_cache.clear()
 
 
-@pytest.mark.parametrize("version,display", [
-    ("2.11.0-0", "2.11.0a"), ("2.11.0-1", "2.11.0b"),
-    ("2.11.0", "2.11.0"), ("2.10.0b", "2.10.0b"),
+@pytest.mark.parametrize("version,channel,display", [
+    ("2.11.0-4", "stable", "v2.11.0"),
+    ("2.11.0-4", "prerelease", "v2.11.0e"),
+    ("2.11.0-0", "prerelease", "v2.11.0a"),
+    ("2.11.0-1", "prerelease", "v2.11.0b"),
+    ("2.11.0", None, "v2.11.0"),
+    ("2.10.0b", None, "v2.10.0b"),
 ])
-def test_webui_derives_display_version(env_file, tmp_path, monkeypatch, version, display):
+def test_webui_derives_display_version(env_file, tmp_path, monkeypatch, version, channel, display):
     path = tmp_path / "VERSION"
     path.write_text(version)
+    if channel is not None:
+        path.with_name("RELEASE_CHANNEL").write_text(channel)
     monkeypatch.setattr(webui, "VERSION_PATH", path)
     with authed_client() as client:
         assert client.get("/api/about").json()["version"] == display
@@ -2502,7 +2508,7 @@ def test_update_check_github_first(env_file, update_cache_clean):
     rj = r.json()
     assert rj["ok"] is True
     assert rj["source"] == "github"
-    assert rj["current_version"] == "2.0.0"
+    assert rj["current_version"] == "v2.0.0"
     assert rj["has_update"] is True
     assert rj["latest"]["version"] == "2.9.0"
     assert rj["latest"]["html_url"] == GH_RELEASE["html_url"]
