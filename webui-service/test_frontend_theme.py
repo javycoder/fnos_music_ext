@@ -125,6 +125,11 @@ def test_theme_preference_key_matches_boot_and_app(filename):
     assert '"fnmusic-theme"' in (STATIC / filename).read_text(encoding="utf-8")
 
 
+def test_direct_play_hint_warns_about_experimental_playback():
+    assert '<p class="hint">测试功能，如遇播放异常可以尝试关闭</p>' in HTML
+    assert "默认关闭；开启后保存生效。三个音源互不联动。" not in HTML
+
+
 def test_about_donate_dom_order_and_ids():
     """关于页打赏区 DOM 顺序微信在先，ID 兼容与徽章契约。"""
     tags = elements()

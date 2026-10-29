@@ -123,6 +123,17 @@ def test_formal_210_documents_changes_since_290():
         assert required in notes
 
 
+def test_prerelease_2110e_documents_cumulative_changes_since_2100():
+    notes = (ROOT / 'CHANGELOG.md').read_text(encoding='utf-8').split(
+        '## [2.11.0e]', 1)[1].split('\n## [', 1)[0]
+    for required in ('v2.10.0', '2.10.1', '2.10.2', '2.11.0-4', 'Pre-release',
+                     '### 新增', '### 修复', '### 安装与维护', '播放直连', '远程目录',
+                     '洛雪', 'Chat Completions', 'Responses', 'token', '飞牛用户',
+                     '公共歌单', '#83', '#84', '#85', '#96', '1.0.10'):
+        assert required in notes
+    assert '微信' not in notes
+
+
 RELEASE_WORKFLOW = ROOT / '.github/workflows/release.yml'
 CLEANUP_STEP = 'Remove previous published prereleases'
 PUBLISH_STEP = 'Create or update GitHub Release'
@@ -131,6 +142,7 @@ PUBLISH_STEP = 'Create or update GitHub Release'
 @pytest.mark.parametrize("version,tag,formal,success", [
     ("2.11.0-0", "v2.11.0a", "false", True),
     ("2.11.0-1", "v2.11.0b", "false", True),
+    ("2.11.0-4", "v2.11.0e", "false", True),
     ("2.11.0", "v2.11.0", "true", True),
     ("2.11.0-0", "v2.11.0", "", False),
     ("2.11.0", "v2.11.0a", "", False),
