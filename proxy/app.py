@@ -20,9 +20,11 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import contextlib
+import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager, closing
 from contextvars import ContextVar
@@ -36,27 +38,40 @@ import anyio
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
+try:  # 飞牛卷本地/远程判定：staged 落盘的开关依据
+    from .tee_save_mode import should_stage as _should_stage
+except ImportError:  # 兼容脚本式启动（无包上下文）
+    from tee_save_mode import should_stage as _should_stage
+
 try:
     from . import recommend as dailyrec
+    from .direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
     from . import localrecommend as localrec
     from . import localmatch
+    from .organize import target_dir as layout_target_dir, safe_part as safe_layout_part
+    from .organize import _ensure_target_dir as ensure_layout_dir
+    from .media_url import hostname_for_log, validate_media_url
     from . import nmplaylists as nmpl
     from . import publicplaylists as pubpl
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
-    from .env_merge import parse_env_file
+    from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic
     from .fnlog import diag as fn_diag
     from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    from direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
+    from organize import target_dir as layout_target_dir, safe_part as safe_layout_part
+    from organize import _ensure_target_dir as ensure_layout_dir
+    from media_url import hostname_for_log, validate_media_url  # type: ignore
     import nmplaylists as nmpl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
-    from env_merge import parse_env_file  # type: ignore
+    from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic  # type: ignore
     from fnlog import diag as fn_diag  # type: ignore
     from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
     from version import get_version  # type: ignore
@@ -69,6 +84,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 setup_logging("fnmusic_proxy", "proxy")
 
 _HOME = dailyrec.home_dir()
+DOWNLOAD_LAYOUTS = ("flat", "artist", "album", "artist_album")
 
 # lx 平台别名 → 规范代码（与 lxmusic-service/app.py 的 _SOURCE_ALIASES 保持一致）
 _LX_ALIASES = {
@@ -85,6 +101,7 @@ _LX_ALIASES = {
     "kw": "kw",
     "kuwo": "kw",
 }
+_LIBRARY_FILE_LOCK = threading.RLock()
 
 
 def _normalize_lx_sources(raw: str) -> list[str]:
@@ -117,6 +134,9 @@ CONF = {
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "netease_direct_play": os.environ.get("FNMUSIC_NETEASE_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
+    "musicdl_direct_play": os.environ.get("FNMUSIC_MUSICDL_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
+    "lx_direct_play": os.environ.get("FNMUSIC_LX_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
@@ -144,6 +164,12 @@ CONF = {
     # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
+    "download_layout": os.environ.get("FNMUSIC_DOWNLOAD_LAYOUT", "flat")
+        if os.environ.get("FNMUSIC_DOWNLOAD_LAYOUT", "flat") in
+        ("flat", "artist", "album", "artist_album") else "flat",
+    # 落盘方式（WebUI「目录设置」可改）：auto 按目标目录自动判定，direct 直写，
+    # staged 本地中转；非法值回落 auto（tee_save_mode() 内兜底）
+    "tee_save_mode": os.environ.get("FNMUSIC_TEE_SAVE_MODE", "auto").strip().lower(),
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
     # 收藏/加入歌单自动绑定本地：默认关；在线歌曲收藏后后台自动整轨下载并绑定本地文件，
     # 官方曲库收录后再把收藏/歌单写进官方（成功后删本地映射，避免双列表重复显示）
@@ -188,6 +214,9 @@ CONF = {
     # 洛雪多源管理（WebUI 维护）：当前激活源地址与源列表 JSON，搜索结果来源标记用
     "lx_source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
     "lx_source_list": os.environ.get("LX_SOURCE_LIST", "[]"),
+    "lx_url_timeout": float(os.environ.get("LX_URL_TIMEOUT", "15.0")),
+    "lx_resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "8.0")),
+    "lx_probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
@@ -217,6 +246,7 @@ CONF = {
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     "public_playlists_enabled": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
     "public_playlists_selection": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""),
+    "public_playlists_by_user": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", ""),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
@@ -539,10 +569,16 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
+    "FNMUSIC_NETEASE_DIRECT_PLAY": ("netease_direct_play", "direct_bool"),
+    "FNMUSIC_MUSICDL_DIRECT_PLAY": ("musicdl_direct_play", "direct_bool"),
+    "FNMUSIC_LX_DIRECT_PLAY": ("lx_direct_play", "direct_bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
     "LX_SOURCE_URL": ("lx_source_url", "str"),
     "LX_SOURCE_LIST": ("lx_source_list", "str"),
+    "LX_URL_TIMEOUT": ("lx_url_timeout", "lx_timeout"),
+    "LX_RESOLVER_TIMEOUT": ("lx_resolver_timeout", "lx_timeout"),
+    "LX_PROBE_TIMEOUT": ("lx_probe_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
@@ -550,6 +586,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_DL_QUALITY": ("dl_quality", "dl_quality"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
+    "FNMUSIC_DOWNLOAD_LAYOUT": ("download_layout", "download_layout"),
+    "FNMUSIC_TEE_SAVE_MODE": ("tee_save_mode", "tee_save_mode"),
     "FNMUSIC_TEE_CACHE_MAX": ("tee_cache_max", "tee_cache_max"),
     # 歌曲缓存目录（WebUI「储存 → 目录设置」可改）：变更时把已落库歌曲的
     # .ref 去重标记迁到新目录，避免换目录后同一首歌重新出网、曲库重复
@@ -564,6 +602,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
+    "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": ("netease_playlist_resident", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
@@ -611,6 +650,8 @@ def _env_watch_path() -> str:
 
 def _env_watch_parse(raw: str, kind: str):
     raw = str(raw or "").strip()
+    if kind == "direct_bool":
+        return raw.lower() in ("true", "1", "yes", "on")
     if kind in ("bool", "strict_bool"):
         if kind == "strict_bool" and raw.lower() not in ("true", "1", "yes", "false", "0", "no", ""):
             return None
@@ -632,6 +673,8 @@ def _env_watch_parse(raw: str, kind: str):
     if kind == "cache_dir":
         # 空值=恢复默认（<home>/cache）；不要用旧环境变量兜底
         return raw or os.path.join(dailyrec.home_dir(), "cache")
+    if kind == "download_layout":
+        return raw if raw in DOWNLOAD_LAYOUTS else None
     if kind == "tee_cache_max":
         try:
             return max(1, min(100, int(raw)))
@@ -639,6 +682,8 @@ def _env_watch_parse(raw: str, kind: str):
             return None
     if kind == "quality_mode":
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
+    if kind == "tee_save_mode":
+        return raw.lower() if raw.lower() in ("auto", "direct", "staged") else None
     if kind == "dl_quality":
         return raw.lower() if raw.lower() in ("app", "original", "standard") else None
     if kind == "netease_quality":
@@ -664,6 +709,12 @@ def _env_watch_parse(raw: str, kind: str):
     if kind == "seconds":
         try:
             return max(1.0, min(60.0, float(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "lx_timeout":
+        try:
+            value = float(raw)
+            return value if 1.0 <= value <= 300.0 else None
         except (TypeError, ValueError):
             return None
     if kind == "bind_timeout":
@@ -730,6 +781,13 @@ def _migrate_media_refs(old_dir: str, new_dir: str) -> int:
 
 
 def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
+    # Cache-root changes must move .ref records after an in-flight organization
+    # group has published its new paths, never halfway through that group.
+    with _LIBRARY_FILE_LOCK:
+        return _apply_env_hot_reload(env_path)
+
+
+def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     """解析 .env 应用白名单键；返回变化的 CONF 键（仅环境项返回环境键）。
 
     先验证再同步环境原始字符串；recommend 等模块直接读 os.environ。
@@ -755,10 +813,24 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
             changed.append(env_key)
     if "cache_dir" in changed:
         _migrate_media_refs(old_cache_dir or "", CONF["cache_dir"])
+    if set(changed) & {"tee_save_mode", "cache_dir", "tee_save_dir"}:
+        # 落盘方式/目标目录/缓存目录任一变化，此前的 staged 判定全部作废，
+        # 不清空的话旧判定会一直复用到重启
+        _TEE_STAGED_CACHE.clear()
     if set(changed) & {"quality_mode", "netease_quality"}:
         _sync_netease_quality()
     if set(changed) & _LX_CONFIG_KEYS:
         _sync_lx_config_epoch()
+    if set(changed) & {"lx_url_timeout", "lx_resolver_timeout", "lx_probe_timeout"}:
+        # New callers must not join a task still using the previous timeout budget.
+        global _LX_RESOLVE_EPOCH
+        _LX_RESOLVE_EPOCH += 1
+        _LX_FRESH_COOLDOWN.clear()
+    for provider, conf_name in _DIRECT_PLAY_CONF_KEYS.items():
+        if conf_name in changed or set(changed) & (
+                _SOURCE_CONF_KEYS | {"quality_mode", "netease_quality", "lx_quality", "netease_playlist_resident"}):
+            _DIRECT_PLAY_GENERATIONS[provider] += 1
+            _DIRECT_TARGET_BINDINGS.invalidate_source(provider, _DIRECT_PLAY_GENERATIONS[provider])
     return changed
 
 
@@ -789,6 +861,14 @@ _SOURCE_CONF_KEYS = {
     "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
     "lx_source_url", "lx_source_list",
 }
+_DIRECT_PLAY_CONF_KEYS = {
+    "netease": "netease_direct_play",
+    "musicdl": "musicdl_direct_play",
+    "lx": "lx_direct_play",
+}
+_DIRECT_PLAY_GENERATIONS = {provider: 0 for provider in _DIRECT_PLAY_CONF_KEYS}
+_DIRECT_TARGET_BINDINGS = DirectTargetBindings()
+_DIRECT_FILE_BINDINGS = FileTargetBindings()
 _LIKED_TASKS: dict[str, asyncio.Task] = {}
 _LIKED_WAKEUP: asyncio.Event | None = None
 _LIKED_BUILD_LOCK: asyncio.Lock | None = None
@@ -1007,9 +1087,16 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
 
 async def _env_watch_loop() -> None:
     last = _env_watch_stat()
+    migration_retry_at = 0.0
     while True:
         try:
             await asyncio.sleep(_ENV_WATCH_INTERVAL_S)
+            if not CONF.get("public_playlists_by_user") and time.monotonic() >= migration_retry_at:
+                migration_retry_at = time.monotonic() + 30
+                try:
+                    await asyncio.to_thread(migrate_public_playlist_users)
+                except Exception as exc:
+                    logger.debug("public playlist migration pending: %s", exc)
             cur = _env_watch_stat()
             if cur is None or cur == last:
                 last = cur
@@ -1018,8 +1105,15 @@ async def _env_watch_loop() -> None:
             settled = _env_watch_stat()
             if settled != cur:
                 continue  # 仍在写入，下一轮再看
-            last = settled
-            changed = apply_env_hot_reload()
+            # A large audio copy must not block the event loop while waiting
+            # for its thread lock. Retry this same file revision next tick.
+            if not _LIBRARY_FILE_LOCK.acquire(blocking=False):
+                continue
+            try:
+                changed = apply_env_hot_reload()
+                last = settled
+            finally:
+                _LIBRARY_FILE_LOCK.release()
             if changed:
                 _reset_search_cache()
                 _refresh_recommend_config(changed)
@@ -1642,8 +1736,17 @@ def title_from_track(item: dict) -> str:
 # issue #75：在线曲目首播总预算。lxmusic 端点总预算（LX_URL_TIMEOUT）默认 15s，
 # 网易/洛雪之外的音源维持原有 12s。单次尝试不再另设 6s 上限，冷播放等待解析结果
 # 而不提前放弃——App 首播失败的核心成因即"音源还在解析，代理已经超时放弃"。
-_LX_STREAM_STARTUP_S = 20.0
+_LX_STREAM_STARTUP_SLACK_S = 5.0
+_LX_URL_REQUEST_SLACK_S = 1.0
 _STREAM_STARTUP_S = 12.0
+
+
+def _lx_url_request_timeout_s() -> float:
+    return max(1.0, float(CONF.get("lx_url_timeout") or 15.0)) + _LX_URL_REQUEST_SLACK_S
+
+
+def _lx_stream_startup_timeout_s() -> float:
+    return max(1.0, float(CONF.get("lx_url_timeout") or 15.0)) + _LX_STREAM_STARTUP_SLACK_S
 
 
 def should_cache(range_header: str | None) -> bool:
@@ -1757,6 +1860,11 @@ def _path_stem(path: str) -> str:
 
 def remember_media_path(guid: str, media_path: str) -> None:
     """记住曲库里的文件词干（不含扩展名），音频和 .lrc 共用。"""
+    with _LIBRARY_FILE_LOCK:
+        _remember_media_path_locked(guid, media_path)
+
+
+def _remember_media_path_locked(guid: str, media_path: str) -> None:
     stem = _path_stem(media_path)
     try:
         os.makedirs(CONF["cache_dir"], exist_ok=True)
@@ -2361,7 +2469,67 @@ def _existing_library_file(directory: str, basename: str) -> str | None:
     return None
 
 
-def library_media_path(guid: str, title: str, ext: str, artist: str = "", directory: str | None = None) -> str:
+def download_layout() -> str:
+    layout = str(CONF.get("download_layout") or "flat").strip()
+    return layout if layout in DOWNLOAD_LAYOUTS else "flat"
+
+
+def download_subdir(root: str, artist: str = "", album: str = "") -> str:
+    """下载和整理共用同一套目录计算及符号链接检查。"""
+    root_abs = os.path.realpath(os.path.abspath(root))
+    target = layout_target_dir(root_abs, download_layout(), artist, album)
+    ensure_layout_dir(root_abs, target, create_root=True)
+    return target
+
+
+def _find_reusable_library_file(root: str, basename: str) -> str | None:
+    """同曲已有文件保持原位复用，切换存放方式不制造重复副本。"""
+    if not os.path.isdir(root):
+        return None
+    for base, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if not os.path.islink(os.path.join(base, name)))
+        for ext in CACHE_EXTS:
+            candidate = os.path.join(base, f"{basename}.{ext}")
+            if (os.path.basename(candidate) in files and not os.path.islink(candidate)
+                    and os.path.getsize(candidate) > 0):
+                return candidate
+    return None
+
+
+def _within_dir(path: str, root: str) -> bool:
+    """path 是否位于 root 目录之内（realpath + 大小写规整；两侧不存在亦可判定）。"""
+    try:
+        rp = os.path.normcase(os.path.realpath(path))
+        rr = os.path.normcase(os.path.realpath(root))
+        return bool(rr) and (rp == rr or rp.startswith(rr + os.sep))
+    except (OSError, ValueError):
+        return False
+
+
+def _current_save_roots() -> list[str]:
+    """当前有效的曲库保存根目录（排除不可写的 tee_save_dir 与纯滚动缓存目录）。"""
+    roots: list[str] = []
+    for d in (tee_save_dir(), detect_library_dir()):
+        if d and d not in roots:
+            roots.append(d)
+    return roots
+
+
+def _stem_in_current_roots(stem: str) -> bool:
+    """旧 .ref 词干是否仍落在当前任一有效保存根之内。
+
+    用户切换保存目录（tee_save_dir / 曲库目录）后，指向旧目录或不可写目录的词干属
+    过期引用；沿用它会把实际落点带离当前配置目录，staged 判定随之错配。仅当词干目录
+    仍在 _current_save_roots() 任一根内（换音质/改布局等同根场景）才继续沿旧词干新建。
+    """
+    stem_dir = os.path.dirname(stem)
+    if not stem_dir:
+        return False
+    return any(_within_dir(stem_dir, root) for root in _current_save_roots())
+
+
+def library_media_path(guid: str, title: str, ext: str, artist: str = "", album: str = "",
+                       directory: str | None = None) -> str:
     lib = directory or detect_library_dir()
     recalled = recalled_media_path(guid)
     if recalled and not _is_rolling_cache_stem(recalled, guid):
@@ -2376,13 +2544,23 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "", direct
         existing = _existing_library_file(os.path.dirname(stem), os.path.basename(stem))
         if existing:
             return existing
-        return dest
+        # 词干文件已不存在：仅当词干目录仍在当前保存根内才沿旧词干新建（换音质/
+        # 改布局的同根场景）。切过保存目录的旧词干是过期引用——继续返回旧目录
+        # 会让实际落点脱离 staged 判定基准，在旧（远程）目录重现 .part 与改名。
+        if _stem_in_current_roots(stem):
+            return dest
+        logger.info(
+            "stale media ref for %s ignored: %s outside current save roots, fall back to %s",
+            guid, stem, lib,
+        )
+    download_root = os.path.abspath(directory or detect_library_dir())
+    lib = download_subdir(download_root, artist, album)
     os.makedirs(lib, exist_ok=True)
     basename = library_basename(title, artist, source_from_online_guid(guid) or "")
     if basename.lower() != "unknown":
         # issue #52 重复曲目：同曲（同"歌手 - 歌名"）跨 guid 二次落盘直接复用
         # 已有文件，聚合搜索多源条目/跨平台候选切换不再各存一份
-        existing = _existing_library_file(lib, basename)
+        existing = _existing_library_file(lib, basename) or _find_reusable_library_file(download_root, basename)
         if existing:
             return existing
     return unique_library_path(lib, basename, ext)
@@ -2441,34 +2619,51 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
         return
     if text == read_lyric_cache(guid):
         return
-    path = lyric_cache_path(guid, title=title, artist=artist)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    part_path = f"{path}.{uuid4().hex[:8]}.part"
-    try:
-        with open(part_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.write("\n")
-        os.replace(part_path, path)
-        adopt_library_perms(path)
-        remember_media_path(guid, path)
-    except Exception as e:
-        logger.warning("Failed to write lyric cache %s: %s", path, e)
-        if os.path.exists(part_path):
-            try:
-                os.remove(part_path)
-            except Exception:
-                pass
+    with _LIBRARY_FILE_LOCK:
+        path = lyric_cache_path(guid, title=title, artist=artist)
+        if _dir_is_remote_mount(os.path.dirname(path)):
+            if _staged_write_lyric(path, text):
+                remember_media_path(guid, path)
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        part_path = f"{path}.{uuid4().hex[:8]}.part"
+        try:
+            with open(part_path, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.write("\n")
+            os.replace(part_path, path)
+            adopt_library_perms(path)
+            remember_media_path(guid, path)
+        except Exception as e:
+            logger.warning("Failed to write lyric cache %s: %s", path, e)
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except Exception as e2:
+                    logger.warning("Failed to remove lyric .part %s: %s", part_path, e2)
 
 
 def promote_shadow_lyric(guid: str, audio_path: str) -> None:
     """音频落曲库后，把 cache 里的影子歌词（无音频时代的 guid 命名副本）提升为
-    音频旁 sidecar，词曲贴身；曲库已有 sidecar 时不覆盖。跨文件系统时退化为复制。
+    音频旁 sidecar，词曲贴身；曲库已有 sidecar 时不覆盖。跨文件系统时退化为复制；
+    落点目录判定为远程挂载时改走 staged 单次写入——不在远程目录写 .part、
+    不在远程改名（与 write_lyric_cache 的目录分流策略一致）。
     """
     dest = os.path.splitext(audio_path)[0] + ".lrc"
     if os.path.exists(dest):
         return
     shadow = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.lrc")
-    if not os.path.exists(shadow):
+    try:
+        with open(shadow, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return
+    if not text.strip():
+        _remove_quiet(shadow)
+        return
+    if _dir_is_remote_mount(os.path.dirname(audio_path) or "."):
+        if _staged_write_lyric(audio_path, text):
+            _remove_quiet(shadow)
         return
     try:
         os.replace(shadow, dest)
@@ -2492,7 +2687,7 @@ async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str
         data = r.json()
         if not (isinstance(data, dict) and data.get("ok") is not False):
             return None
-        write_lyric_cache(
+        await asyncio.to_thread(write_lyric_cache,
             guid,
             str(data.get("lyric") or ""),
             title=str(data.get("title") or ""),
@@ -2527,7 +2722,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                         lyric_text = str(l_data.get("lyric") or "").strip()
                         if lyric_text:
                             info = await _online_info(request, guid)
-                            write_lyric_cache(
+                            await asyncio.to_thread(write_lyric_cache,
                                 guid,
                                 lyric_text,
                                 title=str((info or {}).get("title") or ""),
@@ -2541,7 +2736,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
     data = await _online_info(request, guid)
     text = str((data or {}).get("lyric") or "").strip()
     if text:
-        write_lyric_cache(
+        await asyncio.to_thread(write_lyric_cache,
             guid,
             text,
             title=str((data or {}).get("title") or ""),
@@ -3161,7 +3356,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                 params=params,
                 # 略高于 lxmusic 端点总预算（LX_URL_TIMEOUT，默认 15s）：让端点自己
                 # 返回 404/502 完成降档缓存，而不是在 proxy 侧掐断后反复重解析
-                timeout=16.0,
+                timeout=_lx_url_request_timeout_s(),
             )
             if r.status_code == 200:
                 data = r.json()
@@ -3236,7 +3431,7 @@ async def resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: 
             try:
                 result = await asyncio.wait_for(
                     resolve_lx_url(client, song_id, fresh=fresh, meta=meta, max_quality=max_quality),
-                    _LX_STREAM_STARTUP_S)
+                    _lx_stream_startup_timeout_s())
             except TimeoutError:
                 return None
             return result if epoch == _LX_RESOLVE_EPOCH else None
@@ -3322,7 +3517,8 @@ def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
         if len(_LX_URL_PIN) >= _LX_URL_PIN_MAX:
             oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
             _LX_URL_PIN.pop(oldest, None)
-    _LX_URL_PIN[str(song_id)] = (resolved, now + _LX_URL_PIN_TTL_S)
+    remaining = min(_LX_URL_PIN_TTL_S, max(0.0, float(resolved.get("reuse_for_s", _LX_URL_PIN_TTL_S))))
+    _LX_URL_PIN[str(song_id)] = (resolved, now + remaining)
 
 
 # issue #54：UA 敏感 CDN（如酷我）按 User-Agent 放行/拒绝——lxmusic 探活统一用
@@ -3667,6 +3863,8 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                             except (TypeError, ValueError):
                                 expi = 0.0
                             ttl = min(max(expi - 60.0, 1.0), 1800.0) if expi > 0 else 300.0
+                            if inner.get("reuse_for_s") is not None:
+                                ttl = min(ttl, max(0.0, float(inner["reuse_for_s"])))
                             _netease_url_pin_store(key, url, ttl)
                             fn_diag(logger, "netease_resolved", song_id=key, quality=q,
                                     ms=int((time.monotonic()-started)*1000), fresh=fresh)
@@ -4298,7 +4496,10 @@ async def _lyric_orphan_sweeper() -> None:
             for d in (tee_save_dir(), detect_library_dir()):
                 if d and d not in dirs and d != CONF["cache_dir"]:
                     dirs.append(d)
-            removed = await asyncio.to_thread(sweep_orphan_lyrics, CONF["cache_dir"], dirs)
+            def sweep_locked():
+                with _LIBRARY_FILE_LOCK:
+                    return sweep_orphan_lyrics(CONF["cache_dir"], dirs)
+            removed = await asyncio.to_thread(sweep_locked)
             if removed:
                 logger.info("orphan lyric sweep removed %d file(s): %s", len(removed), removed)
         except asyncio.CancelledError:
@@ -4310,46 +4511,191 @@ async def _lyric_orphan_sweeper() -> None:
 
 _maintenance_jobs: dict[str, dict] = {}
 _maintenance_task: asyncio.Task | None = None
+_organize_jobs: dict[str, dict] = {}
+_organize_task: asyncio.Task | None = None
+_last_organize_job: dict | None = None
+
+
+def list_music_users(db_path: str = "") -> list[dict]:
+    """Read active users from the official music database without mutating it."""
+    path = db_path or str(CONF.get("music_db") or dailyrec.music_db_path())
+    if not path or not os.path.exists(path):
+        raise ValueError(f"飞牛音乐数据库不可用: {path}")
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
+            rows = con.execute(
+                """SELECT guid, name, role
+                     FROM user
+                    WHERE status != 'deleted' AND TRIM(guid) != ''
+                    ORDER BY id"""
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"读取飞牛音乐用户失败: {exc}") from exc
+    users = [
+        {"guid": str(row[0]), "name": str(row[1] or ""), "role": str(row[2] or "")}
+        for row in rows
+    ]
+    return users
+
+
+def migrate_public_playlist_users(users: list[dict] | None = None) -> None:
+    path = _env_watch_path()
+    if not os.path.isfile(path):
+        return
+    with env_file_lock(path):
+        existing, comments = parse_env_file(path, strict=True)
+        values = dict(existing)
+        if str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
+            pubpl.validate_user_selections(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])
+            return
+        users = list_music_users() if users is None else users
+        selection = pubpl.parse_selection(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""))
+        mapping = {user["guid"]: selection for user in users}
+        raw = json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
+        updated = [(key, value) for key, value in existing if key != "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]
+        updated.append(("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", raw))
+        write_env_atomic(path, render_env(updated, trailing=comments))
+
+
+async def _try_migrate_public_playlist_users() -> None:
+    try:
+        await asyncio.to_thread(migrate_public_playlist_users)
+        changes = apply_env_hot_reload()
+        _refresh_recommend_config(changes)
+    except (ValueError, OSError) as exc:
+        logger.warning("公共歌单用户配置迁移未完成，将重试: %s", exc)
+
+
+def _organize_target() -> tuple[str, str]:
+    explicit = str(CONF.get("tee_save_dir") or "").strip()
+    root = os.path.realpath(os.path.abspath(explicit if explicit else detect_library_dir()))
+    if root == os.path.realpath(CONF["cache_dir"]):
+        raise ValueError("整理目录不能是歌曲缓存目录")
+    if not os.path.isdir(root) or not os.access(root, os.W_OK | os.X_OK):
+        raise ValueError(f"整理目录不可用: {root}")
+    return root, download_layout()
+
+
+async def _run_cleanup_locked(job: dict) -> None:
+    try:
+        from .maintenance import run_cleanup
+    except ImportError:
+        from maintenance import run_cleanup
+    # Cleanup already rechecks writers and mutates without awaits. A thread lock
+    # held across its awaits can deadlock a worker finalizing a download.
+    await run_cleanup(sys.modules[__name__], job)
+    if job["status"] != "failed":
+        job.update(status="completed", phase="清理完成")
 
 
 async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int, dict]:
-    global _maintenance_task
+    global _maintenance_task, _organize_task, _last_organize_job
     if method == "GET":
+        if path == "/api/maintenance/music-users":
+            try:
+                users = await asyncio.to_thread(list_music_users)
+                await asyncio.to_thread(migrate_public_playlist_users, users)
+                values = dict(parse_env_file(_env_watch_path(), strict=True)[0])
+                CONF["public_playlists_by_user"] = values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "")
+            except (ValueError, OSError) as exc:
+                return 503, {"ok": False, "error": str(exc)}
+            return 200, {"ok": True, "users": users, "total": len(users),
+                         "public_playlists_by_user": pubpl.parse_user_selections(
+                             CONF.get("public_playlists_by_user"))}
+        if path == "/api/maintenance/organize":
+            job = _last_organize_job
+            try:
+                root = _organize_target()[0]
+            except ValueError as exc:
+                return 400, {"ok": False, "error": str(exc), "job": None}
+            return 200, {"ok": True, "root": root, "layout": download_layout(),
+                         "job": dict(job) if job else None}
+        if path.startswith("/api/maintenance/organize/"):
+            job = _organize_jobs.get(path.rsplit("/", 1)[-1])
+            return (200, {"ok": True, "job": dict(job)}) if job else (
+                404, {"ok": False, "error": "任务不存在或服务已重启，请重新执行整理"})
         job = _maintenance_jobs.get(path.rsplit("/", 1)[-1])
         return (200, {"ok": True, "job": dict(job)}) if job else (
             404, {"ok": False, "error": "任务不存在或服务已重启，请重新执行清理"})
-    if method != "POST" or body != {"confirm_beta": True}:
-        return 400, {"ok": False, "error": "必须明确确认 Beta 风险"}
-    if _maintenance_task is not None and not _maintenance_task.done():
-        job = next(j for j in _maintenance_jobs.values() if j["status"] == "running")
-        return 200, {"ok": True, "job": dict(job)}
-    job = {"id": uuid4().hex, "status": "running", "phase": "准备扫描",
-           "scanned": 0, "removed": 0, "bytes": 0, "skipped": 0,
-           "errors": [], "details": [], "started_at": time.time()}
-    while len(_maintenance_jobs) >= 10:
-        _maintenance_jobs.pop(next(iter(_maintenance_jobs)))
-    _maintenance_jobs[job["id"]] = job
 
-    async def run():
+    if method != "POST":
+        return 400, {"ok": False, "error": "不支持的维护请求"}
+    if path == "/api/maintenance/cleanup":
+        if body != {"confirm_beta": True}:
+            return 400, {"ok": False, "error": "必须明确确认 Beta 风险"}
+        if _maintenance_task is not None and not _maintenance_task.done():
+            job = next(j for j in _maintenance_jobs.values() if j["status"] == "running")
+            return 200, {"ok": True, "job": dict(job)}
+        if _organize_task is not None and not _organize_task.done():
+            return 409, {"ok": False, "error": "整理任务进行中，请稍后再清理"}
+        job = {"id": uuid4().hex, "status": "running", "phase": "准备扫描",
+               "scanned": 0, "removed": 0, "bytes": 0, "skipped": 0,
+               "errors": [], "details": [], "started_at": time.time()}
+        while len(_maintenance_jobs) >= 10:
+            _maintenance_jobs.pop(next(iter(_maintenance_jobs)))
+        _maintenance_jobs[job["id"]] = job
+
+        async def run_cleanup_task():
+            try:
+                await _run_cleanup_locked(job)
+            except asyncio.CancelledError:
+                job.update(status="failed", phase="服务停止，清理已中断")
+                raise
+            except Exception as exc:
+                job["errors"].append(str(exc))
+                job.update(status="failed", phase="清理失败")
+            finally:
+                job["finished_at"] = time.time()
+
+        _maintenance_task = asyncio.create_task(run_cleanup_task())
+        return 200, {"ok": True, "job": dict(job)}
+
+    if path != "/api/maintenance/organize":
+        return 400, {"ok": False, "error": "不支持的维护请求"}
+    if (not isinstance(body, dict) or set(body) != {"confirm_beta", "root", "layout"} or
+            body.get("confirm_beta") is not True or
+            body.get("layout") not in DOWNLOAD_LAYOUTS or not isinstance(body.get("root"), str)):
+        return 400, {"ok": False, "error": "整理确认参数无效"}
+    try:
+        root, layout = _organize_target()
+    except ValueError as exc:
+        return 400, {"ok": False, "error": str(exc)}
+    if body["root"] != root or body["layout"] != layout:
+        return 409, {"ok": False, "error": "设置已变化，请重新确认整理"}
+    if _organize_task is not None and not _organize_task.done():
+        return 200, {"ok": True, "job": dict(_organize_jobs[_organize_task.get_name()])}
+    if _maintenance_task is not None and not _maintenance_task.done():
+        return 409, {"ok": False, "error": "清理任务进行中，请稍后再整理"}
+    job = {"id": uuid4().hex, "status": "running", "phase": "准备扫描", "root": root,
+           "layout": layout, "scanned": 0, "moved": 0, "unchanged": 0, "skipped": 0,
+           "failed": 0, "errors": [], "details": [], "started_at": time.time()}
+    while len(_organize_jobs) >= 10:
+        _organize_jobs.pop(next(iter(_organize_jobs)))
+    _organize_jobs[job["id"]] = job
+    _last_organize_job = job
+
+    async def run_organize_task():
+        global _organize_task, _last_organize_job
         try:
             try:
-                from .maintenance import run_cleanup
+                from .organize import run_organize
             except ImportError:
-                from maintenance import run_cleanup
-            import sys
-            await run_cleanup(sys.modules[__name__], job)
+                from organize import run_organize
+            await run_organize(sys.modules[__name__], job)
             if job["status"] != "failed":
-                job.update(status="completed", phase="清理完成")
+                job.update(status="completed", phase="整理完成")
         except asyncio.CancelledError:
-            job.update(status="failed", phase="服务停止，清理已中断")
+            job.update(status="failed", phase="服务停止，整理已中断")
             raise
         except Exception as exc:
             job["errors"].append(str(exc))
-            job.update(status="failed", phase="清理失败")
+            job.update(status="failed", phase="整理失败")
+            job["failed"] += 1
         finally:
             job["finished_at"] = time.time()
+            _last_organize_job = job
 
-    _maintenance_task = asyncio.create_task(run())
+    _organize_task = asyncio.create_task(run_organize_task(), name=job["id"])
     return 200, {"ok": True, "job": dict(job)}
 
 
@@ -4368,6 +4714,8 @@ async def lifespan(fastapi_app: FastAPI):
     # 版本变化失效当日推荐缓存（issue #49）：升级重启后旧歌单曲目的音源侧
     # songInfo 反查全冷，重建才能进持久层，不留"第二天才好"的空窗
     _sync_recommend_version_marker()
+    if _background_jobs_enabled():
+        await _try_migrate_public_playlist_users()
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
     log_task = asyncio.create_task(_log_retention_loop()) if _background_jobs_enabled() else None
@@ -4444,6 +4792,9 @@ async def lifespan(fastapi_app: FastAPI):
         if _maintenance_task is not None and not _maintenance_task.done():
             _maintenance_task.cancel()
             await asyncio.gather(_maintenance_task, return_exceptions=True)
+        if _organize_task is not None and not _organize_task.done():
+            _organize_task.cancel()
+            await asyncio.gather(_organize_task, return_exceptions=True)
         await pubpl.shutdown()
         lx_tasks = _cancel_lx_resolutions()
         if lx_tasks:
@@ -4575,7 +4926,8 @@ async def ext_healthz(request: Request):
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
-                "mode": "per-user: source-slot -> llm -> local-random",
+                "mode": ("per-user: llm -> local-random" if dailyrec.llm_daily_enabled()
+                         else "per-user: source-slot -> llm -> local-random"),
                 # 推荐口径：每日/热门仍只随当前音源构建（常驻不并入网易），
                 # 与上方 musicbox 探活口径（_netease_runtime_usable）区分
                 "netease": bool(CONF.get("netease_enabled")),
@@ -5216,6 +5568,250 @@ def _tee_metadata_fallback(
     return title, artist, album
 
 
+# ---------------------------------------------------------------- staged 落盘
+# 目标目录挂在 WebDAV/rclone/davfs 等网络文件系统上时，直接流式写 .part 再在
+# 远程改名既慢又易失败，中断还会在远程留下半截中间文件被音乐库误认成正常曲目。
+# staged 模式改为：下载、定名、权限、标签、封面、歌词全部在本地 cache/staging
+# 内完成，最后只向目标目录写一次完整文件——远程不出现 .part，也不需要远程改名。
+
+_TEE_STAGED_CACHE = {}          # (mode, target, cache) -> bool
+_STAGING_SWEEP_AT = [0.0]       # 上次清扫时间戳
+_STAGING_SWEEP_INTERVAL = 3600.0
+_STAGING_PART_TTL = 86400.0
+
+
+def tee_save_mode() -> str:
+    """解析落盘模式：CONF 优先，其次环境变量，非法值回落 auto。"""
+    mode = str(CONF.get("tee_save_mode") or "").strip().lower()
+    if not mode:
+        mode = str(os.environ.get("FNMUSIC_TEE_SAVE_MODE", "auto")).strip().lower()
+    if mode not in ("auto", "direct", "staged"):
+        mode = "auto"
+    return mode
+
+
+def _sweep_stale_parts(directory: str, ttl: float = _STAGING_PART_TTL) -> int:
+    """清理目录下超龄的 .part 中间文件。
+
+    缓存目录的回收只按 `online_*.<音频扩展名>` 匹配，`.part` 没有回收路径，
+    中断下载的碎片会永久堆积，这里一并兜底。
+    """
+    import time as _time
+
+    removed = 0
+    now = _time.time()
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_file() or not entry.name.endswith(".part"):
+                continue
+            if now - entry.stat().st_mtime <= ttl:
+                continue
+            os.unlink(entry.path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def staged_dir() -> str:
+    """本地暂存区，恒定落在 cache_dir 之下，从不触碰目标目录。"""
+    import time as _time
+
+    path = os.path.join(CONF["cache_dir"], "staging")
+    os.makedirs(path, exist_ok=True)
+    now = _time.time()
+    if now - _STAGING_SWEEP_AT[0] > _STAGING_SWEEP_INTERVAL:
+        _STAGING_SWEEP_AT[0] = now
+        try:
+            swept = _sweep_stale_parts(path) + _sweep_stale_parts(CONF["cache_dir"])
+            if swept:
+                logger.info("staged: purged %d stale .part files", swept)
+        except Exception as e:  # 清扫失败不影响主流程
+            logger.debug("staged: sweep skipped: %s", e)
+    return path
+
+
+def _staged_decision(directory: str) -> bool:
+    """按实际落点目录判定是否需要「本地加工完整 → 一次性上传」。
+
+    判定基准必须与最终写入目录一致：按配置目录判 direct、实际却写旧引用指向
+    的远程目录，会在远程目录重现 .part 与远程改名（issue #88 要根除的行为）。
+    显式 direct/staged 配置在 _should_stage 内仍是最高优先级，契约不变。
+    """
+    mode = tee_save_mode()
+    target = os.path.abspath(directory or ".")
+    cache = CONF["cache_dir"]
+    key = (mode, target, cache)
+    if key in _TEE_STAGED_CACHE:
+        return _TEE_STAGED_CACHE[key]
+    staged, reason = _should_stage(target, cache, mode)
+    _TEE_STAGED_CACHE[key] = staged
+    logger.info("[tee_save] target=%s cache=%s -> %s (%s)",
+                target, cache, "staged" if staged else "direct", reason)
+    return staged
+
+
+def use_staged_save() -> bool:
+    """当前配置的保存目录是否需要 staged（下载侧 .part 选址等预判场景使用）。"""
+    return _staged_decision(tee_save_dir())
+
+
+def _dir_is_remote_mount(directory: str) -> bool:
+    """目录是否在本地缓存目录之外、且被判定为远程挂载（staged 场景）。
+
+    以目标目录自身为判定基准，而非 tee_save_dir()——歌词等旁路文件的落点
+    可能与音频目标不同（无音频时落 cache）。cache_dir 内恒为本地直写：
+    暂存区宿主目录按定义就是本地盘，判 staged 只会引入无谓拷贝。
+    """
+    directory = os.path.abspath(directory or "")
+    cache = os.path.abspath(CONF["cache_dir"] or "")
+    if directory == cache or directory.startswith(cache + os.sep):
+        return False
+    key = (tee_save_mode(), directory)
+    if key in _TEE_STAGED_CACHE:
+        return _TEE_STAGED_CACHE[key]
+    staged, reason = _should_stage(directory, cache, tee_save_mode())
+    _TEE_STAGED_CACHE[key] = staged
+    logger.info("[staged] %s -> %s (%s)", directory,
+                "staged" if staged else "direct", reason)
+    return staged
+
+
+class _StagedSaveError(OSError):
+    """上传失败；调用方仍拥有完整的原始下载，可保留缓存后重试。"""
+
+
+def _upload_staged_file(src_path: str, dest: str) -> bool:
+    """把本地已加工完的文件整体写入目标目录；网络挂载时即一次完整上传。
+
+    网络文件系统没有「以终名原子写入」能力，写入中断可能在目标目录留下同名
+    截断文件，因此写完必须核对大小，不符立即删残件。目标已存在且大小一致时
+    按既有语义复用，绝不覆盖用户文件。
+    """
+    try:
+        size = os.path.getsize(src_path)
+    except OSError as e:
+        logger.warning("staged: source missing %s: %s", src_path, e)
+        return False
+
+    if os.path.exists(dest):
+        try:
+            if os.path.getsize(dest) == size:
+                return True
+        except OSError:
+            pass
+        logger.warning("staged: %s exists with different size, keep it", dest)
+        return False
+
+    created = False
+    complete = False
+    try:
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # 排他创建，避免 exists 检查后其他任务/用户新建的文件被覆盖。
+        # 写入前即记录所有权，中途失败也清理本次创建的截断文件。
+        with open(src_path, "rb") as source, open(dest, "xb") as target:
+            created = True
+            shutil.copyfileobj(source, target)
+        if os.path.getsize(dest) != size:
+            logger.warning("staged: size mismatch after upload: %s", dest)
+            return False
+        adopt_library_perms(dest)
+        complete = True
+        return True
+    except OSError as e:
+        logger.warning("staged: upload failed for %s: %s", dest, e)
+        return False
+    finally:
+        if created and not complete:
+            try:
+                os.unlink(dest)
+            except OSError as e:
+                logger.warning("staged: failed to remove incomplete upload %s: %s", dest, e)
+
+
+def _staged_write_lyric(dest_audio: str, text: str) -> bool:
+    """staged 模式歌词落盘：本地写全 → 目标目录单次完整写入。
+
+    write_lyric_cache 走「先写 .part 再 rename」的原子策略；网络挂载上 rename
+    本身也是一次远程改名，且中断会留下 .part。这里改为本地成文后整文件单次
+    写入，曲库已有同内容 sidecar 则跳过、已有不同内容则绝不覆盖。
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    lrc_dst = os.path.splitext(dest_audio)[0] + ".lrc"
+    if os.path.exists(lrc_dst):
+        try:
+            with open(lrc_dst, encoding="utf-8") as f:
+                if f.read().strip() == text:
+                    return True
+        except Exception:
+            pass
+        logger.info("staged: lyric exists, keep it: %s", lrc_dst)
+        return True
+    stage = staged_dir()
+    tmp = os.path.join(stage, f"{uuid4().hex[:8]}.lrc")
+    try:
+        os.makedirs(stage, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n")
+        adopt_library_perms(tmp)
+        if _upload_staged_file(tmp, lrc_dst):
+            logger.info("staged: lyric written %s", lrc_dst)
+            return True
+    except Exception as e:
+        logger.warning("staged: lyric write failed for %s: %s", lrc_dst, e)
+    finally:
+        _remove_quiet(tmp)
+    return False
+
+
+def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
+                                  artist: str, album: str, src: dict, dest: str):
+    """staged 落盘：本地定名加工完整 → 目标目录单次写入。
+
+    dest 由调用方按当前保存根算出并已确认不存在（复用分支在外层统一处理），
+    保证 staged 判定与实际落点目录一致。
+    """
+    stage = staged_dir()
+
+    # 每个任务独立加工副本，原始下载在上传成功前保持完整，失败可重试。
+    fd, staged = tempfile.mkstemp(prefix="audio-", suffix=f".{ext}", dir=stage)
+    os.close(fd)
+    try:
+        shutil.copyfile(part, staged)
+        adopt_library_perms(staged)
+        write_audio_tags(staged, title, artist, album)
+        cover_url = _cover_url_of(src)
+        if cover_url and CONF.get("auto_cover", True):
+            try:
+                fetched = download_cover_bytes(cover_url)
+                if fetched and embed_audio_cover(staged, fetched[0], fetched[1]):
+                    logger.info("cover embedded for %s: %s", guid, staged)
+            except Exception as e:
+                logger.debug("cover embed step skipped for %s: %s", guid, e)
+        if not _upload_staged_file(staged, dest):
+            raise _StagedSaveError(f"staged upload failed: {dest}")
+    finally:
+        _remove_quiet(staged)
+    _remove_quiet(part)
+    logger.info("staged: uploaded %s", dest)
+
+    remember_media_path(guid, dest)
+
+    if CONF.get("lyric_auto_dl"):
+        promote_shadow_lyric(guid, dest)
+
+    return dest, False
+
+
 def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: str,
                            album: str, src: dict) -> "tuple[str, bool]":
     """把已校验完整的音频转正进曲库：定名/落位/权限/标签/封面/影子歌词随迁。
@@ -5223,14 +5819,27 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
     目标文件已存在（同 guid 重复落盘或同曲跨 guid，issue #52）一律复用已有文件：
     丢弃本次字节绝不覆盖（用户自有文件与已有标签都不动），只刷新 guid 引用让
     后续播放命中本地。跨文件系统（缓存目录与曲库不同挂载点）退化为复制+删除。
-    返回 (dest, reused)。
+    staged/direct 按实际落点目录判定（use_staged_save 只看配置目录，旧引用把
+    落点带离配置目录时会错配）。返回 (dest, reused)。
     """
-    dest = library_media_path(guid, title, ext, artist=artist, directory=tee_save_dir())
-    reused = os.path.exists(dest)
-    if reused:
-        _remove_quiet(part)
-        logger.info("library file already exists for %s, reuse %s", guid, dest)
-    else:
+    with _LIBRARY_FILE_LOCK:
+        dest = library_media_path(guid, title, ext, artist=artist, album=album, directory=tee_save_dir())
+        reused = os.path.exists(dest)
+        if reused:
+            # 复用判定先行（双模式共用）：不做标签改写、不下载封面——
+            # 用户自有文件的字节绝不动（issue #52）。
+            _remove_quiet(part)
+            logger.info("library file already exists for %s, reuse %s", guid, dest)
+            remember_media_path(guid, dest)
+            # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+            if CONF.get("lyric_auto_dl"):
+                promote_shadow_lyric(guid, dest)
+            return dest, reused
+        if _staged_decision(os.path.dirname(dest) or "."):
+            return _install_library_audio_staged(
+                part, guid, ext, title, artist, album, src, dest
+            )
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         try:
             os.replace(part, dest)
         except OSError:
@@ -5250,11 +5859,11 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
                     logger.info("cover embedded for %s: %s", guid, dest)
             except Exception as e:
                 logger.debug("cover embed step skipped for %s: %s", guid, e)
-    remember_media_path(guid, dest)
-    # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-    if CONF.get("lyric_auto_dl"):
-        promote_shadow_lyric(guid, dest)
-    return dest, reused
+        remember_media_path(guid, dest)
+        # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
+        if CONF.get("lyric_auto_dl"):
+            promote_shadow_lyric(guid, dest)
+        return dest, reused
 
 
 def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled: bool,
@@ -5311,7 +5920,19 @@ def _tee_finalize(part: str, guid: str, ext: str, info: dict | None, tee_enabled
                 "元数据缺失暂存 cache，重播补齐后转正", guid, title, artist,
             )
             return {"dest": dest, "title": title, "artist": artist, "album": album, "deferred": True}
-        dest, reused = _install_library_audio(part, guid, ext, title, artist, album, src)
+        try:
+            dest, reused = _install_library_audio(part, guid, ext, title, artist, album, src)
+        except _StagedSaveError:
+            # 保留可播放、可由 deferred promotion 重试入库的缓存；失败不触发
+            # 歌词下载、曲库扫描或官方绑定，后台下载调用方仍按失败计。
+            cached = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
+            with _LIBRARY_FILE_LOCK:
+                os.makedirs(CONF["cache_dir"], exist_ok=True)
+                if os.path.abspath(part) != os.path.abspath(cached):
+                    os.replace(part, cached)
+                remember_media_path(guid, cached)
+            logger.warning("staged: retained download for retry %s: %s", guid, cached)
+            return None
     else:
         # 边听边存关闭：只写滚动缓存（cache_safe_guid 命名，find_cache_file 精确名可命中）
         dest = os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.{ext}")
@@ -5582,7 +6203,8 @@ def stream_tee_response(
             tee_enabled = bool(CONF.get("tee_save_enabled"))
             if should_cache(range_header) and full_resource:
                 try:
-                    directory = tee_save_dir() if tee_enabled else CONF["cache_dir"]
+                    directory = ((staged_dir() if use_staged_save() else tee_save_dir())
+                                 if tee_enabled else CONF["cache_dir"])
                     os.makedirs(directory, exist_ok=True)
                     part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
                     fp = open(part, "wb")
@@ -6051,7 +6673,8 @@ def _prune_full_fetch_state(now: float) -> None:
             del _full_fetch_failed[g]
 
 
-def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bool:
+def _register_background_fetch(request: Request, guid: str, gate_key: str,
+                               direct_target: DirectMediaTarget | None = None) -> bool:
     """后台整轨下载通用注册逻辑，按 gate_key 指定的 CONF 键做门禁。"""
     if not CONF.get(gate_key) or find_cache_file(guid):
         return False
@@ -6066,7 +6689,9 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str) -> bo
     if now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
         return False
     headers = copy_incoming_headers(request)
-    _full_fetch_tasks[guid] = asyncio.create_task(_full_fetch_download(guid, headers))
+    download = (_full_fetch_download(guid, headers, direct_target=direct_target)
+                if direct_target is not None else _full_fetch_download(guid, headers))
+    _full_fetch_tasks[guid] = asyncio.create_task(download)
     return True
 
 
@@ -6078,6 +6703,269 @@ def _register_full_fetch(request: Request, guid: str) -> None:
     失败后冷却期内不重试，防止坏源反复打上游。
     """
     _register_background_fetch(request, guid, "tee_save_enabled")
+
+
+async def _strict_direct_play_auth(request: Request) -> bool:
+    """Fail closed before exposing any external temporary URL."""
+    if not any(request.headers.get(key) for key in (
+            "cookie", "authorization", "x-trim-music-temp-token", "authx")):
+        return False
+    try:
+        probe = get_upstream_client(request.app).build_request(
+            "GET", "/music/api/v1/user/me", headers=copy_incoming_headers(request))
+        response = await asyncio.wait_for(get_upstream_client(request.app).send(probe), timeout=4.0)
+        try:
+            payload = response.json()
+        except Exception:
+            return False
+        finally:
+            await response.aclose()
+        return (
+            response.status_code == 200
+            and isinstance(payload, dict)
+            and payload.get("code") == 0
+            and isinstance(payload.get("data"), dict)
+            and bool(payload["data"].get("guid"))
+        )
+    except Exception as exc:
+        fn_diag(logger, "direct_rejected", guid="auth", reason=f"auth_{type(exc).__name__}")
+        return False
+
+
+def _representation_key(*parts: object) -> str:
+    return hashlib.sha256("\0".join(str(part) for part in parts).encode("utf-8", "replace")).hexdigest()
+
+
+def _pin_deadline(value: float | None) -> float:
+    if not value:
+        return time.monotonic() + 60.0
+    return value
+
+
+def _direct_internal_token() -> str:
+    token = os.environ.get("FNMUSIC_INTERNAL_TOKEN", "").strip()
+    if not token:
+        token = str(dict(parse_env_file(_env_watch_path())[0]).get("FNMUSIC_INTERNAL_TOKEN") or "").strip()
+    return token
+
+
+async def _resolve_direct_target(request: Request, guid: str, source: str) -> DirectMediaTarget:
+    provider = "netease" if source == "netease" else "lx" if source == "lx" else "musicdl"
+    generation = _DIRECT_PLAY_GENERATIONS[provider]
+    now = time.time()
+    if source == "netease":
+        try:
+            from .netease_direct import upgrade_netease_media_url
+        except ImportError:
+            from netease_direct import upgrade_netease_media_url  # type: ignore
+        song_id = song_id_from_online_guid(guid).split(":")[-1]
+        url = await resolve_netease_url(get_musicbox_client(request.app), song_id)
+        if not url:
+            raise RuntimeError("resolve_failed")
+        url = await upgrade_netease_media_url(url)
+        pin = _NETEASE_URL_PIN.get(song_id)
+        info = _online_meta_for_request(request, guid) or {}
+        return DirectMediaTarget(
+            provider=provider, platform="netease", canonical_id=song_id, url=str(url),
+            server_headers={"User-Agent": _MEDIA_UA_PC}, ext=str(info.get("ext") or ""),
+            resolved_at=now, reuse_deadline=_pin_deadline(pin[1] if pin else None),
+            expiry_source="policy", source_generation=generation,
+            representation_key=_representation_key(url, "netease", info.get("ext")),
+        )
+    if source == "lx":
+        song_id = song_id_from_online_guid(guid)
+        resolved = await resolve_lx_url_shared(
+            get_lx_client(request.app), song_id,
+            meta=_online_meta_for_request(request, guid))
+        if not resolved or not resolved.get("url"):
+            raise RuntimeError("resolve_failed")
+        pin = _LX_URL_PIN.get(song_id)
+        ext = str(resolved.get("ext") or "")
+        quality = str(resolved.get("actual_tier") or resolved.get("quality") or "")
+        return DirectMediaTarget(
+            provider=provider, platform=(guid.split(":")[2:3] or [""])[0], canonical_id=song_id,
+            url=str(resolved["url"]), protocol=str(resolved.get("protocol") or "https"),
+            server_headers=_lx_media_headers(resolved), ext=ext,
+            actual_quality=quality, resolved_at=now,
+            reuse_deadline=_pin_deadline(pin[1] if pin else None), expiry_source="policy",
+            source_generation=generation, representation_key=_representation_key(resolved["url"], ext, quality),
+        )
+
+    token = _direct_internal_token()
+    if not token:
+        raise PermissionError("internal_authentication_missing")
+    response = await get_musicdl_client(request.app).get(
+        "/internal/resolve",
+        params={"id": song_id_from_online_guid(guid)},
+        headers={"X-Internal-Token": token},
+        timeout=16.0,
+    )
+    if response.status_code == 404:
+        _, entry = _retained_track(request, guid)
+        if await _recover_source(request, guid, entry):
+            response = await get_musicdl_client(request.app).get(
+                "/internal/resolve", params={"id": song_id_from_online_guid(guid)},
+                headers={"X-Internal-Token": token}, timeout=16.0)
+    if response.status_code != 200:
+        raise RuntimeError(f"resolve_http_{response.status_code}")
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("url"):
+        raise RuntimeError("resolve_invalid_response")
+    ext = str(payload.get("ext") or "")
+    quality = str(payload.get("actual_quality") or "")
+    try:
+        file_size = int(payload.get("file_size")) if payload.get("file_size") is not None else None
+    except (TypeError, ValueError):
+        file_size = None
+    deadline = float(payload.get("reuse_deadline") or 0.0)
+    return DirectMediaTarget(
+        provider=provider, platform=str(payload.get("platform") or ""), canonical_id=str(payload.get("canonical_id") or ""),
+        url=str(payload["url"]), protocol=str(payload.get("protocol") or "https"),
+        server_headers=dict(payload.get("server_headers") or {}), ext=ext,
+        actual_quality=quality, file_size=file_size,
+        resolved_at=float(payload.get("resolved_at") or now),
+        reuse_deadline=deadline - time.time() + time.monotonic(),
+        upstream_expires_at=payload.get("upstream_expires_at"),
+        expiry_source=str(payload.get("expiry_source") or "unknown"),
+        source_generation=generation,
+        representation_key=_representation_key(payload["url"], ext, quality, payload.get("canonical_id")),
+        selection_id=str(payload.get("selection_id") or ""),
+    )
+
+
+def _nonzero_range(range_header: str | None) -> bool:
+    value = str(range_header or "").strip()
+    return bool(value and not re.fullmatch(r"bytes\s*=\s*0-\d*", value, re.I))
+
+
+def _direct_scope(request: Request) -> str:
+    return _representation_key(_credential_scope(request), request.headers.get("authx", "")
+                               if not any(request.headers.get(key) for key in (
+                                   "cookie", "authorization", "x-trim-music-temp-token")) else "")
+
+
+def _direct_source_config() -> str:
+    return json.dumps([_source_config(), CONF.get("quality_mode"), CONF.get("lx_source_list")],
+                      sort_keys=True, default=str)
+
+
+def _direct_file_response_guard(request: Request, guid: str, path: str) -> Response | None:
+    if request.query_params.get("_ext_hls_stub") == "1":
+        return None
+    source = source_from_online_guid(guid)
+    provider = source if source in ("netease", "lx") else "musicdl"
+    if not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]):
+        return None
+    scope = _direct_scope(request)
+    if _nonzero_range(request.headers.get("range")):
+        if not _DIRECT_FILE_BINDINGS.matches(scope, guid, path):
+            return _direct_error(409, "range_identity_unavailable")
+    else:
+        try:
+            _DIRECT_FILE_BINDINGS.remember(scope, guid, path)
+        except OSError:
+            return _direct_error(409, "file_identity_unavailable")
+        _DIRECT_TARGET_BINDINGS.forget(scope, guid)
+    return None
+
+
+def _direct_error(status: int, reason: str) -> JSONResponse:
+    return JSONResponse(
+        content={"code": status, "msg": "direct play unavailable", "data": {"reason": reason}},
+        status_code=status, headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _direct_redirect_response(request: Request, guid: str) -> Response | None:
+    source = source_from_online_guid(guid)
+    if not is_online_guid(guid) or not source:
+        return None
+    provider = {"netease": "netease", "lx": "lx"}.get(source, "musicdl")
+    scope = _direct_scope(request)
+    range_header = request.headers.get("range")
+    if request.query_params.get("_ext_hls_stub") == "1":
+        fn_diag(logger, "direct_bypassed", guid=guid, reason="hls_stub")
+        return None
+    if not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]):
+        if _nonzero_range(range_header) and _DIRECT_TARGET_BINDINGS.known(scope, guid):
+            return _direct_error(409, "range_identity_unavailable")
+        fn_diag(logger, "direct_bypassed", guid=guid, reason="switch_disabled")
+        return None
+    if not _source_enabled(guid):
+        fn_diag(logger, "direct_rejected", guid=guid, reason="source_unavailable")
+        return _direct_error(503, "source_unavailable")
+    generation = _DIRECT_PLAY_GENERATIONS[provider]
+    config = _direct_source_config()
+    if not await _strict_direct_play_auth(request):
+        fn_diag(logger, "direct_rejected", guid=guid, reason="authorization_failed")
+        return _direct_error(401, "authorization_failed")
+    binding = _DIRECT_TARGET_BINDINGS.get(scope, guid)
+    if binding is not None and binding.generation != generation:
+        fn_diag(logger, "direct_rejected", guid=guid, reason="generation_changed")
+        return _direct_error(409, "generation_changed")
+    if _nonzero_range(range_header):
+        if binding is None:
+            fn_diag(logger, "direct_rejected", guid=guid, reason="range_identity_unavailable")
+            return _direct_error(409, "range_identity_unavailable")
+        decision = await asyncio.to_thread(validate_media_url, binding.target.url)
+        if not decision.ok:
+            return _direct_error(502, decision.reason)
+    elif binding is None:
+        try:
+            target = await _resolve_direct_target(request, guid, source)
+        except PermissionError as exc:
+            fn_diag(logger, "direct_resolve_failed", guid=guid, reason=str(exc))
+            return _direct_error(503, str(exc))
+        except Exception as exc:
+            fn_diag(logger, "direct_resolve_failed", guid=guid, reason=type(exc).__name__)
+            return _direct_error(502, "resolve_failed")
+        if target.source_generation != generation or _DIRECT_PLAY_GENERATIONS[provider] != generation:
+            fn_diag(logger, "direct_rejected", guid=guid, reason="generation_changed")
+            return _direct_error(409, "generation_changed")
+        if target.reuse_deadline <= time.monotonic():
+            return _direct_error(502, "target_expired")
+        if target.ext.lower() in ("m3u8", "m3u") or target.protocol.lower() in ("hls", "m3u8"):
+            return _direct_error(502, "original_file_required")
+        decision = await asyncio.to_thread(validate_media_url, target.url)
+        if not decision.ok:
+            fn_diag(logger, "direct_rejected", guid=guid, reason=decision.reason, host=decision.host)
+            return _direct_error(502, decision.reason)
+        if (generation != _DIRECT_PLAY_GENERATIONS[provider] or config != _direct_source_config()
+                or not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]) or not _source_enabled(guid)):
+            return _direct_error(409, "generation_changed")
+        binding = _DIRECT_TARGET_BINDINGS.put(
+            scope, guid, target, generation,
+            min(300.0, target.reuse_deadline - time.monotonic()),
+        )
+        _DIRECT_FILE_BINDINGS.forget(scope, guid)
+    else:
+        decision = await asyncio.to_thread(validate_media_url, binding.target.url)
+        if not decision.ok:
+            fn_diag(logger, "direct_rejected", guid=guid, reason=decision.reason, host=decision.host)
+            return _direct_error(502, decision.reason)
+
+    if (not CONF.get(_DIRECT_PLAY_CONF_KEYS[provider]) or _DIRECT_PLAY_GENERATIONS[provider] != generation
+            or config != _direct_source_config() or not _source_enabled(guid)):
+        fn_diag(logger, "direct_rejected", guid=guid, reason="disabled_after_resolve")
+        return _direct_error(409, "disabled_after_resolve")
+    if time.monotonic() >= binding.expires_at:
+        return _direct_error(409, "target_expired")
+    background_save = False
+    if request.method == "GET":
+        background_save = _register_background_fetch(
+            request, guid, "tee_save_enabled", direct_target=binding.target)
+    fn_diag(
+        logger, "direct_redirect_issued", guid=guid, provider=provider,
+        method=request.method, host=hostname_for_log(binding.target.url),
+        range_kind="nonzero" if _nonzero_range(range_header) else "initial",
+        generation=generation, expiry_source=binding.target.expiry_source,
+        background_save=background_save,
+    )
+    return RedirectResponse(
+        binding.target.url,
+        status_code=302,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
 
 
 def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
@@ -6135,8 +7023,48 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
     return base
 
 
+async def _open_direct_save(request: Request, guid: str, target: DirectMediaTarget):
+    if target.reuse_deadline <= time.monotonic():
+        return None
+    owned = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=True)
+    response = None
+    try:
+        headers = {**target.server_headers, "Accept-Encoding": "identity"}
+        headers = {key: value for key, value in headers.items() if key.lower() != "range"}
+        if target.provider == "musicdl":
+            if not target.selection_id or not _direct_internal_token():
+                return None
+            await owned.aclose()
+            owned = None
+            client = get_musicdl_client(request.app)
+            outgoing = client.build_request(
+                "GET", "/internal/stream", params={"selection": target.selection_id},
+                headers={"X-Internal-Token": _direct_internal_token()})
+        else:
+            client = owned
+            outgoing = client.build_request("GET", target.url, headers=headers)
+        response = await client.send(outgoing, stream=True)
+        content_type = response.headers.get("content-type", "").lower()
+        if (response.status_code != 200 or any(value in content_type for value in ("text/", "json"))
+                or response.headers.get("content-encoding", "identity").lower() not in ("", "identity")):
+            return None
+        chunks = response.aiter_bytes()
+        first = await anext(chunks, b"")
+        if not first:
+            return None
+        result = (response, owned, target.ext or ext_from_content_type(content_type),
+                  _online_meta_for_request(request, guid), chunks, first)
+        response = owned = None
+        return result
+    finally:
+        if response is not None:
+            await response.aclose()
+        if owned is not None:
+            await owned.aclose()
+
+
 async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False,
-                               fresh_url: bool = False) -> None:
+                               fresh_url: bool = False, direct_target: DirectMediaTarget | None = None) -> None:
     """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。
 
     无损档解码校验失败时按 guid 拉黑并自动以 mp3 档重试一次（服务端
@@ -6150,8 +7078,11 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         # 合成最小 Request scope（触发请求的凭证头 + app 实例），完整复用在线取
         # 流的解析/元数据/首字节校验逻辑；Range 传 None 保证拿到完整资源。
         fake_request = _synth_request(cred_headers)
-        opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3,
-                                           fresh_url=fresh_url or force_mp3)
+        if direct_target is not None:
+            opened = await _open_direct_save(fake_request, guid, direct_target)
+        else:
+            opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3,
+                                               fresh_url=fresh_url or force_mp3)
         if not opened:
             raise RuntimeError("open failed")
         resp, owned, ext, info, chunks, first = opened
@@ -6159,7 +7090,8 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         length = resp.headers.get("content-length", "")
         if length.isdigit():
             expected = int(length)
-        directory = tee_save_dir()
+        # staged 模式下先落本地暂存区，完整下载并加工后再一次性写入目标目录
+        directory = staged_dir() if use_staged_save() else tee_save_dir()
         os.makedirs(directory, exist_ok=True)
         part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
         written = 0
@@ -6192,7 +7124,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
                     if owned:
                         await owned.aclose()
                     resp = owned = None
-                if not force_mp3 and reason == "decode_error":
+                if direct_target is None and not force_mp3 and reason == "decode_error":
                     logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
                     await _full_fetch_download(guid, cred_headers, force_mp3=True, fresh_url=True)
                     return
@@ -6904,7 +7836,7 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
         return Response(status_code=full.status_code, headers=dict(full.headers))
     opened = None
-    budget = _LX_STREAM_STARTUP_S if source_from_online_guid(guid) == "lx" else 4.0
+    budget = _lx_stream_startup_timeout_s() if source_from_online_guid(guid) == "lx" else 4.0
     try:
         opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=budget)
     except Exception:
@@ -7146,30 +8078,60 @@ def _on_hls_segment_failure(guid: str, sess: "tc.Session | None") -> None:
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request, subpath: str = ""):
     startup_started = time.monotonic()
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath or None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
+    if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
+            and _DIRECT_TARGET_BINDINGS.known(_direct_scope(request), guid)):
+        return await _direct_redirect_response(request, guid)
+    source = source_from_online_guid(guid)
+    provider = source if source in ("netease", "lx") else "musicdl"
+    if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
+            and CONF.get(_DIRECT_PLAY_CONF_KEYS[provider])
+            and not _DIRECT_FILE_BINDINGS.matches(_direct_scope(request), guid)):
+        return _direct_error(409, "range_identity_unavailable")
     if request.method == "HEAD":
         local_head = await resolve_local_play(request, guid)
         if local_head is not None:
+            guarded = _direct_file_response_guard(request, guid, local_head["path"])
+            if guarded is not None:
+                return guarded
             head = _local_head_response(guid, local_head, range_header)
             if head is not None:
+                fn_diag(logger, "direct_bypassed", guid=guid, reason="local_hit")
                 return head
         range_header = _sanitize_stale_local_range(guid, range_header)
         cached = find_cache_file(guid, playback=True)
+        if cached:
+            guarded = _direct_file_response_guard(request, guid, cached)
+            if guarded is not None:
+                return guarded
+            fn_diag(logger, "direct_bypassed", guid=guid, reason="cache_hit")
+            return await _stream_head_response(request, guid, cached, range_header)
+        direct = await _direct_redirect_response(request, guid)
+        if direct is not None:
+            return direct
         return await _stream_head_response(request, guid, cached, range_header)
     # 本地曲库命中优先于普通试听缓存（规格）：命中且可播则完全不触在线链路
     local = await resolve_local_play(request, guid)
     if local is not None:
+        guarded = _direct_file_response_guard(request, guid, local["path"])
+        if guarded is not None:
+            return guarded
         local_resp = await _serve_local_stream(guid, local, range_header)
         if local_resp is not None:
+            fn_diag(logger, "direct_bypassed", guid=guid, reason="local_hit")
             return local_resp
     # 本地起播失败或因故障跳过：客户端续拉偏移可能指向本地布局，不能套到在线文件上
     range_header = _sanitize_stale_local_range(guid, range_header)
     cached = find_cache_file(guid, playback=True)
     log_stream_probe(request.method, guid, range_header, bool(cached))
     if cached:
+        guarded = _direct_file_response_guard(request, guid, cached)
+        if guarded is not None:
+            return guarded
+        fn_diag(logger, "direct_bypassed", guid=guid, reason="cache_hit")
         if request.method != "HEAD" and _is_deferred_cache_file(guid, cached):
             # 元数据缺失暂存 cache 的曲目（issue #52）：重播时补齐元数据转正进曲库。
             # retained/headers 在请求上下文内先取好，重活放后台任务不阻塞出流。
@@ -7180,13 +8142,16 @@ async def stream_track(request: Request, subpath: str = ""):
         localmatch.clear_served(guid)
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext),
                                      delivery_kind="cached", delivery_guid=guid)
+    direct = await _direct_redirect_response(request, guid)
+    if direct is not None:
+        return direct
     item, entry = _retained_track(request, guid)
     candidates = [guid]
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
     deadline = asyncio.get_running_loop().time() + (
-        _LX_STREAM_STARTUP_S if source_from_online_guid(guid) == "lx" else _STREAM_STARTUP_S)
+        _lx_stream_startup_timeout_s() if source_from_online_guid(guid) == "lx" else _STREAM_STARTUP_S)
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
             continue
@@ -7384,7 +8349,7 @@ def _legacy_hls_stub(guid: str, info: "dict | None") -> Response:
         duration_s = 0
     if duration_s <= 0:
         duration_s = 240
-    stream_url = f"/music/api/v1/track/stream?guid={quote(guid, safe='')}"
+    stream_url = f"/music/api/v1/track/stream?guid={quote(guid, safe='')}&_ext_hls_stub=1"
     playlist = (
         "#EXTM3U\n"
         "#EXT-X-VERSION:3\n"
@@ -7957,7 +8922,7 @@ async def track_metadata(request: Request, subpath: str = ""):
     if cached_lyric:
         data = {**data, "lyric": cached_lyric}
     elif data.get("lyric"):
-        write_lyric_cache(
+        await asyncio.to_thread(write_lyric_cache,
             guid,
             str(data.get("lyric") or ""),
             title=str(data.get("title") or ""),
@@ -8347,19 +9312,27 @@ async def static_cover(request: Request, subpath: str = ""):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
+        if not _recommend_request_owned(user_guid, playlist_kind, guid):
+            return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
         if playlist_kind == "liked":
             cached = await _load_requested_playlist_bundle(request, user_guid, playlist_kind, guid)
         else:
             cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
-        return await _playlist_cover_response(request, guid, tracks)
+        response = await _playlist_cover_response(request, guid, tracks)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     if pubpl.is_public_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        return await _playlist_cover_response(
+        if not pubpl.selection_allows(CONF, user_guid, pubpl.entry_from_guid(guid)):
+            return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
+        response = await _playlist_cover_response(
             request, guid, pubpl.cached_tracks(guid) or [], pubpl.cover_url_for(guid))
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     # 网易账号歌单封面：登记的封面直链同源直出（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
@@ -9053,7 +10026,7 @@ def _recommend_kinds_enabled() -> list[str]:
 
 def _is_shared_user_guid(user_guid: str) -> bool:
     """身份探测未解析到真实用户 guid（保守回落 shared）的会话。"""
-    return str(user_guid or "").strip() == "shared"
+    return str(user_guid or "").strip() in ("", "shared")
 
 
 def _recommend_injectable_kinds(user_guid: str) -> list[str]:
@@ -9228,9 +10201,17 @@ async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "dail
 
 
 async def _load_requested_playlist_bundle(request: Request, user_guid: str, kind: str, guid: str) -> dict:
-    if kind == "liked" and guid != dailyrec.recommend_playlist_guid("liked", user_guid=user_guid):
-        return dailyrec.empty_daily_bundle(user_guid, "liked")
+    if kind in ("liked", "daily") and not _recommend_request_owned(user_guid, kind, guid):
+        return dailyrec.empty_daily_bundle(user_guid, kind)
     return await _load_daily_bundle(request, user_guid, kind)
+
+
+def _recommend_request_owned(user_guid: str, kind: str, guid: str) -> bool:
+    if kind not in _recommend_injectable_kinds(user_guid):
+        return False
+    if kind == "hot":
+        return True
+    return guid == dailyrec.recommend_playlist_guid(kind, user_guid=user_guid)
 
 
 # === playlist tracks（官方歌单内的在线附加条目）===
@@ -9575,7 +10556,7 @@ async def playlist_list(request: Request):
     public_cards: list[dict] = []
     if public_on:
         try:
-            public_cards = await pubpl.peek_cards(request.app.state, CONF, build_online_track)
+            public_cards = await pubpl.peek_cards(request.app.state, CONF, build_online_track, user_guid)
             for card in public_cards:
                 g = str(card.get("guid") or "")
                 if is_online_guid(g):
@@ -9623,9 +10604,11 @@ async def playlist_detail(request: Request):
     guid = resolve_real_guid(str(request.query_params.get("guid") or "").strip())
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
     if public_entry:
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
         if not is_authed:
             return auth_resp or JSONResponse(content={"code": -1, "msg": "unauthorized", "data": None}, status_code=401)
+        if not pubpl.selection_allows(CONF, user_guid, public_entry):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             card = await pubpl.load_summary(request.app.state, public_entry)
         except Exception:
@@ -9759,7 +10742,7 @@ async def playlist_batch_detail(request: Request):
             recs.append(card)
     for g in public_ids:
         entry = pubpl.entry_from_guid(g)
-        if entry is None:
+        if entry is None or not pubpl.selection_allows(CONF, user_guid, entry):
             continue
         try:
             card = await pubpl.load_summary(request.app.state, entry)
@@ -9792,6 +10775,8 @@ async def playlist_track_list(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
+        if not pubpl.selection_allows(CONF, user_guid, public_entry):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             tracks = dailyrec.stamp_playlist_tracks(
                 await pubpl.load_tracks(request.app.state, public_entry, build_online_track)

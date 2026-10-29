@@ -26,35 +26,34 @@ jobs:
     outputs:
       formal: ${{ steps.release-kind.outputs.formal }}
     env:
-      # 打赏收款链接（可选）：配置后发布包内自动生成支付宝二维码
+      # 打赏二维码文本（可选）：两个渠道独立生成，不把文本或图片提交到仓库
       ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
+      WECHAT_QRCODE: ${{ secrets.WECHAT_QRCODE }}
       # push 触发时为被推的 tag；dispatch 补发时为输入的 tag
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
+          fetch-depth: 0
 
       - name: Verify tag matches VERSION
-        run: |
-          tag="${TAG#v}"
-          version="$(head -n1 VERSION | tr -d '[:space:]')"
-          if [ "$tag" != "$version" ]; then
-            echo "tag ${TAG} 与 VERSION 文件 ${version} 不一致" >&2
-            exit 1
-          fi
-
-      - name: Classify release
         id: release-kind
         run: |
-          case "${TAG#v}" in
-            *[a-z]) echo "formal=false" >> "$GITHUB_OUTPUT" ;;
-            *) echo "formal=true" >> "$GITHUB_OUTPUT" ;;
-          esac
+          python3 proxy/version.py --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify stable release is merged into main
+        if: steps.release-kind.outputs.formal == 'true'
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Verify official music compatibility record
+        run: python3 scripts/check_music_compat.py
 
       - name: Run packaging tests
         run: |
-          python -m pip install pytest qrcode pillow
+          python -m pip install pytest qrcode pillow zxing-cpp PyYAML
           python -m pytest packaging/tests/
 
       - name: Download fnpack
@@ -65,9 +64,12 @@ jobs:
         env:
           FNPACK_VERSION: "1.2.3"
 
-      # 打赏二维码不入库：配置了 ALIPAY_QRCODE secret（收款链接）时现场生成
-      # PNG 打进发布包（二维码中心叠加支付宝徽标，scripts/gen_alipay_qr.py）；
-      # 未配置则跳过（开源发布形态，运行时自动隐藏打赏卡片）
+      # 二维码图片不入库：按各自 Secret 独立生成，未配置的渠道在 WebUI 隐藏。
+      # 微信中心复用 FPK 图标，不需要中文字体。
+      - name: Install donation QR dependencies (optional)
+        if: env.ALIPAY_QRCODE != '' || env.WECHAT_QRCODE != ''
+        run: python3 -m pip install --quiet qrcode pillow
+
       - name: Install CJK font for QR badge (best-effort)
         if: env.ALIPAY_QRCODE != ''
         run: sudo apt-get install -y --no-install-recommends fonts-noto-cjk || true
@@ -75,19 +77,30 @@ jobs:
       - name: Generate Alipay QR code (optional)
         if: env.ALIPAY_QRCODE != ''
         run: |
-          python3 -m pip install --quiet qrcode pillow
           python3 scripts/gen_alipay_qr.py
+          test -s webui-service/static/alipay.png
+
+      - name: Generate WeChat QR code (optional)
+        if: env.WECHAT_QRCODE != ''
+        run: |
+          python3 scripts/gen_wechat_qr.py
+          test -s webui-service/static/wechat.png
 
       - name: Build fpk package
         run: |
           ./packaging/fpk/build.sh
           ls -la dist/
 
+      - name: Verify donation assets in fpk
+        run: |
+          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          python3 scripts/check_donate_assets.py "$fpk_file"
+
       - name: Extract changelog for this version
         run: |
-          version="${TAG#v}"
+          version="${{ steps.release-kind.outputs.display_version }}"
           awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            index($0, "## [" ver "]") == 1 { found = 1; next }
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md > /tmp/release-notes.md
@@ -143,7 +156,7 @@ jobs:
           title="fnmusic-ext ${ver}"
           # 字母后缀 = 自动迭代预发布：标记 Pre-release（/releases/latest 与应用内
           # 检查更新都会跳过它，最新正式版不受影响），标题明示未经完整测试
-          pre_flags=""
+          pre_flags="--prerelease=false"
           case "$ver" in
             *[a-z])
               pre_flags="--prerelease"
@@ -305,7 +318,7 @@ jobs:
             # assets 不带附件 id，需走附件列表接口
             gcurl -f -o /tmp/gitee-att-list.json \
               "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
-            for attach_id in $(jq -r --arg fpk "fnmusic-ext-${ver}.fpk" --arg sum "fnmusic-ext-${ver}.fpk.sha256" \
+            for attach_id in $(jq -r --arg fpk "$(basename "${fpk_file}")" --arg sum "$(basename "${fpk_file}").sha256" \
                 '.[]? | select(.name == $fpk or .name == $sum) | .id' /tmp/gitee-att-list.json); do
               gcurl -o /dev/null -X DELETE \
                 "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true

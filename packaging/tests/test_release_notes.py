@@ -34,6 +34,7 @@ def test_notes_correction_only_updates_existing_release_body(tmp_path):
     ('changed-runtime', False, False),
     ('correction-only', True, True),
     ('missing-section', False, False),
+    ('numeric-migration', True, False),
 ])
 def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path, case, success, edited):
     if not shutil.which('jq'):
@@ -48,6 +49,8 @@ def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path
     git('init', '-q')
     git('config', 'user.name', 'Release Test')
     git('config', 'user.email', 'release@example.invalid')
+    (repo / 'proxy').mkdir()
+    shutil.copyfile(ROOT / 'proxy/version.py', repo / 'proxy/version.py')
     (repo / 'VERSION').write_text('2.10.0b\n')
     initial = ('# Changelog\n\n## [未发布]\n\n## [2.10.0b]\n\nPublished notes.\n'
                '\n## [2.9.0]\n' + 'Historical notes.\n' * 10000)
@@ -61,6 +64,9 @@ def test_notes_correction_skips_unchanged_section_but_guards_real_edits(tmp_path
         updated = updated.replace('Published notes.', 'Corrected published notes.')
     elif case == 'missing-section':
         updated = updated.split('## [2.10.0b]')[0]
+    elif case == 'numeric-migration':
+        (repo / 'VERSION').write_text('2.10.0-1\n')
+        updated = updated.replace('Published notes.', 'New package notes.')
     if case != 'correction-only':
         (repo / 'runtime.py').write_text('value = 2\n')
     (repo / 'CHANGELOG.md').write_text(updated)
@@ -117,9 +123,63 @@ def test_formal_210_documents_changes_since_290():
         assert required in notes
 
 
+def test_formal_2110_documents_cumulative_changes_since_2100():
+    notes = (ROOT / 'CHANGELOG.md').read_text(encoding='utf-8').split(
+        '## [2.11.0]', 1)[1].split('\n## [', 1)[0]
+    assert 'Pre-release' not in notes
+    assert '非正式预发布' not in notes
+    for required in ('v2.10.0', 'v2.11.0', '2.10.1', '2.10.2', '2.11.0-4',
+                     '### 新增', '### 修复', '### 安装与维护', '播放直连', '远程目录',
+                     '洛雪', 'Chat Completions', 'Responses', 'token', '飞牛用户',
+                     '公共歌单', '#83', '#84', '#85', '#96', '1.0.10'):
+        assert required in notes
+    assert '微信' not in notes
+
+
 RELEASE_WORKFLOW = ROOT / '.github/workflows/release.yml'
 CLEANUP_STEP = 'Remove previous published prereleases'
 PUBLISH_STEP = 'Create or update GitHub Release'
+
+
+@pytest.mark.parametrize("version,channel,tag,formal,success", [
+    ("2.11.0-4", "stable", "v2.11.0", "true", True),
+    ("2.11.0-26", "stable", "v2.11.0", "true", True),
+    ("2.11.0-0", "prerelease", "v2.11.0a", "false", True),
+    ("2.11.0-1", "prerelease", "v2.11.0b", "false", True),
+    ("2.11.0-4", "prerelease", "v2.11.0e", "false", True),
+    ("2.11.0-4", None, "v2.11.0", "", False),
+    ("2.11.0-4", "", "v2.11.0", "", False),
+    ("2.11.0-4", "formal", "v2.11.0", "", False),
+    ("2.11.0-4", "stable", "v2.11.0e", "", False),
+    ("2.11.0-4", "prerelease", "v2.11.0", "", False),
+    ("2.11.0", "stable", "v2.11.0", "", False),
+    ("2.11.0-0", "prerelease", "v2.11.0-0", "", False),
+    ("2.11.0-26", "prerelease", "v2.11.0z", "", False),
+    ("2.11.0a", "prerelease", "v2.11.0a", "", False),
+])
+def test_release_ci_validates_tag_and_derives_kind(tmp_path, version, channel, tag, formal, success):
+    (tmp_path / "proxy").mkdir()
+    shutil.copyfile(ROOT / "proxy/version.py", tmp_path / "proxy/version.py")
+    (tmp_path / "VERSION").write_text(version)
+    if channel is not None:
+        (tmp_path / "RELEASE_CHANNEL").write_text(channel)
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", _release_step("Verify tag matches VERSION")],
+        cwd=tmp_path, env=dict(os.environ, TAG=tag, GITHUB_OUTPUT=str(output)),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert (result.returncode == 0) is success, result.stdout + result.stderr
+    if success:
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert values["version"] == version
+        assert values["tag"] == tag
+        assert values["display_version"] == tag[1:]
+        assert values["ui_version"] == tag
+        assert values["channel"] == channel
+        assert values["formal"] == formal
+    else:
+        assert not output.exists()
 
 
 def _release_step(name):
@@ -354,6 +414,38 @@ def test_gitee_step_script_is_valid_bash():
     path = Path('/tmp/gitee-step.sh')
     path.write_text(script)
     subprocess.run(['bash', '-n', str(path)], check=True)
+
+
+def test_gitee_existing_asset_cleanup_uses_install_revision(tmp_path):
+    """补发只能选择真实 -N 安装包附件，不能从展示 tag 拼裸版本名。"""
+    if not shutil.which('jq'):
+        pytest.skip('release shell sandbox requires jq')
+    assets = tmp_path / 'assets.json'
+    assets.write_text(json.dumps([
+        {'id': 11, 'name': 'fnmusic-ext-2.11.0-4.fpk'},
+        {'id': 12, 'name': 'fnmusic-ext-2.11.0-4.fpk.sha256'},
+        {'id': 21, 'name': 'fnmusic-ext-2.11.0.fpk'},
+        {'id': 22, 'name': 'fnmusic-ext-2.10.2.fpk'},
+        {'id': 23, 'name': 'Source code.zip'},
+    ]))
+    script = _unindent_run(_gitee_step_script())
+    selector = script.split('for attach_id in $(', 1)[1].split('); do', 1)[0]
+    selector = selector.replace('/tmp/gitee-att-list.json', f'"{assets}"')
+    result = subprocess.run(
+        ['bash', '-e', '-o', 'pipefail', '-c', selector],
+        env=dict(os.environ, fpk_file='dist/fnmusic-ext-2.11.0-4.fpk', ver='2.11.0'),
+        capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == ['11', '12']
+
+
+def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
+    workflow = (ROOT / '.github/workflows/release.yml').read_text()
+    guard = workflow.split('- name: Verify stable release is merged into main', 1)[1]
+    guard = guard.split('- name:', 1)[0]
+    assert "if: steps.release-kind.outputs.formal == 'true'" in guard
+    assert 'git fetch origin main' in guard
+    assert 'git merge-base --is-ancestor HEAD origin/main' in guard
+    assert 'pre_flags="--prerelease=false"' in workflow
 
 
 def test_gitee_large_upload_never_uses_body_replaying_retry():

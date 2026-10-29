@@ -28,14 +28,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(head -n1 VERSION | tr -d '[:space:]')"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+[a-z]?$ ]]
+          version="$(python3 proxy/version.py --allow-legacy)"
           tag="v${version}"
           if ! git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
             echo "${tag} is not published yet; normal release workflow will supply notes."
             exit 0
           fi
           git merge-base --is-ancestor "$tag" HEAD
+          if [ "$(git show "${tag}:VERSION" | tr -d '[:space:]')" != "$(head -n1 VERSION | tr -d '[:space:]')" ]; then
+            echo "${tag} package version changed; normal release workflow must rebuild it."
+            exit 0
+          fi
           extract_notes() {
             awk -v ver="$version" '
               index($0, "## [" ver "]") == 1 { found = 1; next }

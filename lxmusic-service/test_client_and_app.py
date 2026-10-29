@@ -1117,8 +1117,8 @@ def test_source_capabilities_union_of_enabled_sources():
 
             async def list_custom_sources(self):
                 return [
-                    {"id": "a.js", "name": "a", "enabled": True, "supportedSources": ["kw", "kg"]},
-                    {"id": "b.js", "name": "b", "enabled": True, "supportedSources": ["wy", "tx"]},
+                    {"id": "a.js", "name": "a", "enabled": True, "status": "success", "supportedSources": ["kw", "kg"]},
+                    {"id": "b.js", "name": "b", "enabled": True, "status": "success", "supportedSources": ["wy", "tx"]},
                     {"id": "c.js", "name": "c", "enabled": False, "supportedSources": ["mg"]},
                 ]
 
@@ -1144,9 +1144,9 @@ def test_describe_user_source_lists_all_enabled():
         class MultiClient:
             async def list_custom_sources(self):
                 return [
-                    {"id": "a.js", "name": "src-a", "enabled": True, "version": "1.0",
+                    {"id": "a.js", "name": "src-a", "enabled": True, "status": "success", "version": "1.0",
                      "supportedSources": ["kw", "kg"]},
-                    {"id": "b.js", "name": "src-b", "enabled": True, "version": "2.0",
+                    {"id": "b.js", "name": "src-b", "enabled": True, "status": "success", "version": "2.0",
                      "supportedSources": ["wy"]},
                     {"id": "c.js", "name": "src-c", "enabled": False, "version": "1.0",
                      "supportedSources": ["mg"]},
@@ -1191,6 +1191,129 @@ def test_source_capabilities_reflects_failed_status():
             assert "failed" in info["reason"]
     finally:
         lxapp.LXSERVER = orig_lx
+
+
+# ------------------------------------------------- issue #96：状态语义回归 --
+
+_BAD = {"id": "bad.js", "name": "bad", "enabled": True, "status": "failed",
+        "error": "script crashed", "supportedSources": ["kw"]}
+_GOOD = {"id": "good.js", "name": "good", "enabled": True, "status": "success",
+         "supportedSources": ["kw", "wy"]}
+
+
+def test_describe_aggregates_any_ready_source(monkeypatch):
+    """坏源排在首位也不能把其余健康源整体拖成"未加载"（issue #96 核心）。"""
+    from app import describe_user_source
+    import app as lxapp
+
+    class Fixed:
+        def __init__(self, sources):
+            self._sources = sources
+
+        async def list_custom_sources(self):
+            return self._sources
+
+    orig = lxapp.LXSERVER
+    try:
+        for label, sources in (("bad-first", [_BAD, _GOOD]), ("good-first", [_GOOD, _BAD])):
+            lxapp.LXSERVER = Fixed([dict(s) for s in sources])
+            desc = asyncio.run(describe_user_source())
+            assert desc["configured"] is True, label
+            assert desc["initialized"] is True, label
+            assert desc["state"] == "degraded", label
+            assert desc["ready_count"] == 1 and desc["failed_count"] == 1, label
+            assert "script crashed" in desc["last_error"], label
+            by_id = {s["id"]: s for s in desc["sources"]}
+            assert by_id["good.js"]["initialized"] is True, label
+            assert by_id["bad.js"]["initialized"] is False, label
+    finally:
+        lxapp.LXSERVER = orig
+
+
+def test_describe_reports_loading_when_status_missing():
+    """上游重载窗口缺 status：不得默认成功，应显示加载中。"""
+    from app import describe_user_source
+    import app as lxapp
+
+    class Reloading:
+        async def list_custom_sources(self):
+            return [{"id": "p.js", "name": "p", "enabled": True, "supportedSources": ["kw"]}]
+
+    orig = lxapp.LXSERVER
+    try:
+        lxapp.LXSERVER = Reloading()
+        desc = asyncio.run(describe_user_source())
+        assert desc["initialized"] is False
+        assert desc["state"] == "loading"
+        assert desc["pending_count"] == 1
+        assert desc["sources"][0]["status"] == "loading"
+    finally:
+        lxapp.LXSERVER = orig
+
+
+def test_source_info_reports_service_failure(test_app_client, fake_lx):
+    """源列表查询失败必须按服务故障返回，不能伪装成"未配置源"。"""
+    async def dead():
+        raise httpx.ConnectError("lxserver down")
+
+    fake_lx.list_custom_sources = dead
+    res = test_app_client.get("/api/v1/source")
+    assert res.status_code == 503
+    body = res.json()
+    assert body["category"] == "service_unavailable"
+    assert body["stage"] == "lxmusic_to_lxserver"
+    assert body["data"]["state"] == "unavailable"
+
+
+def test_activate_confirms_target_initialization_failure(test_app_client, fake_lx):
+    """toggle 成功但目标源初始化失败：不得返回激活成功。"""
+    async def failing(target, enabled):
+        s = fake_lx._find(target)
+        if s and enabled:
+            s["enabled"] = True
+            s["status"] = "failed"
+            s["error"] = "init timeout after 3000ms"
+            fake_lx.toggle_calls.append((s["id"], True))
+            return True
+        return await FakeLxServerClient.set_source_enabled(fake_lx, target, enabled)
+
+    fake_lx.set_source_enabled = failing
+    res = test_app_client.post("/api/v1/source", json={"url": "source2"})
+    assert res.status_code == 500
+    body = res.json()
+    assert body["category"] == "runtime"
+    assert "init timeout" in body["error"]
+
+
+def test_activate_pending_target_returns_504(test_app_client, fake_lx, monkeypatch):
+    """目标初始化结果一直待定：返回待确认而非假成功，也不误报脚本失败。"""
+    import app as lxapp
+    monkeypatch.setattr(lxapp, "SOURCE_INIT_CONFIRM_TIMEOUT", 0.3)
+    monkeypatch.setattr(lxapp, "SOURCE_INIT_POLL_INTERVAL", 0.05)
+
+    async def pending(target, enabled):
+        s = fake_lx._find(target)
+        if s and enabled:
+            s["enabled"] = True  # 保持无 status：模拟上游重载/初始化中
+            fake_lx.toggle_calls.append((s["id"], True))
+            return True
+        return await FakeLxServerClient.set_source_enabled(fake_lx, target, enabled)
+
+    fake_lx.set_source_enabled = pending
+    res = test_app_client.post("/api/v1/source", json={"url": "source2"})
+    assert res.status_code == 504
+    body = res.json()
+    assert body["category"] == "initialization_pending"
+    assert body["source_id"] == "source2"
+
+
+def test_reactivate_ready_source_skips_toggle(test_app_client, fake_lx):
+    """已启用且初始化成功的源重复激活：幂等直达确认，不再触发 toggle。"""
+    before = list(fake_lx.toggle_calls)
+    res = test_app_client.post("/api/v1/source", json={"url": "source1"})
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert fake_lx.toggle_calls == before
 
 
 
@@ -1289,6 +1412,17 @@ def fresh_url_cache():
     lxapp._URL_CACHE.clear()
     lxapp._URL_INFLIGHT.clear()
     lxapp._CHAIN_HEALTH.clear()
+
+
+def test_track_url_description_reports_remaining_cache_lifetime(test_app_client, fresh_url_cache):
+    lxapp._URL_CACHE[("lx:kw:123", "lossless")] = {
+        "data": {"url": "https://cdn.example/fixture.flac", "ext": "flac"},
+        "ts": lxapp.time.monotonic() - float(lxapp.CONF["url_cache_ttl"]) + 8,
+    }
+    response = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:123"})
+    assert response.status_code == 200
+    assert 0 < response.json()["data"]["reuse_for_s"] <= 8
+    assert response.json()["data"]["expiry_source"] == "policy"
 
 
 def test_track_url_success_cache_reuses_resolution(test_app_client, fresh_url_cache, fake_lx):
@@ -1583,7 +1717,7 @@ async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cach
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def flaky_resolve(client, src, item, quality="lossless", budget=20.0):
+    async def flaky_resolve(client, src, item, quality="lossless", budget=20.0, **kwargs):
         started.set()
         await release.wait()
         raise RuntimeError("boom")
@@ -1603,7 +1737,7 @@ async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cach
     assert lxapp._URL_INFLIGHT == {}
     assert lxapp._URL_CACHE == {}
 
-    async def ok_resolve(client, src, item, quality="lossless", budget=20.0):
+    async def ok_resolve(client, src, item, quality="lossless", budget=20.0, **kwargs):
         return {"id": item.get("id"), "url": "https://media.test/song.flac"}
 
     monkeypatch.setattr(lxapp, "resolve_and_probe", ok_resolve)
@@ -1825,9 +1959,10 @@ def _install_probe_client():
     lxapp.app.state.client = mock_client(handler)
 
     def restore():
-        lxapp.app.state._state.pop("client", None)
         if had_client:
             lxapp.app.state.client = orig_client
+        else:
+            lxapp.get_http(lxapp.app)
 
     return restore
 
@@ -1835,9 +1970,9 @@ def _install_probe_client():
 def _spy_get_music_url(fake_lx, seen):
     original = fake_lx.get_music_url
 
-    async def spy(song_info, quality="128k", exclude_api_sources=None):
+    async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
         seen.append(dict(song_info))
-        return await original(song_info, quality, exclude_api_sources)
+        return await original(song_info, quality, exclude_api_sources, request_timeout)
 
     fake_lx.get_music_url = spy
 
@@ -1952,3 +2087,88 @@ def test_proxy_media_ua_matches_lx_probe_ua():
         sys.path.insert(0, repo_root)
     from proxy.app import _LX_MEDIA_UA
     assert _LX_MEDIA_UA == lxapp.UA_PC
+
+
+def test_lx_timeouts_hot_reload_clears_negative_cache_and_circuit_breaker(tmp_path, monkeypatch, fresh_url_cache):
+    """热重载配置时清空失败负缓存与熔断状态，保留成功缓存。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LX_RESOLVER_TIMEOUT=8.0\nLX_URL_TIMEOUT=15.0\nLX_PROBE_TIMEOUT=3.0\n", encoding="utf-8")
+    monkeypatch.setenv("LX_ENV_PATH", str(env_file))
+
+    lxapp._reload_timeout_settings()
+    assert lxapp.CONF["resolver_timeout"] == 8.0
+    assert lxapp.CONF["url_timeout"] == 15.0
+    assert lxapp.CONF["probe_timeout"] == 3.0
+
+    # 填充正缓存、负缓存与熔断状态
+    lxapp._URL_CACHE[("lx:kg:good", "high")] = {"data": {"url": "https://ok.test"}, "ts": 1000.0}
+    lxapp._URL_CACHE[("lx:kg:bad", "high")] = {"data": None, "ts": 1000.0}
+    lxapp._CHAIN_HEALTH["user_source:kg"] = {"state": "open", "failures": 5}
+    old_gen = lxapp._URL_CACHE_GEN
+
+    # 修改配置
+    env_file.write_text("LX_RESOLVER_TIMEOUT=12.0\nLX_URL_TIMEOUT=25.0\nLX_PROBE_TIMEOUT=5.0\n", encoding="utf-8")
+    lxapp._reload_timeout_settings()
+
+    assert lxapp.CONF["resolver_timeout"] == 12.0
+    assert lxapp.CONF["url_timeout"] == 25.0
+    assert lxapp.CONF["probe_timeout"] == 5.0
+    # 负缓存清除，正缓存保留
+    assert ("lx:kg:bad", "high") not in lxapp._URL_CACHE
+    assert ("lx:kg:good", "high") in lxapp._URL_CACHE
+    # 熔断清空，代数递增
+    assert lxapp._CHAIN_HEALTH == {}
+    assert lxapp._URL_CACHE_GEN > old_gen
+
+
+@pytest.mark.anyio
+async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_enlarged_timeout(fake_lx, monkeypatch, fresh_url_cache):
+    """慢源解析超时保护：超出单次解析超时放弃/接力，调大参数后成功取链。"""
+    async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
+        fake_lx.url_timeouts.append(request_timeout)
+        await asyncio.sleep(0.1)
+        return {"url": "https://media.test/slow.mp3", "type": "128k"}
+
+    monkeypatch.setattr(fake_lx, "get_music_url", slow_get_music_url)
+
+    def probe_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            206,
+            content=b"\xff\xfb\x90\x44" + b"\x00" * 4096,
+            headers={"Content-Range": "bytes 0-4099/50000", "Content-Type": "audio/mpeg"},
+        )
+
+    client = mock_client(probe_handler)
+
+    # 1. resolver_timeout 设为 0.03s（小于 0.1s），应该超时失败
+    res1 = await lxapp.resolve_and_probe(
+        client, "kw", {"id": "lx:kw:SLOW", "songmid": "SLOW"}, quality="128k",
+        budget=1.0, resolver_timeout=0.03, probe_timeout=0.5,
+    )
+    assert res1 is None
+    assert fake_lx.url_timeouts[-1] == 0.03
+
+    # 2. 调大 resolver_timeout 到 0.5s（大于 0.1s），成功返回
+    res2 = await lxapp.resolve_and_probe(
+        client, "kw", {"id": "lx:kw:SLOW", "songmid": "SLOW"}, quality="128k",
+        budget=1.0, resolver_timeout=0.5, probe_timeout=0.5,
+    )
+    assert res2 is not None
+    assert res2["url"] == "https://media.test/slow.mp3"
+    assert fake_lx.url_timeouts[-1] == 0.5
+
+
+def test_track_url_endpoint_uses_hot_reloaded_timeouts(test_app_client, fake_lx, tmp_path, monkeypatch, fresh_url_cache):
+    """GET /api/v1/track/url 每次请求使用配置快照透传单次解析超时。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LX_RESOLVER_TIMEOUT=11.5\nLX_URL_TIMEOUT=22.0\nLX_PROBE_TIMEOUT=4.5\n", encoding="utf-8")
+    monkeypatch.setenv("LX_ENV_PATH", str(env_file))
+
+    restore = _install_probe_client()
+    try:
+        resp = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:5886682", "quality": "128k"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert fake_lx.url_timeouts[-1] == 11.5
+    finally:
+        restore()

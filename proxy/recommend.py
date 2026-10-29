@@ -2,6 +2,7 @@
 
 两个独立歌单，各自受开关门控（见 .env FNMUSIC_RECOMMEND_*）：
   - 每日推荐（daily，FNMUSIC_RECOMMEND_DAILY）：按账户隔离，逐级补齐至 PLAYLIST_SIZE 首：
+      明确启用大模型用途且接口完整时，所有用户均跳过第 1 层，个人 LLM → 本地补齐。
       1. netease-daily  网易真·每日推荐（musicbox）。音源每天只有一份内容，
                         当天仅第一个构建的用户可用（占用"音源名额"，见 source-slot）
       2. llm            大模型候选 + 搜索匹配（接口完整且勾选每日推荐用途，种子按用户）
@@ -226,6 +227,11 @@ def llm_daily_enabled() -> bool:
     )
 
 
+def daily_strategy() -> str:
+    """Daily cache compatibility key: LLM-personal or upstream-source."""
+    return "llm-personal" if llm_daily_enabled() else "source"
+
+
 def llm_liked_selected() -> bool:
     return (os.environ.get("FNMUSIC_LLM_LIKED_ENABLED", "false").strip().lower()
             in ("true", "1", "yes"))
@@ -251,9 +257,9 @@ def llm_liked_refresh_hours() -> float:
     return value if math.isfinite(value) and value >= 0.5 else 0.5
 
 
-def llm_usage_summary() -> dict:
+def llm_usage_summary(limit: int | None = None, history_limit: int = 0, history_offset: int = 0) -> dict:
     """当日 token 用量概览（healthz recommend 段与 WebUI 共用）。"""
-    return llm_usage.summary()
+    return llm_usage.summary(limit=limit, history_limit=history_limit, history_offset=history_offset)
 
 
 def recommend_cache_dir() -> str:
@@ -279,7 +285,7 @@ def recommend_playlist_guid(kind: str, day: str | None = None, user_guid: str = 
         return LIKED_GUID_PREFIX + hashlib.sha256(user_guid.encode("utf-8")).hexdigest()
     prefix = HOT_GUID_PREFIX if kind == "hot" else DAILY_GUID_PREFIX
     day = day or today_key()
-    suffix = re.sub(r"[^A-Za-z0-9]", "", user_guid)[:12]
+    suffix = hashlib.sha256(user_guid.encode("utf-8")).hexdigest() if user_guid else ""
     if suffix:
         return f"{prefix}{day}:{suffix}"
     return f"{prefix}{day}"
@@ -961,17 +967,24 @@ def _llm_endpoint(base: str) -> tuple[str, str]:
 def _llm_usage(protocol: str, body: dict) -> dict:
     """归一化 usage：chat 与 responses 两套字段名统一成 prompt/completion 口径。"""
     usage = body.get("usage") if isinstance(body, dict) else None
-    if not isinstance(usage, dict):
-        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0}
-    prompt = usage.get("prompt_tokens", usage.get("input_tokens")) or 0
-    completion = usage.get("completion_tokens", usage.get("output_tokens")) or 0
+    if not isinstance(usage, dict) or not usage:
+        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True}
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+    completion = usage.get("completion_tokens", usage.get("output_tokens"))
     details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
     reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else 0
     total = usage.get("total_tokens")
+    if prompt is None and completion is None and total is None:
+        return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True}
     if total is None:
-        total = (prompt or 0) + (completion or 0)
-    return {"prompt": int(prompt or 0), "completion": int(completion or 0),
-            "total": int(total or 0), "reasoning": int(reasoning or 0)}
+        total = (int(prompt or 0)) + (int(completion or 0))
+    return {
+        "prompt": int(prompt or 0),
+        "completion": int(completion or 0),
+        "total": int(total or 0),
+        "reasoning": int(reasoning or 0),
+        "unknown": False,
+    }
 
 
 def _extract_llm_text(protocol: str, body: dict) -> tuple[str, str, str]:
@@ -1042,7 +1055,7 @@ async def _llm_complete(
     limit = llm_daily_token_limit()
     if not llm_usage.within_limit(limit):
         detail = f"当日 token 已达上限 {limit}，明日自动重置"
-        llm_usage.record(None, "token-limit", detail)
+        llm_usage.record(None, "token-limit", detail, actual_request=False)
         raise LLMFailure("token-limit", detail)
     protocol, url = _llm_endpoint(base)
     payload: dict = {"model": llm_model()}
@@ -1073,32 +1086,35 @@ async def _llm_complete(
     except LLMFailure:
         raise
     except httpx.TimeoutException as e:
-        llm_usage.record(None, "timeout", str(e))
+        llm_usage.record(None, "timeout", str(e), actual_request=True)
         raise LLMFailure("timeout", str(e)) from e
     except Exception as e:
-        llm_usage.record(None, "network", str(type(e).__name__))
+        llm_usage.record(None, "network", str(type(e).__name__), actual_request=True)
         raise LLMFailure("network", str(e)) from e
     if resp.status_code >= 400:
         snippet = (resp.text or "").strip()[:300]
-        llm_usage.record(None, f"http-{resp.status_code}", snippet)
+        llm_usage.record(None, f"http-{resp.status_code}", snippet, actual_request=True)
         raise LLMFailure(f"http-{resp.status_code}", snippet)
     try:
         body = resp.json()
     except ValueError as e:
-        llm_usage.record(None, "bad-response", "响应不是合法 JSON")
+        llm_usage.record(None, "bad-response", "响应不是合法 JSON", actual_request=True)
         raise LLMFailure("bad-response", "响应不是合法 JSON") from e
     if not isinstance(body, dict):
-        llm_usage.record(None, "bad-response", "响应不是 JSON 对象")
+        llm_usage.record(None, "bad-response", "响应不是 JSON 对象", actual_request=True)
         raise LLMFailure("bad-response", "响应不是 JSON 对象")
     usage = _llm_usage(protocol, body)
+    is_unknown = bool(usage.get("unknown", False))
     content, finish, status = _extract_llm_text(protocol, body)
-    llm_usage.record(usage)
     if not content.strip():
         # issue #83 核心：HTTP 200 但正文为空（推理 token 耗尽预算）必须显式失败，
-        # 不能静默返回空列表让每日推荐无声退回本地
+        # 不能静默返回空列表让每日推荐无声退回本地。
+        # empty-content 时 actual HTTP 尝试已发生，且消耗了 token，
+        # 一次性记录 usage 与 failure，绝不重复记账 (actual_request=True)。
         detail = _empty_content_detail(protocol, finish, status, usage)
-        llm_usage.record(None, "empty-content", detail)
+        llm_usage.record(usage, "empty-content", detail, actual_request=True, is_unknown_usage=is_unknown)
         raise LLMFailure("empty-content", detail)
+    llm_usage.record(usage, actual_request=True, is_unknown_usage=is_unknown)
     logger.debug("llm %s ok: finish=%s status=%s usage=%s",
                  protocol, finish or "-", status or "-", usage)
     return content
@@ -1677,7 +1693,7 @@ def fallback_cache_path(user_guid: str, day: str, kind: str = "daily") -> str:
     return cache_path(user_guid, day, kind)[:-len(".json")] + ".fallback.json"
 
 
-def _load_bundle_file(path: str, day: str) -> dict | None:
+def _load_bundle_file(path: str, day: str, expected_strategy: str | None = None) -> dict | None:
     if not os.path.exists(path):
         return None
     try:
@@ -1689,6 +1705,9 @@ def _load_bundle_file(path: str, day: str) -> dict | None:
             return None
         if data.get("status") not in ("ready", "partial"):
             return None
+        if (expected_strategy is not None
+                and str(data.get("strategy") or "source") != expected_strategy):
+            return None
         tracks = data.get("tracks")
         if not isinstance(tracks, list) or not tracks:
             return None
@@ -1699,12 +1718,20 @@ def _load_bundle_file(path: str, day: str) -> dict | None:
 
 
 def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
-    return _load_bundle_file(cache_path(user_guid, day, kind), day)
+    strategy = daily_strategy() if kind == "daily" else None
+    data = _load_bundle_file(cache_path(user_guid, day, kind), day, strategy)
+    if data and data.get("guid") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
+        return None
+    return data
 
 
 def load_fallback_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
     """读取升级过渡兜底 bundle（新版当日缓存建成前的新旧衔接数据源）。"""
-    return _load_bundle_file(fallback_cache_path(user_guid, day, kind), day)
+    strategy = daily_strategy() if kind == "daily" else None
+    data = _load_bundle_file(fallback_cache_path(user_guid, day, kind), day, strategy)
+    if data and data.get("guid") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
+        return None
+    return data
 
 
 def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily") -> None:
@@ -1944,8 +1971,11 @@ async def get_or_build_daily(
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
 
+    strategy = daily_strategy()
+
     def current() -> bool:
-        return publication_guard is None or publication_guard() is True
+        return ((kind != "daily" or daily_strategy() == strategy)
+                and (publication_guard is None or publication_guard() is True))
 
     if not current():
         return empty_daily_bundle(user_guid, kind)
@@ -2051,8 +2081,7 @@ async def get_or_build_daily(
             day_shifted(items, day, "lx-charts"), build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
-        # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源
-        # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
+        # 明确启用时所有用户的第一优先级；否则作为网易日推不可用后的个人化补充。
         if llm_http is None or not llm_daily_enabled() or not recommend_daily:
             return []
         recs = await call_llm(
@@ -2107,6 +2136,7 @@ async def get_or_build_daily(
             "seedCount": len(play_seeds),
             "favoriteCount": len(fav_seeds),
             "builtAt": int(time.time()),
+            "strategy": strategy if kind == "daily" else None,
         }
         save_daily_cache(user_guid, day, cp, kind)
 
@@ -2208,15 +2238,16 @@ async def get_or_build_daily(
                     contributing.append(name)
                 _save_checkpoint()
 
-    # 每日推荐链（按账户隔离）：网易真每日推荐（每天仅第一个用户，占用音源名额）
-    # -> LLM（配置即用，种子按用户）-> 本地曲库随机兜底（最近没听过优先）；
+    # 每日推荐链（按账户隔离）：LLM 明确启用且接口完整时所有用户优先生成个人
+    # 推荐；否则网易真每日推荐（每天仅第一个用户，占用音源名额）-> LLM ->
+    # 本地曲库随机兜底（最近没听过优先）；
     # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。
     # FNMUSIC_RECOMMEND_DAILY / FNMUSIC_RECOMMEND_HOT 分别门控两条链的构建。
     if kind == "hot":
         await run_tier("netease-charts", from_netease_charts)
         await run_tier("lx-charts", from_lx_charts)
     elif recommend_daily:
-        if not source_slot_claimed(day):
+        if strategy != "llm-personal" and not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
         await run_tier("llm", from_llm)
         if current() and len(tracks) < PLAYLIST_SIZE:
@@ -2253,6 +2284,7 @@ async def get_or_build_daily(
         "tracks": tracks,
         "tiers": contributing,
         "tierFailures": list(tier_failures),
+        "strategy": strategy if kind == "daily" else None,
         "seedCount": len(play_seeds),
         "favoriteCount": len(fav_seeds),
         "builtAt": int(time.time()),

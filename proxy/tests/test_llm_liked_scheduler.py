@@ -489,6 +489,8 @@ def test_startup_restores_persisted_unread_batch_without_requests(tmp_path, monk
         await pa._schedule_liked_builds(pa.app)
         await asyncio.gather(*list(pa._LIKED_TASKS.values()))
         first = localrec.load_llm_bundle("u1", pa._liked_source_fingerprint(), db_path=str(db))
+        other = localrec.load_llm_bundle("u2", pa._liked_source_fingerprint(), db_path=str(db))
+        assert other and other["firstFetchedAt"] is None
         assert first and first["tracks"]
         assert first["firstFetchedAt"] is None
         before = len(model_calls)
@@ -502,6 +504,7 @@ def test_startup_restores_persisted_unread_batch_without_requests(tmp_path, monk
         assert loaded["batchId"] == first["batchId"]
         assert loaded["firstFetchedAt"] is None
         pa._mark_liked_response_fetched("u1", loaded)
+        assert localrec.load_llm_bundle("u2", pa._liked_source_fingerprint(), db_path=str(db)) == other
         fetched = localrec.load_llm_bundle("u1", pa._liked_source_fingerprint(), db_path=str(db))
         assert fetched["firstFetchedAt"] == first["publishedAt"] + 90 * 86400
         monkeypatch.setattr(pa.time, "time", lambda: fetched["firstFetchedAt"] + 1801)
@@ -509,6 +512,7 @@ def test_startup_restores_persisted_unread_batch_without_requests(tmp_path, monk
         assert "u1" in pa._LIKED_TASKS
         await asyncio.gather(*list(pa._LIKED_TASKS.values()))
         refreshed = localrec.load_llm_bundle("u1", pa._liked_source_fingerprint(), db_path=str(db))
+        assert localrec.load_llm_bundle("u2", pa._liked_source_fingerprint(), db_path=str(db)) == other
         assert refreshed["batchId"] != first["batchId"]
         assert refreshed["firstFetchedAt"] is None
 

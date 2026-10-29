@@ -33,11 +33,15 @@ from lxserver_client import (
     SUPPORTED_PLATFORMS,
     is_lxserver_unreachable,
     normalize_source,
+    serialize_source_operation,
 )
 
 VERIFY_KEYWORDS = ("晴天", "江南", "十年", "倔强")
 _PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
+_CLEANUP_TIMEOUT_S = 3.0
+_CLOSE_TIMEOUT_S = 1.0
+logger = logging.getLogger("lxmusic_service")
 
 
 def _new_temp_client(**kwargs) -> LxServerClient:
@@ -87,8 +91,13 @@ async def download_script(url: str, timeout: float = 20.0) -> str:
     """下载或读取脚本内容。支持 http(s):// 与 file://"""
     url = url.strip()
     if url.startswith("file://"):
-        parsed = urllib.parse.urlparse(url)
-        path = urllib.parse.unquote(parsed.path)
+        raw = urllib.parse.unquote(url[len("file://"):])
+        if os.name == "nt":
+            if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+                raw = raw[1:]
+            elif raw.startswith("///") and len(raw) > 4 and raw[4] == ":":
+                raw = raw[3:]
+        path = raw
         if not os.path.isfile(path):
             raise ValueError(f"本地文件不存在: {path}")
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -120,6 +129,37 @@ def parse_script_meta(script: str) -> dict:
     return meta
 
 
+async def _cleanup_verification_client(
+    client: LxServerClient, created_id: str | None, changed_reused_id: str | None,
+) -> None:
+    """在持锁的原 Task 内有界恢复；不能用 wait_for/shield 派生新锁 owner。"""
+    try:
+        async with asyncio.timeout(_CLEANUP_TIMEOUT_S):
+            if created_id:
+                if await client.delete_custom_source(created_id) is False:
+                    raise RuntimeError("delete returned false")
+            elif changed_reused_id:
+                if await client.toggle_custom_source(changed_reused_id, False) is False:
+                    raise RuntimeError("toggle returned false")
+    except (Exception, asyncio.CancelledError) as exc:
+        logger.warning(
+            "verify_source cleanup failed (%s source %s): %s",
+            "delete created" if created_id else "restore reused",
+            created_id or changed_reused_id or "none", type(exc).__name__,
+        )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+    finally:
+        try:
+            async with asyncio.timeout(_CLOSE_TIMEOUT_S):
+                await client.close()
+        except (Exception, asyncio.CancelledError) as exc:
+            logger.warning("verify_source client close failed: %s", type(exc).__name__)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+
+
+@serialize_source_operation
 async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict:
     """端到端校验一个源 URL 并返回结构化报告。"""
     import app as lx_app  # 延迟导入
@@ -168,8 +208,7 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
     temp_filename = f"verify_tmp_{int(time.time())}.js"
     # lxserver 上传后以脚本 @name 生成唯一 id；已存在同 id 源时复用既有源（测毕还原其启用态）
     temp_source_id: str | None = None
-    reused_source: dict | None = None
-    reused_was_enabled: bool | None = None
+    changed_reused_id: str | None = None
     try:
         # 上传为临时源
         try:
@@ -187,7 +226,7 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         sources = await temp_client.list_custom_sources()
         target_src = None
         for s in sources:
-            if (temp_source_id and s.get("id") == temp_source_id) or s.get("name") == meta["name"]:
+            if (s.get("id") == temp_source_id if temp_source_id else s.get("name") == meta["name"]):
                 target_src = s
                 break
         if target_src is None:
@@ -197,10 +236,15 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         # lxserver 解析只走 enabled 的源（isSourceSupported 跳过禁用源）：
         # 新上传的临时源默认禁用，须临时启用；复用既有源时记住原状态，测毕还原
         if temp_source_id is None:
-            reused_source = target_src
-            reused_was_enabled = bool(target_src.get("enabled"))
-            if not reused_was_enabled:
-                await temp_client.toggle_custom_source(str(target_src.get("id")), True)
+            if not target_src.get("enabled"):
+                reused_id = str(target_src.get("id") or "")
+                if not reused_id:
+                    report.update(category="internal", message="复用源缺少 ID，无法临时启用")
+                    return report
+                if await temp_client.toggle_custom_source(reused_id, True) is False:
+                    report.update(category="internal", message="复用源临时启用失败")
+                    return report
+                changed_reused_id = reused_id
         else:
             await temp_client.toggle_custom_source(temp_source_id, True)
 
@@ -319,19 +363,6 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         )
         return report
     finally:
-        # 清理：自建的临时源直接删除；复用的既有源还原启用态
-        if temp_source_id:
-            try:
-                await temp_client.delete_custom_source(temp_source_id)
-            except Exception:
-                pass
-        elif reused_source is not None and reused_was_enabled is False:
-            try:
-                await temp_client.toggle_custom_source(str(reused_source.get("id")), False)
-            except Exception as exc:  # noqa: BLE001
-                # lxserver 不可达时无法还原（测试中途掉线即走到这里）：留着启用态
-                # 不算成功验证，必须留下痕迹供定位，而非静默泄漏。
-                logging.getLogger("lxmusic_service").warning(
-                    "verify_source failed to re-disable reused source %s: %s",
-                    reused_source.get("name"), type(exc).__name__)
-        await temp_client.close()
+        # 只删除上传返回的本次创建 ID；既有源只恢复本次成功切换的状态。
+        # timeout/cancel 仍在原 task/共享锁内完成有界清理，然后再向调用方传播。
+        await _cleanup_verification_client(temp_client, temp_source_id, changed_reused_id)

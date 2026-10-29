@@ -24,6 +24,10 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setitem(p.CONF, "music_db", str(tmp_path / "missing.db"))
     monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
     monkeypatch.setitem(p.CONF, "tee_save_dir", "")
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "auto")
+    monkeypatch.setitem(p.CONF, "download_layout", "flat")
+    monkeypatch.setenv("FNMUSIC_TEE_SAVE_MODE", "auto")
+    monkeypatch.setattr(p, "_TEE_STAGED_CACHE", {})
     monkeypatch.setitem(p.CONF, "tee_cache_max", 2)
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", False)
     monkeypatch.setattr(p, "_TEE_SAVE_DIR_WARNED", False)
@@ -638,3 +642,368 @@ async def test_deferred_promotion_yields_before_moving_file(monkeypatch):
     assert install_at[0] - t0 >= 0.4, "promotion must yield to serving before touching files"
     assert not os.path.exists(cached)
     assert audio_files(p.CONF["library_dir"]) == ["周杰伦 - 晴天.flac"]
+
+
+# ---------------------------------------------------------------- 歌词 staged 分流
+
+def _audio_into_library(guid, title="晴天", artist="周杰伦", ext="flac"):
+    """往曲库目录放一个音频文件并记住媒体路径，让 lyric_cache_path 走「音频旁」。"""
+    dest = os.path.join(p.CONF["library_dir"], f"{artist} - {title}.{ext}")
+    with open(dest, "wb") as f:
+        f.write(b"A" * 64)
+    p.remember_media_path(guid, dest)
+    return dest
+
+
+@pytest.mark.anyio
+async def test_lyric_write_to_remote_library_leaves_no_part(monkeypatch):
+    """staged 场景（tee_save_dir 判定远程）：歌词接口直写路径分流到本地成文
+    单次上传，曲库目录零 .part 残件（issue：*.lrc.<hex>.part 残留）。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:2"
+    _audio_into_library(guid)
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+
+    p.write_lyric_cache(guid, "[00:00.00]测试歌词", title="晴天", artist="周杰伦")
+
+    assert os.path.isfile(lrc)
+    with open(lrc, encoding="utf-8") as f:
+        assert f.read().strip() == "[00:00.00]测试歌词"
+    leftovers = [n for n in os.listdir(p.CONF["library_dir"]) if n.endswith(".part")]
+    assert leftovers == []
+    # 上传成功后 guid 引用已刷新
+    assert p.recalled_media_stem(guid) == os.path.splitext(lrc)[0]
+
+
+@pytest.mark.anyio
+async def test_lyric_write_remote_same_content_second_call_no_op(monkeypatch):
+    """staged 场景同内容二次写入（模拟并发/短间隔重复请求）：不再产生任何
+    远程 IO 与暂存副本，曲库目录零 .part。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:3"
+    _audio_into_library(guid, title="晴天", artist="周杰伦")
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+
+    for _ in range(3):
+        p.write_lyric_cache(guid, "[00:00.00]测试歌词", title="晴天", artist="周杰伦")
+
+    assert os.path.isfile(lrc)
+    leftovers = [n for n in os.listdir(p.CONF["library_dir"]) if n.endswith(".part")]
+    assert leftovers == []
+    staged = os.listdir(os.path.join(p.CONF["cache_dir"], "staging"))
+    assert staged == []
+
+
+@pytest.mark.anyio
+async def test_lyric_write_remote_never_overwrites_existing(monkeypatch):
+    """staged 场景曲库已有不同内容歌词：绝不覆盖（与 _staged_write_lyric 语义
+    一致，保护用户自有歌词）。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:4"
+    dest = _audio_into_library(guid)
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+    with open(lrc, "w", encoding="utf-8") as f:
+        f.write("[00:00.00]用户自有歌词")
+
+    p.write_lyric_cache(guid, "[00:00.00]线上歌词", title="晴天", artist="周杰伦")
+
+    with open(lrc, encoding="utf-8") as f:
+        assert f.read().strip() == "[00:00.00]用户自有歌词"
+    assert os.path.getsize(dest) == 64  # 音频也不受影响
+
+
+@pytest.mark.anyio
+async def test_lyric_write_local_library_keeps_part_rename(monkeypatch):
+    """本地盘（direct 判定）行为与修复前一致：.part + rename 原子写，
+    覆盖更新语义保留。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "direct")
+    guid = "online:kuwo:5"
+    _audio_into_library(guid)
+    lrc = os.path.join(p.CONF["library_dir"], "周杰伦 - 晴天.lrc")
+
+    p.write_lyric_cache(guid, "[00:00.00]第一版", title="晴天", artist="周杰伦")
+    assert os.path.isfile(lrc)
+    p.write_lyric_cache(guid, "[00:00.00]第二版", title="晴天", artist="周杰伦")
+
+    with open(lrc, encoding="utf-8") as f:
+        assert f.read().strip() == "[00:00.00]第二版"
+    leftovers = [n for n in os.listdir(p.CONF["library_dir"]) if n.endswith(".part")]
+    assert leftovers == []
+
+
+@pytest.mark.anyio
+async def test_lyric_write_no_audio_falls_into_cache_without_staging(monkeypatch):
+    """第三档（无音频落 cache）：cache_dir 内恒为本地直写，即使 mode=staged
+    也不引入 staging 拷贝，文件以 guid 命名。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:6"
+
+    p.write_lyric_cache(guid, "[00:00.00]影子歌词", title="晴天", artist="周杰伦")
+
+    shadow = os.path.join(p.CONF["cache_dir"], f"{p.cache_safe_guid(guid)}.lrc")
+    assert os.path.isfile(shadow)
+    staged_dir = os.path.join(p.CONF["cache_dir"], "staging")
+    assert not os.path.isdir(staged_dir) or os.listdir(staged_dir) == []
+
+
+def test_lyric_part_cleanup_failure_is_logged(monkeypatch, tmp_path, caplog):
+    """本地直写路径清理残件失败不再静默吞掉：warning 带残件路径。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "direct")
+    monkeypatch.setitem(p.CONF, "tee_save_dir", str(tmp_path / "lib"))
+    os.makedirs(p.CONF["tee_save_dir"], exist_ok=True)
+    guid = "online:kuwo:7"
+    monkeypatch.setattr(p, "read_lyric_cache", lambda g: "")
+    monkeypatch.setattr(p, "lyric_cache_path",
+                        lambda g, title="", artist="": str(tmp_path / "lib" / "x.lrc"))
+    monkeypatch.setattr(p.os, "replace",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(p.os.path, "exists", lambda pp: "part" in str(pp))
+    monkeypatch.setattr(p.os, "remove",
+                        lambda pp: (_ for _ in ()).throw(OSError("gone")))
+    with caplog.at_level(logging.WARNING):
+        p.write_lyric_cache(guid, "[00:00.00]词")
+    assert any(".part" in r.getMessage() and "gone" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_tee_save_mode_hot_reload_invalidates_judgment_cache(tmp_path, monkeypatch):
+    """热重载改 FNMUSIC_TEE_SAVE_MODE 后：CONF 同步新值、staged 判定缓存清空
+    （否则旧判定复用到重启，改 direct/staged 不生效）。"""
+    import importlib as _il
+    env_file = str(tmp_path / ".env")
+
+    def _apply(mode):
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.write(f"FNMUSIC_TEE_SAVE_MODE={mode}\n")
+        return p.apply_env_hot_reload(env_file)
+
+    p._TEE_STAGED_CACHE[("auto", "/some/remote/dir")] = True
+    changed = _apply("direct")
+    assert "tee_save_mode" in changed
+    assert p.CONF["tee_save_mode"] == "direct"
+    assert p.tee_save_mode() == "direct"
+    assert ("auto", "/some/remote/dir") not in p._TEE_STAGED_CACHE  # 缓存已清
+
+    # 非法值被校验器拒绝：CONF 不动、无变更报告
+    p._TEE_STAGED_CACHE[("direct", "/x")] = False
+    changed = _apply("ultra")
+    assert changed == []
+    assert p.CONF["tee_save_mode"] == "direct"
+    assert p._TEE_STAGED_CACHE[("direct", "/x")] is False  # 未误清
+
+
+def test_lyric_judgment_uses_lyric_target_dir_not_tee_dir(tmp_path, monkeypatch):
+    """歌词 staged 判定以歌词落点目录为基准：tee_save_dir 是本地而歌词落点
+    （音频旁）在别处时，按歌词落点自身判定，不跟 tee_save_dir 走。"""
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    other = tmp_path / "other_lib"
+    (other).mkdir()
+    lrc = os.path.join(str(other), "x.lrc")
+
+    assert p._dir_is_remote_mount(os.path.dirname(lrc)) is True
+    # cache_dir 内恒直写
+    cache_lrc = os.path.join(p.CONF["cache_dir"], "a.lrc")
+    assert p._dir_is_remote_mount(os.path.dirname(cache_lrc)) is False
+
+
+@pytest.mark.anyio
+async def test_staged_stream_downloads_only_into_local_staging(monkeypatch):
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:staged-stream"
+
+    class InspectAudio(Audio):
+        async def __aiter__(self):
+            remote_parts = [name for name in os.listdir(p.CONF["library_dir"])
+                            if name.endswith(".part")]
+            assert remote_parts == []
+            stage = p.staged_dir()
+            assert any(name.endswith(".part") for name in os.listdir(stage))
+            yield self.payload
+
+    await listen(guid, ext="mp3", response=httpx.Response(200, stream=InspectAudio()))
+    dest = p.recalled_media_path(guid)
+    assert dest and open(dest, "rb").read() == b"A" * 4096
+    assert os.listdir(p.staged_dir()) == []
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_staged_upload_cleans_partial_final_name(tmp_path, monkeypatch, interrupted):
+    source, target = tmp_path / "source.mp3", tmp_path / "target.mp3"
+    source.write_bytes(b"A" * 4096)
+
+    def partial_copy(source_file, target_file):
+        target_file.write(source_file.read(10))
+        if interrupted:
+            raise OSError("connection lost")
+
+    monkeypatch.setattr(p.shutil, "copyfileobj", partial_copy)
+    assert p._upload_staged_file(str(source), str(target)) is False
+    assert not target.exists()
+    assert source.read_bytes() == b"A" * 4096
+
+
+def test_staged_upload_never_overwrites_racing_user_file(tmp_path, monkeypatch):
+    import builtins
+
+    source, target = tmp_path / "source.mp3", tmp_path / "target.mp3"
+    source.write_bytes(b"A" * 4096)
+    real_open = builtins.open
+
+    def racing_open(path, mode="r", *args, **kwargs):
+        if str(path) == str(target) and mode == "xb":
+            target.write_bytes(b"user-owned")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(p, "open", racing_open, raising=False)
+    assert p._upload_staged_file(str(source), str(target)) is False
+    assert target.read_bytes() == b"user-owned"
+
+
+@pytest.mark.anyio
+async def test_staged_failure_retains_cache_and_retries_without_false_success(monkeypatch):
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:retry-staged"
+    metadata = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}
+    original_upload = p._upload_staged_file
+    monkeypatch.setattr(p, "_upload_staged_file", lambda *args: False)
+    scans, bindings, finalized = [], [], []
+    monkeypatch.setattr(p, "_schedule_library_scan", lambda *a: scans.append(a))
+    monkeypatch.setattr(p, "_dispatch_official_binding", lambda *a: bindings.append(a))
+
+    async def post_finalize(meta):
+        finalized.append(meta)
+
+    await listen(guid, ext="mp3", info=metadata, post_finalize=post_finalize)
+    cached = p.find_cache_file(guid)
+    assert cached and open(cached, "rb").read() == b"A" * 4096
+    assert p._is_deferred_cache_file(guid, cached)
+    assert audio_files(p.CONF["library_dir"]) == []
+    assert scans == bindings == finalized == []
+    assert os.listdir(p.staged_dir()) == []
+
+    monkeypatch.setattr(p, "_upload_staged_file", original_upload)
+    monkeypatch.setattr(p, "_tee_metadata_fallback",
+                        lambda *a, **kw: ("晴天", "周杰伦", "叶惠美"))
+    await p._promote_deferred_cache({}, guid, cached)
+    dest = p.recalled_media_path(guid)
+    assert dest and dest != cached and open(dest, "rb").read() == b"A" * 4096
+    assert not os.path.exists(cached)
+    assert len(scans) == len(bindings) == 1
+
+
+@pytest.mark.anyio
+async def test_staged_background_upload_failure_enters_retry_cooldown(monkeypatch):
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    guid = "online:kuwo:background-failure"
+    payload = b"F" * 4096
+
+    async def fake_open(*args, **kwargs):
+        resp = httpx.Response(200, stream=Whole(payload),
+                              headers={"content-length": str(len(payload))})
+        return resp, None, "mp3", {"title": "晴天", "artist": "周杰伦"}, Done(), payload
+
+    monkeypatch.setattr(p, "_open_online_stream", fake_open)
+    monkeypatch.setattr(p, "_upload_staged_file", lambda *args: False)
+    monkeypatch.setattr(p, "_schedule_library_scan",
+                        lambda *args: pytest.fail("failed upload must not trigger scan"))
+    monkeypatch.setattr(p, "_dispatch_official_binding",
+                        lambda *args: pytest.fail("failed upload must not bind"))
+    await p._full_fetch_download(guid, {})
+    assert guid in p._full_fetch_failed
+    cached = p.find_cache_file(guid)
+    assert cached and open(cached, "rb").read() == payload
+    assert audio_files(p.CONF["library_dir"]) == []
+    assert os.listdir(p.staged_dir()) == []
+
+
+@pytest.mark.parametrize("layout", ["flat", "artist", "album", "artist_album"])
+def test_staged_install_respects_download_layout_and_reuses_file(tmp_path, monkeypatch, layout):
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    monkeypatch.setitem(p.CONF, "download_layout", layout)
+    parts = {
+        "flat": (),
+        "artist": ("周杰伦",),
+        "album": ("叶惠美",),
+        "artist_album": ("周杰伦", "叶惠美"),
+    }
+    original = tmp_path / "original.part"
+    original.write_bytes(b"A" * 4096)
+    dest, reused = p._install_library_audio(
+        str(original), "online:kuwo:layout", "mp3", "晴天", "周杰伦", "叶惠美", {})
+    assert dest == os.path.join(p.CONF["library_dir"], *parts[layout], "周杰伦 - 晴天.mp3")
+    assert not reused
+    assert not original.exists()
+    original.write_bytes(b"B" * 8192)
+    monkeypatch.setattr(p, "write_audio_tags",
+                        lambda *args: pytest.fail("reused audio must not be retagged"))
+    again, reused = p._install_library_audio(
+        str(original), "online:netease:layout", "mp3", "晴天", "周杰伦", "叶惠美", {})
+    assert again == dest and reused
+    assert open(dest, "rb").read() == b"A" * 4096
+    assert not original.exists()
+
+
+def test_staged_tasks_use_independent_work_files_and_preserve_failed_source(tmp_path, monkeypatch):
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    first, second = tmp_path / "first.part", tmp_path / "second.part"
+    first.write_bytes(b"A" * 4096)
+    second.write_bytes(b"B" * 8192)
+    staged_paths = []
+
+    def overlapping_tags(path, *args):
+        staged_paths.append(path)
+        if len(staged_paths) == 1:
+            p._install_library_audio(
+                str(second), "online:kuwo:overlap", "mp3", "晴天", "周杰伦", "叶惠美", {})
+            assert open(path, "rb").read() == b"A" * 4096
+
+    monkeypatch.setattr(p, "write_audio_tags", overlapping_tags)
+    with pytest.raises(p._StagedSaveError):
+        p._install_library_audio(
+            str(first), "online:netease:overlap", "mp3", "晴天", "周杰伦", "叶惠美", {})
+    assert len(set(staged_paths)) == 2
+    assert first.read_bytes() == b"A" * 4096
+    assert not second.exists()
+    assert os.listdir(p.staged_dir()) == []
+    assert p.recalled_media_path("online:netease:overlap") is None
+
+
+def test_staged_install_holds_organization_lock(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    original = tmp_path / "download.part"
+    original.write_bytes(b"A" * 4096)
+
+    def check_lock(*args):
+        def probe():
+            acquired = p._LIBRARY_FILE_LOCK.acquire(blocking=False)
+            if acquired:
+                p._LIBRARY_FILE_LOCK.release()
+            return acquired
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(probe).result(timeout=3) is False
+
+    monkeypatch.setattr(p, "write_audio_tags", check_lock)
+    p._install_library_audio(
+        str(original), "online:kuwo:locked", "mp3", "晴天", "周杰伦", "叶惠美", {})
+
+
+def test_staged_reuse_promotes_shadow_lyric_without_touching_audio(tmp_path, monkeypatch):
+    monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
+    monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
+    guid = "online:kuwo:shadow-reuse"
+    dest = _audio_into_library(guid)
+    os.makedirs(p.CONF["cache_dir"], exist_ok=True)
+    shadow = os.path.join(p.CONF["cache_dir"], f"{p.cache_safe_guid(guid)}.lrc")
+    with open(shadow, "w", encoding="utf-8") as f:
+        f.write("[00:00.00]影子歌词")
+    original = tmp_path / "download.part"
+    original.write_bytes(b"B" * 4096)
+    result, reused = p._install_library_audio(
+        str(original), guid, "flac", "晴天", "周杰伦", "叶惠美", {})
+    assert result == dest and reused
+    assert open(dest, "rb").read() == b"A" * 64
+    assert not os.path.exists(shadow)
+    with open(os.path.splitext(dest)[0] + ".lrc", encoding="utf-8") as f:
+        assert "影子歌词" in f.read()

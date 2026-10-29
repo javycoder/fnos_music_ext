@@ -4,10 +4,12 @@
 两个消费方（fnmusic-ext 代理、music-box）都以该 ID 串通信。
 """
 import asyncio
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -86,6 +88,22 @@ def _startup_sources() -> "tuple[list[str], str]":
 
 
 _CONF_SOURCES, _SOURCES_ORIGIN = _startup_sources()
+
+
+def _startup_internal_token() -> str:
+    token = os.environ.get("FNMUSIC_INTERNAL_TOKEN", "").strip()
+    if token or parse_env_file is None:
+        return token
+    try:
+        pairs, _ = parse_env_file(Path(os.environ.get("FNMUSIC_ENV_FILE", "/repo/.env")))
+        return str(dict(pairs).get("FNMUSIC_INTERNAL_TOKEN") or "").strip()
+    except Exception:
+        return ""
+
+
+_INTERNAL_TOKEN = _startup_internal_token()
+_DIRECT_RESOLVE_INFLIGHT: dict[tuple, asyncio.Task] = {}
+_DIRECT_SELECTIONS: dict[str, dict] = {}
 
 CONF = {
     "sources": _CONF_SOURCES,
@@ -419,6 +437,45 @@ async def _resolve_entry(song_id: str, auto_refresh: bool = True):
     raise HTTPException(502, f"playable URL expired for {song_id!r}; bounded refresh failed, re-search keyword and source")
 
 
+def _internal_authorized(x_internal_token: str | None) -> bool:
+    supplied = str(x_internal_token or "").strip()
+    return bool(_INTERNAL_TOKEN and supplied and hmac.compare_digest(
+        supplied.encode("utf-8"), _INTERNAL_TOKEN.encode("utf-8")))
+
+
+async def _direct_resolve_entry(song_id: str) -> dict:
+    """Resolve a cached known ID without opening a foreground audio stream."""
+    key = (asyncio.get_running_loop(), str(song_id))
+    task = _DIRECT_RESOLVE_INFLIGHT.get(key)
+    if task is None or task.done():
+        if len(_DIRECT_RESOLVE_INFLIGHT) >= 16:
+            raise HTTPException(503, "direct resolution busy")
+
+        async def resolve():
+            entry = _cache_get(song_id)
+            if entry is None:
+                raise HTTPException(404, "unknown song id; re-search required")
+            if entry["item"].get("download_url") and time.time() - entry["ts"] < CONF["url_ttl"]:
+                return entry
+            refreshed = await asyncio.wait_for(_refresh_by_keyword(song_id), timeout=16.0)
+            if (not refreshed or not refreshed["item"].get("download_url")
+                    or time.time() - refreshed["ts"] >= CONF["url_ttl"]):
+                raise HTTPException(502, "direct resolution failed")
+            return refreshed
+
+        task = asyncio.create_task(resolve())
+        _DIRECT_RESOLVE_INFLIGHT[key] = task
+
+        def finish(done):
+            if _DIRECT_RESOLVE_INFLIGHT.get(key) is done:
+                _DIRECT_RESOLVE_INFLIGHT.pop(key, None)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finish)
+    return await asyncio.shield(task)
+
+
 def _fetch_upstream_stream_sync(url: str, headers: dict):
     """通过 curl_cffi 同步流式请求上游音频源（模拟 Chrome TLS 指纹）。"""
     return curl_requests.get(
@@ -486,6 +543,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        direct_tasks = [task for task in _DIRECT_RESOLVE_INFLIGHT.values()
+                        if task.get_loop() is asyncio.get_running_loop()]
+        for task in direct_tasks:
+            task.cancel()
+        if direct_tasks:
+            await asyncio.gather(*direct_tasks, return_exceptions=True)
         await SINGLE_FLIGHT.aclose()
         try:
             await SOURCE_WORKERS.aclose()
@@ -808,3 +871,76 @@ async def stream(
         status_code=206 if "Content-Range" in out_headers or resp.status_code == 206 else 200,
         headers=out_headers,
     )
+
+
+@app.get("/internal/resolve")
+async def internal_resolve(
+    id: str = Query(..., min_length=1),
+    x_internal_token: str | None = Header(None, alias="X-Internal-Token"),
+):
+    """Return a protected URL description for proxy-side direct playback."""
+    if not _internal_authorized(x_internal_token):
+        raise HTTPException(503, "internal authentication unavailable")
+    entry = await _direct_resolve_entry(id)
+    item = entry.get("item") or {}
+    url = str(item.get("download_url") or "")
+    if not url:
+        raise HTTPException(502, "playable URL unavailable")
+    now = time.time()
+    reuse_deadline = now + max(0.0, float(CONF["url_ttl"]) - max(0.0, now - float(entry.get("ts") or now)))
+    description = {
+        "ok": True,
+        "provider": "musicdl",
+        "platform": str(item.get("source") or ""),
+        "canonical_id": str(item.get("id") or id),
+        "url": url,
+        "server_headers": dict(entry.get("download_headers") or {}),
+        "protocol": str(item.get("protocol") or ""),
+        "ext": str(item.get("ext") or ""),
+        "actual_quality": str(item.get("quality") or ""),
+        "file_size": item.get("file_size"),
+        "resolved_at": now,
+        "reuse_deadline": reuse_deadline,
+        "upstream_expires_at": None,
+        "expiry_source": "policy",
+    }
+    for selection in list(_DIRECT_SELECTIONS):
+        if _DIRECT_SELECTIONS[selection]["reuse_deadline"] <= now:
+            _DIRECT_SELECTIONS.pop(selection, None)
+    while len(_DIRECT_SELECTIONS) >= 512:
+        _DIRECT_SELECTIONS.pop(next(iter(_DIRECT_SELECTIONS)))
+    selection = secrets.token_urlsafe(24)
+    description["selection_id"] = selection
+    _DIRECT_SELECTIONS[selection] = description
+    return description
+
+
+@app.get("/internal/stream")
+async def internal_stream(
+    selection: str = Query(..., min_length=1),
+    x_internal_token: str | None = Header(None, alias="X-Internal-Token"),
+):
+    if not _internal_authorized(x_internal_token):
+        raise HTTPException(503, "internal authentication unavailable")
+    selected = _DIRECT_SELECTIONS.get(selection)
+    if selected is None or selected["reuse_deadline"] <= time.time():
+        raise HTTPException(409, "selection expired; restart required")
+    headers = {key: value for key, value in selected["server_headers"].items() if key.lower() != "range"}
+    headers["Accept-Encoding"] = "identity"
+    try:
+        upstream = await _fetch_upstream_stream(selected["url"], headers)
+    except Exception:
+        raise HTTPException(502, "selected media unavailable") from None
+    if upstream.status_code != 200:
+        upstream.close()
+        raise HTTPException(502, "selected media unavailable")
+    output = {key: value for key, value in upstream.headers.items()
+              if key.lower() in ("content-type", "content-length", "content-encoding")}
+
+    def body():
+        try:
+            yield from upstream.iter_content(256 * 1024)
+        finally:
+            upstream.close()
+
+    return StreamingResponse(body(), headers=output)

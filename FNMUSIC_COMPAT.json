@@ -1,0 +1,6 @@
+{
+  "extension_version": "2.11.0-4",
+  "music_versions": ["1.0.10"],
+  "checked_at": "2026-10-29",
+  "notes": "2026-10-29 本次正式发布前再次通过已信任的SSH 只读复核实机 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10。未修改官方程序、生产配置或曲库；本次离线回归与独立实例 LX 源验收另行记录，不将短段音频检查等同于真实 Web/iOS/Android 全曲播放。仅记录适配基线，不控制运行时行为。"
+}

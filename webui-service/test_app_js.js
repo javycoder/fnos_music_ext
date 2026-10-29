@@ -16,9 +16,16 @@ const vm = require("node:vm");
 function stubEl() {
   const classes = new Set();
   const listeners = {};
+  const attrs = new Map();
   return {
     hidden: false, textContent: "", innerHTML: "", className: "", value: "",
-    checked: false, disabled: false, src: "", dataset: {}, _t: null,
+    checked: false, disabled: false, dataset: {}, _t: null, style: {},
+    get src() { return attrs.get("src") || ""; },
+    set src(v) { attrs.set("src", String(v)); },
+    hasAttribute(name) { return attrs.has(name); },
+    getAttribute(name) { return attrs.has(name) ? attrs.get(name) : null; },
+    setAttribute(name, v) { attrs.set(name, String(v)); },
+    removeAttribute(name) { attrs.delete(name); },
     classList: {
       add(...c) { c.forEach((x) => classes.add(x)); },
       remove(...c) { c.forEach((x) => classes.delete(x)); },
@@ -29,8 +36,10 @@ function stubEl() {
       },
       contains(c) { return classes.has(c); },
     },
+    contains(child) { return child === this || !!(this._children && this._children.includes(child)); },
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
     appendChild(child) { (this._children = this._children || []).push(child); return child; },
+    replaceChildren(...children) { this._children = children; },
     removeChild(child) { return child; },
     remove() {},
     // 测试用：手动触发某类事件监听器（真实 DOM 的 input/change 事件在此不可用）
@@ -43,11 +52,13 @@ function stubEl() {
     // 绑到元素上，元素必须终身同一个对象（真实 DOM 亦如此），不能整体换新
     _resetState() {
       classes.clear();
+      attrs.clear();
       this.hidden = false; this.textContent = ""; this.innerHTML = "";
       this.className = ""; this.value = ""; this.checked = false;
-      this.disabled = false; this.src = ""; this.dataset = {}; this._t = null;
+      this.disabled = false; this.dataset = {}; this._t = null;
     },
     querySelectorAll() { return []; },
+    get content() { return { cloneNode: () => ({ nodeName: "help-content" }) }; },
   };
 }
 
@@ -58,6 +69,10 @@ const qsaRegistry = new Map();
 
 global.document = {
   querySelector(sel) {
+    if (sel.startsWith("template[data-help-id=")) {
+      const wanted = sel.slice('template[data-help-id="'.length, -2);
+      return (global.helpTemplates || []).find((tpl) => tpl.dataset.helpId === wanted) || null;
+    }
     if (!els.has(sel)) els.set(sel, stubEl());
     return els.get(sel);
   },
@@ -72,6 +87,13 @@ global.document = {
   body: stubEl(),
 };
 global.window = stubEl();
+const localStore = new Map();
+global.window.localStorage = {
+  getItem: (k) => (localStore.has(k) ? localStore.get(k) : null),
+  setItem: (k, v) => localStore.set(k, String(v)),
+  removeItem: (k) => localStore.delete(k),
+  clear: () => localStore.clear(),
+};
 // 日志导出的 blob 下载链路（URL.createObjectURL + a[download]）
 const createdUrls = [];
 global.URL.createObjectURL = (blob) => { createdUrls.push(blob); return `blob:fake-${createdUrls.length}`; };
@@ -134,6 +156,11 @@ function reset() {
   els.forEach((el) => el._resetState && el._resetState());
   routes = new Map();
   fetchCalls.length = 0;
+  global.helpTemplates = [];
+  localStore.clear();
+  try {
+    vm.runInThisContext("if (typeof publicDetailInflight !== 'undefined') publicDetailInflight.clear(); if (typeof publicDetailAbortControllers !== 'undefined') publicDetailAbortControllers.clear();");
+  } catch (_) {}
 }
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
@@ -405,7 +432,8 @@ test("洛雪源列表：旧数据（无 active 标记）按 LX_SOURCE_URL 推导
   });
   await global.loadConfig();
   const html = els.get("#lx-source-list").innerHTML;
-  assert.ok(html.includes("已激活"), "匹配 LX_SOURCE_URL 的项应显示已激活徽标");
+  assert.ok(html.includes("已配置启用"), "匹配 LX_SOURCE_URL 只代表已配置启用，而非运行就绪");
+  assert.ok(html.includes("运行状态未知"));
   assert.ok(html.includes("取消激活"), "激活项应有取消激活按钮");
   assert.ok(html.includes("激活"), "未激活项应有激活按钮");
   // 恰好一处已激活
@@ -428,6 +456,76 @@ test("洛雪源列表：多源同时激活共存渲染", async () => {
   assert.strictEqual((html.match(/lx-badge/g) || []).length, 2, "两个已激活徽标");
   assert.strictEqual((html.match(/lx-btn-deactivate/g) || []).length, 2, "两个取消激活按钮");
   assert.strictEqual((html.match(/lx-btn-activate/g) || []).length, 1, "一个激活按钮");
+});
+
+test("洛雪源列表：轮询只同步运行徽标，不覆盖待保存激活与取消", async () => {
+  reset();
+  const items = [{ name: "甲", url: "file:///a.js", active: true },
+    { name: "乙", url: "file:///b.js", active: false }];
+  enqueue("/app/fnmusic-ext/api/config", { values: { LX_SOURCE_LIST: JSON.stringify(items) } });
+  await global.loadConfig();
+  global.deactivateLxSource(0);
+  global.activateLxSource(1);
+  const sourceStatus = (sources) => ({ version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: { state: "degraded", sources } });
+  enqueue("/app/fnmusic-ext/api/status", sourceStatus([
+    { url: "file:///a.js", status: "success" },
+    { url: "file:///b.js", status: "failed", error: '<img src=x onerror="bad">' },
+  ]));
+  await global.loadStatus();
+  let html = els.get("#lx-source-list").innerHTML;
+  assert.ok(html.includes("待保存取消"));
+  assert.ok(html.includes("待保存激活"));
+  assert.ok(html.includes("运行就绪"));
+  assert.ok(html.includes("运行失败"));
+  assert.ok(html.includes("&lt;img"));
+  assert.ok(!html.includes("<img src=x"));
+  assert.ok(els.get("#save-bar").classList.contains("show"));
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) => sel === "input[name=provider]"
+    ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  try {
+    assert.deepStrictEqual(JSON.parse(global.collectConfig().LX_SOURCE_LIST).map((s) => s.active), [false, true]);
+  } finally { global.document.querySelectorAll = qsa; }
+  enqueue("/app/fnmusic-ext/api/status", sourceStatus([{ url: "file:///b.js", initialized: true }]));
+  await global.loadStatus();
+  html = els.get("#lx-source-list").innerHTML;
+  assert.ok(!html.includes("运行就绪"), "缺少 status 不可用 initialized=true 假报成功");
+  assert.ok(html.includes("运行状态未知"));
+  assert.ok(html.includes("待保存激活"));
+  const ovHtml = els.get("#ov-lx").innerHTML;
+  assert.ok(ovHtml.includes("就绪 0 · 失败 0 · 待定 1"), "escapeHtml(0) 不得把数字 0 抹空");
+});
+
+test("洛雪源列表：本地上传源缺失 sourceUrl 时按 id/文件名兜底匹配运行状态", async () => {
+  reset();
+  const items = [
+    { name: "本地源甲", url: "file:///data/lxserver/users/source/_open/local_a.js", active: true },
+    { name: "历史上传源乙", url: "file:///data/lxmusic/uploads/legacy_b.js", active: true },
+  ];
+  enqueue("/app/fnmusic-ext/api/config", { values: { LX_SOURCE_LIST: JSON.stringify(items) } });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t",
+    current_provider: "lxmusic",
+    processes: {},
+    services: {},
+    lx_source: {
+      state: "degraded",
+      ready_count: 1,
+      failed_count: 1,
+      pending_count: 0,
+      sources: [
+        { id: "local_a.js", name: "本地源甲", url: "", status: "success" },
+        { id: "legacy_b", name: "历史上传源乙", url: "", status: "failed", error: "脚本语法错误" },
+      ],
+    },
+  });
+  await global.loadStatus();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.ok(html.includes("运行就绪"), "空 url 的本地上传源应通过 id 匹配运行就绪");
+  assert.ok(html.includes("运行失败"), "历史 uploads 路径本地源应通过文件名/名称匹配运行失败");
+  assert.ok(html.includes("脚本语法错误"), "本地上传源错误详情应正常渲染");
 });
 
 test("collectConfig：lxmusic 下无激活源时拒绝提交", async () => {
@@ -545,6 +643,29 @@ test("saveConfig：服务故障的源保留激活并如实提示，不谎报已�
   assert.ok(message.includes("「故障源」服务暂不可用，激活配置已保留（服务未就绪）"));
   assert.ok(!message.includes("已自动取消激活"));
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
+test("saveConfig：忙与初始化待定保留配置提示，不谎报停用", async () => {
+  for (const [category, label] of [["source_operation_busy", "源操作忙碌"], ["initialization_pending", "初始化待定"]]) {
+    reset();
+    const values = { FNMUSIC_LX_ENABLED: "true", LX_SOURCE_LIST: JSON.stringify([
+      { name: "源", url: "file:///pending.js", active: true }]) };
+    enqueue("/app/fnmusic-ext/api/config", { values });
+    await global.loadConfig();
+    enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: [],
+      actions: [{ kind: "lx_activate", op: "activate", source: "源", ok: false, category, error: "稍后重试" }],
+      warnings: [{ source: "源", category, message: "稍后重试" }],
+    }, { values });
+    const qsa = global.document.querySelectorAll;
+    global.document.querySelectorAll = (sel) => sel === "input[name=provider]"
+      ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+    try { await global.saveConfig(); } finally { global.document.querySelectorAll = qsa; }
+    const message = els.get("#toast").textContent;
+    assert.ok(message.includes(`${label}，激活配置已保留`));
+    assert.ok(!message.includes("已自动取消激活"));
+    assert.strictEqual(els.get("#toast").className, "toast fail");
+    assert.ok(els.get("#lx-source-list").innerHTML.includes("已配置启用"));
+  }
 });
 
 test("collectConfig：全部源自动停用后仍可保存其它设置且不恢复旧激活标记", async () => {
@@ -732,6 +853,27 @@ test("saveConfig：fs-check 不可用（直连 501/网络错误）→ 降级放�
   assert.ok(fetchCalls.some((c) => c.method === "PUT" && c.path === "/app/fnmusic-ext/api/config"));
 });
 
+test("版本标签：正式/预发布新旧API均只显示一个v前缀", async () => {
+  for (const version of ["2.11.0", "v2.11.0", "2.11.0e", "v2.11.0e"]) {
+    const expected = `v${version.replace(/^v/, "")}`;
+    enqueue("/app/fnmusic-ext/api/status", {
+      version, current_provider: "none", processes: {}, services: {}, lx_source: null,
+    });
+    await global.loadStatus();
+    assert.strictEqual(els.get("#brand-version").textContent, expected);
+    enqueue("/app/fnmusic-ext/api/about", { ok: true, version, logs: [], disclaimer: [] });
+    await global.loadAbout();
+    assert.strictEqual(els.get("#about-version").textContent, expected);
+    enqueue("/app/fnmusic-ext/api/update-check", {
+      ...UPDATE_PAYLOAD, current_version: version,
+      latest: { ...UPDATE_PAYLOAD.latest, version },
+    });
+    await global.checkUpdate();
+    global.openUpdateModal();
+    assert.strictEqual(els.get("#update-modal-version").textContent, expected);
+  }
+});
+
 /* ------------------------------------------------ 关于页 ------------------- */
 test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=false 隐藏打赏", async () => {
   enqueue("/app/fnmusic-ext/api/about", {
@@ -771,6 +913,134 @@ test("loadAbout：donate=true 展示打赏卡片并指向静态二维码", async
   );
   // 解析不到免责声明时隐藏该卡片
   assert.strictEqual(global.document.querySelector("#about-disclaimer-card").hidden, true);
+});
+
+test("loadAbout：旧接口兼容 donate=true（仅支付宝，微信不请求）", async () => {
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "native",
+    disclaimer: [], donate: true, logs: [], log_retention_days: 3,
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, false);
+  assert.strictEqual(global.document.querySelector("#about-donate-alipay").hidden, false);
+  assert.strictEqual(
+    global.document.querySelector("#about-donate-img").getAttribute("src"),
+    "/app/fnmusic-ext/static/alipay.png",
+  );
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat-img").hasAttribute("src"), false);
+});
+
+test("loadAbout：四组合显隐与二维码请求行为", async () => {
+  const cases = [
+    {
+      name: "双无：无码全隐藏且不请求任何图片",
+      payload: { donate: false, donate_alipay: false, donate_wechat: false },
+      expectCard: true, expectWechat: true, expectAlipay: true,
+      wechatHasSrc: false, alipayHasSrc: false,
+    },
+    {
+      name: "双有：双码均显示且指向对应静态图片",
+      payload: { donate: true, donate_alipay: true, donate_wechat: true },
+      expectCard: false, expectWechat: false, expectAlipay: false,
+      wechatHasSrc: true, alipayHasSrc: true,
+      expectWechatSrc: "/app/fnmusic-ext/static/wechat.png",
+      expectAlipaySrc: "/app/fnmusic-ext/static/alipay.png",
+    },
+    {
+      name: "仅微信：微信显示有码，支付宝隐藏且不请求",
+      payload: { donate: false, donate_alipay: false, donate_wechat: true },
+      expectCard: false, expectWechat: false, expectAlipay: true,
+      wechatHasSrc: true, alipayHasSrc: false,
+      expectWechatSrc: "/app/fnmusic-ext/static/wechat.png",
+    },
+    {
+      name: "仅支付宝：支付宝显示有码，微信隐藏且不请求",
+      payload: { donate: true, donate_alipay: true, donate_wechat: false },
+      expectCard: false, expectWechat: true, expectAlipay: false,
+      wechatHasSrc: false, alipayHasSrc: true,
+      expectAlipaySrc: "/app/fnmusic-ext/static/alipay.png",
+    },
+  ];
+
+  for (const c of cases) {
+    enqueue("/app/fnmusic-ext/api/about", {
+      ok: true, version: "2.8.0e", deploy_mode: "native",
+      disclaimer: [], ...c.payload, logs: [], log_retention_days: 3,
+    });
+    await global.loadAbout();
+    assert.strictEqual(
+      global.document.querySelector("#about-donate").hidden,
+      c.expectCard,
+      `${c.name} - #about-donate hidden 期望 ${c.expectCard}`,
+    );
+    assert.strictEqual(
+      global.document.querySelector("#about-donate-wechat").hidden,
+      c.expectWechat,
+      `${c.name} - #about-donate-wechat hidden 期望 ${c.expectWechat}`,
+    );
+    assert.strictEqual(
+      global.document.querySelector("#about-donate-alipay").hidden,
+      c.expectAlipay,
+      `${c.name} - #about-donate-alipay hidden 期望 ${c.expectAlipay}`,
+    );
+    const wechatImg = global.document.querySelector("#about-donate-wechat-img");
+    const alipayImg = global.document.querySelector("#about-donate-img");
+    assert.strictEqual(
+      wechatImg.hasAttribute("src"),
+      c.wechatHasSrc,
+      `${c.name} - 微信图片 src 属性存在性期望 ${c.wechatHasSrc}`,
+    );
+    if (c.wechatHasSrc) {
+      assert.strictEqual(wechatImg.getAttribute("src"), c.expectWechatSrc);
+    }
+    assert.strictEqual(
+      alipayImg.hasAttribute("src"),
+      c.alipayHasSrc,
+      `${c.name} - 支付宝图片 src 属性存在性期望 ${c.alipayHasSrc}`,
+    );
+    if (c.alipayHasSrc) {
+      assert.strictEqual(alipayImg.getAttribute("src"), c.expectAlipaySrc);
+    }
+  }
+});
+
+test("loadAbout：重复 load 清除隐藏图片 src 防止无效请求或残留", async () => {
+  const wechatImg = global.document.querySelector("#about-donate-wechat-img");
+  const alipayImg = global.document.querySelector("#about-donate-img");
+
+  // 1. 第一次 load：双码全有
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: true, donate_alipay: true, donate_wechat: true, logs: [],
+  });
+  await global.loadAbout();
+  assert.strictEqual(wechatImg.getAttribute("src"), "/app/fnmusic-ext/static/wechat.png");
+  assert.strictEqual(alipayImg.getAttribute("src"), "/app/fnmusic-ext/static/alipay.png");
+
+  // 2. 第二次 load：仅微信，支付宝隐藏并清除 src（无 src 属性）
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: false, donate_alipay: false, donate_wechat: true, logs: [],
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, false);
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat").hidden, false);
+  assert.strictEqual(wechatImg.getAttribute("src"), "/app/fnmusic-ext/static/wechat.png");
+  assert.strictEqual(global.document.querySelector("#about-donate-alipay").hidden, true);
+  assert.strictEqual(alipayImg.hasAttribute("src"), false, "支付宝二维码隐藏时必须移除 src 属性以防发起请求");
+
+  // 3. 第三次 load：双无，全部隐藏且两者 src 均被清除
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true, version: "2.8.0e", deploy_mode: "docker",
+    disclaimer: [], donate: false, donate_alipay: false, donate_wechat: false, logs: [],
+  });
+  await global.loadAbout();
+  assert.strictEqual(global.document.querySelector("#about-donate").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-donate-wechat").hidden, true);
+  assert.strictEqual(global.document.querySelector("#about-donate-alipay").hidden, true);
+  assert.strictEqual(wechatImg.hasAttribute("src"), false, "双无时微信图片不得保留 src 属性");
+  assert.strictEqual(alipayImg.hasAttribute("src"), false, "双无时支付宝图片不得保留 src 属性");
 });
 
 test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async () => {
@@ -1016,6 +1286,27 @@ test("loadStatus：概览进程含 lxserver，不可达透出 healthz 详情并�
   assert.ok(svcHtml.includes("lxserver unreachable"), "healthz 失败详情应透出，便于定位底层进程故障");
   assert.ok(!svcHtml.includes("<script>"), "错误详情必须 HTML 转义");
   assert.ok(svcHtml.includes("&lt;script&gt;"));
+});
+
+test("loadStatus：洛雪六态与统计、逐源错误原值安全展示", async () => {
+  for (const [state, label] of Object.entries({ unconfigured: "未配置", loading: "初始化中", ready: "可用",
+    degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" })) {
+    reset();
+    enqueue("/app/fnmusic-ext/api/status", { version: "t", current_provider: "lxmusic", processes: {}, services: {},
+      lx_source: { state, ready_count: 1, failed_count: 2, pending_count: 3, sources: [
+        { name: "<b>源</b>", status: "failed", error: "<script>bad</script>" },
+        { name: "unknown", status: "<img src=x>" },
+      ] } });
+    await global.loadStatus();
+    const html = els.get("#ov-lx").innerHTML;
+    assert.ok(html.includes(label));
+    assert.ok(html.includes("就绪 1 · 失败 2 · 待定 3"));
+    assert.ok(html.includes("&lt;b&gt;源&lt;/b&gt;"));
+    assert.ok(html.includes("运行失败：&lt;script&gt;bad&lt;/script&gt;"));
+    assert.ok(html.includes("&lt;img src=x&gt;"));
+    assert.ok(!html.includes("<script>"));
+    assert.ok(!html.includes("<img src=x>"));
+  }
 });
 
 test("loadStatus：洛雪卡片源信息与错误文本转义", async () => {
@@ -1733,6 +2024,589 @@ test("已选名称：瞬时失败缓存到期可恢复，不永久保留失败",
   await global.ensurePublicSelectionDetails();
   assert.strictEqual(fetchCalls.length, 2);
   assert.ok(els.get("#public-selected").innerHTML.includes("到期恢复"));
+});
+
+test("播放直连：新后端回填、收集并可兼容旧 schema", async () => {
+  const schema = {
+    FNMUSIC_NETEASE_DIRECT_PLAY: {},
+    FNMUSIC_MUSICDL_DIRECT_PLAY: {},
+    FNMUSIC_LX_DIRECT_PLAY: {},
+    FNMUSIC_DOWNLOAD_LAYOUT: {},
+  };
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_NETEASE_DIRECT_PLAY: "true",
+    FNMUSIC_MUSICDL_DIRECT_PLAY: "false",
+    FNMUSIC_LX_DIRECT_PLAY: "true",
+    FNMUSIC_DOWNLOAD_LAYOUT: "artist_album",
+  }, schema });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, false);
+  assert.strictEqual(els.get("#direct-netease").checked, true);
+  assert.strictEqual(els.get("#direct-musicdl").checked, false);
+  assert.strictEqual(els.get("#direct-lx").checked, true);
+  let collected = vm.runInThisContext("collectConfig()");
+  assert.strictEqual(els.get("#download-layout").disabled, false);
+  assert.strictEqual(collected.FNMUSIC_DOWNLOAD_LAYOUT, "artist_album");
+  assert.deepStrictEqual(
+    ["FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"].map(key => collected[key]),
+    [true, false, true]
+  );
+
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, true);
+  assert.strictEqual(els.get("#direct-musicdl").disabled, true);
+  assert.strictEqual(els.get("#direct-lx").disabled, true);
+  assert.ok(!("FNMUSIC_NETEASE_DIRECT_PLAY" in vm.runInThisContext("collectConfig()")));
+  assert.strictEqual(els.get("#download-layout").disabled, true);
+  assert.ok(!("FNMUSIC_DOWNLOAD_LAYOUT" in vm.runInThisContext("collectConfig()")));
+});
+
+test("播放直连：八种组合与手工布尔别名独立回填", async () => {
+  const keys = ["FNMUSIC_NETEASE_DIRECT_PLAY", "FNMUSIC_MUSICDL_DIRECT_PLAY", "FNMUSIC_LX_DIRECT_PLAY"];
+  const schema = Object.fromEntries(keys.map((key) => [key, {}]));
+  for (let combination = 0; combination < 8; combination += 1) {
+    const expected = keys.map((key, index) => Boolean(combination & (1 << index)));
+    const aliases = ["YES", "1", "on"];
+    const values = Object.fromEntries(keys.map((key, index) => [key, expected[index] ? aliases[index] : "false"]));
+    enqueue("/app/fnmusic-ext/api/config", { values, schema });
+    await global.loadConfig();
+    const result = vm.runInThisContext("collectConfig()");
+    assert.deepStrictEqual(keys.map((key) => result[key]), expected);
+  }
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#direct-netease").disabled, true);
+  assert.ok(!("FNMUSIC_NETEASE_DIRECT_PLAY" in vm.runInThisContext("collectConfig()")));
+});
+
+test("帮助弹窗：滚动恢复、焦点往返且不标脏", async () => {
+  const template = stubEl();
+  template.dataset.helpId = "direct-play";
+  global.helpTemplates = [template];
+  els.get("#help-modal").hidden = true;
+  const trigger = stubEl();
+  trigger.getAttribute = () => "播放直连帮助";
+  document.body.style.overflow = "auto";
+  const before = vm.runInThisContext("dirty");
+  global.openHelp("direct-play", trigger);
+  assert.strictEqual(els.get("#help-modal").hidden, false);
+  assert.strictEqual(els.get("#help-title").textContent, "播放直连");
+  assert.deepStrictEqual(els.get("#help-body")._children, [{ nodeName: "help-content" }]);
+  assert.strictEqual(document.body.style.overflow, "hidden");
+  global.closeHelp();
+  assert.strictEqual(els.get("#help-modal").hidden, true);
+  assert.strictEqual(document.body.style.overflow, "auto");
+  assert.strictEqual(els.get("#help-body")._children.length, 0);
+  assert.strictEqual(document.activeElement, trigger);
+  assert.strictEqual(vm.runInThisContext("dirty"), before);
+});
+
+const ORGANIZE_PATH = "/app/fnmusic-ext/api/maintenance/organize";
+function resetOrganize() {
+  vm.runInThisContext("clearTimeout(organizeTimer); organizeTimer=null; organizeJob=null; organizeInfo=null; organizeConfirmation=null;");
+  els.get("#organize-modal").hidden = true;
+}
+
+test("下载存放方式：新 schema 回填保存，旧 schema 不提交未知字段", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { FNMUSIC_DOWNLOAD_LAYOUT: "artist_album" },
+    schema: { FNMUSIC_DOWNLOAD_LAYOUT: {} },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#download-layout").value, "artist_album");
+  assert.strictEqual(els.get("#download-layout").disabled, false);
+  els.get("#download-layout").value = "album";
+  assert.strictEqual(global.collectConfig().FNMUSIC_DOWNLOAD_LAYOUT, "album");
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#download-layout").disabled, true);
+  assert.ok(!("FNMUSIC_DOWNLOAD_LAYOUT" in global.collectConfig()));
+});
+
+test("落盘方式：三种模式回填保存，非法值回落，旧后端不提交未知字段", async () => {
+  for (const mode of ["auto", "direct", "staged"]) {
+    enqueue("/app/fnmusic-ext/api/config", {
+      values: { FNMUSIC_TEE_SAVE_MODE: mode },
+      schema: { FNMUSIC_TEE_SAVE_MODE: {} },
+    });
+    await global.loadConfig();
+    assert.strictEqual(els.get("#tee-save-mode").disabled, false);
+    assert.strictEqual(els.get("#tee-save-mode").value, mode);
+    assert.strictEqual(global.collectConfig().FNMUSIC_TEE_SAVE_MODE, mode);
+  }
+  els.get("#tee-save-mode").value = "invalid";
+  assert.strictEqual(global.collectConfig().FNMUSIC_TEE_SAVE_MODE, "auto");
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#tee-save-mode").disabled, true);
+  assert.ok(!("FNMUSIC_TEE_SAVE_MODE" in global.collectConfig()));
+});
+
+const organizeResponse = (status, extra = {}) => ({ ok: true, root: "/vol1/music", layout: "flat", job: {
+  id: "organize-1", status, phase: "scan", layout: "flat", scanned: 3, moved: 2,
+  unchanged: 1, skipped: 0, failed: 0, errors: [], details: [], ...extra,
+} });
+
+test("整理 Beta：目录或方式未保存时不弹窗、不提交", async () => {
+  reset();
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_TEE_SAVE_DIR: "/vol1/new", FNMUSIC_DOWNLOAD_LAYOUT: "artist",
+  } });
+  await global.loadConfig();
+  enqueue(ORGANIZE_PATH, { ok: true, root: "/vol1/music", layout: "flat", job: null });
+  els.get("#organize-modal").hidden = true;
+  await global.openOrganizeModal();
+  assert.strictEqual(els.get("#organize-modal").hidden, true);
+  const posts = fetchCalls.filter((call) => call.path === ORGANIZE_PATH && call.method === "POST");
+  assert.strictEqual(posts.length, 0);
+});
+
+test("整理 Beta：显示实际目录和风险，确认提交并提示重扫", async () => {
+  reset();
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  enqueue(ORGANIZE_PATH, { ...organizeResponse("running"), job: null });
+  els.get("#organize-modal").hidden = true;
+  await global.openOrganizeModal();
+  assert.strictEqual(els.get("#organize-modal").hidden, false);
+  assert.ok(els.get("#organize-warning").textContent.includes("/vol1/music"));
+  assert.ok(els.get("#organize-warning").textContent.includes("可能导致歌曲暂时无法播放"));
+  assert.strictEqual(document.activeElement, els.get("#organize-cancel-btn"));
+  enqueue(ORGANIZE_PATH, organizeResponse("running"));
+  const first = global.startOrganize();
+  await global.startOrganize();
+  await first;
+  const posts = fetchCalls.filter((call) => call.path === ORGANIZE_PATH && call.method === "POST");
+  assert.strictEqual(posts.length, 1);
+  assert.deepStrictEqual(JSON.parse(posts[0].body), {
+    confirm_beta: true, root: "/vol1/music", layout: "flat",
+  });
+  assert.ok(els.get("#organize-status").textContent.includes("整理中"));
+  enqueue(ORGANIZE_PATH + "/organize-1", organizeResponse("completed", { moved: 2 }));
+  await tick(1100);
+  assert.ok(els.get("#organize-status").textContent.includes("请在飞牛音乐中重新扫描曲库"));
+});
+
+test("整理 Beta：检测表单未保存编辑及取消，不提交任务", async () => {
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  for (const [field, edited] of [["#download-layout", "artist"], ["#dir-download", "/new"]]) {
+    const input = els.get(field);
+    const old = input.value;
+    input.value = edited;
+    enqueue(ORGANIZE_PATH, { ok: true, root: "/vol1/music", layout: "flat", job: null });
+    await global.openOrganizeModal();
+    assert.strictEqual(els.get("#organize-modal").hidden, true);
+    input.value = old;
+  }
+  enqueue(ORGANIZE_PATH, { ok: true, root: "/vol1/music", layout: "flat", job: null });
+  await global.openOrganizeModal();
+  assert.strictEqual(els.get("#organize-modal").hidden, false);
+  global.closeOrganizeModal();
+  await global.startOrganize();
+  assert.strictEqual(fetchCalls.filter(call => call.method === "POST").length, 0);
+});
+
+test("整理 Beta：刷新恢复及重复点击只查询已有任务", async () => {
+  resetOrganize();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  enqueue(ORGANIZE_PATH, organizeResponse("running"));
+  await global.loadOrganizeStatus();
+  enqueue(ORGANIZE_PATH + "/organize-1", organizeResponse("completed"));
+  await global.openOrganizeModal();
+  await tick(5);
+  assert.strictEqual(fetchCalls.filter(call => call.method === "POST").length, 0);
+  assert.strictEqual(els.get("#organize-modal").hidden, true);
+  assert.ok(els.get("#organize-status").textContent.includes("整理完成"));
+  resetOrganize();
+});
+
+test("公共歌单用户：切换保留草稿、仅提交修改用户、新用户为空", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} },
+    values: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: "{}" },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true, users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }, { guid: "new" }],
+    public_playlists_by_user: {},
+  });
+  await global.loadConfig();
+  await global.selectPublicUser("a");
+  vm.runInThisContext(`publicSelection = [
+    {provider:"musicbox",source:"netease",kind:"chart",id:"3778678"}
+  ]; stashPublicUser(true);`);
+  await global.selectPublicUser("b");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+  vm.runInThisContext("stashPublicUser(true)");
+  await global.selectPublicUser("new");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+  assert.strictEqual(global.anyPublicMusicboxSelection(), true);
+  await global.selectPublicUser("a");
+  assert.strictEqual(vm.runInThisContext("publicSelection[0].id"), "3778678");
+  const changes = JSON.parse(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER);
+  assert.deepStrictEqual(Object.keys(changes).sort(), ["a", "b"]);
+  assert.deepStrictEqual(changes.b, []);
+  enqueue("/app/fnmusic-ext/api/config", {values:{}});
+  await global.loadConfig();
+});
+
+test("公共歌单用户：查询失败禁用配置，重试恢复", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} }, values: {},
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", new Error("数据库不可读"));
+  await global.loadConfig();
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  assert.strictEqual(els.get("#public-playlists-browser").hidden, true);
+  assert.ok(els.get("#public-users-note").textContent.includes("失败"));
+  assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {ok:true, users:[{guid:"a"}]});
+  await global.loadMusicUsers();
+  assert.strictEqual(els.get("#public-user").disabled, false);
+  enqueue("/app/fnmusic-ext/api/config", {values:{}});
+  await global.loadConfig();
+});
+
+test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
+  vm.runInThisContext(`
+    configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = {};
+    publicUsersReady = true; publicUsers = [{guid:"a"},{guid:"b"}];
+    publicUserGuid = "a"; publicSelectionMap = {a:[
+      {provider:"musicbox",source:"netease",kind:"playlist",id:"7108"}
+    ],b:[]}; publicSelection = publicSelectionMap.a;
+    publicDetailCache.clear(); $("#public-playlists-browser").hidden = false;
+  `);
+  let finish;
+  enqueue("/app/fnmusic-ext/api/public-playlists/7108", {
+    __rawResponse: true, resp: {ok:true, status:200, json:()=>new Promise(resolve=>{finish=resolve;})},
+  });
+  const pending = global.ensurePublicSelectionDetails();
+  await tick(0);
+  assert.strictEqual(typeof finish, "function");
+  await global.selectPublicUser("b");
+  if (finish) finish({ok:true, item:{id:"7108",name:"旧用户详情"}});
+  await pending;
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+  assert.ok(!els.get("#public-selected").innerHTML.includes("旧用户详情"));
+  enqueue("/app/fnmusic-ext/api/config", {values:{}});
+  await global.loadConfig();
+});
+
+test("洛雪超时设置：loadConfig 回填默认与已存参数 + 输入标脏", async () => {
+  reset();
+  // 缺省回填默认值
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lx-resolver-timeout").value, "8.0");
+  assert.strictEqual(els.get("#lx-url-timeout").value, "15.0");
+  assert.strictEqual(els.get("#lx-probe-timeout").value, "3.0");
+
+  // 回填持久化自定义值
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    LX_RESOLVER_TIMEOUT: "12.5",
+    LX_URL_TIMEOUT: "25.0",
+    LX_PROBE_TIMEOUT: "4.5",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lx-resolver-timeout").value, "12.5");
+  assert.strictEqual(els.get("#lx-url-timeout").value, "25.0");
+  assert.strictEqual(els.get("#lx-probe-timeout").value, "4.5");
+
+  // 输入标脏
+  els.get("#save-bar").classList.remove("show");
+  els.get("#lx-resolver-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+
+  els.get("#save-bar").classList.remove("show");
+  els.get("#lx-url-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+
+  els.get("#save-bar").classList.remove("show");
+  els.get("#lx-probe-timeout").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+});
+
+test("洛雪超时设置：collectConfig 校验小数/整数范围（1–300），非法输入提示并拒绝", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      LX_SOURCE_LIST: JSON.stringify([{ name: "甲", url: "file:///a.js", active: true }]),
+    },
+  });
+  await global.loadConfig();
+  const qsa = global.document.querySelectorAll;
+  global.document.querySelectorAll = (sel) =>
+    sel === "input[name=provider]" ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+  els.get("#panel-lxmusic").hidden = false;
+
+  try {
+    // 正常取值与小数支持
+    els.get("#lx-resolver-timeout").value = "12.5";
+    els.get("#lx-url-timeout").value = "25.0";
+    els.get("#lx-probe-timeout").value = "4.5";
+    let cfg = global.collectConfig();
+    assert.strictEqual(cfg.LX_RESOLVER_TIMEOUT, 12.5);
+    assert.strictEqual(cfg.LX_URL_TIMEOUT, 25.0);
+    assert.strictEqual(cfg.LX_PROBE_TIMEOUT, 4.5);
+
+    // 边界值 1 与 300 通过
+    els.get("#lx-resolver-timeout").value = "1";
+    els.get("#lx-url-timeout").value = "300";
+    els.get("#lx-probe-timeout").value = "1.0";
+    cfg = global.collectConfig();
+    assert.strictEqual(cfg.LX_RESOLVER_TIMEOUT, 1);
+    assert.strictEqual(cfg.LX_URL_TIMEOUT, 300);
+    assert.strictEqual(cfg.LX_PROBE_TIMEOUT, 1);
+
+    // 非法值（<1, >300, 非数, 空白）抛错
+    for (const bad of ["0.9", "0", "-5", "300.1", "500", "abc", "", "   "]) {
+      els.get("#lx-resolver-timeout").value = bad;
+      assert.throws(() => global.collectConfig(), /单次解析超时必须是 1–300 秒的数字/);
+      els.get("#lx-resolver-timeout").value = "8.0";
+
+      els.get("#lx-url-timeout").value = bad;
+      assert.throws(() => global.collectConfig(), /取链总超时必须是 1–300 秒的数字/);
+      els.get("#lx-url-timeout").value = "15.0";
+
+      els.get("#lx-probe-timeout").value = bad;
+      assert.throws(() => global.collectConfig(), /直链探活超时必须是 1–300 秒的数字/);
+      els.get("#lx-probe-timeout").value = "3.0";
+    }
+  } finally {
+    global.document.querySelectorAll = qsa;
+  }
+});
+
+test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保存且不提交超时参数", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  els.get("#panel-lxmusic").hidden = true;
+  els.get("#lx-resolver-timeout").value = "invalid";
+  els.get("#lx-url-timeout").value = "0";
+  els.get("#lx-probe-timeout").value = "999";
+
+  const cfg = global.collectConfig();
+  assert.strictEqual("LX_RESOLVER_TIMEOUT" in cfg, false);
+  assert.strictEqual("LX_URL_TIMEOUT" in cfg, false);
+  assert.strictEqual("LX_PROBE_TIMEOUT" in cfg, false);
+});
+
+test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆状态", async () => {
+  reset();
+  const storageTitle = els.get("#nav-storage-title");
+  const storageSubs = els.get("#nav-storage-subs");
+  const advancedTitle = els.get("#nav-advanced-title");
+  const advancedSubs = els.get("#nav-advanced-subs");
+
+  // 首访收起
+  global.setNavGroupExpanded("storage", false, false);
+  global.setNavGroupExpanded("advanced", false, false);
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(storageSubs.hidden, true);
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(advancedSubs.hidden, true);
+
+  // 点击展开储存
+  await storageTitle.dispatch("click");
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(storageSubs.hidden, false);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-storage-expanded"), "true");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+
+  // 再次点击收起
+  await storageTitle.dispatch("click");
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(storageSubs.hidden, true);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-storage-expanded"), "false");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+
+  // 点击展开高级
+  await advancedTitle.dispatch("click");
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(advancedSubs.hidden, false);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-advanced-expanded"), "true");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+});
+
+test("导航切页：切子页自动展开一级分组并联动高亮", () => {
+  reset();
+  const storageTitle = els.get("#nav-storage-title");
+  const storageSubs = els.get("#nav-storage-subs");
+  const advancedTitle = els.get("#nav-advanced-title");
+  const advancedSubs = els.get("#nav-advanced-subs");
+  const bottomStorage = els.get("#bottom-storage-trigger");
+  const bottomAdvanced = els.get("#bottom-advanced-trigger");
+
+  // 切到 tee（边听边存）
+  global.switchPage("tee");
+  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(storageSubs.hidden, false);
+  assert.strictEqual(storageTitle.classList.contains("active"), true);
+  assert.strictEqual(bottomStorage.classList.contains("active"), true);
+  assert.strictEqual(advancedTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+
+  // 切到 llm（大模型）
+  global.switchPage("llm");
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(advancedSubs.hidden, false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), true);
+  assert.strictEqual(bottomAdvanced.classList.contains("active"), true);
+  assert.strictEqual(storageTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomStorage.classList.contains("active"), false);
+
+  // 切到 settings（常规页）
+  global.switchPage("settings");
+  assert.strictEqual(storageTitle.classList.contains("active"), false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomStorage.classList.contains("active"), false);
+  assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+});
+
+test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", async () => {
+  reset();
+  els.get("#cleanup-modal").hidden = true;
+  els.get("#organize-modal").hidden = true;
+  const trigger = els.get("#bottom-storage-trigger");
+  const menu = els.get("#bottom-storage-menu");
+  const otherEl = stubEl();
+
+  // 初始收起（对应 HTML 上的 hidden 属性与 aria-expanded="false"）
+  menu.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+
+  assert.strictEqual(menu.hidden, true);
+
+  // 点击触发项弹出菜单并获得焦点
+  await trigger.dispatch("click");
+  assert.strictEqual(menu.hidden, false);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "true");
+
+  // 按 Escape 关闭并 focus 返回 trigger
+  await global.window.dispatch("keydown", { key: "Escape", preventDefault: () => {} });
+  assert.strictEqual(menu.hidden, true);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(global.document.activeElement, trigger);
+
+  // 再次打开
+  await trigger.dispatch("click");
+  assert.strictEqual(menu.hidden, false);
+
+  // 外点关闭并 focus 返回 trigger
+  await global.window.dispatch("click", { target: otherEl });
+  assert.strictEqual(menu.hidden, true);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(global.document.activeElement, trigger);
+});
+
+test("公共歌单用户：直连 403/501 明确显示安全架构限制与飞牛桌面引导，失败不当空列表覆写", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} },
+    values: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({ u1: [{ provider: "musicbox", id: "100" }] }) },
+  });
+
+  // 直连 403
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    __rawResponse: true,
+    resp: { ok: false, status: 403, json: async () => ({ ok: false, error: "需要管理员" }) },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  const note403 = els.get("#public-users-note").textContent;
+  assert.ok(note403.includes("安全架构限制"), `应包含安全架构限制: ${note403}`);
+  assert.ok(note403.includes("飞牛桌面"), `应引导飞牛桌面: ${note403}`);
+  assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
+
+  // 直连 501
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    __rawResponse: true,
+    resp: { ok: false, status: 501, json: async () => ({ detail: "直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台" }) },
+  });
+  await global.loadMusicUsers();
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  const note501 = els.get("#public-users-note").textContent;
+  assert.ok(note501.includes("安全架构限制"), `应包含安全架构限制: ${note501}`);
+  assert.ok(note501.includes("飞牛桌面"), `应引导飞牛桌面: ${note501}`);
+  assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
+});
+
+test("HTML/CSS 规范：?视觉与触屏规范、大模型页面标题、APP下载音质及LLM卡片完整接口", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
+
+  // 页面标题大模型
+  assert.ok(html.includes('<h2><span>大模型</span><button class="help-btn"'), "大模型标题需符合规范");
+
+  // 所有下载音质显示改APP下载音质
+  assert.ok(html.includes("APP下载音质"), "需包含 APP下载音质 显示");
+  assert.ok(html.includes('aria-label="APP下载音质帮助"'), "帮助按钮 aria-label 需为 APP下载音质帮助");
+
+  // LLM卡片HTML接口与IDs
+  const requiredIds = [
+    "llm-usage-line",
+    "llm-usage-summary",
+    "llm-usage-history",
+    "llm-usage-refresh",
+    "llm-usage-prev",
+    "llm-usage-next",
+    "llm-usage-page",
+  ];
+  for (const id of requiredIds) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 必须包含 id="${id}"`);
+  }
+  assert.ok(html.includes('<div id="llm-usage-history"'), "#llm-usage-history 必须为 div 元素");
+
+  // ?视觉22px桌面占28px触屏点击44px
+  assert.ok(css.includes("width: 22px"), ".help-btn 需为 22px 视觉大小");
+  assert.ok(css.includes("height: 22px"), ".help-btn 需为 22px 视觉大小");
+  assert.ok(css.includes("margin: 3px"), ".help-btn 需设置 margin 3px (占 28px 空间)");
+  assert.ok(css.includes("width: 44px") && css.includes("height: 44px"), ".help-btn 需具备 44px 触屏点击尺寸");
+
+  // LLM历史表规范
+  assert.ok(css.includes(".usage-table"), "需包含 .usage-table 样式");
+  assert.ok(css.includes("border-collapse: collapse"), ".usage-table 需 collapse");
+  assert.ok(css.includes("tabular-nums"), "数字列需使用 tabular-nums");
+});
+
+test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐藏对应项与外层卡片", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/about", {
+    ok: true,
+    version: "2.11.0c",
+    donate: true,
+    donate_alipay: true,
+    donate_wechat: true,
+    logs: [],
+  });
+  enqueue("/app/fnmusic-ext/api/update-check", { ok: true, has_update: false });
+  await global.loadAbout();
+  const donateCard = els.get("#about-donate");
+  const wechatWrap = els.get("#about-donate-wechat");
+  const alipayWrap = els.get("#about-donate-alipay");
+  const wechatImg = els.get("#about-donate-wechat-img");
+  const alipayImg = els.get("#about-donate-img");
+  assert.strictEqual(donateCard.hidden, false);
+  assert.strictEqual(wechatWrap.hidden, false);
+  assert.strictEqual(alipayWrap.hidden, false);
+
+  // 微信二维码图片加载失败 → 仅隐藏微信项，保留支付宝与外层卡片
+  wechatImg.onerror();
+  assert.strictEqual(wechatWrap.hidden, true);
+  assert.strictEqual(alipayWrap.hidden, false);
+  assert.strictEqual(donateCard.hidden, false);
+
+  // 支付宝二维码也加载失败 → 隐藏支付宝项并收起外层打赏卡片
+  alipayImg.onerror();
+  assert.strictEqual(alipayWrap.hidden, true);
+  assert.strictEqual(donateCard.hidden, true);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

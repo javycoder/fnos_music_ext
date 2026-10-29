@@ -354,9 +354,10 @@ def _maintenance_request(method="POST", path="/api/maintenance/cleanup",
 
 
 @pytest.mark.parametrize("admin", ["false", "", "1"])
-def test_maintenance_requires_admin(tmp_path, admin):
+@pytest.mark.parametrize("path", ["/api/maintenance/cleanup", "/api/maintenance/music-users"])
+def test_maintenance_requires_admin(tmp_path, admin, path):
     sock = _start_gateway(tmp_path, 1)
-    data = _request(sock, _maintenance_request(admin=admin))
+    data = _request(sock, _maintenance_request(admin=admin, path=path))
     assert data.startswith(b"HTTP/1.1 403")
 
 
@@ -365,6 +366,14 @@ def test_maintenance_requires_admin(tmp_path, admin):
 def test_maintenance_requires_only_explicit_confirmation(tmp_path, body):
     sock = _start_gateway(tmp_path, 1)
     assert _request(sock, _maintenance_request(body=body)).startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.parametrize("layout", [[], {}, None, 1, "../escape"])
+def test_organize_invalid_layout_is_rejected_before_socket(tmp_path, layout):
+    sock = _start_gateway(tmp_path, 1)
+    body = json.dumps({"confirm_beta": True, "root": "/music", "layout": layout}).encode()
+    assert _request(sock, _maintenance_request(
+        path="/api/maintenance/organize", body=body)).startswith(b"HTTP/1.1 400")
 
 
 @pytest.mark.parametrize("method,path", [
@@ -427,6 +436,18 @@ def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
             assert json.loads(data.split(b"\r\n\r\n")[1]) == {"job_id": job, "state": "done", "deleted": 7}
             assert calls == [("POST", "/api/maintenance/cleanup", {"confirm_beta": True}),
                              ("GET", "/api/maintenance/cleanup/" + job, {})]
+            organize_body = json.dumps({
+                "confirm_beta": True, "root": "/vol1/music", "layout": "artist"
+            }).encode("utf-8")
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                path=prefix + "/api/maintenance/organize", body=organize_body))
+            assert data.startswith(b"HTTP/1.1 202")
+            assert calls[-1] == ("POST", "/api/maintenance/organize", {
+                "confirm_beta": True, "root": "/vol1/music", "layout": "artist"})
+            data = await asyncio.to_thread(_request, gateway_path, _maintenance_request(
+                "GET", prefix + "/api/maintenance/music-users", b""))
+            assert data.startswith(b"HTTP/1.1 200")
+            assert calls[-1] == ("GET", "/api/maintenance/music-users", {})
         finally:
             await maintenance.stop(server)
     asyncio.run(run())

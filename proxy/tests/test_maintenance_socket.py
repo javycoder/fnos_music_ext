@@ -22,6 +22,13 @@ def request(method="POST", target=m.CLEANUP_PATH, body=b'{"confirm_beta":true}',
             + extra + b"\r\n" + body)
 
 
+@pytest.mark.parametrize("layout", [[], {}, None, 1, "../escape"])
+def test_organize_body_rejects_invalid_layout_type(layout):
+    with pytest.raises(ValueError, match="confirmation"):
+        m._validate_body("POST", m.ORGANIZE_PATH,
+                         {"confirm_beta": True, "root": "/music", "layout": layout})
+
+
 async def exchange(path, raw):
     reader, writer = await asyncio.open_unix_connection(str(path))
     writer.write(raw)
@@ -51,6 +58,15 @@ def test_private_permissions_delegation_and_stop(tmp_path):
             status, data = await exchange(path, request())
             assert status == 202 and data["state"] == "real proxy state"
             assert calls == [("POST", m.CLEANUP_PATH, {"confirm_beta": True})]
+            status, _ = await exchange(path, request("GET", "/api/maintenance/music-users", b""))
+            assert status == 202
+            assert calls[-1] == ("GET", "/api/maintenance/music-users", {})
+            organize_body = b'{"confirm_beta":true,"root":"/vol1/music","layout":"artist_album"}'
+            status, _ = await exchange(path, request(
+                "POST", m.ORGANIZE_PATH, organize_body))
+            assert status == 202
+            assert calls[-1] == ("POST", m.ORGANIZE_PATH, {
+                "confirm_beta": True, "root": "/vol1/music", "layout": "artist_album"})
             status, _ = await exchange(path, request("GET", m.CLEANUP_PATH + "/" + "a" * 32, b""))
             assert status == 202
             assert calls[-1][2] == {}

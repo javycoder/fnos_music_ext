@@ -16,6 +16,8 @@ MAX_BODY = 4096
 REQUEST_TIMEOUT = 5
 CALLBACK_TIMEOUT = 30
 CLEANUP_PATH = "/api/maintenance/cleanup"
+ORGANIZE_PATH = "/api/maintenance/organize"
+LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
 
 
 def _parent(path: Path) -> None:
@@ -39,7 +41,31 @@ def _parent(path: Path) -> None:
 
 def _route(method: str, path: str) -> bool:
     return ((method == "POST" and path == CLEANUP_PATH)
-            or (method == "GET" and re.fullmatch(CLEANUP_PATH + r"/[0-9a-fA-F]{32}", path) is not None))
+            or (method == "GET" and path == "/api/maintenance/music-users")
+            or (method == "GET" and re.fullmatch(CLEANUP_PATH + r"/[0-9a-fA-F]{32}", path) is not None)
+            or (method == "POST" and path == ORGANIZE_PATH)
+            or (method == "GET" and (path == ORGANIZE_PATH or
+                re.fullmatch(ORGANIZE_PATH + r"/[0-9a-fA-F]{32}", path) is not None)))
+
+
+def _validate_body(method: str, path: str, body):
+    if method == "GET":
+        return {}
+    if path == CLEANUP_PATH:
+        if body != {"confirm_beta": True} or type(body.get("confirm_beta")) is not bool:
+            raise ValueError("Explicit confirmation required")
+        return {"confirm_beta": True}
+    if (not isinstance(body, dict) or set(body) != {"confirm_beta", "root", "layout"} or
+            type(body.get("confirm_beta")) is not bool or body.get("confirm_beta") is not True or
+            not isinstance(body.get("layout"), str) or
+            body.get("layout") not in LAYOUTS or
+            not isinstance(body.get("root"), str)):
+        raise ValueError("Explicit organize confirmation required")
+    root = body["root"]
+    if (not root.startswith("/") or ".." in root.split("/") or
+            any(char in root for char in "\r\n\x00")):
+        raise ValueError("Invalid organize root")
+    return {"confirm_beta": True, "root": root, "layout": body["layout"]}
 
 
 def _recover_stale_socket(path: Path) -> None:
@@ -133,8 +159,7 @@ async def start(loop, callback, path=DEFAULT_SOCKET):
                 body = await reader.readexactly(int(length))
                 if method == "POST":
                     body = json.loads(body)
-                    if body != {"confirm_beta": True} or type(body.get("confirm_beta")) is not bool:
-                        raise ValueError("Explicit confirmation required")
+                    body = _validate_body(method, target, body)
                 elif body:
                     raise ValueError("GET body is unsupported")
                 else:

@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from proxy import env_merge
-from proxy.version import FALLBACK_VERSION, get_version
+from proxy.version import (FALLBACK_VERSION, display_version, get_version,
+                           read_release_channel, release_info, ui_version)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -22,10 +23,66 @@ def test_version_file_exists_with_semver():
     version_file = REPO_ROOT / "VERSION"
     assert version_file.is_file(), "仓库根目录必须存在 VERSION 文件"
     ver = _read_repo_version()
-    base = re.sub(r"[a-z]$", "", ver)
-    parts = base.split(".")
-    assert len(parts) == 3 and all(p.isdigit() for p in parts), \
-        f"VERSION 必须是 x.y.z 形式（自动迭代构建可加单字母后缀），当前为 {ver!r}"
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:-\d+)?", ver), \
+        f"VERSION 必须是 x.y.z 或 x.y.z-N，当前为 {ver!r}"
+    channel = read_release_channel(REPO_ROOT / "RELEASE_CHANNEL")
+    assert release_info(ver, channel=channel)["version"] == ver
+
+
+@pytest.mark.parametrize("version,channel,display,formal", [
+    ("2.11.0-0", "stable", "2.11.0", "true"),
+    ("2.11.0-4", "stable", "2.11.0", "true"),
+    ("2.11.0-26", "stable", "2.11.0", "true"),
+    ("2.11.0-0", "prerelease", "2.11.0a", "false"),
+    ("2.11.0-1", "prerelease", "2.11.0b", "false"),
+    ("2.11.0-4", "prerelease", "2.11.0e", "false"),
+    ("2.11.0-25", "prerelease", "2.11.0z", "false"),
+])
+def test_release_version_mapping(version, channel, display, formal):
+    assert release_info(version, channel=channel) == {
+        "version": version, "display_version": display, "ui_version": f"v{display}",
+        "tag": f"v{display}", "channel": channel, "formal": formal,
+    }
+    assert display_version(version, channel=channel) == display
+    assert ui_version(version, channel=channel) == f"v{display}"
+
+
+@pytest.mark.parametrize("channel", [None, "", "formal", "STABLE", "stable\nformal=true"])
+def test_new_publication_requires_an_explicit_valid_channel(channel):
+    with pytest.raises(ValueError):
+        release_info("2.11.0-4", channel=channel)
+
+
+def test_prerelease_letter_limit_does_not_limit_stable_package_revisions():
+    with pytest.raises(ValueError):
+        release_info("2.11.0-26", channel="prerelease")
+    assert release_info("2.11.0-26", channel="stable")["tag"] == "v2.11.0"
+
+
+def test_channel_file_is_fail_closed_except_explicit_legacy_reads(tmp_path):
+    path = tmp_path / "RELEASE_CHANNEL"
+    with pytest.raises(ValueError):
+        read_release_channel(path)
+    assert read_release_channel(path, allow_legacy=True) is None
+    for invalid in ("", "formal", "stable\nprerelease"):
+        path.write_text(invalid)
+        with pytest.raises(ValueError):
+            read_release_channel(path, allow_legacy=True)
+    path.write_text("stable\n")
+    assert read_release_channel(path) == "stable"
+
+
+@pytest.mark.parametrize("version", [
+    "2.11.0", "2.11.0a", "v2.11.0", "2.11", "2.11.0--1", "2.11.0-01",
+    "2.11.0-rc1", "2.11.0\ninjected=value", "",
+])
+def test_invalid_package_version_is_rejected(version):
+    with pytest.raises(ValueError):
+        release_info(version, channel="stable")
+
+
+def test_existing_letter_version_still_displays():
+    assert display_version("2.10.0b") == "2.10.0b"
 
 
 def test_get_version_reads_file(monkeypatch):

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import math
 import json
 import logging
 import os
@@ -36,11 +37,14 @@ from lxserver_client import (
     map_lxserver_song,
     normalize_source,
     parse_interval_to_seconds,
+    SourceOperationBusy,
+    serialize_source_operation,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 仓库根：复用 proxy/fnlog
 from proxy.fnlog import diag as fn_diag  # noqa: E402
-from proxy.fnlog import setup_logging  # noqa: E402
+from proxy.fnlog import setup_logging, redact  # noqa: E402
+from proxy.env_merge import parse_env_file  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fnmusic.lxmusic")
@@ -48,6 +52,9 @@ logger = logging.getLogger("fnmusic.lxmusic")
 setup_logging("fnmusic.lxmusic", "lxmusic")
 
 SERVICE_VERSION = "2.7.0"
+HEALTH_SNAPSHOT_TIMEOUT = 1.5  # 小于 proxy 的约 2 秒探活预算
+SOURCE_INIT_CONFIRM_TIMEOUT = 10.0
+SOURCE_INIT_POLL_INTERVAL = 0.25
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 配置字典
@@ -68,6 +75,64 @@ CONF: dict[str, Any] = {
     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
+
+_TIMEOUT_ENV_KEYS: tuple[tuple[str, str, float], ...] = (
+    ("url_timeout", "LX_URL_TIMEOUT", 15.0),
+    ("resolver_timeout", "LX_RESOLVER_TIMEOUT", 8.0),
+    ("probe_timeout", "LX_PROBE_TIMEOUT", 3.0),
+)
+_PERSISTED_ENV_CACHE: "tuple[tuple[str, int, int], dict[str, str]] | None" = None
+
+
+def _persisted_env_paths() -> list[Path]:
+    configured_path = os.environ.get("LX_ENV_PATH")
+    if configured_path:
+        return [Path(configured_path)]
+    return [
+        Path(os.environ.get("WEBUI_REPO_DIR", "/repo")) / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+
+
+def _persisted_env_values() -> dict[str, str]:
+    global _PERSISTED_ENV_CACHE
+    for path in _persisted_env_paths():
+        try:
+            stat = path.stat()
+            fingerprint = (str(path), stat.st_mtime_ns, stat.st_size)
+            if _PERSISTED_ENV_CACHE and _PERSISTED_ENV_CACHE[0] == fingerprint:
+                return dict(_PERSISTED_ENV_CACHE[1])
+            entries, _ = parse_env_file(path)
+            values = dict(entries)
+            _PERSISTED_ENV_CACHE = (fingerprint, values)
+            return dict(values)
+        except OSError:
+            continue
+    return dict(os.environ)
+
+
+def _reload_timeout_settings() -> dict[str, float]:
+    values = _persisted_env_values()
+    changed = False
+    for conf_key, env_key, default in _TIMEOUT_ENV_KEYS:
+        raw = values.get(env_key, os.environ.get(env_key, str(default)))
+        try:
+            parsed = float(str(raw).strip())
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(parsed) or not 1.0 <= parsed <= 300.0:
+            continue
+        if CONF[conf_key] != parsed:
+            CONF[conf_key] = parsed
+            changed = True
+    if changed:
+        global _URL_CACHE_GEN
+        for key, entry in list(_URL_CACHE.items()):
+            if entry.get("data") is None:
+                _URL_CACHE.pop(key, None)
+        _CHAIN_HEALTH.clear()
+        _URL_CACHE_GEN += 1
+    return {key: float(CONF[key]) for key, _, _ in _TIMEOUT_ENV_KEYS}
 
 # 全局客户端实例
 LXSERVER = LxServerClient(
@@ -134,7 +199,9 @@ def _url_cache_reset() -> None:
     _URL_CACHE_GEN += 1
 
 
-async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | None:
+async def _refresh_cached_url(
+    client: httpx.AsyncClient, data: dict, probe_timeout: float | None = None,
+) -> dict | None:
     """对过期的缓存直链做 Range 前缀探活续期。
 
     仅请求 CDN 少量前缀字节、不消耗按次计量的音源解析额度；仍可用则返回
@@ -147,7 +214,7 @@ async def _refresh_cached_url(client: httpx.AsyncClient, data: dict) -> dict | N
     headers = dict(data.get("headers") or {})
     headers.setdefault("User-Agent", UA_PC)
     try:
-        ok, final_url, _ct, size = await probe_url(client, url, headers)
+        ok, final_url, _ct, size = await probe_url(client, url, headers, timeout=probe_timeout)
     except Exception:
         return None
     if not ok:
@@ -166,8 +233,9 @@ async def _resolve_url_cached(
     src: str,
     item: dict,
     quality: str = "lossless",
-    budget: float = 20.0,
+    budget: float | None = None,
     fresh: bool = False,
+    timeout_settings: "dict[str, float] | None" = None,
 ) -> dict | None:
     """带成功缓存/失败负缓存/同键在途合并的播放直链解析。
 
@@ -177,10 +245,12 @@ async def _resolve_url_cached(
     - fresh=True 显式旁路缓存强制重新解析（代理重试路径确认旧链失效后使用）；
     - 同键并发共享一次实际解析；源代计数变化后代间结果不回写。"""
     canonical_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
+    settings = timeout_settings or _reload_timeout_settings()
     tiers = _quality_tiers(quality)
     key = (canonical_id, tiers[0] if tiers else "standard")
     gen = _URL_CACHE_GEN
-    deadline = time.monotonic() + max(float(budget), 1.0)
+    effective_budget = settings["url_timeout"] if budget is None else float(budget)
+    deadline = time.monotonic() + max(effective_budget, 1.0)
 
     if not fresh:
         entry = _URL_CACHE.get(key)
@@ -200,7 +270,8 @@ async def _resolve_url_cached(
                 return data
 
     remaining = deadline - time.monotonic()
-    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen, fresh)
+    return await _resolve_url_inflight(
+        client, src, item, quality, max(remaining, 1.0), key, gen, fresh, settings)
 
 
 async def _resolve_url_inflight(
@@ -212,6 +283,7 @@ async def _resolve_url_inflight(
     key: tuple[str, str],
     gen: int,
     fresh: bool = False,
+    timeout_settings: "dict[str, float] | None" = None,
 ) -> dict | None:
     """探活及解析整体合并；不同源代和强制刷新不共享旧探活任务。"""
     inflight_key = (gen, *key, fresh)
@@ -223,6 +295,7 @@ async def _resolve_url_inflight(
 
     fut = asyncio.get_running_loop().create_future()
     _URL_INFLIGHT[inflight_key] = fut
+    settings = timeout_settings or _reload_timeout_settings()
     try:
         deadline = time.monotonic() + budget
         result = None
@@ -233,14 +306,21 @@ async def _resolve_url_inflight(
                 remaining = deadline - time.monotonic()
                 try:
                     async with asyncio.timeout(max(remaining, 0.001)):
-                        result = await _refresh_cached_url(client, entry["data"])
+                        result = await _refresh_cached_url(
+                            client, entry["data"], settings["probe_timeout"])
                 except TimeoutError:
                     result = None
                 refreshed_hit = result is not None
         if not refreshed_hit:
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                result = await resolve_and_probe(client, src, item, quality, budget=remaining)
+                result = await resolve_and_probe(
+                    client, src, item, quality,
+                    budget=remaining,
+                    resolver_timeout=settings["resolver_timeout"],
+                    probe_timeout=settings["probe_timeout"],
+                    generation=gen,
+                )
         else:
             _STATS["url_cache_hits"] += 1
     except BaseException as exc:
@@ -334,17 +414,19 @@ async def probe_url(
     client: httpx.AsyncClient,
     url: str,
     headers: dict | None = None,
+    timeout: float | None = None,
 ) -> tuple[bool, str, str, int]:
     """有界流式前缀探活。返回 (是否有效, 最终URL, MIME/扩展名, 总大小)。"""
     h = {k: v for k, v in (headers or {}).items() if k.lower() not in ("range", "accept-encoding")}
     h.setdefault("User-Agent", UA_PC)
     h.update({"Range": f"bytes=0-{_PROBE_BYTES - 1}", "Accept-Encoding": "identity"})
     try:
-        async with asyncio.timeout(CONF["probe_timeout"]):
+        probe_timeout = float(CONF["probe_timeout"] if timeout is None else timeout)
+        async with asyncio.timeout(probe_timeout):
             curr_url = url
             for _ in range(6):  # 最多 5 次重定向
                 async with client.stream(
-                    "GET", curr_url, headers=h, follow_redirects=False, timeout=CONF["probe_timeout"]
+                    "GET", curr_url, headers=h, follow_redirects=False, timeout=probe_timeout
                 ) as r:
                     if r.status_code in (301, 302, 303, 307, 308):
                         location = r.headers.get("location")
@@ -609,6 +691,9 @@ async def resolve_and_probe(
     item: dict,
     quality: str = "lossless",
     budget: float = 20.0,
+    resolver_timeout: float | None = None,
+    probe_timeout: float | None = None,
+    generation: int | None = None,
 ) -> dict | None:
     """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。
 
@@ -617,6 +702,9 @@ async def resolve_and_probe(
     同档位直链探活失败或脚本静默空返回（200 无 url）时，按 excludeApiSources 排除
     已试脚本换下一个激活源重试。"""
     src = normalize_source(source)
+    active_generation = _URL_CACHE_GEN if generation is None else generation
+    effective_resolver_timeout = float(CONF["resolver_timeout"] if resolver_timeout is None else resolver_timeout)
+    effective_probe_timeout = float(CONF["probe_timeout"] if probe_timeout is None else probe_timeout)
     track_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
     chain_key = f"user_source:{src}" if src else "user_source"
 
@@ -645,9 +733,10 @@ async def resolve_and_probe(
             if remaining <= 0:
                 break
             try:
-                async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
+                async with asyncio.timeout(min(remaining, effective_resolver_timeout)):
                     res = await LXSERVER.get_music_url(song_info, lx_q,
-                                                       exclude_api_sources=excluded or None)
+                                                       exclude_api_sources=excluded or None,
+                                                       request_timeout=effective_resolver_timeout)
             except Exception as exc:
                 logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
                 res = None
@@ -680,7 +769,8 @@ async def resolve_and_probe(
                 break
             try:
                 async with asyncio.timeout(remaining_probe):
-                    ok, final_url, ct, size = await probe_url(client, raw_url, headers)
+                    ok, final_url, ct, size = await probe_url(
+                        client, raw_url, headers, timeout=effective_probe_timeout)
             except Exception:
                 ok = False
 
@@ -708,7 +798,8 @@ async def resolve_and_probe(
             if res.get("hasMoreSources") is False or not tried:
                 break
 
-    _chain_record_failure(chain_key)
+    if active_generation == _URL_CACHE_GEN:
+        _chain_record_failure(chain_key)
     return None
 
 
@@ -721,104 +812,131 @@ def _source_supported_platforms(s: dict) -> list[str]:
     return supported or list(SUPPORTED_PLATFORMS)
 
 
-async def source_capabilities() -> dict[str, dict]:
-    """描述各平台的可用性（搜索可用性、播放解析可用性、音质列表）。
-
-    多源同时激活时按全部启用源（status != failed）的平台并集判定。"""
-    lx_alive = await LXSERVER.is_alive()
-    sources = await LXSERVER.list_custom_sources() if lx_alive else []
-    enabled_sources = [s for s in sources if s.get("enable") or s.get("enabled")]
-
-    supported: set[str] = set()
-    first_error = ""
-    for s in enabled_sources:
-        if str(s.get("status") or "ok") == "failed":
-            if not first_error:
-                first_error = str(s.get("error") or "init error")
-            continue
-        supported.update(_source_supported_platforms(s))
-
-    caps: dict[str, dict] = {}
-    for src in SUPPORTED_PLATFORMS:
-        has_playback = bool(lx_alive and enabled_sources and (src in supported))
-        reason = ""
-        if not lx_alive:
-            reason = "lxserver unready"
-        elif not enabled_sources:
-            reason = "no active custom source"
-        elif not supported and first_error:
-            reason = f"all active sources failed: {first_error}"
-        elif src not in supported:
-            reason = f"platform {src} not supported by active source"
-
-        qualitys = ["128k", "320k", "flac"] if has_playback else []
-        caps[src] = {
-            "search": bool(lx_alive),
-            "playback_available": has_playback,
-            "qualitys": qualitys,
-            "reason": reason,
-        }
-    return caps
-
-
-async def describe_user_source() -> dict:
-    """描述当前激活的音源（支持多源同时激活）。
-
-    兼容约定：configured/url/source/initialized/last_error 等既有字段取第一个启用源；
-    新增 sources 数组（全部启用源）与 active_count。"""
-    try:
-        sources = await LXSERVER.list_custom_sources()
-    except Exception:
-        sources = []
-
-    enabled = [s for s in sources if s.get("enable") or s.get("enabled")]
-
-    def _entry(s: dict) -> dict:
-        status = str(s.get("status") or "ok")
-        return {
-            "id": str(s.get("id") or ""),
+def _describe_source_snapshot(sources: list[dict]) -> dict:
+    """配置启用与运行就绪分离；缺失状态表示尚未获得初始化结果，而非成功。"""
+    enabled = [s for s in (sources or []) if isinstance(s, dict) and (s.get("enable") or s.get("enabled"))]
+    active_sources = []
+    for s in enabled:
+        sid = str(s.get("id") or "")
+        raw_url = str(s.get("sourceUrl") or "").strip()
+        resolved_url = raw_url or (f"file://{_lx_source_fs_path(sid)}" if sid else "")
+        status = str(s.get("status") or "loading")
+        active_sources.append({
+            "id": sid,
             "name": str(s.get("name") or ""),
             "version": str(s.get("version") or "1.0.0"),
-            "url": str(s.get("sourceUrl") or ""),
+            "url": resolved_url,
             "status": status,
-            "error": str(s.get("error") or ""),
-            "initialized": status != "failed",
+            "error": redact(str(s.get("error") or "")),
+            "initialized": status == "success",
             "platforms": _source_supported_platforms(s),
-        }
-
-    active_sources = [_entry(s) for s in enabled]
-
+        })
+    ready = sum(s["initialized"] for s in active_sources)
+    failed = sum(s["status"] == "failed" for s in active_sources)
+    pending = len(active_sources) - ready - failed
     if not active_sources:
-        return {
-            "configured": False,
-            "url": "",
-            "initialized": False,
-            "last_error": "",
-            "source": None,
-            "sources": [],
-            "active_count": 0,
-        }
-
-    first_src, first = enabled[0], active_sources[0]
-    platforms_desc = {p: {"qualitys": ["128k", "320k", "flac"]} for p in first["platforms"]}
-
-    return {
-        "configured": True,
-        "url": first_src.get("name") or first_src.get("id") or "",
-        "initialized": first["initialized"],
-        "last_error": first["error"],
-        "source": {
+        state = "unconfigured"
+    elif ready:
+        state = "ready" if ready == len(active_sources) else "degraded"
+    else:
+        state = "loading" if pending else "failed"
+    result = {
+        "configured": bool(active_sources),
+        "url": "",
+        "initialized": ready > 0,
+        "last_error": "; ".join(f"{s['name'] or s['id']}: {s['error']}"
+                                for s in active_sources if s["error"]),
+        "source": None,
+        "sources": active_sources,
+        "active_count": len(active_sources),
+        "state": state,
+        "ready_count": ready,
+        "failed_count": failed,
+        "pending_count": pending,
+    }
+    if active_sources:
+        first_src, first = enabled[0], active_sources[0]
+        # 保留旧首源字段的身份；整体 initialized 则按所有明确成功源聚合。
+        result["url"] = first_src.get("name") or first_src.get("id") or ""
+        result["source"] = {
             "name": first_src.get("name", "lx-source"),
             "version": first_src.get("version", "1.0.0"),
             "author": first_src.get("author", ""),
-            "platforms": platforms_desc,
+            "platforms": {p: {"qualitys": ["128k", "320k", "flac"]} for p in first["platforms"]},
             "running": first["initialized"],
             "pid": 0,
-            "uptime_s": 3600,
-        },
-        "sources": active_sources,
-        "active_count": len(active_sources),
-    }
+            "uptime_s": 0,
+        }
+    return result
+
+
+def _source_capabilities_snapshot(sources: list[dict], *, alive: bool = True, error: str = "") -> dict[str, dict]:
+    enabled = [s for s in (sources or []) if isinstance(s, dict) and (s.get("enable") or s.get("enabled"))]
+    supported: set[str] = set()
+    for s in enabled:
+        if s.get("status") == "success":
+            supported.update(_source_supported_platforms(s))
+    failed = [s for s in enabled if s.get("status") == "failed"]
+    caps = {}
+    for src in SUPPORTED_PLATFORMS:
+        available = bool(alive and src in supported)
+        if not alive:
+            reason = error or "lxserver unready"
+        elif not enabled:
+            reason = "no active custom source"
+        elif len(failed) == len(enabled):
+            reason = "all active sources failed: " + redact(str(failed[0].get("error") or "init error"))
+        elif not supported:
+            reason = "active sources initializing"
+        elif not available:
+            reason = f"platform {src} not supported by active source"
+        else:
+            reason = ""
+        caps[src] = {"search": alive, "playback_available": available,
+                     "qualitys": ["128k", "320k", "flac"] if available else [], "reason": reason}
+    return caps
+
+
+async def source_capabilities() -> dict[str, dict]:
+    """仅明确初始化成功的启用源提供播放能力。"""
+    try:
+        alive = await LXSERVER.is_alive()
+        sources = await LXSERVER.list_custom_sources() if alive else []
+        return _source_capabilities_snapshot(sources, alive=alive)
+    except Exception as exc:
+        return _source_capabilities_snapshot([], alive=False, error=_source_query_error(exc))
+
+
+class SourceStateQueryError(RuntimeError):
+    """源管理列表未能提供可信快照，不代表脚本失效。"""
+
+
+async def _query_source_list() -> list[dict]:
+    try:
+        return await LXSERVER.list_custom_sources()
+    except Exception as exc:
+        raise SourceStateQueryError(_source_query_error(exc)) from exc
+
+
+async def describe_user_source() -> dict:
+    # 请求失败必须由调用方作为服务故障处理，不能伪装成“没有配置源”。
+    return _describe_source_snapshot(await _query_source_list())
+
+
+def _source_query_error(exc: Exception) -> str:
+    detail = redact(str(exc)).strip() or type(exc).__name__
+    if isinstance(exc, SourceStateQueryError):
+        return detail
+    return f"lxserver 源状态查询失败: {detail}"[:1000]
+
+
+def _source_query_response(exc: Exception) -> JSONResponse:
+    error = _source_query_error(exc)
+    return JSONResponse(status_code=503, content={
+        "ok": False, "error": error, "category": "service_unavailable",
+        "stage": "lxmusic_to_lxserver",
+        "data": {"state": "unavailable", "initialized": False, "last_error": error},
+    })
 
 
 # ------------------------------------------------------------- FastAPI 生命周期 --
@@ -931,6 +1049,8 @@ async def _reconcile_source_targets(urls: list[str]) -> None:
 
 
 async def _bootstrap_migration():
+    # 等待 lxserver 就绪不占用管理锁：启动期（lxserver 慢启动最长约 10s）
+    # WebUI 的激活请求不应被启动对账挡成 409。
     for _ in range(20):
         try:
             if await LXSERVER.is_alive():
@@ -938,7 +1058,11 @@ async def _bootstrap_migration():
         except Exception:
             pass
         await asyncio.sleep(0.5)
+    await _migrate_persisted_sources()
 
+
+@serialize_source_operation
+async def _migrate_persisted_sources():
     try:
         old_dir = Path(os.environ.get("LX_DATA_DIR", "/data/lxmusic"))
         uploads = old_dir / "uploads"
@@ -1010,6 +1134,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="fnmusic-lxmusic", version=SERVICE_VERSION, lifespan=lifespan)
 
 
+@app.exception_handler(SourceStateQueryError)
+async def source_query_error_handler(request: Request, exc: SourceStateQueryError):
+    return _source_query_response(exc)
+
+
+@app.exception_handler(SourceOperationBusy)
+async def source_operation_busy_handler(request: Request, exc: SourceOperationBusy):
+    return JSONResponse(status_code=409, content={
+        "ok": False, "error": "源管理操作正在进行，请稍后重试",
+        "category": "source_operation_busy", "stage": "lxmusic_to_lxserver",
+    })
+
+
 @app.exception_handler(ValueError)
 async def value_error_handler(_request: Request, exc: ValueError):
     return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
@@ -1035,35 +1172,36 @@ def _err(msg: str, code: int = 404) -> JSONResponse:
 
 @app.get("/healthz")
 async def healthz():
-    lxserver_alive = await LXSERVER.is_alive()
-    user_src = await describe_user_source()
-    caps = await source_capabilities()
-    if not lxserver_alive:
-        user_src["last_error"] = "lxserver unreachable"
-        return JSONResponse(
-            status_code=503,
-            content={
-                "ok": False,
-                "error": "lxserver unreachable",
-                "service": "fnmusic-lxmusic",
-                "version": SERVICE_VERSION,
-                "sources": CONF["sources"],
-                "user_source": user_src,
-                "circuit": chain_health_snapshot(),
-                "capabilities": caps,
-                "charts": ["kg", "kw", "wy"],
-            },
-        )
-    return {
-        "ok": True,
+    # 两个底层请求并发且有总预算；状态与能力复用同一份源列表。
+    error = ""
+    sources: list[dict] = []
+    try:
+        async with asyncio.timeout(HEALTH_SNAPSHOT_TIMEOUT):
+            alive, sources = await asyncio.gather(LXSERVER.is_alive(), LXSERVER.list_custom_sources())
+        if not alive:
+            error = "lxserver unreachable"
+    except Exception as exc:
+        error = _source_query_error(exc)
+    if error:
+        user_src = {"state": "unavailable", "initialized": False, "last_error": error}
+    else:
+        user_src = _describe_source_snapshot(sources)
+    result = {
+        "ok": not bool(error),
         "service": "fnmusic-lxmusic",
         "version": SERVICE_VERSION,
         "sources": CONF["sources"],
         "user_source": user_src,
+        "source_ready": bool(user_src["initialized"]),
         "circuit": chain_health_snapshot(),
-        "capabilities": caps,
+        "capabilities": _source_capabilities_snapshot(sources, alive=not bool(error), error=error),
         "charts": ["kg", "kw", "wy"],
     }
+    if error:
+        result.update(error=error, category="service_unavailable", stage="lxmusic_to_lxserver")
+        return JSONResponse(status_code=503, content=result)
+    # 源失败是 readiness 问题，不让进程恢复逻辑反复重启健康的服务。
+    return result
 
 
 @app.get("/api/v1/search")
@@ -1469,10 +1607,13 @@ async def track_url(
     cached = _cache_get(canonical_id) or _item_from_song_info(canonical_id, src) \
         or {"id": canonical_id, "lx_source": src}
     client = get_http(app)
+    timeout_settings = _reload_timeout_settings()
 
+    generation = _URL_CACHE_GEN
     try:
         result = await _resolve_url_cached(
-            client, src, cached, quality, budget=CONF["url_timeout"], fresh=bool(fresh)
+            client, src, cached, quality,
+            budget=timeout_settings["url_timeout"], fresh=bool(fresh), timeout_settings=timeout_settings
         )
     except Exception as e:
         _STATS["errors"] += 1
@@ -1481,6 +1622,12 @@ async def track_url(
 
     if not result:
         return _err("no playable url", 404)
+    if generation != _URL_CACHE_GEN:
+        return _err("source changed during resolution", 409)
+    tiers = _quality_tiers(quality)
+    selection = _URL_CACHE.get((cached.get("id") or canonical_id, tiers[0] if tiers else "standard"))
+    remaining = (max(0.0, CONF["url_cache_ttl"] - (time.monotonic() - selection["ts"]))
+                 if selection and selection.get("data") == result else 0.0)
 
     return {
         "ok": True,
@@ -1488,6 +1635,8 @@ async def track_url(
             "id": track_id,
             "quality": quality,
             **{k: v for k, v in result.items() if k != "probed"},
+            "reuse_for_s": remaining,
+            "expiry_source": "policy",
         },
     }
 
@@ -1550,6 +1699,34 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
 
 # ------------------------------------------------------------- 自定义音源管理 --
 
+async def _confirm_source_initialization(source_id: str) -> tuple[str, dict, dict | None]:
+    """等待目标源而非聚合状态；不把查询失败或待定误当成脚本失败。"""
+    deadline = time.monotonic() + SOURCE_INIT_CONFIRM_TIMEOUT
+    snapshot = _describe_source_snapshot([])
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return source_id, snapshot, None
+        try:
+            async with asyncio.timeout(min(2.0, remaining)):
+                sources = await _query_source_list()
+        except TimeoutError as exc:
+            raise SourceStateQueryError("lxserver 源状态查询超时") from exc
+        snapshot = _describe_source_snapshot(sources)
+        target = next((s for s in sources if str(s.get("id") or "") == source_id), None)
+        if target is None:
+            target = next((s for s in sources if str(s.get("name") or "") == source_id), None)
+        if target:
+            source_id = str(target.get("id") or source_id)
+            if target.get("enabled") or target.get("enable"):
+                if target.get("status") in ("success", "failed"):
+                    return source_id, snapshot, target
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return source_id, snapshot, None
+        await asyncio.sleep(min(SOURCE_INIT_POLL_INTERVAL, remaining))
+
+
 class SourceBody(BaseModel):
     url: str = ""
     script: str = ""
@@ -1558,7 +1735,10 @@ class SourceBody(BaseModel):
 
 @app.get("/api/v1/source")
 async def source_info():
-    user_src = await describe_user_source()
+    try:
+        user_src = await describe_user_source()
+    except Exception as exc:
+        return _source_query_response(exc)
     return {"ok": True, "data": user_src, "circuit": chain_health_snapshot()}
 
 
@@ -1571,7 +1751,11 @@ async def source_verify(body: SourceBody):
     if not url.startswith(("http://", "https://", "file://")):
         return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
-        report = await asyncio.wait_for(verify_url(url), timeout=120.0)
+        # asyncio.timeout 保持同一任务执行 verify_url，避免子任务身份破坏管理锁重入。
+        async with asyncio.timeout(120.0):
+            report = await verify_url(url)
+    except SourceOperationBusy:
+        raise
     except asyncio.TimeoutError:
         return _err("校验超时 (120s)", 504)
     except Exception as exc:
@@ -1650,12 +1834,7 @@ def _lx_source_fs_path(source_id: str) -> str:
 
 async def _find_lxserver_source(*, by_id: str = "", by_name: str = "", by_url: str = "") -> dict | None:
     """在 lxserver 已有源列表中查找（按 id / 名称 / 导入 URL 任一命中）。"""
-    try:
-        sources = await LXSERVER.list_custom_sources()
-    except Exception as exc:
-        if is_lxserver_unreachable(exc):
-            raise
-        return None
+    sources = await _query_source_list()
     for s in sources:
         if by_id and str(s.get("id") or "") == by_id:
             return s
@@ -1669,6 +1848,7 @@ async def _find_lxserver_source(*, by_id: str = "", by_name: str = "", by_url: s
 
 
 @app.post("/api/v1/source/upload")
+@serialize_source_operation
 async def source_upload(body: UploadBody):
     """落盘并导入上传的自定义源脚本。
 
@@ -1696,6 +1876,8 @@ async def source_upload(body: UploadBody):
             )
         try:
             existing = await _find_lxserver_source(by_name=name)
+        except SourceStateQueryError as lookup_exc:
+            return _source_query_response(lookup_exc)
         except Exception as lookup_exc:
             if not is_lxserver_unreachable(lookup_exc):
                 raise
@@ -1734,6 +1916,7 @@ async def source_upload(body: UploadBody):
 
 
 @app.post("/api/v1/source")
+@serialize_source_operation
 async def source_set(body: SourceBody):
     """激活/停用自定义源（多源叠加语义：只改目标源启用态，不动其他源）。
 
@@ -1795,18 +1978,29 @@ async def source_set(body: SourceBody):
                     )
         else:
             # file:// URL 或裸 id/名称：取最后一段作为 lxserver 源 id（与上传时返回的 id 一致）
-            parsed = urllib.parse.urlparse(url)
-            path_part = urllib.parse.unquote(parsed.path) if parsed.scheme else url
-            source_id = path_part.rsplit("/", 1)[-1]
+            if url.startswith("file://"):
+                raw = urllib.parse.unquote(url[len("file://"):])
+                if os.name == "nt":
+                    if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+                        raw = raw[1:]
+                    elif raw.startswith("///") and len(raw) > 4 and raw[4] == ":":
+                        raw = raw[3:]
+                path_part = raw
+            else:
+                parsed = urllib.parse.urlparse(url)
+                path_part = urllib.parse.unquote(parsed.path) if parsed.scheme else url
+            norm_path = path_part.replace("\\", "/")
+            source_id = norm_path.rsplit("/", 1)[-1]
             if not await LXSERVER.set_source_enabled(source_id, body.enabled):
                 # 列表中无此 id：激活语义下，若本地确有脚本文件（如旧数据卷 /data/lxmusic/uploads），
                 # 自动补导入 lxserver 后激活，保证历史配置可继续使用；停用语义不做补导入，
                 # 但 file:// 的 basename（用户自己的文件名）不是 lxserver 按 @name 派生的
                 # id——先按名称反查，再读本地脚本按 @name 反查真实 id 后停用
                 resolved = False
+                has_file = os.path.isfile(path_part)
                 if not body.enabled:
                     existing = await _find_lxserver_source(by_name=source_id.removesuffix(".js"))
-                    if not existing and path_part.startswith("/") and os.path.isfile(path_part):
+                    if not existing and has_file:
                         try:
                             with open(path_part, "r", encoding="utf-8", errors="replace") as f:
                                 script = f.read()
@@ -1818,7 +2012,7 @@ async def source_set(body: SourceBody):
                     if existing:
                         source_id = str(existing.get("id") or source_id)
                         resolved = True
-                if body.enabled and path_part.startswith("/") and os.path.isfile(path_part):
+                if body.enabled and has_file:
                     with open(path_part, "r", encoding="utf-8", errors="replace") as f:
                         script = f.read()
                     try:
@@ -1843,6 +2037,8 @@ async def source_set(body: SourceBody):
                                  "category": "runtime"},
                         status_code=500,
                     )
+    except SourceStateQueryError as exc:
+        return _source_query_response(exc)
     except Exception as exc:
         if is_lxserver_unreachable(exc):
             logger.error("lxserver 不可连接，切换源失败: %s", exc)
@@ -1856,13 +2052,35 @@ async def source_set(body: SourceBody):
             status_code=500,
         )
 
+    # 激活必须以目标源的明确初始化结果为准；停用无需等待初始化。
+    confirmed_id, user_src, target = source_id, None, None
+    if body.enabled:
+        confirmed_id, user_src, target = await _confirm_source_initialization(source_id)
+        if target is None:
+            return JSONResponse(status_code=504, content={
+                "ok": False,
+                "error": f"源 {source_id} 初始化结果待确认，可稍后重试或查看运行日志",
+                "category": "initialization_pending", "stage": "lxserver_init",
+                "source_id": confirmed_id,
+            })
+        if target.get("status") == "failed":
+            return JSONResponse(status_code=500, content={
+                "ok": False,
+                "error": f"源初始化失败: {redact(str(target.get('error') or '')).strip() or 'init error'}",
+                "category": "runtime", "stage": "lxserver_init",
+                "source_id": confirmed_id,
+            })
+        source_id = confirmed_id
+
     _CHAIN_HEALTH.clear()
     _url_cache_reset()
-    user_src = await describe_user_source()
+    if user_src is None:
+        user_src = await describe_user_source()
     return {"ok": True, "data": user_src, "source_id": source_id}
 
 
 @app.delete("/api/v1/source")
+@serialize_source_operation
 async def source_clear():
     """停用全部自定义源。"""
     try:

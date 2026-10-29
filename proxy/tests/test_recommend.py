@@ -808,10 +808,10 @@ def _mb_detail_rows(n: int, prefix: str, sid_base: int = 90000) -> list[dict]:
 
 @pytest.mark.anyio
 async def test_daily_prefers_netease_daily_and_skips_llm(tmp_path, monkeypatch):
-    """网易启用时：真·每日推荐直接命中（平台 ID 直连），LLM 完全不调用。"""
+    """未启用个人大模型用途时保留音源原生推荐。"""
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(tmp_path / "missing.db"))
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
-    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
+    monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "false")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "rc"))
     llm_calls = {"n": 0}
@@ -1212,6 +1212,14 @@ def test_playlist_list_daily_isolated_between_users(tmp_path, monkeypatch):
 
         tracks_b = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid_b, "page": 1, "size": 50}).json()
         assert {t["title"] for t in tracks_b["data"]["list"]} == {"乙歌1", "乙歌2"}
+        foreign = client.get("/music/api/v1/track/playlist-detail/list",
+                             params={"playlistGUID": guid_a, "size": 50}).json()
+        assert foreign["data"]["list"] == []
+        detail = client.get("/music/api/v1/playlist/detail", params={"guid": guid_a}).json()
+        assert detail["data"]["trackCount"] == 0
+        batch = client.get("/music/api/v1/playlist/batch-detail", params={"guids": guid_a}).json()
+        assert all(card["guid"] != guid_a for card in batch["data"]["list"])
+        assert client.get("/music/api/v1/static/cover", params={"coverId": guid_a}).status_code == 404
 
 
 def test_playlist_list_shared_user_skips_daily_keeps_hot(tmp_path, monkeypatch):
@@ -1482,8 +1490,10 @@ async def test_daily_case2_source_slot_first_netease_others_local(tmp_path, monk
 
 
 @pytest.mark.anyio
-async def test_daily_case3_source_slot_first_netease_others_llm(tmp_path, monkeypatch):
-    """情况3：网易可用且配置了 LLM -> 第一个用户用网易日推，其余用户走 LLM。"""
+@pytest.mark.parametrize("order", [("u1", "u2"), ("u2", "u1")])
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_daily_case3_all_users_llm(tmp_path, monkeypatch, order, concurrent):
+    """启用个人大模型每日推荐后，所有用户均跳过共享音源日推。"""
     db = tmp_path / "music.db"
     _make_local_db(db, n_tracks=30)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
@@ -1526,19 +1536,20 @@ async def test_daily_case3_source_slot_first_netease_others_llm(tmp_path, monkey
             httpx.AsyncClient(
                 transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768",
             ) as mdl:
-        first = await dailyrec.get_or_build_daily(
-            user_guid="u1", musicdl_client=mdl, musicbox_client=mb, llm_http=llm_client,
-            build_track=build_online_track, netease_enabled=True,
-        )
-        llm_after_first = llm_calls["n"]
-        second = await dailyrec.get_or_build_daily(
-            user_guid="u2", musicdl_client=mdl, musicbox_client=mb, llm_http=llm_client,
-            build_track=build_online_track, netease_enabled=True,
-        )
-    assert first["tiers"] == ["netease-daily"] and llm_after_first == 0
-    assert mb_calls["n"] == 1
+        async def build(user):
+            return await dailyrec.get_or_build_daily(
+                user_guid=user, musicdl_client=mdl, musicbox_client=mb, llm_http=llm_client,
+                build_track=build_online_track, netease_enabled=True,
+            )
+        if concurrent:
+            first, second = await asyncio.gather(*(build(user) for user in order))
+        else:
+            first, second = await build(order[0]), await build(order[1])
+    assert first["tiers"] == ["llm"]
+    assert mb_calls["n"] == 0
     assert second["tiers"] == ["llm"]
-    assert llm_calls["n"] >= 1
+    assert llm_calls["n"] == 2
+    assert not dailyrec.source_slot_claimed()
     assert all(str(t["guid"]).startswith("online:") for t in second["tracks"])
 
 
@@ -1646,6 +1657,7 @@ def test_playlist_list_serves_partial_checkpoint_progressively(tmp_path, monkeyp
         first_cp = {
             "day": day, "kind": kind, "guid": dailyrec.daily_playlist_guid(day, user_guid),
             "status": "partial",
+            "strategy": dailyrec.daily_strategy(),
             "playlist": dailyrec.build_playlist_record(
                 dailyrec.daily_playlist_guid(day, user_guid), "每日推荐", track.get("guid"), 1,
             ),

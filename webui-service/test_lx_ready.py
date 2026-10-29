@@ -121,6 +121,10 @@ def lx_http(monkeypatch, procs):
         fn = state["business"].get(path)
         if fn is not None:
             return fn(request)
+        if path == "/api/v1/source" and request.method == "POST":
+            url = json.loads(request.content).get("url", "")
+            return httpx.Response(200, json={"ok": True, "source_id": "test-source", "data": {
+                "sources": [{"id": "test-source", "url": url, "status": "success"}]}})
         return httpx.Response(200, json={"ok": True})
 
     webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -367,13 +371,13 @@ def test_health_requires_exact_success(code, payload):
 
 
 def test_first_upload_without_active_source(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
     _ok_upload(lx_http)
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.post("/api/lx/upload", json={"filename": "first.js", "script": "// first"})
     assert r.status_code == 200
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert webui.preview_seconds_left("lxmusic") > 0
     assert [c for c in procs["calls"] if c[0] == "start"] == [
         ("start", "lxserver"), ("start", "lxmusic")]
@@ -516,18 +520,18 @@ def test_health_wait_uses_deadline(env_file, procs, lx_http, monkeypatch):
 
 
 def test_save_ready_success_but_validation_failure_keeps_preview(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
-    before = env_file.read_text()
+    before = env_file.read_text(encoding="utf-8")
     r = client.put("/api/config", json={"values": {
         "FNMUSIC_LX_ENABLED": "true", "LX_SOURCE_LIST": "[]"}})
     assert r.status_code == 400
-    assert env_file.read_text() == before
+    assert env_file.read_text(encoding="utf-8") == before
     assert webui.preview_seconds_left("lxmusic") > 0
 
 
 def test_save_switch_does_not_start_ready_processes_twice(env_file, procs, lx_http, client):
-    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n")
+    env_file.write_text("FNMUSIC_LX_ENABLED='false'\nLX_SOURCE_LIST='[]'\n", encoding="utf-8")
     lx_http.update(healthy=False, healthy_after_starts=2)
     r = client.put("/api/config", json={"values": {
         "FNMUSIC_LX_ENABLED": "true", "LX_SOURCE_LIST": json.dumps([
@@ -586,3 +590,113 @@ def test_timeout_warning_reports_unknown_status_without_polling(
     assert "stage=webui_to_lxmusic" in caplog.text
     assert "'lxserver': 'UNKNOWN'" in caplog.text
     assert not procs["calls"]
+
+
+@pytest.mark.parametrize("kind", ["missing", "unknown", "loading", "other_success", "busy", "pending", "internal", "non_json", "internal_stale_failed"])
+def test_activation_uncertain_keeps_config_and_skips_cleanup(env_file, procs, lx_http, client, kind):
+    posted = []
+    url = "https://s/1.js"
+    def source(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"id": "old", "url": "https://s/old.js", "status": "success"}]}})
+        payload = json.loads(request.content)
+        posted.append(payload)
+        assert payload.get("enabled") is not False, "未确认的激活结果不可触发 cleanup"
+        if kind == "non_json":
+            return httpx.Response(500, text="Internal Server Error")
+        if kind in ("busy", "pending", "internal", "internal_stale_failed"):
+            category, code = {"busy": ("source_operation_busy", 409),
+                              "pending": ("initialization_pending", 504),
+                              "internal": ("internal", 500),
+                              "internal_stale_failed": ("internal", 500)}[kind]
+            return httpx.Response(code, json={"ok": False, "category": category, "error": kind,
+                "data": {"sources": [{"url": url, "status": "failed"}]}
+                if kind == "internal_stale_failed" else {}})
+        entries = [] if kind == "missing" else [
+            {"id": "other" if kind == "other_success" else "target",
+             "url": "https://s/other.js" if kind == "other_success" else url,
+             "initialized": True, **({"status": "success" if kind == "other_success" else "loading"}
+                                      if kind != "unknown" else {})}]
+        return httpx.Response(200, json={"ok": True, "source_id": "target", "data": {"sources": entries}})
+    lx_http["business"]["/api/v1/source"] = source
+    r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
+        {"url": url, "active": True}])}})
+    assert r.status_code == 200, r.text
+    action = next(a for a in r.json()["actions"] if a["kind"] == "lx_activate")
+    assert action["ok"] is False
+    assert not action.get("auto_disabled")
+    assert action["category"] == ({"busy": "source_operation_busy", "internal": "internal",
+                                   "internal_stale_failed": "internal", "non_json": "service_unavailable"}.get(kind)
+                                  or "initialization_pending")
+    assert webui._list_active_urls(webui.read_env()) == {url}
+    assert posted == [{"url": url}]
+
+
+@pytest.mark.parametrize("identity", ["source_id", "unique_file", "ambiguous"])
+def test_local_upload_identity_without_url(env_file, procs, lx_http, client, identity):
+    url = "file:///data/lxmusic/uploads/xinghai.js"
+    def source(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        entries = [{"id": "xinghai.js", "name": "星海", "status": "success"}]
+        if identity == "ambiguous":
+            entries.append({"id": "other", "name": "xinghai", "status": "failed"})
+        return httpx.Response(200, json={"ok": True,
+            "source_id": "xinghai.js" if identity == "source_id" else "",
+            "data": {"sources": entries}})
+    lx_http["business"]["/api/v1/source"] = source
+    response = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
+        {"url": url, "name": "星海", "active": True}])}})
+    assert response.status_code == 200, response.text
+    action = next(a for a in response.json()["actions"] if a["kind"] == "lx_activate" and a.get("op") == "activate")
+    assert action["ok"] is (identity != "ambiguous")
+    assert not action.get("auto_disabled")
+    assert webui._list_active_urls(webui.read_env()) == {url}
+
+
+@pytest.mark.parametrize("category,code", [("source_operation_busy", 409), ("initialization_pending", 504)])
+def test_verify_nonterminal_does_not_write_or_disable(env_file, procs, lx_http, client, category, code):
+    lx_http["business"]["/api/v1/source/verify"] = lambda request: httpx.Response(code, json={
+        "ok": False, "data": {"category": category, "message": "try later"}})
+    before = env_file.read_text(encoding="utf-8")
+    r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
+        {"url": "https://s/new.js", "active": True}])}})
+    assert r.status_code == code
+    assert r.json()["category"] == category
+    assert env_file.read_text(encoding="utf-8") == before
+    assert lx_http["calls"] == ["/api/v1/source/verify"]
+
+
+@pytest.mark.parametrize("state,statuses", [("unconfigured", []), ("loading", ["loading"]),
+    ("ready", ["success"]), ("degraded", ["failed", "success"]), ("failed", ["failed"]),
+    ("unavailable", [])])
+def test_status_reuses_health_source_snapshot(env_file, procs, lx_http, client, state, statuses):
+    snapshot = {"state": state, "last_error": "preserved", "sources": [
+        {"id": str(i), "url": f"https://s/{i}.js", "status": status,
+         "initialized": status != "success"} for i, status in enumerate(statuses)]}
+    def health(request):
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"ok": True, "user_source": snapshot})
+        pytest.fail("healthz 已含源快照，不应再次查询 source")
+    webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(health))
+    body = client.get("/api/status").json()
+    result = body["lx_source"]
+    assert body["services"]["lxmusic"]["reachable"] is True  # 源 failed 不等于 liveness 失败
+    assert result["state"] == state
+    assert result["last_error"] == "preserved"
+    assert result["ready_count"] == statuses.count("success")
+    assert result["failed_count"] == statuses.count("failed")
+    assert result["pending_count"] == statuses.count("loading")
+    assert result["initialized"] == ("success" in statuses)
+    assert [s["initialized"] for s in result["sources"]] == [s == "success" for s in statuses]
+
+
+def test_status_source_query_failure_preserves_last_error(env_file, procs, lx_http, client):
+    lx_http["business"]["/api/v1/source"] = lambda request: httpx.Response(503, json={
+        "ok": False, "category": "service_unavailable", "stage": "lxmusic_to_lxserver",
+        "error": "query failed", "data": {"state": "unavailable", "last_error": "upstream detail"}})
+    result = client.get("/api/status").json()["lx_source"]
+    assert result["state"] == "unavailable"
+    assert result["last_error"] == "upstream detail"
+    assert result["error"] == "query failed"

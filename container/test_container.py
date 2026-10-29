@@ -252,6 +252,21 @@ def test_entrypoint_resident_skips_without_cookie(entrypoint_env, tmp_path):
     assert entrypoint_env(env_text) == ["start musicdl"]
 
 
+@pytest.mark.parametrize("mapping,needs_musicbox", [
+    ({"a": [], "b": [{"provider": "musicbox", "source": "netease",
+                     "kind": "chart", "id": "3778678"}]}, True),
+    ({"a": [], "b": []}, False),
+    ({}, False),
+])
+def test_entrypoint_public_resident_considers_every_user(entrypoint_env, mapping, needs_musicbox):
+    import json
+    env_text = ("FNMUSIC_MUSICDL_ENABLED=true\n"
+                "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+                "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED=true\n"
+                "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='" + json.dumps(mapping) + "'\n")
+    assert entrypoint_env(env_text) == ["start musicdl"] + (["start musicbox"] if needs_musicbox else [])
+
+
 def test_entrypoint_resident_requires_my_playlists_flag(entrypoint_env, tmp_path):
     """常驻为账号歌单供数：账号歌单开关未开时不空跑 musicbox。"""
     _seed_musicbox_cookie(tmp_path)
@@ -420,7 +435,7 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
     ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
-    required = {"publicplaylists"}
+    required = {"publicplaylists"} | set(re.findall(r"\bproxy/([A-Za-z_]\w*)\.py\b", copied))
     origins: dict[str, str] = {"publicplaylists": "动态导入（proxy/app.py）"}
     for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
@@ -446,6 +461,6 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
 
     for module_name in sorted(required):
         module = f"proxy/{module_name}.py"
-        origin = origins[module_name]
+        origin = origins.get(module_name, "Dockerfile COPY")
         assert module in copied, f"{origin} 依赖 {module}，Dockerfile 需 COPY 进镜像"
         assert f"!{module}" in ignore, f"{origin} 依赖 {module}，.dockerignore 需放行构建上下文"

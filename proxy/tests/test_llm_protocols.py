@@ -267,7 +267,7 @@ def test_usage_state_path_webui_repo_dir_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("WEBUI_REPO_DIR", str(tmp_path))
     assert llm_usage._state_path() == str(tmp_path / "llm_usage.json")
     monkeypatch.setenv("FNMUSIC_HOME", "/custom/home")
-    assert llm_usage._state_path() == "/custom/home/llm_usage.json"
+    assert os.path.normpath(llm_usage._state_path()) == os.path.normpath("/custom/home/llm_usage.json")
 
 
 def test_usage_file_world_readable_under_strict_umask(tmp_path, monkeypatch):
@@ -282,9 +282,10 @@ def test_usage_file_world_readable_under_strict_umask(tmp_path, monkeypatch):
         llm_usage.record({"prompt": 1, "completion": 2, "total": 3})
     finally:
         os.umask(old_umask)
-    assert stat.S_IMODE(usage_file.stat().st_mode) == 0o644
+    if os.name != "nt":
+        assert stat.S_IMODE(usage_file.stat().st_mode) == 0o644
     data = json.loads(usage_file.read_text(encoding="utf-8"))
-    assert data["total"] == 3
+    assert data["days"][llm_usage._today()]["total"] == 3
 
 
 def test_getters_bounds(monkeypatch):
