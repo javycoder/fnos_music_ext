@@ -568,3 +568,34 @@ async def test_strict_auth_and_no_silent_proxy_fallback_on_direct_failure(monkey
         assert private_target_resp.status_code == 502
         assert private_target_resp.json()["data"]["reason"] == "host_not_public"
         assert proxy_stream_called == []
+
+
+@pytest.mark.asyncio
+async def test_external_cross_origin_307_can_remove_credentials_before_nas(monkeypatch):
+    """外部跨域307与内部相对307不同：客户端移除授权时NAS应安全拒绝。"""
+    monkeypatch.setitem(proxy_app.CONF, "lx_direct_play", True)
+    monkeypatch.setattr(proxy_app, "_source_enabled", lambda _guid: True)
+    monkeypatch.setattr(proxy_app, "find_cache_file", lambda *_args, **_kwargs: None)
+
+    async def no_local(*_args):
+        return None
+
+    monkeypatch.setattr(proxy_app, "resolve_local_play", no_local)
+    nas = httpx.ASGITransport(app=proxy_app.app)
+    nas_requests = []
+
+    async def route(request):
+        if request.url.host == "entry.test":
+            return httpx.Response(307, headers={
+                "Location": "https://nas.test:2443/music/api/v1/track/stream?guid=online:lx:kg:fixture"})
+        nas_requests.append((request.url.host, request.url.port, request.headers.get("Authorization")))
+        return await nas.handle_async_request(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route), follow_redirects=True,
+                                 trust_env=False) as client:
+        response = await client.get("https://entry.test/listen", headers={"Authorization": "Bearer fixture-only"})
+    assert [item.status_code for item in response.history] == [307]
+    assert nas_requests == [("nas.test", 2443, None)]
+    assert response.status_code == 401
+    assert response.json()["data"]["reason"] == "authorization_failed"
+    await nas.aclose()
