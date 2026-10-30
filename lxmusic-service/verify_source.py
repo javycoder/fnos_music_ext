@@ -36,7 +36,10 @@ from lxserver_client import (
     serialize_source_operation,
 )
 
+from proxy.quality_policy import QUALITY_LEVELS, to_lx_quality
+
 VERIFY_KEYWORDS = ("晴天", "江南", "十年", "倔强")
+_LX_QUALITY_ORDER = tuple(to_lx_quality(q) for q in reversed(QUALITY_LEVELS))
 _PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
 _CLEANUP_TIMEOUT_S = 3.0
@@ -159,6 +162,93 @@ async def _cleanup_verification_client(
                 raise
 
 
+def _declared_qualities(source: dict, platform: str) -> list[str]:
+    """只报告运行时显式声明档位；缺失元数据不等于支持全档。"""
+    raw = source.get("sources") or source.get("platforms") or {}
+    spec = raw.get(platform, {}) if isinstance(raw, dict) else {}
+    values = spec.get("qualitys", spec.get("qualities", [])) if isinstance(spec, dict) else []
+    if not values and isinstance(source.get("qualitys"), dict):
+        values = source["qualitys"].get(platform, [])
+    if not isinstance(values, (list, tuple)):
+        return []
+    return [q for q in _LX_QUALITY_ORDER if q in values]
+
+
+def _verification_headers(lx_app, platform: str, resolved: dict) -> dict:
+    """保持正式播放相同 UA/平台 Referer；不透传客户端认证或 Host。"""
+    headers = {"User-Agent": lx_app.UA_PC}
+    referer = {"kg": "https://www.kugou.com/", "tx": "https://y.qq.com/"}.get(platform)
+    if referer:
+        headers["Referer"] = referer
+    source_headers = resolved.get("headers")
+    source_headers = source_headers if isinstance(source_headers, dict) else {}
+    for key, value in source_headers.items():
+        if isinstance(key, str) and key.lower() in ("user-agent", "referer", "origin"):
+            headers = {k: v for k, v in headers.items() if k.lower() != key.lower()}
+            headers[key] = str(value)
+    return headers
+
+
+async def _verification_samples(lx_app, temp_client, sources, target_src, report, keywords):
+    """顺序抽样且受调用方总超时约束；一项成功不会跳过其他平台。"""
+    client = lx_app.get_http(lx_app.app)
+    target_id = str(target_src.get("id") or "")
+    excluded = [str(s["id"]) for s in sources if s.get("id") and str(s["id"]) != target_id]
+    report["quality_results"] = {p: {} for p in report["platforms"]}
+    for keyword in keywords[:4]:
+        for platform in report["platforms"]:
+            base = {"keyword": keyword, "platform": platform, "result": "", "error": ""}
+            try:
+                songs = await temp_client.search(keyword, source=platform, page=1, limit=3)
+            except Exception as exc:
+                if is_lxserver_unreachable(exc):
+                    raise
+                report["attempts"].append(dict(base, result="search_error", error=type(exc).__name__))
+                continue
+            if not songs:
+                report["attempts"].append(dict(base, result="no_items"))
+                continue
+            declared = report["qualitys"][platform]
+            # 最高与最低已声明档位；能力未知时只做128k探索，不伪造声明。
+            qualities = list(dict.fromkeys((declared[0], declared[-1]))) if declared else ["128k"]
+            for quality in qualities:
+                for song in songs[:3]:
+                    attempt = dict(base, quality=quality, song_id=str(song.get("id") or ""),
+                                   capability_known=bool(declared))
+                    sinfo = temp_client.get_cached_song_info(song["id"]) or temp_client.synthesize_song_info(song["id"], song)
+                    try:
+                        resolved = await temp_client.get_music_url(sinfo, quality, exclude_api_sources=excluded)
+                    except Exception as exc:
+                        if is_lxserver_unreachable(exc):
+                            raise
+                        report["attempts"].append(dict(attempt, result="resolve_failed", error=type(exc).__name__))
+                        continue
+                    if not resolved or not resolved.get("url"):
+                        report["attempts"].append(dict(attempt, result="resolve_empty"))
+                        continue
+                    resolved_id = str(resolved.get("sourceId") or "")
+                    resolved_name = str(resolved.get("sourceName") or "")
+                    if ((resolved_id and resolved_id != target_id) or
+                            (not resolved_id and resolved_name != report["meta"]["name"])):
+                        report["attempts"].append(dict(attempt, result="resolved_by_other_source"))
+                        continue
+                    headers = _verification_headers(lx_app, platform, resolved)
+                    ok, final_url, content_type, size = await lx_app.probe_url(client, resolved["url"], headers)
+                    report["attempts"].append(dict(attempt, result="ok" if ok else "probe_failed"))
+                    previous = report["quality_results"][platform].get(quality)
+                    report["quality_results"][platform][quality] = "ok" if ok or previous == "ok" else "failed"
+                    if ok:
+                        report["platform_results"][platform] = "ok"
+                        report["ok"] = True
+                        # 管理报告不发布完整临时签名链接，只保留媒体主机与格式。
+                        report["probe"] = {"platform": platform, "song": song.get("title", ""),
+                                           "host": urllib.parse.urlsplit(final_url).hostname or "",
+                                           "ct": content_type, "size": size, "quality": quality}
+                        break
+                    if report["platform_results"][platform] != "ok":
+                        report["platform_results"][platform] = "failed"
+
+
 @serialize_source_operation
 async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict:
     """端到端校验一个源 URL 并返回结构化报告。"""
@@ -262,7 +352,7 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
 
         declared = [p for p in declared if p in SUPPORTED_PLATFORMS]
         report["declared_platforms"] = declared
-        report["qualitys"] = {p: ["128k", "320k", "flac"] for p in declared}
+        report["qualitys"] = {p: _declared_qualities(target_src, p) for p in declared}
         usable = declared
         report["platforms"] = usable
         report["platform_results"] = {p: "untested" for p in usable}
@@ -271,87 +361,19 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
             report.update(category="no_platform", message="源未声明任何支持的音乐平台")
             return report
 
-        # 抽样测试
-        client = lx_app.get_http(lx_app.app)
-        target_id = str(target_src.get("id") or temp_source_id or "")
-        other_sources = [
-            str(s.get("id"))
-            for s in sources
-            if str(s.get("id") or "") and str(s.get("id") or "") != target_id
-        ]
-        for kw in keywords:
-            for platform in usable:
-                attempt = {"keyword": kw, "platform": platform, "result": "", "error": ""}
-                try:
-                    search_res = await temp_client.search(kw, source=platform, page=1, limit=3)
-                except Exception as exc:
-                    if is_lxserver_unreachable(exc):
-                        raise
-                    attempt.update(result="search_error", error=str(exc))
-                    report["attempts"].append(attempt)
-                    continue
-
-                if not search_res:
-                    attempt.update(result="no_items")
-                    report["attempts"].append(attempt)
-                    continue
-
-                # 尝试解析第一首歌
-                first_song = search_res[0]
-                sinfo = temp_client.get_cached_song_info(first_song["id"]) or temp_client.synthesize_song_info(
-                    first_song["id"], first_song
-                )
-                try:
-                    url_res = await temp_client.get_music_url(
-                        sinfo, "128k", exclude_api_sources=other_sources
-                    )
-                except Exception as exc:
-                    if is_lxserver_unreachable(exc):
-                        raise
-                    attempt.update(result="resolve_failed", error=str(exc))
-                    report["attempts"].append(attempt)
-                    continue
-
-                if not url_res or not url_res.get("url"):
-                    attempt.update(result="resolve_empty")
-                    report["attempts"].append(attempt)
-                    continue
-
-                # 校验解析归属：必须由待测源解析，防止被并发其他源代劳
-                resolved_id = str(url_res.get("sourceId") or "")
-                resolved_name = str(url_res.get("sourceName") or "")
-                if (target_id and resolved_id and resolved_id != target_id) and (
-                    resolved_name and resolved_name != meta["name"]
-                ):
-                    attempt.update(result="resolved_by_other_source")
-                    report["attempts"].append(attempt)
-                    continue
-
-                # 探活
-                probe_ok, final_url, ct, size = await lx_app.probe_url(client, url_res["url"])
-                if probe_ok:
-                    attempt.update(result="ok")
-                    report["platform_results"][platform] = "ok"
-                    report["attempts"].append(attempt)
-                    report["ok"] = True
-                    report["probe"] = {
-                        "platform": platform,
-                        "song": first_song.get("title", ""),
-                        "url": final_url,
-                        "ct": ct,
-                        "size": size,
-                    }
-                    return report
-                else:
-                    attempt.update(result="probe_failed")
-                    report["platform_results"][platform] = "failed"
-                    report["attempts"].append(attempt)
-
-        # 全部失败
-        report.update(
-            category="resolve",
-            message="源脚本解析尝试均未成功，可能接口已被上游限制或凭据失效",
-        )
+        # 验证所有平台；总预算到期时保留已完成证据，不伪装成脚本失效。
+        try:
+            async with asyncio.timeout(_SAMPLE_BUDGET_S):
+                await _verification_samples(lx_app, temp_client, sources, target_src, report, keywords)
+        except TimeoutError:
+            report.update(category="timeout", message="校验总预算已耗尽，未完成项保持未测", complete=False)
+            return report
+        report["complete"] = True
+        if report["ok"]:
+            report.update(category="partial" if any(v != "ok" for v in report["platform_results"].values()) else "ok",
+                          message="抽样完成；各平台和音质结果请分别查看")
+        else:
+            report.update(category="resolve", message="当前样本未获得可播放媒体；请区分搜索、解析和探活阶段")
         return report
 
     except Exception as exc:
