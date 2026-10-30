@@ -123,7 +123,7 @@ def _safe_liked_number(raw: str, default: float | int, *, integer: bool = False)
         if integer:
             return value if 0 <= value <= 100 else default
         return value if value >= 0.5 else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -134,8 +134,6 @@ def _safe_scan_number(raw: str, default: float, lo: float, hi: float):
         if not math.isfinite(value) or value < lo or value > hi:
             return default
         return value
-    except (TypeError, ValueError):
-        return default
     except (TypeError, ValueError, OverflowError):
         return default
 
@@ -6156,26 +6154,44 @@ def _scan_config() -> "tuple[str, str]":
 
     # 1. 路径格式安全校验：必须为内部绝对路径，且不能为外部绝对 URL
     if not path or not path.startswith("/") or path.startswith("//"):
-        logger.warning("Invalid library scan path: must start with single '/': %r", path)
+        logger.warning("Invalid library scan path: must start with single '/'")
         return "", ""
     # 禁止 scheme（如 http:, https:）以及相对路径遍历
     if ":" in path or ".." in path.split("/"):
-        logger.warning("Invalid library scan path: external URL or traversal rejected: %r", path)
+        logger.warning("Invalid library scan path: external URL or traversal rejected")
         return "", ""
-    # 禁止控制字符（换行、回车、空字符等）
-    if any(ord(c) < 32 for c in path):
-        logger.warning("Invalid library scan path: control characters rejected: %r", path)
+    # 检查有限层URL解码，避免路由解码后出现外部主机、遍历或换行。
+    # 不在告警中记录原始配置，路径或JSON可能包含用户凭据。
+    from urllib.parse import unquote
+    decoded = path
+    for _ in range(4):
+        if (decoded.startswith("//") or "\\" in decoded or "#" in decoded
+                or ":" in decoded or ".." in decoded.split("/")
+                or any(ord(c) < 32 or ord(c) == 127 for c in decoded)):
+            logger.warning("Invalid library scan path: ambiguous or unsafe encoding")
+            return "", ""
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    else:
+        logger.warning("Invalid library scan path: excessive nested encoding")
         return "", ""
 
-    # 2. 请求体 JSON 安全校验
+    # 2. 请求体必须是有界JSON对象，不能将数组/标量当作官方参数。
     if body:
+        if len(body.encode("utf-8")) > 65536:
+            logger.warning("Invalid library scan body: exceeds 64 KiB")
+            return "", ""
         if any(ord(c) < 32 and c not in "\r\n\t" for c in body):
             logger.warning("Invalid library scan body: control characters rejected")
             return "", ""
         try:
-            json.loads(body)
-        except Exception as e:
-            logger.warning("Invalid library scan body: malformed JSON (%s)", e)
+            if not isinstance(json.loads(body), dict):
+                logger.warning("Invalid library scan body: expected JSON object")
+                return "", ""
+        except (ValueError, RecursionError):
+            logger.warning("Invalid library scan body: malformed JSON")
             return "", ""
 
     return path, body
@@ -6184,9 +6200,8 @@ def _scan_config() -> "tuple[str, str]":
 def _clean_scan_headers(headers: dict | None) -> dict:
     """提取扫描请求所需的会话凭据，过滤跨路径无效或危险的头部。
 
-    注意：authx 请求头是基于触发请求 URI/Method 计算的单次签名，
-    不能在完全不同的 scan 接口路径上重放。会话凭证（Cookie/Authorization）
-    可以在同站/Unix 上游中复用。
+    尚未验证 authx 是否允许跨路径复用，默认不将媒体票据重放到扫描接口。
+    Cookie/Authorization 只发往同站 Unix 上游，仍以官方业务码确认授权结果。
     """
     if not headers:
         return {}
