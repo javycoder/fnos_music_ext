@@ -2,22 +2,27 @@
 fnmusic-ext 洛雪音源适配服务 (基于 lxserver 后端)。
 
 契约说明：
-1. 保持对 proxy 和 WebUI 的既有 10 个 HTTP API 契约完全不变；
+1. 既有播放/搜索/源管理接口保持兼容；源管理新增 POST /api/v1/source/reorder，
+   GET /api/v1/source 增加 policy 字段（自动切换、平台优选、稳定脚本顺序）；
 2. 内部通过 lxserver_client 调用容器内本地运行的 lxserver (端口 8005)；
-3. 本模块负责曲目 ID (lx:<src>:<id>) 映射、音质降档、Range 魔数探活 (probe_url)、
-   熔断防护 (_chain_*)、搜索并发门闸 (LxSearchGate) 以及旧版状态兼容。
+3. 本模块负责曲目 ID (lx:<src>:<id>) 映射、Range 魔数探活 (probe_url)、
+   熔断防护 (_chain_*)、搜索并发门闸 (LxSearchGate) 以及旧版状态兼容；
+4. 播放编排由 playback_policy 负责：音质 -> 脚本顺序 -> 同脚本原平台/其他平台，
+   跨平台候选必须通过歌名/歌手/版本/时长可信匹配。
 """
 
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import math
 import json
 import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -26,7 +31,7 @@ import urllib.parse
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from lxserver_client import (
     DEFAULT_ADMIN_PASSWORD,
@@ -39,6 +44,23 @@ from lxserver_client import (
     parse_interval_to_seconds,
     SourceOperationBusy,
     serialize_source_operation,
+)
+from playback_policy import (
+    CandidateFinder,
+    PolicySettings,
+    build_source_catalog,
+    from_lx_quality,
+    media_ext_from_content_type,
+    media_ext_from_url,
+    merge_reorder,
+    merge_source_order,
+    normalize_quality,
+    ordered_scripts,
+    plan_steps,
+    quality_ladder,
+    read_policy_settings,
+    ScriptInfo,
+    to_lx_quality,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 仓库根：复用 proxy/fnlog
@@ -154,6 +176,12 @@ _URL_INFLIGHT: dict[tuple[int, str, str, bool], asyncio.Future] = {}
 _URL_CACHE_GEN = 0
 _STATS = {"searches": 0, "url_resolutions": 0, "url_cache_hits": 0, "errors": 0}
 
+# 跨平台候选：每平台 3 个、搜索并发 2、结果缓存 60 秒（播放策略模块实现）
+_CANDIDATES = CandidateFinder()
+# 三项策略的最近快照签名。策略变化时推进源代并失效候选缓存，阻止旧任务回写。
+_POLICY_SIGNATURE: tuple | None = None
+_SOURCE_ORDER_FILENAME = "source_order.json"
+
 # 探活前缀字节数
 _PROBE_BYTES = 4096
 
@@ -193,10 +221,16 @@ def _cache_get(track_id: str) -> dict | None:
 
 
 def _url_cache_reset() -> None:
-    """清空播放直链缓存并推进源代计数：切源/重导入脚本后旧直链一律作废，防止串源。"""
+    """清空播放直链缓存并推进源代计数：切源/重导入脚本后旧直链一律作废，防止串源。
+
+    候选搜索缓存同样依赖脚本顺序与配置代，必须一起失效，避免排序后仍用旧候选。
+    """
     _URL_CACHE.clear()
     global _URL_CACHE_GEN
     _URL_CACHE_GEN += 1
+    finder = globals().get("_CANDIDATES")
+    if finder is not None:
+        finder.invalidate()
 
 
 async def _refresh_cached_url(
@@ -353,21 +387,377 @@ async def _resolve_url_inflight(
     return result
 
 
+def _normalize_quality(quality: str) -> str:
+    """统一档位名；共享模块异常时回退到播放默认 lossless。"""
+    try:
+        return str(normalize_quality(quality) or "lossless")
+    except Exception:
+        return "lossless"
+
+
 def _quality_tiers(quality: str) -> list[str]:
-    q = (quality or "").strip().lower()
-    if q in ("lossless", "flac", "sq", "hires", "hr", "master"):
-        return ["lossless", "high", "standard"]
-    if q in ("high", "320", "exhigh", "hq"):
-        return ["high", "standard"]
-    return ["standard"]
+    """目标档严格向下阶梯；洛雪旧 high 由共享模块归一为 exhigh（320k）。"""
+    try:
+        tiers = [str(tier) for tier in quality_ladder(quality) if str(tier)]
+    except Exception:
+        tiers = []
+    return tiers or ["standard"]
 
 
 def _tier_to_lx_quality(tier: str) -> str:
-    if tier == "lossless":
-        return "flac"
-    if tier == "high":
-        return "320k"
-    return "128k"
+    try:
+        return str(to_lx_quality(tier) or "128k")
+    except Exception:
+        return "128k"
+
+
+# 兼容旧代理契约的 actual_tier 粗粒度：无损及以上都按 lossless，320k/192k 按 high。
+def _legacy_tier(quality: str) -> str:
+    if quality in ("lossless", "hires", "jymaster", "sky"):
+        return "lossless"
+    if quality in ("exhigh", "higher"):
+        return "high"
+    return "standard"
+
+
+_QUALITY_BITRATE = {
+    "standard": 128000,
+    "higher": 192000,
+    "exhigh": 320000,
+    "lossless": 960000,
+    "hires": 2304000,
+    "jymaster": 2304000,
+    "sky": 2304000,
+}
+
+
+# ------------------------------------------------------------- 播放策略配置 --
+
+def _policy_settings() -> PolicySettings:
+    """读取三项 env 策略；.env 热更新逐键覆盖进程环境，缺失键继续用进程环境。"""
+    values = dict(os.environ)
+    values.update(_persisted_env_values())
+    return read_policy_settings(values)
+
+
+def _sync_policy_generation(settings: PolicySettings) -> None:
+    """策略变化时推进源代：清空旧直链、候选缓存和熔断，旧在途结果不得回写。"""
+    global _POLICY_SIGNATURE
+    signature = (
+        bool(settings.auto_switch),
+        bool(settings.platform_preferred),
+        tuple(settings.source_order),
+    )
+    if _POLICY_SIGNATURE is not None and signature != _POLICY_SIGNATURE:
+        _url_cache_reset()
+        _CHAIN_HEALTH.clear()
+        fn_diag(logger, "policy", op="generation_bump")
+    _POLICY_SIGNATURE = signature
+
+
+def _source_order_path() -> Path:
+    return Path(str(CONF["data_dir"])) / _SOURCE_ORDER_FILENAME
+
+
+def _as_source_id_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    ids: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        sid = item.strip()
+        if sid and sid not in ids:
+            ids.append(sid)
+    return ids
+
+
+def _read_source_order_file() -> dict:
+    """读取排序持久文件；损坏/缺失静默当作空，不阻断播放。"""
+    try:
+        raw = json.loads(_source_order_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"order": [], "env_order": []}
+    if not isinstance(raw, dict):
+        return {"order": [], "env_order": []}
+    return {
+        "order": _as_source_id_list(raw.get("order")),
+        "env_order": _as_source_id_list(raw.get("env_order")),
+    }
+
+
+def _write_source_order_file(order: list[str], env_order: list[str]) -> None:
+    """原子写入排序文件：tmp + os.replace，避免半截 JSON。"""
+    path = _source_order_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "order": [str(item) for item in order if str(item)],
+        "env_order": [str(item) for item in env_order if str(item)],
+    }
+    fd, tmp = tempfile.mkstemp(prefix=".source-order-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _effective_source_order(
+    catalog_ids: list[str],
+    env_order: tuple[str, ...] | list[str],
+    *,
+    persist_cleanup: bool = False,
+) -> list[str]:
+    """合并 env、排序文件与当前源目录，得到完整稳定顺序。
+
+    规则：env 是用户配置基线；若 env 与文件记录的 env 快照一致，文件里的
+    最新 POST 排序优先；env 被改写则 env 覆盖旧文件。删除的 ID 在合并时
+    丢弃；`persist_cleanup=True` 时把清理后的顺序写回磁盘（默认只在管理
+    接口/状态查询时写，播放路径不写盘）。
+    """
+    stored = _read_source_order_file()
+    file_order = stored["order"]
+    env_list = [str(item) for item in (env_order or []) if str(item)]
+    if env_list:
+        if file_order and env_list == stored["env_order"]:
+            chosen = file_order
+        else:
+            # env 可能只列激活脚本：按槽位合并，保留停用脚本的历史位置。
+            base = file_order or merge_source_order(catalog_ids, [])
+            chosen = merge_reorder(base, env_list)
+    else:
+        chosen = file_order
+    merged = merge_source_order(catalog_ids, chosen)
+    if persist_cleanup and merged != file_order:
+        try:
+            _write_source_order_file(merged, env_list)
+        except OSError as exc:
+            logger.warning("写入洛雪脚本排序失败: %s", exc)
+    return merged
+
+
+def _policy_payload(sources: list[dict], *, persist_cleanup: bool = False) -> dict:
+    """给 WebUI 源管理返回统一策略视图（自动切换、平台优选、稳定顺序、配置代）。"""
+    settings = _policy_settings()
+    _sync_policy_generation(settings)
+    catalog = build_source_catalog(sources)
+    order = _effective_source_order(
+        [script.id for script in catalog],
+        settings.source_order,
+        persist_cleanup=persist_cleanup,
+    )
+    scripts = ordered_scripts(catalog, order)
+    active = [script.id for script in scripts if script.ready]
+    return {
+        "auto_switch": bool(settings.auto_switch),
+        "platform_preferred": bool(settings.platform_preferred),
+        "source_order": order,
+        "active_source_order": active,
+        "generation": _URL_CACHE_GEN,
+    }
+
+
+def _resolve_policy_snapshot(
+    sources: list[dict],
+) -> tuple[PolicySettings, list[ScriptInfo], list[ScriptInfo]]:
+    """播放前的一次性策略快照：策略 env -> 源目录 -> 稳定顺序。"""
+    settings = _policy_settings()
+    _sync_policy_generation(settings)
+    catalog = build_source_catalog(sources)
+    order = _effective_source_order(
+        [script.id for script in catalog], settings.source_order,
+    )
+    return settings, catalog, ordered_scripts(catalog, order)
+
+
+class SourceStateQueryError(RuntimeError):
+    """源管理列表未能提供可信快照，不代表脚本失效，也不应写负缓存或熔断。"""
+
+
+async def _policy_source_list(deadline: float) -> list[dict]:
+    """在总预算内读取源列表；超时/内部服务故障上浮为服务错误，不触发脚本熔断。"""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SourceStateQueryError("读取洛雪源列表前预算已耗尽")
+    try:
+        async with asyncio.timeout(min(remaining, 2.0)):
+            return await LXSERVER.list_custom_sources()
+    except TimeoutError as exc:
+        logger.warning("读取洛雪源列表超时，播放解析放弃")
+        raise SourceStateQueryError("读取洛雪源列表超时") from exc
+    except Exception as exc:
+        logger.warning("读取洛雪源列表失败，播放解析放弃: %s", exc)
+        detail = redact(str(exc)).strip() or type(exc).__name__
+        raise SourceStateQueryError(f"lxserver 源状态查询失败: {detail}"[:1000]) from exc
+
+
+def _platform_headers(platform: str) -> dict[str, str]:
+    """探活与实际播放共用同一请求头；Referer 按实际来源平台补齐。"""
+    headers = {"User-Agent": UA_PC}
+    if platform == "kg":
+        headers["Referer"] = "https://www.kugou.com/"
+    elif platform == "tx":
+        headers["Referer"] = "https://y.qq.com/"
+    return headers
+
+
+def _exclude_others(script_id: str, catalog: list[ScriptInfo]) -> list[str] | None:
+    """排除其他脚本的稳定 ID，把上游自动切换固定到当前脚本。
+
+    只传 ID、不传 name：脚本名可能重复，按名字排除会把当前脚本一起排除。
+    不改任何脚本的全局启用状态；只影响本次 /api/music/url 请求。
+    """
+    others: list[str] = []
+    for script in catalog:
+        if script.id != script_id and script.id not in others:
+            others.append(script.id)
+    return others or None
+
+
+def _chain_key(script_id: str, platform: str, generation: int) -> str:
+    """熔断按脚本 + 平台 + 配置代隔离，不能用平台全局键误伤其他脚本。"""
+    return f"policy:{int(generation)}:{script_id}:{platform}"
+
+
+@dataclass
+class _AttemptResult:
+    """一次固定脚本/平台的解析结果分类。"""
+
+    data: dict | None = None
+    failure: bool = False
+    timeout: bool = False
+    service_error: bool = False
+
+
+def _candidate_song_info(candidate: dict) -> dict:
+    """候选曲目 -> lxserver songInfo；搜索阶段已缓存原始对象时直接复用。"""
+    track_id = str(candidate.get("id") or "")
+    info = LXSERVER.get_cached_song_info(track_id) if track_id else None
+    if info:
+        return info
+    return LXSERVER.synthesize_song_info(track_id, candidate)
+
+
+async def _search_candidates(platform: str, keyword: str, limit: int) -> list[dict]:
+    """候选搜索入口：直接走 lxserver 搜索，不占用全局 LxSearchGate。"""
+    return await LXSERVER.search(keyword, source=platform, limit=limit)
+
+
+async def _attempt_pinned(
+    client: httpx.AsyncClient,
+    *,
+    script: ScriptInfo,
+    platform: str,
+    song_info: dict,
+    resolved_track_id: str,
+    track_id: str,
+    quality: str,
+    requested_quality: str,
+    deadline: float,
+    resolver_timeout: float,
+    probe_timeout: float,
+    exclude_sources: list[str] | None,
+) -> _AttemptResult:
+    """固定脚本、固定平台、固定档位解析一次，并做同请求头 Range 探活。"""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _AttemptResult(timeout=True)
+    lx_quality = _tier_to_lx_quality(quality)
+    headers = _platform_headers(platform)
+    per_call_timeout = max(0.01, min(remaining, resolver_timeout))
+    try:
+        async with asyncio.timeout(per_call_timeout):
+            response = await LXSERVER.get_music_url(
+                song_info,
+                lx_quality,
+                exclude_api_sources=exclude_sources,
+                request_timeout=per_call_timeout,
+            )
+    except TimeoutError:
+        # 单次解析超时由外层继续下一个脚本/档位；预算耗尽与取消都不能算脚本失败。
+        return _AttemptResult(timeout=True)
+    except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            logger.warning("lxserver 播放解析内部故障: %s", exc)
+            return _AttemptResult(service_error=True)
+        logger.debug("lxserver get_music_url 失败 script=%s platform=%s: %s",
+                     script.id, platform, exc)
+        return _AttemptResult(failure=True)
+
+    if not response or not response.get("url"):
+        # 200 空 url（脚本静默空返回）按该脚本/平台失败处理，交由计划换脚本。
+        return _AttemptResult(failure=True)
+
+    raw_url = str(response["url"])
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _AttemptResult(timeout=True)
+    try:
+        async with asyncio.timeout(max(0.01, min(remaining, probe_timeout))):
+            ok, final_url, content_type, size = await probe_url(
+                client, raw_url, headers,
+                timeout=max(0.01, min(remaining, probe_timeout)),
+            )
+    except Exception:
+        ok = False
+        final_url, content_type, size = raw_url, "", 0
+
+    if not ok:
+        logger.info("探活拒绝 %s quality=%s ct=%s script=%s platform=%s url=%.120s",
+                    track_id, quality, content_type or "", script.id, platform, raw_url)
+        return _AttemptResult(failure=True)
+
+    # 魔数探活已确认格式；MIME/最终 URL 都识别不了时宁可失败，也不硬写 mp3。
+    ext = media_ext_from_content_type(content_type) or media_ext_from_url(final_url)
+    if not ext:
+        logger.warning("探活通过但无法识别媒体格式 %s ct=%r url=%.120s",
+                       track_id, content_type, final_url)
+        return _AttemptResult(failure=True)
+
+    reported_lx = str(response.get("type") or "").strip().lower()
+    actual_quality = from_lx_quality(reported_lx) or quality
+    actual_lx_quality = reported_lx or lx_quality
+    try:
+        upstream_br = int(response.get("br") or 0)
+    except (TypeError, ValueError):
+        upstream_br = 0
+    br = upstream_br or _QUALITY_BITRATE.get(actual_quality, 128000)
+    fallback_reason = ""
+    if actual_quality != requested_quality:
+        fallback_reason = (
+            f"requested {requested_quality}; resolved {actual_quality} "
+            f"({actual_lx_quality})"
+        )
+    return _AttemptResult(data={
+        "id": track_id,
+        "url": final_url,
+        "ext": ext,
+        "file_size": size,
+        "actual_tier": _legacy_tier(actual_quality),
+        "actual_quality": actual_quality,
+        "requested_quality": requested_quality,
+        "actual_lx_quality": actual_lx_quality,
+        "quality_evidence": {
+            "probe": ext,
+            "content_type": content_type or "",
+            "reported_lx_quality": reported_lx or None,
+            "source": "lxserver",
+        },
+        "fallback_reason": fallback_reason,
+        "resolved_track_id": resolved_track_id,
+        "source_platform": platform,
+        "source_script": script.id,
+        "source_script_name": script.name,
+        "resolver": "lxserver",
+        "headers": dict(headers),
+        "br": br,
+    })
 
 
 # ------------------------------------------------------------- 媒体流探活 --
@@ -663,26 +1053,12 @@ _SEARCH_GATE = LxSearchGate()
 
 # ------------------------------------------------------------- 核心解析逻辑 --
 
-# 同档位探活失败后的换源上限：多源同时激活时逐个排除已产出坏链的脚本再试，
-# 超出按音源脚本数量上限直接降档（每轮仍受 resolver_timeout 与总预算约束）
-_MAX_SOURCE_ROUNDS = 3
-
-
-def _scripts_tried(res: dict) -> list[str]:
-    """解析结果里实际参与过的脚本标识（attempts 全部 + 最终产出者），供同档换源排除。
-
-    lxserver 的 excludeApiSources 按脚本 name 或 id（不区分大小写）过滤，二者都传。"""
-    names: list[str] = []
-    for a in (res.get("attempts") or []):
-        if isinstance(a, dict):
-            name = str(a.get("name") or "").strip()
-            if name:
-                names.append(name)
-    for key in ("sourceId", "sourceName"):
-        name = str(res.get(key) or "").strip()
-        if name:
-            names.append(name)
-    return list(dict.fromkeys(names))
+def _track_song_info(track_id: str, item: dict) -> dict:
+    """反查或合成原曲目的 songInfo；关键词型脚本依赖真实歌名歌手。"""
+    song_info = LXSERVER.get_cached_song_info(track_id)
+    if not song_info:
+        song_info = LXSERVER.synthesize_song_info(track_id, item)
+    return song_info
 
 
 async def resolve_and_probe(
@@ -695,111 +1071,122 @@ async def resolve_and_probe(
     probe_timeout: float | None = None,
     generation: int | None = None,
 ) -> dict | None:
-    """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。
+    """按「音质 -> 脚本顺序 -> 同脚本原平台/其他平台」执行一次总预算解析。
 
-    熔断按平台独立计数：某一平台（如 tx 只产出加密 mflac、mg 后端全挂）连续失败
-    只熔断该平台，不再拖垮其他健康平台的解析（2026-10-10 全局熔断误伤全平台故障）。
-    同档位直链探活失败或脚本静默空返回（200 无 url）时，按 excludeApiSources 排除
-    已试脚本换下一个激活源重试。"""
+    与旧实现的区别：
+    - 计划由 playback_policy.plan_steps 一次生成，不再有每档最多三脚本的第二套梯度；
+    - 目标档位遍历完所有就绪脚本后才降档，跨平台候选先经过可信匹配；
+    - 每次请求用 excludeApiSources 排除其他脚本，只固定当前脚本，不改全局启用态；
+    - 探活/搜索/降档共用同一个 deadline；取消、预算耗尽、lxserver 内部故障不计熔断；
+    - 熔断键是脚本 + 平台 + 配置代，单个脚本坏链不会误伤同平台其他脚本。
+    """
     src = normalize_source(source)
+    if not src:
+        return None
     active_generation = _URL_CACHE_GEN if generation is None else generation
-    effective_resolver_timeout = float(CONF["resolver_timeout"] if resolver_timeout is None else resolver_timeout)
-    effective_probe_timeout = float(CONF["probe_timeout"] if probe_timeout is None else probe_timeout)
+    effective_resolver_timeout = float(
+        CONF["resolver_timeout"] if resolver_timeout is None else resolver_timeout
+    )
+    effective_probe_timeout = float(
+        CONF["probe_timeout"] if probe_timeout is None else probe_timeout
+    )
+    deadline = time.monotonic() + max(float(budget), 0.001)
+    target_quality = _normalize_quality(quality)
     track_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
-    chain_key = f"user_source:{src}" if src else "user_source"
 
-    if not _chain_available(chain_key):
-        logger.warning("lx resolve skipped: %s circuit is open", chain_key)
+    # 源列表本身也是内部服务调用：失败/超时上浮为 503，不写负缓存、不记脚本熔断。
+    sources = await _policy_source_list(deadline)
+    settings, catalog, scripts = _resolve_policy_snapshot(sources)
+    steps = plan_steps(
+        _quality_tiers(target_quality),
+        scripts,
+        src,
+        auto_switch=settings.auto_switch,
+        platform_preferred=settings.platform_preferred,
+    )
+    if not steps:
+        logger.debug("lx resolve no plan: source=%s quality=%s scripts=%d",
+                     src, target_quality, len(scripts))
         return None
 
-    # 反查或合成 songInfo
-    song_info = LXSERVER.get_cached_song_info(track_id)
-    if not song_info:
-        song_info = LXSERVER.synthesize_song_info(track_id, item)
-
-    deadline = time.monotonic() + budget
-    tiers = _quality_tiers(quality)
+    original_info = _track_song_info(track_id, item)
+    scripts_by_id = {script.id: script for script in scripts}
+    # 跨平台候选按「脚本+档位」首次需要时并发预取；缓存 60 秒，后续档位零搜索。
+    prefetched: dict[tuple[str, str], dict[str, list[dict]]] = {}
     attempted_tiers: list[str] = []
+    failed_steps: set[tuple[str, str]] = set()
+    budget_exhausted = False
 
-    for tier in tiers:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+    for step in steps:
+        if active_generation != _URL_CACHE_GEN:
+            return None
+        if step.quality not in attempted_tiers:
+            attempted_tiers.append(step.quality)
+        if deadline - time.monotonic() <= 0:
+            budget_exhausted = True
             break
-        lx_q = _tier_to_lx_quality(tier)
-        attempted_tiers.append(tier)
-        excluded: list[str] = []
-        for _round in range(_MAX_SOURCE_ROUNDS):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                async with asyncio.timeout(min(remaining, effective_resolver_timeout)):
-                    res = await LXSERVER.get_music_url(song_info, lx_q,
-                                                       exclude_api_sources=excluded or None,
-                                                       request_timeout=effective_resolver_timeout)
-            except Exception as exc:
-                logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
-                res = None
+        chain_key = _chain_key(step.script_id, step.platform, active_generation)
+        if not _chain_available(chain_key):
+            continue
 
-            if not res or not res.get("url"):
-                if res is None:
-                    break  # 服务端无可用源/调用出错（已试尽全部源）：降档
-                # 200 但空 url：脚本"成功"却拿不出直链（如平台未激活的静默空返回），
-                # 与探活失败同等换源轮换
-                tried = [n for n in _scripts_tried(res) if n not in excluded]
-                excluded.extend(tried)
-                if res.get("hasMoreSources") is False or not tried:
+        if step.platform == src:
+            attempts: list[tuple[str, dict]] = [(track_id, original_info)]
+        else:
+            prefetch_key = (step.script_id, step.quality)
+            if prefetch_key not in prefetched:
+                script = scripts_by_id.get(step.script_id)
+                others = [p for p in (script.platforms if script else ()) if p != src]
+                prefetched[prefetch_key] = await _CANDIDATES.find_many(
+                    _search_candidates, item, others, deadline, active_generation,
+                )
+            attempts = []
+            for candidate in prefetched[prefetch_key].get(step.platform) or []:
+                candidate_id = str(candidate.get("id") or "")
+                if candidate_id:
+                    attempts.append((candidate_id, _candidate_song_info(candidate)))
+        if not attempts:
+            continue
+
+        exclude_sources = _exclude_others(step.script_id, catalog)
+        step_failed = False
+        for resolved_id, song_info in attempts:
+            attempt = await _attempt_pinned(
+                client,
+                script=scripts_by_id[step.script_id],
+                platform=step.platform,
+                song_info=song_info,
+                resolved_track_id=resolved_id,
+                track_id=track_id,
+                quality=step.quality,
+                requested_quality=target_quality,
+                deadline=deadline,
+                resolver_timeout=effective_resolver_timeout,
+                probe_timeout=effective_probe_timeout,
+                exclude_sources=exclude_sources,
+            )
+            if attempt.service_error:
+                # 内部服务故障上浮为 503：不写负缓存、不写脚本熔断，也不继续消耗预算。
+                raise SourceStateQueryError("lxserver 播放解析内部故障")
+            if attempt.data:
+                _chain_record_success(chain_key)
+                result = dict(attempt.data)
+                result["attempted_tiers"] = list(attempted_tiers)
+                return result
+            if attempt.timeout:
+                # 单次超时只是本脚本/本候选慢；预算耗尽时结束整个计划，不记熔断。
+                if deadline - time.monotonic() <= 0:
+                    budget_exhausted = True
                     break
                 continue
+            step_failed = True
+        if step_failed:
+            failed_steps.add((step.script_id, step.platform))
+        if budget_exhausted:
+            break
 
-            raw_url = res["url"]
-            # issue #54：UA 敏感 CDN（如酷我）按 User-Agent 差异放行/拒绝，探活与
-            # 实际播放必须同一 UA。探活 UA 直接进返回 headers 交给代理复用，
-            # 杜绝「探活 Chrome UA 通过、代理 httpx 默认 UA 被 403」的错位
-            headers = {"User-Agent": UA_PC}
-            # 酷狗或特殊源防盗链头
-            if src == "kg":
-                headers["Referer"] = "https://www.kugou.com/"
-            elif src == "tx":
-                headers["Referer"] = "https://y.qq.com/"
-
-            # 媒体魔数探活（共用同一总预算）
-            remaining_probe = deadline - time.monotonic()
-            if remaining_probe <= 0:
-                break
-            try:
-                async with asyncio.timeout(remaining_probe):
-                    ok, final_url, ct, size = await probe_url(
-                        client, raw_url, headers, timeout=effective_probe_timeout)
-            except Exception:
-                ok = False
-
-            if ok:
-                _chain_record_success(chain_key)
-                ext = "flac" if "flac" in ct else ("mp3" if "mp3" in ct else "mp3")
-                return {
-                    "id": track_id,
-                    "url": final_url,
-                    "ext": ext,
-                    "file_size": size,
-                    "actual_tier": tier,
-                    "resolver": "lxserver",
-                    "headers": headers,
-                    "br": 320000 if tier == "high" else (960000 if tier == "lossless" else 128000),
-                    "attempted_tiers": attempted_tiers,
-                }
-
-            # 直链探活失败（过期/加密/HTML 错误页）：排除产出该链的脚本同档换源重试；
-            # 服务端确认已无更多候选源时不再轮换，直接降档
-            logger.info("probe rejected %s tier=%s ct=%s source=%s url=%.120s", track_id, tier,
-                        ct or "", res.get("sourceName") or "", raw_url)
-            tried = [n for n in _scripts_tried(res) if n not in excluded]
-            excluded.extend(tried)
-            if res.get("hasMoreSources") is False or not tried:
-                break
-
-    if active_generation == _URL_CACHE_GEN:
-        _chain_record_failure(chain_key)
+    if active_generation == _URL_CACHE_GEN and not budget_exhausted:
+        for script_id, platform in failed_steps:
+            _chain_record_failure(_chain_key(script_id, platform, active_generation))
     return None
 
 
@@ -905,10 +1292,6 @@ async def source_capabilities() -> dict[str, dict]:
         return _source_capabilities_snapshot(sources, alive=alive)
     except Exception as exc:
         return _source_capabilities_snapshot([], alive=False, error=_source_query_error(exc))
-
-
-class SourceStateQueryError(RuntimeError):
-    """源管理列表未能提供可信快照，不代表脚本失效。"""
 
 
 async def _query_source_list() -> list[dict]:
@@ -1608,6 +1991,8 @@ async def track_url(
         or {"id": canonical_id, "lx_source": src}
     client = get_http(app)
     timeout_settings = _reload_timeout_settings()
+    # 策略 env 改变时推进配置代并清空旧直链，避免继续复用旧顺序下的解析结果。
+    _sync_policy_generation(_policy_settings())
 
     generation = _URL_CACHE_GEN
     try:
@@ -1615,6 +2000,9 @@ async def track_url(
             client, src, cached, quality,
             budget=timeout_settings["url_timeout"], fresh=bool(fresh), timeout_settings=timeout_settings
         )
+    except SourceStateQueryError:
+        # 内部 lxserver 不可用是服务故障（503），不能伪装成曲目不可播（404/502）。
+        raise
     except Exception as e:
         _STATS["errors"] += 1
         logger.warning("lx url resolve %s failed: %s", track_id, e)
@@ -1733,13 +2121,133 @@ class SourceBody(BaseModel):
     enabled: bool = True  # false 表示停用该源（多源叠加语义下的取消激活）
 
 
+class ReorderBody(BaseModel):
+    """排序接口请求体：稳定脚本 ID 数组（只传 WebUI 可见的激活脚本即可）。"""
+
+    source_ids: list[str] = Field(default_factory=list)
+
+
 @app.get("/api/v1/source")
 async def source_info():
     try:
-        user_src = await describe_user_source()
+        sources = await _query_source_list()
+        user_src = _describe_source_snapshot(sources)
+        policy_payload = _policy_payload(sources, persist_cleanup=True)
     except Exception as exc:
         return _source_query_response(exc)
-    return {"ok": True, "data": user_src, "circuit": chain_health_snapshot()}
+    return {
+        "ok": True,
+        "data": user_src,
+        "circuit": chain_health_snapshot(),
+        "policy": policy_payload,
+    }
+
+
+def _validate_reorder_ids(source_ids: list[str]) -> list[str]:
+    ids: list[str] = []
+    for raw in source_ids or []:
+        sid = str(raw or "").strip()
+        if not sid:
+            raise ValueError("source_ids 不能包含空值")
+        if len(sid) > 200 or any(ch in sid for ch in "\r\n\x00"):
+            raise ValueError("source_ids 包含非法脚本 ID")
+        if sid in ids:
+            raise ValueError(f"重复的脚本 ID: {sid}")
+        ids.append(sid)
+    return ids
+
+
+async def _rollback_source_order(previous: list[str]) -> None:
+    """上游排序失败/未生效时尽力恢复旧顺序；恢复失败只记录，不覆盖原始错误。"""
+    try:
+        await LXSERVER.reorder_custom_sources(previous)
+    except Exception as exc:
+        logger.warning("恢复洛雪脚本原顺序失败: %s", exc)
+
+
+@app.post("/api/v1/source/reorder")
+@serialize_source_operation
+async def source_reorder(body: ReorderBody):
+    """调整脚本顺序：管理锁串行、上游 sourceIds 持久化、失败回滚。
+
+    只改顺序，不改任何脚本的全局启用状态；成功后排空直链/候选缓存并推进
+    配置代，旧在途解析的回写会被 `_URL_CACHE_GEN` 检查丢弃。
+    """
+    submitted = _validate_reorder_ids(body.source_ids)
+    try:
+        sources = await _query_source_list()
+    except SourceStateQueryError as exc:
+        return _source_query_response(exc)
+    catalog = build_source_catalog(sources)
+    catalog_ids = [script.id for script in catalog]
+    if not catalog_ids:
+        return _err("没有可排序的自定义源", 400)
+
+    unknown = [sid for sid in submitted if sid not in set(catalog_ids)]
+    if unknown:
+        raise ValueError(f"未知脚本 ID: {', '.join(unknown)}")
+
+    settings = _policy_settings()
+    before = _effective_source_order(catalog_ids, settings.source_order)
+    after = merge_reorder(before, submitted)
+
+    try:
+        await LXSERVER.reorder_custom_sources(after)
+    except Exception as exc:
+        if is_lxserver_unreachable(exc):
+            return JSONResponse(status_code=503, content={
+                "ok": False, "error": "洛雪脚本服务 lxserver 不可连接，请查看运行日志",
+                "category": "service_unavailable", "stage": "lxmusic_to_lxserver",
+            })
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": f"调整脚本顺序失败: {exc}",
+            "category": "internal", "stage": "lxmusic_to_lxserver",
+        })
+
+    # 上游必须真的按新顺序返回；未生效不写入本地，避免 UI 显示成功但播放仍旧顺序。
+    try:
+        after_sources = await _query_source_list()
+    except Exception as exc:
+        await _rollback_source_order(before)
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": f"排序后源列表确认失败: {exc}",
+            "category": "internal", "stage": "lxmusic_to_lxserver",
+        })
+    # 只校验当前就绪（激活且初始化成功）脚本的相对顺序：上游是否给停用脚本
+    # 重排不影响播放（本地文件保留停用位置），也避免上游异步重载造成误回滚。
+    ready_ids = {script.id for script in catalog if script.ready}
+    actual_ids = [str(item.get("id") or "") for item in after_sources if isinstance(item, dict)]
+    expected = [sid for sid in after if sid in ready_ids]
+    actual = [sid for sid in actual_ids if sid in ready_ids]
+    if actual != expected:
+        logger.warning("上游排序未生效: expected=%s actual=%s", expected, actual)
+        await _rollback_source_order(before)
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "上游未按提交顺序生效，已尝试恢复原顺序",
+            "category": "internal", "stage": "lxmusic_to_lxserver",
+        })
+
+    try:
+        _write_source_order_file(after, list(settings.source_order))
+    except OSError as exc:
+        await _rollback_source_order(before)
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": f"保存脚本顺序失败: {exc}",
+            "category": "internal", "stage": "lxmusic_to_lxserver",
+        })
+
+    _url_cache_reset()
+    _CHAIN_HEALTH.clear()
+    policy_payload = _policy_payload(after_sources)
+    return {
+        "ok": True,
+        "data": {
+            "source_ids": after,
+            "active_source_order": policy_payload["active_source_order"],
+            "generation": _URL_CACHE_GEN,
+            "policy": policy_payload,
+        },
+    }
 
 
 @app.post("/api/v1/source/verify")

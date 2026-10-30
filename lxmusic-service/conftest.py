@@ -65,6 +65,10 @@ class FakeLxServerClient:
                 "types": [{"type": "128k"}, {"type": "320k"}, {"type": "flac"}],
             }
         ]
+        # 跨平台候选搜索替身：平台 -> 原始 song 列表；为空时回退 search_results。
+        self.search_results_by_source: dict[str, list[dict]] = {}
+        # 搜索调用记录 (source, keyword, page, pages, limit)：候选搜索/缓存断言用。
+        self.search_calls: list[tuple[str, str, int, int, int]] = []
         self.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
         self.lyric_result = {"lyric": "[00:00.00] 歌词内容\n[00:05.00] 第二句"}
         self._song_info_cache = {}
@@ -75,12 +79,18 @@ class FakeLxServerClient:
         # get_music_url 调用记录 (songmid, quality)：缓存/在途合并测试统计实际解析次数用
         self.url_calls: list[tuple[str, str]] = []
         self.url_timeouts: list[float | None] = []
+        # 同步记录每次调用的 song_info.source（跨平台候选解析断言用）
+        self.url_song_sources: list[str] = []
         # 同步记录每次调用的 excludeApiSources（换源轮换测试断言用）
         self.url_excludes: list[list[str] | None] = []
         # 非空时按序弹出作为 get_music_url 返回值（先于 url_result 判定），耗尽后返回 None
         self.url_script: list[dict | None] = []
         # 非空时 get_music_url 等待该事件（同测试循环内使用）：并发时序控制
         self.url_gate: asyncio.Event | None = None
+        # 上游排序替身：记录 sourceIds；reorder_mutate=False 模拟上游未生效（校验失败回滚）
+        self.reorder_calls: list[list[str]] = []
+        self.reorder_fail: Exception | None = None
+        self.reorder_mutate = True
 
     @staticmethod
     def _derive_source_id(filename: str, script: str) -> str:
@@ -112,17 +122,22 @@ class FakeLxServerClient:
     async def search(self, keyword: str, source: str = "kw", page: int = 1, pages: int = 1, limit: int = 20) -> list[dict]:
         from lxserver_client import map_lxserver_song
 
+        self.search_calls.append((source, keyword, page, pages, limit))
+        rows = self.search_results_by_source.get(source, self.search_results)
         res = []
-        for raw in self.search_results:
+        for raw in rows:
             item = map_lxserver_song(raw, fallback_source=source)
             self._song_info_cache[item["id"]] = raw
             res.append(item)
+            if len(res) >= limit:
+                break
         return res
 
     async def get_music_url(self, song_info: dict, quality: str = "128k",
                             exclude_api_sources: list[str] | None = None,
                             request_timeout: float | None = None) -> dict | None:
         self.url_calls.append((str(song_info.get("songmid") or ""), quality))
+        self.url_song_sources.append(str(song_info.get("source") or ""))
         self.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         self.url_timeouts.append(request_timeout)
         if self.url_gate is not None:
@@ -227,6 +242,21 @@ class FakeLxServerClient:
             target["status"] = "success"
         self.toggle_calls.append((target["id"], bool(enabled)))
         return True
+
+    async def reorder_custom_sources(self, source_ids: list[str]) -> dict:
+        """模拟上游 POST /api/custom-source/reorder {sourceIds: []}。
+
+        reorder_mutate=False 时只记调用、不改列表，用于验证"上游未生效→回滚"。
+        """
+        self.reorder_calls.append([str(i) for i in source_ids])
+        if self.reorder_fail is not None:
+            raise self.reorder_fail
+        if self.reorder_mutate:
+            by_id = {str(s.get("id") or ""): s for s in self.sources}
+            ordered = [by_id[i] for i in source_ids if i in by_id]
+            ordered += [s for s in self.sources if str(s.get("id") or "") not in source_ids]
+            self.sources = ordered
+        return {"success": True}
 
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
         target = self._find(source_id)

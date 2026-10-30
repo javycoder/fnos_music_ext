@@ -1501,16 +1501,16 @@ async def test_track_url_ttl_expiry_dead_url_reresolves(fake_lx, fresh_url_cache
 def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_cache, fake_lx):
     """解析失败写负缓存：短时间内重复请求不再打音源；fresh=1 旁路强制重新解析。
 
-    一次失败解析会走完整音质阶梯（flac→320k→128k 共 3 次调低档调用）。"""
+    一次失败解析会走完整七档阶梯中的四档（flac→320k→192k→128k）。"""
     fake_lx.url_result = None
     r1 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
     r2 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
     assert r1.status_code == 404 and r2.status_code == 404
-    assert len(fake_lx.url_calls) == 3  # 第二次请求负缓存命中，未再走阶梯
+    assert len(fake_lx.url_calls) == 4  # 第二次请求负缓存命中，未再走阶梯
 
     r3 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless&fresh=1")
     assert r3.status_code == 404
-    assert len(fake_lx.url_calls) == 6  # fresh 旁路负缓存，重新走一遍阶梯
+    assert len(fake_lx.url_calls) == 8  # fresh 旁路负缓存，重新走一遍阶梯
 
     # 音源恢复后 fresh 重取成功并覆盖负缓存，后续请求恢复命中
     fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
@@ -1523,7 +1523,7 @@ def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_ca
         assert r5.status_code == 200
     finally:
         lxapp.app.state.client = orig_client
-    assert len(fake_lx.url_calls) == 7  # 成功解析在首档即命中，仅 +1
+    assert len(fake_lx.url_calls) == 9  # 成功解析在首档即命中，仅 +1
 
 
 def _ua_gated_cdn_handler(request: httpx.Request) -> httpx.Response:
@@ -1574,28 +1574,29 @@ async def test_track_url_refresh_backfills_ua(fake_lx, fresh_url_cache):
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_scoped_per_platform(fake_lx, fresh_url_cache):
-    """平台级熔断：tx 连续失败只熔断 tx，kw 解析不受牵连。
+    """脚本+平台级熔断：tx 上的脚本连续失败只熔断该脚本/tx，kw 解析不受牵连。
 
     2026-10-10 回归：全局 user_source 熔断下 tx/mg 第三方源故障（tx 只产出加密
     mflac、mg 后端全挂）连累 kw/kg/wy 全平台 404，表现为"几乎所有洛雪曲目不可播"。"""
     probe_client = mock_client(_flac_probe_handler)
     fake_lx.url_result = None
+    fake_lx.sources[0]["supportedSources"] = ["kw", "kg", "wy", "tx"]
     try:
-        # 3 首不同 tx 曲目各失败一次（同曲会命中失败负缓存不再打音源）→ 触发 tx 平台熔断
+        # 3 首不同 tx 曲目各失败一次（同曲会命中失败负缓存不再打音源）→ 触发该脚本 tx 熔断
         for i, songmid in enumerate(["001abc", "002def", "003ghi"]):
             r = await lxapp._resolve_url_cached(
                 probe_client, "tx", {"id": f"lx:tx:{songmid}", "lx_source": "tx"}, "lossless", 20.0)
             assert r is None
         tx_calls = len(fake_lx.url_calls)
-        assert tx_calls == 9  # 3 次解析 × 完整音质阶梯 3 档
+        assert tx_calls == 12  # 3 次解析 × 七档阶梯中的四档（flac/320k/192k/128k）
 
-        # 第 4 首 tx 曲目被平台熔断直接跳过：不再消耗音源调用
+        # 第 4 首 tx 曲目被该脚本+平台熔断直接跳过：不再消耗音源调用
         r4 = await lxapp._resolve_url_cached(
             probe_client, "tx", {"id": "lx:tx:004jkl", "lx_source": "tx"}, "lossless", 20.0)
         assert r4 is None
         assert len(fake_lx.url_calls) == tx_calls
 
-        # kw 不受 tx 熔断影响，正常解析成功
+        # kw 是不同平台、不同熔断键，不受 tx 脚本熔断影响，正常解析成功
         fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
         rw = await lxapp._resolve_url_cached(
             probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
@@ -1608,8 +1609,14 @@ async def test_circuit_breaker_scoped_per_platform(fake_lx, fresh_url_cache):
 
 @pytest.mark.asyncio
 async def test_probe_reject_rotates_to_next_source(fake_lx, fresh_url_cache):
-    """同档直链探活失败：excludeApiSources 排除产出坏链的脚本换下一个激活源重试。"""
+    """同档直链探活失败：excludeApiSources 排除当前脚本后换下一个就绪脚本重试。"""
     probe_client = mock_client(_flac_probe_handler)
+    fake_lx.sources = [
+        {"id": "bad.js", "name": "坏链源", "enabled": True, "status": "success",
+         "supportedSources": ["kw"]},
+        {"id": "good.js", "name": "好链源", "enabled": True, "status": "success",
+         "supportedSources": ["kw"]},
+    ]
     fake_lx.url_script = [
         {"url": "https://media.test/dead.flac", "type": "flac",
          "sourceName": "坏链源", "sourceId": "bad.js", "hasMoreSources": True},
@@ -1620,8 +1627,8 @@ async def test_probe_reject_rotates_to_next_source(fake_lx, fresh_url_cache):
         r = await lxapp._resolve_url_cached(
             probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
         assert r and r["url"] == "https://media.test/song.flac"
-        # 第 2 次调用排除了第 1 个产出坏链的脚本（name 与 id 都传，lxserver 按二者过滤）
-        assert fake_lx.url_excludes == [None, ["bad.js", "坏链源"]]
+        # 每次请求都排除其他脚本的稳定 ID，把上游自动切换固定到当前脚本
+        assert fake_lx.url_excludes == [["good.js"], ["bad.js"]]
     finally:
         await probe_client.aclose()
         fake_lx.url_script.clear()
@@ -1652,6 +1659,12 @@ async def test_probe_reject_no_more_sources_falls_to_next_tier(fake_lx, fresh_ur
 async def test_empty_url_response_rotates_to_next_source(fake_lx, fresh_url_cache):
     """脚本"成功"却拿不出直链（200 无 url，如平台未激活的静默空返回）：同档换源重试。"""
     probe_client = mock_client(_flac_probe_handler)
+    fake_lx.sources = [
+        {"id": "empty.js", "name": "空手源", "enabled": True, "status": "success",
+         "supportedSources": ["kg"]},
+        {"id": "good.js", "name": "好链源", "enabled": True, "status": "success",
+         "supportedSources": ["kg"]},
+    ]
     fake_lx.url_script = [
         {"type": "flac", "sourceName": "空手源", "sourceId": "empty.js", "hasMoreSources": True},
         {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "好链源"},
@@ -1660,7 +1673,7 @@ async def test_empty_url_response_rotates_to_next_source(fake_lx, fresh_url_cach
         r = await lxapp._resolve_url_cached(
             probe_client, "kg", {"id": "lx:kg:abc123", "lx_source": "kg"}, "lossless", 20.0)
         assert r and r["url"] == "https://media.test/song.flac"
-        assert fake_lx.url_excludes == [None, ["empty.js", "空手源"]]
+        assert fake_lx.url_excludes == [["good.js"], ["empty.js"]]
     finally:
         await probe_client.aclose()
         fake_lx.url_script.clear()

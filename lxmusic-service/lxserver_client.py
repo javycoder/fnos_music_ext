@@ -824,6 +824,26 @@ class LxServerClient:
         data = self._parse_admin_resp(resp, f"删除自定义源 {source_id}")
         return bool(data.get("success", True))
 
+    @serialize_source_operation
+    async def reorder_custom_sources(self, source_ids: list[str]) -> dict:
+        """调整激活脚本顺序（lxserver v2.1.2 原生端点）。
+
+        上游契约：POST /api/custom-source/reorder，JSON 键为 sourceIds，沿用
+        x-frontend-auth 管理认证；只改顺序，不改任何脚本的全局 enabled 状态。
+        管理锁与 app 层共用同一 task 可重入锁域，排序请求之间不会交错。
+        """
+        ids = [str(item).strip() for item in (source_ids or []) if str(item).strip()]
+        client = await self.get_client()
+        resp = await client.post(
+            "/api/custom-source/reorder",
+            json={"sourceIds": ids},
+            timeout=self.timeout,
+        )
+        # 上游若以 202/204 表示已接受/已生效（无响应体），不能按失败处理。
+        if resp.status_code in (202, 204):
+            return {"success": True}
+        return self._parse_admin_resp(resp, "调整自定义源顺序")
+
     @staticmethod
     def _parse_admin_resp(resp: httpx.Response, action: str) -> dict:
         """lxserver 管理端点约定：HTTP 200 + {success: true} 才算成功，
