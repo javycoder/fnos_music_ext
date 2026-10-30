@@ -144,16 +144,19 @@ def _produced_count(directory: str) -> int:
         return 0
 
 
-def _usable_cache(directory: str) -> dict | None:
+def _usable_cache(directory: str, expected_bitrate: str | None = None) -> dict | None:
     """磁盘上已完整（done + init 存在 + 分片覆盖声明清单）的转码缓存，返回 state。
 
     分片数不足的 done 目录一律拒用：历史版本把半途断流的半成品转正成
     "完整"缓存（issue #50：播一半分片 404 跳歌），此校验让带毒缓存自愈。
+    若指定 expected_bitrate，比特率不匹配的缓存不得混用。
     """
     state = _read_state(directory)
     if state.get("status") != "done":
         return None
     if not os.path.isfile(os.path.join(directory, INIT_NAME)):
+        return None
+    if expected_bitrate is not None and str(state.get("bitrate") or "").strip() != str(expected_bitrate).strip():
         return None
     try:
         declared = int(state.get("declared_count") or 1)
@@ -317,7 +320,7 @@ async def ensure_session(
 
     if alive and alive.watcher and not alive.watcher.done():
         await asyncio.shield(alive.watcher)
-    state = _usable_cache(directory)
+    state = _usable_cache(directory, expected_bitrate=bitrate)
     if state and source_fingerprint is not None and state.get("source_fingerprint") != source_fingerprint:
         state = None
     if state:

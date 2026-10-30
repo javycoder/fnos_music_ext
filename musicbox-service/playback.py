@@ -93,20 +93,55 @@ def _rows(payload) -> list:
     return rows
 
 
+_STANDARD_LEVELS = {
+    "standard": "standard", "higher": "higher", "exhigh": "exhigh",
+    "lossless": "lossless", "hires": "hires", "jymaster": "jymaster", "sky": "sky",
+}
+_STANDARD_ENCODE_TYPES = {
+    "standard": "mp3", "higher": "mp3", "exhigh": "mp3",
+    "lossless": "flac", "hires": "flac", "jymaster": "flac", "sky": "flac",
+}
+
+
+def _safe_level_and_encode_type(quality: str) -> tuple[str, str]:
+    """验证真实 NEMbox helper 能力；未知档位（特别是 sky）绝不能被静默改低。"""
+    clean_q = str(quality or "").strip().lower()
+    level = None
+    try:
+        from NEMbox.api import music_quality_to_level
+        cand_level = music_quality_to_level(clean_q)
+        # 若 NEMbox helper 不认识 sky 并将其静默改低，则纠正为 sky
+        if clean_q == "sky" and cand_level != "sky":
+            level = "sky"
+        else:
+            level = cand_level or _STANDARD_LEVELS.get(clean_q, clean_q)
+    except Exception:
+        level = _STANDARD_LEVELS.get(clean_q, clean_q)
+
+    try:
+        from NEMbox.api import level_to_encode_type
+        cand_encode = level_to_encode_type(level)
+        encode_type = cand_encode or _STANDARD_ENCODE_TYPES.get(level, "mp3")
+    except Exception:
+        encode_type = _STANDARD_ENCODE_TYPES.get(level, "mp3")
+
+    return str(level), str(encode_type)
+
+
 async def _request(song_id: int, quality: str, generation: int) -> dict:
     try:
         from NEMbox.api import (
             BASE_URL, EAPI_BASE_URL, eapi_encrypt, eapi_response_decrypt,
-            encrypted_request, level_to_encode_type, music_quality_to_level,
+            encrypted_request,
         )
     except ImportError as exc:
         raise CapabilityError("NEMbox playback protocol unavailable") from exc
     header_cookie, headers, cookies = await asyncio.to_thread(_snapshot, generation)
-    level = music_quality_to_level(quality)
+    level, encode_type = _safe_level_and_encode_type(quality)
     api_path = "/api/song/enhance/player/url/v1"
     payload = {
         "ids": json.dumps([song_id], separators=(",", ":")),
-        "level": level, "encodeType": level_to_encode_type(level),
+        "level": level, "encodeType": encode_type,
         "e_r": True, "header": header_cookie,
     }
     eapi_headers = {
@@ -130,19 +165,24 @@ async def _request(song_id: int, quality: str, generation: int) -> dict:
         except ValueError:
             data = eapi_response_decrypt(response.content.hex().upper())
         rows = _rows(data)
-        if not rows:
-            bitrate = {"standard": 128000, "higher": 192000, "exhigh": 320000,
-                       "lossless": 999000, "hires": 999000, "jymaster": 999000}[level]
-            csrf = header_cookie.get("__csrf", "")
-            fallback_headers = {key: value for key, value in headers.items() if key.lower() != "host"}
-            response = await client.post(
-                f"{BASE_URL}/weapi/song/enhance/player/url",
-                data=encrypted_request({"ids": [song_id], "br": bitrate, "csrf_token": csrf}),
-                headers=fallback_headers,
-            )
-            response.raise_for_status()
-            response_cookies.update(response.cookies)
-            rows = _rows(response.json())
+        # 尊重账号权益与源能力限制：sky 与 jymaster 没有对应 weapi 码率，绝不走旧 weapi 伪造高档
+        if not rows and level not in ("sky", "jymaster"):
+            bitrate_map = {
+                "standard": 128000, "higher": 192000, "exhigh": 320000,
+                "lossless": 999000, "hires": 999000,
+            }
+            bitrate = bitrate_map.get(level)
+            if bitrate:
+                csrf = header_cookie.get("__csrf", "")
+                fallback_headers = {key: value for key, value in headers.items() if key.lower() != "host"}
+                response = await client.post(
+                    f"{BASE_URL}/weapi/song/enhance/player/url",
+                    data=encrypted_request({"ids": [song_id], "br": bitrate, "csrf_token": csrf}),
+                    headers=fallback_headers,
+                )
+                response.raise_for_status()
+                response_cookies.update(response.cookies)
+                rows = _rows(response.json())
         # 只合并响应更新；请求快照里的旧 cookie 不得覆盖 CLI 刚写入的登录态。
         if response_cookies:
             await asyncio.to_thread(_merge_cookies, generation, response_cookies)

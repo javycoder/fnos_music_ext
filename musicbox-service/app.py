@@ -50,7 +50,8 @@ except Exception:  # noqa: BLE001  无 proxy/ 上下文（如独立调试）时�
 ensure_xdg_dirs()
 
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
-QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
+# 统一官方七档支持：standard, higher, exhigh, lossless, hires, jymaster, sky
+QUALITY_WHITELIST = {"standard", "higher", "exhigh", "lossless", "hires", "jymaster", "sky"}
 
 
 class UpstreamException(Exception):

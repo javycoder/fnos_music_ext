@@ -54,6 +54,7 @@ try:
     from . import nmplaylists as nmpl
     from . import publicplaylists as pubpl
     from . import transcode as tc
+    from . import quality_policy as qp
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic
     from .fnlog import diag as fn_diag
@@ -70,6 +71,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import nmplaylists as nmpl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
+    import quality_policy as qp  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic  # type: ignore
     from fnlog import diag as fn_diag  # type: ignore
@@ -252,6 +254,9 @@ CONF = {
     "llm_liked_enabled": os.environ.get("FNMUSIC_LLM_LIKED_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "liked_refresh_hours": _safe_liked_number(os.environ.get("FNMUSIC_LIKED_REFRESH_HOURS", "0.5"), 0.5),
     "liked_size": _safe_liked_number(os.environ.get("FNMUSIC_LIKED_SIZE", "20"), 20, integer=True),
+    # 统一官方七档播放与下载配置；未显式设置时为 None，由兼容策略从旧配置计算首档
+    "play_quality": os.environ.get("FNMUSIC_PLAY_QUALITY") or None,
+    "download_quality": os.environ.get("FNMUSIC_DOWNLOAD_QUALITY") or None,
     # v2.0.0：音质模式 high|balanced|smooth（档序见 quality_order，只影响在线取源）；
     # 推荐双开关 / 封面补全 / .env 热重载默认开，均可被 .env 覆盖
     "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
@@ -597,6 +602,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "LX_PROBE_TIMEOUT": ("lx_probe_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
+    "FNMUSIC_PLAY_QUALITY": ("play_quality", "play_quality"),
+    "FNMUSIC_DOWNLOAD_QUALITY": ("download_quality", "download_quality"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
     "FNMUSIC_NETEASE_QUALITY": ("netease_quality", "netease_quality"),
     "FNMUSIC_DL_QUALITY": ("dl_quality", "dl_quality"),
@@ -697,6 +704,19 @@ def _env_watch_parse(raw: str, kind: str):
         try:
             return max(1, min(100, int(raw)))
         except (TypeError, ValueError):
+            return None
+    if kind == "play_quality":
+        try:
+            return qp.normalize_quality(raw, default=None)
+        except ValueError:
+            return None
+    if kind == "download_quality":
+        raw_clean = raw.lower()
+        if raw_clean == "app":
+            return "app"
+        try:
+            return qp.normalize_quality(raw, default=None)
+        except ValueError:
             return None
     if kind == "quality_mode":
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
@@ -854,7 +874,7 @@ def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         # 落盘方式/目标目录/缓存目录任一变化，此前的 staged 判定全部作废，
         # 不清空的话旧判定会一直复用到重启
         _TEE_STAGED_CACHE.clear()
-    if set(changed) & {"quality_mode", "netease_quality"}:
+    if set(changed) & {"quality_mode", "netease_quality", "play_quality"}:
         _sync_netease_quality()
     if set(changed) & _LX_CONFIG_KEYS:
         _sync_lx_config_epoch()
@@ -865,7 +885,7 @@ def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         _LX_FRESH_COOLDOWN.clear()
     for provider, conf_name in _DIRECT_PLAY_CONF_KEYS.items():
         if conf_name in changed or set(changed) & (
-                _SOURCE_CONF_KEYS | {"quality_mode", "netease_quality", "lx_quality", "netease_playlist_resident"}):
+                _SOURCE_CONF_KEYS | {"quality_mode", "netease_quality", "lx_quality", "play_quality", "netease_playlist_resident"}):
             _DIRECT_PLAY_GENERATIONS[provider] += 1
             _DIRECT_TARGET_BINDINGS.invalidate_source(provider, _DIRECT_PLAY_GENERATIONS[provider])
     return changed
@@ -893,7 +913,42 @@ def _env_watch_stat(path: "str | None" = None):
 # 音源集合相关的 CONF 键：任一变化意味着推荐缓存里的旧源曲目可能不可播（issue #22）
 # issue #75：洛雪解析身份相关配置（音质/音源/开关）。任一变化都让在途解析与钉链
 # 失效，避免旧音质配置的解析结果写回新配置下的首播。
-_LX_CONFIG_KEYS = {"lx_enabled", "lx_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"}
+_LX_CONFIG_KEYS = {"lx_enabled", "lx_quality", "play_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"}
+
+
+def effective_play_quality_conf() -> str:
+    """当前生效的播放档位：优先新配置；未配置时从旧 CONF 动态计算首档兼容。"""
+    explicit = CONF.get("play_quality")
+    if explicit:
+        try:
+            return qp.normalize_quality(explicit)
+        except ValueError:
+            pass
+    values = {
+        "FNMUSIC_PLAY_QUALITY": CONF.get("play_quality") or "",
+        "FNMUSIC_QUALITY_MODE": CONF.get("quality_mode") or "high",
+        "FNMUSIC_LX_ENABLED": "1" if CONF.get("lx_enabled") else "0",
+        "FNMUSIC_LX_QUALITY": CONF.get("lx_quality") or "lossless",
+        "FNMUSIC_NETEASE_QUALITY": CONF.get("netease_quality") or "lossless",
+    }
+    return qp.effective_play_quality(values)
+
+
+def effective_download_quality_conf() -> str:
+    """当前生效的下载档位：优先新配置；未配置时旧 standard 迁移为 exhigh (320k)。"""
+    explicit = CONF.get("download_quality")
+    if explicit:
+        if str(explicit).strip().lower() == "app":
+            return "app"
+        try:
+            return qp.normalize_quality(explicit)
+        except ValueError:
+            pass
+    values = {
+        "FNMUSIC_DOWNLOAD_QUALITY": CONF.get("download_quality") or "",
+        "FNMUSIC_DL_QUALITY": CONF.get("dl_quality") or "app",
+    }
+    return qp.effective_download_quality(values)
 _SOURCE_CONF_KEYS = {
     "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
     "lx_source_url", "lx_source_list",
@@ -3295,8 +3350,8 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
         return None
 
 
-# 音质档（从低到高）：网易 = musicbox QUALITY_WHITELIST 全集；
-# lx = 洛雪源脚本三档（128k/320k/flac 对应 standard/high/lossless）
+# 音质档（从低到高）：旧网易 6 档保留仅用于 quality_order 旧兼容；
+# 新统一七档阶梯由 quality_policy 模块维护。
 _NETEASE_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster"]
 _LX_QUALITY_LADDER = ["standard", "high", "lossless"]
 
@@ -3352,17 +3407,29 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                     fn_diag(logger, "lx_pin_hit", guid=key[:80])
                     return dict(pinned)
             _LX_URL_PIN.pop(key, None)
-    primary = str(CONF.get("lx_quality") or "lossless").strip()
-    ladder = _LX_QUALITY_LADDER
-    if max_quality in ("high", "standard", "mp3"):
-        ladder = [q for q in _LX_QUALITY_LADDER if q not in ("lossless", "flac")]
-        if primary in ("lossless", "flac") or not primary:
-            primary = "high" if max_quality != "standard" else "standard"
-        if max_quality == "standard":
-            ladder = [q for q in ladder if q != "high"]
-    qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities and primary in ladder:
-        qualities.insert(0, primary)
+    # 显式新七档配置生效时：LX 代理只传一次目标档，由 B 组服务统一向下降档而非 proxy 双重循环
+    if CONF.get("play_quality"):
+        eff_q = effective_play_quality_conf()
+        if max_quality in ("high", "standard", "mp3"):
+            lossless_tiers = {"lossless", "hires", "jymaster", "sky"}
+            if eff_q in lossless_tiers or not eff_q:
+                eff_q = "standard" if max_quality == "standard" else "exhigh"
+            elif max_quality == "standard" and eff_q in ("higher", "exhigh"):
+                eff_q = "standard"
+        target_lx_q = qp.to_lx_quality(eff_q)
+        qualities = [target_lx_q]
+    else:
+        primary = str(CONF.get("lx_quality") or "lossless").strip()
+        ladder = _LX_QUALITY_LADDER
+        if max_quality in ("high", "standard", "mp3"):
+            ladder = [q for q in _LX_QUALITY_LADDER if q not in ("lossless", "flac")]
+            if primary in ("lossless", "flac") or not primary:
+                primary = "high" if max_quality != "standard" else "standard"
+            if max_quality == "standard":
+                ladder = [q for q in ladder if q != "high"]
+        qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
+        if primary and primary not in qualities and primary in ladder:
+            qualities.insert(0, primary)
 
     extra: dict[str, str] = {}
     if meta:
@@ -3441,7 +3508,7 @@ def _cancel_lx_resolutions() -> list[asyncio.Task]:
 def _sync_lx_config_epoch() -> None:
     global _LX_CONFIG_SIG, _LX_RESOLVE_EPOCH
     signature = tuple(str(CONF.get(key)) for key in (
-        "lx_enabled", "lx_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"))
+        "lx_enabled", "lx_quality", "play_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"))
     if signature == _LX_CONFIG_SIG:
         return
     previous, _LX_CONFIG_SIG = _LX_CONFIG_SIG, signature
@@ -3458,7 +3525,8 @@ async def resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: 
     _sync_lx_config_epoch()
     loop = asyncio.get_running_loop()
     epoch = _LX_RESOLVE_EPOCH
-    key = (loop, str(song_id), max_quality or "", epoch, bool(fresh))
+    eff_q = str(CONF.get("play_quality") or "")
+    key = (loop, str(song_id), max_quality or "", eff_q, epoch, bool(fresh))
     task = _LX_URL_INFLIGHT.get(key)
     if task is None or task.done():
         if sum(not task.done() for task in _LX_URL_INFLIGHT.values()) >= 16:
@@ -3852,17 +3920,28 @@ def _prefetch_netease(request: Request, guid: str) -> None:
 async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str, fresh: bool,
                                         max_quality: str | None = None) -> str | None:
     key = str(song_id)
-    primary = str(CONF.get("netease_quality") or "lossless").strip()
-    ladder = _NETEASE_QUALITY_LADDER
-    if max_quality in ("exhigh", "higher", "standard", "mp3"):
-        ladder = [q for q in _NETEASE_QUALITY_LADDER if q not in ("lossless", "hires", "jymaster")]
-        if primary in ("lossless", "hires", "jymaster") or not primary:
-            primary = "exhigh"
-    qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities and primary in ladder:
-        qualities.insert(0, primary)
+    # 若显式配置了 play_quality，优先使用七档降级阶梯；未显式配置时保留旧兼容模式
+    if CONF.get("play_quality"):
+        eff = effective_play_quality_conf()
+        candidates = qp.quality_ladder(eff)
+        if max_quality in ("exhigh", "higher", "standard", "mp3"):
+            lossless_tiers = {"lossless", "hires", "jymaster", "sky"}
+            candidates = [q for q in candidates if q not in lossless_tiers]
+        qualities = candidates
+    else:
+        primary = str(CONF.get("netease_quality") or "lossless").strip()
+        ladder = _NETEASE_QUALITY_LADDER
+        if max_quality in ("exhigh", "higher", "standard", "mp3"):
+            ladder = [q for q in _NETEASE_QUALITY_LADDER if q not in ("lossless", "hires", "jymaster", "sky")]
+            if primary in ("lossless", "hires", "jymaster", "sky") or not primary:
+                primary = "exhigh"
+        qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
+        if primary and primary not in qualities and primary in ladder:
+            qualities.insert(0, primary)
 
     mode = CONF.get("quality_mode")
+    primary = str(CONF.get("netease_quality") or "lossless").strip()
+    configured_play_q = CONF.get("play_quality")
     for q in qualities:
         started = time.monotonic()
         try:
@@ -3891,7 +3970,10 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                             url = str(url)
                             if not url.startswith(("http://", "https://")):
                                 return None
-                            if (str(CONF.get("netease_quality") or "lossless").strip(), CONF.get("quality_mode")) != (primary, mode):
+                            if configured_play_q is not None:
+                                if CONF.get("play_quality") != configured_play_q:
+                                    return None
+                            elif (str(CONF.get("netease_quality") or "lossless").strip(), CONF.get("quality_mode")) != (primary, mode):
                                 return None
                             # TTL 以服务端 expi（秒）为准，预留 60s 网络余量；上限 30min，
                             # 无 expi 时保守 5min。失败重解析由调用方 refresh=True 触发。
@@ -8671,8 +8753,9 @@ _DL_TASK_TTL_S = 3600.0
 _DL_TRANSCODE_SUBDIR = "dltrans"
 
 
-def _dl_transcode_path(guid: str) -> str:
-    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.mp3")
+def _dl_transcode_path(guid: str, quality: str = "exhigh", ext: str = "mp3") -> str:
+    safe_q = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(quality or "exhigh"))
+    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.{safe_q}.{ext}")
 
 
 # App 请求词命中才算显式要"标准"档（MP3 320k）；其余一律按原始档交付
@@ -8680,21 +8763,29 @@ _DL_STANDARD_WORDS = ("standard", "std", "mp3", "标准")
 
 
 def _dl_effective_quality(raw_quality: str, is_original: bool) -> str:
-    """下载交付档位：original=原文件，standard=MP3 320k。
-
-    2.6.3-2.7.0 的词表只认 ("original","standard") 且缺省=standard，App 无损
-    偏好下发的 quality 值落到缺省，FLAC 被擅自转成 MP3（用户反馈的下载变
-    MP3）。现缺省跟随 App：standard 词表命中才转码，未知/缺省一律原文件；
-    dl_quality=original|standard 可整体强制覆盖（热重载）。
+    """下载交付档位：
+    - 若全局配置显式指定了具体七档，配置优先；
+    - 兼容旧配置 dl_quality=standard (320k -> exhigh) 与 original (sky)；
+    - 跟随 App 请求策略：
+      * 官方旧协议 standard 对应 320k (exhigh)；
+      * 显式 original / is_original 对应最高可用 (sky)；
+      * 未知/缺省跟随当前生效的播放档；
+      * 新七档按请求档位规范化。
     """
-    mode = str(CONF.get("dl_quality") or "app").strip().lower()
-    if mode in ("original", "standard"):
-        return mode
-    if is_original:
-        return "original"
-    if str(raw_quality or "").strip().lower() in _DL_STANDARD_WORDS:
-        return "standard"
-    return "original"
+    explicit_dl = CONF.get("download_quality")
+    if explicit_dl and str(explicit_dl).strip().lower() != "app":
+        try:
+            return qp.normalize_quality(explicit_dl)
+        except ValueError:
+            pass
+    legacy_mode = str(CONF.get("dl_quality") or "app").strip().lower()
+    if legacy_mode == "original":
+        return "sky"
+    if legacy_mode == "standard":
+        return "exhigh"
+
+    play_q = effective_play_quality_conf()
+    return qp.app_download_quality(raw_quality, is_original, play_q)
 
 
 def _dl_sweep() -> None:
@@ -8741,22 +8832,32 @@ def _dl_state_word(task: dict) -> str:
 
 
 async def _dl_produce(task: dict, cred_headers: dict) -> None:
-    """后台产文件：标准档按官方规格 MP3 320k（源已是 mp3 直接供原文件）；原始档供原文件。"""
+    """后台产文件：下载按目标档位贯穿；低码率不伪造无损，源为 MP3 时直接交付原文件。"""
     guid = task["guid"]
+    target_q = str(task.get("quality") or "exhigh")
     try:
         src = find_cache_file(guid)
+        if src and _is_rolling_cache_stem(src, guid):
+            src = None
         if not src and _source_enabled(guid):
-            # 无本地文件：先走整轨下载管线（带元数据命名/落库，与边听边存同款）
-            await _full_fetch_download(guid, cred_headers)
+            # 无本地曲库文件：按目标档位走后台整轨下载
+            force_mp3 = target_q in ("standard", "higher", "exhigh")
+            await _full_fetch_download(guid, cred_headers, force_mp3=force_mp3)
             src = find_cache_file(guid)
         if not src:
             task["state"] = "failed"
             task["errmsg"] = "online source unavailable"
             return
-        if task.get("quality") == "original" or os.path.splitext(src)[1].lower() == ".mp3":
+        src_ext = os.path.splitext(src)[1].lstrip(".").lower() or "mp3"
+        is_src_lossless = src_ext in _LOSSLESS_EXTS
+
+        # "不要把低码率转 FLAC 伪称无损"：若源已是有损音频，或者目标为无损/最高可用，绝不转码为假 FLAC
+        if not is_src_lossless or target_q in ("lossless", "hires", "jymaster", "sky", "original"):
             task["path"] = src
         else:
-            target = _dl_transcode_path(guid)
+            bitrate_map = {"standard": "128k", "higher": "192k", "exhigh": "320k"}
+            target_bitrate = bitrate_map.get(target_q, str(CONF.get("transcode_dl_bitrate") or "320k"))
+            target = _dl_transcode_path(guid, target_q, "mp3")
             os.makedirs(os.path.dirname(target), exist_ok=True)
             if not os.path.isfile(target):
                 task["state"] = "transcoding"
@@ -8764,7 +8865,7 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
                 proc = await asyncio.create_subprocess_exec(
                     tc.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                     "-i", src, "-vn", "-map_metadata", "-1",
-                    "-c:a", "libmp3lame", "-b:a", str(CONF.get("transcode_dl_bitrate") or "320k"),
+                    "-c:a", "libmp3lame", "-b:a", target_bitrate,
                     "-f", "mp3", target,
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 )
