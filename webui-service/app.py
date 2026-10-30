@@ -1160,16 +1160,166 @@ def _is_admin(headers: dict[str, str]) -> bool:
     return headers.get("x-trim-isadmin", "").lower() == "true"
 
 
+# ---------------------------------------------------------------- 分段健康 --
+# issue #108 现场：supervisor 报告 lxserver/lxmusic 两个进程都 RUNNING，但
+# lxmusic 查询 lxserver 持续 TimeoutError。旧模型只有 reachable=true/false，
+# 把「进程活着但不响应」和「服务正常」混在一起，异常类型也丢掉了。
+# 这里把健康拆成五层，每层单独出结论，异常保留类型：
+#   process 进程层（supervisor 状态）
+#   http    HTTP 层（/healthz 是否应答）
+#   list    源列表层（能否取到音源列表快照）
+#   script  脚本层（自定义源初始化是否成功）
+#   playback 播放层（能否按 Dashlane期望目标档位交付）
+# 分层后 RUNNING + TimeoutError 会落在 http.error_type=timeout 上，排障时不再需要猜。
+HEALTH_HTTP_TIMEOUT = 4.0
+# 进程层失败时不隐瞒 HTTP 层：标记未探活而非复用旧结论。
+_NOT_PROBED = {"ok": False, "error_type": "not_probed", "detail": "进程未运行，未探活"}
+
+
+def _http_error_layer(exc: BaseException) -> "tuple[str, str]":
+    """把 HTTP 异常映射成稳定的错误类型 + 脱敏细节。
+
+    超时、连接失败、协议错误必须分开：#108 的 TimeoutError 不应当和
+    「端口没监听」的 ConnectError 假装成同一回事。
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout", str(exc) or exc.__class__.__name__
+    if isinstance(exc, httpx.ConnectError):
+        return "connect", str(exc) or exc.__class__.__name__
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return "protocol", str(exc) or exc.__class__.__name__
+    if isinstance(exc, httpx.HTTPError):
+        return "http_error", str(exc) or exc.__class__.__name__
+    return type(exc).__name__, str(exc) or exc.__class__.__name__
+
+
+async def _probe_http_layer(request: Request, url: str,
+                            *, timeout: float = HEALTH_HTTP_TIMEOUT) -> dict:
+    """HTTP 就绪层探活：成功与否都返回字典，异常类型保留在 error_type。
+
+    连接阶段单独给较短上限：目标端口没监听时 ConnectError 应当很快返回，
+    不能让整层健康检查卡在默认的 5 秒连接超时上。
+    """
+    client = get_http(request)
+    budget = httpx.Timeout(timeout, connect=min(2.0, timeout))
+    try:
+        resp = await client.get(url, timeout=budget)
+    except Exception as exc:  # noqa: BLE001  # 探活失败即结论，不是异常
+        error_type, detail = _http_error_layer(exc)
+        return {"ok": False, "error_type": error_type,
+                "detail": " ".join(redact(detail).split())[:240]}
+    data = _resp_json(resp)
+    if resp.status_code < 400 and data.get("ok", True):
+        return {"ok": True, "error_type": "", "detail": "", "status_code": resp.status_code,
+                "data": data}
+    detail = str(data.get("error") or f"HTTP {resp.status_code}")
+    return {"ok": False, "error_type": "http_status", "detail": " ".join(redact(detail).split())[:240],
+            "status_code": resp.status_code, "data": data}
+
+
+async def _layered_health(request: Request, provider: str,
+                          health_payload: "dict | None" = None) -> dict:
+    """按 provider 组装五层健康结论；每层失败都不影响其他层出结论。
+
+    health_payload 传入本轮已取到的 /healthz 结论（api_status 循环里已经探过
+    一次），避免同一请求重复探活拖慢状态页。
+    所有探活共用一次总预算：慢初始化时不能让每一层各自耗尽一个超时。
+    """
+    started = time.monotonic()
+    result = {"provider": provider or "none",
+              "process": {"ok": False, "detail": ""},
+              "http": dict(_NOT_PROBED),
+              "list": dict(_NOT_PROBED),
+              "script": dict(_NOT_PROBED),
+              "playback": dict(_NOT_PROBED)}
+    if provider not in PROVIDERS:
+        result["process"]["detail"] = "未启用任何音源"
+        return result
+
+    programs = PROVIDER_PROGRAMS.get(provider, [provider])
+    processes = supervisor_status()
+    states = {prog: processes.get(prog, {}).get("state", "UNKNOWN") for prog in programs}
+    missing = [p for p, s in states.items() if s != "RUNNING"]
+    result["process"]["ok"] = not missing
+    result["process"]["states"] = states
+    result["process"]["detail"] = ("" if not missing else "、".join(f"{p}:{states[p]}" for p in missing))
+    if missing:
+        # 进程层不过，HTTP 层结论无从谈起；保留"未探活"而不是拿上次结果冒充。
+        return result
+
+    if isinstance(health_payload, dict):
+        # 复用本轮已取到的 /healthz 结论（成败都算）：同一请求内不重复探活，
+        # 免得慢初始化把状态接口拖成多倍超时。
+        http_layer = health_payload
+        result["http"] = http_layer
+    else:
+        http_layer = await _probe_http_layer(request, f"{PROVIDER_HEALTH[provider]}/healthz")
+        result["http"] = http_layer
+    if not http_layer["ok"]:
+        return result
+
+    # 源列表层：与健康应答分开看，能否取到音源列表是另一件事。
+    if provider == "lxmusic":
+        list_url = f"{CONF['lx_url']}/api/v1/source"
+    elif provider == "musicbox":
+        list_url = f"{CONF['musicbox_url']}/playlists"
+    else:
+        list_url = f"{CONF['musicdl_url']}/platforms"
+    # 剩余总预算；已耗掉的部分从单次超时里扣，保证整轮探活有界。
+    remaining = HEALTH_HTTP_TIMEOUT - (time.monotonic() - started)
+    if remaining <= 0:
+        result["list"] = {"ok": False, "error_type": "timeout",
+                          "detail": "健康检查总预算耗尽，未完成列表层探活"}
+        result["script"] = {"ok": False, "state": "unknown", "detail": "预算耗尽未取到脚本状态"}
+        result["playback"] = {"ok": False, "detail": "预算耗尽未完成播放就绪判定"}
+        return result
+    list_layer = await _probe_http_layer(request, list_url, timeout=remaining)
+    result["list"] = {"ok": list_layer["ok"], "error_type": list_layer.get("error_type", ""),
+                      "detail": list_layer.get("detail", "")}
+
+    # 脚本/播放层只对洛雪有意义：脚本初始化失败与服务器可达是两件事。
+    if provider == "lxmusic":
+        snapshot = http_layer.get("data", {}).get("user_source")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        state = str(snapshot.get("state") or "unknown")
+        initialized = bool(snapshot.get("initialized"))
+        result["script"] = {
+            "ok": initialized and state == "ready",
+            "state": state,
+            "detail": " ".join(redact(str(snapshot.get("last_error") or "")).split())[:240],
+            "ready_count": int(snapshot.get("ready_count") or 0),
+            "failed_count": int(snapshot.get("failed_count") or 0),
+            "pending_count": int(snapshot.get("pending_count") or 0),
+        }
+        result["playback"] = {
+            "ok": initialized and result["list"]["ok"],
+            "detail": "" if initialized else "自定义源未就绪，无法交付播放链接",
+        }
+    else:
+        result["script"] = {"ok": True, "state": "not_applicable", "detail": ""}
+        result["playback"] = {"ok": result["list"]["ok"],
+                              "detail": "" if result["list"]["ok"] else "音源列表不可用时无法交付播放"}
+    return result
+
+
 @app.get("/api/status")
 async def api_status(request: Request):
     values = read_env()
     provider = current_provider(values)
     processes = supervisor_status()
+    # 整轮 /api/status 的探活总预算：healthz、源列表、分层检查共用，
+    # 慢初始化不至于把状态接口拖成逐级叠加的长等待（#108）。
+    probe_started = time.monotonic()
     services: dict[str, dict] = {}
     lx_snapshot = None
+    # 本轮 /healthz 分段探活结果：services 与分段健康共用一份，避免同请求重复探活
+    # 拖慢状态接口（#108 现场要的是单次结论，不是多轮重试）。
+    lx_probe_result = None
     for name, base in (("musicdl", CONF["musicdl_url"]), ("musicbox", CONF["musicbox_url"]),
                        ("lxmusic", CONF["lx_url"])):
-        if name in PROVIDERS and name != provider:
+        # 只对当前启用的音源探活。按需加载架构下其余音源就是未运行，
+        # 逐个探活既无意义又会让慢初始化把状态接口拖成数倍超时（#108）。
+        if name != provider:
             if name == "musicbox" and _resident_flag(values):
                 # 网易云歌单常驻：musicbox 非当前音源但应常驻运行，照常探活
                 ok, data = await _fetch_json(request, f"{base}/healthz")
@@ -1178,20 +1328,35 @@ async def api_status(request: Request):
                 continue
             services[name] = {"reachable": False, "note": "未启用（按需未启动）"}
             continue
-        ok, data = await _fetch_json(request, f"{base}/healthz")
-        services[name] = {"reachable": ok, "detail": data if ok else data.get("error", "")}
-        if name == "lxmusic" and isinstance(data.get("user_source"), dict):
-            lx_snapshot = data["user_source"]
+        probe = await _probe_http_layer(
+            request, f"{base}/healthz",
+            timeout=max(0.5, HEALTH_HTTP_TIMEOUT - (time.monotonic() - probe_started)))
+        data = probe.get("data", {}) if isinstance(probe.get("data"), dict) else {}
+        ok = probe["ok"]
+        services[name] = {"reachable": ok,
+                          "detail": data if ok else probe.get("detail", "")}
+        if name == "lxmusic":
+            lx_probe_result = probe
+            if isinstance(data.get("user_source"), dict):
+                lx_snapshot = data["user_source"]
     lx_source = None
     if provider == "lxmusic":
         # healthz 已带同轮源快照时直接复用，避免再次 query 产生重复负载或状态竞态。
         if lx_snapshot is not None:
             lx_source = _lx_source_snapshot(lx_snapshot)
         else:
-            ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source")
-            snapshot = data.get("data") if isinstance(data.get("data"), dict) else {}
-            lx_source = _lx_source_snapshot(snapshot, unavailable=not ok,
-                                             error=data.get("error", "unreachable") if not ok else "")
+            # 剩余总预算：列表层不能越过本轮 health 检查的 deadline。
+            spent = time.monotonic() - probe_started
+            remaining = HEALTH_HTTP_TIMEOUT - spent
+            if remaining <= 0:
+                lx_source = _lx_source_snapshot({}, unavailable=True,
+                                                error="健康检查总预算耗尽")
+            else:
+                ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source",
+                                             timeout=remaining)
+                snapshot = data.get("data") if isinstance(data.get("data"), dict) else {}
+                lx_source = _lx_source_snapshot(snapshot, unavailable=not ok,
+                                                error=data.get("error", "unreachable") if not ok else "")
     return {
         "ok": True,
         "version": _read_version(),
@@ -1202,6 +1367,10 @@ async def api_status(request: Request):
         "previews": {p: round(preview_seconds_left(p)) for p in list(_preview_until)},
         "services": services,
         "lx_source": lx_source,
+        # 分段健康：进程/HTTP/列表/脚本/播放五层，各层独立结论。
+        # lxmusic 的 /healthz 本轮已取到，直接复用避免重复探活拖慢状态接口。
+        "health": await _layered_health(
+            request, provider, health_payload=lx_probe_result),
     }
 
 
@@ -1963,6 +2132,51 @@ def _log_files_info() -> "list[dict]":
     ]
 
 
+def _archive_text(raw: bytes) -> bytes:
+    """日志正文入包前脱敏。
+
+    返环场景：lxserver 与宿主安装日志常带 token/Authorization/cookie 原文，
+    把这些原样打进用户下载的包等于泄露凭据；这里统一走 fnlog.redact()。
+    解码失败（非 UTF-8 二进制日志）时保留原字节，不做部分解码猜测。
+    """
+    try:
+        return redact(raw.decode("utf-8", errors="replace")).encode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001  # 脱敏失败不得阻断排障导出
+        return raw
+
+
+def _redact_chunk(raw: bytes) -> bytes:
+    """日志正文入包前脱敏。
+
+    背景：lxserver 与宿主安装日志常带 token/Authorization/cookie 原文，
+    把这些原样打进用户下载的包等于泄露凭据；统一走 fnlog.redact()。
+    非 UTF-8 字节原样保留，不做部分解码猜测。
+    """
+    try:
+        return redact(raw.decode("utf-8", errors="replace")).encode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001  # 脱敏失败不得阻断排障导出
+        return raw
+
+
+def _copy_redacted(source, member) -> None:
+    """按行脱敏后写入 zip 成员，避免把整个日志文件读进内存。
+
+    行首Analysis遇到超长行（无换行）时按 64KB 分块处理，既不会丢内容，
+    也不会因为一次解码超大字符串拖慢打包。
+    """
+    buffer = b""
+    while True:
+        chunk = source.read(65536)
+        if not chunk:
+            break
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            member.write(_redact_chunk(line) + b"\n")
+    if buffer:
+        member.write(_redact_chunk(buffer))
+
+
 def _write_log_archive(directory: Path, target: Path) -> None:
     """在线程池中执行日志读取、压缩与环境探测。"""
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1976,13 +2190,15 @@ def _write_log_archive(directory: Path, target: Path) -> None:
                     if (not stat.S_ISREG(opened.st_mode)
                             or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)):
                         continue
+                    # issue #108：逐行脱敏后写入，避免一次性读入整个大日志文件。
                     with zf.open(item.name, "w") as member:
-                        shutil.copyfileobj(source, member)
+                        _copy_redacted(source, member)
             except OSError:
                 continue
         snapshot = "\n".join(env_snapshot_lines(
             "container" if Path("/.dockerenv").exists() else "host"))
-        zf.writestr("export_env_snapshot.txt", snapshot + "\n")
+        # 环境快照同样过一遍脱敏：它可能包含config摘要里遗漏的秘密值。
+        zf.writestr("export_env_snapshot.txt", redact(snapshot) + "\n")
 
 
 class _LogExportResponse(FileResponse):

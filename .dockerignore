@@ -18,6 +18,8 @@ proxy/*
 !proxy/version.py
 !proxy/llm_usage.py
 !proxy/media_url.py
+# A 组（主智能体）共享七档音质策略，逐團隊并行合入期间先放行
+!proxy/quality_policy.py
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/

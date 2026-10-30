@@ -32,12 +32,18 @@ def test_supervisord_programs_all_autostart_false(supervisord_conf):
     for section in programs:
         assert supervisord_conf.get(section, "autostart") == "false"
         assert supervisord_conf.get(section, "autorestart") == "true"
-        # 日志汇到容器 stdout，组内进程一起停，避免 uvicorn 子进程残留
-        assert supervisord_conf.get(section, "stdout_logfile") == "/dev/stdout"
-        assert supervisord_conf.get(section, "stdout_logfile_maxbytes") == "0"
-        assert supervisord_conf.get(section, "redirect_stderr") == "true"
+        # 组内进程一起停，避免 uvicorn 子进程残留
         assert supervisord_conf.get(section, "stopasgroup") == "true"
         assert supervisord_conf.get(section, "killasgroup") == "true"
+        assert supervisord_conf.get(section, "redirect_stderr") == "true"
+        # 日志默认汇到容器 stdout（docker logs 聚合）。lxserver 是唯一例外：
+        # issue #108 已证实 stdout 单向管道读不回来，管理页导出拿不到它的运行
+        # 日志，因此改为落盘到共享日志根，详见 test_lxserver_logging.py。
+        if section == "program:lxserver":
+            assert supervisord_conf.get(section, "stdout_logfile").startswith("/repo/logs/")
+            continue
+        assert supervisord_conf.get(section, "stdout_logfile") == "/dev/stdout"
+        assert supervisord_conf.get(section, "stdout_logfile_maxbytes") == "0"
 
 
 def test_supervisord_ports_and_directories(supervisord_conf):

@@ -80,6 +80,34 @@ start_prog() {
     fi
 }
 
+# 有界就绪等待：慢初始化（脚本首次加载、依赖下载）只是耗时长，不是故障，
+# 因此这里只等、不重启进程、不停进程、不动用户音源；等不到就把结论写进
+# 容器日志供导出。默认 0 秒（关闭）：容器按需启动要快速返回，就绪状态由
+# healthcheck 的进程层 + HTTP 层两层检查持续反映，不需要入口阻塞。
+# 需要等链路就绪的场景（例如 NAS 慢盘首次初始化）可显式设置该环境变量。
+LXMUSIC_HEALTH_URL="${LXMUSIC_HEALTH_URL:-http://127.0.0.1:8003/healthz}"
+LX_READY_WAIT="${LX_READY_WAIT:-0}"
+wait_ready() {
+    _prog="$1"
+    _url="$2"
+    _remaining="$LX_READY_WAIT"
+    case "$_remaining" in
+        ''|*[!0-9]*) log "WARN: LX_READY_WAIT 非数字（$_remaining），跳过就绪等待"; return 0 ;;
+    esac
+    [ "$_remaining" -gt 0 ] || return 0
+    _end=$(( $(date +%s) + _remaining ))
+    while [ "$(date +%s)" -lt "$_end" ]; do
+        _code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$_url" 2>/dev/null)"
+        case "$_code" in
+            2??) log "$_prog 已就绪（HTTP $_code）"; return 0 ;;
+        esac
+        sleep 2
+    done
+    log "WARN: $_prog 在 ${LX_READY_WAIT}s 内未通过 HTTP 就绪检查"
+    log "WARN: 进程保持不变（不重启、不停用），用户音源不清空；状态由 healthcheck 反映"
+    return 1
+}
+
 # 三选一音源：只启动 .env 选中的那个（多开视为异常，全部忽略只取第一个命中）
 if [ "$(env_flag FNMUSIC_MUSICDL_ENABLED)" = "true" ]; then
     start_prog musicdl
@@ -88,6 +116,8 @@ elif [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" = "true" ]; then
 elif [ "$(env_flag FNMUSIC_LX_ENABLED)" = "true" ]; then
     start_prog lxserver
     start_prog lxmusic
+    # 有界等待整条链路就绪；失败只记录，不停进程也不清空用户音源。
+    wait_ready lxmusic "$LXMUSIC_HEALTH_URL" || true
 else
     log "未配置任何音源（FNMUSIC_MUSICDL_ENABLED/FNMUSIC_NETEASE_ENABLED/FNMUSIC_LX_ENABLED 均未启用）"
 fi

@@ -59,11 +59,17 @@ command="@NODE@" index.js
 autostart=false
 autorestart=true
 startretries=5
+startsecs=3
+stopwaitsecs=10
 stopsignal=TERM
 stopasgroup=true
 killasgroup=true
-stdout_logfile=@RUN@/lxserver.log
-stdout_logfile_maxbytes=0
+; #108：日志必须落在 webui 导出扫描的同一个日志根（@REPO@/logs，与
+; fnlog.log_dir() 的「仓库/logs」一致）；此前写在 @RUN@（sources-native/），
+; 导出包里永远缺 lxserver 记录。有界滚动避免占满宿主磁盘。
+stdout_logfile=@REPO@/logs/lxserver.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
 redirect_stderr=true
 environment=DATA_PATH="@DATA@/lxserver",CONFIG_PATH="@DATA@/lxserver/config.js",PORT="8005",BIND_IP="127.0.0.1"
 

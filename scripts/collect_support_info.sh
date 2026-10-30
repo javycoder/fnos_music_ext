@@ -56,6 +56,48 @@ done
 [ -r /var/log/apps/fnmusic-ext-install.log ] || [ -r /var/apps/fnmusic-ext/pkgvar/fnmusic-app.log ] \
     || echo "安装日志不可读（可能无权限）：请用 sudo bash scripts/collect_support_info.sh 重跑"
 
+section "音源进程与 HTTP 就绪（#108 分层：进程 RUNNING ≠ 服务可用）"
+# 只读收集：进程层（supervisor/systemctl）与 HTTP 层分开列，便于区分
+# 「进程在但不响应」和「进程没起来」。失败不明示的根因，只给证据。
+ supply_conf=""
+for cand in "${BASE_DIR}/sources-native/supervisord.conf" /etc/supervisor/supervisord.conf; do
+    if [ -r "$cand" ]; then supply_conf="$cand"; break; fi
+done
+if [ -n "$supply_conf" ] && command -v supervisorctl >/dev/null 2>&1; then
+    supervisorctl -c "$supply_conf" status 2>/dev/null || \
+        sudo supervisorctl -c "$supply_conf" status 2>/dev/null || echo "supervisorctl status 不可用"
+else
+    echo "未找到可读的 supervisor 配置（Docker 与 native 形态均尝试）"
+fi
+echo "--- 本机音源 HTTP 探活（各 3s 超时，供对照，不代表最终结论）"
+for url in "http://127.0.0.1:8768/healthz" "http://127.0.0.1:8770/healthz" \
+           "http://127.0.0.1:8772/healthz" "http://127.0.0.1:8774/healthz" \
+           "http://127.0.0.1:8005/api/status"; do
+    code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${url}" 2>/dev/null || echo "FAIL")"
+    echo "  ${url} -> ${code}"
+done
+
+section "洛雪脚本状态"
+# lxmusic 的 healthz 自带 user_source 快照（草案初始化结果），一并留存。
+lx_code="$(curl -sS -m 3 -o /tmp/fnmusic_lx_health.json -w '%{http_code}' \
+    "http://127.0.0.1:8772/healthz" 2>/dev/null || echo FAIL)"
+echo "  healthz -> ${lx_code}"
+if [ -r /tmp/fnmusic_lx_health.json ]; then
+    python3 -c 'import json,sys
+try:
+    d = json.load(open("/tmp/fnmusic_lx_health.json"))
+except Exception as e:
+    print("  无法解析洛雪健康快照:", e); sys.exit()
+print("  自定义源状态:", (d.get("user_source") or {}).get("state", "unknown"))
+print("  初始化完成数:", (d.get("user_source") or {}).get("ready_count", 0),
+      "失败数:", (d.get("user_source") or {}).get("failed_count", 0),
+      "待定数:", (d.get("user_source") or {}).get("pending_count", 0))
+err = (d.get("user_source") or {}).get("last_error")
+if err:
+    print("  最后错误:", str(err)[:200])' 2>/dev/null || echo "  洛雪健康快照不可用"
+    rm -f /tmp/fnmusic_lx_health.json
+fi
+
 section "磁盘空间"
 df -h "${BASE_DIR}" 2>/dev/null | tail -2
 
