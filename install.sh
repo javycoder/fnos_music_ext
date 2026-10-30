@@ -33,6 +33,7 @@ installation_lock "$@"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 SOURCES_RAW=""
+SOURCES_EXPLICIT=0
 NON_INTERACTIVE=0
 ENABLE_RECOMMEND=""
 # 仅显式 --disable-recommend 才清除 .env 中已保存的大模型配置；
@@ -424,17 +425,30 @@ print_featured_mdl_menu() {
     echo "  直接回车 = 默认精选（酷我+咪咕）；输入 all = 平台白名单维持 .env 既有值。"
 }
 
+read_dotenv_value() {
+    local file="${1:-}"
+    local key="${2:-}"
+    [ -n "${file}" ] && [ -f "${file}" ] || return 0
+    grep -E "^\s*(export\s+)?${key}=" "${file}" 2>/dev/null | tail -n1 | sed -E "s/^\s*(export\s+)?${key}=//" | sed -E "s/^['\"]|['\"]$//g" | tr -d '\r'
+}
+
 parse_sources() {
     local raw="${1:-}"
-    # 覆盖安装（升级）：存量 .env 已有音源开关时以存量为准——向导默认值/安装参数
-    # 只该影响全新安装，否则每次覆盖装都会把用户已切换的源重置回初次选择。
+    # 覆盖安装（升级）：存量 .env 已有音源开关时以存量为准。
+    # 显式优先原则：
+    # 1. 命令行显式指定了 --sources（SOURCES_EXPLICIT=1）或传入非空非默认源时，必须优先采用显式选择；
+    # 2. 仅当未显式指定音源（raw 为空且 SOURCES_EXPLICIT=0）且存量 .env 存在时，才自动沿用存量配置。
     # BASE_DIR 用默认空值：单测单独抽取本函数在 set -u 下裸跑，不定义 BASE_DIR
     local env_file="${BASE_DIR:-}/.env"
-    if [ -n "${BASE_DIR:-}" ] && [ -f "${env_file}" ] && grep -q "^FNMUSIC_LX_ENABLED=" "${env_file}" 2>/dev/null; then
+    local explicit=0
+    [ "${SOURCES_EXPLICIT:-0}" -eq 1 ] && explicit=1
+    [ -n "${raw}" ] && [ "${raw}" != "musicdl" ] && explicit=1
+
+    if [ "${explicit}" -eq 0 ] && [ -n "${BASE_DIR:-}" ] && [ -f "${env_file}" ]; then
         local keep_mdl keep_box keep_lx
-        keep_mdl="$(sed -n "s/^FNMUSIC_MUSICDL_ENABLED=//p" "${env_file}" | tail -n1 | tr -d "\"'[:space:]")"
-        keep_box="$(sed -n "s/^FNMUSIC_NETEASE_ENABLED=//p" "${env_file}" | tail -n1 | tr -d "\"'[:space:]")"
-        keep_lx="$(sed -n "s/^FNMUSIC_LX_ENABLED=//p" "${env_file}" | tail -n1 | tr -d "\"'[:space:]")"
+        keep_mdl="$(read_dotenv_value "${env_file}" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]')"
+        keep_box="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]')"
+        keep_lx="$(read_dotenv_value "${env_file}" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]')"
         if [ -n "${keep_mdl}${keep_box}${keep_lx}" ]; then
             ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
             [ "${keep_mdl}" = "true" ] || [ "${keep_mdl}" = "1" ] && ENABLE_MUSICDL=1
@@ -448,6 +462,7 @@ parse_sources() {
             return 0
         fi
     fi
+    KEEP_SOURCES_FROM_ENV=0
     ENABLE_MUSICDL=0
     ENABLE_MUSICBOX=0
     ENABLE_LX=0
@@ -548,8 +563,8 @@ while [ $# -gt 0 ]; do
             exit 1 ;;
         --sources)
             [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
-            SOURCES_RAW="${2}"; shift 2 ;;
-        --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
+            SOURCES_RAW="${2}"; SOURCES_EXPLICIT=1; shift 2 ;;
+        --sources=*) SOURCES_RAW="${1#*=}"; SOURCES_EXPLICIT=1; shift ;;
         --lx-source-url)
             [ $# -ge 2 ] || { log_err "--lx-source-url 需要 URL 参数"; exit 1; }
             LX_SOURCE_URL_CLI="${2}"; shift 2 ;;
@@ -595,7 +610,7 @@ run_docker() {
         local key
         local -a build_env=()
         for key in FNMUSIC_BUILD_FINGERPRINT FNMUSIC_BASE_IMAGE FNMUSIC_PIP_INDEX FNMUSIC_APT_MIRROR; do
-            if [[ -v "${key}" ]]; then
+            if [ -n "${!key+x}" ]; then
                 build_env+=("${key}=${!key}")
             fi
         done
@@ -1248,8 +1263,8 @@ ENV_DESIRED="$(mktemp)"
     elif [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
         # 存量音源保留：musicdl 平台白名单也沿用 .env 既有值，不被默认重置
         keep_env="${BASE_DIR:-}/.env"
-        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "$(sed -n "s/^FNMUSIC_ONLINE_SOURCES=//p" "${keep_env}" 2>/dev/null | tail -n1 | tr -d "\"'[:space:]")")'"
-        echo "MUSICDL_SOURCES='$(dotenv_escape "$(sed -n "s/^MUSICDL_SOURCES=//p" "${keep_env}" 2>/dev/null | tail -n1 | tr -d "\"'[:space:]")")'"
+        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "$(read_dotenv_value "${keep_env}" "FNMUSIC_ONLINE_SOURCES" | tr -d '[:space:]')")'"
+        echo "MUSICDL_SOURCES='$(dotenv_escape "$(read_dotenv_value "${keep_env}" "MUSICDL_SOURCES" | tr -d '[:space:]')")'"
     else
         echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     fi

@@ -616,8 +616,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_AUTO_COVER": ("auto_cover", "bool"),
     "FNMUSIC_LYRIC_AUTO_DL": ("lyric_auto_dl", "bool"),
     "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
-    "FNMUSIC_SCAN_DELAY_S": ("scan_delay_s", "scan_number"),
-    "FNMUSIC_SCAN_COOLDOWN_S": ("scan_cooldown_s", "scan_number"),
+    "FNMUSIC_SCAN_DELAY_S": ("scan_delay_s", "scan_delay"),
+    "FNMUSIC_SCAN_COOLDOWN_S": ("scan_cooldown_s", "scan_cooldown"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
@@ -742,9 +742,20 @@ def _env_watch_parse(raw: str, kind: str):
             return max(10.0, min(3600.0, float(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "scan_delay":
+        try:
+            value = float(raw)
+            return value if math.isfinite(value) and 0.0 <= value <= 600.0 else None
+        except (TypeError, ValueError):
+            return None
+    if kind == "scan_cooldown":
+        try:
+            value = float(raw)
+            return value if math.isfinite(value) and 0.0 <= value <= 3600.0 else None
+        except (TypeError, ValueError):
+            return None
     if kind == "scan_number":
-        # 扫描时间窗（延迟/冷却）：0 允许（延迟 0=立即发、冷却 0=仅合并窗口），
-        # 上限与默认值各自语义内收敛
+        # 兼容旧调用或通用测试
         try:
             value = float(raw)
             return value if math.isfinite(value) and 0 <= value <= 3600.0 else None
@@ -6122,20 +6133,138 @@ _SCAN_TTL_S = 90.0
 _SCAN_MERGE_S = 3.0
 _scan_last_attempt = 0.0
 _scan_task: "asyncio.Task | None" = None
+_scan_pending_headers: "dict | None" = None
 
 
 def _scan_config() -> "tuple[str, str]":
-    """解析重扫配置「路径|JSON体」：竖线分隔，JSON 段可选（兼容旧纯路径格式）。
+    """解析重扫配置「路径|JSON体」并进行严格安全校验。
 
-    返回 (path, body)；body 为空串表示无请求体。
+    - 竖线分隔，JSON 段可选（兼容旧纯路径格式）。
+    - 路径必须是曲库服务的内部绝对路径（以单个 / 开头，禁止 // 开头、禁止 scheme、禁止相对路径与 .. 遍历）。
+    - 禁止任何控制字符（如 \r, \n, \0 等）。
+    - 若配置了请求体，必须是合法 JSON 格式，且不含控制字符。
+    - 校验不通过时记录 warning 并返回 ("", "")，绝不发起非法或外部请求。
     """
     raw = str(CONF.get("library_scan_path") or "").strip()
     if not raw:
         return "", ""
     if "|" in raw:
         path, _, body = raw.partition("|")
-        return path.strip(), body.strip()
-    return raw, ""
+        path, body = path.strip(), body.strip()
+    else:
+        path, body = raw, ""
+
+    # 1. 路径格式安全校验：必须为内部绝对路径，且不能为外部绝对 URL
+    if not path or not path.startswith("/") or path.startswith("//"):
+        logger.warning("Invalid library scan path: must start with single '/': %r", path)
+        return "", ""
+    # 禁止 scheme（如 http:, https:）以及相对路径遍历
+    if ":" in path or ".." in path.split("/"):
+        logger.warning("Invalid library scan path: external URL or traversal rejected: %r", path)
+        return "", ""
+    # 禁止控制字符（换行、回车、空字符等）
+    if any(ord(c) < 32 for c in path):
+        logger.warning("Invalid library scan path: control characters rejected: %r", path)
+        return "", ""
+
+    # 2. 请求体 JSON 安全校验
+    if body:
+        if any(ord(c) < 32 and c not in "\r\n\t" for c in body):
+            logger.warning("Invalid library scan body: control characters rejected")
+            return "", ""
+        try:
+            json.loads(body)
+        except Exception as e:
+            logger.warning("Invalid library scan body: malformed JSON (%s)", e)
+            return "", ""
+
+    return path, body
+
+
+def _clean_scan_headers(headers: dict | None) -> dict:
+    """提取扫描请求所需的会话凭据，过滤跨路径无效或危险的头部。
+
+    注意：authx 请求头是基于触发请求 URI/Method 计算的单次签名，
+    不能在完全不同的 scan 接口路径上重放。会话凭证（Cookie/Authorization）
+    可以在同站/Unix 上游中复用。
+    """
+    if not headers:
+        return {}
+    cleaned = {}
+    for k, v in headers.items():
+        lk = str(k).lower().strip()
+        # 允许透传会话凭据 cookie 与 authorization，剔除 authx 签名
+        if lk in ("cookie", "authorization"):
+            cleaned[k] = v
+    return cleaned
+
+
+async def _run_scan_worker(initial_wait: float) -> None:
+    """后台扫描工作协程：处理合并延迟、发送扫描请求、处理冷却以及补发待扫任务。"""
+    global _scan_last_attempt, _scan_pending_headers
+    if initial_wait > 0:
+        await asyncio.sleep(initial_wait)
+
+    while _scan_pending_headers is not None:
+        cur_headers = _scan_pending_headers
+        _scan_pending_headers = None
+
+        scan_path, scan_body = _scan_config()
+        if not scan_path:
+            return
+
+        _scan_last_attempt = time.monotonic()
+        try:
+            client = get_upstream_client(app)
+            req_headers = dict(cur_headers)
+            if scan_body:
+                req_headers["content-type"] = "application/json"
+            req = client.build_request(
+                "POST",
+                scan_path,
+                headers=req_headers,
+                content=scan_body.encode("utf-8") if scan_body else None,
+            )
+            # 有界超时 10 秒，防止上游挂起
+            resp = await asyncio.wait_for(client.send(req), timeout=10.0)
+            try:
+                # 读取完整响应
+                body_bytes = await resp.aread()
+                if resp.status_code == 200:
+                    biz_ok = True
+                    try:
+                        resp_json = json.loads(body_bytes.decode("utf-8"))
+                        if isinstance(resp_json, dict) and "code" in resp_json:
+                            # 官方接口标准成功码为 0 或 200
+                            biz_ok = resp_json["code"] in (0, 200)
+                    except Exception:
+                        pass
+                    if biz_ok:
+                        logger.info("Library scan triggered via %s", scan_path)
+                    else:
+                        logger.warning(
+                            "Library scan %s returned business error: %s",
+                            scan_path, body_bytes[:200],
+                        )
+                else:
+                    logger.warning(
+                        "Library scan %s returned %s (check FNMUSIC_LIBRARY_SCAN_PATH)",
+                        scan_path, resp.status_code,
+                    )
+            finally:
+                # 响应对象必须安全关闭，避免连接泄漏
+                await resp.aclose()
+        except Exception as e:
+            logger.warning("Library scan trigger failed: %s", e)
+
+        # 检查是否在发送期间或冷却期间又有新文件落盘进队列
+        if _scan_pending_headers is not None:
+            cooldown_cfg = CONF.get("scan_cooldown_s")
+            cooldown = float(_SCAN_TTL_S if cooldown_cfg is None else cooldown_cfg)
+            elapsed = time.monotonic() - _scan_last_attempt
+            remaining = cooldown - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
 
 
 def _schedule_library_scan(headers: dict | None) -> None:
@@ -6143,48 +6272,39 @@ def _schedule_library_scan(headers: dict | None) -> None:
 
     官方扫描接口无公开资料：配置「路径|JSON体」（如
     /music/api/v1/shared-library/scan|{"guid":"..."}），JSON 段可选；
-    3 秒合并窗口（连续落盘多首只发一次）+ 90 秒 TTL（成功与失败都节流，
-    路径配错不会风暴）。凭证头取自触发请求（copy_incoming_headers，含
-    Authx 新鲜签名原样透传），只在任务内一次性使用，不落盘。
+    可配置延迟合并窗口（连续落盘多首只发一次）+ 冷却窗口（成功与失败都节流）。
+    凭证头只透传会话级认证（如 cookie/authorization），剔除路径绑定的 authx 签名。
+    冷却期内若有新文件落盘，记录待扫任务，冷却结束后自动补扫，防止漏扫。
     """
-    global _scan_task, _scan_last_attempt
+    global _scan_task, _scan_last_attempt, _scan_pending_headers
     if not str(CONF.get("library_scan_path") or "").strip() or not headers:
         return
-    if time.monotonic() - _scan_last_attempt < float(CONF.get("scan_cooldown_s") or _SCAN_TTL_S):
-        return
-    if _scan_task is not None and not _scan_task.done():
+
+    safe_headers = _clean_scan_headers(headers)
+    if not safe_headers:
         return
 
-    async def _run() -> None:
-        global _scan_last_attempt
-        delay = max(float(CONF.get("scan_delay_s") or 0.0), 0.0)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        scan_path, scan_body = _scan_config()
-        if not scan_path:
-            return
-        _scan_last_attempt = time.monotonic()
-        try:
-            client = get_upstream_client(app)
-            req_headers = dict(headers)
-            if scan_body:
-                req_headers["content-type"] = "application/json"
-            req = client.build_request(
-                "POST", scan_path, headers=req_headers,
-                content=scan_body.encode("utf-8") if scan_body else None,
-            )
-            resp = await client.send(req)
-            if resp.status_code == 200:
-                logger.info("Library scan triggered via %s", scan_path)
-            else:
-                logger.warning(
-                    "Library scan %s returned %s (check FNMUSIC_LIBRARY_SCAN_PATH)",
-                    scan_path, resp.status_code,
-                )
-        except Exception as e:
-            logger.warning("Library scan trigger failed: %s", e)
+    cooldown_cfg = CONF.get("scan_cooldown_s")
+    cooldown = float(_SCAN_TTL_S if cooldown_cfg is None else cooldown_cfg)
+    now = time.monotonic()
 
-    _scan_task = asyncio.create_task(_run())
+    # 如果正在运行或处于冷却期中，更新 pending_headers，保证冷却期后重扫最新文件
+    in_cooldown = (now - _scan_last_attempt) < cooldown
+    is_running = _scan_task is not None and not _scan_task.done()
+
+    if is_running or in_cooldown:
+        _scan_pending_headers = safe_headers
+        if not is_running:
+            # 当前没有正在跑的任务，但处于冷却期：启动后台协程等待剩余冷却时间后触发
+            wait_s = max(0.0, cooldown - (now - _scan_last_attempt))
+            _scan_task = asyncio.create_task(_run_scan_worker(wait_s))
+        return
+
+    # 不在冷却期且无正在运行的任务：立即调度工作协程
+    _scan_pending_headers = safe_headers
+    delay_cfg = CONF.get("scan_delay_s")
+    delay = max(float(0.0 if delay_cfg is None else delay_cfg), 0.0)
+    _scan_task = asyncio.create_task(_run_scan_worker(delay))
 
 
 def stream_tee_response(

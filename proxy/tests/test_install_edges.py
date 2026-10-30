@@ -901,3 +901,47 @@ def test_netease_login_consecutive_failures_terminate(tmp_path):
     assert "网络请求连续失败" in result.stdout
     log = (tmp_path / "nbin" / "netease-curl.log").read_text(encoding="utf-8")
     assert log.count("-X POST") == 5  # 恰好 5 次失败后终止
+
+
+def test_parse_sources_preserves_env_only_when_not_explicit(tmp_path):
+    """覆盖安装测试：未显式指定音源时保留存量 .env，显式 --sources 必须优先。"""
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=false\nFNMUSIC_NETEASE_ENABLED=false\n",
+        encoding="utf-8",
+    )
+
+    # 提取 parse_sources 及依赖函数
+    helpers = r'''
+set -eu
+log_info() { :; }
+log_err() { echo "$*" >&2; }
+lx_alias() { echo "kg"; }
+lx_merge() { :; }
+mdl_merge() { :; }
+mdl_platform_lookup() { echo "musicdl kuwo 酷我"; }
+source_lookup_by_id() { echo "musicbox netease 网易"; }
+apply_source_row() { :; }
+'''
+    script = (
+        helpers
+        + f'BASE_DIR="{tmp_path}"\n'
+        + function(install, "read_dotenv_value")
+        + function(install, "parse_sources")
+        + r'''
+# 场景 1：未显式指定音源（入参为空串），应沿用存量 .env 中的 lx
+parse_sources ""
+echo "IMPLICIT: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEEP_SOURCES_FROM_ENV"
+
+# 场景 2：显式传入参数（例如 --sources musicbox），必须优先采用显式选择
+parse_sources "musicbox"
+echo "EXPLICIT: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEEP_SOURCES_FROM_ENV"
+'''
+    )
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert "IMPLICIT: MDL=0 BOX=0 LX=1 KEEP=1" in lines[0]
+    assert "EXPLICIT: MDL=0 BOX=1 LX=0 KEEP=0" in lines[1]
+

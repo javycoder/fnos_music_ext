@@ -141,8 +141,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": {"kind": "int", "default": "120", "min": 10, "max": 3600, "group": "tee", "reload": "hot", "label": "官方绑定等待（秒）"},
     "FNMUSIC_TEE_HANDOFF_MAX": {"kind": "int", "default": "3", "min": 0, "max": 20, "group": "tee", "reload": "hot", "label": "切歌续传并行数"},
     "FNMUSIC_LIBRARY_SCAN_PATH": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "曲库重扫接口（选填）"},
-    "FNMUSIC_SCAN_DELAY_S": {"kind": "int", "default": "3", "min": 0, "max": 600, "group": "tee", "reload": "hot", "label": "落盘后延迟（秒）"},
-    "FNMUSIC_SCAN_COOLDOWN_S": {"kind": "int", "default": "90", "min": 0, "max": 3600, "group": "tee", "reload": "hot", "label": "扫描冷却窗口（秒）"},
+    "FNMUSIC_SCAN_DELAY_S": {"kind": "float", "default": "3", "min": 0, "max": 600, "clamp": True, "step": "0.5", "group": "tee", "reload": "hot", "label": "落盘后延迟（秒）"},
+    "FNMUSIC_SCAN_COOLDOWN_S": {"kind": "float", "default": "90", "min": 0, "max": 3600, "clamp": True, "step": "0.5", "group": "tee", "reload": "hot", "label": "扫描冷却窗口（秒）"},
     "FNMUSIC_LLM_BASE_URL": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "OpenAI 兼容 Base URL"},
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
@@ -885,6 +885,9 @@ def _normalize_value(key: str, raw) -> str:
             raise ValueError(f"{key}: 期望数字，收到 {raw!r}") from exc
         if not math.isfinite(num):
             raise ValueError(f"{key}: 期望有限数字")
+        if spec.get("clamp"):
+            num = max(float(spec.get("min", num)), min(float(spec.get("max", num)), num))
+            return str(int(num)) if num.is_integer() else str(num)
         if num < float(spec.get("min", num)) or num > float(spec.get("max", num)):
             raise ValueError(f"{key}: 超出允许范围")
         return str(num)

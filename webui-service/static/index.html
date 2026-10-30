@@ -296,9 +296,9 @@
             <input class="input" id="scan-delay" type="number" min="0" max="600" step="0.5">
           </label>
           <label class="field"><span>扫描冷却窗口（秒） <b id="scan-cooldown-label"></b></span>
-            <input class="input" id="scan-cooldown" type="number" min="0" max="3600" step="1">
+            <input class="input" id="scan-cooldown" type="number" min="0" max="3600" step="0.5">
           </label>
-          <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口填「接口路径|JSON参数」，如 /music/api/v1/shared-library/scan|{"guid":"你的共享库id"}（guid 可在飞牛音乐网页端手动扫库时按 F12 从请求参数获取）。歌曲落盘后延迟指定秒数（合并连续落盘，0=立即发）自动携带登录态调用（Authx 签名透传，无需额外配置），加速官方入库；冷却窗口内不重复触发；JSON 参数段可省略。留空=官方自动扫描入库。</p>
+          <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口填「接口路径|JSON参数」，如 /music/api/v1/shared-library/scan|{"guid":"你的共享库id"}（guid 可在飞牛音乐网页端手动扫库时按 F12 从请求参数获取）。歌曲落盘后延迟指定秒数（合并连续落盘，0=立即发）自动携带登录态调用（Cookie/Token 登录凭据透传，无需额外配置），加速官方入库；冷却窗口内不重复触发；JSON 参数段可省略。留空=官方自动扫描入库。</p>
         </div>
         <div class="card">
           <div class="card-title">清理垃圾文件 <span class="badge">Beta</span></div>

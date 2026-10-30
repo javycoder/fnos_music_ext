@@ -2729,7 +2729,13 @@ def test_scan_timing_config_roundtrip(env_file):
         rj = client.get("/api/config").json()
         assert rj["values"]["FNMUSIC_SCAN_DELAY_S"] == "10"
         assert rj["values"]["FNMUSIC_SCAN_COOLDOWN_S"] == "30"
-        # 越界钳制到范围内（与既有 int 键同语义：700→600，-1→0）
+        # 允许有限小数（例如 2.5 秒延迟，15.5 秒冷却）
+        r = client.put("/api/config", json={"values": {"FNMUSIC_SCAN_DELAY_S": 2.5, "FNMUSIC_SCAN_COOLDOWN_S": 15.5}})
+        assert r.status_code == 200
+        rj = client.get("/api/config").json()
+        assert rj["values"]["FNMUSIC_SCAN_DELAY_S"] == "2.5"
+        assert rj["values"]["FNMUSIC_SCAN_COOLDOWN_S"] == "15.5"
+        # 越界钳制到范围内（700→600，-1→0）
         r = client.put("/api/config", json={"values": {"FNMUSIC_SCAN_DELAY_S": 700}})
         assert r.status_code == 200
         rj = client.get("/api/config").json()
