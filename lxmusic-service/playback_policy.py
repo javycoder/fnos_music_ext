@@ -395,7 +395,8 @@ _UNKNOWN_TITLES = {"未知曲目", "未知歌曲", "unknown", "unknown title"}
 _UNKNOWN_ARTISTS = {"未知歌手", "未知艺术家", "unknown", "unknown artist"}
 _BRACKET_RE = re.compile(r"[\(（\[\【]([^\)）\]\】]{1,40})[\)）\]\】]")
 _PUNCT_RE = re.compile(r"[\s\-_·•・.,，。!！?？'\"“”‘’`~@#$%^&*+=|\\/<>:;；、]+")
-_ARTIST_SPLIT_RE = re.compile(r"(?:feat\.?|ft\.?|with|&|、|,|，|/|;|；|\+)+", re.I)
+# 英文合作标记必须是独立单词，不能把Withers/Theft等姓名拆成可误匹配碎片。
+_ARTIST_SPLIT_RE = re.compile(r"(?:\s+(?:feat\.?|ft\.?|with)\s+|&|、|,|，|/|;|；|\+)+", re.I)
 _YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 
 # 版本标签规则：括号内或标题尾部命中即归一为同一标签。

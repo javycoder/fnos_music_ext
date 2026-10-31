@@ -445,6 +445,9 @@ def test_artist_comparison_forbids_substring_matches():
     """歌手比较禁止子串：歌迷会与相近名字都不算同一歌手。"""
     assert not policy.artists_compatible("周杰伦", "周杰伦歌迷会")
     assert not policy.artists_compatible("王菲", "王菲菲")
+    assert not policy.artists_compatible("Bill Withers", "Bill Withers Fanclub")
+    assert not policy.artists_compatible("Theft", "The Fanclub")
+    assert policy.artists_compatible("Bill Withers feat. Guest", "Bill Withers")
     # 正常同名与多歌手仍然兼容
     assert policy.artists_compatible("周杰伦", "周杰伦")
     assert policy.artists_compatible("周杰伦", "周杰伦、费玉清")
