@@ -30,6 +30,7 @@ from lxserver_client import (
     DEFAULT_ADMIN_PASSWORD,
     DEFAULT_LXSERVER_URL,
     LxServerClient,
+    UnsafeVmRequired,
     SUPPORTED_PLATFORMS,
     is_lxserver_unreachable,
     normalize_source,
@@ -218,7 +219,8 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
                                    capability_known=bool(declared))
                     sinfo = temp_client.get_cached_song_info(song["id"]) or temp_client.synthesize_song_info(song["id"], song)
                     try:
-                        resolved = await temp_client.get_music_url(sinfo, quality, exclude_api_sources=excluded)
+                        resolved = await temp_client.get_music_url(
+                            sinfo, quality, exclude_api_sources=excluded, auto_switch_api_source=False)
                     except Exception as exc:
                         if is_lxserver_unreachable(exc):
                             raise
@@ -228,9 +230,7 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
                         report["attempts"].append(dict(attempt, result="resolve_empty"))
                         continue
                     resolved_id = str(resolved.get("sourceId") or "")
-                    resolved_name = str(resolved.get("sourceName") or "")
-                    if ((resolved_id and resolved_id != target_id) or
-                            (not resolved_id and resolved_name != report["meta"]["name"])):
+                    if not target_id or resolved_id != target_id:
                         report["attempts"].append(dict(attempt, result="resolved_by_other_source"))
                         continue
                     headers = _verification_headers(lx_app, platform, resolved)
@@ -305,6 +305,10 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         try:
             upload_res = await temp_client.upload_custom_source(temp_filename, script)
             temp_source_id = str(upload_res.get("id") or "") or None
+        except UnsafeVmRequired:
+            report.update(category="unsafe_vm_required", requires_unsafe_vm=True, complete=False,
+                          message="脚本需要不安全VM运行环境；本项目未自动授权，本次未验证")
+            return report
         except Exception as upload_exc:
             if "已存在" not in str(upload_exc):
                 # 内部通信故障上浮，不能归为脚本错误。

@@ -63,26 +63,51 @@ async def test_verification_visits_all_platforms_candidates_and_declared_qualiti
 
 
 @pytest.mark.anyio
-async def test_unknown_runtime_quality_metadata_explores_more_than_128k(fake_lx, monkeypatch):
+@pytest.mark.parametrize('include_source_id', [True, False])
+async def test_unknown_runtime_quality_metadata_explores_more_than_128k(fake_lx, monkeypatch, include_source_id):
     # 真实上游list仅给supportedSources，不暴露脚本已声明的qualitys。
     source = {'id': 'unknown.js', 'supportedSources': ['kg']}
     report = {'platforms': ['kg'], 'qualitys': {'kg': []}, 'attempts': [],
               'platform_results': {'kg': 'untested'}, 'ok': False, 'meta': {'name': 'unknown'}}
     async def search(*_args, **_kwargs):
         return [{'id': 'lx:kg:one', 'title': 'test'}]
-    calls = []
-    async def resolve(_song, quality, **_kwargs):
-        calls.append(quality)
-        return {'sourceId': 'unknown.js', 'url': 'https://media.invalid/test'}
+    calls, probes = [], []
+    async def resolve(_song, quality, **kwargs):
+        calls.append((quality, kwargs.get('auto_switch_api_source')))
+        result = {'sourceName': 'unknown', 'url': 'https://media.invalid/test'}
+        if include_source_id:
+            result['sourceId'] = 'unknown.js'
+        return result
     async def probe(*_args, **_kwargs):
+        probes.append(True)
         return True, 'https://media.invalid/test', 'audio/mpeg', 1024
     monkeypatch.setattr(fake_lx, 'search', search)
     monkeypatch.setattr(fake_lx, 'get_music_url', resolve)
     monkeypatch.setattr(lx_app, 'probe_url', probe)
     await verify._verification_samples(lx_app, fake_lx, [source], source, report, ['test'])
-    assert calls == ['flac', '128k']
+    assert calls == [('flac', False), ('128k', False)]
+    assert report['ok'] is include_source_id
+    assert bool(probes) is include_source_id
     assert all(not attempt['capability_known'] for attempt in report['attempts'])
     assert report['qualitys']['kg'] == []
+
+
+@pytest.mark.anyio
+async def test_verifier_marks_unsafe_vm_as_untested_not_broken_script(fake_lx, monkeypatch):
+    from lxserver_client import UnsafeVmRequired
+    async def script(_url):
+        return '/** @name fixture */'
+    async def upload(*_args, **_kwargs):
+        raise UnsafeVmRequired('fixture permission required')
+    monkeypatch.setattr(verify, 'download_script', script)
+    monkeypatch.setattr(verify, '_new_temp_client', lambda **_kwargs: fake_lx)
+    monkeypatch.setattr(fake_lx, 'upload_custom_source', upload)
+    report = await verify.verify_url('https://scripts.invalid/fixture.js')
+    assert not report['ok']
+    assert report['category'] == 'unsafe_vm_required'
+    assert report['requires_unsafe_vm'] is True
+    assert report['complete'] is False
+    assert fake_lx.toggle_calls == []
 
 
 def test_malformed_headers_do_not_crash_verification():
