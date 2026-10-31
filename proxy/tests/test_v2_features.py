@@ -71,17 +71,19 @@ def test_quality_order_netease_ladder_modes():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("mode,expected", [
-    ("high", ["lossless", "high", "standard"]),
-    ("balanced", ["high", "standard", "lossless"]),
-    ("smooth", ["standard", "high", "lossless"]),
+    ("high", ["flac"]),
+    ("balanced", ["320k"]),
+    ("smooth", ["128k"]),
 ])
-async def test_resolve_lx_url_follows_quality_mode(monkeypatch, mode, expected):
+async def test_resolve_lx_url_migrates_legacy_mode_to_one_backend_target(monkeypatch, mode, expected):
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(str(request.url.params.get("quality")))
-        return httpx.Response(404)  # 全部失败才会逐档尝试
+        return httpx.Response(404)  # 服务负责降档，代理不能再请求其他档或回升。
 
+    monkeypatch.setitem(CONF, "play_quality", None)
+    monkeypatch.setitem(CONF, "lx_enabled", True)
     monkeypatch.setitem(CONF, "quality_mode", mode)
     monkeypatch.setitem(CONF, "lx_quality", "lossless")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772") as client:
@@ -90,19 +92,25 @@ async def test_resolve_lx_url_follows_quality_mode(monkeypatch, mode, expected):
 
 
 @pytest.mark.anyio
-async def test_resolve_netease_url_default_high_ladder(monkeypatch):
+@pytest.mark.parametrize('mode, expected', [
+    ('high', ['lossless', 'exhigh', 'higher', 'standard']),
+    ('balanced', ['lossless', 'exhigh', 'higher', 'standard']),
+    ('smooth', ['standard']),
+])
+async def test_resolve_netease_url_legacy_modes_only_downgrade(monkeypatch, mode, expected):
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(str(request.url.params.get("quality")))
         return httpx.Response(200, json={"ok": True, "data": {"code": 200, "url": ""}})
 
-    monkeypatch.setitem(CONF, "quality_mode", "high")
+    monkeypatch.setitem(CONF, "play_quality", None)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
+    monkeypatch.setitem(CONF, "quality_mode", mode)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8770") as client:
-        assert await resolve_netease_url(client, "186016") is None
-    # 6 档梯在 lossless 锚点向下：lossless → exhigh → higher → standard
-    assert seen == ["lossless", "exhigh", "higher", "standard"]
+        assert await resolve_netease_url(client, f"186016-{mode}") is None
+    assert seen == expected
 
 
 def _alt(sid: str, kbps: float, dur: float = 200.0) -> dict:

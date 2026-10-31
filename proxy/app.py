@@ -4056,28 +4056,17 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                                         generation: int | None = None,
                                         return_details: bool = False) -> str | dict | None:
     key = str(song_id)
-    if quality_override is not None:
-        # 下载使用 prepare 捕获的目标，不读取可能已热重载的播放档位。
-        candidates = qp.quality_ladder(qp.normalize_quality(quality_override, default=None))
-        qualities = candidates
-    # 若显式配置了 play_quality，优先使用七档降级阶梯；未显式配置时保留旧兼容模式
-    elif CONF.get("play_quality"):
-        eff = effective_play_quality_conf()
-        candidates = qp.quality_ladder(eff)
-        if max_quality in ("exhigh", "higher", "standard", "mp3"):
-            lossless_tiers = {"lossless", "hires", "jymaster", "sky"}
-            candidates = [q for q in candidates if q not in lossless_tiers]
-        qualities = candidates
-    else:
-        primary = str(CONF.get("netease_quality") or "lossless").strip()
-        ladder = _NETEASE_QUALITY_LADDER
-        if max_quality in ("exhigh", "higher", "standard", "mp3"):
-            ladder = [q for q in _NETEASE_QUALITY_LADDER if q not in ("lossless", "hires", "jymaster", "sky")]
-            if primary in ("lossless", "hires", "jymaster", "sky") or not primary:
-                primary = "exhigh"
-        qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
-        if primary and primary not in qualities and primary in ladder:
-            qualities.insert(0, primary)
+    # 新旧配置都先归一为一个目标，再使用同一严格向下阶梯；不能恢复旧版回升路径。
+    target = (qp.normalize_quality(quality_override, default=None)
+              if quality_override is not None else effective_play_quality_conf())
+    if max_quality is not None:
+        try:
+            cap = qp.normalize_quality(max_quality, default=None)
+        except ValueError:
+            cap = None
+        if cap is not None and qp.QUALITY_LEVELS.index(cap) < qp.QUALITY_LEVELS.index(target):
+            target = cap
+    qualities = qp.quality_ladder(target)
 
     mode = CONF.get("quality_mode")
     primary = str(CONF.get("netease_quality") or "lossless").strip()
