@@ -28,7 +28,8 @@ PHASES = (
         "musicdl": ("musicdl-service",),
         "lxmusic": ("lxmusic-service",),
     },
-    {"infrastructure": ("container", "packaging/tests", "tests/runner")},
+    # 只含离线pytest用例；真实第三方脚本仍须单独显式授权矩阵CLI。
+    {"infrastructure": ("container", "packaging/tests", "tests/runner", "tests/integration")},
 )
 SUITES = {name: paths for phase in PHASES for name, paths in phase.items()}
 COVERAGE_TARGETS = (

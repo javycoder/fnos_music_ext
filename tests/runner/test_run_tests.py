@@ -33,6 +33,8 @@ def test_all_pytest_roots_run_exactly_once():
     assert runner.PHASES[0] == {"proxy": ("proxy/tests",)}
     assert set(runner.PHASES[1]) == {"webui", "musicdl", "lxmusic"}
     assert set(runner.PHASES[2]) == {"infrastructure"}
+    # 安全矩阵不能只靠手工执行；目录收集也自动覆盖后续离线适配回归。
+    assert "tests/integration" in runner.SUITES["infrastructure"]
 
 
 def test_command_uses_current_interpreter_without_extra_node_or_xdist():
