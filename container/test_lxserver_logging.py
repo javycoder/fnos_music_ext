@@ -46,14 +46,14 @@ def raw_conf():
 def test_lxserver_log_file_lands_in_shared_log_root(raw_conf):
     """lxserver 日志必须落在共享日志根，才能进入统一导出包。
 
-    容器形态共享日志根由 Dockerfile 的 ENV 固定为 /repo/logs（见
+    容器形态共享日志根由 Dockerfile 的 ENV 固定为 /data/logs（见
     test_container.py 的 FNMUSIC_LOG_DIR 契约），所有服务进程都往这里写，
     webui 的 /api/logs/export 扫描同一目录。
     """
     section = "program:lxserver"
     logfile = raw_conf.get(section, "stdout_logfile")
-    assert logfile.startswith("/repo/logs/"), (
-        f"lxserver 日志需落在共享日志根 /repo/logs/，实际 {logfile}"
+    assert logfile.startswith("/data/logs/"), (
+        f"lxserver 日志需落在共享日志根 /data/logs/，实际 {logfile}"
     )
     assert logfile.endswith("lxserver.log")
     # 容器 stdout 是 docker logs 单向管道，导出读不到；不能再指回 /dev/stdout
@@ -268,6 +268,8 @@ def test_entrypoint_readiness_wait_is_bounded_and_skipped_by_default(tmp_path):
         "SUPERVISOR_CONF": "/nonexistent/supervisord.conf",
         "DATA_PATH": str(tmp_path / "data" / "lxserver"),
         "LX_DATA_DIR": str(tmp_path / "data" / "lxmusic"),
+        # 日志根同样隔离：容器内默认 /data/logs，宿主 runner 上该路径不可建
+        "FNMUSIC_LOG_DIR": str(tmp_path / "logs"),
         # 指向确定不可达的端口：等待必然走到超时分支
         "LXMUSIC_HEALTH_URL": "http://127.0.0.1:1/healthz",
     }

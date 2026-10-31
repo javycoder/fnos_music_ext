@@ -72,8 +72,8 @@ def log_dir() -> Path:
     for cand in here.parent.parents:
         if (cand / "proxy").is_dir() and (cand / "VERSION").exists():
             return cand / "logs"
-    # Images copy fnlog into /app, whereas the shared repository is mounted /repo.
-    return Path("/repo/logs")
+    # Images copy fnlog into /srv, logs live on the writable data volume.
+    return Path("/data/logs")
 
 
 def _open_log_file(filename: str | Path, mode: str = "a", encoding: str = "utf-8",

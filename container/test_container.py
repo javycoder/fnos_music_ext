@@ -40,7 +40,7 @@ def test_supervisord_programs_all_autostart_false(supervisord_conf):
         # issue #108 已证实 stdout 单向管道读不回来，管理页导出拿不到它的运行
         # 日志，因此改为落盘到共享日志根，详见 test_lxserver_logging.py。
         if section == "program:lxserver":
-            assert supervisord_conf.get(section, "stdout_logfile").startswith("/repo/logs/")
+            assert supervisord_conf.get(section, "stdout_logfile").startswith("/data/logs/")
             continue
         assert supervisord_conf.get(section, "stdout_logfile") == "/dev/stdout"
         assert supervisord_conf.get(section, "stdout_logfile_maxbytes") == "0"
@@ -356,7 +356,7 @@ def test_dockerfile_assembly():
 def test_container_logging_root_contract():
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
     env_block = text.split("ENV ", 1)[1].split("\n\n", 1)[0]
-    assert "FNMUSIC_LOG_DIR=/repo/logs" in env_block
+    assert "FNMUSIC_LOG_DIR=/data/logs" in env_block
     assert "groupadd -g 1000 appuser" in text
     assert "useradd -m -u 1000 -g 1000 appuser" in text
     assert "USER appuser" in text
@@ -479,7 +479,7 @@ def test_entrypoint_creates_log_root_before_supervisord(tmp_path):
     """日志根不存在时 supervisord 因 logfile 目录缺失整体启动失败（CI 实证）。
 
     entrypoint 必须在拉起 supervisord 前先建日志根；Docker 与 native 共用
-    此入口，目录取 FNMUSIC_LOG_DIR（容器 /repo/logs，native 为仓库 logs）。
+    此入口，目录取 FNMUSIC_LOG_DIR（容器 /data/logs，native 为仓库 logs）。
     """
     log = tmp_path / "ctl.log"
     fake_bin = tmp_path / "bin"

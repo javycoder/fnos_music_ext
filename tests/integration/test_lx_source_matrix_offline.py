@@ -251,18 +251,27 @@ class TestNodePreloadRealSubprocess:
         assert "ALL_LITERAL_BLOCKED" in proc.stdout
 
     def test_172_217_is_not_private_ip(self, preload_file):
-        """172.217.16.1 不是私网，http 请求在发起阶段不能报 EACCES。"""
+        """172.217.16.1 不是私网，http 请求在发起阶段不能报 EACCES。
+
+        字面公网 IP 无 DNS 失败捷径：受限网络可能静默丢包（无 RST），error
+        事件永不到达。用有限观察窗判定——限时内未出现 EACCES 即视为放行，
+        不依赖外网真实可达或快速失败（CI 实证原写法 10 秒超时）。
+        """
         js = """
         const http = require('http');
+        let finished = false;
+        function finish(ok) {
+          if (finished) return;
+          finished = true;
+          if (ok) { console.log('172_PUBLIC_PASS'); process.exit(0); }
+          process.exit(101);
+        }
         try {
           const req = http.get('http://172.217.16.1');
-          req.on('error', (e) => {
-            if (e.code === 'EACCES') process.exit(101);
-            console.log('172_PUBLIC_PASS');
-            process.exit(0);
-          });
+          req.on('error', (e) => finish(e.code !== 'EACCES'));
+          setTimeout(() => { try { req.destroy(); } catch (_) {} finish(true); }, 1500);
         } catch (e) {
-          if (e.code === 'EACCES') process.exit(102);
+          process.exit(e.code === 'EACCES' ? 102 : 0);
         }
         """
         proc = self._run_node(js, preload_file)

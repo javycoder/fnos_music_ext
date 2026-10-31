@@ -15,7 +15,7 @@ ENV PYTHONUNBUFFERED=1 \
     XDG_CONFIG_HOME=/data/config \
     LX_DATA_DIR=/data/lxmusic \
     WEBUI_REPO_DIR=/repo \
-    FNMUSIC_LOG_DIR=/repo/logs
+    FNMUSIC_LOG_DIR=/data/logs
 
 WORKDIR /srv
 
@@ -86,7 +86,7 @@ RUN set -eu; \
 
 RUN groupadd -g 1000 appuser \
     && useradd -m -u 1000 -g 1000 appuser \
-    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
+    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/logs \
     && chown -R appuser:appuser /data
 
 # lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
