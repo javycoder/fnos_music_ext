@@ -209,8 +209,9 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
                 report["attempts"].append(dict(base, result="no_items"))
                 continue
             declared = report["qualitys"][platform]
-            # 最高与最低已声明档位；能力未知时只做128k探索，不伪造声明。
-            qualities = list(dict.fromkeys((declared[0], declared[-1]))) if declared else ["128k"]
+            # 真实上游list不一定公开品质声明；未知时探索代表高低档，
+            # 但capability_known仍为false，不能把请求成功宣称为脚本全档能力。
+            qualities = list(dict.fromkeys((declared[0], declared[-1]))) if declared else ["flac", "128k"]
             for quality in qualities:
                 for song in songs[:3]:
                     attempt = dict(base, quality=quality, song_id=str(song.get("id") or ""),

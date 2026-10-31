@@ -62,6 +62,29 @@ async def test_verification_visits_all_platforms_candidates_and_declared_qualiti
     assert all('https://' not in str(attempt.get('error', '')) for attempt in report['attempts'])
 
 
+@pytest.mark.anyio
+async def test_unknown_runtime_quality_metadata_explores_more_than_128k(fake_lx, monkeypatch):
+    # 真实上游list仅给supportedSources，不暴露脚本已声明的qualitys。
+    source = {'id': 'unknown.js', 'supportedSources': ['kg']}
+    report = {'platforms': ['kg'], 'qualitys': {'kg': []}, 'attempts': [],
+              'platform_results': {'kg': 'untested'}, 'ok': False, 'meta': {'name': 'unknown'}}
+    async def search(*_args, **_kwargs):
+        return [{'id': 'lx:kg:one', 'title': 'test'}]
+    calls = []
+    async def resolve(_song, quality, **_kwargs):
+        calls.append(quality)
+        return {'sourceId': 'unknown.js', 'url': 'https://media.invalid/test'}
+    async def probe(*_args, **_kwargs):
+        return True, 'https://media.invalid/test', 'audio/mpeg', 1024
+    monkeypatch.setattr(fake_lx, 'search', search)
+    monkeypatch.setattr(fake_lx, 'get_music_url', resolve)
+    monkeypatch.setattr(lx_app, 'probe_url', probe)
+    await verify._verification_samples(lx_app, fake_lx, [source], source, report, ['test'])
+    assert calls == ['flac', '128k']
+    assert all(not attempt['capability_known'] for attempt in report['attempts'])
+    assert report['qualitys']['kg'] == []
+
+
 def test_malformed_headers_do_not_crash_verification():
     from types import SimpleNamespace
     headers = verify._verification_headers(SimpleNamespace(UA_PC='test-agent'), 'kg', {'headers': 'invalid'})
