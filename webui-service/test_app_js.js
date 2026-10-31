@@ -2538,6 +2538,239 @@ test("公共歌单用户：直连 403/501 明确显示安全架构限制与飞�
   assert.strictEqual(global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_BY_USER, undefined);
 });
 
+test("高级洛雪页：关闭自动切换时保留平台优选值并禁用排序", async () => {
+  reset();
+  const schema = {
+    FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+    FNMUSIC_LX_PLATFORM_PREFERRED: { kind: "bool" },
+    FNMUSIC_LX_SOURCE_ORDER: { kind: "str" },
+    FNMUSIC_LX_ENABLED: { kind: "bool" },
+    FNMUSIC_NETEASE_ENABLED: { kind: "bool" },
+    FNMUSIC_MUSICDL_ENABLED: { kind: "bool" },
+    FNMUSIC_PLAY_QUALITY: { kind: "enum" },
+    FNMUSIC_DOWNLOAD_QUALITY: { kind: "enum" },
+  };
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: {
+    FNMUSIC_LX_AUTO_SWITCH: "false",
+    FNMUSIC_LX_PLATFORM_PREFERRED: "true",
+    LX_SOURCE_LIST: JSON.stringify([
+      { id: "source-b", name: "源乙", url: "https://s/b.js", active: true },
+      { id: "source-a", name: "源甲", url: "https://s/a.js", active: true },
+      { id: "inactive", name: "未激活源", url: "https://s/c.js", active: false },
+    ]),
+    FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]',
+    FNMUSIC_LX_ENABLED: "false", FNMUSIC_NETEASE_ENABLED: "true", FNMUSIC_MUSICDL_ENABLED: "false",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#lx-auto-switch").checked, false);
+  assert.strictEqual(els.get("#lx-platform-preferred").checked, true);
+  assert.strictEqual(els.get("#lx-platform-preferred-row").hidden, true);
+  assert.strictEqual(global.canReorderLxSources(), false);
+  assert.ok(els.get("#lx-source-order-list").innerHTML.indexOf("源甲") < els.get("#lx-source-order-list").innerHTML.indexOf("源乙"));
+  assert.ok(!els.get("#lx-source-order-list").innerHTML.includes("未激活源"));
+  const values = global.collectConfig();
+  assert.ok(!("FNMUSIC_LX_PLATFORM_PREFERRED" in values), "关闭后隐藏值不提交，避免清空保存值");
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-a", "source-b"]);
+  global.moveLxSource("source-b", -1);
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-a", "source-b"], "关闭时排序函数不得更改顺序");
+});
+
+test("高级洛雪页：开启自动切换后显示并提交保留的平台优选值", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { schema: {
+    FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+    FNMUSIC_LX_PLATFORM_PREFERRED: { kind: "bool" },
+    FNMUSIC_LX_SOURCE_ORDER: { kind: "str" },
+  }, values: {
+    FNMUSIC_LX_AUTO_SWITCH: "false", FNMUSIC_LX_PLATFORM_PREFERRED: "true",
+    FNMUSIC_LX_SOURCE_ORDER: "[]", LX_SOURCE_LIST: "[]",
+  } });
+  await global.loadConfig();
+  els.get("#lx-auto-switch").checked = true;
+  els.get("#lx-auto-switch").dispatch("change");
+  assert.strictEqual(els.get("#lx-platform-preferred-row").hidden, false);
+  assert.strictEqual(els.get("#lx-platform-preferred").checked, true);
+  assert.strictEqual(global.collectConfig().FNMUSIC_LX_PLATFORM_PREFERRED, true);
+});
+
+test("洛雪排序：激活源按稳定 ID 单独排序，停用保留、删除清理且不搬动管理列表", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { schema: {
+    FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+    FNMUSIC_LX_PLATFORM_PREFERRED: { kind: "bool" },
+    FNMUSIC_LX_SOURCE_ORDER: { kind: "str" },
+  }, values: {
+    FNMUSIC_LX_AUTO_SWITCH: "true", FNMUSIC_LX_PLATFORM_PREFERRED: "false",
+    FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]',
+    LX_SOURCE_LIST: JSON.stringify([
+      { id: "source-b", name: "源乙", url: "https://s/b.js", active: true },
+      { id: "source-a", name: "源甲", url: "https://s/a.js", active: true },
+      { id: "source-c", name: "未激活源", url: "https://s/c.js", active: false },
+    ]),
+  } });
+  await global.loadConfig();
+  assert.strictEqual(global.canReorderLxSources(), true);
+  const sourceManagementBefore = els.get("#lx-source-list").innerHTML;
+  assert.ok(els.get("#lx-source-order-list").innerHTML.indexOf("源甲") < els.get("#lx-source-order-list").innerHTML.indexOf("源乙"));
+  assert.strictEqual(global.moveLxSource("source-b", -1), true);
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-b", "source-a"]);
+  assert.strictEqual(els.get("#lx-source-list").innerHTML, sourceManagementBefore, "排序不能搬动原源管理列表");
+  global.deactivateLxSource(1);
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-b", "source-a"], "停用后保留历史位置");
+  global.deleteLxSource(0);
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-a"], "删除后清理稳定 ID");
+});
+
+test("高级页保存：排序通过专用接口同步，避免重复提交源管理列表", async () => {
+  reset();
+  const sourceList = [
+    { id: "source-a", name: "源甲", url: "https://s/a.js", active: true },
+    { id: "source-b", name: "源乙", url: "https://s/b.js", active: true },
+  ];
+  const schema = {
+    FNMUSIC_MUSICDL_ENABLED: { kind: "bool" }, FNMUSIC_NETEASE_ENABLED: { kind: "bool" },
+    FNMUSIC_LX_ENABLED: { kind: "bool" }, FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+    FNMUSIC_LX_PLATFORM_PREFERRED: { kind: "bool" }, FNMUSIC_LX_SOURCE_ORDER: { kind: "str" },
+  };
+  qsaRegistry.set("input[name=provider]", [{ value: "lxmusic", checked: true }]);
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: {
+    FNMUSIC_LX_ENABLED: "true", FNMUSIC_NETEASE_ENABLED: "false", FNMUSIC_MUSICDL_ENABLED: "false",
+    FNMUSIC_LX_AUTO_SWITCH: "true", FNMUSIC_LX_PLATFORM_PREFERRED: "false",
+    FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]', LX_SOURCE_LIST: JSON.stringify(sourceList),
+    LX_RESOLVER_TIMEOUT: "8.0", LX_URL_TIMEOUT: "15.0", LX_PROBE_TIMEOUT: "3.0",
+  } });
+  enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: [], actions: [] });
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]' } });
+  enqueue("/app/fnmusic-ext/api/lx/source/reorder", { ok: true, changed: ["FNMUSIC_LX_SOURCE_ORDER"] });
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: {
+    FNMUSIC_LX_ENABLED: "true", FNMUSIC_NETEASE_ENABLED: "false", FNMUSIC_MUSICDL_ENABLED: "false",
+    FNMUSIC_LX_AUTO_SWITCH: "true", FNMUSIC_LX_PLATFORM_PREFERRED: "false",
+    FNMUSIC_LX_SOURCE_ORDER: '["source-b","source-a"]', LX_SOURCE_LIST: JSON.stringify(sourceList),
+    LX_RESOLVER_TIMEOUT: "8.0", LX_URL_TIMEOUT: "15.0", LX_PROBE_TIMEOUT: "3.0",
+  } });
+  await global.loadConfig();
+  global.switchPage("lx");
+  assert.strictEqual(global.moveLxSource("source-b", -1), true);
+  await global.saveConfig();
+  const configPut = fetchCalls.find((call) => call.path.endsWith("/api/config") && call.method === "PUT");
+  const configValues = JSON.parse(configPut.body).values;
+  assert.ok(!("LX_SOURCE_LIST" in configValues), "高级排序保存不得重做源列表激活");
+  assert.ok(!("FNMUSIC_LX_SOURCE_ORDER" in configValues), "启用洛雪时排序通过专用代理接口保存");
+  const reorderCall = fetchCalls.find((call) => call.path.endsWith("/api/lx/source/reorder"));
+  assert.deepStrictEqual(JSON.parse(reorderCall.body), { source_ids: ["source-b", "source-a"] });
+});
+
+test("高级页保存：排序返回 409 忙时 toast 提示洛雪源正忙并恢复保存前顺序", async () => {
+  reset();
+  const sourceList = [
+    { id: "source-a", name: "源甲", url: "https://s/a.js", active: true },
+    { id: "source-b", name: "源乙", url: "https://s/b.js", active: true },
+  ];
+  const schema = {
+    FNMUSIC_LX_ENABLED: { kind: "bool" }, FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+    FNMUSIC_LX_PLATFORM_PREFERRED: { kind: "bool" }, FNMUSIC_LX_SOURCE_ORDER: { kind: "str" },
+  };
+  qsaRegistry.set("input[name=provider]", [{ value: "lxmusic", checked: true }]);
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: {
+    FNMUSIC_LX_ENABLED: "true", FNMUSIC_LX_AUTO_SWITCH: "true",
+    FNMUSIC_LX_PLATFORM_PREFERRED: "false",
+    FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]', LX_SOURCE_LIST: JSON.stringify(sourceList),
+  } });
+  enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: [], actions: [] });
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]' } });
+  enqueue("/app/fnmusic-ext/api/lx/source/reorder", {
+    __rawResponse: true,
+    resp: { ok: false, status: 409, json: async () => ({ ok: false, error: "源操作正忙", category: "source_operation_busy" }) },
+  });
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: {
+    FNMUSIC_LX_ENABLED: "true", FNMUSIC_LX_AUTO_SWITCH: "true",
+    FNMUSIC_LX_PLATFORM_PREFERRED: "false",
+    FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]', LX_SOURCE_LIST: JSON.stringify(sourceList),
+  } });
+  enqueue("/app/fnmusic-ext/api/status", { ok: true, current_provider: "lxmusic", processes: {} });
+
+  await global.loadConfig();
+  global.switchPage("lx");
+  assert.strictEqual(global.moveLxSource("source-b", -1), true);
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-b", "source-a"]);
+  await global.saveConfig();
+  assert.ok(els.get("#toast").textContent.includes("忙"));
+  assert.strictEqual(els.get("#toast").className, "toast fail");
+  assert.deepStrictEqual(global.getLxSourceOrder(), ["source-a", "source-b"], "失败后恢复保存前顺序");
+});
+
+test("洛雪排序：关闭自动切换时禁止 touchstart 触屏默认动作", async () => {
+  reset();
+  const itemEl = stubEl();
+  itemEl.dataset.sourceId = "source-a";
+  const container = els.get("#lx-source-order-list");
+  container.querySelectorAll = (sel) => (sel === ".lx-order-item" ? [itemEl] : []);
+  enqueue("/app/fnmusic-ext/api/config", { schema: {
+    FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+    FNMUSIC_LX_PLATFORM_PREFERRED: { kind: "bool" },
+    FNMUSIC_LX_SOURCE_ORDER: { kind: "str" },
+  }, values: {
+    FNMUSIC_LX_AUTO_SWITCH: "false", FNMUSIC_LX_PLATFORM_PREFERRED: "false",
+    FNMUSIC_LX_SOURCE_ORDER: '["source-a"]',
+    LX_SOURCE_LIST: JSON.stringify([{ id: "source-a", name: "源甲", url: "https://s/a.js", active: true }]),
+  } });
+  await global.loadConfig();
+  let prevented = false;
+  await itemEl.dispatch("touchstart", { preventDefault: () => { prevented = true; } });
+  assert.strictEqual(prevented, true, "自动切换关闭时 touchstart 必须被阻止默认行为");
+});
+
+test("Schema 过滤与构建指纹：只发送支持键并提示 HTML/API 版本错配", async () => {
+  reset();
+  global.window.FNMUSIC_WEBUI_BUILD = "static-1";
+  enqueue("/app/fnmusic-ext/api/config", { schema: {
+    FNMUSIC_LX_AUTO_SWITCH: { kind: "bool" },
+  }, webui_build: "static-2", values: {} });
+  await global.loadConfig();
+  assert.deepStrictEqual(global.filterConfigBySchema({
+    FNMUSIC_LX_AUTO_SWITCH: true, FNMUSIC_SEARCH_PROBE: false,
+  }), { FNMUSIC_LX_AUTO_SWITCH: true });
+  assert.strictEqual(els.get("#webui-build-mismatch").hidden, false);
+});
+
+test("音质配置：回填七档官方名称并只提交新键", async () => {
+  reset();
+  const playLevels = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster", "sky"];
+  const downloadLevels = ["app", ...playLevels];
+  const playRadios = playLevels.map((value) => Object.assign(stubEl(), { value }));
+  const downloadRadios = downloadLevels.map((value) => Object.assign(stubEl(), { value }));
+  qsaRegistry.set("input[name=play-quality]", playRadios);
+  qsaRegistry.set("input[name=download-quality]", downloadRadios);
+  enqueue("/app/fnmusic-ext/api/config", { schema: {
+    FNMUSIC_PLAY_QUALITY: { kind: "enum" }, FNMUSIC_DOWNLOAD_QUALITY: { kind: "enum" },
+  }, values: {
+    FNMUSIC_PLAY_QUALITY: "lossless", FNMUSIC_DOWNLOAD_QUALITY: "app",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(playRadios.find((el) => el.value === "lossless").checked, true);
+  assert.strictEqual(downloadRadios.find((el) => el.value === "app").checked, true);
+  const values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_PLAY_QUALITY, "lossless");
+  assert.strictEqual(values.FNMUSIC_DOWNLOAD_QUALITY, "app");
+  assert.ok(!("FNMUSIC_QUALITY_MODE" in values));
+  assert.ok(!("FNMUSIC_DL_QUALITY" in values));
+});
+
+test("HTML/CSS：高级洛雪子页、七档官方标签与排序可访问性完整", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const js = fs.readFileSync(path.join(__dirname, "static", "app.js"), "utf8");
+  const labels = ["标准", "较高", "极高", "无损", "Hi-Res", "超清母带", "沉浸声"];
+  for (const label of labels) assert.ok(html.includes(label), `缺少官方音质名 ${label}`);
+  for (const id of ["lx-auto-switch", "lx-platform-preferred", "lx-source-order-list"]) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 缺少 ${id}`);
+  }
+  assert.ok(html.includes('data-page="lx"'));
+  assert.ok(js.includes('draggable="${disabled ? "false" : "true"}"'));
+  assert.ok(js.includes("上移") && js.includes("下移"), "排序必须提供键盘可达按钮");
+  assert.ok(!js.includes("FNMUSIC_QUALITY_MODE") && !js.includes("FNMUSIC_DL_QUALITY"));
+  assert.ok(js.includes('FNMUSIC_LX_AUTO_SWITCH') && js.includes('FNMUSIC_LX_SOURCE_ORDER'));
+});
+
 test("HTML/CSS 规范：?视觉与触屏规范、大模型页面标题、APP下载音质及LLM卡片完整接口", () => {
   const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
   const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");

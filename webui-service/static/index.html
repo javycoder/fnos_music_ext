@@ -6,7 +6,8 @@
   <title>fnmusic-ext 管理台</title>
   <!-- 先定主题再加载样式，深色模式下避免首屏白闪 -->
   <script src="/app/fnmusic-ext/static/theme-boot.js"></script>
-  <link rel="stylesheet" href="/app/fnmusic-ext/static/style.css">
+  <script>window.FNMUSIC_WEBUI_BUILD = "__WEBUI_BUILD__";</script>
+  <link rel="stylesheet" href="/app/fnmusic-ext/static/style.css?build=__WEBUI_BUILD__">
   <link rel="icon" type="image/png" href="/app/fnmusic-ext/static/icon.png">
 </head>
 <body>
@@ -38,6 +39,7 @@
             <span>高级</span><span class="nav-arrow" aria-hidden="true">▾</span>
           </button>
           <div class="nav-group-subs" id="nav-advanced-subs" hidden>
+            <button class="nav-item nav-sub" data-page="lx">lx音乐源</button>
             <button class="nav-item nav-sub" data-page="llm">大模型</button>
           </div>
         </div>
@@ -48,6 +50,9 @@
     </aside>
 
     <main class="main">
+      <div class="hint warning" id="webui-build-mismatch" role="alert" hidden>
+        WebUI 静态资源与后端配置接口版本不匹配。请刷新页面；若提示仍在，请重新打开管理页。
+      </div>
       <!-- 概览 -->
       <section class="page active" id="page-overview">
         <h2>概览</h2>
@@ -189,20 +194,31 @@
           <p class="hint">测试功能，如遇播放异常可以尝试关闭</p>
         </div>
         <div class="card">
-          <div class="card-title"><span>音质偏好</span><button class="help-btn" type="button" data-help="quality" aria-label="音质偏好帮助">?</button></div>
+          <div class="card-title"><span>在线播放音质</span><button class="help-btn" type="button" data-help="quality" aria-label="在线播放音质帮助">?</button></div>
           <div class="radio-list" id="quality-list">
-            <label><input type="radio" name="quality" value="high"><div><b>高音质</b><span>优先最高档，失败逐级向下</span></div></label>
-            <label><input type="radio" name="quality" value="balanced"><div><b>平衡</b><span>取中间档（偶数档取中间偏高），失败先降后升</span></div></label>
-            <label><input type="radio" name="quality" value="smooth"><div><b>流畅</b><span>优先最低档，最快出声</span></div></label>
+            <label><input type="radio" name="play-quality" value="standard"><div><b>标准</b><span>128 kbps</span></div></label>
+            <label><input type="radio" name="play-quality" value="higher"><div><b>较高</b><span>192 kbps</span></div></label>
+            <label><input type="radio" name="play-quality" value="exhigh"><div><b>极高</b><span>320 kbps</span></div></label>
+            <label><input type="radio" name="play-quality" value="lossless"><div><b>无损</b><span>FLAC；默认档位</span></div></label>
+            <label><input type="radio" name="play-quality" value="hires"><div><b>Hi-Res</b><span>FLAC 24 bit</span></div></label>
+            <label><input type="radio" name="play-quality" value="jymaster"><div><b>超清母带</b><span>需要音源和账号支持</span></div></label>
+            <label><input type="radio" name="play-quality" value="sky"><div><b>沉浸声</b><span>需要音源和账号支持</span></div></label>
           </div>
+          <p class="hint">所选档位不可用时只逐级降档，不会回升。实际音质受账号权益和音源能力限制；musicdl 不保证每个平台都提供全部档位。</p>
         </div>
         <div class="card">
           <div class="card-title"><span>APP下载音质</span><button class="help-btn" type="button" data-help="download-quality" aria-label="APP下载音质帮助">?</button></div>
           <div class="radio-list" id="dl-quality-list">
-            <label><input type="radio" name="dl-quality" value="app"><div><b>跟随 App</b><span>App 明确选"标准"才交 MP3，其余一律无损原文件（FLAC 等）</span></div></label>
-            <label><input type="radio" name="dl-quality" value="original"><div><b>无损原文件</b><span>下载一律交付原文件，App 选"标准"也不转码</span></div></label>
-            <label><input type="radio" name="dl-quality" value="standard"><div><b>MP3 320k</b><span>一律按官方"标准"档交 MP3 320kbps（省空间，与官方一致）</span></div></label>
+            <label><input type="radio" name="download-quality" value="app"><div><b>跟随 App</b><span>默认；使用 App 请求的音质档位</span></div></label>
+            <label><input type="radio" name="download-quality" value="standard"><div><b>标准</b><span>128 kbps</span></div></label>
+            <label><input type="radio" name="download-quality" value="higher"><div><b>较高</b><span>192 kbps</span></div></label>
+            <label><input type="radio" name="download-quality" value="exhigh"><div><b>极高</b><span>320 kbps</span></div></label>
+            <label><input type="radio" name="download-quality" value="lossless"><div><b>无损</b><span>FLAC</span></div></label>
+            <label><input type="radio" name="download-quality" value="hires"><div><b>Hi-Res</b><span>FLAC 24 bit</span></div></label>
+            <label><input type="radio" name="download-quality" value="jymaster"><div><b>超清母带</b><span>需要音源和账号支持</span></div></label>
+            <label><input type="radio" name="download-quality" value="sky"><div><b>沉浸声</b><span>需要音源和账号支持</span></div></label>
           </div>
+          <p class="hint">下载音质独立于在线播放设置。源缺少所选档位时按策略向下选择；不会把低品质文件包装成高品质。</p>
         </div>
         <div class="card">
           <div class="card-title"><span>推荐与公共歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
@@ -247,6 +263,26 @@
               <div id="public-selected" class="stack"></div>
             </div>
           </div>
+        </div>
+      </section>
+
+      <!-- 高级：洛雪播放策略与源顺序；不复用音源导入管理面板 -->
+      <section class="page" id="page-lx">
+        <h2>lx音乐源</h2>
+        <p class="hint">仅当洛雪是主音源时影响播放。打开本页或在其他主音源下保存偏好，不会启动洛雪服务。</p>
+        <div class="card">
+          <div class="card-title">自动切换</div>
+          <label class="switch-row"><span>自动切换可用脚本</span><input type="checkbox" id="lx-auto-switch"></label>
+          <div id="lx-platform-preferred-row" hidden>
+            <label class="switch-row"><span>跨平台优选同一首歌</span><input type="checkbox" id="lx-platform-preferred"></label>
+            <p class="hint">仅在当前脚本声明的平台范围内尝试匹配，不更改源激活状态。</p>
+          </div>
+        </div>
+        <div class="card" id="lx-source-order-card" aria-disabled="true">
+          <div class="card-title">已激活源顺序</div>
+          <p class="hint">同一音质档位按此顺序尝试脚本。停用源保留原位置；重新激活后恢复顺序；删除源会移除其排序 ID。</p>
+          <div id="lx-source-order-list" class="stack" role="list" aria-label="洛雪已激活源顺序"></div>
+          <p id="lx-source-order-note" class="hint" role="status"></p>
         </div>
       </section>
 
@@ -478,6 +514,7 @@
     <div class="bottom-nav-group">
       <button class="nav-item bottom-nav-trigger" id="bottom-advanced-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-advanced-menu">高级</button>
       <div class="bottom-sub-menu" id="bottom-advanced-menu" role="menu" hidden>
+        <button class="bottom-sub-item nav-item" data-page="lx" role="menuitem">lx音乐源</button>
         <button class="bottom-sub-item nav-item" data-page="llm" role="menuitem">大模型</button>
       </div>
     </div>
@@ -530,10 +567,11 @@
     <p>实际兼容性取决于洛雪脚本和目标 CDN，部分平台依赖 UA/Referer 或 Cookie。更换脚本后需要重新验证；脚本选出的原文件表示不会被伪装成客户端已可播。</p>
   </template>
   <template data-help-id="quality">
-    <p>只影响在线播放/搜索时按什么档位取歌：高音质优先无损原文件；平衡取中间档；流畅优先低档。保存后热更新生效。</p>
+    <p>只影响在线播放取歌。七档从标准到沉浸声排列，默认无损；所选档位缺失时严格向下选择，不会回升。实际音质受音源能力与账号权益限制。</p>
+    <p>musicdl 各平台支持档位不同，不能保证每个平台都有全部选项。扩展不会把低品质音频重新编码后标成 Hi-Res 或母带。</p>
   </template>
   <template data-help-id="download-quality">
-    <p>只影响 App 内点“下载”拿到的文件。默认“跟随 App”：只有 App 明确选标准才交 MP3，其余保持原文件；无损歌曲不会擅自转成 MP3。</p>
+    <p>下载音质与在线播放音质独立。默认“跟随 App”会按 App 请求选择目标档位；固定档位缺失时只向下选择。实际交付仍取决于账号权益和音源能力。</p>
   </template>
   <template data-help-id="recommend">
     <p>热门榜单与每日推荐是两个独立歌单。公共歌单可浏览并勾选网易/洛雪的原生榜单和分类歌单，作为只读歌单展示；musicdl 没有统一推荐歌单发现接口。</p>
@@ -616,6 +654,6 @@
 
   <div class="toast" id="toast" hidden></div>
 
-  <script src="/app/fnmusic-ext/static/app.js"></script>
+  <script src="/app/fnmusic-ext/static/app.js?build=__WEBUI_BUILD__"></script>
 </body>
 </html>

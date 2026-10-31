@@ -282,6 +282,22 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   font-size: 12px; font-weight: 500; background: var(--ok-soft); color: var(--ok);
 }
 
+/* 高级洛雪页独立排序层；原导入/激活列表仍使用 LX_SOURCE_LIST 原顺序。 */
+#lx-source-order-card.is-disabled { opacity: .58; }
+#lx-source-order-card.is-disabled .lx-order-item { pointer-events: none; touch-action: none; }
+.lx-order-item {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--chip-bg);
+}
+.lx-order-item[draggable="true"] { cursor: grab; }
+.lx-order-item[draggable="true"]:active { cursor: grabbing; }
+.lx-order-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lx-order-handle { color: var(--muted); user-select: none; touch-action: none; }
+.lx-order-name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+.lx-order-buttons { display: flex; flex: none; gap: 6px; }
+.lx-order-buttons .btn { min-width: 52px; min-height: 44px; padding: 5px 8px; }
+
 /* -------------------------------------------------- 目录权限校验状态行 */
 .dir-check { font-size: 13px; overflow-wrap: anywhere; }
 .dir-check.ok { color: var(--ok); }

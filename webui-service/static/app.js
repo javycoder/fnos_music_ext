@@ -16,6 +16,8 @@ let configPresence = {}; // .env 显式存在的键（区分默认空与管理�
 let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
+let currentPage = "overview";
+let lxSourceListDirty = false; // 避免高级策略保存时重复触发原源列表的激活/校验流程
 const DOWNLOAD_LAYOUT_LABELS = {
   flat: "歌曲",
   artist: "歌手/歌曲",
@@ -25,6 +27,7 @@ const DOWNLOAD_LAYOUT_LABELS = {
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
 let lxSourceList = [];    // 本地待保存配置；运行状态轮询不可覆盖 active
+let lxSourceOrder = [];   // 洛雪稳定源 ID 顺序；停用时保留历史位置
 let lxRuntimeSnapshot = null; // /api/status 的只读运行快照
 const LX_STATE_LABEL = { unconfigured: "未配置", loading: "初始化中", ready: "可用", degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" };
 const LX_SOURCE_STATUS_LABEL = { success: "运行就绪", failed: "运行失败", loading: "初始化中", unknown: "运行状态未知" };
@@ -304,11 +307,12 @@ function openBottomSubMenu(trigger, menu) {
 }
 
 function switchPage(page) {
+  currentPage = page;
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === "page-" + page));
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
 
   const isStorageSub = page === "tee" || page === "dirs";
-  const isAdvancedSub = page === "llm";
+  const isAdvancedSub = page === "llm" || page === "lx";
 
   const storageTitle = $("#nav-storage-title");
   if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
@@ -506,7 +510,9 @@ async function loadStatus() {
       return `<span class="state-line"><span class="dot ok"></span>${escapeHtml(PROC_LABEL[name])}：正常</span>`;
     }).join("");
     lxRuntimeSnapshot = st.lx_source || null;
+    syncLxSourceOrder();
     renderLxSourceList(); // 只同步运行徽标，不重载配置或丢弃尚未保存的编辑。
+    renderLxSourceOrder();
     const lxCard = $("#ov-lx-card");
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
@@ -547,6 +553,11 @@ async function loadConfig() {
   configValues = cfg.values;
   configPresence = cfg.presence || {};
   configSchema = cfg.schema || {};
+  const expectedBuild = typeof window !== "undefined" ? window.FNMUSIC_WEBUI_BUILD || "" : "";
+  const apiBuild = cfg.webui_build || "";
+  const mismatch = Boolean(expectedBuild && apiBuild && expectedBuild !== apiBuild)
+    || Boolean(expectedBuild && !apiBuild);
+  $("#webui-build-mismatch").hidden = !mismatch;
   applyConfigToForm();
   clearDirty();
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) await loadMusicUsers();
@@ -560,8 +571,18 @@ function applyConfigToForm() {
   $$("input[name=provider]").forEach((el) => { el.checked = el.value === provider; });
   syncProviderPanels(provider);
   if (provider === "musicbox") syncNeteaseAccount();
-  const quality = v.FNMUSIC_QUALITY_MODE || "high";
-  $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
+  const hasAutoSwitch = Boolean(configSchema.FNMUSIC_LX_AUTO_SWITCH);
+  const hasPlatformPreferred = Boolean(configSchema.FNMUSIC_LX_PLATFORM_PREFERRED);
+  $("#lx-auto-switch").disabled = !hasAutoSwitch;
+  $("#lx-auto-switch").checked = hasAutoSwitch
+    ? ["true", "1", "yes", "on"].includes(String(v.FNMUSIC_LX_AUTO_SWITCH ?? "true").trim().toLowerCase()) : false;
+  $("#lx-platform-preferred").disabled = !hasPlatformPreferred;
+  $("#lx-platform-preferred").checked = hasPlatformPreferred
+    ? ["true", "1", "yes", "on"].includes(String(v.FNMUSIC_LX_PLATFORM_PREFERRED || "false").trim().toLowerCase()) : false;
+  const playQuality = v.FNMUSIC_PLAY_QUALITY || "lossless";
+  $$("input[name=play-quality]").forEach((el) => { el.checked = el.value === playQuality; });
+  const downloadQuality = v.FNMUSIC_DOWNLOAD_QUALITY || "app";
+  $$("input[name=download-quality]").forEach((el) => { el.checked = el.value === downloadQuality; });
   [
     ["#direct-netease", "FNMUSIC_NETEASE_DIRECT_PLAY"],
     ["#direct-musicdl", "FNMUSIC_MUSICDL_DIRECT_PLAY"],
@@ -571,8 +592,6 @@ function applyConfigToForm() {
     el.disabled = !configSchema[key];
     el.checked = configSchema[key] ? ["true", "1", "yes", "on"].includes(String(v[key] || "").trim().toLowerCase()) : false;
   });
-  const dlQuality = v.FNMUSIC_DL_QUALITY || "app";
-  $$("input[name=dl-quality]").forEach((el) => { el.checked = el.value === dlQuality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
@@ -635,6 +654,7 @@ function applyConfigToForm() {
   $("#lx-resolver-timeout").value = v.LX_RESOLVER_TIMEOUT || "8.0";
   $("#lx-url-timeout").value = v.LX_URL_TIMEOUT || "15.0";
   $("#lx-probe-timeout").value = v.LX_PROBE_TIMEOUT || "3.0";
+  lxSourceListDirty = false;
   try {
     const rawList = v.LX_SOURCE_LIST;
     lxSourceList = rawList ? JSON.parse(rawList) : [];
@@ -642,6 +662,12 @@ function applyConfigToForm() {
   } catch (_) {
     lxSourceList = [];
   }
+  try {
+    const parsedOrder = JSON.parse(v.FNMUSIC_LX_SOURCE_ORDER || "[]");
+    lxSourceOrder = Array.isArray(parsedOrder)
+      ? [...new Set(parsedOrder.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim()))]
+      : [];
+  } catch (_) { lxSourceOrder = []; }
   // 兼容旧数据：列表无任何 active 标记时按 LX_SOURCE_URL 推导
   const savedUrl = (v.LX_SOURCE_URL || "").trim();
   if (lxSourceList.length && !lxSourceList.some((item) => "active" in item)) {
@@ -651,7 +677,10 @@ function applyConfigToForm() {
   if (savedUrl && !lxSourceList.some((item) => item.url === savedUrl)) {
     lxSourceList.unshift({ name: lxDefaultName(savedUrl), url: savedUrl, active: true });
   }
+  syncLxSourceOrder();
+  updateLxAutoSwitchSettings();
   renderLxSourceList();
+  renderLxSourceOrder();
   syncLxAddButton();
   renderPlatformChips();
 }
@@ -665,8 +694,17 @@ function collectConfig() {
     ...(configSchema.FNMUSIC_NETEASE_DIRECT_PLAY ? { FNMUSIC_NETEASE_DIRECT_PLAY: $("#direct-netease").checked } : {}),
     ...(configSchema.FNMUSIC_MUSICDL_DIRECT_PLAY ? { FNMUSIC_MUSICDL_DIRECT_PLAY: $("#direct-musicdl").checked } : {}),
     ...(configSchema.FNMUSIC_LX_DIRECT_PLAY ? { FNMUSIC_LX_DIRECT_PLAY: $("#direct-lx").checked } : {}),
-    FNMUSIC_QUALITY_MODE: ($$("input[name=quality]").find((el) => el.checked) || {}).value || "high",
-    FNMUSIC_DL_QUALITY: ($$("input[name=dl-quality]").find((el) => el.checked) || {}).value || "app",
+    ...(configSchema.FNMUSIC_PLAY_QUALITY ? {
+      FNMUSIC_PLAY_QUALITY: ($$("input[name=play-quality]").find((el) => el.checked) || {}).value || "lossless",
+    } : {}),
+    ...(configSchema.FNMUSIC_DOWNLOAD_QUALITY ? {
+      FNMUSIC_DOWNLOAD_QUALITY: ($$("input[name=download-quality]").find((el) => el.checked) || {}).value || "app",
+    } : {}),
+    ...(configSchema.FNMUSIC_LX_AUTO_SWITCH ? { FNMUSIC_LX_AUTO_SWITCH: $("#lx-auto-switch").checked } : {}),
+    ...(configSchema.FNMUSIC_LX_PLATFORM_PREFERRED && $("#lx-auto-switch").checked
+      ? { FNMUSIC_LX_PLATFORM_PREFERRED: $("#lx-platform-preferred").checked } : {}),
+    ...(configSchema.FNMUSIC_LX_SOURCE_ORDER
+      ? { FNMUSIC_LX_SOURCE_ORDER: JSON.stringify(lxSourceOrder) } : {}),
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
     FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: $("#public-playlists-enabled").checked,
@@ -755,9 +793,16 @@ function collectConfig() {
   return values;
 }
 
+function filterConfigBySchema(values) {
+  const supported = new Set(Object.keys(configSchema || {}));
+  // 正常后端总会返回 Schema；无 Schema 的旧测试桩/旧服务保留原有兼容流程。
+  if (!supported.size) return values;
+  return Object.fromEntries(Object.entries(values).filter(([key]) => supported.has(key)));
+}
+
 async function saveConfig() {
   let values;
-  try { values = collectConfig(); } catch (exc) { toast(exc.message, "fail"); return; }
+  try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
   // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
   // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
   for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
@@ -774,12 +819,50 @@ async function saveConfig() {
   btn.textContent = pendingNew > 0
     ? `保存中（校验 ${pendingNew} 个新激活源，可能需要 1-2 分钟）…`
     : "保存中…";
+  const syncOrderThroughProxy = values.FNMUSIC_LX_ENABLED === true
+    && $("#lx-auto-switch").checked
+    && Boolean(configSchema.FNMUSIC_LX_SOURCE_ORDER);
+  const requestedOrder = lxSourceOrder.slice();
+  if (syncOrderThroughProxy) delete values.FNMUSIC_LX_SOURCE_ORDER;
+  if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
   try {
     const result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ values }),
     });
+    let orderApplied = false;
+    if (syncOrderThroughProxy) {
+      // 配置保存可能为新激活源补入 lxserver ID；将它们追加到用户排序之后再调用专用代理。
+      const savedConfig = await api("/api/config");
+      let savedOrder = [];
+      try {
+        const parsed = JSON.parse(savedConfig.values.FNMUSIC_LX_SOURCE_ORDER || "[]");
+        if (Array.isArray(parsed)) savedOrder = parsed.filter((id) => typeof id === "string");
+      } catch (_) { /* 共享配置格式错误时保留当前顺序，接口会给出明确校验错误 */ }
+      const finalOrder = requestedOrder.slice();
+      savedOrder.forEach((id) => { if (!finalOrder.includes(id)) finalOrder.push(id); });
+      if (JSON.stringify(finalOrder) !== JSON.stringify(savedOrder)) {
+        try {
+          const reorder = await api("/api/lx/source/reorder", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source_ids: finalOrder }),
+          });
+          orderApplied = Boolean((reorder.changed || []).includes("FNMUSIC_LX_SOURCE_ORDER"));
+          if (orderApplied) result.changed = [...new Set([...(result.changed || []), "FNMUSIC_LX_SOURCE_ORDER"])];
+        } catch (exc) {
+          await loadConfig();
+          await loadStatus();
+          const isBusy = exc.status === 409 || exc.body?.category === "source_operation_busy";
+          const reason = isBusy
+            ? (exc.message && exc.message.includes("忙") ? exc.message : "洛雪源正忙，请稍候重试")
+            : exc.message;
+          toast(`其他配置已保存；洛雪源排序失败，${reason}；已恢复保存顺序`, "fail");
+          return;
+        }
+      }
+    }
     const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
     const warnings = result.warnings || [];
     const parts = [];
@@ -2053,6 +2136,171 @@ function findLxRuntimeSource(item, sources) {
   return undefined;
 }
 
+// 只用持久化 source.id、准确 URL 或本地上传文件 ID 建立排序身份，不按显示名称猜测。
+function lxStableSourceId(item) {
+  if (item && typeof item.id === "string" && item.id.trim()) return item.id.trim();
+  if (item && typeof item.source_id === "string" && item.source_id.trim()) return item.source_id.trim();
+  const sources = Array.isArray(lxRuntimeSnapshot?.sources) ? lxRuntimeSnapshot.sources : [];
+  const url = String(item?.url || "");
+  const exactUrl = sources.filter((source) => source && source.url === url && source.id);
+  if (exactUrl.length === 1) return String(exactUrl[0].id);
+  if (url.toLowerCase().startsWith("file://")) {
+    let filename = url.replace(/\\/g, "/").split("/").pop() || "";
+    try { filename = decodeURIComponent(filename); } catch (_) { /* 保留原始路径尾段 */ }
+    const ids = sources.filter((source) => source && source.id === filename).map((source) => String(source.id));
+    if (ids.length === 1) return ids[0];
+  }
+  return "";
+}
+
+function syncLxSourceOrder() {
+  lxSourceList.forEach((item) => {
+    const id = lxStableSourceId(item);
+    if (id && !item.id) {
+      item.id = id;
+      lxSourceListDirty = true;
+    }
+    if (id && item.active && !lxSourceOrder.includes(id)) lxSourceOrder.push(id);
+  });
+}
+
+function getLxSourceOrder() {
+  return lxSourceOrder.slice();
+}
+
+function activeLxOrderItems() {
+  return lxSourceList.filter((item) => item && item.active).map((item, index) => ({
+    item, index, id: lxStableSourceId(item),
+  })).sort((left, right) => {
+    const leftPosition = left.id ? lxSourceOrder.indexOf(left.id) : -1;
+    const rightPosition = right.id ? lxSourceOrder.indexOf(right.id) : -1;
+    if (leftPosition >= 0 && rightPosition >= 0) return leftPosition - rightPosition;
+    return left.index - right.index;
+  });
+}
+
+function canReorderLxSources() {
+  if (!$("#lx-auto-switch").checked || !configSchema.FNMUSIC_LX_AUTO_SWITCH
+      || !configSchema.FNMUSIC_LX_SOURCE_ORDER) return false;
+  const ids = activeLxOrderItems().map((entry) => entry.id);
+  return ids.every(Boolean) && new Set(ids).size === ids.length;
+}
+
+function updateLxAutoSwitchSettings() {
+  const autoSwitch = $("#lx-auto-switch");
+  const preferredRow = $("#lx-platform-preferred-row");
+  const preferred = $("#lx-platform-preferred");
+  const orderCard = $("#lx-source-order-card");
+  const enabled = Boolean(configSchema.FNMUSIC_LX_AUTO_SWITCH && autoSwitch.checked);
+  preferredRow.hidden = !enabled;
+  preferred.disabled = !configSchema.FNMUSIC_LX_PLATFORM_PREFERRED || !enabled;
+  const reorderable = canReorderLxSources();
+  orderCard.classList.toggle("is-disabled", !reorderable);
+  orderCard.setAttribute("aria-disabled", String(!reorderable));
+  renderLxSourceOrder();
+}
+
+function reorderLxSourceTo(sourceId, targetIndex) {
+  if (!canReorderLxSources()) return false;
+  const visibleIds = activeLxOrderItems().map((entry) => entry.id);
+  const oldIndex = visibleIds.indexOf(sourceId);
+  if (oldIndex < 0 || targetIndex < 0 || targetIndex >= visibleIds.length || oldIndex === targetIndex) return false;
+  visibleIds.splice(targetIndex, 0, visibleIds.splice(oldIndex, 1)[0]);
+  const activeIds = new Set(visibleIds);
+  let pointer = 0;
+  const next = lxSourceOrder.map((id) => activeIds.has(id) ? visibleIds[pointer++] : id);
+  while (pointer < visibleIds.length) next.push(visibleIds[pointer++]);
+  if (next.every((id, index) => id === lxSourceOrder[index]) && next.length === lxSourceOrder.length) return false;
+  lxSourceOrder = next;
+  renderLxSourceOrder();
+  markDirty("洛雪源顺序已修改，保存后生效");
+  return true;
+}
+
+function moveLxSource(sourceId, offset) {
+  if (!canReorderLxSources()) return false;
+  const visibleIds = activeLxOrderItems().map((entry) => entry.id);
+  const index = visibleIds.indexOf(sourceId);
+  if (index < 0) return false;
+  return reorderLxSourceTo(sourceId, index + offset);
+}
+
+let draggingLxSourceId = "";
+
+function renderLxSourceOrder() {
+  const container = $("#lx-source-order-list");
+  const note = $("#lx-source-order-note");
+  if (!container || !note) return;
+  syncLxSourceOrder();
+  const rows = activeLxOrderItems();
+  const reorderable = canReorderLxSources();
+  if (!rows.length) {
+    container.innerHTML = '<span class="muted">暂无已激活源</span>';
+    note.textContent = "";
+    return;
+  }
+  container.innerHTML = rows.map(({ item, id }, index) => {
+    const label = escapeHtml(item.name || lxDefaultName(item.url));
+    const disabled = !reorderable || !id;
+    const idText = id ? "" : "（待同步稳定 ID）";
+    return `<div class="lx-order-item" role="listitem" draggable="${disabled ? "false" : "true"}"
+        tabindex="${disabled ? "-1" : "0"}" aria-disabled="${disabled}" data-source-id="${escapeHtml(id)}">
+      <span class="lx-order-handle" aria-hidden="true">⋮⋮</span>
+      <span class="lx-order-name">${label}${idText}</span>
+      <div class="lx-order-buttons">
+        <button class="btn small lx-order-up" type="button" data-source-id="${escapeHtml(id)}" aria-label="${label}上移" ${disabled || index === 0 ? "disabled" : ""}>上移</button>
+        <button class="btn small lx-order-down" type="button" data-source-id="${escapeHtml(id)}" aria-label="${label}下移" ${disabled || index === rows.length - 1 ? "disabled" : ""}>下移</button>
+      </div>
+    </div>`;
+  }).join("");
+  if (!$("#lx-auto-switch").checked) {
+    note.textContent = "自动切换已关闭，排序已禁用；已保存顺序不会清空。";
+  } else if (rows.some((row) => !row.id)) {
+    note.textContent = "部分旧源还没有稳定 ID。切到洛雪主音源后，WebUI 会按已验证 URL 或上传文件身份同步；不会按名称猜测。";
+  } else {
+    note.textContent = "可拖动排序，也可用上移/下移按钮操作。";
+  }
+
+  container.querySelectorAll(".lx-order-up").forEach((button) => {
+    button.addEventListener("click", () => moveLxSource(button.dataset.sourceId, -1));
+  });
+  container.querySelectorAll(".lx-order-down").forEach((button) => {
+    button.addEventListener("click", () => moveLxSource(button.dataset.sourceId, 1));
+  });
+  container.querySelectorAll(".lx-order-item").forEach((row) => {
+    row.addEventListener("dragstart", (event) => {
+      if (!canReorderLxSources()) { event.preventDefault(); return; }
+      draggingLxSourceId = row.dataset.sourceId || "";
+      if (event.dataTransfer) event.dataTransfer.setData("text/plain", draggingLxSourceId);
+    });
+    row.addEventListener("touchstart", (event) => {
+      if (!canReorderLxSources()) event.preventDefault();
+    }, { passive: false });
+    row.addEventListener("dragover", (event) => {
+      if (canReorderLxSources()) event.preventDefault();
+    });
+    row.addEventListener("drop", (event) => {
+      if (!canReorderLxSources()) return;
+      event.preventDefault();
+      const sourceId = (event.dataTransfer && event.dataTransfer.getData("text/plain")) || draggingLxSourceId;
+      const targetIndex = activeLxOrderItems().findIndex((entry) => entry.id === row.dataset.sourceId);
+      reorderLxSourceTo(sourceId, targetIndex);
+      draggingLxSourceId = "";
+    });
+    row.addEventListener("dragend", () => { draggingLxSourceId = ""; });
+    row.addEventListener("keydown", (event) => {
+      if (!canReorderLxSources()) {
+        if (event.key.startsWith("Arrow")) event.preventDefault();
+        return;
+      }
+      if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        event.preventDefault();
+        moveLxSource(row.dataset.sourceId, event.key === "ArrowUp" ? -1 : 1);
+      }
+    });
+  });
+}
+
 function renderLxSourceList() {
   const container = $("#lx-source-list");
   if (!container) return;
@@ -2110,7 +2358,10 @@ function activateLxSource(idx) {
   const item = lxSourceList[idx];
   if (!item || item.active) return;
   item.active = true;
+  lxSourceListDirty = true;
+  syncLxSourceOrder();
   renderLxSourceList();
+  renderLxSourceOrder();
   markDirty("已标记激活，需点击下方「保存并生效」（新激活源会先自动校验）");
   toast(`已标记激活「${item.name || lxDefaultName(item.url)}」，请点击下方「保存并生效」`, "ok");
 }
@@ -2119,7 +2370,9 @@ function deactivateLxSource(idx) {
   const item = lxSourceList[idx];
   if (!item || !item.active) return;
   item.active = false;
+  lxSourceListDirty = true;
   renderLxSourceList();
+  renderLxSourceOrder();
   markDirty("已标记取消激活，需点击下方「保存并生效」");
   toast(`已标记取消激活「${item.name || lxDefaultName(item.url)}」，保存后停用`, "ok");
 }
@@ -2128,8 +2381,12 @@ function deleteLxSource(idx) {
   const item = lxSourceList[idx];
   if (!item) return;
   const name = item.name || lxDefaultName(item.url);
+  const sourceId = lxStableSourceId(item);
   lxSourceList.splice(idx, 1);
+  lxSourceListDirty = true;
+  if (sourceId) lxSourceOrder = lxSourceOrder.filter((id) => id !== sourceId);
   renderLxSourceList();
+  renderLxSourceOrder();
   markDirty("洛雪源列表已修改，需保存后生效");
   toast(`已从列表移除「${name}」${item.active ? "（保存后将一并停用）" : ""}`, "ok");
 }
@@ -2280,6 +2537,7 @@ $("#lx-add").addEventListener("click", () => {
     lxSourceList.push({ name, url, active: false });
     toast(`已添加「${name}」至洛雪源列表，点其「激活」并保存后生效`, "ok");
   }
+  lxSourceListDirty = true;
   $("#lx-url").value = "";
   if ($("#lx-name")) $("#lx-name").value = "";
   syncLxAddButton();
@@ -2399,8 +2657,13 @@ $("#lx-url").addEventListener("input", () => {
 if ($("#lx-name")) {
   $("#lx-name").addEventListener("input", () => markDirty());
 }
-$$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-$$("input[name=dl-quality]").forEach((el) => el.addEventListener("change", () => markDirty("APP下载音质需保存后生效")));
+$$("input[name=play-quality]").forEach((el) => el.addEventListener("change", () => markDirty("在线播放音质需保存后生效")));
+$$("input[name=download-quality]").forEach((el) => el.addEventListener("change", () => markDirty("APP下载音质需保存后生效")));
+$("#lx-auto-switch").addEventListener("change", () => {
+  updateLxAutoSwitchSettings();
+  markDirty("洛雪自动切源设置需保存后生效");
+});
+$("#lx-platform-preferred").addEventListener("change", () => markDirty("洛雪平台优选设置需保存后生效"));
 ["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 ["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>
