@@ -672,6 +672,10 @@ class TestGeneratedWorkerBehavior:
         assert platform["status"] == "ok"
         assert report["quality_capability"] == "unknown"
         assert all(item["exploratory"] is True for item in platform["attempts"])
+        assert report["validation_scope"] == "native_url_and_prefix"
+        assert report["decode_status"] == "not_tested"
+        assert report["adapter_status"] == "not_tested"
+        assert report["playback_verified"] is False
         assert report["overall_status"] == "ok"
 
     def test_budget_expiry_keeps_partial_results_and_marks_untested_slots(self, monkeypatch):

@@ -922,6 +922,10 @@ def main():
         "requireUnsafe": False,
         "platforms": {{}},
         "quality_capability": "unknown",
+        "validation_scope": "native_url_and_prefix",
+        "decode_status": "not_tested",
+        "adapter_status": "not_tested",
+        "playback_verified": False,
         "coverage": "not_tested",
         "attempts": [],
         "overall_status": "failed"
@@ -1248,6 +1252,8 @@ def run_matrix(args: argparse.Namespace) -> int:
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "image": args.image,
         "total_samples": len(samples),
+        "validation_scope": "native_url_and_prefix",
+        "playback_verified": False,
         "overall_status": "pending",
         "results": []
     }
