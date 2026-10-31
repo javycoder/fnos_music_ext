@@ -25,7 +25,8 @@ WORKDIR /srv
 # 因此不探测、始终把国内可达的公共 DNS 写到最前（写入失败不中断）；apt-get update
 # 对 DNS 失败只报 W: 警告且退出码为 0，回退判定看「索引是否真正落地」而非退出码；
 # 镜像源与官方源都取不到索引才判失败。安装完成后恢复官方源，宿主机与最终镜像不受影响。
-# 失败文案用 "ERROR:" 不用 "[ERROR]"：后者会被应用中心弹窗 grep 成整段 RUN 标题。
+# 失败文案统一用 "ERROR:" 前缀，不得写出带方括号的 ERROR 标记（注释里也不行）：
+# BuildKit 失败时按行号回显本文件上下文，该字样会被应用中心弹窗错误摘要误收（#109）。
 RUN set -eu; \
     fix_dns() { \
         { \
@@ -53,6 +54,9 @@ RUN set -eu; \
         apt_update; \
     fi; \
     if ! lists_fetched; then \
+        if ! grep -q '^nameserver 223\.5\.5\.5' /etc/resolv.conf 2>/dev/null; then \
+            echo "ERROR: 构建容器备用 DNS 注入未生效（/etc/resolv.conf 不可改写或被覆盖）。" >&2; \
+        fi; \
         echo "ERROR: apt 镜像源与官方源均未取到索引：构建容器无法访问 Debian 源。" >&2; \
         echo "ERROR: 若宿主机 /etc/resolv.conf 的 DNS 指向本机（127.x），Docker 容器无法复用，" >&2; \
         echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \

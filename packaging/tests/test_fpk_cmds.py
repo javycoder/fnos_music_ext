@@ -435,6 +435,44 @@ def test_install_callback_ignores_buildkit_run_title_with_error_echo(sb):
     assert "apt 镜像源" not in trim_log
 
 
+def test_install_callback_surfaces_buildkit_error_context_without_pollution(sb):
+    """issue #109：镜像构建失败时弹窗必须显示真实构建错误，排除 BuildKit 回显行。
+
+    BuildKit（plain 进度）在 RUN 失败时会回显三类非错误内容：
+    步骤标题 `#18 [ 3/20] RUN …`、失败步骤头 ` > [4/7] RUN …`、带行号的
+    Dockerfile 上下文 `  28 | # 注释`（含 `29 | >>> RUN …` 失败行）。其中上下文
+    行会原样带出 Dockerfile 注释文字——注释里一旦出现字面 [ERROR] 就会被
+    错误摘要误收，挤掉真正的构建错误（apt 双源失败引导 / failed to solve /
+    apt 的 E: 行），安装失败弹窗只剩注释文字。
+    """
+    sb.make_repo()
+    log = sb.pkgvar / "fnmusic-app.log"
+    log.write_text(
+        "#18 3.2 ERROR: apt 镜像源与官方源均未取到索引：构建容器无法访问 Debian 源。\n"
+        "#18 3.2 ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。\n"
+        "#18 3.3 E: Unable to locate package ffmpeg\n"
+        "  27 |     # 镜像源与官方源都取不到索引才判失败。安装完成后恢复官方源。\n"
+        "  28 |     # 失败文案用 \"ERROR:\" 不用 \"[ERROR]\"：后者会被应用中心弹窗 grep 成整段 RUN 标题。\n"
+        "  29 | >>> RUN set -eu; echo \"ERROR: apt 镜像源与官方源均未取到索引\"; exit 1\n"
+        " > [4/7] RUN set -eu; echo \"ERROR: apt 镜像源与官方源均未取到索引\";\n"
+        "ERROR: failed to solve: process \"/bin/sh -c apt-get\" did not complete successfully: exit code: 1\n"
+        "\033[31m[ERROR]\033[0m Docker 镜像保障失败（复用或重建应用镜像未成功），请查看上方原始错误。\n"
+        "\033[31m[ERROR]\033[0m 应用中心安装日志：/var/log/apps/fnmusic-ext-install.log。\n",
+        encoding="utf-8")
+    result = sb.run("install_callback", wizard_sources="musicdl",
+                    STUB_INSTALL_RC="7")
+    assert result.returncode == 1
+    trim_log = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    # 真实构建错误必须进入弹窗：apt 失败引导、apt E: 行、BuildKit 汇总行
+    assert "daemon.json" in trim_log
+    assert "Unable to locate package" in trim_log
+    assert "failed to solve" in trim_log
+    # BuildKit 回显的上下文/失败行（含注释文字与整段 RUN 标题）不得污染弹窗
+    assert "失败文案用" not in trim_log
+    assert ">>> RUN" not in trim_log
+    assert "> [4/7] RUN" not in trim_log
+
+
 def test_install_callback_copies_output_to_durable_log(sb):
     """安装过程写到回滚删不掉的日志，弹窗给出该路径而不是 TRIM_PKGVAR。"""
     sb.make_repo(stub="""#!/bin/bash

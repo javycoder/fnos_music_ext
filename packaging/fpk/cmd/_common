@@ -39,14 +39,21 @@ fnmusic_fail() {
 }
 
 fnmusic_error_brief() {
-    # Installer [ERROR] lines for the App Center popup. BuildKit prints the
-    # whole RUN script as a step title; if that script contains echo "[ERROR]",
-    # a naive grep matches the title and the 300-char popup becomes fix_dns.
+    # Installer/build error lines for the App Center popup. Matched markers:
+    # the installer's "[ERROR]" prefix plus plain "ERROR:" lines (Dockerfile
+    # guidance, "ERROR: failed to solve") and apt "E:" lines — real build
+    # failures never use the bracketed marker, a bracket-only grep hid them.
+    # BuildKit echoes must stay out: step titles ("#12 [ 3/20] RUN ..." repeat
+    # the whole RUN script), failed-step headers (" > [4/7] RUN ...") and the
+    # numbered Dockerfile context printed around a failing line ("  28 | ..." /
+    # "  29 | >>> RUN ..."). Otherwise a comment that merely mentions an error
+    # marker is mistaken for an error line and crowds the real cause out of
+    # the 400-char popup (issue #109).
     local log="${1:-${FNMUSIC_LOG}}"
     [ -f "${log}" ] || return 0
     sed $'s/\x1b\\[[0-9;]*m//g' "${log}" 2>/dev/null \
-        | grep -a '\[ERROR\]' \
-        | grep -avE '\[ [0-9]+/[0-9]+\] RUN ' \
+        | grep -aE '\[ERROR\]|ERROR:|(^|[^A-Za-z])E: ' \
+        | grep -avE '\[ [0-9]+/[0-9]+\] RUN |^[[:space:]]*[0-9]+[[:space:]]*\||^[[:space:]]*> ' \
         | tail -n 5 \
         | tr '\n' ' ' \
         | { python3 -c 'import sys; sys.stdout.write(sys.stdin.read()[:400])' 2>/dev/null || cut -c1-400; }

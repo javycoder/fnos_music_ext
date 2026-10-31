@@ -390,10 +390,14 @@ def test_dockerfile_network_fallback_resilience():
     assert "if ! apt-get update" not in text
     assert "lists_fetched" in apt_step and "/var/lib/apt/lists" in apt_step
     assert "|| true)" in apt_step  # find 失败不得被 set -e 打死
-    # 镜像源与官方源双失败要给出带排查建议的明确错误；禁止 [ERROR] 污染弹窗 grep
+    # 镜像源与官方源双失败要给出带排查建议的明确错误；禁止 [ERROR] 污染弹窗 grep。
+    # 全文件（含注释）不得出现字面 [ERROR]：BuildKit 失败时会带行号回显 Dockerfile
+    # 上下文，注释里的字面 [ERROR] 同样会被应用中心弹窗错误摘要误收（issue #109）。
     assert "均未取到索引" in apt_step
     assert "daemon.json" in apt_step
-    assert 'echo "[ERROR]' not in text
+    assert "[ERROR]" not in text
+    # 双源失败时必须报告备用 DNS 注入是否真正生效，区分「注入失败」与「源不可达」
+    assert "注入未生效" in apt_step
     # pip 步骤：同样自带 DNS 自愈（resolv.conf 改写不跨 RUN 层）+ 官方 PyPI 回退
     pip_step = text.split("# 四个服务的")[1]
     assert "getent hosts" not in pip_step
