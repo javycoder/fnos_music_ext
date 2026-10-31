@@ -21,7 +21,7 @@ def test_musicbox_app_whitelist_contains_sky():
 
 def test_musicbox_app_allows_sky_query(monkeypatch):
     """验证 GET /api/v1/song/{id}/url 允许 quality=sky 查询，不抛出 400 校验错误。"""
-    async def mock_get_url(sid, quality, fresh=False):
+    async def mock_get_url(sid, quality, fresh=False, purpose="playback", context_generation=0):
         return {"code": 200, "url": "http://cdn/sky.flac", "level": quality}
 
     monkeypatch.setattr(mb_app, "get_song_url_async", mock_get_url)

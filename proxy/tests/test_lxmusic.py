@@ -236,22 +236,22 @@ def test_is_playable_online_track_verified_semantics():
 
 
 @pytest.mark.anyio
-async def test_resolve_lx_url_downgrade():
-    hits = {"n": 0}
+async def test_resolve_lx_url_delegates_quality_fallback_to_service(monkeypatch):
+    """旧配置也只发共享策略首档；B 服务负责该档以下的降档。"""
+    seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        hits["n"] += 1
-        if request.url.params.get("quality") == "lossless":
-            return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": ""}})
-        return httpx.Response(
-            200,
-            json={"ok": True, "data": {"id": "x", "url": "http://audio.test/320.mp3", "ext": "mp3"}},
-        )
+        seen.append(request.url.params.get("quality"))
+        return httpx.Response(404, json={"ok": False, "data": None})
 
+    monkeypatch.setitem(CONF, "play_quality", None)
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "quality_mode", "high")
+    monkeypatch.setitem(CONF, "lx_quality", "lossless")
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
     res = await resolve_lx_url(client, "lx:wy:186016")
-    assert res and res["url"] == "http://audio.test/320.mp3"
-    assert hits["n"] == 2
+    assert res is None
+    assert seen == ["flac"]
     await client.aclose()
 
 
@@ -324,27 +324,29 @@ async def test_resolve_lx_url_pin_consistent_within_ttl():
 
 
 @pytest.mark.anyio
-async def test_resolve_lx_url_max_quality_bypasses_lossless_pin_and_downgrades():
-    """max_quality=high 时旁路无损钉链，且请求 quality=high。"""
+async def test_resolve_lx_url_max_quality_bypasses_lossless_pin_and_downgrades(monkeypatch):
+    """max_quality=high 时旁路无损钉链，并只请求 320k 首档。"""
     hits = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         q = request.url.params.get("quality")
         hits.append(q)
-        if q == "lossless":
+        if q == "flac":
             return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": "http://audio.test/lossless.flac", "ext": "flac", "actual_tier": "lossless"}})
         return httpx.Response(200, json={"ok": True, "data": {"id": "x", "url": "http://audio.test/320.mp3", "ext": "mp3", "actual_tier": "high"}})
 
+    monkeypatch.setitem(CONF, "play_quality", "lossless")
+    monkeypatch.setitem(CONF, "lx_enabled", True)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8772")
     first = await resolve_lx_url(client, "lx:kg:PINTEST_DOWN")
     assert first and first["ext"] == "flac"
-    assert hits == ["lossless"]
+    assert hits == ["flac"]
 
-    # 再次解析但指定 max_quality="high"：必须旁路无损钉链，重新请求 high
+    # 再次解析但指定 max_quality="high"：必须旁路无损钉链，只请求目标 320k。
     downgraded = await resolve_lx_url(client, "lx:kg:PINTEST_DOWN", max_quality="high")
     assert downgraded and downgraded["ext"] == "mp3"
     assert downgraded["url"] == "http://audio.test/320.mp3"
-    assert hits == ["lossless", "high"]
+    assert hits == ["flac", "320k"]
     await client.aclose()
 
 

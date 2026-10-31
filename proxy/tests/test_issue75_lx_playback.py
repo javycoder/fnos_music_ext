@@ -631,8 +631,8 @@ async def test_lx_standard_transcode_reuses_shared_resolution(fake_ffmpeg, tmp_p
     client = httpx.AsyncClient(transport=httpx.MockTransport(transport_handler), base_url="http://127.0.0.1:8772")
     app.state.lx_client = client
 
-    # 预热取链
-    await resolve_lx_url_shared(client, "lx:kg:TRANSCODE1", max_quality="high")
+    # 预热当前播放首档；转码随后用相同目标与用途复用该解析。
+    await resolve_lx_url_shared(client, "lx:kg:TRANSCODE1")
     assert len(upstream_calls) == 1
 
     # 构造假 Request 调用 _start_transcode_session

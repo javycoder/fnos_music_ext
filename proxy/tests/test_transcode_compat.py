@@ -221,6 +221,28 @@ def seed_cached_audio(guid: str, data: bytes = b"MP3DATA" * 200, ext: str = "mp3
     return path
 
 
+def stub_online_download(monkeypatch, source_quality="lossless", ext="flac"):
+    """提供独立在线源流，避免把本地曲库文件误当作待转码输入。"""
+    class Response:
+        status_code = 200
+        headers = {"content-length": "2048"}
+
+        async def aclose(self):
+            return None
+
+    async def local_none(*args, **kwargs):
+        return None
+
+    async def chunks():
+        yield b"B" * 1024
+
+    async def open_stream(*args, **kwargs):
+        return Response(), None, ext, {}, chunks(), b"A" * 1024, source_quality
+
+    monkeypatch.setattr(appmod, "resolve_local_play", local_none)
+    monkeypatch.setattr(appmod, "_open_online_stream", open_stream)
+
+
 # === transcode 模块：playlist 合成 ===
 
 def test_playlist_text_floor_count_and_tail():
@@ -555,9 +577,9 @@ def test_hls_stub_fallback_without_ffmpeg(env):
 
 # === App 下载侧：prepare → status → file → delete（协议形状对齐官方实测） ===
 
-def test_download_standard_transcode_flow(env, fake_ffmpeg):
+def test_download_standard_transcode_flow(monkeypatch, env, fake_ffmpeg):
     fake_ffmpeg("ok")
-    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 500, ext="flac")
+    stub_online_download(monkeypatch)
     with TestClient(app) as client:
         prep = client.post("/music/api/v1/download/track/transcode/prepare",
                            json={"trackGUID": FAKE_KUWO, "quality": "standard"})
@@ -703,6 +725,7 @@ def test_download_is_original_truthy_string(env):
 
 def test_download_dl_quality_force_original_overrides_standard(monkeypatch, env):
     """dl_quality=original：App 显式要"标准"档也交付原文件（整体强制覆盖）。"""
+    monkeypatch.setitem(CONF, "download_quality", None)
     monkeypatch.setitem(CONF, "dl_quality", "original")
     payload = b"FLACDATA" * 200
     seed_cached_audio(FAKE_KUWO, payload, ext="flac")
@@ -723,9 +746,10 @@ def test_download_dl_quality_force_original_overrides_standard(monkeypatch, env)
 
 def test_download_dl_quality_standard_missing_quality_transcodes(monkeypatch, env, fake_ffmpeg):
     """dl_quality=standard：缺省 quality 也按官方"标准"档转码 MP3 320k（回归 2.6.3 行为）。"""
+    monkeypatch.setitem(CONF, "download_quality", None)
     monkeypatch.setitem(CONF, "dl_quality", "standard")
     fake_ffmpeg("ok")
-    seed_cached_audio(FAKE_KUWO, b"FLACDATA" * 500, ext="flac")
+    stub_online_download(monkeypatch)
     with TestClient(app) as client:
         did = client.post("/music/api/v1/download/track/transcode/prepare",
                           json={"guid": FAKE_KUWO}).json()["data"]["downloadId"]
@@ -1068,8 +1092,8 @@ def test_open_stream_blacklisted_guid_requests_mp3(env):
     monkeypatch.undo()
 
 
-def test_open_stream_blacklisted_guid_lx_requests_high_mp3(env, monkeypatch):
-    """拉黑曲目的 LX 取流请求使用 max_quality=high 降档，且扩展名修正为 mp3。"""
+def test_open_stream_blacklisted_guid_lx_requests_320k_mp3(env, monkeypatch):
+    """拉黑曲目的 LX 取流请求按共享映射使用 320k 首档，扩展名修正为 mp3。"""
     guid = "online:lx:kw:99006"
     appmod._LOSSLESS_BAD.clear()
     appmod._lossless_blacklist(guid)
@@ -1110,7 +1134,7 @@ def test_open_stream_blacklisted_guid_lx_requests_high_mp3(env, monkeypatch):
     assert opened is not None
     assert opened[2] == "mp3"
     assert len(recorded_requests) == 1
-    assert recorded_requests[0].get("quality") == "high"
+    assert recorded_requests[0].get("quality") == "320k"
 
 
 @pytest.mark.asyncio

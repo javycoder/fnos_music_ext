@@ -221,11 +221,14 @@ def search(
 
 
 @app.get("/api/v1/song/{song_id}/url")
-async def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0)):
+async def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0),
+                    purpose: str = Query("playback"), generation: int = Query(0, ge=0)):
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
+    purpose = "download" if purpose.strip().lower() == "download" else "playback"
     try:
-        item = await get_song_url_async(song_id, quality, fresh=bool(fresh))
+        item = await get_song_url_async(
+            song_id, quality, fresh=bool(fresh), purpose=purpose, context_generation=generation)
         return {"ok": True, "data": item}
     except playback.ResolutionTimeout as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc

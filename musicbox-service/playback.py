@@ -226,7 +226,8 @@ async def _cli(song_id: int, quality: str) -> dict:
             await process.wait()
 
 
-async def _resolve(song_id: int, quality: str, generation: int) -> dict:
+async def _resolve(song_id: int, quality: str, generation: int,
+                   purpose: str, context_generation: int) -> dict:
     started = time.monotonic()
     try:
         async with asyncio.timeout(BUDGET_S):
@@ -257,9 +258,9 @@ async def _resolve(song_id: int, quality: str, generation: int) -> dict:
             del _cache[key]
         if len(_cache) >= CACHE_MAX:
             del _cache[min(_cache, key=lambda key: _cache[key][1])]
-        _cache[(generation, song_id, quality)] = (item, now + ttl)
-    logger.info("playback resolved song=%s quality=%s available=%s ms=%d",
-                song_id, quality, bool(item.get("url")), int((time.monotonic() - started) * 1000))
+        _cache[(generation, song_id, quality, purpose, context_generation)] = (item, now + ttl)
+    logger.info("playback resolved song=%s quality=%s purpose=%s available=%s ms=%d",
+                song_id, quality, purpose, bool(item.get("url")), int((time.monotonic() - started) * 1000))
     return item
 
 
@@ -270,22 +271,27 @@ def _finish(task, key) -> None:
         task.exception()
 
 
-async def get_song_url_async(song_id: int, quality: str, fresh: bool = False) -> dict:
+async def get_song_url_async(song_id: int, quality: str, fresh: bool = False,
+                             purpose: str = "playback", context_generation: int = 0) -> dict:
+    purpose = "download" if str(purpose).strip().lower() == "download" else "playback"
+    context_generation = max(0, int(context_generation or 0))
     with _lock:
         generation = _generation
-        cached = _cache.get((generation, song_id, quality))
-    key = (asyncio.get_running_loop(), generation, song_id, quality)
+        cache_key = (generation, song_id, quality, purpose, context_generation)
+        cached = _cache.get(cache_key)
+    key = (asyncio.get_running_loop(), *cache_key)
     task = _tasks.get(key)
     if task is None or task.done():
         if not fresh and cached and cached[1] > time.monotonic():
             return {**cached[0], "reuse_for_s": max(0.0, cached[1] - time.monotonic()),
                     "expiry_source": "policy"}
-        task = asyncio.create_task(_resolve(song_id, quality, generation))
+        task = asyncio.create_task(
+            _resolve(song_id, quality, generation, purpose, context_generation))
         _tasks[key] = task
         task.add_done_callback(lambda done: _finish(done, key))
     result = await asyncio.shield(task)
     with _lock:
-        selected = _cache.get((generation, song_id, quality))
+        selected = _cache.get(cache_key)
         remaining = max(0.0, selected[1] - time.monotonic()) if selected else 0.0
     return {**result, "reuse_for_s": remaining, "expiry_source": "policy"}
 

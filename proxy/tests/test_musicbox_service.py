@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import asyncio
 import importlib.util
 from pathlib import Path
 import pytest
@@ -64,13 +65,48 @@ async def test_cached_playback_description_reports_remaining_lifetime(monkeypatc
     playback = musicbox_app.playback
     cached_item = {"code": 200, "url": "https://cdn.example/fixture.flac", "expi": 1800}
     monkeypatch.setattr(playback, "_cache", {
-        (playback._generation, 123, "lossless"): (cached_item, time.monotonic() + 8)})
+        (playback._generation, 123, "lossless", "playback", 0): (cached_item, time.monotonic() + 8)})
     monkeypatch.setattr(playback, "_tasks", {})
     first = await playback.get_song_url_async(123, "lossless")
     second = await playback.get_song_url_async(123, "lossless")
     assert 0 < second["reuse_for_s"] <= first["reuse_for_s"] <= 8
     assert first["expiry_source"] == "policy"
     assert "reuse_for_s" not in cached_item
+
+
+@pytest.mark.asyncio
+async def test_netease_cache_and_inflight_include_purpose_and_context_generation(monkeypatch):
+    """网易相同曲目与档位在不同用途或配置代下不得共享任务和缓存。"""
+    playback = musicbox_app.playback
+    monkeypatch.setattr(playback, "_cache", {})
+    monkeypatch.setattr(playback, "_tasks", {})
+    calls = []
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def request(song_id, quality, login_generation):
+        call_id = len(calls) + 1
+        calls.append((song_id, quality))
+        if len(calls) == 2:
+            both_started.set()
+        await release.wait()
+        return {"code": 200, "url": f"https://cdn.test/{call_id}.mp3"}
+
+    monkeypatch.setattr(playback, "_request", request)
+    playback_task = asyncio.create_task(playback.get_song_url_async(
+        123, "standard", purpose="playback", context_generation=7))
+    download_task = asyncio.create_task(playback.get_song_url_async(
+        123, "standard", purpose="download", context_generation=7))
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+    release.set()
+    playback_result, download_result = await asyncio.gather(playback_task, download_task)
+
+    assert playback_result["url"] != download_result["url"]
+    assert calls == [(123, "standard"), (123, "standard")]
+    await playback.get_song_url_async(123, "standard", purpose="download", context_generation=7)
+    assert len(calls) == 2
+    await playback.get_song_url_async(123, "standard", purpose="download", context_generation=8)
+    assert len(calls) == 3
 
 
 def test_auth_login_qr_with_upstream_qr_ascii(monkeypatch):
@@ -466,18 +502,20 @@ def test_song_url_invalid_quality_rejected():
 def test_song_url_forwards_quality_and_fresh_to_async_resolver(monkeypatch):
     captured = {}
 
-    async def resolve(sid, quality, fresh=False):
-        captured["args"] = (sid, quality, fresh)
+    async def resolve(sid, quality, fresh=False, purpose="playback", context_generation=0):
+        captured["args"] = (sid, quality, fresh, purpose, context_generation)
         return {"code": 200, "url": "http://m.test/a.flac"}
 
     monkeypatch.setattr(musicbox_app, "get_song_url_async", resolve)
     with TestClient(app) as client:
-        resp = client.get("/api/v1/song/123/url", params={"quality": "lossless", "fresh": 1})
+        resp = client.get("/api/v1/song/123/url", params={
+            "quality": "lossless", "fresh": 1, "purpose": "download", "generation": 9,
+        })
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
     assert resp.json()["data"]["code"] == 200
     assert resp.json()["data"]["url"].endswith(".flac")
-    assert captured["args"] == (123, "lossless", True)
+    assert captured["args"] == (123, "lossless", True, "download", 9)
 
 
 def test_song_info_artist_album_playlist_cli_args(monkeypatch):
@@ -875,7 +913,7 @@ def test_song_url_async_success_preserves_response_without_sync_cli(monkeypatch)
     def boom(args, timeout=30.0):
         raise AssertionError("CLI 不应被调用")
 
-    async def inproc(sid, quality, fresh=False):
+    async def inproc(sid, quality, fresh=False, purpose="playback", context_generation=0):
         return {"url": "http://inproc/1.flac", "code": 200}
 
     monkeypatch.setattr(musicbox_app, "get_song_url_async", inproc)

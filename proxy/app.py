@@ -848,7 +848,9 @@ def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
     """解析 .env 应用白名单键；返回变化的 CONF 键（仅环境项返回环境键）。
 
     先验证再同步环境原始字符串；recommend 等模块直接读 os.environ。
+    下载任务使用代号固定配置快照，重载后旧任务只能写旧身份路径。
     """
+    global _DL_CONFIG_GENERATION
     path = env_path or _env_watch_path()
     kv = dict(parse_env_file(path)[0])
     changed: list[str] = []
@@ -874,6 +876,8 @@ def _apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
         # 落盘方式/目标目录/缓存目录任一变化，此前的 staged 判定全部作废，
         # 不清空的话旧判定会一直复用到重启
         _TEE_STAGED_CACHE.clear()
+    if set(changed) & _DL_CONFIG_KEYS:
+        _DL_CONFIG_GENERATION += 1
     if set(changed) & {"quality_mode", "netease_quality", "play_quality"}:
         _sync_netease_quality()
     if set(changed) & _LX_CONFIG_KEYS:
@@ -914,6 +918,11 @@ def _env_watch_stat(path: "str | None" = None):
 # issue #75：洛雪解析身份相关配置（音质/音源/开关）。任一变化都让在途解析与钉链
 # 失效，避免旧音质配置的解析结果写回新配置下的首播。
 _LX_CONFIG_KEYS = {"lx_enabled", "lx_quality", "play_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"}
+_DL_CONFIG_KEYS = {
+    "play_quality", "download_quality", "quality_mode", "dl_quality",
+    "netease_quality", "lx_quality", "lx_enabled", "netease_enabled", "musicdl_enabled",
+    "online_sources", "lx_sources", "lx_source_url", "lx_source_list",
+}
 
 
 def effective_play_quality_conf() -> str:
@@ -3356,6 +3365,28 @@ _NETEASE_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires", 
 _LX_QUALITY_LADDER = ["standard", "high", "lossless"]
 
 
+def _lx_target_quality(max_quality: str | None = None,
+                       quality_override: str | None = None) -> str:
+    """统一计算洛雪首档；有明确下载目标时不读取全局播放配置。"""
+    target = qp.normalize_quality(
+        quality_override if quality_override is not None else effective_play_quality_conf(),
+        default=None,
+    )
+    cap = "standard" if max_quality == "standard" else (
+        "exhigh" if max_quality in ("high", "mp3") else None)
+    if cap and qp.QUALITY_LEVELS.index(target) > qp.QUALITY_LEVELS.index(cap):
+        target = cap
+    return target
+
+
+def _lx_url_cache_key(song_id: str, target: str, purpose: str,
+                      generation: int | None, max_quality: str | None) -> object:
+    if purpose == "playback" and generation is None and max_quality is None:
+        return str(song_id)
+    return (str(purpose), str(song_id), str(target),
+            _DL_CONFIG_GENERATION if generation is None else int(generation))
+
+
 def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", primary: "str | None" = None) -> list[str]:
     """按音质模式排档序（ladder 从低到高）。
 
@@ -3380,23 +3411,20 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
 
 
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
-                         meta: "dict | None" = None, max_quality: "str | None" = None) -> "dict | None":
-    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
-
-    fresh=True 时向 lxmusic 传 fresh=1 旁路其成功缓存强制重新解析：
-    重试路径确认缓存直链已失效后使用，避免有界刷新前反复取到同一条死链。
-    meta（issue #49）：曲目真实标签（title/artist/album/duration_s/cover_url），
-    songInfo 反查缓存全冷（重启后点播存量歌单/收藏/历史）时透传给 lxmusic
-    兜底合成——关键词型源脚本按歌名歌手取链，"未知曲目"必然解析失败。"""
+                         meta: "dict | None" = None, max_quality: "str | None" = None,
+                         quality_override: str | None = None, purpose: str = "playback",
+                         generation: int | None = None) -> "dict | None":
+    """洛雪音乐源直链解析，显式下载目标不会读取全局播放档位。"""
     key = str(song_id)
+    target_quality = _lx_target_quality(max_quality, quality_override)
+    cache_key = _lx_url_cache_key(song_id, target_quality, purpose, generation, max_quality)
     epoch = _LX_RESOLVE_EPOCH
-    # issue #54：fresh 冷却窗内快速失败——刚确认打不开的直链短时间重试 fresh
-    # 只会重复消耗音源解析额度；非 fresh 路径不受影响
-    if fresh and _lx_fresh_cooldown_active(key):
+    # 不同用途与目标档使用独立冷却及钉链，避免下载失败影响播放解析。
+    if fresh and _lx_fresh_cooldown_active(cache_key):
         fn_diag(logger, "lx_fresh_cooldown", guid=key[:80])
         return None
     if not fresh:
-        pin = _LX_URL_PIN.get(key)
+        pin = _LX_URL_PIN.get(cache_key)
         if pin:
             if time.monotonic() < pin[1]:
                 pinned = pin[0]
@@ -3404,32 +3432,11 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                 pinned_tier = str((pinned or {}).get("actual_tier") or (pinned or {}).get("quality") or "").lower()
                 is_lossless = pinned_ext in _LOSSLESS_EXTS or pinned_tier in ("lossless", "flac")
                 if not (max_quality in ("high", "standard", "mp3") and is_lossless):
-                    fn_diag(logger, "lx_pin_hit", guid=key[:80])
+                    fn_diag(logger, "lx_pin_hit", guid=key[:80], purpose=purpose)
                     return dict(pinned)
-            _LX_URL_PIN.pop(key, None)
-    # 显式新七档配置生效时：LX 代理只传一次目标档，由 B 组服务统一向下降档而非 proxy 双重循环
-    if CONF.get("play_quality"):
-        eff_q = effective_play_quality_conf()
-        if max_quality in ("high", "standard", "mp3"):
-            lossless_tiers = {"lossless", "hires", "jymaster", "sky"}
-            if eff_q in lossless_tiers or not eff_q:
-                eff_q = "standard" if max_quality == "standard" else "exhigh"
-            elif max_quality == "standard" and eff_q in ("higher", "exhigh"):
-                eff_q = "standard"
-        target_lx_q = qp.to_lx_quality(eff_q)
-        qualities = [target_lx_q]
-    else:
-        primary = str(CONF.get("lx_quality") or "lossless").strip()
-        ladder = _LX_QUALITY_LADDER
-        if max_quality in ("high", "standard", "mp3"):
-            ladder = [q for q in _LX_QUALITY_LADDER if q not in ("lossless", "flac")]
-            if primary in ("lossless", "flac") or not primary:
-                primary = "high" if max_quality != "standard" else "standard"
-            if max_quality == "standard":
-                ladder = [q for q in ladder if q != "high"]
-        qualities = quality_order(ladder, CONF.get("quality_mode"), primary)
-        if primary and primary not in qualities and primary in ladder:
-            qualities.insert(0, primary)
+            _LX_URL_PIN.pop(cache_key, None)
+    # LX 服务收到一个明确首档后负责向下选择，代理不再执行第二层档位循环。
+    qualities = [qp.to_lx_quality(target_quality)]
 
     extra: dict[str, str] = {}
     if meta:
@@ -3451,6 +3458,8 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
     for q in qualities:
         try:
             params = {"id": song_id, "quality": q}
+            if purpose != "playback" or quality_override is not None:
+                params["purpose"] = purpose
             if fresh:
                 params["fresh"] = "1"
             if extra:
@@ -3473,7 +3482,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                             continue
                         if epoch != _LX_RESOLVE_EPOCH:
                             return None
-                        _lx_url_pin_store(key, inner)
+                        _lx_url_pin_store(cache_key, inner)
                         return dict(inner)
         except Exception as e:
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
@@ -3521,12 +3530,17 @@ def _sync_lx_config_epoch() -> None:
 
 
 async def resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
-                                meta: dict | None = None, max_quality: str | None = None) -> dict | None:
+                                meta: dict | None = None, max_quality: str | None = None,
+                                quality_override: str | None = None, purpose: str = "playback",
+                                generation: int | None = None) -> dict | None:
     _sync_lx_config_epoch()
     loop = asyncio.get_running_loop()
     epoch = _LX_RESOLVE_EPOCH
-    eff_q = str(CONF.get("play_quality") or "")
-    key = (loop, str(song_id), max_quality or "", eff_q, epoch, bool(fresh))
+    target = _lx_target_quality(max_quality, quality_override)
+    context_generation = generation if generation is not None else (
+        _DL_CONFIG_GENERATION if purpose != "playback" else None)
+    key = (loop, str(song_id), str(purpose), target, context_generation,
+           max_quality or "", epoch, bool(fresh))
     task = _LX_URL_INFLIGHT.get(key)
     if task is None or task.done():
         if sum(not task.done() for task in _LX_URL_INFLIGHT.values()) >= 16:
@@ -3535,7 +3549,11 @@ async def resolve_lx_url_shared(client: httpx.AsyncClient, song_id: str, fresh: 
         async def resolve():
             try:
                 result = await asyncio.wait_for(
-                    resolve_lx_url(client, song_id, fresh=fresh, meta=meta, max_quality=max_quality),
+                    resolve_lx_url(
+                        client, song_id, fresh=fresh, meta=meta, max_quality=max_quality,
+                        quality_override=quality_override, purpose=purpose,
+                        generation=context_generation,
+                    ),
                     _lx_stream_startup_timeout_s())
             except TimeoutError:
                 return None
@@ -3592,7 +3610,7 @@ def _prefetch_lx(request: Request, guid: str) -> None:
 # 后旧链失效重解析时，同曲可能换 rendition（实测同曲 lossless 档可从 320k MP3
 # 换成 48k AAC，字节布局完全不同），带偏移的续拉即错位断流，表象仍为"播到
 # 一半跳歌"。有效期内钉住同一条解析结果，取流/续传/转码各调用点自动一致。
-_LX_URL_PIN: "dict[str, tuple[dict, float]]" = {}
+_LX_URL_PIN: "dict[object, tuple[dict, float]]" = {}
 _LX_URL_PIN_MAX = 1024
 # 与 lxmusic LX_URL_CACHE_TTL 默认值对齐：钉链到期时 lxmusic 缓存同样到期，
 # 由其探活续期保持同链或重解析，proxy 侧不自行强制 fresh
@@ -3604,14 +3622,14 @@ def _lx_url_pin_valid(song_id: str) -> bool:
     return bool(pin and time.monotonic() < pin[1])
 
 
-def _lx_url_pin_drop(song_id: str, reason: str = "") -> None:
-    """直链打不开/首字节失败即弃钉：后续解析重新出链，不再撞同一条死链。"""
-    dropped = _LX_URL_PIN.pop(str(song_id), None)
+def _lx_url_pin_drop(song_id: object, reason: str = "") -> None:
+    """直链打不开/首字节失败即弃对应用途的钉链。"""
+    dropped = _LX_URL_PIN.pop(song_id, None)
     if dropped and reason:
         fn_diag(logger, "lx_pin_drop", guid=str(song_id)[:80], reason=reason)
 
 
-def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
+def _lx_url_pin_store(song_id: object, resolved: dict) -> None:
     """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
     if not CONF.get("lx_enabled", True):
         return
@@ -3623,7 +3641,7 @@ def _lx_url_pin_store(song_id: str, resolved: dict) -> None:
             oldest = min(_LX_URL_PIN, key=lambda k: _LX_URL_PIN[k][1])
             _LX_URL_PIN.pop(oldest, None)
     remaining = min(_LX_URL_PIN_TTL_S, max(0.0, float(resolved.get("reuse_for_s", _LX_URL_PIN_TTL_S))))
-    _LX_URL_PIN[str(song_id)] = (resolved, now + remaining)
+    _LX_URL_PIN[song_id] = (resolved, now + remaining)
 
 
 # issue #54：UA 敏感 CDN（如酷我）按 User-Agent 放行/拒绝——lxmusic 探活统一用
@@ -3654,12 +3672,12 @@ _MEDIA_UA_PC = _LX_MEDIA_UA
 # 直链失效反复 fresh 重解析，而 lxmusic 端 fresh 不与其成功缓存合并，每次都
 # 真实出网消耗解析额度。同曲 fresh 冷却窗内快速失败，额度消耗有界化；
 # 非 fresh 路径（钉链/成功缓存）不受影响，网络抖动恢复后照常播出。
-_LX_FRESH_COOLDOWN: "dict[str, float]" = {}
+_LX_FRESH_COOLDOWN: "dict[object, float]" = {}
 _LX_FRESH_COOLDOWN_S = 60.0
 _LX_FRESH_COOLDOWN_MAX = 1024
 
 
-def _lx_fresh_cooldown_mark(song_id: str) -> None:
+def _lx_fresh_cooldown_mark(song_id: object) -> None:
     """fresh 取到的直链仍打不开时标记冷却：额度有限，冷却窗内不再重复重解析。"""
     now = time.monotonic()
     if len(_LX_FRESH_COOLDOWN) >= _LX_FRESH_COOLDOWN_MAX:
@@ -3668,15 +3686,15 @@ def _lx_fresh_cooldown_mark(song_id: str) -> None:
         if len(_LX_FRESH_COOLDOWN) >= _LX_FRESH_COOLDOWN_MAX:
             oldest = min(_LX_FRESH_COOLDOWN, key=lambda k: _LX_FRESH_COOLDOWN[k])
             _LX_FRESH_COOLDOWN.pop(oldest, None)
-    _LX_FRESH_COOLDOWN[str(song_id)] = now + _LX_FRESH_COOLDOWN_S
+    _LX_FRESH_COOLDOWN[song_id] = now + _LX_FRESH_COOLDOWN_S
 
 
-def _lx_fresh_cooldown_active(song_id: str) -> bool:
-    until = _LX_FRESH_COOLDOWN.get(str(song_id))
+def _lx_fresh_cooldown_active(song_id: object) -> bool:
+    until = _LX_FRESH_COOLDOWN.get(song_id)
     if until is None:
         return False
     if time.monotonic() >= until:
-        _LX_FRESH_COOLDOWN.pop(str(song_id), None)
+        _LX_FRESH_COOLDOWN.pop(song_id, None)
         return False
     return True
 
@@ -3791,6 +3809,61 @@ _NETEASE_URL_TIMEOUT_S = 13.0
 _NETEASE_URL_CONFIG = None
 _NETEASE_PREFETCH: set = set()
 _NETEASE_PREHEATED_PINS: dict = {}
+# App 下载使用独立解析缓存，身份包含用途、目标档与 prepare 时捕获的配置代号。
+_NETEASE_DOWNLOAD_CACHE: dict[tuple, tuple[dict, float]] = {}
+_NETEASE_DOWNLOAD_INFLIGHT: dict[tuple, asyncio.Task] = {}
+_NETEASE_DOWNLOAD_FAILED: dict[tuple, float] = {}
+_NETEASE_DOWNLOAD_FAIL_TTL_S = 5.0
+
+
+def _netease_quality_evidence(payload: dict) -> str:
+    """只从服务端明确返回的音质字段取证；缺少证据时保留 unknown。"""
+    for field in ("actual_quality", "actual_tier", "level", "quality"):
+        value = payload.get(field)
+        if value:
+            try:
+                return qp.normalize_quality(value, default=None)
+            except ValueError:
+                continue
+    for field in ("bitrate", "br", "kbps"):
+        value = payload.get(field)
+        try:
+            bitrate = float(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if bitrate >= 1000:
+            bitrate /= 1000
+        if bitrate > 0:
+            if bitrate <= 160:
+                return "standard"
+            if bitrate <= 240:
+                return "higher"
+            if bitrate <= 400:
+                return "exhigh"
+    return "unknown"
+
+
+def _netease_download_cache_key(song_id: str, quality: str, purpose: str,
+                                generation: int) -> tuple:
+    return (str(purpose), str(song_id), str(quality), int(generation))
+
+
+def _netease_download_cache_drop(song_id: str, quality: str, purpose: str,
+                                 generation: int, reason: str) -> None:
+    """只失效发生错误的下载用途和目标档 URL，并短暂抑制相同失败重试。"""
+    key = _netease_download_cache_key(song_id, quality, purpose, generation)
+    _NETEASE_DOWNLOAD_CACHE.pop(key, None)
+    _NETEASE_DOWNLOAD_FAILED[key] = time.monotonic()
+    if len(_NETEASE_DOWNLOAD_FAILED) > _NETEASE_URL_PIN_MAX:
+        cutoff = time.monotonic() - _NETEASE_DOWNLOAD_FAIL_TTL_S
+        for failed_key, failed_at in list(_NETEASE_DOWNLOAD_FAILED.items()):
+            if failed_at < cutoff:
+                _NETEASE_DOWNLOAD_FAILED.pop(failed_key, None)
+        if len(_NETEASE_DOWNLOAD_FAILED) > _NETEASE_URL_PIN_MAX:
+            oldest = min(_NETEASE_DOWNLOAD_FAILED, key=_NETEASE_DOWNLOAD_FAILED.get)
+            _NETEASE_DOWNLOAD_FAILED.pop(oldest, None)
+    fn_diag(logger, "netease_download_cache_drop", song_id=str(song_id),
+            quality=quality, purpose=purpose, generation=generation, reason=reason)
 
 
 def _netease_url_pin_drop(song_id: str, reason: str = "invalid_response") -> None:
@@ -3877,6 +3950,62 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str, refresh: 
     return await asyncio.shield(task)
 
 
+async def _resolve_netease_download_media(client: httpx.AsyncClient, song_id: str, quality: str,
+                                          *, purpose: str = "download",
+                                          generation: int | None = None) -> dict | None:
+    """按 prepare 快照解析网易下载媒体，缓存身份隔离用途、目标档与配置代号。"""
+    target = qp.normalize_quality(quality, default=None)
+    context_generation = _DL_CONFIG_GENERATION if generation is None else int(generation)
+    cache_key = _netease_download_cache_key(song_id, target, purpose, context_generation)
+    now = time.monotonic()
+    cached = _NETEASE_DOWNLOAD_CACHE.get(cache_key)
+    if cached and cached[1] > now:
+        return dict(cached[0])
+    _NETEASE_DOWNLOAD_CACHE.pop(cache_key, None)
+    failed_at = _NETEASE_DOWNLOAD_FAILED.get(cache_key)
+    if failed_at is not None and now - failed_at < _NETEASE_DOWNLOAD_FAIL_TTL_S:
+        return None
+
+    task = _NETEASE_DOWNLOAD_INFLIGHT.get(cache_key)
+    if task is None or task.done():
+        if sum(not item.done() for item in _NETEASE_DOWNLOAD_INFLIGHT.values()) >= 16:
+            return None
+
+        async def resolve() -> dict | None:
+            try:
+                result = await asyncio.wait_for(
+                    _resolve_netease_url_uncached(
+                        client, str(song_id), False, quality_override=target,
+                        purpose=purpose, generation=context_generation, return_details=True,
+                    ), _NETEASE_URL_BUDGET_S,
+                )
+            except asyncio.TimeoutError:
+                result = None
+            if result:
+                ttl = max(0.0, float(result.get("reuse_for_s") or 300.0))
+                if len(_NETEASE_DOWNLOAD_CACHE) >= _NETEASE_URL_PIN_MAX:
+                    oldest = min(_NETEASE_DOWNLOAD_CACHE, key=lambda key: _NETEASE_DOWNLOAD_CACHE[key][1])
+                    _NETEASE_DOWNLOAD_CACHE.pop(oldest, None)
+                # 旧代任务只写旧代键，新配置不会读取或覆盖这条结果。
+                _NETEASE_DOWNLOAD_CACHE[cache_key] = (dict(result), time.monotonic() + ttl)
+                _NETEASE_DOWNLOAD_FAILED.pop(cache_key, None)
+            else:
+                _NETEASE_DOWNLOAD_FAILED[cache_key] = time.monotonic()
+            return result
+
+        task = asyncio.create_task(resolve())
+        _NETEASE_DOWNLOAD_INFLIGHT[cache_key] = task
+
+        def finish(done):
+            if _NETEASE_DOWNLOAD_INFLIGHT.get(cache_key) is done:
+                _NETEASE_DOWNLOAD_INFLIGHT.pop(cache_key, None)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finish)
+    return await asyncio.shield(task)
+
+
 def _cancel_netease_resolutions() -> list:
     tasks = list(_NETEASE_URL_INFLIGHT.values()) + list(_NETEASE_PREFETCH)
     for task in tasks:
@@ -3918,10 +4047,18 @@ def _prefetch_netease(request: Request, guid: str) -> None:
 
 
 async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str, fresh: bool,
-                                        max_quality: str | None = None) -> str | None:
+                                        max_quality: str | None = None,
+                                        quality_override: str | None = None,
+                                        purpose: str = "playback",
+                                        generation: int | None = None,
+                                        return_details: bool = False) -> str | dict | None:
     key = str(song_id)
+    if quality_override is not None:
+        # 下载使用 prepare 捕获的目标，不读取可能已热重载的播放档位。
+        candidates = qp.quality_ladder(qp.normalize_quality(quality_override, default=None))
+        qualities = candidates
     # 若显式配置了 play_quality，优先使用七档降级阶梯；未显式配置时保留旧兼容模式
-    if CONF.get("play_quality"):
+    elif CONF.get("play_quality"):
         eff = effective_play_quality_conf()
         candidates = qp.quality_ladder(eff)
         if max_quality in ("exhigh", "higher", "standard", "mp3"):
@@ -3946,6 +4083,10 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
         started = time.monotonic()
         try:
             params = {"quality": q}
+            if quality_override is not None or purpose != "playback":
+                params["purpose"] = purpose
+                if generation is not None:
+                    params["generation"] = str(generation)
             if fresh:
                 # 仅明确刷新、过期/失效钉链旁路；普通冷请求保留 musicbox 负缓存。
                 params["fresh"] = "1"
@@ -3970,13 +4111,14 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                             url = str(url)
                             if not url.startswith(("http://", "https://")):
                                 return None
-                            if configured_play_q is not None:
-                                if CONF.get("play_quality") != configured_play_q:
+                            if quality_override is None:
+                                if configured_play_q is not None:
+                                    if CONF.get("play_quality") != configured_play_q:
+                                        return None
+                                elif (str(CONF.get("netease_quality") or "lossless").strip(), CONF.get("quality_mode")) != (primary, mode):
                                     return None
-                            elif (str(CONF.get("netease_quality") or "lossless").strip(), CONF.get("quality_mode")) != (primary, mode):
-                                return None
                             # TTL 以服务端 expi（秒）为准，预留 60s 网络余量；上限 30min，
-                            # 无 expi 时保守 5min。失败重解析由调用方 refresh=True 触发。
+                            # 无 expi 时保守 5min。未返回实际档位时只记录 unknown。
                             try:
                                 expi = float(inner.get("expi") or 0)
                             except (TypeError, ValueError):
@@ -3984,16 +4126,23 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                             ttl = min(max(expi - 60.0, 1.0), 1800.0) if expi > 0 else 300.0
                             if inner.get("reuse_for_s") is not None:
                                 ttl = min(ttl, max(0.0, float(inner["reuse_for_s"])))
-                            _netease_url_pin_store(key, url, ttl)
+                            result = {
+                                "url": url, "ext": str(inner.get("ext") or "").lower(),
+                                "actual_quality": _netease_quality_evidence(inner),
+                                "requested_quality": q, "reuse_for_s": ttl,
+                            }
+                            if quality_override is None and purpose == "playback":
+                                _netease_url_pin_store(key, url, ttl)
                             fn_diag(logger, "netease_resolved", song_id=key, quality=q,
-                                    ms=int((time.monotonic()-started)*1000), fresh=fresh)
-                            return url
+                                    ms=int((time.monotonic()-started)*1000), fresh=fresh, purpose=purpose)
+                            return result if return_details else url
         except Exception as e:
             fn_diag(logger, "netease_resolve_error", song_id=key, quality=q, reason=type(e).__name__)
             return None
         fn_diag(logger, "netease_quality_unavailable", song_id=key, quality=q,
                 ms=int((time.monotonic()-started)*1000))
-    _NETEASE_URL_PIN.pop(key, None)
+    if quality_override is None and purpose == "playback":
+        _NETEASE_URL_PIN.pop(key, None)
     return None
 
 
@@ -6689,7 +6838,9 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
 
 
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
-                              force_mp3: bool = False, fresh_url: bool = False, refresh: bool = False):
+                              force_mp3: bool = False, fresh_url: bool = False, refresh: bool = False,
+                              quality_override: str | None = None, purpose: str = "playback",
+                              generation: int | None = None, include_quality: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client.
 
     fresh_url：lx 直链解析旁路 lxmusic 成功缓存强制刷新（仅重试路径使用）。
@@ -6705,6 +6856,10 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     owned = None
     resp = None
     ext = None
+    actual_quality = "unknown"
+    netease_download_quality = None
+    netease_download_generation = None
+    lx_pin_key = None
     try:
         if source in ("netease", "lx"):
             # issue #55：元数据快路径与取链解析并行发起（此前解析完再串行等
@@ -6714,28 +6869,52 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if source == "netease":
                     song_id = song_id_from_online_guid(guid).split(":")[-1]
                     max_q = "exhigh" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
-                    if max_q:
-                        fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
-                    url = await resolve_netease_url(get_musicbox_client(request.app), song_id, refresh=refresh or bool(max_q),
-                                                    max_quality=max_q)
+                    if purpose == "download":
+                        netease_download_quality = qp.normalize_quality(
+                            quality_override or effective_play_quality_conf(), default=None)
+                        netease_download_generation = (
+                            _DL_CONFIG_GENERATION if generation is None else int(generation))
+                        selected = await _resolve_netease_download_media(
+                            get_musicbox_client(request.app), song_id,
+                            netease_download_quality,
+                            purpose=purpose, generation=netease_download_generation,
+                        )
+                        if not selected:
+                            return None
+                        url = selected["url"]
+                        ext = selected.get("ext")
+                        actual_quality = selected.get("actual_quality") or "unknown"
+                    else:
+                        if max_q:
+                            fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
+                        url = await resolve_netease_url(get_musicbox_client(request.app), song_id,
+                                                        refresh=refresh or bool(max_q), max_quality=max_q)
                     if not url:
                         return None
                     headers["User-Agent"] = _MEDIA_UA_PC
                 else:
                     song_id = song_id_from_online_guid(guid)
-                    if _lx_fresh_cooldown_active(song_id) and not _lx_url_pin_valid(song_id):
+                    if purpose != "download" and _lx_fresh_cooldown_active(song_id) and not _lx_url_pin_valid(song_id):
                         return None
                     max_q = "high" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
+                    target = _lx_target_quality(
+                        max_q, quality_override if purpose == "download" else None)
+                    lx_pin_key = _lx_url_cache_key(
+                        song_id, target, purpose,
+                        generation if purpose == "download" else None, max_q)
                     if max_q:
                         fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
                     resolved = await resolve_lx_url_shared(
                         get_lx_client(request.app), song_id, fresh=fresh_url or bool(max_q),
-                        meta=_online_meta_for_request(request, guid),
-                        max_quality=max_q)
+                        meta=_online_meta_for_request(request, guid), max_quality=max_q,
+                        quality_override=quality_override if purpose == "download" else None,
+                        purpose=purpose, generation=generation if purpose == "download" else None,
+                    )
                     if not resolved:
                         return None
                     url = resolved["url"]
                     ext = resolved.get("ext")
+                    actual_quality = _netease_quality_evidence(resolved)
                     headers.update(_lx_media_headers(resolved))
                 if info_task is not None:
                     if source == "netease":
@@ -6766,9 +6945,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             client = get_musicdl_client(request.app)
             via_musicdl = True
             params = {"id": song_id_from_online_guid(guid), "proxy": "true"}
-            # 无损档已被判定损坏的曲目（或上层明确要求）直接取 mp3 档；
-            # 带断点续传的请求不切档——前后字节必须来自同一条流
-            if (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
+            # musicdl 只声明 mp3 强制降档能力；七档低目标再由本地真实编码率处理。
+            target_q = qp.normalize_quality(quality_override) if quality_override else None
+            if purpose == "download" and target_q in ("standard", "higher", "exhigh"):
+                params["quality"] = "mp3"
+                actual_quality = _netease_quality_evidence(info or {})
+            # 损坏无损流的播放回退仍只影响当前播放请求。
+            elif (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
                 params["quality"] = "mp3"
             req = client.build_request("GET", "/stream", params=params, headers=headers)
         try:
@@ -6784,30 +6967,41 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 # Reject servers ignoring identity: decoded bytes cannot use encoded
                 # Content-Length/Range offsets, and must not enter the audio cache.
                 if source == "netease":
-                    # 钉住的直链打不开（过期/换 rendition）：弃钉，让重试解析新链
-                    _netease_url_pin_drop(song_id, reason=f"cdn_status_{resp.status_code}_or_non_audio")
+                    # 只清理触发失败的用途，下载请求不得失效播放钉链。
+                    if purpose == "download" and netease_download_quality is not None:
+                        _netease_download_cache_drop(
+                            song_id, netease_download_quality, purpose,
+                            netease_download_generation or 0, "cdn_unavailable")
+                    else:
+                        _netease_url_pin_drop(
+                            song_id, reason=f"cdn_status_{resp.status_code}_or_non_audio")
                 elif source == "lx":
-                    _lx_url_pin_drop(song_id, reason=f"cdn_status_{resp.status_code}_or_non_audio")
+                    _lx_url_pin_drop(lx_pin_key or song_id, reason=f"cdn_status_{resp.status_code}_or_non_audio")
                     # issue #54：fresh 强刷出的直链也打不开，冷却窗内不再重复重解析
                     if fresh_url:
-                        _lx_fresh_cooldown_mark(song_id)
+                        _lx_fresh_cooldown_mark(lx_pin_key or song_id)
                 return None
             chunks = resp.aiter_bytes()
             first = await anext(chunks, b"")
         except Exception as exc:
-            if source == "lx":
-                if not isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
-                    _lx_url_pin_drop(song_id, reason="cdn_error")
-                    if fresh_url:
-                        _lx_fresh_cooldown_mark(song_id)
+            # 网易超时/临时服务错误保留钉链；显式无效 HTTP 响应与空流在下方定向清理。
+            if source == "lx" and not isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
+                _lx_url_pin_drop(lx_pin_key or song_id, reason="cdn_error")
+                if fresh_url:
+                    _lx_fresh_cooldown_mark(lx_pin_key or song_id)
             raise
         if not first:
             if source == "netease":
-                _netease_url_pin_drop(song_id, reason="empty_stream")
+                if purpose == "download" and netease_download_quality is not None:
+                    _netease_download_cache_drop(
+                        song_id, netease_download_quality, purpose,
+                        netease_download_generation or 0, "empty_stream")
+                else:
+                    _netease_url_pin_drop(song_id, reason="empty_stream")
             elif source == "lx":
-                _lx_url_pin_drop(song_id, reason="empty_stream")
+                _lx_url_pin_drop(lx_pin_key or song_id, reason="empty_stream")
                 if fresh_url:
-                    _lx_fresh_cooldown_mark(song_id)
+                    _lx_fresh_cooldown_mark(lx_pin_key or song_id)
             return None
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
@@ -6819,7 +7013,14 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             # NetEase returns a URL, not LX's resolved dict. The capped resolver
             # has selected a lossy tier even if CDN headers retain stale metadata.
             ext = (resolved.get("ext") or "mp3") if source == "lx" else "mp3"
+        ext = ext or ext_from_content_type(content_type)
+        if purpose == "download":
+            response_quality = resp.headers.get("x-actual-quality") or resp.headers.get("x-audio-quality")
+            if response_quality:
+                actual_quality = _netease_quality_evidence({"actual_quality": response_quality})
         result = (resp, owned, ext, info, chunks, first)
+        if include_quality:
+            result = (*result, actual_quality or "unknown")
         resp = owned = None  # transfer ownership to response iterator
         return result
     finally:
@@ -8751,11 +8952,20 @@ async def track_transcode(request: Request):
 _DL_TASKS: dict[str, dict] = {}
 _DL_TASK_TTL_S = 3600.0
 _DL_TRANSCODE_SUBDIR = "dltrans"
+_DL_CONFIG_GENERATION = 0
 
 
-def _dl_transcode_path(guid: str, quality: str = "exhigh", ext: str = "mp3") -> str:
+def _dl_transcode_path(guid: str, quality: str = "exhigh", ext: str = "mp3", *,
+                       purpose: str = "download", generation: int = 0,
+                       identity: str = "shared", stage: str = "output") -> str:
+    """下载文件路径按用途、目标档、配置代号和任务身份区分。"""
     safe_q = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(quality or "exhigh"))
-    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, f"{cache_safe_guid(guid)}.{safe_q}.{ext}")
+    safe_purpose = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(purpose or "download"))
+    safe_identity = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(identity or "shared"))
+    safe_stage = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(stage or "output"))
+    filename = (f"{cache_safe_guid(guid)}.{safe_purpose}.g{int(generation)}."
+                f"{safe_q}.{safe_identity}.{safe_stage}.{ext}")
+    return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, filename)
 
 
 # App 请求词命中才算显式要"标准"档（MP3 320k）；其余一律按原始档交付
@@ -8764,8 +8974,8 @@ _DL_STANDARD_WORDS = ("standard", "std", "mp3", "标准")
 
 def _dl_effective_quality(raw_quality: str, is_original: bool) -> str:
     """下载交付档位：
-    - 若全局配置显式指定了具体七档，配置优先；
-    - 兼容旧配置 dl_quality=standard (320k -> exhigh) 与 original (sky)；
+    - 新配置 app 跟随 App 请求，且不受旧键覆盖；具体七档配置优先；
+    - 旧 dl_quality=standard 对应 exhigh，旧 original 迁移到 lossless；
     - 跟随 App 请求策略：
       * 官方旧协议 standard 对应 320k (exhigh)；
       * 显式 original / is_original 对应最高可用 (sky)；
@@ -8773,14 +8983,16 @@ def _dl_effective_quality(raw_quality: str, is_original: bool) -> str:
       * 新七档按请求档位规范化。
     """
     explicit_dl = CONF.get("download_quality")
-    if explicit_dl and str(explicit_dl).strip().lower() != "app":
+    if explicit_dl:
+        if str(explicit_dl).strip().lower() == "app":
+            return qp.app_download_quality(raw_quality, is_original, effective_play_quality_conf())
         try:
-            return qp.normalize_quality(explicit_dl)
+            return qp.normalize_quality(explicit_dl, default=None)
         except ValueError:
             pass
     legacy_mode = str(CONF.get("dl_quality") or "app").strip().lower()
     if legacy_mode == "original":
-        return "sky"
+        return "lossless"
     if legacy_mode == "standard":
         return "exhigh"
 
@@ -8831,59 +9043,161 @@ def _dl_state_word(task: dict) -> str:
     return {"completed": "ready"}.get(state, state)
 
 
-async def _dl_produce(task: dict, cred_headers: dict) -> None:
-    """后台产文件：下载按目标档位贯穿；低码率不伪造无损，源为 MP3 时直接交付原文件。"""
-    guid = task["guid"]
-    target_q = str(task.get("quality") or "exhigh")
+def _dl_should_transcode(target_quality: str, source_quality: str, source_ext: str) -> bool:
+    """只向下编码在线下载；未知音质不伪标高档，已有本地曲库文件不调用此函数。"""
+    if target_quality not in ("standard", "higher", "exhigh"):
+        return False
     try:
-        src = find_cache_file(guid)
-        if src and _is_rolling_cache_stem(src, guid):
-            src = None
-        if not src and _source_enabled(guid):
-            # 无本地曲库文件：按目标档位走后台整轨下载
-            force_mp3 = target_q in ("standard", "higher", "exhigh")
-            await _full_fetch_download(guid, cred_headers, force_mp3=force_mp3)
-            src = find_cache_file(guid)
-        if not src:
-            task["state"] = "failed"
-            task["errmsg"] = "online source unavailable"
-            return
-        src_ext = os.path.splitext(src)[1].lstrip(".").lower() or "mp3"
-        is_src_lossless = src_ext in _LOSSLESS_EXTS
+        target_rank = qp.QUALITY_LEVELS.index(qp.normalize_quality(target_quality, default=None))
+    except ValueError:
+        return False
+    try:
+        source_rank = qp.QUALITY_LEVELS.index(qp.normalize_quality(source_quality, default=None))
+    except ValueError:
+        # 低目标需要真实 MP3 编码；对未知输入不声明来源品质，只声明输出编码档。
+        return target_quality in ("standard", "higher") or source_ext in _LOSSLESS_EXTS
+    return source_rank > target_rank
 
-        # "不要把低码率转 FLAC 伪称无损"：若源已是有损音频，或者目标为无损/最高可用，绝不转码为假 FLAC
-        if not is_src_lossless or target_q in ("lossless", "hires", "jymaster", "sky", "original"):
-            task["path"] = src
-        else:
+
+async def _dl_produce(task: dict, cred_headers: dict) -> None:
+    """按 prepare 捕获的目标档独立取流和产物，不读取播放缓存或全局播放档。"""
+    guid = str(task["guid"])
+    target_q = qp.normalize_quality(task.get("target_quality") or task.get("quality") or "exhigh", default=None)
+    provider = str(task.get("provider") or source_from_online_guid(guid))
+    generation = int(task.get("generation") or 0)
+    purpose = str(task.get("purpose") or "download")
+    download_id = str(task.get("downloadId") or uuid4().hex)
+    task["downloadId"] = download_id
+    fake_request = _synth_request(cred_headers)
+    source_path = source_part = output_part = None
+    resp = owned = None
+    try:
+        # 真实本地曲库曲目保持原文件，不执行 App 下载转码。
+        local = await resolve_local_play(fake_request, guid, probe=True)
+        if not local:
+            # .ref 指向曲库完整文件时允许直接复用；cache 目录中的播放流绝不命中此分支。
+            recalled = recalled_media_path(guid)
+            if recalled:
+                path_real = os.path.realpath(recalled)
+                cache_root = os.path.realpath(str(CONF.get("cache_dir") or ""))
+                library_roots = [CONF.get("library_dir"), tee_save_dir(), detect_library_dir()]
+                in_library = False
+                for root in library_roots:
+                    if not root:
+                        continue
+                    try:
+                        if os.path.commonpath([path_real, os.path.realpath(root)]) == os.path.realpath(root):
+                            in_library = True
+                            break
+                    except ValueError:
+                        continue
+                try:
+                    in_cache = os.path.commonpath([path_real, cache_root]) == cache_root
+                except ValueError:
+                    in_cache = False
+                if in_library and not in_cache:
+                    local = {"path": recalled, "size": os.path.getsize(recalled)}
+        if local and local.get("path"):
+            task["path"] = str(local["path"])
+            task["source_quality"] = _netease_quality_evidence(local)
+            task["actual_quality"] = task["source_quality"]
+            task["state"] = "completed"
+            task["percent"] = 100
+            task["size"] = int(local.get("size") or os.path.getsize(task["path"]))
+            return
+        if not _source_enabled(guid):
+            raise RuntimeError("online source unavailable")
+
+        # 任务独立路径不与播放 GUID 缓存共享；每个 prepare 也有固定文件身份。
+        opened = await _open_online_stream(
+            fake_request, guid, None, quality_override=target_q, purpose=purpose,
+            generation=generation, include_quality=True,
+        )
+        if not opened:
+            raise RuntimeError("online source unavailable")
+        resp, owned, ext, info, chunks, first, source_quality = opened
+        source_quality = str(source_quality or "unknown")
+        try:
+            source_quality = qp.normalize_quality(source_quality, default=None)
+        except ValueError:
+            source_quality = "unknown"
+        source_ext = str(ext or (info or {}).get("ext") or "mp3").strip(".").lower() or "mp3"
+        source_path = _dl_transcode_path(
+            guid, target_q, source_ext, purpose=purpose, generation=generation,
+            identity=download_id, stage="source",
+        )
+        source_part = source_path + ".part"
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        expected = None
+        content_length = str(resp.headers.get("content-length") or "")
+        if content_length.isdigit():
+            expected = int(content_length)
+        written = 0
+        with open(source_part, "wb") as output:
+            if first:
+                output.write(first)
+                written += len(first)
+            async for chunk in chunks:
+                if chunk:
+                    output.write(chunk)
+                    written += len(chunk)
+        if written < 1024 or (expected is not None and written != expected):
+            raise RuntimeError(f"download size mismatch written={written} expected={expected}")
+        os.replace(source_part, source_path)
+        source_part = None
+
+        if _dl_should_transcode(target_q, source_quality, source_ext):
             bitrate_map = {"standard": "128k", "higher": "192k", "exhigh": "320k"}
-            target_bitrate = bitrate_map.get(target_q, str(CONF.get("transcode_dl_bitrate") or "320k"))
-            target = _dl_transcode_path(guid, target_q, "mp3")
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            if not os.path.isfile(target):
-                task["state"] = "transcoding"
-                task["percent"] = 0
-                proc = await asyncio.create_subprocess_exec(
-                    tc.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                    "-i", src, "-vn", "-map_metadata", "-1",
-                    "-c:a", "libmp3lame", "-b:a", target_bitrate,
-                    "-f", "mp3", target,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                if await proc.wait() != 0:
-                    task["state"] = "failed"
-                    task["errmsg"] = "transcode failed"
-                    return
-            task["path"] = target
+            target_bitrate = bitrate_map[target_q]
+            output_path = _dl_transcode_path(
+                guid, target_q, "mp3", purpose=purpose, generation=generation,
+                identity=download_id, stage="encoded",
+            )
+            output_part = output_path + ".part"
+            if not tc.FFMPEG_BIN:
+                raise RuntimeError("transcoder unavailable for requested download quality")
+            task["state"] = "transcoding"
+            task["percent"] = 0
+            proc = await asyncio.create_subprocess_exec(
+                tc.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-i", source_path, "-vn", "-map_metadata", "-1",
+                "-c:a", "libmp3lame", "-b:a", target_bitrate,
+                "-f", "mp3", output_part,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await proc.wait() != 0 or not os.path.isfile(output_part) or os.path.getsize(output_part) == 0:
+                raise RuntimeError("transcode failed")
+            os.replace(output_part, output_path)
+            output_part = None
+            _remove_quiet(source_path)
+            source_path = None
+            task["path"] = output_path
+            task["actual_quality"] = target_q
+        else:
+            task["path"] = source_path
+            task["actual_quality"] = source_quality
+        task["source_quality"] = source_quality
+        task["provider"] = provider
+        task["generation"] = generation
         task["state"] = "completed"
         task["percent"] = 100
-        try:
-            task["size"] = os.path.getsize(task["path"])
-        except OSError:
-            task["size"] = 0
-    except Exception as e:  # noqa: BLE001
-        logger.warning("download transcode produce failed for %s: %s", guid, e)
+        task["size"] = os.path.getsize(task["path"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("download producer failed for %s: %s", guid, type(exc).__name__)
         task["state"] = "failed"
-        task["errmsg"] = "internal error"
+        task["errmsg"] = "online source unavailable" if str(exc) == "online source unavailable" else "internal error"
+    finally:
+        if source_part:
+            _remove_quiet(source_part)
+        if output_part:
+            _remove_quiet(output_part)
+        if source_path and source_path != task.get("path"):
+            _remove_quiet(source_path)
+        with anyio.CancelScope(shield=True):
+            if resp:
+                await resp.aclose()
+            if owned:
+                await owned.aclose()
 
 
 async def _dl_forward(request: Request):
@@ -8934,8 +9248,14 @@ async def dl_transcode_prepare(request: Request):
     quality = effective
     _dl_sweep()
     download_id = uuid4().hex
-    task = {"guid": guid, "quality": quality, "state": "waiting", "percent": 0,
-            "downloadId": download_id, "touched": time.monotonic(), "started": time.time()}
+    source = source_from_online_guid(guid)
+    provider = source if source in ("netease", "lx") else "musicdl"
+    task = {
+        "guid": guid, "quality": quality, "target_quality": quality,
+        "provider": provider, "generation": _DL_CONFIG_GENERATION,
+        "purpose": "download", "state": "waiting", "percent": 0,
+        "downloadId": download_id, "touched": time.monotonic(), "started": time.time(),
+    }
     _DL_TASKS[download_id] = task
     asyncio.create_task(_dl_produce(task, copy_incoming_headers(request)))
     return JSONResponse(content={
