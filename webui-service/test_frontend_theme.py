@@ -2,6 +2,7 @@
 import re
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -36,13 +37,13 @@ def test_theme_boot_is_synchronous_before_stylesheet():
     style = next(i for i, (tag, attrs) in enumerate(tags)
                  if tag == "link" and attrs.get("rel") == "stylesheet")
     app = next(i for i, (tag, attrs) in enumerate(tags)
-               if tag == "script" and attrs.get("src", "").endswith("/app.js"))
+               if tag == "script" and urlsplit(attrs.get("src", "")).path.endswith("/app.js"))
     assert boot < style < app
     assert not {"async", "defer", "type"}.intersection(tags[boot][1])
     for _, attrs in tags:
         asset = attrs.get("src", attrs.get("href", ""))
         if asset.startswith("/app/fnmusic-ext/static/"):
-            assert (STATIC / asset.rsplit("/", 1)[1]).is_file(), asset
+            assert (STATIC / urlsplit(asset).path.rsplit("/", 1)[1]).is_file(), asset
 
 
 def test_settings_has_desktop_mobile_navigation_and_three_local_preferences():
