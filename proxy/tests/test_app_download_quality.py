@@ -22,6 +22,20 @@ def test_lx_unknown_actual_quality_is_not_replaced_by_request_target(actual):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize('actual', ['', 'unknown'])
+async def test_lx_direct_target_does_not_restore_request_echo_as_actual_quality(monkeypatch, actual):
+    async def resolve(*args, **kwargs):
+        return {'url': 'https://media.example/fixture.flac', 'ext': 'flac',
+                'quality': 'sky', 'resolution_quality': 'sky',
+                'actual_quality': actual, 'actual_tier': ''}
+    monkeypatch.setattr(appmod, 'get_lx_client', lambda *args: object())
+    monkeypatch.setattr(appmod, 'resolve_lx_url_shared', resolve)
+    target = await appmod._resolve_direct_target(
+        appmod._synth_request({}), 'online:lx:wy:fixture', 'lx')
+    assert target.actual_quality == 'unknown'
+
+
+@pytest.mark.anyio
 async def test_lx_download_ignores_playback_lossless_blacklist(monkeypatch):
     captured = {}
     class Response:

@@ -7242,7 +7242,8 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
             raise RuntimeError("resolve_failed")
         pin = _LX_URL_PIN.get(song_id)
         ext = str(resolved.get("ext") or "")
-        quality = str(resolved.get("actual_tier") or resolved.get("quality") or "")
+        # 直连同样只能使用实际品质字段，不能把LX解析请求回显重新补成实测值。
+        quality = _netease_quality_evidence(resolved)
         return DirectMediaTarget(
             provider=provider, platform=(guid.split(":")[2:3] or [""])[0], canonical_id=song_id,
             url=str(resolved["url"]), protocol=str(resolved.get("protocol") or "https"),
