@@ -450,9 +450,12 @@ def test_track_url_reports_m4a_instead_of_mp3(test_app_client, fake_lx, policy_r
     data = response.json()["data"]
     assert data["ext"] == "m4a"
     assert data["headers"]["User-Agent"] == lxapp.UA_PC
-    assert data["actual_quality"] == "standard"
+    # type 只是请求/解析档回显：只能写 resolution_quality，实际档保持未知
+    assert data["resolution_quality"] == "standard"
     assert data["requested_quality"] == "standard"
-    assert data["actual_lx_quality"] == "128k"
+    assert data["resolution_lx_quality"] == "128k"
+    assert data["actual_quality"] == ""
+    assert data["actual_tier"] == ""
     assert data["source_platform"] == "kw"
     assert data["source_script"] == "source1"
     assert data["quality_evidence"]["probe"] == "m4a"
@@ -476,8 +479,10 @@ def test_track_url_does_not_claim_lossless_for_lower_upstream_quality(
     assert response.status_code == 200, response.text
     data = response.json()["data"]
     assert data["ext"] == "mp3"
-    assert data["actual_quality"] == "standard"
-    assert data["actual_tier"] == "standard"
+    assert data["resolution_quality"] == "standard"
+    # 上游解析档降低，但实际档没有任何实测证据，不能回填请求/解析标签
+    assert data["actual_quality"] == ""
+    assert data["actual_tier"] == ""
     assert "lossless" in data["fallback_reason"]
     assert "standard" in data["fallback_reason"]
 
@@ -651,7 +656,8 @@ def test_track_url_platform_preferred_resolves_trusted_other_platform(
     assert data["source_platform"] == "wy"
     assert data["resolved_track_id"] == "lx:wy:wy9"
     assert data["source_script"] == "only.js"
-    assert data["actual_quality"] == "lossless"
+    assert data["resolution_quality"] == "lossless"
+    assert data["actual_quality"] == ""
 
 
 @pytest.mark.asyncio

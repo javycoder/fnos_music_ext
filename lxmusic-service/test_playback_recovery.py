@@ -15,7 +15,9 @@
 5. 按运行声明跳过明确不支持的档位，未知仍可探索；单次尝试的搜索/解析/探活
    共用一个 slot 预算，首慢源不能吃光总预算；不设最多三脚本上限。
 6. 直接复用 proxy/quality_policy.py，不再保留本地七档回退；mp3 不反推 128k；
-   码率未知记 0，不编造 999k/1999k；quality_evidence 标明报告档与探测格式。
+   码率未知记 0，不编造 999k/1999k；quality_evidence 分三层（请求档、上游解析档、
+   探活格式），type 只当请求回显、verified 恒为 False；低档上限拿到 FLAC 媒体
+   按越界拒绝，actual_quality 保持未知。
 7. 播放路径新日志只记媒体主机名与阶段，不记录带签名的原始直链。
 8. source_capabilities 与 describe 不再硬编码三档，只报真实声明或未知。
 9. 排序：env 清空回退持久顺序、新激活追加、停用保留槽位、重启恢复，
@@ -140,8 +142,12 @@ def test_low_tier_from_first_script_is_stashed_not_returned(
     # 两个脚本都按目标档 flac 请求，没有先降到 320k
     assert [quality for _, quality in fake_lx.url_calls] == ["flac", "flac"]
     assert data["source_script"] == "b.js"
-    assert data["actual_quality"] == "lossless"
+    # 交付依据是上游解析档（type 回显），不是实测档：actual 仍未知
+    assert data["resolution_quality"] == "lossless"
     assert data["requested_quality"] == "lossless"
+    assert data["actual_quality"] == ""
+    assert data["quality_evidence"]["from_stash"] is False
+    assert data["quality_evidence"]["served_tier"] == "lossless"
 
 
 def test_stashed_lower_tier_is_reused_when_ladder_reaches_its_tier(
@@ -163,8 +169,14 @@ def test_stashed_lower_tier_is_reused_when_ladder_reaches_its_tier(
     data = response.json()["data"]
     # 只请求目标档一次，低档结果来自暂存而不是重复解析
     assert [quality for _, quality in fake_lx.url_calls] == ["flac"]
-    assert data["actual_quality"] == "standard"
+    assert data["resolution_quality"] == "standard"
     assert data["requested_quality"] == "lossless"
+    assert data["actual_quality"] == ""
+    evidence = data["quality_evidence"]
+    assert evidence["from_stash"] is True
+    assert evidence["served_tier"] == "standard"
+    # 暂存命中用解析档比档，喂给理由里的也是解析档
+    assert evidence["served_tier_source"] == "resolution_quality"
     assert "lossless" in data["fallback_reason"]
     assert "standard" in data["fallback_reason"]
 
@@ -190,7 +202,8 @@ def test_ladder_uses_better_stash_before_new_request(
     # 目标档各问一次后即用暂存，不再向下重复请求同一脚本
     assert [quality for _, quality in fake_lx.url_calls] == ["flac", "flac"]
     assert data["source_script"] == "a.js"
-    assert data["actual_quality"] == "exhigh"
+    assert data["resolution_quality"] == "exhigh"
+    assert data["actual_quality"] == ""
 
 
 def test_reported_quality_above_target_is_never_claimed(
@@ -227,7 +240,8 @@ def test_unknown_or_contradictory_quality_cannot_preempt_verified_target(
     assert response.status_code == 200, response.text
     data = response.json()['data']
     assert data['source_script'] == 'b.js'
-    assert data['actual_quality'] == 'lossless'
+    assert data['resolution_quality'] == 'lossless'
+    assert data['actual_quality'] == ''
     assert data['ext'] == 'flac'
 
 
@@ -332,10 +346,11 @@ async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, run
     async def without_flac(song_info, quality="128k", exclude_api_sources=None,
                            request_timeout=None, auto_switch_api_source=True):
         fake_lx.url_calls.append((str(song_info.get("songmid") or ""), quality))
-        # 该脚本没有无损档：要 flac 时拿不到链接，320k 及以下正常
+        # 该脚本没有无损档：要 flac 时拿不到链接；320k 及以下给真实的 mp3 直链
+        # （降档后拿到 FLAC 媒体属于越界表示，会被拒绝，不是这里的测试对象）
         if quality == "flac":
             return None
-        return {"url": "https://media.test/ok.flac", "type": quality, "sourceId": "a.js"}
+        return {"url": f"https://media.test/{quality}.mp3", "type": quality, "sourceId": "a.js"}
 
     monkeypatch.setattr(fake_lx, "get_music_url", without_flac)
     client = _media_client()
@@ -345,7 +360,8 @@ async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, run
                 client, "kw", _item(), quality="lossless",
                 budget=2.0, resolver_timeout=0.5, probe_timeout=0.5,
             )
-            assert result is not None and result["actual_quality"] == "exhigh"
+            assert result is not None and result["resolution_quality"] == "exhigh"
+            assert result["actual_quality"] == ""
         # 只有无损档被记失败，标准档没有被牵连
         assert any(key.endswith(":lossless") for key in lxapp._CHAIN_HEALTH), lxapp._CHAIN_HEALTH
         assert not any(key.endswith(":standard") for key in lxapp._CHAIN_HEALTH)
@@ -357,7 +373,7 @@ async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, run
         )
     finally:
         await client.aclose()
-    assert standard is not None and standard["actual_quality"] == "standard"
+    assert standard is not None and standard["resolution_quality"] == "standard"
     # 标准档是真的重新请求了脚本，而不是被熔断跳过
     assert fake_lx.url_calls[calls_before:] == [(str(_item()["songmid"]), "128k")]
 
@@ -554,11 +570,12 @@ async def test_first_slow_script_does_not_eat_total_budget(fake_lx, runtime, mon
     async def slow(song_info, quality="128k", exclude_api_sources=None,
                    request_timeout=None, auto_switch_api_source=True):
         await asyncio.sleep(1.0)
-        return {"url": "https://media.test/a.flac", "type": "128k", "sourceId": "a.js"}
+        # 标准档请求要真实的有损媒体：低档却回 FLAC 会被判越界拒绝
+        return {"url": "https://media.test/a.mp3", "type": "128k", "sourceId": "a.js"}
 
     async def fast(song_info, quality="128k", exclude_api_sources=None,
                    request_timeout=None, auto_switch_api_source=True):
-        return {"url": "https://media.test/b.flac", "type": "128k", "sourceId": "b.js"}
+        return {"url": "https://media.test/b.mp3", "type": "128k", "sourceId": "b.js"}
 
     calls: list[str] = []
 
@@ -663,12 +680,17 @@ def test_unknown_reported_quality_is_reported_as_unknown(test_app_client, fake_l
         lxapp.app.state.client = restore
     assert response.status_code == 200, response.text
     data = response.json()["data"]
+    # type=mp3 不是七档之一：解析档与实际档都未知，不按容器猜 128k
     assert data["actual_quality"] == ""
+    assert data["resolution_quality"] == ""
     evidence = data["quality_evidence"]
-    assert evidence["reported_quality"] is None
-    assert evidence["reported_known"] is False
+    assert evidence["resolution_quality"] is None
+    assert evidence["resolution_known"] is False
+    assert evidence["type_source"] == "request_echo"
+    assert evidence["actual_known"] is False
     assert evidence["probe"] == "mp3"
     assert evidence["verified"] is False
+    assert "unknown" in data["fallback_reason"]
 
 
 def test_unknown_bitrate_is_not_fabricated(test_app_client, fake_lx, runtime):
@@ -682,6 +704,110 @@ def test_unknown_bitrate_is_not_fabricated(test_app_client, fake_lx, runtime):
     finally:
         lxapp.app.state.client = restore
     assert response.json()["data"]["br"] == 0
+
+
+# ================================ 6.1 音质证据：type 只是请求回显 ========
+
+def _constant_flac_script(fake_lx, monkeypatch, *, url="https://media.test/constant.flac"):
+    """真实 NAS 观测替身：脚本无视请求档，永远回同一条 constant.flac。
+
+    上游 ``/api/music/url`` 固定字段只有
+    ``url/type/sourceId/sourceName/downloadSource/requestedSource/hasMoreSources/attempts``；
+    ``type`` 随请求档回显（要 128k 回 128k，要 flac 回 flac），没有任何字段
+    能证明实际音频档位。因此它是“请求/解析档”，不是实测档。
+    """
+
+    async def constant(song_info, quality="128k", exclude_api_sources=None,
+                       request_timeout=None, auto_switch_api_source=True):
+        fake_lx.url_calls.append((str(song_info.get("songmid") or ""), quality))
+        fake_lx.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
+        fake_lx.url_auto_switch.append(bool(auto_switch_api_source))
+        return {
+            "url": url, "type": quality, "sourceId": "a.js", "sourceName": "a.js",
+            "downloadSource": "kw", "requestedSource": "kw", "hasMoreSources": False,
+            "attempts": 1,
+        }
+
+    monkeypatch.setattr(fake_lx, "get_music_url", constant)
+
+
+def test_constant_flac_script_echoing_type_never_claims_actual_quality(
+    test_app_client, fake_lx, runtime, monkeypatch,
+):
+    """无损请求 + 恒定 FLAC 脚本：type=flac 只能算解析档，不能变成实际无损。"""
+    fake_lx.sources = [_ready("a.js", ["kw"])]
+    _constant_flac_script(fake_lx, monkeypatch)
+    restore = lxapp.app.state.client
+    lxapp.app.state.client = _media_client()
+    try:
+        response = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    finally:
+        lxapp.app.state.client = restore
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert [quality for _, quality in fake_lx.url_calls] == ["flac"]
+    assert data["ext"] == "flac"
+    # 编排依据：上游解析档；证据链：请求档 -> 解析档 -> 探活格式
+    assert data["resolution_quality"] == "lossless"
+    assert data["resolution_lx_quality"] == "flac"
+    assert data["requested_quality"] == "lossless"
+    # 没有任何实测字段：实际档保持未知，不能用请求回显回填，也不能编造码率
+    assert data["actual_quality"] == ""
+    assert data["actual_tier"] == ""
+    assert data["br"] == 0
+    evidence = data["quality_evidence"]
+    assert evidence["type_source"] == "request_echo"
+    assert evidence["requested_quality"] == "lossless"
+    assert evidence["resolution_quality"] == "lossless"
+    assert evidence["actual_quality"] is None
+    assert evidence["actual_known"] is False
+    # 探活只证明可读媒体，不等于验证了七档中的实际档位
+    assert evidence["probe"] == "flac"
+    assert evidence["probe_readable"] is True
+    assert evidence["verified"] is False
+
+
+def test_standard_request_with_flac_media_is_rejected_not_relabelled(
+    test_app_client, fake_lx, runtime, monkeypatch, caplog,
+):
+    """所选标准档却拿到明确 FLAC 媒体：不能改标签冒充 128k，必须拒绝。"""
+    fake_lx.sources = [_ready("a.js", ["kw"])]
+    _constant_flac_script(fake_lx, monkeypatch)
+    restore = lxapp.app.state.client
+    lxapp.app.state.client = _media_client()
+    try:
+        with caplog.at_level(logging.INFO, logger="fnmusic.lxmusic"):
+            response = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=standard")
+    finally:
+        lxapp.app.state.client = restore
+    # 否则“流畅/标准”模式仍会把 FLAC 交给客户端，只是标签写成 128k
+    assert response.status_code == 404, response.text
+    assert any("quality_lossless_above_target" in record.getMessage()
+               for record in caplog.records), [r.getMessage() for r in caplog.records]
+
+
+def test_hires_echo_does_not_fabricate_hires_actual_quality(
+    test_app_client, fake_lx, runtime, monkeypatch,
+):
+    """Hi-Res 请求回显 flac24bit：只能记解析档，不能编造实际 Hi-Res。"""
+    fake_lx.sources = [_ready("a.js", ["kw"])]
+    _constant_flac_script(fake_lx, monkeypatch)
+    restore = lxapp.app.state.client
+    lxapp.app.state.client = _media_client()
+    try:
+        response = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=hires")
+    finally:
+        lxapp.app.state.client = restore
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert [quality for _, quality in fake_lx.url_calls] == ["flac24bit"]
+    assert data["resolution_quality"] == "hires"
+    assert data["resolution_lx_quality"] == "flac24bit"
+    assert data["actual_quality"] == ""
+    assert data["actual_tier"] == ""
+    assert data["br"] == 0
+    assert data["quality_evidence"]["verified"] is False
+    assert data["quality_evidence"]["type_source"] == "request_echo"
 
 
 # ==================================================== 7 日志脱敏 ==

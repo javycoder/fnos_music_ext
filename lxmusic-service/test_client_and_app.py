@@ -869,7 +869,9 @@ def test_track_url_resolution(test_app_client):
         assert data["ok"] is True
         assert data["data"]["id"] == "lx:kw:5886682"
         assert data["data"]["ext"] == "flac"
-        assert data["data"]["actual_tier"] == "lossless"
+        # type=flac 只是解析档回显，实际档没有实测证据
+        assert data["data"]["resolution_quality"] == "lossless"
+        assert data["data"]["actual_tier"] == ""
         assert "headers" in data["data"]
     finally:
         lxapp.app.state.client = orig_client

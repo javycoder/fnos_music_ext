@@ -59,7 +59,6 @@ from playback_policy import (
     normalize_quality,
     ordered_scripts,
     plan_steps,
-    QUALITY_LEVELS,
     quality_ladder,
     quality_rank,
     read_policy_settings,
@@ -419,16 +418,10 @@ def _tier_to_lx_quality(tier: str) -> str:
         return "128k"
 
 
-# 兼容旧代理契约的 actual_tier 粗粒度：无损及以上都按 lossless，320k/192k 按 high。
-# 档位未知（上游没报 type）时返回空串：宁可让旧字段缺失，也不假装是标准档。
-def _legacy_tier(quality: str) -> str:
-    if quality in ("lossless", "hires", "jymaster", "sky"):
-        return "lossless"
-    if quality in ("exhigh", "higher"):
-        return "high"
-    if quality in QUALITY_LEVELS:
-        return "standard"
-    return ""
+# 探活确认的无损媒体：只认魔数已经确认的 FLAC（ogg/m4a 可能装的是有损编码，
+# 不从 URL 或容器猜无损）。低档请求（标准/较高/极高）拿到它属于越界表示，
+# 不允许改标签冒充低档，否则“流畅/标准”模式仍会把 FLAC 交给客户端。
+_LOSSLESS_PROBE_EXTS = frozenset({"flac"})
 
 
 # ------------------------------------------------------------- 播放策略配置 --
@@ -669,12 +662,15 @@ class _AttemptResult:
     """一次固定脚本/平台的解析结果分类。
 
     ``data`` 非空表示拿到可播放直链（探活与格式均已确认），但档位可能低于
-    本次请求的档位——由调用方决定是立即采用还是暂存；``reported_quality``
-    是上游报告的档位（空串表示未知，绝不按扩展名推断）。
+    本次请求的档位——由调用方决定是立即采用还是暂存。
+
+    ``resolution_quality`` 是上游 ``type`` 回显对应的解析档（空串表示未知）。
+    真实 lxserver 对同一条恒定 FLAC 会按请求回显 type（要 128k 回 128k，要
+    flac 回 flac），所以它只能用于编排排序与降档说明，绝不是实测档位。
     """
 
     data: dict | None = None
-    reported_quality: str = ""
+    resolution_quality: str = ""
     failure: bool = False
     timeout: bool = False
     service_error: bool = False
@@ -741,12 +737,20 @@ def _finish_attempt(
     attempted_tiers: list[str],
     from_stash: bool = False,
 ) -> dict:
-    """收尾一次成功解析：补齐走过的档位与“暂存复用”标记，不改已验证字段。"""
+    """收尾一次成功解析：补齐走过的档位、交付档位与档位依据。
+
+    ``served_tier`` 是本次走到的阶梯档，``served_tier_source`` 说明它是按
+    ``resolution_quality``（上游解析档回显）比档得到的，不是实测档位。
+    暂存复用不重写 ``fallback_reason``：它记录的是同一脚本这次解析的
+    请求档与解析档差异，与阶梯走到第几档无关。
+    """
     result = dict(data)
     result["attempted_tiers"] = list(attempted_tiers)
     evidence = dict(result.get("quality_evidence") or {})
     evidence["from_stash"] = bool(from_stash)
     evidence["served_tier"] = step_quality
+    evidence["served_tier_source"] = "resolution_quality"
+    evidence["served_resolution_quality"] = result.get("resolution_quality") or None
     result["quality_evidence"] = evidence
     return result
 
@@ -774,6 +778,11 @@ async def _attempt_pinned(
     总预算，探活只能用它剩下的时间。请求显式关闭上游自动切源并排除其他脚本；
     响应 ``sourceId`` 必须等于本脚本 ID——缺 ID、别的脚本或内置平台应答都不算
     本脚本成功。
+
+    返回的 ``type`` 只能当解析档回显：真实脚本对任何请求都回同一条恒定媒体，
+    却按请求回显 type。因此它写入 ``resolution_quality``（编排与降档说明用），
+    不写 ``actual_quality``；同时保留三道边界：解析档高于所选上限、有损容器与
+    无损声明矛盾、低档上限却拿到无损媒体，都按失败处理交给阶梯继续。
     """
     remaining = slot_deadline - time.monotonic()
     if remaining <= 0:
@@ -849,61 +858,70 @@ async def _attempt_pinned(
                        track_id, content_type, _media_host(final_url or raw_url))
         return _AttemptResult(failure=True)
 
-    reported_lx = str(response.get("type") or "").strip().lower()
-    reported_quality = from_lx_quality(reported_lx)
+    # 上游 /api/music/url 的固定字段只有
+    # url/type/sourceId/sourceName/downloadSource/requestedSource/hasMoreSources/
+    # attempts。真实 NAS 实测：脚本对任何请求都回同一条 constant.flac，type 却
+    # 随请求变（128k 回 128k、flac 回 flac）。所以 type 是“请求/解析档回显”，
+    # 只能当 resolution_quality 用于编排排序，不能写成 actual_quality。
+    echoed_lx = str(response.get("type") or "").strip().lower()
+    resolution_quality = from_lx_quality(echoed_lx)
     target_rank = quality_rank(requested_quality)
-    reported_rank = quality_rank(reported_quality)
-    # 不通过修改标签伪造降档：已知实际档高于上限时拒绝该表示。
-    above_target = reported_rank >= 0 and target_rank >= 0 and reported_rank > target_rank
-    if above_target:
+    resolution_rank = quality_rank(resolution_quality)
+    # 不通过修改标签伪造降档：上游回显的解析档高于所选上限时拒绝该表示，
+    # 由阶梯继续换脚本/继续降档。
+    if resolution_rank >= 0 and target_rank >= 0 and resolution_rank > target_rank:
         logger.info("播放品质超过上限 script=%s platform=%s stage=quality_above_target", script.id, platform)
         return _AttemptResult(failure=True)
-    # MP3/ADTS AAC明确不是无损；不能用上游flac标签掩盖实际有损编码。
-    if ext in {"mp3", "aac"} and reported_rank >= quality_rank("lossless"):
+    # MP3/ADTS AAC 明确不是无损：不能用上游 flac 标签掩盖实际有损编码。
+    if ext in {"mp3", "aac"} and resolution_rank >= quality_rank("lossless"):
         logger.info("品质声明与编码矛盾 script=%s platform=%s stage=quality_format_mismatch", script.id, platform)
         return _AttemptResult(failure=True)
-    claimed_quality = reported_quality
-    try:
-        upstream_br = int(response.get("br") or 0)
-    except (TypeError, ValueError):
-        upstream_br = 0
+    # 低档上限却拿到明确的无损媒体：不能只把标签改成低档冒充交付，否则
+    # “流畅/标准/较高/极高”模式仍会流出 FLAC。拒绝后继续同档其他脚本或降档。
+    if ext in _LOSSLESS_PROBE_EXTS and 0 <= target_rank < quality_rank("lossless"):
+        logger.info("低档上限拿到无损媒体 script=%s platform=%s ext=%s stage=quality_lossless_above_target",
+                    script.id, platform, ext)
+        return _AttemptResult(failure=True)
     fallback_reason = ""
-    if above_target:
+    if not resolution_quality:
+        # type 缺失或不是七档之一：解析档未知，实际档同样未知，不按扩展名猜。
         fallback_reason = (
-            f"requested {requested_quality}; upstream reported {reported_quality} "
-            f"({reported_lx}) above target"
+            f"requested {requested_quality}; upstream parse tier unknown "
+            f"({echoed_lx or 'missing'}); actual quality unknown"
         )
-    elif not reported_quality:
-        # 上游没报或报了无法识别的类型：如实标注未知，不按扩展名猜档位。
+    elif resolution_quality != requested_quality:
         fallback_reason = (
-            f"requested {requested_quality}; reported quality unknown "
-            f"({reported_lx or 'missing'})"
+            f"requested {requested_quality}; upstream parse tier {resolution_quality} "
+            f"({echoed_lx}); actual quality unknown"
         )
-    elif reported_quality != requested_quality:
-        fallback_reason = (
-            f"requested {requested_quality}; resolved {reported_quality} "
-            f"({reported_lx})"
-        )
-    return _AttemptResult(reported_quality=reported_quality, data={
+    return _AttemptResult(resolution_quality=resolution_quality, data={
         "id": track_id,
         "url": final_url,
         "ext": ext,
         "file_size": size,
-        "actual_tier": _legacy_tier(claimed_quality),
-        "actual_quality": claimed_quality,
+        # 实际档位没有任何可信证据：保持空/未知，绝不用请求或解析标签回填。
+        "actual_quality": "",
+        "actual_tier": "",
+        # 编排依据：上游解析档（type 回显），不是实测。
+        "resolution_quality": resolution_quality,
+        "resolution_lx_quality": echoed_lx,
         "requested_quality": requested_quality,
-        "actual_lx_quality": (
-            _tier_to_lx_quality(claimed_quality) if claimed_quality else (reported_lx or "")
-        ),
         "quality_evidence": {
             "stage": "lxserver+probe",
+            # 第一层：本次请求档；第二层：上游解析档回显；第三层：探活确认格式。
+            "requested_quality": requested_quality,
+            "requested_lx_quality": lx_quality,
+            "resolution_quality": resolution_quality or None,
+            "resolution_lx_quality": echoed_lx or None,
+            "resolution_known": bool(resolution_quality),
+            "type_source": "request_echo",
+            "actual_quality": None,
+            "actual_known": False,
             "probe": ext,
             "content_type": content_type or "",
-            "reported_lx_quality": reported_lx or None,
-            "reported_quality": reported_quality or None,
-            "reported_known": bool(reported_quality),
-            "reported_above_target": above_target,
-            "verified": bool(reported_quality),
+            # 探活只证明拿到可读媒体前缀，不证明实际属于七档中的哪一档。
+            "probe_readable": True,
+            "verified": False,
             "source": "lxserver",
             "source_id": source_id,
             "media_host": media_host,
@@ -915,8 +933,8 @@ async def _attempt_pinned(
         "source_script_name": script.name,
         "resolver": "lxserver",
         "headers": dict(headers),
-        # 码率未知就记 0：不用 999k/1999k 之类的假码率冒充高档。
-        "br": upstream_br,
+        # 码率保持 0：上游响应没有可核实的码率字段，不按档位/源能力猜。
+        "br": 0,
     })
 
 
@@ -1238,7 +1256,8 @@ async def resolve_and_probe(
     - 计划由 playback_policy.plan_steps 一次生成，同一目标档位遍历完全部就绪
       脚本后才降档；不设“最多三个脚本”的上限；
     - 某个脚本回了低于本档的结果时先暂存，不立即返回；等阶梯走到该档位时再
-      复用（同一脚本不会为了降档被重复请求），已知档位高于目标档的结果不采信；
+      复用（同一脚本不会为了降档被重复请求）；比档与降档说明都用上游解析档
+      resolution_quality，实际档位没有实测证据时保持未知；
     - 每次请求用 excludeApiSources 排除其他脚本并关闭上游自动切源，只固定当前
       脚本，不改全局启用态；响应的 sourceId 必须等于该脚本 ID；
     - 搜索/解析/探活共用同一个 deadline，并按剩余尝试数切分 slot，首慢源不能
@@ -1302,10 +1321,12 @@ async def resolve_and_probe(
         memory_key = (step.script_id, step.platform)
         cached = stashed.get(memory_key)
         if cached is not None:
-            cached_rank = quality_rank(str(cached.get("actual_quality") or ""))
+            # 暂存比档只用上游解析档（resolution_quality）；actual_quality 恒为
+            # 未知，拿它比档会让所有暂存都变成“未知”，永远命中不了。
+            cached_rank = quality_rank(str(cached.get("resolution_quality") or ""))
             step_rank = quality_rank(step.quality)
             if 0 <= step_rank <= cached_rank:
-                # 阶梯走到该脚本已给出的档位：直接复用，不再重复请求。
+                # 阶梯走到该脚本已给出的解析档：直接复用，不再重复请求。
                 return _finish_attempt(cached, step_quality=step.quality,
                                        attempted_tiers=attempted_tiers, from_stash=True)
             continue
@@ -1363,18 +1384,20 @@ async def resolve_and_probe(
                 raise SourceStateQueryError("lxserver 播放解析内部故障")
             if attempt.data:
                 _chain_record_success(chain_key)
-                claimed_rank = quality_rank(str(attempt.data.get("actual_quality") or ""))
+                # 排序依据是上游解析档回显，不是空的实测档位。
+                resolved_rank = quality_rank(str(attempt.data.get("resolution_quality") or ""))
                 step_rank = quality_rank(step.quality)
-                if claimed_rank < 0:
+                if resolved_rank < 0:
+                    # type 缺失或无法识别：真正的未知候选最后才兜底。
                     unknown_stashed.setdefault(memory_key, dict(attempt.data))
                     break
-                if claimed_rank >= step_rank:
-                    # 确定达到本步档位后才交付；未知档位留到全部确定档尝试结束。
+                if resolved_rank >= step_rank:
+                    # 解析档达到本步档位后才交付；未知档位留到全部确定档尝试结束。
                     # 交付前把本轮已失败的档位记上（例如该脚本没有无损档）。
                     _record_step_failures(failed_steps, active_generation)
                     return _finish_attempt(attempt.data, step_quality=step.quality,
                                            attempted_tiers=attempted_tiers)
-                # 已知低于本步档位：暂存，先把本档的其他脚本问完。
+                # 解析档已知低于本步档位：暂存，先把本档的其他脚本问完。
                 stashed[memory_key] = dict(attempt.data)
                 break
             if attempt.timeout:
@@ -1392,7 +1415,10 @@ async def resolve_and_probe(
     _record_step_failures(failed_steps, active_generation)
     if unknown_stashed and active_generation == _URL_CACHE_GEN:
         fallback = next(iter(unknown_stashed.values()))
-        fallback["fallback_reason"] = "quality unknown; no confirmed target or lower-tier result"
+        fallback["fallback_reason"] = (
+            f"requested {target_quality}; upstream parse tier unknown; "
+            "requested tier not confirmed; actual quality unknown"
+        )
         return _finish_attempt(fallback, step_quality="", attempted_tiers=attempted_tiers, from_stash=True)
     return None
 
