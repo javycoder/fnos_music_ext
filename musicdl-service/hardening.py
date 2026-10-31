@@ -29,6 +29,16 @@ class WorkerTaskError(RuntimeError):
     """任务级失败：worker 上报后仍健康存活，坑位保留复用，仅本次任务失败。"""
 
 
+def is_task_level_error(exc: BaseException) -> bool:
+    """判断是不是「任务级失败」：worker 已按协议上报阶段错误，进程仍然健康。
+
+    这类失败不应回收 worker，也不该计入 crashed。search_core 的
+    SearchStageError / ProbeStageError 带 stage 属性，这里用鸭子类型判断，
+    避免 hardening 反向依赖 search_core。
+    """
+    return isinstance(exc, WorkerTaskError) or getattr(exc, "stage", None) is not None
+
+
 class SearchProgress:
     """Bounded per-request handoff, never a cache; close rejects late results."""
 
@@ -289,6 +299,12 @@ class SourceBulkhead:
             slot.stats["task_failed"] += 1
             raise
         except BaseException as exc:
+            if is_task_level_error(exc):
+                # 同进程内执行的任务级失败（例如测试替身直接跑 search_core）：
+                # 语义等同于 worker 上报错误，不该按进程崩溃回收。
+                reason = "task_failed"
+                slot.stats["task_failed"] += 1
+                raise WorkerTaskError(str(exc)) from exc
             reason = ("cancelled" if isinstance(exc, asyncio.CancelledError) else
                       "timeout" if isinstance(exc, asyncio.TimeoutError) else "worker_failed")
             slot.stats["timeouts" if reason == "timeout" else "crashed"] += 1

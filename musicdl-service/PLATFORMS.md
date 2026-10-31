@@ -21,8 +21,30 @@
 - **数字不再表示整源**。`1,2,3` = 网易云 + mdl-酷我 + mdl-酷狗，不是 musicbox + musicdl + lxmusic。
 - 短名 token 仍可用：`lx-kw`、`musicdl-gequhai` / `mdl-49`（`mdl-` 后的数字也是本表全局编号）。
 - 海外平台（Spotify/Deezer 等）在国内网络环境多数不可达；有声/电台类（喜马拉雅等）返回的是音频节目。
-- 各平台可用性随上游接口变化，搜索返回空即代表该平台当前不可用，不影响其他平台。
+- 各平台可用性随上游接口变化。**搜索返回空只代表这次没结果，不等于平台永久故障**：服务不会因空结果触发熔断或压缩超时预算，下一次请求仍会正常重试该平台。
 - lx `tx`（QQ）仅搜索，播放链路暂缺，故不列入精选。
+
+## 支持边界（务必先读）
+
+本表的 musicdl 短名不靠猜测，而是对齐 **musicdl 2.14.2 实际注册表**：
+57 个 `MusicClient` 类，由包内 `musicdl/modules/sources/__init__.py` 的
+`MusicClientBuilder.REGISTERED_MODULES` 定义，已与固定 wheel 逐条核对。
+但「SDK 注册了该平台」不等于「本扩展能直接交付它的流」，区别如下：
+
+- **不承诺全源七档音质**。实际档位取决于账号权益与上游能力；`bitrate` 未知时本服务
+  如实报 `unknown`，不按扩展名或平台能力猜 Hi-Res / 超清母带。
+- **注册不等于支持裸流透传**。以下情形本服务明确标记为 `unsupported`（不支持），
+  既不签发直链，也不实现任何绕过机制：
+  - `raw_data.play_auth` 非空——例如汽水音乐（Soda）的部分曲目受 DRM 保护，必须由
+    SDK 的 `_download` 走完下载与解密后处理才是可用媒体，裸 URL 只是密文载荷；
+  - 其它 DRM / 加密标记（`drm`、`encrypted` 等）；
+  - 非普通文件协议，以及HLS/DASH清单。清单即使用HTTPS、SDK标成HTTP，也需要专用处理；
+  - 加密容器扩展名（`.ncm`、`.qmc0`、`.qmcflac`、`.kgm`、`.mflac`、`.mgg`、`.mg3d` 等）。
+- 普通 HTTP 且未加密的实际音频（mp3 / flac / m4a / ogg 等）继续通过 `/stream` 与
+  `/internal/resolve` 正常交付。
+
+`musicdl-service/test_sdk_contract.py` 会用固定 wheel 核对本表与真实注册表的
+数量与名称一致；不一致时用例直接失败，不会被悄悄放行。
 
 ## 平台总表
 

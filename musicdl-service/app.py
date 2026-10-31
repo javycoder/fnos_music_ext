@@ -35,6 +35,9 @@ except ImportError:
     logger.warning("curl_cffi not installed, falling back to standard httpx client")
 
 from musicdl import musicdl  # noqa: E402
+# worker 也是从 musicdl-service 目录启动，两个进程共用同一份 search_core
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import search_core  # noqa: E402  归一化与媒体履约判据（worker 与 API 共用同一份）
 from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy, SearchProgress  # noqa: E402
 
 # 复用仓库根（容器内 /srv）的 proxy.env_merge 解析 .env；独立运行无仓库结构时退回纯环境变量
@@ -243,6 +246,16 @@ def _search_payload(source: str, keyword: str, fetch_size: int, limit: int,
     }
 
 
+def _note_empty_source_result(source: str, breaker, adaptive) -> None:
+    """记录一次「源正常返回但没有可用结果」。
+
+    空结果不是平台失效：可能是关键词不在这个站、也可能是所有候选都被初筛挡掉
+    （例如需要后处理受 DRM 保护的流，本服务不支持）。因此不记熔断失败，也不压
+    自适应预算——否则一次空搜索会把这个源在冷却期内判成永久故障。
+    """
+    logger.info("source %s returned no usable results (not counted as failure)", source)
+
+
 async def _refresh_by_keyword(song_id: str) -> dict | None:
     """URL 过期或下载失败后按缓存的关键词重搜一次，找回同 ID 的曲目。"""
     entry = _cache_get(song_id)
@@ -416,10 +429,26 @@ async def _maybe_downgrade(id: str, entry: dict, url: str, quality: str,
     return url, src_headers
 
 
+async def _reject_unsupported_entry(song_id: str, entry: dict) -> None:
+    """透传直链与 /stream 的共同前置检查。
+
+    需要服务端后处理（DRM/play_auth）、非 HTTP 协议或加密容器的条目不能当作
+    裸媒体转发。搜索初筛已经过滤过一次，这里在交付路径上再拦一次，避免客户端
+    绕过搜索直接用 id 拿到无法播放的链接。
+    """
+    item = (entry or {}).get("item") or {}
+    reason = search_core.media_unsupported_reason(item)
+    if reason is None:
+        return
+    logger.info("refusing unsupported media for %s: %s", song_id, reason)
+    raise HTTPException(409, f"unsupported media for {song_id!r}: {reason}")
+
+
 async def _resolve_entry(song_id: str, auto_refresh: bool = True):
     entry = _cache_get(song_id)
     if entry is None:
         raise HTTPException(404, f"unknown song id {song_id!r}: cache expired or service restarted; re-search keyword and source once, then retry")
+    await _reject_unsupported_entry(song_id, entry)
     fresh = entry["item"].get("download_url") and (time.time() - entry["ts"]) < CONF["url_ttl"]
     if fresh:
         return entry
@@ -673,6 +702,8 @@ async def search(
                 ADAPTIVE.record_success(source, latency)
                 if items:
                     SOURCE_BREAKER.record_success(source, latency)
+                else:
+                    _note_empty_source_result(source, SOURCE_BREAKER, ADAPTIVE)
                 return source, items, None
             except SourceBusy as exc:
                 # Admission rejection is not another upstream failure.
@@ -796,6 +827,13 @@ async def info(id: str = Query(..., min_length=1)):
         "album": item.get("album"),
         "duration_s": item.get("duration_s"),
         "ext": item.get("ext"),
+        # 实际协议与交付形态：让上层能在取流之前判断是否需要专门处理
+        "protocol": item.get("protocol", ""),
+        "delivery": item.get("delivery", ""),
+        # 实际品质未知时如实报 unknown，不按扩展名猜 Hi-Res/母带
+        "quality": item.get("quality", ""),
+        "bitrate": item.get("bitrate", 0),
+        "samplerate": item.get("samplerate", 0),
         "file_size": item.get("file_size"),
         "cover_url": item.get("cover_url"),
         "lyric": entry.get("lyric", ""),
@@ -882,6 +920,7 @@ async def internal_resolve(
     if not _internal_authorized(x_internal_token):
         raise HTTPException(503, "internal authentication unavailable")
     entry = await _direct_resolve_entry(id)
+    await _reject_unsupported_entry(id, entry)
     item = entry.get("item") or {}
     url = str(item.get("download_url") or "")
     if not url:

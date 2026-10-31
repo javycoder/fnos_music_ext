@@ -630,15 +630,21 @@ def test_stream_rejects_encoded_origin_before_reading(monkeypatch, use_curl):
     (404, "audio/mpeg", False),
 ])
 def test_curl_probe_closes_head_and_streamed_fallback(monkeypatch, status, content_type, expected):
+    """HEAD 405 回退有界 GET Range：只读前缀，stream 与 head 都要关闭。"""
     closed = []
     head = types.SimpleNamespace(status_code=405, close=lambda: closed.append("head"))
+    # 真实媒体前缀；json/html 场景由 body 决定判据
+    body = b"{" if content_type.startswith("text/") or "json" in content_type else b"ID3\x03" + bytes(64)
     stream = types.SimpleNamespace(
         status_code=status, headers={"content-type": content_type},
+        iter_content=lambda size: iter([body]),
         close=lambda: closed.append("stream"))
 
     def get(url, **kwargs):
-        assert kwargs["stream"] is True
-        assert kwargs["headers"]["Range"] == "bytes=0-1"
+        assert not kwargs.get("stream", False)
+        assert callable(kwargs["content_callback"])
+        assert kwargs["headers"]["Range"].startswith("bytes=0-")
+        kwargs["content_callback"](body)
         return stream
 
     monkeypatch.setattr(search_core, "HAS_CURL_CFFI", True)
@@ -649,14 +655,20 @@ def test_curl_probe_closes_head_and_streamed_fallback(monkeypatch, status, conte
 
 
 @pytest.mark.parametrize("status,expected", [(200, True), (404, False)])
-def test_curl_probe_closes_head_without_fallback(monkeypatch, status, expected):
+def test_curl_probe_closes_head_and_checks_success_body(monkeypatch, status, expected):
     closed = []
     head = types.SimpleNamespace(status_code=status, headers={"content-type": "audio/mpeg"},
                                  close=lambda: closed.append("head"))
+    response = types.SimpleNamespace(status_code=200, headers={"content-type": "audio/mpeg"},
+                                     close=lambda: closed.append("body"))
+    def get(*args, **kwargs):
+        assert status == 200  # HEAD404仍直接拒绝，不浪费正文请求。
+        kwargs['content_callback'](b'ID3' + bytes([3]) + bytes(64))
+        return response
     monkeypatch.setattr(search_core, "HAS_CURL_CFFI", True)
-    monkeypatch.setattr(search_core, "curl_requests", types.SimpleNamespace(head=lambda *a, **kw: head))
+    monkeypatch.setattr(search_core, "curl_requests", types.SimpleNamespace(head=lambda *a, **kw: head, get=get))
     assert search_core.probe_playable_sync("http://test.invalid/audio", {}) is expected
-    assert closed == ["head"]
+    assert closed == (["body", "head"] if status == 200 else ["head"])
 
 
 @pytest.mark.parametrize("failure", ["request", "headers", "close"])
@@ -673,6 +685,9 @@ def test_curl_probe_closes_responses_on_fallback_failure(monkeypatch, failure):
                 raise RuntimeError("invalid headers")
             return {"content-type": "audio/mpeg"}
 
+        def iter_content(self, _size):
+            return iter([b"ID3\x03" + bytes(64)])
+
         def close(self):
             closed.append("stream")
             if failure == "close":
@@ -681,6 +696,7 @@ def test_curl_probe_closes_responses_on_fallback_failure(monkeypatch, failure):
     def get(*args, **kwargs):
         if failure == "request":
             raise RuntimeError("request failed")
+        kwargs['content_callback'](b'ID3' + bytes([3]) + bytes(64))
         return Stream()
 
     monkeypatch.setattr(search_core, "HAS_CURL_CFFI", True)
@@ -701,7 +717,8 @@ def test_probe_playable_sync_unit(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if "audio.mp3" in url_str:
-            return httpx.Response(200, headers={"Content-Type": "audio/mpeg", "Content-Length": "1000000"})
+            body = b'ID3' + bytes([3]) + bytes(1020)
+            return httpx.Response(200, headers={"Content-Type": "audio/mpeg", "Content-Length": str(len(body))}, content=body)
         if "html_error" in url_str:
             return httpx.Response(200, headers={"Content-Type": "text/html; charset=utf-8"}, text="<html>404 Not Found</html>")
         if "notfound" in url_str:

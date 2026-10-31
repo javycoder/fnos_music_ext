@@ -353,6 +353,14 @@ class Client:
             while True: time.sleep(1)
         time.sleep(.03)
         return type("R", (), {"status_code":200,"headers":{}})()
+    def stream(self, *args, **kwargs):
+        class PrefixResponse:
+            status_code = 200
+            headers = {"content-type": "audio/mpeg"}
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def iter_bytes(self, size): yield b"ID3" + bytes([3]) + bytes(64)
+        return PrefixResponse()
 httpx.Client = Client
 # Force standard httpx probe even on machines with curl_cffi installed.
 import sys
