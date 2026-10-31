@@ -3818,7 +3818,10 @@ _NETEASE_DOWNLOAD_FAIL_TTL_S = 5.0
 
 def _netease_quality_evidence(payload: dict) -> str:
     """只从服务端明确返回的音质字段取证；缺少证据时保留 unknown。"""
-    for field in ("actual_quality", "actual_tier", "level", "quality"):
+    # LX响应quality是请求档，不是实际档；明确unknown不能回退到请求标签。
+    actual_fields = ("actual_quality", "actual_tier")
+    fields = actual_fields if any(field in payload for field in actual_fields) else ("level",)
+    for field in fields:
         value = payload.get(field)
         if value:
             try:
@@ -6896,7 +6899,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     song_id = song_id_from_online_guid(guid)
                     if purpose != "download" and _lx_fresh_cooldown_active(song_id) and not _lx_url_pin_valid(song_id):
                         return None
-                    max_q = "high" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
+                    max_q = "high" if (purpose != "download" and (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
                     target = _lx_target_quality(
                         max_q, quality_override if purpose == "download" else None)
                     lx_pin_key = _lx_url_cache_key(
@@ -6951,7 +6954,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 params["quality"] = "mp3"
                 actual_quality = _netease_quality_evidence(info or {})
             # 损坏无损流的播放回退仍只影响当前播放请求。
-            elif (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
+            elif purpose != "download" and (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header:
                 params["quality"] = "mp3"
             req = client.build_request("GET", "/stream", params=params, headers=headers)
         try:
@@ -7006,7 +7009,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
         # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
-        downgraded = (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header
+        downgraded = purpose != "download" and (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header
         if (via_musicdl or downgraded) and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
             ext = "mp3"
         elif downgraded and (not ext or ext in _LOSSLESS_EXTS):
@@ -8944,9 +8947,9 @@ async def track_transcode(request: Request):
 #                                             errno, errmsg, downloadId, percent}
 #   file    GET ?downloadId=           → 音频字节（支持断点，Content-Type 按扩展名）
 #   delete  POST {downloadId}          → data{downloadId, deleted:true}
-# 档位（2.8.0 修复"FLAC 下载变 MP3"）：只有 App 显式请求"标准"档（standard 词表）
-# 才交 MP3 320k；未知档位词与缺省一律交付原文件——2.6.3-2.7.0 缺省=standard，
-# App 无损偏好下发的 quality 值落到缺省被擅自转码。dl_quality 可整体强制覆盖。
+# 七档下载目标在prepare时固定；跟随App的旧standard词仍表示320k，
+# 新UI标准是128k。缺省与未知请求使用播放档，显式original选择最高可用。
+# 下载不复用播放流缓存，也不受播放坏流黑名单影响；已有曲库文件保持原样。
 # 官方服务不认识在线曲目的伪装 guid，透传必失败；此处仅当 guid 是在线曲目才接管，
 # 本地曲目与未知 downloadId 一律透传官方。
 _DL_TASKS: dict[str, dict] = {}
@@ -8968,7 +8971,7 @@ def _dl_transcode_path(guid: str, quality: str = "exhigh", ext: str = "mp3", *,
     return os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR, filename)
 
 
-# App 请求词命中才算显式要"标准"档（MP3 320k）；其余一律按原始档交付
+# 官方旧协议的标准下载词；真正目标由共享音质策略解释。
 _DL_STANDARD_WORDS = ("standard", "std", "mp3", "标准")
 
 
@@ -9000,10 +9003,26 @@ def _dl_effective_quality(raw_quality: str, is_original: bool) -> str:
     return qp.app_download_quality(raw_quality, is_original, play_q)
 
 
+def _dl_remove_owned_artifacts(task: dict) -> None:
+    """只删除本任务实际创建并登记的独立产物，绝不按path猜测曲库文件。"""
+    for path in task.pop("_owned_paths", set()):
+        _remove_quiet(path)
+
+
+def _dl_discard_task(task: dict) -> None:
+    task["_discarded"] = True
+    producer = task.get("_producer")
+    if isinstance(producer, asyncio.Task) and not producer.done():
+        producer.cancel()  # producer的finally负责关闭流、回收编码进程和临时文件。
+    else:
+        _dl_remove_owned_artifacts(task)
+
+
 def _dl_sweep() -> None:
     now = time.monotonic()
     for key, task in list(_DL_TASKS.items()):
         if now - float(task.get("touched", 0)) > _DL_TASK_TTL_S:
+            _dl_discard_task(task)
             _DL_TASKS.pop(key, None)
 
 
@@ -9057,6 +9076,28 @@ def _dl_should_transcode(target_quality: str, source_quality: str, source_ext: s
         # 低目标需要真实 MP3 编码；对未知输入不声明来源品质，只声明输出编码档。
         return target_quality in ("standard", "higher") or source_ext in _LOSSLESS_EXTS
     return source_rank > target_rank
+
+
+async def _dl_run_encoder(*argv: str) -> int:
+    """编码最多600秒；超时或取消必须终止并等待子进程，不能遗留后台CPU任务。"""
+    process = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    finished = False
+    try:
+        code = await asyncio.wait_for(process.wait(), timeout=600.0)
+        finished = True
+        return code
+    finally:
+        if not finished:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            with anyio.CancelScope(shield=True):
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2.0)
+                except (TimeoutError, ProcessLookupError):
+                    pass
 
 
 async def _dl_produce(task: dict, cred_headers: dict) -> None:
@@ -9144,6 +9185,7 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
         if written < 1024 or (expected is not None and written != expected):
             raise RuntimeError(f"download size mismatch written={written} expected={expected}")
         os.replace(source_part, source_path)
+        task.setdefault("_owned_paths", set()).add(source_path)
         source_part = None
 
         if _dl_should_transcode(target_q, source_quality, source_ext):
@@ -9158,16 +9200,16 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
                 raise RuntimeError("transcoder unavailable for requested download quality")
             task["state"] = "transcoding"
             task["percent"] = 0
-            proc = await asyncio.create_subprocess_exec(
+            code = await _dl_run_encoder(
                 tc.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-i", source_path, "-vn", "-map_metadata", "-1",
                 "-c:a", "libmp3lame", "-b:a", target_bitrate,
                 "-f", "mp3", output_part,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            if await proc.wait() != 0 or not os.path.isfile(output_part) or os.path.getsize(output_part) == 0:
+            if code != 0 or not os.path.isfile(output_part) or os.path.getsize(output_part) == 0:
                 raise RuntimeError("transcode failed")
             os.replace(output_part, output_path)
+            task.setdefault("_owned_paths", set()).add(output_path)
             output_part = None
             _remove_quiet(source_path)
             source_path = None
@@ -9182,6 +9224,9 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
         task["state"] = "completed"
         task["percent"] = 100
         task["size"] = os.path.getsize(task["path"])
+    except asyncio.CancelledError:
+        task.update(state="failed", errmsg="cancelled")
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("download producer failed for %s: %s", guid, type(exc).__name__)
         task["state"] = "failed"
@@ -9193,6 +9238,9 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
             _remove_quiet(output_part)
         if source_path and source_path != task.get("path"):
             _remove_quiet(source_path)
+        if task.get("_discarded") or task.get("state") != "completed":
+            _dl_remove_owned_artifacts(task)
+        task.pop("_producer", None)
         with anyio.CancelScope(shield=True):
             if resp:
                 await resp.aclose()
@@ -9257,7 +9305,7 @@ async def dl_transcode_prepare(request: Request):
         "downloadId": download_id, "touched": time.monotonic(), "started": time.time(),
     }
     _DL_TASKS[download_id] = task
-    asyncio.create_task(_dl_produce(task, copy_incoming_headers(request)))
+    task["_producer"] = asyncio.create_task(_dl_produce(task, copy_incoming_headers(request)))
     return JSONResponse(content={
         "code": 0, "msg": "",
         "data": {"status": "success", "errno": "", "errmsg": "", "downloadId": download_id},
@@ -9309,6 +9357,7 @@ async def dl_transcode_delete(request: Request):
     download_id = ""
     for key, value in list(_DL_TASKS.items()):
         if value is task:
+            _dl_discard_task(task)
             _DL_TASKS.pop(key, None)
             download_id = key
     return JSONResponse(content={

@@ -14,6 +14,126 @@ from proxy import quality_policy as qp
 from proxy import transcode as tc
 
 
+@pytest.mark.parametrize('actual', ['', 'unknown'])
+def test_lx_unknown_actual_quality_is_not_replaced_by_request_target(actual):
+    # LX响应quality是请求档；actual_quality为空时不能把sky当成真实品质。
+    payload = {'quality': 'sky', 'actual_quality': actual, 'actual_tier': '', 'br': 0}
+    assert appmod._netease_quality_evidence(payload) == 'unknown'
+
+
+@pytest.mark.anyio
+async def test_lx_download_ignores_playback_lossless_blacklist(monkeypatch):
+    captured = {}
+    class Response:
+        status_code = 200
+        headers = {'content-type': 'audio/mpeg'}
+        async def aiter_bytes(self):
+            yield b'fLaC' + b'\x00' * 2044
+        async def aclose(self):
+            pass
+    class Client:
+        def build_request(self, method, url, **kwargs):
+            return httpx.Request(method, url)
+        async def send(self, request, **kwargs):
+            return Response()
+        async def aclose(self):
+            pass
+    async def resolve(*args, **kwargs):
+        captured.update(kwargs)
+        return {'url': 'https://media.test/dl.flac', 'ext': 'flac', 'actual_quality': 'lossless'}
+    monkeypatch.setattr(appmod, '_retained_track', lambda *args: ({'ext': 'flac'}, None))
+    monkeypatch.setattr(appmod, '_lossless_is_blacklisted', lambda *args: True)
+    monkeypatch.setattr(appmod, 'get_lx_client', lambda *args: object())
+    monkeypatch.setattr(appmod, 'resolve_lx_url_shared', resolve)
+    monkeypatch.setattr(appmod.httpx, 'AsyncClient', lambda **kwargs: Client())
+    opened = await appmod._open_online_stream(
+        appmod._synth_request({}), 'online:lx:kw:123', None,
+        quality_override='lossless', purpose='download', generation=7, include_quality=True)
+    try:
+        assert captured['max_quality'] is None
+        assert captured['quality_override'] == 'lossless'
+        assert opened[2] == 'flac'
+        assert opened[-1] == 'lossless'
+    finally:
+        await opened[0].aclose()
+        await opened[1].aclose()
+
+
+@pytest.mark.anyio
+async def test_download_cancellation_reaps_encoder(tmp_path, monkeypatch):
+    import asyncio
+    started, exited = asyncio.Event(), asyncio.Event()
+    killed, closed = [], []
+    class Response:
+        headers = {'content-length': '2048'}
+        async def aclose(self):
+            closed.append(True)
+    async def chunks():
+        yield b'b' * 1024
+    async def stream(*args, **kwargs):
+        return Response(), None, 'mp3', {}, chunks(), b'a' * 1024, 'exhigh'
+    class Process:
+        async def wait(self):
+            started.set()
+            await exited.wait()
+            return -9
+        def kill(self):
+            killed.append(True)
+            exited.set()
+    async def spawn(*args, **kwargs):
+        return Process()
+    monkeypatch.setitem(CONF, 'cache_dir', str(tmp_path))
+    monkeypatch.setattr(appmod, 'resolve_local_play', _async_none)
+    monkeypatch.setattr(appmod, '_source_enabled', lambda *args: True)
+    monkeypatch.setattr(appmod, '_open_online_stream', stream)
+    monkeypatch.setattr(appmod.asyncio, 'create_subprocess_exec', spawn)
+    monkeypatch.setattr(tc, 'FFMPEG_BIN', 'fixture-ffmpeg')
+    task = {'guid': 'online:netease:CANCEL', 'quality': 'standard', 'downloadId': 'cancel'}
+    producer = asyncio.create_task(_dl_produce(task, {}))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    producer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await producer
+    assert killed, '取消下载必须终止独立编码进程'
+    assert closed
+    assert not list(tmp_path.rglob('*.part'))
+
+
+@pytest.mark.anyio
+async def test_delete_cancels_active_download_and_preserves_original_file(tmp_path, monkeypatch):
+    import asyncio
+    original = tmp_path / 'original.flac'
+    original.write_bytes(b'original-library-data')
+    producer = asyncio.create_task(asyncio.Event().wait())
+    task = {'guid': 'online:netease:DELETE', 'path': str(original), 'state': 'waiting',
+            '_producer': producer, 'touched': 0}
+    monkeypatch.setitem(_DL_TASKS, 'fixture-delete', task)
+    request = appmod._synth_request({})
+    request.scope['query_string'] = b'downloadId=fixture-delete'
+    try:
+        response = await appmod.dl_transcode_delete(request)
+        assert response.status_code == 200
+        assert producer.cancelling(), '删除活动下载必须取消生产任务'
+        assert original.read_bytes() == b'original-library-data'
+    finally:
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+
+
+def test_expired_download_cleans_only_recorded_owned_artifacts(tmp_path, monkeypatch):
+    original, owned = tmp_path / 'original.flac', tmp_path / 'owned.mp3'
+    original.write_bytes(b'original')
+    owned.write_bytes(b'owned')
+    expired_at = appmod.time.monotonic() - appmod._DL_TASK_TTL_S - 1
+    monkeypatch.setitem(_DL_TASKS, 'expired-owned', {
+        'state': 'completed', 'path': str(owned), '_owned_paths': {str(owned)}, 'touched': expired_at})
+    monkeypatch.setitem(_DL_TASKS, 'expired-original', {
+        'state': 'completed', 'path': str(original), 'touched': expired_at})
+    appmod._dl_sweep()
+    assert not owned.exists()
+    assert original.read_bytes() == b'original'
+
+
 def test_dl_effective_quality_semantics(monkeypatch):
     """测试 App 下载档位解释：
     - 旧 App standard 解释为 exhigh (320k)
@@ -325,6 +445,7 @@ async def test_musicdl_download_requests_only_supported_lossy_hint(monkeypatch, 
             return Response()
 
     monkeypatch.setattr(appmod, "get_musicdl_client", lambda application: Client())
+    monkeypatch.setattr(appmod, "_lossless_is_blacklisted", lambda *args: True)
     monkeypatch.setattr(appmod, "_retained_track", lambda *args: ({"ext": "mp3"}, None))
     opened = await appmod._open_online_stream(
         appmod._synth_request({}), "online:musicdl:123", None,
