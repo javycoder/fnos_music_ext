@@ -276,7 +276,7 @@ def test_status_process_layer_down_not_reported_as_http(
     health = client.get("/api/status").json()["health"]
     assert health["process"]["ok"] is False
     assert health["process"]["detail"]
-    # 进程层就失败时不再去问 HTTP，避免用旧 Laplacians的答案掩盖真实原因
+    # 进程未运行时，分层结果不能用HTTP应答掩盖进程故障。
     assert health["http"]["ok"] is False
     assert health["http"]["error_type"] == "not_probed"
 
