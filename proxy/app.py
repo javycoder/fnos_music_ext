@@ -6214,6 +6214,28 @@ def _clean_scan_headers(headers: dict | None) -> dict:
     return cleaned
 
 
+async def _scan_request_outcome(client: httpx.AsyncClient, request: httpx.Request) -> str:
+    """扫描接口总预算10秒、响应上限64KiB；只认可明确业务成功码。"""
+    async with asyncio.timeout(10.0):
+        response = await client.send(request, stream=True)
+        try:
+            if response.status_code != 200:
+                return f"http_{response.status_code}"
+            body = bytearray()
+            async for chunk in response.aiter_bytes(chunk_size=8192):
+                if len(body) + len(chunk) > 65536:
+                    return "response_too_large"
+                body.extend(chunk)
+            try:
+                payload = json.loads(body)
+            except (ValueError, RecursionError):
+                return "invalid_json"
+            code = payload.get("code") if isinstance(payload, dict) else None
+            return "ok" if type(code) is int and code in (0, 200) else "business_unconfirmed"
+        finally:
+            await response.aclose()
+
+
 async def _run_scan_worker(initial_wait: float) -> None:
     """后台扫描工作协程：处理合并延迟、发送扫描请求、处理冷却以及补发待扫任务。"""
     global _scan_last_attempt, _scan_pending_headers
@@ -6240,37 +6262,14 @@ async def _run_scan_worker(initial_wait: float) -> None:
                 headers=req_headers,
                 content=scan_body.encode("utf-8") if scan_body else None,
             )
-            # 有界超时 10 秒，防止上游挂起
-            resp = await asyncio.wait_for(client.send(req), timeout=10.0)
-            try:
-                # 读取完整响应
-                body_bytes = await resp.aread()
-                if resp.status_code == 200:
-                    biz_ok = True
-                    try:
-                        resp_json = json.loads(body_bytes.decode("utf-8"))
-                        if isinstance(resp_json, dict) and "code" in resp_json:
-                            # 官方接口标准成功码为 0 或 200
-                            biz_ok = resp_json["code"] in (0, 200)
-                    except Exception:
-                        pass
-                    if biz_ok:
-                        logger.info("Library scan triggered via %s", scan_path)
-                    else:
-                        logger.warning(
-                            "Library scan %s returned business error: %s",
-                            scan_path, body_bytes[:200],
-                        )
-                else:
-                    logger.warning(
-                        "Library scan %s returned %s (check FNMUSIC_LIBRARY_SCAN_PATH)",
-                        scan_path, resp.status_code,
-                    )
-            finally:
-                # 响应对象必须安全关闭，避免连接泄漏
-                await resp.aclose()
-        except Exception as e:
-            logger.warning("Library scan trigger failed: %s", e)
+            outcome = await _scan_request_outcome(client, req)
+            if outcome == "ok":
+                logger.info("Library scan triggered")
+            else:
+                # 仅记录阶段结果；路径查询参数与上游正文都可能包含凭据。
+                logger.warning("Library scan not confirmed: reason=%s", outcome)
+        except Exception as exc:
+            logger.warning("Library scan trigger failed: error_type=%s", type(exc).__name__)
 
         # 检查是否在发送期间或冷却期间又有新文件落盘进队列
         if _scan_pending_headers is not None:
