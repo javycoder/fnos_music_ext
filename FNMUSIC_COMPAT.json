@@ -1,6 +1,6 @@
 {
   "extension_version": "2.12.0-1",
   "music_versions": ["1.0.10"],
-  "checked_at": "2026-10-29",
-  "notes": "音乐适配基线沿用 2026-10-29 通过已信任的SSH 只读核实机 /var/apps/trim.music/manifest 的结果：appname=trim.music，version=1.0.10。本次 2.12.0b 预发布未重新连接实机核对 manifest，官方版本无变化证据时不虚报新核对日期；如后续实机版本更新需重新核对并更新本文件。仅记录适配基线，不控制运行时行为。"
+  "checked_at": "2026-10-31",
+  "notes": "2026-10-31 通过已信任的SSH 只读核实机 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10，与 2026-10-29 基线一致，官方版本无变化。后续发布须重新连接实机核对 manifest，官方版本无变化证据时不虚报新核对日期；如后续实机版本更新需重新核对并更新本文件。仅记录适配基线，不控制运行时行为。"
 }
