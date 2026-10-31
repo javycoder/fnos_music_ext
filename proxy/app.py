@@ -9173,6 +9173,16 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
         content_length = str(resp.headers.get("content-length") or "")
         if content_length.isdigit():
             expected = int(content_length)
+        content_range = str(resp.headers.get("content-range") or "").strip()
+        if getattr(resp, "status_code", 200) == 206 or content_range:
+            # Content-Length只证明当前片段，必须确认它覆盖0到总长度的完整表示。
+            match = re.fullmatch(r"bytes\s+0-(\d+)/(\d+)", content_range, re.I)
+            if not match or int(match[1]) + 1 != int(match[2]) or int(match[2]) <= 0:
+                raise RuntimeError("incomplete download representation")
+            total = int(match[2])
+            if expected is not None and expected != total:
+                raise RuntimeError("inconsistent download length")
+            expected = total
         written = 0
         with open(source_part, "wb") as output:
             if first:
@@ -9184,6 +9194,11 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
                     written += len(chunk)
         if written < 1024 or (expected is not None and written != expected):
             raise RuntimeError(f"download size mismatch written={written} expected={expected}")
+        if source_ext in _LOSSLESS_EXTS:
+            # 独立下载不能绕过已有完整无损解码检查，也不污染播放侧坏流状态。
+            valid, _reason = await asyncio.to_thread(_check_audio_file, source_part)
+            if not valid:
+                raise RuntimeError("download decode validation failed")
         os.replace(source_part, source_path)
         task.setdefault("_owned_paths", set()).add(source_path)
         source_part = None

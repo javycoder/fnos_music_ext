@@ -134,6 +134,39 @@ def test_expired_download_cleans_only_recorded_owned_artifacts(tmp_path, monkeyp
     assert original.read_bytes() == b'original'
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize('content_range, decode_ok, completed', [
+    ('bytes 1024-3071/8192', True, False),
+    ('', False, False),
+    ('bytes 0-2047/2048', True, True),
+])
+async def test_download_requires_complete_representation_and_valid_lossless(
+    tmp_path, monkeypatch, content_range, decode_ok, completed,
+):
+    closed = []
+    class Response:
+        status_code = 206 if content_range else 200
+        headers = {'content-length': '2048', 'content-range': content_range}
+        async def aclose(self):
+            closed.append(True)
+    async def chunks():
+        yield b'\x00' * 1024
+    async def stream(*args, **kwargs):
+        return Response(), None, 'flac', {}, chunks(), b'fLaC' + b'\x00' * 1020, 'lossless'
+    monkeypatch.setitem(CONF, 'cache_dir', str(tmp_path))
+    monkeypatch.setattr(appmod, 'resolve_local_play', _async_none)
+    monkeypatch.setattr(appmod, '_source_enabled', lambda *args: True)
+    monkeypatch.setattr(appmod, '_open_online_stream', stream)
+    monkeypatch.setattr(appmod, '_check_audio_file', lambda path: (decode_ok, 'ok' if decode_ok else 'decode_error'))
+    task = {'guid': 'online:lx:kw:COMPLETE', 'quality': 'lossless', 'downloadId': 'complete'}
+    await _dl_produce(task, {})
+    assert (task['state'] == 'completed') is completed
+    assert closed
+    if not completed:
+        assert not list(tmp_path.rglob('*.part'))
+        assert not task.get('path')
+
+
 def test_dl_effective_quality_semantics(monkeypatch):
     """测试 App 下载档位解释：
     - 旧 App standard 解释为 exhigh (320k)
