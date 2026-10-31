@@ -56,7 +56,7 @@ MAX_SCRIPT_BYTES = 2 * 1024 * 1024  # 严格有界 2MB
 SAMPLE_TOTAL_TIMEOUT_S = 90.0  # 每样本总超时 90 秒
 DOCKER_EXEC_HARD_TIMEOUT_S = 110.0  # docker exec 父硬超时 110 秒
 DEFAULT_IMAGE = "fnmusic-sources:latest"
-DEFAULT_INVENTORY = "docs/lx_source_inventory.json"
+DEFAULT_INVENTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lx_source_inventory.json")
 DEFAULT_OUTPUT = "lx-source-matrix-report.json"
 KEYWORDS = ("晴天", "江南")  # 每平台两个固定验证关键词
 SUPPORTED_PLATFORMS = ("kg", "wy", "mg", "tx", "kw")
@@ -148,7 +148,7 @@ def validate_git_blob_and_sha256(
 
 
 def load_inventory(inventory_path: str) -> list[dict]:
-    """读取 docs/lx_source_inventory.json 样本清单，返回样本列表。"""
+    """读取 lx_source_inventory.json 样本清单，返回样本列表。"""
     path = Path(inventory_path)
     if not path.is_file():
         raise FileNotFoundError(f"Inventory 文件不存在: {inventory_path}")

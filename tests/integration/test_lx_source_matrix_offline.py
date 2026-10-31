@@ -102,8 +102,8 @@ class TestHashAndInventoryValidation:
             sm.validate_script_size(oversized)
 
     def test_inventory_file_reading(self):
-        """验证读取 docs/lx_source_inventory.json 样本清单结构。"""
-        inventory_path = REPO_ROOT / "docs" / "lx_source_inventory.json"
+        """验证读取 lx_source_inventory.json 样本清单结构。"""
+        inventory_path = REPO_ROOT / "tests" / "integration" / "lx_source_inventory.json"
         assert inventory_path.is_file()
         samples = sm.load_inventory(str(inventory_path))
         assert len(samples) == 40

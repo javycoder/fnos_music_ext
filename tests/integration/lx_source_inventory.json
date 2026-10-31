@@ -1,0 +1,657 @@
+{
+  "purpose": "Pinned public script metadata only; no scripts executed or embedded.",
+  "repositories": {
+    "pdone/lx-music-source": "000578ddca4a676012cf735abdc3489efdc67c74",
+    "guoyue2010/lxmusic-": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+    "Macrohard0001/lx-ikun-music-sources": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad"
+  },
+  "source_location_count": 57,
+  "unique_blob_count": 40,
+  "samples": [
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "changqing/latest.js"
+        }
+      ],
+      "git_blob_sha": "559123ad822201b2e7c21fc3176a1176785280c2",
+      "sha256": "6a942987c1e111a113376fbf8ff9fb677c487058f16ce792779c72f69c4ed6de",
+      "bytes": 27645,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "fish/latest.js"
+        }
+      ],
+      "git_blob_sha": "1a0bfa2edb6ec5fcee1677e86830cdc53f0c472e",
+      "sha256": "a711e152c4f28c32fd46b38839a70f476e0b669905773a90e2ce63246136af47",
+      "bytes": 639619,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "flower/latest.js"
+        }
+      ],
+      "git_blob_sha": "4be6e47f3e1365d9b817129f6ae1355ea7676721",
+      "sha256": "15c166987edde41cf5917b3160c0ab253ff17e5e6bc6765c9eaa11a822c4aa97",
+      "bytes": 10057,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "grass/latest.js"
+        }
+      ],
+      "git_blob_sha": "97b765159eaacd082daaff65136950a3d5b5de21",
+      "sha256": "d694275f382427d3fef809fc77338ef014dc330af710cca6b3233ece8740510f",
+      "bytes": 9176,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "helloworld/latest.js"
+        }
+      ],
+      "git_blob_sha": "9072550b4b65d8a5135201a86c404e7873719202",
+      "sha256": "12d7a289647b4f4ff8b94d4b27d06a55b7ca9b9be6ac89c602cac2052eced723",
+      "bytes": 21421,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "huanyin/latest.js"
+        },
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/幻音音源 v3.js"
+        }
+      ],
+      "git_blob_sha": "e4970d8cdb6445cf307308e37b42a06d8373e332",
+      "sha256": "4a81129240ecae3ebf6b42f28c73e2d37bbcb6fccac9a73a401d90cdd36bee5f",
+      "bytes": 7316,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "huibq/latest.js"
+        }
+      ],
+      "git_blob_sha": "f2028068db448a9e0b738106112eb300bcefbcc2",
+      "sha256": "a9adeb456690b523008038224091cee31977606302d79082eb06adb3c75c9146",
+      "bytes": 2727,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "hyw/latest.js"
+        }
+      ],
+      "git_blob_sha": "023e0bcf40edebb33613d557c399abe5430eb1bc",
+      "sha256": "0f48bdab4205e4423397f970b926565085a5af4f3b8a8a19f4cdc0e755647cd5",
+      "bytes": 12082,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "ikun/latest.js"
+        }
+      ],
+      "git_blob_sha": "acaf03a60ff8b9e3bca20e4afdf4d7c36bcfd38a",
+      "sha256": "8db6c45bc225f1f15fc2e96f7d9ad3bf2e49dd1f2a998cdf23704185ea41fe89",
+      "bytes": 4991,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "jiexiang/latest.js"
+        }
+      ],
+      "git_blob_sha": "389b95d0359ccd1f1c3edace490ccb32fa9f4f20",
+      "sha256": "a4f25710ea8c993e20626df2345fb933607eb4b91b794bd323f954e7085b94df",
+      "bytes": 91493,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "juhe/latest.js"
+        }
+      ],
+      "git_blob_sha": "da25829e493dd37554aecc9e59b2272eb75874b8",
+      "sha256": "f7a661f01af7ea23035d5fac3b89d7c756372fc8a64bbfd649918f8a101cbf33",
+      "bytes": 994,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "lx/latest.js"
+        }
+      ],
+      "git_blob_sha": "ce12f2160fc479998aec09d3e890efa1c2e9db08",
+      "sha256": "79a5c4703e060eaff6f8ffaac05d2fadf5e22b7729f6fe151d1cca2fa3935171",
+      "bytes": 64094,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "qdy/latest.js"
+        }
+      ],
+      "git_blob_sha": "d861aa245dfe83a64ec55f3a51351f844335de4e",
+      "sha256": "213f73232562b528826dd97601e74212b517014e06fd614b28d8d8aa0dda400c",
+      "bytes": 31090,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "sixyin/latest.js"
+        }
+      ],
+      "git_blob_sha": "aa1345bdc9863e397012ff6ff70e406aff617eb3",
+      "sha256": "a407ffe0ab23c29cd32ce249b83e61c8e2b70719895f16034566ad7557282785",
+      "bytes": 333015,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "xinghai/latest.js"
+        }
+      ],
+      "git_blob_sha": "25db1d81b31570e545a7e84af6a1726973ee0fb1",
+      "sha256": "807d6157e4fd7cdd05b8727efd73778b54a3b05a0b5e4c6bb28dedc0668e94e9",
+      "bytes": 38858,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "pdone/lx-music-source",
+          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "path": "yuningxi/latest.js"
+        },
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/lx-玉宁熙V1.2.2.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/lx-玉宁熙V1.2.2.js"
+        }
+      ],
+      "git_blob_sha": "48466d237804a8ed453abe01001080786f44b7cd",
+      "sha256": "9ddcc32f55ba1981166f16bf55c03c43165b098932208a5fb4c9c64192650f0c",
+      "bytes": 147347,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/(推荐)裤佬SVIP音源（酷狗挂了）.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/(推荐)裤佬SVIP音源（酷狗挂了）.js"
+        }
+      ],
+      "git_blob_sha": "9a4cab8acd63be9fb2968e3a0c60ac49932e3ff9",
+      "sha256": "7ba2ca2c4b5ec2b0931f1a4f7f542a19e844f40f2765b661d0aee3b38e63ad4a",
+      "bytes": 99113,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/gdstudio音乐源 v1.0.1（仅支持网易）.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/gdstudio音乐源 v1.0.1（仅支持网易）.js"
+        }
+      ],
+      "git_blob_sha": "0a643a7e4b7d2fb431cc151ef2918add9852da5a",
+      "sha256": "05631b29ff18a4b8688b4464abf0f38952474cd4d8d6c4149c365b0190c7fd28",
+      "bytes": 8689,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/stellarwave-v3.2.0.js"
+        }
+      ],
+      "git_blob_sha": "fea22ebce18829d6b1cb81aaee9c5e3d917fa481",
+      "sha256": "a1c565851dea2e4209a2695a4e5af27f6425121aea3510510d3cc70c317b7c34",
+      "bytes": 79856,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/全豆要-聚合音源-V4.1（酷狗挂了）.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/全豆要-聚合音源-V4.1（酷狗挂了）.js"
+        }
+      ],
+      "git_blob_sha": "a5ff68b06f63cba4488c0cb57abc70c9a41d6c21",
+      "sha256": "e501fa90f8136a714e0b8e7b44a50d9ee344083a9a5164da7f87a07b6f763650",
+      "bytes": 32392,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/墨澜音乐源v2.3.0.js"
+        }
+      ],
+      "git_blob_sha": "498f358f05ec1e16a2590ab6929a47ba2303da71",
+      "sha256": "9667af5501684e6948d8a24d20269cc90af6aa0fc196f2e6b8534f82ef053dd2",
+      "bytes": 88879,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/屿溪-终章.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/屿溪-终章.js"
+        }
+      ],
+      "git_blob_sha": "0eb495487696b012375465c115da78d709d90bb3",
+      "sha256": "b45e05b8c043f0e715f9856ea400707bdf131b9c05b5014e1de9d0821a9972a7",
+      "bytes": 128060,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/念心音源 v1.0.2.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/念心音源 v1.0.2.js"
+        }
+      ],
+      "git_blob_sha": "b98810e26208057ce8438cfcce0f9448cc9d065a",
+      "sha256": "86f6c05f8fef7169fd010a1da362824b5c4b7f5695f89d384fe53564f3fa88d2",
+      "bytes": 26672,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/收集の聚合接口.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/收集の聚合接口.js"
+        }
+      ],
+      "git_blob_sha": "74acc9483ef97a31c3b5c0e411924433523a0ca3",
+      "sha256": "cd4b68b133ef8de80a75ac6f9c5d9c80b383e1fe3c364f4366553d18ca9418a5",
+      "bytes": 2931,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/溯音音源_v1.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/溯音音源_v1.js"
+        }
+      ],
+      "git_blob_sha": "e6b7f1f46c7e9934743b9286eb979405f123ec67",
+      "sha256": "d10c9c28823b5c2ce4e3fef3b25b8ff16d2d165bd0883e2b866900ef7c0dc0ee",
+      "bytes": 17656,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/独家音源V5.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/独家音源V5.js"
+        }
+      ],
+      "git_blob_sha": "f66741cba986b2631bb230a3ad91de915565fa39",
+      "sha256": "65ae85f557e8f616d7f2a2446fe59078dee34c825bd766aa5b059b6255697c57",
+      "bytes": 62829,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/稳定版音源 v1.0.3.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/稳定版音源 v1.0.3.js"
+        }
+      ],
+      "git_blob_sha": "59dd5ef66fc12a456a2095b4c8835efc8f6771ea",
+      "sha256": "5e5f39c1a51b6c005104f382b22cd0a3e0af2ba30c7003e4fd03bfcf9f6a088a",
+      "bytes": 3292,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/统一音乐源.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/统一音乐源.js"
+        }
+      ],
+      "git_blob_sha": "df44509ec316e58560fa25c72e0c08b4e6955f05",
+      "sha256": "a18bdd58fd3f5e26d00c8c18d7b0825367f54a1c01bb8f8321ac7f5d374f1a7c",
+      "bytes": 9245,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/聚合API接口 (CF) v3.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/聚合API接口 (CF) v3.js"
+        }
+      ],
+      "git_blob_sha": "bda5084a40f566893a7363b162c471631b35ecff",
+      "sha256": "47648623f242fa8bccc8965d33666ac36147f63b68bd7776bb082e44e1c2d6f8",
+      "bytes": 1005,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/西瓜聚合.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/西瓜聚合.js"
+        }
+      ],
+      "git_blob_sha": "260f924df31db238b8e05bceec6196057fc2887c",
+      "sha256": "d38afb4498fa72c6c34e98891bf3d454a01d2683d4a7e5144602f8298308948d",
+      "bytes": 42834,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/非常刀 v5.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/非常刀 v5.js"
+        }
+      ],
+      "git_blob_sha": "c1724ef140e03bdca336bb92c397c4d0a5a26199",
+      "sha256": "49486cab064e64d5ad63723e670c44ee55eadadcc790ccf493351fbde64284d7",
+      "bytes": 17846,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "guoyue2010/lxmusic-",
+          "commit": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
+          "path": "V260907/𝖧౿ᥣᥣ𝗈 Ԝ𝗈𝗋ᥣᑯ260809.js"
+        },
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/𝖧౿ᥣᥣ𝗈 Ԝ𝗈𝗋ᥣᑯ260809.js"
+        }
+      ],
+      "git_blob_sha": "8dc43f1b3f2befe2141e5d60b86a7dc89d3c6659",
+      "sha256": "4c3b500faf864766bdbfe964a965314991d3f4f5b8f931567e2f956bab8b21cb",
+      "bytes": 21553,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/Hei Music1.3.1 (1).js"
+        }
+      ],
+      "git_blob_sha": "7dad1c43ea497826c9fe2c1a9c753c7fa9b9ab1d",
+      "sha256": "b788ad01c034cecd780dd75948d94405e9adedde60622dc27225cc35694f0048",
+      "bytes": 54668,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/其他/星澜.js"
+        }
+      ],
+      "git_blob_sha": "b4ff84cde7d5ecef379825a7745702be2a6d9312",
+      "sha256": "a677d2300225781dcdcd056ac6f6eba699b6822e4e2e0a9723276c40dc9ba5a5",
+      "bytes": 73009,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/HYWmusic_beta_公益测试.js"
+        }
+      ],
+      "git_blob_sha": "b2e6b8e5aa233702e6f7c57007e23e8b5b511ced",
+      "sha256": "cc5150108b833a2e1d92a0d43cca7667e571055043c51bcfca1348cca610c681",
+      "bytes": 9057,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/K×H测试 v1.7.17.js"
+        }
+      ],
+      "git_blob_sha": "52ed638ee36902879cd8f932e2e0a3cf953aea8b",
+      "sha256": "5c0fd239110e4835533d7f289ad895cae2ded3917af501db0650f08f592265ea",
+      "bytes": 68271,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/xinghai-music-sourcev2.3.11.js"
+        }
+      ],
+      "git_blob_sha": "58dd0ae025ba346d2c8ace76eb60f12fca993ef5",
+      "sha256": "de889d47bf6e12c27b841cea8254383425ddf3f94f54a4155c89616a0bd004df",
+      "bytes": 12317,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/推荐/墨澜聚合音源 v2.0.0.js"
+        }
+      ],
+      "git_blob_sha": "ba93278d7ca4d4f9b61229d924b1e5963af0e806",
+      "sha256": "f103ebfbb46720af895a9daa56c1ed1cc00ea2c505153580c88a5bccb7ad39a8",
+      "bytes": 63787,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/未测试/野花音源_.js"
+        }
+      ],
+      "git_blob_sha": "8a7afd0128b023ac5810173a070d143ba26e0b67",
+      "sha256": "be95d7257862a458aeceee73f41159be28123669bca95905a50ad76cddb2ab10",
+      "bytes": 10057,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    },
+    {
+      "locations": [
+        {
+          "repository": "Macrohard0001/lx-ikun-music-sources",
+          "commit": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad",
+          "path": "V260817/未测试/野草音源.js"
+        }
+      ],
+      "git_blob_sha": "8ea45e6d39083460531c52c6261e41a14cb46761",
+      "sha256": "44622174a718d688c1f5fc8e5e79c9dda53bb46de12d5e802e9c664524cd288b",
+      "bytes": 9176,
+      "fetch": "verified",
+      "runtime_test": "pending_isolated_instance"
+    }
+  ]
+}

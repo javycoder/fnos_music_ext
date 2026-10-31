@@ -58,7 +58,6 @@ jobs:
             ':!CHANGELOG.md' \
             ':!.github/workflows/release-notes.yml' \
             ':!packaging/tests/test_release_notes.py' \
-            ':!CHANGELOG.md' \
             ':!.zcode/skills/fnmusic-release/SKILL.md'
           gh api "repos/${GH_REPO}/releases/tags/${tag}" > /tmp/release-before.json
           jq -e '.draft == false' /tmp/release-before.json
