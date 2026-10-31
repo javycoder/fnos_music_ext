@@ -197,6 +197,22 @@ def test_status_reports_layered_health(env_file, log_root, monkeypatch, client):
     assert health["script"]["ok"] is True
 
 
+@pytest.mark.parametrize("payload", [[], None, True, 7, "token=fixture-secret-value"])
+def test_status_survives_non_object_health_json(env_file, log_root, monkeypatch, client, payload):
+    """上游 JSON 结构异常只影响诊断结果，不能让整个管理状态接口报 500。"""
+    def handler(request):
+        return httpx.Response(200, content=json.dumps(payload).encode("utf-8"),
+                              headers={"Content-Type": "application/json"})
+
+    _install_lx_transport(monkeypatch, handler)
+    response = client.get("/api/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["services"]["lxmusic"]["reachable"] is False
+    assert body["health"]["http"]["ok"] is False
+    assert "fixture-secret-value" not in response.text
+
+
 def test_status_preserves_timeout_error_type(env_file, log_root, monkeypatch, client):
     """#108 现场类型：进程 RUNNING 但查询超时——异常类型必须是 timeout 而非笼统失败。"""
     def handler(request: httpx.Request) -> httpx.Response:

@@ -1410,18 +1410,8 @@ async def compare_candidate(request: CandidateComparisonRequest) -> dict:
             ffmpeg_path=request.ffmpeg_path,
         )
 
-    native_media_obj = None
-    if report["native_prefix"].get("status") == "ok":
-        # transport 记录的是适配侧；原生侧重新读取一次以保留同一 URL 的两个证据。
-        native_media_obj = await asyncio.to_thread(
-            fetch_media_prefix,
-            native_url,
-            deadline=float(request.deadline),
-            headers=module._platform_headers(platform),
-            resolver=request.resolver,
-            dial=request.dial,
-            ssl_context=request.ssl_context,
-        )
+    # 解码复用已登记的原生前缀；再次取流会浪费总预算，还可能让短链过期
+    # 或网络抖动抹掉本轮已取得的证据。适配侧继续使用自身独立的响应。
     report["decode"]["native"] = await decode_side(native_media, "no_native_prefix")
     report["decode"]["adapter"] = await decode_side(adapter_media, "no_adapter_prefix")
     decode_statuses = {

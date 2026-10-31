@@ -863,6 +863,33 @@ class TestAdapterComparison:
         ):
             assert forbidden not in serialized
 
+    def test_native_prefix_is_fetched_once_and_reused_for_decode(self, backend, monkeypatch):
+        """原生侧已取到前缀后，解码只复用该响应，不再消耗媒体请求与总预算。"""
+        fetch = lac.fetch_media_prefix
+        prefixes = []
+        decoded = []
+
+        def fetch_once_per_side(*args, **kwargs):
+            # 第一份来自真实适配探活，第二份来自原生对比；第三次已无验证用途。
+            if len(prefixes) >= 2:
+                raise lac.MediaFetchFailed("deadline_exhausted")
+            response = fetch(*args, **kwargs)
+            prefixes.append(response.prefix)
+            return response
+
+        async def record_decode(prefix, **kwargs):
+            decoded.append(prefix)
+            return {"status": "decoded"}
+
+        monkeypatch.setattr(lac, "fetch_media_prefix", fetch_once_per_side)
+        monkeypatch.setattr(lac, "decode_prefix", record_decode)
+        report = self._run(_request(backend))
+        assert report["candidate_disposition"] == "adapter_ok"
+        assert len(prefixes) == 2
+        assert decoded == [prefixes[1], prefixes[0]]
+        media_requests = [row for row in backend.requests if row[1] == "/stream.wav"]
+        assert len(media_requests) == 2
+
     def test_app_exception_is_contained_as_inconclusive(self, backend, monkeypatch):
         """真实 app 入口抛异常时只记受控类型，不炸整轮、不判整源死。"""
         module = lac.load_app_module(str(APP_SOURCE), lac.snapshot_sha256(APP_SOURCE))

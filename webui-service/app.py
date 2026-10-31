@@ -1159,9 +1159,14 @@ def _resp_json(resp: httpx.Response) -> dict:
     """防御性解析同容器服务的响应体：上游裸 500 等非 JSON 文本时返回带 error 的
     字典而不是抛 JSONDecodeError（否则自身也会 500，用户只能看到 "HTTP 500"）。"""
     try:
-        return resp.json() if resp.content else {}
+        data = resp.json() if resp.content else {}
     except Exception:  # noqa: BLE001
         return {"ok": False, "error": f"上游返回非 JSON 响应（HTTP {resp.status_code}）"}
+    # 调用方按对象读取状态字段；数组、null 和标量不能使诊断接口再次报错。
+    # 不回显异常正文，避免把源脚本可能携带的凭据送入诊断响应。
+    if not isinstance(data, dict):
+        return {"ok": False, "error": f"上游返回非 JSON 对象（HTTP {resp.status_code}）"}
+    return data
 
 
 async def _fetch_json(request: Request, url: str, *, timeout: float = 4.0) -> "tuple[bool, dict]":
@@ -1330,11 +1335,8 @@ async def _probe_http_layer(request: Request, url: str,
         return {"ok": False, "error_type": error_type,
                 "detail": " ".join(redact(detail).split())[:240]}
     data = _resp_json(resp)
-    try:
-        parsed = resp.json()
-    except ValueError:
-        parsed = None
-    if 200 <= resp.status_code < 300 and isinstance(parsed, dict) and data.get("ok", True):
+    # 共享解析器已经校验 JSON 对象；空响应仍不能证明服务健康。
+    if 200 <= resp.status_code < 300 and resp.content and data.get("ok", True):
         return {"ok": True, "error_type": "", "detail": "", "status_code": resp.status_code,
                 "data": data}
     detail = str(data.get("error") or f"HTTP {resp.status_code}")
