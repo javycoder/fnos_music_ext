@@ -64,6 +64,9 @@ LX_COMMENT = "洛雪音乐源 lxmusic（第三音源，宿主机端口 8772 -> �
 LX_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LX_ENABLED", "true"),
     ("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
+    ("FNMUSIC_LX_AUTO_SWITCH", "true"),
+    ("FNMUSIC_LX_PLATFORM_PREFERRED", "false"),
+    ("FNMUSIC_LX_SOURCE_ORDER", "[]"),
 ]
 LX_PREFIX = "FNMUSIC_LX_"
 
@@ -128,6 +131,28 @@ def merge_env(
     explicit = set(explicit or ())
     existing_map = dict(existing)
     desired_map = dict(desired)
+    if any(key.startswith("FNMUSIC_") for key in existing_map.keys() | desired_map.keys()):
+        # 先迁移旧偏好，再补安装默认值；不能让默认lossless覆盖旧balanced/smooth。
+        # 同时支持包导入和安装脚本直接执行本文件，不维护第二套映射。
+        try:
+            from .quality_policy import quality_migration
+        except ImportError:
+            from quality_policy import quality_migration
+        legacy_keys = {"FNMUSIC_QUALITY_MODE", "FNMUSIC_DL_QUALITY",
+                       "FNMUSIC_LX_QUALITY", "FNMUSIC_NETEASE_QUALITY"}
+        context = dict(existing_map)
+        context.update({key: value for key, value in desired_map.items() if key in explicit})
+        proposals = (quality_migration(context) if legacy_keys.intersection(existing_map)
+                     else {"FNMUSIC_PLAY_QUALITY": "lossless", "FNMUSIC_DOWNLOAD_QUALITY": "app"})
+        for key, value in proposals.items():
+            if key in explicit or str(existing_map.get(key) or "").strip():
+                continue
+            desired_map[key] = value
+            if key in existing_map:
+                explicit.add(key)  # 空白新键也需要完成一次幂等迁移。
+        desired = [(key, desired_map[key]) for key, _ in desired]
+        seen_desired = {key for key, _ in desired}
+        desired += [(key, value) for key, value in desired_map.items() if key not in seen_desired]
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
     summary = {"added": [], "updated": [], "preserved": [], "custom_kept": []}

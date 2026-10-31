@@ -289,14 +289,16 @@ def test_ensure_prefix_defaults_adds_missing_lx_keys():
     m = dict(kv)
     assert m["FNMUSIC_LX_ENABLED"] == "true"
     assert m["FNMUSIC_LX_URL"] == "http://127.0.0.1:8772"
-    assert added == ["FNMUSIC_LX_ENABLED", "FNMUSIC_LX_URL"]
+    assert added == [key for key, _ in env_merge.LX_DEFAULTS]
 
 
 def test_ensure_prefix_defaults_preserves_existing_lx_values():
     existing = [("FNMUSIC_LX_ENABLED", "false"), ("FNMUSIC_LX_URL", "http://nas:8772")]
     kv, added = env_merge.ensure_prefix_defaults(existing)
-    assert added == []
-    assert dict(kv) == dict(existing)
+    assert added == ["FNMUSIC_LX_AUTO_SWITCH", "FNMUSIC_LX_PLATFORM_PREFERRED", "FNMUSIC_LX_SOURCE_ORDER"]
+    assert all(dict(kv)[key] == value for key, value in existing)
+    repeated, newly_added = env_merge.ensure_prefix_defaults(kv)
+    assert repeated == kv and newly_added == []
 
 
 def test_render_env_includes_lx_comment():
