@@ -19,6 +19,7 @@ Environment="ENV_FLAG_LIB=@REPO@/container/env_flag.sh"
 Environment="FNMUSIC_ENV_FILE=@REPO@/.env"
 Environment="DATA_PATH=@DATA@/lxserver"
 Environment="LX_DATA_DIR=@DATA@/lxmusic"
+Environment="FNMUSIC_LOG_DIR=@REPO@/logs"
 ExecStart=/bin/bash "@REPO@/container/entrypoint.sh"
 TimeoutStartSec=75
 TimeoutStopSec=20

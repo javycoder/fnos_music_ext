@@ -58,6 +58,11 @@ EOF
 
 init_lxserver_config
 
+# supervisord 要求 logfile 目录必须已存在，否则解析配置即失败、全部音源起不来
+# （CI 离线容器实证）。日志根与 fnlog 解析优先级同源：容器 /repo/logs（Dockerfile
+# 已导出 FNMUSIC_LOG_DIR），native 由 systemd unit 导出仓库 logs 目录。
+mkdir -p "${FNMUSIC_LOG_DIR:-/repo/logs}"
+
 supervisord -c "$SUP_CONF" &
 SUP_PID=$!
 

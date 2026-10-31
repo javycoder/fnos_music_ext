@@ -541,3 +541,16 @@ sudo() { printf 'mock-sudo %s\\n' "$*"; }
     assert ("stop fnmusic-sources --adopt" in result.stdout) == adopt
     assert ("mock-sudo rm -f /etc/systemd/system/fnmusic-sources.service" in result.stdout) == adopt
     assert ("remove fnmusic-sources --adopt" in result.stdout) == adopt
+
+
+def test_native_unit_log_dir_matches_supervisor_lxserver_logfile():
+    """native 侧 lxserver 日志读写必须同源。
+
+    unit 导出的 FNMUSIC_LOG_DIR 与 supervisord-native.conf.in 的 lxserver
+    logfile 使用同一目录，entrypoint 才能凭同一变量先建目录——supervisord
+    遇到不存在的 logfile 目录会整体启动失败（CI 实证，非仅 lxserver 受损）。
+    """
+    unit = (BASE / "fnmusic-sources-native.service.in").read_text(encoding="utf-8")
+    sup = (BASE / "container" / "supervisord-native.conf.in").read_text(encoding="utf-8")
+    assert 'Environment="FNMUSIC_LOG_DIR=@REPO@/logs"' in unit
+    assert "stdout_logfile=@REPO@/logs/lxserver.log" in sup

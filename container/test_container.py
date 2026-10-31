@@ -187,6 +187,9 @@ def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path, tmp_path: Path | 
         env["LX_DATA_DIR"] = str(data_dir / "lxmusic")
         # 镜像容器形态的 XDG_DATA_HOME=/data：musicbox cookie 启发判断用
         env["XDG_DATA_HOME"] = str(data_dir)
+        # 真实环境 Dockerfile ENV 与 native systemd unit 都导出日志根；
+        # 宿主测试不设会落到只读 /repo，entrypoint 建目录即失败
+        env["FNMUSIC_LOG_DIR"] = str(tmp_path / "logs")
     proc = subprocess.run(
         ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
         capture_output=True, text=True, timeout=30,
@@ -470,3 +473,36 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
         origin = origins.get(module_name, "Dockerfile COPY")
         assert module in copied, f"{origin} 依赖 {module}，Dockerfile 需 COPY 进镜像"
         assert f"!{module}" in ignore, f"{origin} 依赖 {module}，.dockerignore 需放行构建上下文"
+
+
+def test_entrypoint_creates_log_root_before_supervisord(tmp_path):
+    """日志根不存在时 supervisord 因 logfile 目录缺失整体启动失败（CI 实证）。
+
+    entrypoint 必须在拉起 supervisord 前先建日志根；Docker 与 native 共用
+    此入口，目录取 FNMUSIC_LOG_DIR（容器 /repo/logs，native 为仓库 logs）。
+    """
+    log = tmp_path / "ctl.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    FakeSupervisor(fake_bin, log)
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_MUSICDL_ENABLED=true\n", encoding="utf-8")
+    # 深层不存在的日志根：验证 mkdir -p 语义，而非仅一层目录
+    log_root = tmp_path / "repo-root" / "nested" / "logs"
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "ENV_FLAG_LIB": str(CONTAINER_DIR / "env_flag.sh"),
+        "SUPERVISOR_CONF": "/nonexistent/supervisord.conf",
+        "FNMUSIC_ENV_FILE": str(env_file),
+        "FNMUSIC_LOG_DIR": str(log_root),
+        # 重定向数据目录：宿主 macOS 上 /data 只读，容器外测试必须指到临时目录
+        "DATA_PATH": str(tmp_path / "data" / "lxserver"),
+        "LX_DATA_DIR": str(tmp_path / "data" / "lxmusic"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+    }
+    proc = subprocess.run(
+        ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert log_root.is_dir(), "entrypoint 应在 supervisord 启动前创建日志根目录"
