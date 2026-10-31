@@ -33,6 +33,8 @@ __pycache__/
 .zcode/
 .agents/
 AGENTS.md
+# 需求文档仅作本地协作依据，不纳入版本管理
+REQUIREMENTS.md
 *.part
 *.log
 # 收款码：本地测试/CI 从对应 QRCODE secret 生成，绝不入库
