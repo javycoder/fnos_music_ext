@@ -318,7 +318,8 @@ function isDisallowedIP(ip) {
 const originalLookup = dns.lookup;
 dns.lookup = function(hostname, options, callback) {
   let cb = typeof options === 'function' ? options : callback;
-  let opts = typeof options === 'object' ? options : {};
+  // 网络策略只允许IPv4，直接查询A记录，不因正常域名另有AAAA记录而整体拒绝。
+  const opts = { ...(options && typeof options === 'object' ? options : {}), family: 4 };
   originalLookup(hostname, opts, (err, address, family) => {
     if (err) return cb(err, address, family);
     if (hostname === '127.0.0.1') {
@@ -344,7 +345,8 @@ dns.lookup = function(hostname, options, callback) {
 if (dns.promises && dns.promises.lookup) {
   const origPromisesLookup = dns.promises.lookup;
   dns.promises.lookup = async function(hostname, options) {
-    const res = await origPromisesLookup(hostname, options);
+    const opts = { ...(options && typeof options === 'object' ? options : {}), family: 4 };
+    const res = await origPromisesLookup(hostname, opts);
     if (hostname === '127.0.0.1') return res;
     if (Array.isArray(res)) {
       for (const item of res) {
@@ -363,6 +365,17 @@ if (dns.promises && dns.promises.lookup) {
   };
 }
 
+// URL/Socket可能提供IPv6或host:port，先保留完整IP再处理端口，不能把::1截成空串。
+function connectionHost(raw) {
+  const text = String(raw || '').trim();
+  if (text.startsWith('[')) {
+    const end = text.indexOf(']');
+    return end >= 0 ? text.slice(1, end) : text;
+  }
+  if (net.isIP(text) !== 0) return text;
+  return text.split(':')[0];
+}
+
 // 拦截 http 与 https request: 区分域名与 IP，字面量私网直接拒，合法域名放行由 DNS 拦截
 function wrapRequest(origFn) {
   return function(input, options, cb) {
@@ -379,7 +392,7 @@ function wrapRequest(origFn) {
       host = options.hostname || options.host || '';
     }
     if (host && typeof host === 'string') {
-      const cleanHost = host.split(':')[0].replace(/^\\[|\\]$/g, '');
+      const cleanHost = connectionHost(host);
       if (net.isIP(cleanHost) !== 0 && isDisallowedIP(cleanHost)) {
         const err = new Error('Network request to private/disallowed literal IP blocked by sandbox: ' + cleanHost);
         err.code = 'EACCES';
@@ -398,14 +411,19 @@ https.get = wrapRequest(https.get);
 // 补强 net.Socket.prototype.connect: 拦截直接 IP 连接与自定义 lookup 绕过 (不影响 server.listen)
 const origSocketConnect = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function(...args) {
+  // net.createConnection内部传入[options, callback]，必须拆开后统一验证。
+  // 复制数组和选项，避免冻结对象让lookup包装赋值静默失败。
+  const connectArgs = Array.isArray(args[0]) ? Array.from(args[0]) : Array.from(args);
   let targetHost = '';
   let hasPath = false;
-  if (typeof args[0] === 'object' && args[0] !== null) {
-    targetHost = args[0].host || '';
-    if (args[0].path) hasPath = true;
-    if (typeof args[0].lookup === 'function') {
-      const origCustomLookup = args[0].lookup;
-      args[0].lookup = function(h, o, c) {
+  if (typeof connectArgs[0] === 'object' && connectArgs[0] !== null) {
+    const options = { ...connectArgs[0] };
+    connectArgs[0] = options;
+    targetHost = options.host || '';
+    if (options.path) hasPath = true;
+    if (typeof options.lookup === 'function') {
+      const origCustomLookup = options.lookup;
+      options.lookup = function(h, o, c) {
         const cb = typeof o === 'function' ? o : c;
         const opts = typeof o === 'object' ? o : {};
         origCustomLookup(h, opts, (err, address, family) => {
@@ -427,11 +445,11 @@ net.Socket.prototype.connect = function(...args) {
         });
       };
     }
-  } else if (typeof args[0] === 'number' || (typeof args[0] === 'string' && !isNaN(Number(args[0])))) {
-    if (typeof args[1] === 'string') {
-      targetHost = args[1];
+  } else if (typeof connectArgs[0] === 'number' || (typeof connectArgs[0] === 'string' && !isNaN(Number(connectArgs[0])))) {
+    if (typeof connectArgs[1] === 'string') {
+      targetHost = connectArgs[1];
     }
-  } else if (typeof args[0] === 'string') {
+  } else if (typeof connectArgs[0] === 'string') {
     hasPath = true;
   }
 
@@ -443,7 +461,7 @@ net.Socket.prototype.connect = function(...args) {
   }
 
   if (targetHost && typeof targetHost === 'string') {
-    const clean = targetHost.split(':')[0].replace(/^\\[|\\]$/g, '');
+    const clean = connectionHost(targetHost);
     if (net.isIP(clean) !== 0 && isDisallowedIP(clean)) {
       const err = new Error('Socket connect to disallowed private IP blocked by sandbox: ' + clean);
       err.code = 'EACCES';
@@ -452,7 +470,7 @@ net.Socket.prototype.connect = function(...args) {
     }
   }
 
-  return origSocketConnect.apply(this, args);
+  return origSocketConnect.apply(this, connectArgs);
 };
 """
 
@@ -506,7 +524,7 @@ def safe_remove_container(
     inspect_cmd = ["docker", "inspect", container_id]
     res = subprocess.run(inspect_cmd, capture_output=True, text=True, timeout=15)
     if res.returncode != 0:
-        logger.warning("容器 inspect 失败或容器不存在: %s", res.stderr.strip())
+        logger.warning("容器清理跳过 stage=inspect error_type=ContainerInspectFailed")
         return False
 
     try:
@@ -573,17 +591,49 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import socket
+import http.client
+import ipaddress
+import queue
+import threading
+import signal
+from contextlib import contextmanager
 
 ADMIN_TOKEN = "{admin_token}"
 PORT = 8005
 BASE_URL = f"http://127.0.0.1:{{PORT}}"
 SAMPLE_BUDGET_S = {sample_budget_s}
+MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 START_TIME = time.monotonic()
+
+class BudgetExceeded(TimeoutError):
+    """Raised when the single per-sample deadline has expired."""
 
 def get_remaining_budget():
     elapsed = time.monotonic() - START_TIME
-    rem = SAMPLE_BUDGET_S - elapsed
-    return max(0.5, rem)
+    remaining = SAMPLE_BUDGET_S - elapsed
+    if remaining <= 0:
+        raise BudgetExceeded("sample time budget expired")
+    return remaining
+
+def bounded_timeout(maximum):
+    """Cap each network timeout at the remaining sample-wide budget."""
+    return min(float(maximum), get_remaining_budget())
+
+@contextmanager
+def enforce_sample_deadline():
+    """Dedicated worker alarm bounds even a continuously dripping blocking read."""
+    remaining = get_remaining_budget()
+    old_handler = signal.getsignal(signal.SIGALRM)
+    def expired(signum, frame):
+        raise BudgetExceeded("sample time budget expired")
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old_handler)
+
 
 def write_lxserver_config():
     cfg_dir = "/data/lxserver"
@@ -607,36 +657,43 @@ def write_lxserver_config():
 def wait_for_lxserver(timeout=15.0):
     start = time.monotonic()
     while time.monotonic() - start < timeout:
-        if get_remaining_budget() <= 1.0:
-            break
-        # 1. 无认证必须返回 401
+        # 无认证必须返回 401；每个本机请求都受样本总预算约束。
+        req_noauth = urllib.request.Request(f"{{BASE_URL}}/api/status")
         try:
-            req_noauth = urllib.request.Request(f"{{BASE_URL}}/api/status")
-            with urllib.request.urlopen(req_noauth, timeout=1.0) as resp:
-                pass
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                pass
+            with urllib.request.urlopen(req_noauth, timeout=bounded_timeout(1.0)) as resp:
+                get_remaining_budget()
+        except BudgetExceeded:
+            raise
+        except urllib.error.HTTPError as exc:
+            try:
+                if exc.code == 401:
+                    pass
+            finally:
+                exc.close()
         except Exception:
             pass
 
-        # 2. 带 token 必须返回 200
+        # 带 token 必须返回 200；管理接口继续使用普通 loopback opener。
+        req_auth = urllib.request.Request(
+            f"{{BASE_URL}}/api/status",
+            headers={{"x-frontend-auth": ADMIN_TOKEN}}
+        )
         try:
-            req_auth = urllib.request.Request(
-                f"{{BASE_URL}}/api/status",
-                headers={{"x-frontend-auth": ADMIN_TOKEN}}
-            )
-            with urllib.request.urlopen(req_auth, timeout=1.0) as resp:
-                if resp.getcode() == 200:
+            with urllib.request.urlopen(req_auth, timeout=bounded_timeout(1.0)) as resp:
+                status = resp.getcode()
+                get_remaining_budget()
+                if status == 200:
                     return True
+        except BudgetExceeded:
+            raise
         except Exception:
             pass
-        time.sleep(0.2)
+
+        time.sleep(min(0.2, get_remaining_budget()))
     return False
 
 def http_json(path, data=None, method="GET", timeout=None):
-    if timeout is None:
-        timeout = min(10.0, get_remaining_budget())
+    request_timeout = bounded_timeout(10.0 if timeout is None else timeout)
     url = f"{{BASE_URL}}{{path}}"
     headers = {{"x-frontend-auth": ADMIN_TOKEN}}
     body = None
@@ -647,18 +704,34 @@ def http_json(path, data=None, method="GET", timeout=None):
             method = "POST"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            return resp.getcode(), json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+            raw = resp.read(MAX_HTTP_RESPONSE_BYTES + 1)
+            status = resp.getcode()
+            get_remaining_budget()
+            if len(raw) > MAX_HTTP_RESPONSE_BYTES:
+                return status, {{"error_type": "ResponseTooLarge"}}
+            return status, json.loads(raw.decode("utf-8"))
+    except BudgetExceeded:
+        raise
+    except urllib.error.HTTPError as exc:
         try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except Exception:
-            parsed = {{"error": raw.decode("utf-8", errors="replace")}}
-        return e.code, parsed
-    except Exception as e:
-        return 500, {{"error": str(e)}}
+            raw = exc.read(MAX_HTTP_RESPONSE_BYTES + 1)
+            get_remaining_budget()
+            if len(raw) > MAX_HTTP_RESPONSE_BYTES:
+                return exc.code, {{"error_type": "ResponseTooLarge"}}
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except Exception:
+                parsed = {{"error_type": "HTTPErrorResponseNotJson"}}
+            return exc.code, parsed
+        except BudgetExceeded:
+            raise
+        except Exception as error:
+            return exc.code, {{"error_type": type(error).__name__}}
+        finally:
+            exc.close()
+    except Exception as error:
+        return 500, {{"error_type": type(error).__name__}}
 
 def detect_magic(chunk):
     if not chunk or len(chunk) < 4:
@@ -678,49 +751,99 @@ def detect_magic(chunk):
     return None
 
 def is_private_ip(ip_str):
+    """Only globally routable IPv4 addresses are valid probe destinations."""
     try:
-        parts = [int(p) for p in ip_str.split(".")]
-        if len(parts) != 4:
-            return True
-        a, b, c, d = parts
-        if a == 0 or a == 127 or a == 10:
-            return True
-        if a == 172 and (16 <= b <= 31):
-            return True
-        if a == 192 and b == 168:
-            return True
-        if a == 169 and b == 254:
-            return True
-        if a == 100 and (64 <= b <= 127):
-            return True
-        if a == 198 and (b == 18 or b == 19):
-            return True
-        if a >= 224:
-            return True
-        return False
+        address = ipaddress.ip_address(ip_str.strip())
     except Exception:
         return True
+    return address.version != 4 or not address.is_global
+
+def resolve_ipv4_with_budget(host, port):
+    """Run blocking system DNS lookup in a daemon thread bounded by the sample deadline."""
+    result_queue = queue.Queue(maxsize=1)
+    def lookup():
+        try:
+            result_queue.put((True, socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)))
+        except Exception as error:
+            result_queue.put((False, error))
+    resolver = threading.Thread(target=lookup, daemon=True)
+    resolver.start()
+    try:
+        succeeded, result = result_queue.get(timeout=get_remaining_budget())
+    except queue.Empty:
+        raise BudgetExceeded("DNS lookup exceeded sample time budget")
+    get_remaining_budget()
+    if not succeeded:
+        raise result
+    return result
+
+class PinnedConnectionMixin:
+    """Connect to a validated IPv4 literal while retaining the original HTTP host."""
+
+    def __init__(self, host, connect_ip, **kwargs):
+        self.connect_ip = connect_ip
+        super().__init__(host, **kwargs)
+        # HTTPConnection stores socket.create_connection on each instance; restore this custom hook explicitly.
+        self._create_connection = PinnedConnectionMixin._create_connection.__get__(self, type(self))
+
+    def _create_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            # The TCP peer is pinned; HTTPSConnection still uses self.host for SNI and certificate checks.
+            sock.connect((self.connect_ip, address[1]))
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+class PinnedHTTPConnection(PinnedConnectionMixin, http.client.HTTPConnection):
+    pass
+
+class PinnedHTTPSConnection(PinnedConnectionMixin, http.client.HTTPSConnection):
+    pass
 
 def probe_stream(url, headers_dict=None):
-    """容器内部流探活：最多 3 跳重定向，禁止私网重定向，Range 请求，脱敏返回。"""
+    """Probe in the container, pin each validated public IPv4, and cap redirects."""
     curr = url
     redirects = 0
     while redirects <= 3:
-        if get_remaining_budget() <= 1.0:
-            return False, {{"error_type": "Timeout"}}
+        get_remaining_budget()
         try:
             parsed = urllib.parse.urlsplit(curr)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except Exception:
             return False, {{"error_type": "InvalidURL"}}
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             return False, {{"error_type": "InvalidSchemeOrHost"}}
 
-        # 防重定向至私网 IP
+        # Resolve once per redirect and reject the whole answer if any address is non-global.
         try:
-            infos = socket.getaddrinfo(parsed.hostname, None, socket.AF_INET)
-            for _, _, _, _, sa in infos:
-                if is_private_ip(sa[0]):
+            literal = None
+            try:
+                literal = ipaddress.ip_address(parsed.hostname)
+            except ValueError:
+                pass
+            if literal is not None:
+                if literal.version != 4 or is_private_ip(str(literal)):
                     return False, {{"error_type": "BlockedPrivateIP"}}
+                infos = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (str(literal), port))]
+            else:
+                infos = resolve_ipv4_with_budget(parsed.hostname, port)
+            addresses = []
+            for family, _, _, _, sockaddr in infos:
+                if family != socket.AF_INET or is_private_ip(sockaddr[0]):
+                    return False, {{"error_type": "BlockedPrivateIP"}}
+                addresses.append(sockaddr[0])
+            if not addresses:
+                return False, {{"error_type": "DNSResolutionFailed"}}
+            connect_ip = addresses[0]
+            get_remaining_budget()
+        except BudgetExceeded:
+            raise
         except Exception:
             return False, {{"error_type": "DNSResolutionFailed"}}
 
@@ -737,14 +860,32 @@ def probe_stream(url, headers_dict=None):
             def redirect_request(self, req, fp, code, msg, hdrs, newurl):
                 return None
 
-        opener = urllib.request.build_opener(NoRedirect)
+        class PinnedHTTPHandler(urllib.request.HTTPHandler):
+            def http_open(self, req):
+                return self.do_open(
+                    lambda host, **kwargs: PinnedHTTPConnection(host, connect_ip=connect_ip, **kwargs),
+                    req,
+                )
+
+        class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(
+                    lambda host, **kwargs: PinnedHTTPSConnection(host, connect_ip=connect_ip, **kwargs),
+                    req,
+                    context=self._context,
+                )
+
+        # Probe traffic must not inherit environment proxy settings; admin loopback calls remain ordinary.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({{}}), NoRedirect(), PinnedHTTPHandler(), PinnedHTTPSHandler()
+        )
         req = urllib.request.Request(curr, headers=req_headers, method="GET")
-        timeout = min(12.0, get_remaining_budget())
         try:
-            with opener.open(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=bounded_timeout(12.0)) as resp:
                 code = resp.getcode()
                 ct = resp.headers.get("Content-Type", "")
                 head = resp.read(1024)
+                get_remaining_budget()
                 magic = detect_magic(head)
                 ok = (code in (200, 206)) and (magic is not None)
                 clean = {{
@@ -754,9 +895,15 @@ def probe_stream(url, headers_dict=None):
                     "magic": magic
                 }}
                 return ok, clean
+        except BudgetExceeded:
+            raise
         except urllib.error.HTTPError as he:
-            if he.code in (301, 302, 303, 307, 308):
-                loc = he.headers.get("Location")
+            try:
+                redirect = he.code in (301, 302, 303, 307, 308)
+                loc = he.headers.get("Location") if redirect else None
+            finally:
+                he.close()
+            if redirect:
                 if not loc:
                     return False, {{"error_type": "RedirectWithoutLocation"}}
                 curr = urllib.parse.urljoin(curr, loc)
@@ -775,6 +922,7 @@ def main():
         "requireUnsafe": False,
         "platforms": {{}},
         "quality_capability": "unknown",
+        "coverage": "not_tested",
         "attempts": [],
         "overall_status": "failed"
     }}
@@ -814,8 +962,12 @@ def main():
             "allowUnsafeVM": False
         }}
         code, upload_res = http_json("/api/custom-source/upload", upload_body, method="POST")
+        if not isinstance(upload_res, dict):
+            report["stages"]["upload"] = "upload_failed"
+            print(json.dumps(report))
+            return
         err_msg = str(upload_res.get("error") or upload_res.get("message") or "")
-        if "requireUnsafe" in err_msg or "原生 VM" in err_msg or "unsafeVM" in err_msg:
+        if upload_res.get("requireUnsafe") is True or "requireUnsafe" in err_msg or "原生 VM" in err_msg or "unsafeVM" in err_msg:
             report["needs_unsafe"] = True
             report["requireUnsafe"] = True
             report["stages"]["upload"] = "needs_unsafe"
@@ -830,11 +982,6 @@ def main():
 
         target_id = upload_res.get("id") or upload_res.get("sourceId")
         if not target_id:
-            c, sources = http_json("/api/custom-source/list")
-            if isinstance(sources, list) and sources:
-                target_id = sources[-1].get("id")
-
-        if not target_id:
             report["stages"]["upload"] = "no_source_id"
             print(json.dumps(report))
             return
@@ -844,7 +991,7 @@ def main():
 
         # 3. 激活与置首位
         c1, t_res = http_json("/api/custom-source/toggle", {{"id": target_id, "enabled": True}}, method="POST")
-        if c1 != 200 or t_res.get("success") is False:
+        if c1 != 200 or not isinstance(t_res, dict) or t_res.get("success") is False:
             report["stages"]["activate"] = "enable_failed"
             print(json.dumps(report))
             return
@@ -852,108 +999,202 @@ def main():
         http_json("/api/custom-source/reorder", {{"sourceIds": [target_id]}}, method="POST")
         report["stages"]["activate"] = "ok"
 
-        # 4. 读取平台与档位契约
-        c2, sources = http_json("/api/custom-source/list")
+        # 4. 读取运行时可验证的平台元数据；列表未公开档位时保持 unknown。
+        _, sources = http_json("/api/custom-source/list")
         target_info = None
         if isinstance(sources, list):
-            for s in sources:
-                if str(s.get("id")) == str(target_id):
-                    target_info = s
+            for source in sources:
+                if isinstance(source, dict) and str(source.get("id")) == str(target_id):
+                    target_info = source
                     break
 
         platforms = []
-        if target_info and "supportedSources" in target_info and isinstance(target_info["supportedSources"], list):
-            platforms = [p for p in target_info["supportedSources"] if p in ("kg", "wy", "mg", "tx", "kw")]
+        if target_info and isinstance(target_info.get("supportedSources"), list):
+            platforms = [
+                platform for platform in target_info["supportedSources"]
+                if platform in ("kg", "wy", "mg", "tx", "kw")
+            ]
         if not platforms:
             platforms = ["kg", "wy", "mg", "tx", "kw"]
+        platforms = list(dict.fromkeys(platforms))
 
         report["quality_capability"] = "unknown"
         test_qualities = [("128k", True), ("flac", True)]
-        if target_info and "qualitys" in target_info and isinstance(target_info["qualitys"], dict):
-            report["quality_capability"] = "declared"
-
         keywords = ["晴天", "江南"]
+        for platform in platforms:
+            report["platforms"][platform] = {{
+                "status": "not_tested_budget",
+                "coverage": "not_tested_budget",
+                "attempts": [],
+                "keywords": {{
+                    keyword: {{
+                        "search_status": "not_tested_budget",
+                        "coverage": "not_tested_budget",
+                        "qualities": {{
+                            quality: {{
+                                "exploratory": exploratory,
+                                "status": "not_tested_budget",
+                                "attempt_count": 0,
+                            }}
+                            for quality, exploratory in test_qualities
+                        }},
+                    }}
+                    for keyword in keywords
+                }},
+            }}
+
         any_success = False
         all_success = True
+        try:
+            for platform in platforms:
+                platform_report = report["platforms"][platform]
+                platform_ok = False
+                for keyword in keywords:
+                    get_remaining_budget()
+                    keyword_report = platform_report["keywords"][keyword]
+                    query = urllib.parse.urlencode({{"source": platform, "name": keyword, "text": keyword, "page": 1, "limit": 3}})
+                    search_code, songs = http_json(f"/api/music/search?{{query}}")
+                    get_remaining_budget()
+                    if search_code != 200 or not isinstance(songs, list) or not songs:
+                        search_status = "no_songs" if search_code == 200 else "search_failed"
+                        keyword_report["search_status"] = search_status
+                        keyword_report["coverage"] = "partial"
+                        for quality, _ in test_qualities:
+                            keyword_report["qualities"][quality]["status"] = "not_tested_" + search_status
+                        platform_report["attempts"].append({{
+                            "keyword": keyword,
+                            "result": search_status,
+                        }})
+                        continue
 
-        for p in platforms:
-            report["platforms"][p] = {{"status": "failed", "attempts": []}}
-            platform_ok = False
-            for kw in keywords:
-                if get_remaining_budget() <= 2.0:
-                    break
-                query = urllib.parse.urlencode({{"source": p, "name": kw, "text": kw, "page": 1, "limit": 3}})
-                c_s, songs = http_json(f"/api/music/search?{{query}}")
-                if c_s != 200 or not isinstance(songs, list) or not songs:
-                    report["platforms"][p]["attempts"].append({{
-                        "keyword": kw,
-                        "result": "no_songs" if c_s == 200 else "search_failed"
-                    }})
-                    continue
+                    keyword_report["search_status"] = "ok"
+                    for quality, is_exploratory in test_qualities:
+                        get_remaining_budget()
+                        quality_report = keyword_report["qualities"][quality]
+                        quality_report["status"] = "in_progress"
+                        candidates = songs[:3]
+                        quality_ok = False
+                        attempted = 0
+                        for song in candidates:
+                            get_remaining_budget()
+                            attempted += 1
+                            quality_report["attempt_count"] = attempted
+                            url_body = {{
+                                "songInfo": song,
+                                "quality": quality,
+                                "enableAutoSwitchApiSource": False,
+                                "excludeApiSources": []
+                            }}
+                            resolve_code, resolve_result = http_json("/api/music/url", url_body, method="POST")
+                            get_remaining_budget()
+                            if resolve_code != 200 or not isinstance(resolve_result, dict):
+                                platform_report["attempts"].append({{
+                                    "keyword": keyword, "quality": quality, "exploratory": is_exploratory,
+                                    "result": "resolve_http_error"
+                                }})
+                                continue
 
-                for (q, is_exploratory) in test_qualities:
-                    for song in songs[:3]:
-                        if get_remaining_budget() <= 2.0:
-                            break
-                        url_body = {{
-                            "songInfo": song,
-                            "quality": q,
-                            "enableAutoSwitchApiSource": False,
-                            "excludeApiSources": []
-                        }}
-                        c_u, res_u = http_json("/api/music/url", url_body, method="POST")
-                        if c_u != 200 or not isinstance(res_u, dict):
-                            report["platforms"][p]["attempts"].append({{
-                                "keyword": kw, "quality": q, "exploratory": is_exploratory,
-                                "result": "resolve_http_error"
-                            }})
-                            continue
-                        ret_url = res_u.get("url")
-                        ret_id = str(res_u.get("sourceId") or "")
-                        if ret_id and ret_id != str(target_id):
-                            report["platforms"][p]["attempts"].append({{
-                                "keyword": kw, "quality": q, "exploratory": is_exploratory,
-                                "result": "resolved_by_other_source"
-                            }})
-                            continue
-                        if not ret_url:
-                            report["platforms"][p]["attempts"].append({{
-                                "keyword": kw, "quality": q, "exploratory": is_exploratory,
-                                "result": "resolve_empty"
-                            }})
-                            continue
+                            returned_id = str(resolve_result.get("sourceId") or "")
+                            if returned_id != str(target_id):
+                                platform_report["attempts"].append({{
+                                    "keyword": keyword, "quality": quality, "exploratory": is_exploratory,
+                                    "result": "resolved_by_other_source" if returned_id else "resolved_source_id_missing"
+                                }})
+                                continue
 
-                        ref_headers = {{"Referer": "https://www.kugou.com/" if p == "kg" else "https://y.qq.com/" if p == "tx" else "https://music.163.com/"}}
-                        probe_ok, probe_res = probe_stream(ret_url, ref_headers)
-                        attempt_rec = {{
-                            "keyword": kw,
-                            "quality": q,
-                            "exploratory": is_exploratory,
-                            "probe_ok": probe_ok,
-                            "probe": probe_res
-                        }}
-                        report["platforms"][p]["attempts"].append(attempt_rec)
-                        if probe_ok:
-                            platform_ok = True
-                            report["platforms"][p]["status"] = "ok"
-                            report["platforms"][p]["probe_sample"] = probe_res
-                            break
-                    if platform_ok:
-                        break
+                            media_url = resolve_result.get("url")
+                            if not media_url:
+                                platform_report["attempts"].append({{
+                                    "keyword": keyword, "quality": quality, "exploratory": is_exploratory,
+                                    "result": "resolve_empty"
+                                }})
+                                continue
+
+                            referer = "https://www.kugou.com/" if platform == "kg" else "https://y.qq.com/" if platform == "tx" else "https://music.163.com/"
+                            probe_ok, probe_result = probe_stream(media_url, {{"Referer": referer}})
+                            attempt_record = {{
+                                "keyword": keyword,
+                                "quality": quality,
+                                "exploratory": is_exploratory,
+                                "probe_ok": probe_ok,
+                                "probe": probe_result,
+                            }}
+                            platform_report["attempts"].append(attempt_record)
+                            if probe_ok:
+                                quality_ok = True
+                                platform_ok = True
+                                platform_report["probe_sample"] = probe_result
+                                break
+
+                        quality_report["attempt_count"] = attempted
+                        quality_report["status"] = "ok" if quality_ok else "failed"
+                    keyword_report["coverage"] = (
+                        "complete"
+                        if all(value["status"] in ("ok", "failed") for value in keyword_report["qualities"].values())
+                        else "partial"
+                    )
+
+                platform_report["status"] = "ok" if platform_ok else "failed"
+                platform_report["coverage"] = (
+                    "complete"
+                    if all(
+                        quality_report["status"] in ("ok", "failed")
+                        for keyword_report in platform_report["keywords"].values()
+                        for quality_report in keyword_report["qualities"].values()
+                    )
+                    else "partial"
+                )
+                if platform_report["coverage"] != "complete":
+                    all_success = False
                 if platform_ok:
-                    break
+                    any_success = True
+                else:
+                    all_success = False
 
-            if platform_ok:
-                any_success = True
+            report["coverage"] = (
+                "complete"
+                if all(platform_report["coverage"] == "complete" for platform_report in report["platforms"].values())
+                else "partial"
+            )
+            if any_success and all_success:
+                report["overall_status"] = "ok"
+            elif any_success or any(
+                platform_report["coverage"] != "complete"
+                for platform_report in report["platforms"].values()
+            ):
+                report["overall_status"] = "partial"
             else:
-                all_success = False
-
-        if any_success and all_success:
-            report["overall_status"] = "ok"
-        elif any_success:
+                report["overall_status"] = "failed"
+        except BudgetExceeded:
+            report["stages"]["budget"] = "expired"
+            report["coverage"] = "partial"
             report["overall_status"] = "partial"
-        else:
-            report["overall_status"] = "failed"
+            for stage in ("init", "upload", "activate"):
+                report["stages"].setdefault(stage, "not_tested_budget")
+            for platform_report in report["platforms"].values():
+                any_search_started = False
+                for keyword_report in platform_report["keywords"].values():
+                    if keyword_report["search_status"] != "not_tested_budget":
+                        any_search_started = True
+                    for quality_report in keyword_report["qualities"].values():
+                        if quality_report["status"] == "in_progress":
+                            quality_report["status"] = (
+                                "partial" if quality_report["attempt_count"] > 0 else "not_tested_budget"
+                            )
+                    if keyword_report["search_status"] == "not_tested_budget":
+                        keyword_report["coverage"] = "not_tested_budget"
+                    elif any(
+                        quality_report["status"] not in ("ok", "failed")
+                        for quality_report in keyword_report["qualities"].values()
+                    ):
+                        keyword_report["coverage"] = "partial"
+                    else:
+                        keyword_report["coverage"] = "complete"
+                platform_report["coverage"] = "partial" if any_search_started else "not_tested_budget"
+                if platform_report["coverage"] == "not_tested_budget":
+                    platform_report["status"] = "not_tested_budget"
+                elif not any(attempt.get("probe_ok") for attempt in platform_report["attempts"]):
+                    platform_report["status"] = "partial"
 
         print(json.dumps(report))
     finally:
@@ -964,7 +1205,8 @@ def main():
             node_proc.kill()
 
 if __name__ == "__main__":
-    main()
+    with enforce_sample_deadline():
+        main()
 '''
 
 
@@ -1006,6 +1248,7 @@ def run_matrix(args: argparse.Namespace) -> int:
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "image": args.image,
         "total_samples": len(samples),
+        "overall_status": "pending",
         "results": []
     }
 
@@ -1017,6 +1260,21 @@ def run_matrix(args: argparse.Namespace) -> int:
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(matrix_report, f, indent=2, ensure_ascii=False)
         tmp_file.replace(output_path)
+
+    def _refresh_matrix_status():
+        statuses = [result.get("overall_status", "failed") for result in matrix_report["results"]]
+        if not statuses:
+            matrix_report["overall_status"] = "pending"
+        elif len(statuses) < matrix_report["total_samples"]:
+            matrix_report["overall_status"] = "running"
+        elif all(status == "ok" for status in statuses):
+            matrix_report["overall_status"] = "ok"
+        elif any(status in ("ok", "partial") for status in statuses):
+            matrix_report["overall_status"] = "partial"
+        elif all(status == "needs_unsafe" for status in statuses):
+            matrix_report["overall_status"] = "needs_unsafe"
+        else:
+            matrix_report["overall_status"] = "failed"
 
     # 初始保存空报告
     _save_atomic_report()
@@ -1044,7 +1302,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                 script_bytes = content
                 break
             except Exception as e:
-                logger.warning("获取样本 %s (loc: %s) 失败: %s", sample_name, loc.get("path"), e)
+                logger.warning("样本获取失败 stage=fetch error_type=%s", type(e).__name__)
 
         if not script_bytes:
             sample_res["stages"]["fetch"] = "fetch_failed"
@@ -1058,7 +1316,7 @@ def run_matrix(args: argparse.Namespace) -> int:
 
         run_proc = subprocess.run(run_args, capture_output=True, text=True, timeout=30)
         if run_proc.returncode != 0:
-            sample_res["stages"]["container_run"] = f"failed: {run_proc.stderr.strip()[:100]}"
+            sample_res["stages"]["container_run"] = "failed"
             return sample_res
 
         container_id = run_proc.stdout.strip()
@@ -1093,20 +1351,33 @@ def run_matrix(args: argparse.Namespace) -> int:
                 timeout=DOCKER_EXEC_HARD_TIMEOUT_S
             )
 
-            if exec_proc.returncode != 0 and not exec_proc.stdout.strip():
+            if exec_proc.returncode != 0:
                 sample_res["stages"]["exec"] = f"exit_{exec_proc.returncode}"
-                return sample_res
+                if not exec_proc.stdout.strip():
+                    return sample_res
+            else:
+                sample_res["stages"]["exec"] = "ok"
 
             try:
                 worker_report = json.loads(exec_proc.stdout.strip())
-                if "stages" in worker_report and isinstance(worker_report["stages"], dict):
+                if not isinstance(worker_report, dict):
+                    raise ValueError("worker report must be an object")
+                if isinstance(worker_report.get("stages"), dict):
                     sample_res["stages"].update(worker_report["stages"])
-                for k, v in worker_report.items():
-                    if k != "stages":
-                        sample_res[k] = v
-            except Exception as e:
+                for key, value in worker_report.items():
+                    if key != "stages":
+                        sample_res[key] = value
+                if exec_proc.returncode != 0:
+                    sample_res["stages"]["exec"] = f"exit_{exec_proc.returncode}"
+            except Exception:
                 sample_res["stages"]["exec"] = "invalid_worker_json"
                 return sample_res
+
+            if sample_res.get("overall_status") == "ok":
+                required_stages = ("exec", "init", "upload", "activate")
+                if any(sample_res["stages"].get(stage) != "ok" for stage in required_stages):
+                    sample_res["stages"]["report_validation"] = "worker_not_fully_executed"
+                    sample_res["overall_status"] = "failed"
 
             return sample_res
         except subprocess.TimeoutExpired:
@@ -1117,7 +1388,7 @@ def run_matrix(args: argparse.Namespace) -> int:
             try:
                 safe_remove_container(container_id, run_uuid, sample_sha)
             except Exception as e:
-                logger.error("清理容器 %s 失败: %s", container_id, e)
+                logger.error("容器清理失败 stage=cleanup error_type=%s", type(e).__name__)
 
     # 并发执行
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1130,11 +1401,12 @@ def run_matrix(args: argparse.Namespace) -> int:
                 res = {
                     "name": s.get("name", "unknown"),
                     "stages": {"task": "unhandled_exception"},
+                    "error_type": type(exc).__name__,
                     "overall_status": "failed",
-                    "error": str(exc)
                 }
             with results_lock:
                 matrix_report["results"].append(res)
+                _refresh_matrix_status()
                 _save_atomic_report()
 
     logger.info("矩阵测试执行完成，报告已保存至 %s", output_path)

@@ -13,9 +13,12 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import types
 import threading
 import time
 import unittest.mock as mock
@@ -226,7 +229,8 @@ class TestNodePreloadRealSubprocess:
         """字面量私网 IP（127.0.0.1, 192.168.1.1, 10.0.0.1, 169.254.169.254）立即报 EACCES。"""
         js = """
         const http = require('http');
-        const ips = ['127.0.0.1', '192.168.1.1', '10.0.0.1', '169.254.169.254'];
+        const ips = ['127.0.0.1', '192.168.1.1', '10.0.0.1', '169.254.169.254',
+                     '192.0.2.1', '198.51.100.1', '203.0.113.1', '[::1]'];
         let blocked = 0;
         for (const ip of ips) {
           try {
@@ -344,6 +348,65 @@ class TestNodePreloadRealSubprocess:
         assert proc.returncode == 0
         assert "CUSTOM_LOOKUP_BLOCKED" in proc.stdout
 
+    @pytest.mark.parametrize('constructor', [
+        "net.createConnection({host: '127.0.0.1', port})",
+        "net.connect(port, '127.0.0.1')",
+        "net.createConnection({host: '::ffff:127.0.0.1', port})",
+        "net.createConnection({host: 'lookup.example.test', port, lookup: (host, options, cb) => cb(null, options.all ? [{address: '127.0.0.1', family: 4}] : '127.0.0.1', 4)})",
+        "net.createConnection(Object.freeze({host: 'lookup.example.test', port, lookup: (host, options, cb) => cb(null, options.all ? [{address: '127.0.0.1', family: 4}] : '127.0.0.1', 4)}))",
+    ])
+    def test_normalized_socket_arguments_cannot_reach_local_trap(self, preload_file, constructor):
+        # Node内部会把createConnection参数包装为数组，不能绕过Socket拦截。
+        js = """
+        const net = require('net');
+        const trap = net.createServer(socket => {
+          socket.destroy();
+          console.error('PRIVATE_TRAP_CONTACTED');
+          process.exit(10);
+        });
+        trap.listen(0, '127.0.0.1', () => {
+          const port = trap.address().port;
+          const socket = CONSTRUCTOR;
+          socket.on('connect', () => process.exit(11));
+          socket.on('error', error => {
+            if (!['EACCES', 'ENOTFOUND'].includes(error.code)) process.exit(12);
+            console.log('PRIVATE_TRAP_BLOCKED');
+            trap.close(() => process.exit(0));
+          });
+          setTimeout(() => process.exit(13), 2000);
+        });
+        """.replace('CONSTRUCTOR', constructor)
+        result = self._run_node(js, preload_file)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'PRIVATE_TRAP_BLOCKED' in result.stdout
+        assert 'PRIVATE_TRAP_CONTACTED' not in result.stderr
+
+    def test_dual_stack_dns_selects_public_ipv4_instead_of_rejecting_host(self, preload_file):
+        # 不发网络请求：模拟双栈DNS，防止IPv6禁用误伤仍有公网IPv4的正常域名。
+        js = """
+        const dns = require('dns');
+        dns.lookup = (host, options, callback) => {
+          const family = options && options.family;
+          callback(null, family === 4 ? '8.8.8.8' : '2001:4860:4860::8888', family === 4 ? 4 : 6);
+        };
+        dns.promises.lookup = async (host, options) => ({
+          address: options && options.family === 4 ? '8.8.8.8' : '2001:4860:4860::8888',
+          family: options && options.family === 4 ? 4 : 6
+        });
+        require(PRELOAD);
+        dns.lookup('dual.example.test', {}, async (error, address) => {
+          if (error || address !== '8.8.8.8') process.exit(10);
+          try {
+            const result = await dns.promises.lookup('dual.example.test', {});
+            if (result.address !== '8.8.8.8') process.exit(11);
+            console.log('PUBLIC_IPV4_SELECTED');
+          } catch (error) { process.exit(12); }
+        });
+        """.replace('PRELOAD', json.dumps(str(preload_file)))
+        result = subprocess.run(['node', '-e', js], capture_output=True, text=True, timeout=5)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'PUBLIC_IPV4_SELECTED' in result.stdout
+
     def test_server_listen_127_not_blocked(self, preload_file):
         """容器内 Node 服务端监听 127.0.0.1 不能被拦截。"""
         js = """
@@ -450,11 +513,417 @@ class TestDockerAndWorkerContracts:
 
 
 # ==============================================================================
-# 6. 真实 CLI 端到端 Fake Subprocess 回归测试
+# 6. 生成 Worker 的真实函数行为回归测试
+# ==============================================================================
+
+class _FakeNodeProcess:
+    """测试用 Node 子进程替身，避免启动 lxserver 或访问宿主网络。"""
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def test_generated_worker_entrypoint_interrupts_blocking_io_at_total_deadline():
+    import ast
+    import signal
+    import time
+    namespace = _load_generated_worker()
+    namespace['SAMPLE_BUDGET_S'] = 0.05
+    namespace['START_TIME'] = time.monotonic()
+    namespace['main'] = lambda: time.sleep(2.0)
+    namespace['__name__'] = '__main__'
+    entrypoint = ast.parse(sm.generate_worker_script('deadline-test-token')).body[-1]
+    code = compile(ast.Module(body=[entrypoint], type_ignores=[]), '<actual-worker-entrypoint>', 'exec')
+    old_handler = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+    with pytest.raises(namespace['BudgetExceeded']):
+        exec(code, namespace)
+    assert time.monotonic() - started < 0.5
+    assert signal.getsignal(signal.SIGALRM) == old_handler
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def _load_generated_worker():
+    """执行实际生成的 worker 源码，但阻止其自动运行 main()。"""
+    namespace = {"__name__": "generated_worker_test"}
+    worker_code = sm.generate_worker_script("worker-test-token")
+    exec(compile(worker_code, "<generated-lx-worker>", "exec"), namespace)
+    namespace["write_lxserver_config"] = lambda: None
+    namespace["wait_for_lxserver"] = lambda timeout: True
+    namespace["subprocess"] = types.SimpleNamespace(
+        Popen=lambda *args, **kwargs: _FakeNodeProcess(),
+        DEVNULL=subprocess.DEVNULL,
+    )
+    return namespace
+
+
+def _run_generated_worker_main(namespace, monkeypatch):
+    """调用生成 worker 的 main() 并解析其 JSON 报告。"""
+    output = io.StringIO()
+    monkeypatch.setattr(namespace["sys"], "stdin", io.StringIO("// synthetic test source"))
+    monkeypatch.setattr(namespace["sys"], "stdout", output)
+    namespace["main"]()
+    return json.loads(output.getvalue())
+
+
+def _successful_worker_api(path, data=None, method="GET", timeout=None):
+    """为真实 worker main() 提供可控的 lxserver API 响应。"""
+    if path == "/api/custom-source/upload":
+        return 200, {"success": True, "id": "target-source"}
+    if path in ("/api/custom-source/toggle", "/api/custom-source/reorder"):
+        return 200, {"success": True}
+    if path == "/api/custom-source/list":
+        return 200, [{"id": "target-source", "supportedSources": ["wy"]}]
+    if path.startswith("/api/music/search?"):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        return 200, [{"name": query["name"][0]}]
+    if path == "/api/music/url":
+        return 200, {"url": "http://media.example.test/audio", "sourceId": "target-source"}
+    raise AssertionError(f"unexpected worker API path: {path}")
+
+
+class TestGeneratedWorkerBehavior:
+    """直接执行生成 worker 的函数，验证运行时分支而非源码字符串。"""
+
+    def test_top_level_require_unsafe_true_is_not_accepted(self, monkeypatch):
+        worker = _load_generated_worker()
+        calls = []
+
+        def fake_http_json(path, data=None, method="GET", timeout=None):
+            calls.append(path)
+            return 400, {"requireUnsafe": True, "message": ""}
+
+        worker["http_json"] = fake_http_json
+        report = _run_generated_worker_main(worker, monkeypatch)
+
+        assert report["needs_unsafe"] is True
+        assert report["requireUnsafe"] is True
+        assert report["overall_status"] == "needs_unsafe"
+        assert report["stages"]["upload"] == "needs_unsafe"
+        assert calls == ["/api/custom-source/upload"]
+
+    def test_missing_upload_id_does_not_claim_last_existing_source(self, monkeypatch):
+        worker = _load_generated_worker()
+        calls = []
+
+        def fake_http_json(path, data=None, method="GET", timeout=None):
+            calls.append(path)
+            if path == "/api/custom-source/upload":
+                return 200, {"success": True}
+            if path == "/api/custom-source/list":
+                return 200, [{"id": "unrelated-existing-source"}]
+            raise AssertionError(f"worker continued after an upload without an ID: {path}")
+
+        worker["http_json"] = fake_http_json
+        report = _run_generated_worker_main(worker, monkeypatch)
+
+        assert report["stages"]["upload"] == "no_source_id"
+        assert "target_source_id" not in report
+        assert calls == ["/api/custom-source/upload"]
+
+    def test_resolve_without_source_id_is_rejected_before_probe(self, monkeypatch):
+        worker = _load_generated_worker()
+        calls = []
+        probe_calls = []
+
+        def fake_http_json(path, data=None, method="GET", timeout=None):
+            calls.append((path, data))
+            if path == "/api/music/url":
+                return 200, {"url": "http://media.example.test/audio"}
+            return _successful_worker_api(path, data, method, timeout)
+
+        worker["http_json"] = fake_http_json
+        worker["probe_stream"] = lambda *args, **kwargs: probe_calls.append(args) or (True, {})
+        report = _run_generated_worker_main(worker, monkeypatch)
+
+        assert probe_calls == []
+        attempts = report["platforms"]["wy"]["attempts"]
+        assert attempts
+        assert all(item["result"] == "resolved_source_id_missing" for item in attempts)
+        assert not any(item.get("probe_ok") for item in attempts)
+
+    def test_success_does_not_skip_keywords_or_exploratory_qualities(self, monkeypatch):
+        worker = _load_generated_worker()
+        calls = []
+
+        def fake_http_json(path, data=None, method="GET", timeout=None):
+            calls.append((path, data))
+            return _successful_worker_api(path, data, method, timeout)
+
+        worker["http_json"] = fake_http_json
+        worker["probe_stream"] = lambda *args, **kwargs: (True, {"magic": "audio/mpeg"})
+        report = _run_generated_worker_main(worker, monkeypatch)
+
+        searches = [path for path, _ in calls if path.startswith("/api/music/search?")]
+        resolutions = [data for path, data in calls if path == "/api/music/url"]
+        assert len(searches) == 2
+        assert {urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["name"][0] for path in searches} == {
+            "晴天", "江南"
+        }
+        assert [item["quality"] for item in resolutions] == ["128k", "flac", "128k", "flac"]
+        platform = report["platforms"]["wy"]
+        assert platform["coverage"] == "complete"
+        assert platform["status"] == "ok"
+        assert report["quality_capability"] == "unknown"
+        assert all(item["exploratory"] is True for item in platform["attempts"])
+        assert report["overall_status"] == "ok"
+
+    def test_budget_expiry_keeps_partial_results_and_marks_untested_slots(self, monkeypatch):
+        worker = _load_generated_worker()
+        clock = [0.0]
+        worker["time"] = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None)
+        worker["START_TIME"] = 0.0
+        worker["SAMPLE_BUDGET_S"] = 90.0
+
+        def fake_probe(*args, **kwargs):
+            clock[0] = 90.0
+            return True, {"magic": "audio/mpeg"}
+
+        worker["http_json"] = _successful_worker_api
+        worker["probe_stream"] = fake_probe
+        report = _run_generated_worker_main(worker, monkeypatch)
+
+        platform = report["platforms"]["wy"]
+        assert report["overall_status"] == "partial"
+        assert report["stages"]["budget"] == "expired"
+        assert report["coverage"] == "partial"
+        assert platform["coverage"] == "partial"
+        assert platform["keywords"]["晴天"]["qualities"]["128k"]["status"] == "ok"
+        assert platform["keywords"]["晴天"]["qualities"]["flac"]["status"] == "not_tested_budget"
+        assert platform["keywords"]["江南"]["search_status"] == "not_tested_budget"
+
+    def test_probe_pins_validated_ip_without_second_dns_lookup(self):
+        worker = _load_generated_worker()
+        connect_calls = []
+        lookup_calls = []
+        public_ip = "93.184.216.34"
+        private_ip = "127.0.0.1"
+
+        def fake_getaddrinfo(host, port, family, socktype):
+            lookup_calls.append((host, port, family, socktype))
+            resolved_ip = public_ip if len(lookup_calls) == 1 else private_ip
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (resolved_ip, port))]
+
+        class RefusingSocket:
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, address):
+                connect_calls.append(address)
+                raise OSError("controlled offline socket")
+
+            def close(self):
+                pass
+
+        with mock.patch.object(worker["socket"], "getaddrinfo", side_effect=fake_getaddrinfo):
+            with mock.patch.object(worker["socket"], "socket", side_effect=lambda *args, **kwargs: RefusingSocket()):
+                ok, result = worker["probe_stream"]("http://rebind.example.test:8123/audio")
+
+        assert ok is False
+        assert result["error_type"] == "URLError"
+        assert len(lookup_calls) == 1
+        assert connect_calls == [(public_ip, 8123)]
+        assert connect_calls[0][0] != private_ip
+
+    def test_probe_uses_remaining_timeout_and_disables_environment_proxy(self, monkeypatch):
+        worker = _load_generated_worker()
+        worker["START_TIME"] = 0.0
+        worker["SAMPLE_BUDGET_S"] = 5.0
+        worker["time"] = types.SimpleNamespace(monotonic=lambda: 2.0)
+        captured = {}
+
+        class FakeResponse:
+            headers = {"Content-Type": "audio/mpeg"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def getcode(self):
+                return 206
+
+            def read(self, limit):
+                return b"ID3" + b"\\x00" * (limit - 3)
+
+        class FakeOpener:
+            def open(self, req, timeout):
+                captured["timeout"] = timeout
+                return FakeResponse()
+
+        def fake_build_opener(*handlers):
+            assert isinstance(handlers[0], worker["urllib"].request.ProxyHandler)
+            assert handlers[0].proxies == {}
+            return FakeOpener()
+
+        monkeypatch.setattr(
+            worker["socket"],
+            "getaddrinfo",
+            lambda host, port, family, socktype: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+            ],
+        )
+        monkeypatch.setattr(worker["urllib"].request, "build_opener", fake_build_opener)
+
+        ok, _ = worker["probe_stream"]("http://media.example.test/audio")
+
+        assert ok is True
+        assert captured["timeout"] == 3.0
+
+    def test_pinned_https_keeps_sni_and_certificate_verification(self, monkeypatch):
+        worker = _load_generated_worker()
+        connected_to = []
+        server_names = []
+
+        class FakeSocket:
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, address):
+                connected_to.append(address)
+
+            def setsockopt(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeTLSContext:
+            check_hostname = True
+            verify_mode = ssl.CERT_REQUIRED
+
+            def wrap_socket(self, raw_socket, server_hostname):
+                server_names.append(server_hostname)
+                return raw_socket
+
+        monkeypatch.setattr(worker["socket"], "socket", lambda *args, **kwargs: FakeSocket())
+        tls_context = FakeTLSContext()
+        connection = worker["PinnedHTTPSConnection"](
+            "media.example.test", connect_ip="93.184.216.34", port=443,
+            context=tls_context,
+        )
+        try:
+            connection.connect()
+        finally:
+            connection.close()
+
+        assert connected_to == [("93.184.216.34", 443)]
+        assert server_names == ["media.example.test"]
+        assert tls_context.check_hostname is True
+        assert tls_context.verify_mode == ssl.CERT_REQUIRED
+
+    def test_worker_ip_check_rejects_non_global_ipv4_ranges(self):
+        worker = _load_generated_worker()
+        assert worker["is_private_ip"]("8.8.8.8") is False
+        assert worker["is_private_ip"]("100.64.0.1") is True
+        assert worker["is_private_ip"]("198.18.0.1") is True
+        assert worker["is_private_ip"]("192.168.1.1") is True
+        assert worker["is_private_ip"]("2001:4860:4860::8888") is True
+
+    def test_http_json_caps_success_and_http_error_bodies_and_closes_error(self, monkeypatch):
+        worker = _load_generated_worker()
+        worker["START_TIME"] = 0.0
+        worker["SAMPLE_BUDGET_S"] = 5.0
+        worker["time"] = types.SimpleNamespace(monotonic=lambda: 2.0)
+        read_limits = []
+        request_timeouts = []
+        maximum = 2 * 1024 * 1024
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self, limit=-1):
+                read_limits.append(limit)
+                return b"x" * limit
+
+            def getcode(self):
+                return 200
+
+        def fake_urlopen(req, timeout):
+            request_timeouts.append(timeout)
+            return FakeResponse()
+
+        monkeypatch.setattr(worker["urllib"].request, "urlopen", fake_urlopen)
+        code, payload = worker["http_json"]("/api/status")
+        assert code == 200
+        assert payload["error_type"] == "ResponseTooLarge"
+        assert read_limits == [maximum + 1]
+        assert request_timeouts == [3.0]
+
+        class TrackingBytesIO(io.BytesIO):
+            def read(self, size=-1):
+                self.requested_size = size
+                return super().read(size)
+
+        error_body = TrackingBytesIO(b"x" * (maximum + 500))
+        headers = __import__("email.message", fromlist=["Message"]).Message()
+        http_error = urllib.error.HTTPError("http://127.0.0.1/test", 500, "failed", headers, error_body)
+
+        def fake_http_error(req, timeout):
+            request_timeouts.append(timeout)
+            raise http_error
+
+        monkeypatch.setattr(worker["urllib"].request, "urlopen", fake_http_error)
+        code, payload = worker["http_json"]("/api/status")
+        assert code == 500
+        assert payload["error_type"] == "ResponseTooLarge"
+        assert error_body.requested_size == maximum + 1
+        assert error_body.closed is True
+        assert request_timeouts == [3.0, 3.0]
+
+    def test_budget_helper_raises_after_deadline(self):
+        worker = _load_generated_worker()
+        worker["START_TIME"] = 10.0
+        worker["SAMPLE_BUDGET_S"] = 90.0
+        worker["time"] = types.SimpleNamespace(monotonic=lambda: 100.0)
+        with pytest.raises(worker["BudgetExceeded"]):
+            worker["get_remaining_budget"]()
+
+
+# ==============================================================================
+# 7. 真实 CLI 端到端 Fake Subprocess 回归测试
 # ==============================================================================
 
 class TestCLIFakeSubprocessEndToEnd:
     """真实 CLI 端到端 fake subprocess 回归测试。"""
+
+    def test_fetch_failure_redacts_raw_exception_and_marks_matrix_failed(self, tmp_path, caplog):
+        inventory = tmp_path / "inventory.json"
+        inventory.write_text(json.dumps({
+            "samples": [{
+                "name": "sample_redaction",
+                "git_blob_sha": "sha_redaction",
+                "locations": [{"repository": "demo/repo", "commit": "c1", "path": "sample.js"}],
+            }]
+        }), encoding="utf-8")
+        output = tmp_path / "report.json"
+        args = sm.parse_args([
+            "--inventory", str(inventory), "--output", str(output), "--allow-third-party-scripts",
+        ])
+        secret_detail = "https://media.example.test/audio?token=must-not-leak"
+
+        with mock.patch("lx_source_matrix.fetch_script_content", side_effect=ValueError(secret_detail)):
+            assert sm.run_matrix(args) == 0
+
+        report = json.loads(output.read_text(encoding="utf-8"))
+        assert report["overall_status"] == "failed"
+        assert report["results"][0]["stages"]["fetch"] == "fetch_failed"
+        assert "error" not in report["results"][0]
+        assert secret_detail not in output.read_text(encoding="utf-8")
+        assert secret_detail not in caplog.text
+        assert "stage=fetch" in caplog.text
+        assert "error_type=ValueError" in caplog.text
 
     def test_run_matrix_single_sample_full_lifecycle(self, tmp_path):
         """单样本完整生命周期端到端测试：
@@ -479,6 +948,16 @@ class TestCLIFakeSubprocessEndToEnd:
         demo_script = b"/*! @name demo_source */\nconsole.log('demo');"
         container_id = "cid_001122334455"
         executed_cmds = []
+        worker_out = {
+            "stages": {"init": "ok", "upload": "ok", "activate": "ok"},
+            "needs_unsafe": False,
+            "requireUnsafe": False,
+            "target_source_id": "src_99",
+            "platforms": {
+                "kg": {"status": "ok", "probe_sample": {"host": "kugou.com", "magic": "audio/mpeg"}}
+            },
+            "overall_status": "ok",
+        }
 
         def fake_fetch(loc, b_sha, s_sha):
             return demo_script
@@ -494,20 +973,6 @@ class TestCLIFakeSubprocessEndToEnd:
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             # 3. docker exec (执行 worker)
             if cmd[0] == "docker" and cmd[1] == "exec" and cmd[-1] == "/data/worker.py":
-                worker_out = {
-                    "stages": {
-                        "init": "ok",
-                        "upload": "ok",
-                        "activate": "ok"
-                    },
-                    "needs_unsafe": False,
-                    "requireUnsafe": False,
-                    "target_source_id": "src_99",
-                    "platforms": {
-                        "kg": {"status": "ok", "probe_sample": {"host": "kugou.com", "magic": "audio/mpeg"}}
-                    },
-                    "overall_status": "ok"
-                }
                 return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(worker_out), stderr="")
             # 4. docker inspect
             if cmd[0] == "docker" and cmd[1] == "inspect":
@@ -546,6 +1011,13 @@ class TestCLIFakeSubprocessEndToEnd:
                 ret = sm.run_matrix(args)
                 assert ret == 0
 
+                # 即使 fake worker 声称 ok，缺少执行阶段也不能通过 CLI 报告成功。
+                worker_out.clear()
+                worker_out.update({"overall_status": "ok"})
+                invalid_out = tmp_path / "matrix_report_unexecuted.json"
+                args.output = str(invalid_out)
+                assert sm.run_matrix(args) == 0
+
         # 检查命令行调用序列
         cmd_names = [c[1] for c in executed_cmds if c[0] == "docker"]
         assert "run" in cmd_names
@@ -563,7 +1035,14 @@ class TestCLIFakeSubprocessEndToEnd:
         assert res0["stages"]["fetch"] == "ok"
         assert res0["stages"]["init"] == "ok"
         assert res0["stages"]["upload"] == "ok"
+        assert res0["stages"]["exec"] == "ok"
         assert res0["overall_status"] == "ok"
+        assert report_data["overall_status"] == "ok"
+
+        invalid_data = json.loads(invalid_out.read_text(encoding="utf-8"))
+        assert invalid_data["overall_status"] == "failed"
+        assert invalid_data["results"][0]["overall_status"] == "failed"
+        assert invalid_data["results"][0]["stages"]["report_validation"] == "worker_not_fully_executed"
 
     def test_run_matrix_two_samples_concurrency_and_atomic_save(self, tmp_path):
         """双样本并发 <= workers，且单样本完成后结果立即原子保存。"""
