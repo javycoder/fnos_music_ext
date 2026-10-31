@@ -60,7 +60,8 @@ def test_log_dir_shared_repo_and_docker_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("FNMUSIC_HOME")
     monkeypatch.delenv("WEBUI_REPO_DIR")
     monkeypatch.setattr(fnlog, "__file__", str(tmp_path / "app" / "fnlog.py"))
-    assert fnlog.log_dir() == Path("/repo/logs")
+    # 镜像内兜底走数据卷：挂载仓库 /repo 对非 root 进程不保证可写（CI 实证）
+    assert fnlog.log_dir() == Path("/data/logs")
 
 
 def test_setup_logging_writes_file_and_idempotent(log_dir):
