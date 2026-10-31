@@ -9,6 +9,8 @@
 set -eu
 SUP_CONF="${SUPERVISOR_CONF:-/etc/supervisor/supervisord.conf}"
 . "${ENV_FLAG_LIB:-/usr/local/bin/env_flag.sh}"
+# 管理认证只用于容器内的lxserver状态接口，不向媒体服务传播。
+export_source_env
 
 # 单个服务的 HTTP 探活上限；健康检查整体还要给 Docker 的 --timeout=10s 让路，
 # 因此取 3s：慢初始化不会拖死健康检查，也不至于把瞬时抖动判成故障。
@@ -26,8 +28,20 @@ running() {
 http_ready() {
     label="$1"
     url="$2"
-    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$HEALTH_HTTP_TIMEOUT" \
-            "$url" 2>/dev/null)" && status=0 || status=$?
+    if [ "$label" = "lxserver" ]; then
+        # 真实v2.1.2的/api/status未认证返回401。凭据经stdin传入curl，
+        # 不出现在进程参数或日志中；禁止跟随跳转，也不使用外部HTTP代理。
+        case "$url" in
+            http://127.0.0.1:*|http://localhost:*) ;;
+            *) echo 'kind=invalid_internal_health_url'; return 1 ;;
+        esac
+        code="$(printf 'x-frontend-auth: %s\n' "${LXSERVER_ADMIN_PASSWORD:-123456}" \
+            | curl -sS --noproxy '*' --header @- -o /dev/null -w '%{http_code}' \
+                --max-time "$HEALTH_HTTP_TIMEOUT" "$url" 2>/dev/null)" && status=0 || status=$?
+    else
+        code="$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' --max-time "$HEALTH_HTTP_TIMEOUT" \
+                "$url" 2>/dev/null)" && status=0 || status=$?
+    fi
     case "$status" in
         0) ;;
         7) echo "kind=connect_refused rc=$status url=$url"; return 1 ;;
@@ -61,7 +75,7 @@ check_lx_http() {
     prog="$1"
     url="$2"
     detail="$(http_ready "$prog" "$url")" || {
-        echo "[healthcheck] $prog 进程已运行但 HTTP 未就绪（$detail）" >&2
+        echo "[healthcheck] $prog 进程已运行但 HTTP 未就绪（${detail}）" >&2
         return 1
     }
     return 0

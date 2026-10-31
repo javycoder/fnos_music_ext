@@ -29,7 +29,7 @@ module.exports = {
   "player.enableAuth": false,
   "subsonic.enable": false,
   "webdav.enable": false,
-  "system.allowUnsafeVM": true
+  "system.allowUnsafeVM": false
 };
 EOF
         log "已初始化/对齐 lxserver 配置: ${_cfg_file}"
