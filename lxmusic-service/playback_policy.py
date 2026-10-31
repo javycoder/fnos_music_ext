@@ -732,7 +732,11 @@ class CandidateFinder:
             # 跟随者有自己的总 deadline：不能无上限等领队的搜索任务。
             try:
                 async with asyncio.timeout(remaining):
-                    return await asyncio.shield(existing)
+                    result = await asyncio.shield(existing)
+                if result is None:
+                    # 领队取消仅撤销它的搜索；跟随者保留原截止时间独立重试。
+                    return await self.find(searcher, item, platform, deadline, generation)
+                return result
             except TimeoutError:
                 logger.debug("candidate follower deadline platform=%s keyword=%s",
                              normalized_platform, keyword)
@@ -763,8 +767,8 @@ class CandidateFinder:
             return matched
         except asyncio.CancelledError:
             if not future.done():
-                future.set_exception(RuntimeError("candidate search cancelled"))
-            future.exception()
+                # 取消标记不作为平台失败或空结果缓存，其他请求可独立重试。
+                future.set_result(None)
             raise
         except Exception as exc:
             # 搜索是软失败：缺候选就回退到其他脚本/档位，不算脚本熔断。

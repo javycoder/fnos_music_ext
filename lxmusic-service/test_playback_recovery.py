@@ -379,6 +379,25 @@ async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, run
 
 
 @pytest.mark.asyncio
+async def test_stash_delivery_preserves_earlier_tier_failures(fake_lx, runtime, monkeypatch):
+    """无损明确失败后，低档暂存成功仍需登记无损失败，不能误伤标准档。"""
+    fake_lx.sources = [_ready("a.js", ["kw"])]
+
+    async def downgrade(song_info, quality="128k", **kwargs):
+        if quality == "flac":
+            return None
+        return {"url": "https://media.test/low.mp3", "type": "128k", "sourceId": "a.js"}
+
+    monkeypatch.setattr(fake_lx, "get_music_url", downgrade)
+    async with _media_client() as client:
+        result = await lxapp.resolve_and_probe(client, "kw", _item(), quality="lossless", budget=2)
+    assert result["quality_evidence"]["from_stash"] is True
+    key = f"policy:{lxapp._URL_CACHE_GEN}:a.js:kw:lossless"
+    assert key in lxapp._CHAIN_HEALTH
+    assert not any(entry.endswith(":standard") for entry in lxapp._CHAIN_HEALTH)
+
+
+@pytest.mark.asyncio
 async def test_cancellation_and_budget_exhaustion_do_not_record_failure(
     fake_lx, runtime, monkeypatch,
 ):

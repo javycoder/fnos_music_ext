@@ -1326,7 +1326,9 @@ async def resolve_and_probe(
             cached_rank = quality_rank(str(cached.get("resolution_quality") or ""))
             step_rank = quality_rank(step.quality)
             if 0 <= step_rank <= cached_rank:
-                # 阶梯走到该脚本已给出的解析档：直接复用，不再重复请求。
+                # 暂存交付也须登记此前的真实失败，保持各档位熔断统计一致。
+                # 暂存本身不是新失败，也不把高档失败计入可用的低档。
+                _record_step_failures(failed_steps, active_generation)
                 return _finish_attempt(cached, step_quality=step.quality,
                                        attempted_tiers=attempted_tiers, from_stash=True)
             continue
@@ -2533,6 +2535,8 @@ async def source_reorder(body: ReorderBody):
     policy_payload = _policy_payload(after_sources)
     return {
         "ok": True,
+        # 与源列表保持同一顶层策略契约，同时保留 data.policy 兼容已有调用方。
+        "policy": policy_payload,
         "data": {
             "source_ids": after,
             "active_source_order": policy_payload["active_source_order"],

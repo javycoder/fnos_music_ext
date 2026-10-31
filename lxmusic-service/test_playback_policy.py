@@ -386,6 +386,35 @@ async def test_candidate_follower_respects_its_own_deadline():
 
 
 @pytest.mark.asyncio
+async def test_candidate_leader_cancellation_does_not_abort_follower():
+    """首个请求取消后，仍有预算的跟随者独立重试，不接收领队异常或负缓存。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def searcher(platform, keyword, limit):
+        calls.append(platform)
+        started.set()
+        await release.wait()
+        return [_candidate()]
+
+    finder = policy.CandidateFinder()
+    deadline = time.monotonic() + 2
+    leader = asyncio.create_task(finder.find(searcher, _target(), "wy", deadline))
+    await started.wait()
+    follower = asyncio.create_task(finder.find(searcher, _target(), "wy", deadline))
+    # 让跟随者进入真实的在途等待分支，再取消原请求。
+    await asyncio.sleep(0)
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    release.set()
+    assert await follower == [_candidate()]
+    assert calls == ["wy", "wy"]
+    assert finder._inflight == {}
+
+
+@pytest.mark.asyncio
 async def test_candidate_search_deadline_cancels_without_leaking_inflight():
     started = asyncio.Event()
     release = asyncio.Event()
@@ -741,6 +770,8 @@ def test_source_reorder_calls_upstream_persists_and_bumps_generation(
     )
     assert response.status_code == 200, response.text
     data = response.json()["data"]
+    # 管理适配层同时消费顶层策略和排序结果，兼容两种已有读取方式。
+    assert response.json()["policy"] == data["policy"]
     assert fake_lx.reorder_calls == [["c.js", "b.js", "a.js"]]
     assert data["source_ids"] == ["c.js", "b.js", "a.js"]
     assert data["active_source_order"] == ["c.js", "b.js", "a.js"]
