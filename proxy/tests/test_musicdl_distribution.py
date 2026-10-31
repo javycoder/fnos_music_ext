@@ -99,8 +99,13 @@ def test_worker_protocol_runs_from_distributed_files_without_network(tmp_path):
     (tmp_path / "search_core.py").write_text(textwrap.dedent('''\
         import os
         print("fake library import chatter", flush=True)
-        def run_search_task(task, emit):
+        def describe_task_error(exc, stage=None):
+            # 与真实 search_core 协议一致：只回传异常类型与阶段，不回传正文。
+            return f"{type(exc).__name__} (stage={stage or 'unspecified'})"
+        def run_search_task(task, emit, on_stage=None):
             os.write(1, b"fake native library chatter\\n")
+            if on_stage is not None:
+                on_stage("search")
             if task.get("fail"):
                 raise ValueError("synthetic-private-detail")
             emit([{"id": "kuwo:fixture"}, {}, ""])
