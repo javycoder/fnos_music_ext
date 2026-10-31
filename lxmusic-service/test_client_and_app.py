@@ -776,8 +776,8 @@ def test_activation_list_503_returns_service_failure(test_app_client, fake_lx, m
 def test_lxserver_upload_sends_json_contract():
     """上传必须发 JSON {filename, content, allowUnsafeVM}（lxserver 端点 JSON.parse，multipart 会被拒）。
 
-    allowUnsafeVM=True 代答"原生 VM 模式"确认：聚合类脚本（pdone/lx-music-source
-    聚合API接口等）需要原生 VM，缺省确认文案会被服务端按 requireUnsafe 拒绝。"""
+    安全契约：第三方脚本不受信任，allowUnsafeVM 默认显式 false，不再代答
+    “原生 VM 模式”确认；需要 VM 的脚本按 unsafe_vm_required 明确报告。"""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -791,12 +791,13 @@ def test_lxserver_upload_sends_json_contract():
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     res = asyncio.run(client.upload_custom_source("x.js", "console.log(1)"))
     assert captured["content_type"].startswith("application/json")
-    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)", "allowUnsafeVM": True}
+    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)",
+                                "allowUnsafeVM": False}
     assert res["id"] == "x.js"
 
 
 def test_lxserver_import_sends_allow_unsafe_vm():
-    """URL 导入同样携带 allowUnsafeVM=True（lxserver import 端点同款确认语义）。"""
+    """URL 导入同样默认 allowUnsafeVM=False，不自动授权不安全 VM。"""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -808,7 +809,7 @@ def test_lxserver_import_sends_allow_unsafe_vm():
     client = LxServerClient(base_url="http://test", admin_password="pw")
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     res = asyncio.run(client.import_custom_source("https://example.com/src.js"))
-    assert captured["body"] == {"url": "https://example.com/src.js", "allowUnsafeVM": True}
+    assert captured["body"] == {"url": "https://example.com/src.js", "allowUnsafeVM": False}
     assert res["id"] == "imp.js"
 
 
@@ -1641,8 +1642,9 @@ async def test_probe_reject_no_more_sources_falls_to_next_tier(fake_lx, fresh_ur
     # 每档都返回探活失败且无更多源；脚本标识不重复计数（tried 已全在 excluded 时停止）
     fake_lx.url_script = [
         {"url": "https://media.test/dead.flac", "type": "flac",
-         "sourceName": "唯一源", "sourceId": "only.js", "hasMoreSources": False},
-        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "唯一源"},
+         "sourceName": "唯一源", "sourceId": "source1", "hasMoreSources": False},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "唯一源",
+         "sourceId": "source1"},
     ]
     try:
         r = await lxapp._resolve_url_cached(
@@ -1667,7 +1669,8 @@ async def test_empty_url_response_rotates_to_next_source(fake_lx, fresh_url_cach
     ]
     fake_lx.url_script = [
         {"type": "flac", "sourceName": "空手源", "sourceId": "empty.js", "hasMoreSources": True},
-        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "好链源"},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "好链源",
+         "sourceId": "good.js"},
     ]
     try:
         r = await lxapp._resolve_url_cached(
@@ -1696,8 +1699,17 @@ def test_chain_half_open_stuck_guard(fresh_url_cache):
 
 def test_track_url_quality_isolation(test_app_client, fresh_url_cache, fake_lx):
     """不同音质档各自解析与缓存，同音质命中缓存（音质变化不串缓存）。"""
+    fake_lx.url_script = [
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceId": "source1"},
+        {"url": "https://media.test/song.mp3", "type": "320k", "sourceId": "source1"},
+    ]
+    def media(request):
+        if request.url.path.endswith('.mp3'):
+            return httpx.Response(206, content=b'\xff\xfb\x90\x44' + b'\x00' * 4096,
+                                  headers={'Content-Type': 'audio/mpeg'})
+        return _flac_probe_handler(request)
     orig_client = lxapp.app.state.client
-    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    lxapp.app.state.client = mock_client(media)
     try:
         assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
         assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
@@ -1960,8 +1972,11 @@ def test_songinfo_store_capacity_eviction(tmp_path):
 
 
 def _install_probe_client():
-    """替换探活 client 为 Range 206 fLaC 应答（与 test_track_url_resolution 同款）。"""
+    """按夹具媒体格式返回Range 206前缀，不把MP3请求伪装为FLAC。"""
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith('.mp3'):
+            return httpx.Response(206, content=b'\xff\xfb\x90\x44' + b'\x00' * 4096,
+                                  headers={'Content-Type': 'audio/mpeg'})
         return httpx.Response(
             206,
             headers={"Content-Type": "audio/flac", "Content-Range": "bytes 0-4095/30000000"},
@@ -1983,9 +1998,11 @@ def _install_probe_client():
 def _spy_get_music_url(fake_lx, seen):
     original = fake_lx.get_music_url
 
-    async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
+    async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None,
+                  auto_switch_api_source=True):
         seen.append(dict(song_info))
-        return await original(song_info, quality, exclude_api_sources, request_timeout)
+        return await original(song_info, quality, exclude_api_sources, request_timeout,
+                              auto_switch_api_source)
 
     fake_lx.get_music_url = spy
 
@@ -1999,7 +2016,7 @@ def test_track_url_meta_params_synthesize_and_writeback(test_app_client, fake_lx
     try:
         res = test_app_client.get(
             "/api/v1/track/url",
-            params={"id": "lx:kw:999001", "quality": "standard",
+            params={"id": "lx:kw:999001", "quality": "lossless",
                     "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
                     "duration": 269.3, "cover": "https://img.test/x.jpg"},
         )
@@ -2021,7 +2038,7 @@ def test_track_url_cold_without_meta_falls_back_unknown(test_app_client, fake_lx
     _spy_get_music_url(fake_lx, seen)
     restore_client = _install_probe_client()
     try:
-        res = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:999002", "quality": "standard"})
+        res = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:999002", "quality": "lossless"})
     finally:
         restore_client()
     assert res.status_code == 200
@@ -2039,7 +2056,7 @@ def test_track_url_cached_songinfo_not_overridden_by_meta(test_app_client, fake_
     try:
         res = test_app_client.get(
             "/api/v1/track/url",
-            params={"id": "lx:kw:999003", "quality": "standard", "title": "假名", "artist": "假歌手"},
+            params={"id": "lx:kw:999003", "quality": "lossless", "title": "假名", "artist": "假歌手"},
         )
     finally:
         restore_client()
@@ -2137,10 +2154,11 @@ def test_lx_timeouts_hot_reload_clears_negative_cache_and_circuit_breaker(tmp_pa
 @pytest.mark.anyio
 async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_enlarged_timeout(fake_lx, monkeypatch, fresh_url_cache):
     """慢源解析超时保护：超出单次解析超时放弃/接力，调大参数后成功取链。"""
-    async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
+    async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None,
+                                 request_timeout=None, auto_switch_api_source=True):
         fake_lx.url_timeouts.append(request_timeout)
         await asyncio.sleep(0.1)
-        return {"url": "https://media.test/slow.mp3", "type": "128k"}
+        return {"url": "https://media.test/slow.mp3", "type": "128k", "sourceId": "source1"}
 
     monkeypatch.setattr(fake_lx, "get_music_url", slow_get_music_url)
 
@@ -2176,6 +2194,7 @@ def test_track_url_endpoint_uses_hot_reloaded_timeouts(test_app_client, fake_lx,
     env_file = tmp_path / ".env"
     env_file.write_text("LX_RESOLVER_TIMEOUT=11.5\nLX_URL_TIMEOUT=22.0\nLX_PROBE_TIMEOUT=4.5\n", encoding="utf-8")
     monkeypatch.setenv("LX_ENV_PATH", str(env_file))
+    fake_lx.url_result = {"url": "https://media.test/song.mp3", "type": "128k", "sourceId": "source1"}
 
     restore = _install_probe_client()
     try:

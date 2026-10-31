@@ -83,6 +83,8 @@ class FakeLxServerClient:
         self.url_song_sources: list[str] = []
         # 同步记录每次调用的 excludeApiSources（换源轮换测试断言用）
         self.url_excludes: list[list[str] | None] = []
+        # 同步记录每次调用传入的 enableAutoSwitchApiSource（固定脚本必须 false）
+        self.url_auto_switch: list[bool] = []
         # 非空时按序弹出作为 get_music_url 返回值（先于 url_result 判定），耗尽后返回 None
         self.url_script: list[dict | None] = []
         # 非空时 get_music_url 等待该事件（同测试循环内使用）：并发时序控制
@@ -135,18 +137,44 @@ class FakeLxServerClient:
 
     async def get_music_url(self, song_info: dict, quality: str = "128k",
                             exclude_api_sources: list[str] | None = None,
-                            request_timeout: float | None = None) -> dict | None:
+                            request_timeout: float | None = None,
+                            auto_switch_api_source: bool = True) -> dict | None:
+        """模拟上游 /api/music/url 的真实返回契约。
+
+        真实 lxserver 固定脚本时会在响应里带 ``sourceId``（被执行的脚本 ID）。
+        替身按 ``excludeApiSources`` 推断本次被固定的脚本并补上 ``sourceId``；
+        ``url_script`` 里的条目是有意构造的上游应答，按原样返回（可模拟
+        缺 ID、别的脚本或内置平台应答）。``url_auto_switch`` 记录调用方传入的
+        自动切源开关，供“固定脚本必须显式 false”的断言使用。
+        """
         self.url_calls.append((str(song_info.get("songmid") or ""), quality))
         self.url_song_sources.append(str(song_info.get("source") or ""))
         self.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         self.url_timeouts.append(request_timeout)
+        self.url_auto_switch.append(bool(auto_switch_api_source))
         if self.url_gate is not None:
             await self.url_gate.wait()
         if self.url_script:
             return self.url_script.pop(0)
         if self.url_result:
-            return dict(self.url_result)
+            result = dict(self.url_result)
+            if not result.get("sourceId"):
+                result["sourceId"] = self._pinned_script_id(exclude_api_sources)
+            return result
         return None
+
+    def _pinned_script_id(self, exclude_api_sources: list[str] | None) -> str:
+        """被固定的脚本 = 启用且就绪、又不在排除列表里的第一个脚本。"""
+        excluded = set(exclude_api_sources or ())
+        for source in self.sources:
+            if not (source.get("enabled") or source.get("enable")):
+                continue
+            if str(source.get("status") or "") != "success":
+                continue
+            sid = str(source.get("id") or "")
+            if sid and sid not in excluded:
+                return sid
+        return ""
 
     async def get_lyric(self, song_info: dict) -> dict | None:
         return self.lyric_result

@@ -2,11 +2,12 @@
 
 洛雪播放策略的纯逻辑层。它解决三件事：
 
-1. 音质阶梯：目标档位严格向下，不回弹。七档名称与洛雪音质字符串的映射
-   由共享模块 ``proxy/quality_policy.py`` 统一；该模块尚未落盘时使用本文件
-   内同契约的回退实现，主智能体接线后自动切换到共享模块。
+1. 音质阶梯：目标档位严格向下，不回弹。七档名称、洛雪音质字符串映射和
+   严格向下阶梯全部来自共享模块 ``proxy/quality_policy.py``，本文件不再
+   重复定义，也不保留本地回退副本（两套语义容易走偏）。
 2. 播放顺序：音质优先 -> 稳定脚本 ID 顺序 -> 同一脚本内原平台优先、
-   其他声明平台其次。目标档位必须遍历完所有候选脚本后才允许降档。
+   其他声明平台其次。目标档位必须遍历完所有候选脚本后才允许降档；
+   运行声明明确不支持的档位直接跳过，未声明（未知）的档位仍可探索。
 3. 跨平台候选：只有歌名、歌手、版本标签、时长都可信时才允许替换；
    每平台最多留三个候选，搜索并发不超过二，结果缓存 60 秒。
 
@@ -16,7 +17,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
@@ -29,103 +30,45 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger("fnmusic.lxmusic.policy")
 
-# 仓库根加入 sys.path，便于导入主智能体维护的共享质量模块。
+# 仓库根加入 sys.path，便于导入共享质量模块（容器镜像会 COPY proxy/）。
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-try:
-    from lxserver_client import SUPPORTED_PLATFORMS, normalize_source
-except ImportError:  # pragma: no cover - 仅独立导入模块时兜底
-    SUPPORTED_PLATFORMS = ("kw", "kg", "tx", "wy", "mg")
-    _SOURCE_ALIASES = {
-        "kugou": "kg", "kg": "kg", "netease": "wy", "163": "wy", "wy": "wy",
-        "migu": "mg", "mg": "mg", "qq": "tx", "tencent": "tx", "tx": "tx",
-        "kuwo": "kw", "kw": "kw",
-    }
-
-    def normalize_source(src: str | None) -> str:
-        return _SOURCE_ALIASES.get(str(src or "").strip().lower(), "")
-
-
-# --------------------------------------------------------------- 音质契约 --
-
-# 统一七档，从低到高。与 REQUIREMENTS.md 和共享模块保持一致。
-QUALITY_LEVELS: tuple[str, ...] = (
-    "standard", "higher", "exhigh", "lossless", "hires", "jymaster", "sky",
+from lxserver_client import (  # noqa: E402  (必须先补 sys.path)
+    SUPPORTED_PLATFORMS,
+    normalize_source,
+    parse_interval_to_seconds,
+)
+from proxy.quality_policy import (  # noqa: E402  (共享七档契约，禁止本地重复定义)
+    QUALITY_LEVELS,
+    normalize_quality,
+    quality_ladder,
+    to_lx_quality,
 )
 
-_LX_QUALITY = {
-    "standard": "128k",
-    "higher": "192k",
-    "exhigh": "320k",
-    "lossless": "flac",
-    "hires": "flac24bit",
-    "jymaster": "master",
-    "sky": "atmos",
-}
 
-_LX_TO_QUALITY = {value: key for key, value in _LX_QUALITY.items()}
-# 兼容上游/旧缓存可能返回的别名，避免实际档位被误报成请求档位。
-_LX_TO_QUALITY.update({
-    "high": "exhigh", "hq": "exhigh",
-    "standard": "standard", "lossless": "lossless",
-    "hires": "hires", "jymaster": "jymaster", "sky": "sky",
-    "mp3": "standard", "flac24": "hires",
-})
-
-_QUALITY_ALIASES = {
-    "standard": "standard", "128k": "standard", "128": "standard", "low": "standard",
-    "smooth": "standard",
-    "higher": "higher", "192k": "higher", "192": "higher",
-    "exhigh": "exhigh", "high": "exhigh", "hq": "exhigh",
-    "320k": "exhigh", "320": "exhigh",
-    "lossless": "lossless", "flac": "lossless", "sq": "lossless",
-    "hires": "hires", "hr": "hires", "flac24bit": "hires", "24bit": "hires",
-    "jymaster": "jymaster", "master": "jymaster", "母带": "jymaster",
-    "sky": "sky", "atmos": "sky", "沉浸声": "sky",
-}
-
-
-def _fallback_normalize_quality(value: Any) -> str:
-    """未知/缺省按播放默认档 lossless 处理；洛雪旧 high 固定为 exhigh。"""
-    text = str(value or "").strip().lower()
-    return _QUALITY_ALIASES.get(text, "lossless")
-
-
-def _fallback_quality_ladder(target: Any) -> list[str]:
-    quality = _fallback_normalize_quality(target)
-    index = QUALITY_LEVELS.index(quality)
-    return list(reversed(QUALITY_LEVELS[: index + 1]))
-
-
-def _fallback_to_lx_quality(value: Any) -> str:
-    return _LX_QUALITY.get(_fallback_normalize_quality(value), "128k")
-
-
-# 共享模块存在时优先使用；接口缺失则整体回退，避免半套语义混用。
-try:  # pragma: no cover - 由主智能体接线后覆盖
-    from proxy.quality_policy import (  # type: ignore
-        QUALITY_LEVELS as _shared_levels,
-        normalize_quality as _shared_normalize_quality,
-        quality_ladder as _shared_quality_ladder,
-        to_lx_quality as _shared_to_lx_quality,
-    )
-except ImportError:
-    normalize_quality = _fallback_normalize_quality
-    quality_ladder = _fallback_quality_ladder
-    to_lx_quality = _fallback_to_lx_quality
-else:
-    QUALITY_LEVELS = tuple(_shared_levels)
-    normalize_quality = _shared_normalize_quality
-    quality_ladder = _shared_quality_ladder
-    to_lx_quality = _shared_to_lx_quality
+def quality_rank(tier: str) -> int:
+    """档位序号（0 最低）；未知/空串返回 -1，调用方据此判断“档位未知”。"""
+    try:
+        return QUALITY_LEVELS.index(str(tier or ""))
+    except ValueError:
+        return -1
 
 
 def from_lx_quality(value: Any) -> str:
-    """洛雪返回的 type（128k/flac/flac24bit/...）映射回统一档位；未知返回空串。"""
+    """洛雪返回的 type（128k/flac/flac24bit/...）映射回统一档位；未知返回空串。
+
+    这里只认明确的洛雪档位与共享模块登记的别名。``mp3`` 这类只说明容器的
+    字面量不能推出 128k——码率必须由上游报告，不能靠扩展名猜。
+    """
     text = str(value or "").strip().lower()
-    return _LX_TO_QUALITY.get(text, "")
+    if not text:
+        return ""
+    try:
+        return normalize_quality(text, default=None)
+    except ValueError:
+        return ""
 
 
 # --------------------------------------------------------------- 策略配置 --
@@ -189,7 +132,11 @@ def read_policy_settings(values: Mapping[str, Any]) -> PolicySettings:
 
 @dataclass(frozen=True)
 class ScriptInfo:
-    """lxserver 自定义源的播放相关快照。"""
+    """lxserver 自定义源的播放相关快照。
+
+    ``qualities`` 是运行期声明的档位映射（平台 -> 明确支持的统一档位）。
+    缺失某个平台表示未知，未知允许探索；只有明确声明不支持才跳过。
+    """
 
     id: str
     name: str
@@ -197,13 +144,68 @@ class ScriptInfo:
     platforms: tuple[str, ...]
     enabled: bool = True
     status: str = ""
+    qualities: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    platforms_declared: bool = True  # 未声明时仅兼容原平台探索，不授权跨平台搜索。
+
+
+def _quality_tiers(raw: Any) -> tuple[str, ...]:
+    """把声明里的洛雪音质字符串/统一档位名解析成统一档位；不认识的忽略。"""
+    if isinstance(raw, str):
+        raw = [raw]
+    tiers: list[str] = []
+    for item in raw or ():
+        text = str(item or "").strip()
+        if not text:
+            continue
+        try:
+            tier = normalize_quality(text, default=None)
+        except ValueError:
+            continue
+        if tier not in tiers:
+            tiers.append(tier)
+    return tuple(tiers)
+
+
+def _parse_platform_qualities(raw: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    """读取 lxserver 源条目里的档位声明。
+
+    兼容三种形态：``platforms: {kw: {qualitys: [...]}}``（运行期平台表）、
+    ``qualitys/supportedQualities: {kw: [...]}``、以及只给一个列表时沿用到
+    声明的全部平台。任何解析不出的形态都当作“未知”，不推断能力。
+    """
+    declared = raw.get("platforms")
+    if declared is None:
+        declared = raw.get("qualitys")
+    if declared is None:
+        declared = raw.get("supportedQualities")
+    result: dict[str, tuple[str, ...]] = {}
+    if isinstance(declared, Mapping):
+        for platform, value in declared.items():
+            normalized = normalize_source(str(platform))
+            if not normalized:
+                continue
+            if isinstance(value, Mapping):
+                value = value.get("qualitys") or value.get("qualities") or ()
+            tiers = _quality_tiers(value)
+            if tiers:
+                result[normalized] = tiers
+    elif isinstance(declared, (list, tuple)):
+        tiers = _quality_tiers(declared)
+        platforms = raw.get("supportedSources") or raw.get("sources") or ()
+        if isinstance(platforms, Mapping):
+            platforms = list(platforms)
+        for platform in platforms:
+            normalized = normalize_source(str(platform))
+            if normalized and tiers:
+                result[normalized] = tiers
+    return result
 
 
 def build_source_catalog(sources: Sequence[dict] | None) -> list[ScriptInfo]:
     """把 lxserver 源列表映射成稳定目录；只有 enabled+status=success 才算就绪。
 
     缺失 status 表示上游仍在加载，不能默认成功。声明平台为空时沿用既有语义，
-    视为支持全部平台。
+    视为支持全部平台。档位声明缺失时保持未知，绝不补成固定三档。
     """
     catalog: list[ScriptInfo] = []
     seen: set[str] = set()
@@ -226,6 +228,7 @@ def build_source_catalog(sources: Sequence[dict] | None) -> list[ScriptInfo]:
             normalized = normalize_source(str(platform))
             if normalized and normalized not in platforms:
                 platforms.append(normalized)
+        platforms_declared = bool(platforms)
         if not platforms:
             platforms = list(SUPPORTED_PLATFORMS)
         catalog.append(ScriptInfo(
@@ -235,8 +238,31 @@ def build_source_catalog(sources: Sequence[dict] | None) -> list[ScriptInfo]:
             platforms=tuple(platforms),
             enabled=enabled,
             status=status,
+            qualities=_parse_platform_qualities(raw),
+            platforms_declared=platforms_declared,
         ))
     return catalog
+
+
+def declared_supports_quality(declared: Any, tier: str) -> bool:
+    """声明里是否明确包含该档位。
+
+    解析不出任何档位（未声明 / 形态不认识）时返回 True：未知可以探索，
+    只有“明确声明了支持列表且其中没有本档”才跳过。
+    """
+    tiers = _quality_tiers(declared)
+    if not tiers:
+        return True
+    return str(tier) in tiers
+
+
+def script_supports_quality(script: ScriptInfo, platform: str, tier: str) -> bool:
+    """运行声明是否明确支持该档位；未声明返回 True（未知可探索，不能造能力）。"""
+    normalized = normalize_source(platform) or str(platform or "")
+    declared = script.qualities.get(normalized)
+    if not declared:
+        return True
+    return str(tier) in declared
 
 
 def merge_source_order(catalog_ids: Iterable[str], preferred: Iterable[str] | None) -> list[str]:
@@ -319,6 +345,9 @@ def plan_steps(
     外层是音质，内层是脚本，再内层是平台：同一目标档位必须遍历完全部
     就绪脚本后才下降一级。自动切换关闭时只选原平台首个就绪兼容脚本，
     并允许它自己逐级降档，不跨脚本、不跨平台。
+
+    运行期明确声明「不支持该档位」的脚本直接跳过该档位，省下预算给后续
+    脚本；没有声明（未知）时仍然尝试，未知不等于不支持。
     """
     tiers = [str(tier).strip() for tier in ladder if str(tier).strip()]
     if not tiers:
@@ -329,12 +358,17 @@ def plan_steps(
     ready = [script for script in scripts if script.ready]
 
     if not auto_switch:
-        chosen = next((script for script in ready if original in script.platforms), None)
+        chosen = next(
+            (script for script in ready
+             if original in script.platforms),
+            None,
+        )
         if chosen is None:
             return []
         return [
             PlaybackStep(chosen.id, chosen.name, original, tier)
             for tier in tiers
+            if script_supports_quality(chosen, original, tier)
         ]
 
     steps: list[PlaybackStep] = []
@@ -343,11 +377,13 @@ def plan_steps(
             platforms: list[str] = []
             if original in script.platforms:
                 platforms.append(original)
-            if platform_preferred:
+            if platform_preferred and script.platforms_declared:
                 for platform in script.platforms:
                     if platform != original and platform in SUPPORTED_PLATFORMS and platform not in platforms:
                         platforms.append(platform)
             for platform in platforms:
+                if not script_supports_quality(script, platform, tier):
+                    continue
                 steps.append(PlaybackStep(script.id, script.name, platform, tier))
     return steps
 
@@ -377,6 +413,11 @@ _VERSION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 def _nfkc(value: Any) -> str:
     return unicodedata.normalize("NFKC", str(value or ""))
+
+
+def _title_of(row: Mapping[str, Any]) -> Any:
+    """条目的歌名键兼容 title/name，避免各处重复取键。"""
+    return row.get("title") or row.get("name")
 
 
 def normalize_title(value: Any) -> str:
@@ -442,18 +483,59 @@ def normalize_artist(value: Any) -> str:
 
 
 def artists_compatible(target_artist: Any, candidate_artist: Any) -> bool:
-    """歌手兼容：任一侧为主歌手名即可，缺关键身份信息直接拒绝。"""
+    """歌手兼容：任一侧完整歌手名精确相等即可。
+
+    禁止子串匹配：「周杰伦」与「周杰伦歌迷会」、「王菲」与「王菲菲」都是
+    不同账号/不同人，旧实现用包含关系会造成假匹配。多歌手用、/&/feat 拆分，
+    只要有一方列出的歌手与另一方完全相同就算兼容，缺关键身份信息直接拒绝。
+    """
     target = _artist_parts(target_artist)
     candidate = _artist_parts(candidate_artist)
     if not target or not candidate:
         return False
-    for left in target:
-        for right in candidate:
-            if left == right:
-                return True
-            if len(left) >= 2 and len(right) >= 2 and (left in right or right in left):
-                return True
-    return False
+    return any(left == right for left in target for right in candidate)
+
+
+# 时长可能出现在这些键上：duration_s（标准条目）、duration（宽松上游）、
+# interval（lxserver 原始 mm:ss）。三者都要显式解析，不能只看一个。
+_DURATION_KEYS: tuple[str, ...] = ("duration_s", "duration", "interval")
+
+
+def _duration_tolerance(*values: float) -> float:
+    """双方时长都已知时的宽容阈值：不小于 5 秒，或较大值的 3%。"""
+    known = [float(value) for value in values if float(value) > 0]
+    return max(5.0, max(known) * 0.03) if known else 5.0
+
+
+def duration_seconds(row: Mapping[str, Any] | None) -> float:
+    """从 duration_s/duration/interval 显式取秒数；无法解析返回 0（未知）。"""
+    if not isinstance(row, Mapping):
+        return 0.0
+    for key in _DURATION_KEYS:
+        value = row.get(key)
+        if value is None or value == "":
+            continue
+        seconds = parse_interval_to_seconds(value)
+        if seconds > 0:
+            return float(seconds)
+    return 0.0
+
+
+def duration_conflicts(row: Mapping[str, Any] | None) -> bool:
+    """同一条目里多个时长键互相矛盾即“已知冲突”，不允许静默通过。"""
+    if not isinstance(row, Mapping):
+        return False
+    values: list[float] = []
+    for key in _DURATION_KEYS:
+        value = row.get(key)
+        if value is None or value == "":
+            continue
+        seconds = parse_interval_to_seconds(value)
+        if seconds > 0:
+            values.append(float(seconds))
+    if len(values) < 2:
+        return False
+    return max(values) - min(values) > _duration_tolerance(*values)
 
 
 def durations_compatible(target_duration: Any, candidate_duration: Any) -> bool:
@@ -465,7 +547,7 @@ def durations_compatible(target_duration: Any, candidate_duration: Any) -> bool:
         return True
     if left <= 0 or right <= 0:
         return True
-    return abs(left - right) <= max(5.0, max(left, right) * 0.03)
+    return abs(left - right) <= _duration_tolerance(left, right)
 
 
 def is_trusted_candidate(target: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
@@ -484,7 +566,10 @@ def is_trusted_candidate(target: Mapping[str, Any], candidate: Mapping[str, Any]
     if not artists_compatible(target.get("artist") or target.get("singer"),
                               candidate.get("artist") or candidate.get("singer")):
         return False
-    return durations_compatible(target.get("duration_s"), candidate.get("duration_s"))
+    # 任一条目自身时长键互相冲突时，时长不可信，不能当作“已知一致”放行。
+    if duration_conflicts(target) or duration_conflicts(candidate):
+        return False
+    return durations_compatible(duration_seconds(target), duration_seconds(candidate))
 
 
 # --------------------------------------------------------- 媒体格式识别 --
@@ -574,19 +659,14 @@ class CandidateFinder:
     @staticmethod
     def _cache_key(item: Mapping[str, Any], platform: str, generation: int,
                    keyword: str) -> tuple:
-        try:
-            duration = int(float(item.get("duration_s") or 0))
-        except (TypeError, ValueError):
-            duration = 0
-        raw_title = item.get("title") or item.get("name")
         return (
             int(generation),
             platform,
             keyword,
-            normalize_title(raw_title),
-            tuple(sorted(version_tags(raw_title))),
+            normalize_title(_title_of(item)),
+            tuple(sorted(version_tags(_title_of(item)))),
             normalize_artist(item.get("artist") or item.get("singer")),
-            duration,
+            int(duration_seconds(item)),
         )
 
     def _cache_get(self, key: tuple, now: float) -> list[dict] | None:

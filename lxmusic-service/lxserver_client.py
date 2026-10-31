@@ -56,6 +56,16 @@ _LXSERVER_CONNECT_ERRORS = (httpx.NetworkError, httpx.TimeoutException, httpx.Re
 _LXSERVER_UNAVAILABLE_STATUSES = (502, 503, 504)
 
 
+class UnsafeVmRequired(RuntimeError):
+    """脚本需要 lxserver 的不安全原生 VM 才能运行；本服务不自动授权。"""
+
+
+# lxserver 拒绝“需要不安全 VM”的脚本时返回确认文案，这里识别常见措辞。
+_UNSAFE_VM_HINT_RE = re.compile(
+    r"(?i)requireUnsafe|allowUnsafeVM|unsafe\s*vm|native\s*vm|原生\s*VM|不安全的?\s*VM|沙箱"
+)
+
+
 def is_lxserver_unreachable(exc: BaseException) -> bool:
     """内部 lxserver 通信是否失败（调用方须确保异常来自内部 HTTP 请求）。"""
     return isinstance(exc, _LXSERVER_CONNECT_ERRORS) or (
@@ -545,6 +555,7 @@ class LxServerClient:
         quality: str = "128k",
         exclude_api_sources: list[str] | None = None,
         request_timeout: float | None = None,
+        auto_switch_api_source: bool = True,
     ) -> dict | None:
         """调用 lxserver /api/music/url 解析直链。
 
@@ -553,12 +564,17 @@ class LxServerClient:
         200 但无 url（脚本"成功"却拿不出直链，如平台未激活的静默空返回）时同样
         返回完整响应（url 为空串/缺失，含 attempts 供换源排除）。
         服务不可用状态上浮；其他非 200 返回 None。
+
+        ``auto_switch_api_source`` 默认 True，保持既有行为（上游可在多个脚本间
+        自动接力）。播放策略自己按脚本顺序编排时传 False，并用
+        ``exclude_api_sources`` 排除其他脚本，把本次请求固定在一个脚本上；
+        上游返回的 ``sourceId`` 必须等于该脚本 ID，调用方据此确认来源。
         """
         client = await self.get_client()
         body = {
             "songInfo": song_info,
             "quality": quality,
-            "enableAutoSwitchApiSource": True,
+            "enableAutoSwitchApiSource": bool(auto_switch_api_source),
         }
         if exclude_api_sources:
             body["excludeApiSources"] = exclude_api_sources
@@ -774,35 +790,38 @@ class LxServerClient:
         raise ValueError("lxserver custom-source/list returned invalid payload")
 
     @serialize_source_operation
-    async def import_custom_source(self, url: str) -> dict:
+    async def import_custom_source(self, url: str, *, allow_unsafe_vm: bool = False) -> dict:
         """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。
 
-        allowUnsafeVM=True 代答 lxserver 的"原生 VM 模式"确认（pdone/lx-music-source
-        等聚合类脚本需要原生 VM 才能运行；部署侧已由 entrypoint 将
-        system.allowUnsafeVM 置 true，服务端全局开关仍兜底）。"""
+        第三方脚本不受信任，本项目不再自动代答 lxserver 的“原生 VM 模式”
+        （allowUnsafeVM）确认：默认显式 false，需要 VM 的脚本会拿到
+        ``UnsafeVmRequired``，由上层明确报告“需要不安全运行环境、未做验证”，
+        既不静默重试，也不伪装成普通脚本失败。
+        """
         client = await self.get_client()
         resp = await client.post(
             "/api/custom-source/import",
-            json={"url": url, "allowUnsafeVM": True},
+            json={"url": url, "allowUnsafeVM": bool(allow_unsafe_vm)},
             timeout=self.timeout,
         )
-        data = self._parse_admin_resp(resp, "导入自定义源")
-        return data
+        return self._parse_unsafe_aware(resp, "导入自定义源")
 
     @serialize_source_operation
-    async def upload_custom_source(self, filename: str, script_content: str) -> dict:
+    async def upload_custom_source(self, filename: str, script_content: str,
+                                   *, allow_unsafe_vm: bool = False) -> dict:
         """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。
 
-        allowUnsafeVM=True 代答"原生 VM 模式"确认，否则需要 VM 的脚本（如聚合
-        API 类）上传永远收到 requireUnsafe 确认文案而被 500 挡下（2026-10-11
-        pdone/lx-music-source 聚合API接口 实测）。"""
+        与 import 同契约：默认显式 allowUnsafeVM=false，只在调用方明确要求时
+        才允许；需要不安全 VM 的脚本抛 ``UnsafeVmRequired``，不做自动重放。
+        """
         client = await self.get_client()
         resp = await client.post(
             "/api/custom-source/upload",
-            json={"filename": filename, "content": script_content, "allowUnsafeVM": True},
+            json={"filename": filename, "content": script_content,
+                  "allowUnsafeVM": bool(allow_unsafe_vm)},
             timeout=self.timeout,
         )
-        return self._parse_admin_resp(resp, "上传自定义源")
+        return self._parse_unsafe_aware(resp, "上传自定义源")
 
     @serialize_source_operation
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
@@ -858,6 +877,29 @@ class LxServerClient:
             return data
         message = data.get("error") or data.get("message") or f"{action}失败 (HTTP {resp.status_code})"
         raise RuntimeError(message)
+
+    def _parse_unsafe_aware(self, resp: httpx.Response, action: str) -> dict:
+        """解析上传/导入响应；识别“需要不安全 VM”并抛专用异常，不重试。
+
+        这类拒绝不是脚本语法或网络问题，重试没有意义，也不该被当成脚本永久
+        失效；上层据此明确告知用户需要不安全运行环境、本次未做验证。
+        """
+        message = (f"{action}被拒绝：脚本需要 lxserver 的不安全原生 VM 运行环境；"
+                   "本项目不自动授权、本次未做验证")
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        # 真实API以布尔字段请求确认，不能依赖错误文案或HTTP状态。
+        if isinstance(payload, dict) and payload.get("requireUnsafe") is True:
+            raise UnsafeVmRequired(message)
+        try:
+            return self._parse_admin_resp(resp, action)
+        except RuntimeError as exc:
+            if _UNSAFE_VM_HINT_RE.search(str(exc)):
+                # 上游文案可能包含脚本密钥，不把原文嵌入公开异常。
+                raise UnsafeVmRequired(message) from None
+            raise
 
     async def set_source_enabled(self, target_id_or_name: str, enabled: bool) -> bool:
         """设置单个源的启用状态（多源可同时启用）。若 target 不存在则直接返回 False，不触碰任何源。"""

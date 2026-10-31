@@ -550,7 +550,8 @@ def test_track_url_uses_script_order_and_stays_on_target_tier(
     })
     fake_lx.url_script = [
         None,
-        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "A"},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "A",
+         "sourceId": "a.js"},
     ]
     orig_client = lxapp.app.state.client
     lxapp.app.state.client = mock_client(_flac_response)
@@ -583,7 +584,8 @@ def test_track_url_auto_switch_off_uses_one_script_and_ladders(
     })
     fake_lx.url_script = [
         None,
-        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "A"},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "A",
+         "sourceId": "a.js"},
     ]
     orig_client = lxapp.app.state.client
     lxapp.app.state.client = mock_client(_flac_response)
@@ -620,12 +622,13 @@ def test_track_url_platform_preferred_resolves_trusted_other_platform(
     })
 
     async def by_platform(song_info, quality="128k", exclude_api_sources=None,
-                          request_timeout=None):
+                          request_timeout=None, auto_switch_api_source=True):
         fake_lx.url_song_sources.append(str(song_info.get("source") or ""))
         fake_lx.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         if song_info.get("source") == "wy":
+            # 真实契约：固定脚本解析成功时上游回报被执行脚本的 sourceId
             return {"url": "https://media.test/song.flac", "type": "flac",
-                    "sourceName": "Only"}
+                    "sourceName": "Only", "sourceId": "only.js"}
         return None
 
     monkeypatch.setattr(fake_lx, "get_music_url", by_platform)
@@ -654,9 +657,10 @@ def test_track_url_platform_preferred_resolves_trusted_other_platform(
 @pytest.mark.asyncio
 async def test_resolver_timeout_does_not_trip_script_circuit(fake_lx, policy_runtime, monkeypatch):
     async def slow(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None):
+                   request_timeout=None, auto_switch_api_source=True):
         await asyncio.sleep(0.05)
-        return {"url": "https://media.test/song.flac", "type": "flac"}
+        return {"url": "https://media.test/song.flac", "type": "flac",
+                "sourceId": "source1"}
 
     monkeypatch.setattr(fake_lx, "get_music_url", slow)
     client = mock_client(_flac_response)
@@ -677,7 +681,7 @@ async def test_internal_service_failure_does_not_trip_script_circuit(
     fake_lx, policy_runtime, monkeypatch,
 ):
     async def dead(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None):
+                   request_timeout=None, auto_switch_api_source=True):
         raise httpx.ConnectError("lxserver down")
 
     monkeypatch.setattr(fake_lx, "get_music_url", dead)
