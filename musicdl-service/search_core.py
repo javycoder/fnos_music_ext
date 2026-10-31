@@ -37,8 +37,8 @@ CFG = {
     # 库按这个数量翻页；一页 10 首大约 4 秒，封顶保证整次 search() 能在预算内返回
     "search_page_cap": max(1, int(os.environ.get("MUSICDL_SEARCH_PAGE_CAP", "10"))),
     "probe_timeout": max(0.2, float(os.environ.get("MUSICDL_PROBE_TIMEOUT", "2"))),
-    # 回退 GET 只读这么多个字节判断 magic，不读整首曲目
-    "probe_max_bytes": max(256, int(os.environ.get("MUSICDL_PROBE_MAX_BYTES", "1024"))),
+    # 探活固定为小前缀，不增加可把探活放大成整曲下载的环境配置。
+    "probe_max_bytes": 1024,
 }
 
 TRIAL_MARKERS = (
@@ -419,7 +419,7 @@ def probe_playable_sync(url: str, headers: dict) -> bool:
     if "404/error.html" in url or "error.html" in url:
         return False
     hdrs = {k: v for k, v in (headers or {}).items() if k.lower() != "range"}
-    max_bytes = max(256, int(CFG.get("probe_max_bytes", 1024)))
+    max_bytes = min(1024, max(256, int(CFG.get("probe_max_bytes", 1024))))
     if HAS_CURL_CFFI:
         try:
             with ExitStack() as responses:

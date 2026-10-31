@@ -589,7 +589,9 @@ def test_head_200_does_not_replace_actual_media_prefix_check(monkeypatch, probe_
 
 @pytest.mark.parametrize('client_path', ['curl', 'httpx', 'curl_real'])
 def test_large_response_can_stop_after_first_media_prefix(monkeypatch, probe_loopback, client_path):
-    srv = probe_loopback(body=b'ID3\\x03' + bytes(200), body_total=2 * 1024 * 1024,
+    # 内部配置误放大也不能让探活等待整曲或消耗无界内存。
+    monkeypatch.setitem(search_core.CFG, 'probe_max_bytes', 64 * 1024 * 1024)
+    srv = probe_loopback(body=b'ID3' + bytes([3]) + bytes(200), body_total=2 * 1024 * 1024,
                          get_status=200, send_prefix_only=True)
     _select_probe_path(monkeypatch, client_path)
     assert search_core.probe_playable_sync(srv.url, {}) is True
