@@ -230,7 +230,9 @@ async def test_metadata_preheat_and_stream_share_resolution(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_quality_change_discards_unused_preheat_but_preserves_playing_pin(monkeypatch):
+@pytest.mark.parametrize("quality_key", ["netease_quality", "play_quality"])
+async def test_quality_change_discards_unused_preheat_but_preserves_playing_pin(monkeypatch, quality_key):
+    monkeypatch.setitem(proxy.CONF, "play_quality", None)
     async def handler(request):
         quality = request.url.params["quality"]
         return httpx.Response(200, json={"ok": True, "data": {
@@ -244,7 +246,7 @@ async def test_quality_change_discards_unused_preheat_but_preserves_playing_pin(
         assert "56" in proxy._NETEASE_PREHEATED_PINS
         await proxy.resolve_netease_url(client, "57")
         playing = proxy._NETEASE_URL_PIN["57"]
-        monkeypatch.setitem(proxy.CONF, "netease_quality", "exhigh")
+        monkeypatch.setitem(proxy.CONF, quality_key, "exhigh")
         proxy._sync_netease_quality()
         assert "56" not in proxy._NETEASE_URL_PIN
         assert proxy._NETEASE_URL_PIN["57"] is playing

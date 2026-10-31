@@ -114,6 +114,80 @@ async def test_download_cancellation_reaps_encoder(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_download_decode_cancellation_reaps_process(monkeypatch):
+    """完整解码校验必须和编码一样响应取消，不能遗留后台 ffmpeg。"""
+    import asyncio
+    started, exited = asyncio.Event(), asyncio.Event()
+    killed, waited = [], []
+
+    class Process:
+        returncode = None
+
+        async def communicate(self):
+            started.set()
+            await exited.wait()
+            return b"", b""
+
+        async def wait(self):
+            waited.append(True)
+            await exited.wait()
+            return -9
+
+        def kill(self):
+            killed.append(True)
+            self.returncode = -9
+            exited.set()
+
+    async def spawn(*args, **kwargs):
+        assert "-xerror" in args and "-map" in args
+        return Process()
+
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "fixture-ffmpeg")
+    monkeypatch.setattr(appmod.asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(appmod._dl_check_audio_file("fixture.flac"))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert killed and waited
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("target", ["exhigh", "lossless"])
+async def test_download_media_bytes_override_library_capability_extension(tmp_path, monkeypatch, target):
+    """曲目具有无损版本不等于本次取到 FLAC；实际 MP3 必须交付 MP3 类型。"""
+    payload = b"ID3" + b"\x00" * 2045
+
+    class Response:
+        status_code = 200
+        headers = {"content-length": "2048", "content-type": "audio/mpeg"}
+
+        async def aclose(self):
+            pass
+
+    async def chunks():
+        yield payload[1:]
+
+    async def stream(*args, **kwargs):
+        # 模拟首块不足以识别格式；产物命名必须检查完整文件前缀。
+        return Response(), None, "flac", {"ext": "flac"}, chunks(), payload[:1], "exhigh"
+
+    monkeypatch.setitem(CONF, "cache_dir", str(tmp_path))
+    monkeypatch.setattr(appmod, "resolve_local_play", _async_none)
+    monkeypatch.setattr(appmod, "_source_enabled", lambda *args: True)
+    monkeypatch.setattr(appmod, "_open_online_stream", stream)
+    monkeypatch.setattr(appmod, "_check_audio_file", lambda path: (True, "ok"))
+    task = {"guid": "online:netease:FORMAT", "quality": target, "downloadId": "format"}
+    await _dl_produce(task, {})
+    assert task["state"] == "completed"
+    assert task["path"].endswith(".mp3")
+    assert appmod.media_type_for_ext(os.path.splitext(task["path"])[1].lstrip(".")) == "audio/mpeg"
+    assert task["actual_quality"] == "exhigh"
+    with open(task["path"], "rb") as downloaded:
+        assert downloaded.read() == payload
+
+
+@pytest.mark.anyio
 async def test_delete_cancels_active_download_and_preserves_original_file(tmp_path, monkeypatch):
     import asyncio
     original = tmp_path / 'original.flac'
@@ -171,7 +245,9 @@ async def test_download_requires_complete_representation_and_valid_lossless(
     monkeypatch.setattr(appmod, 'resolve_local_play', _async_none)
     monkeypatch.setattr(appmod, '_source_enabled', lambda *args: True)
     monkeypatch.setattr(appmod, '_open_online_stream', stream)
-    monkeypatch.setattr(appmod, '_check_audio_file', lambda path: (decode_ok, 'ok' if decode_ok else 'decode_error'))
+    async def check_download(path):
+        return decode_ok, 'ok' if decode_ok else 'decode_error'
+    monkeypatch.setattr(appmod, '_dl_check_audio_file', check_download)
     task = {'guid': 'online:lx:kw:COMPLETE', 'quality': 'lossless', 'downloadId': 'complete'}
     await _dl_produce(task, {})
     assert (task['state'] == 'completed') is completed

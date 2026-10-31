@@ -3895,7 +3895,8 @@ def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
 
 def _sync_netease_quality() -> None:
     global _NETEASE_URL_CONFIG
-    config = (CONF.get("netease_quality"), CONF.get("quality_mode"))
+    # 新七档配置也参与预热失效；活动播放钉链继续保留，避免破坏 Range 续传。
+    config = (CONF.get("netease_quality"), CONF.get("quality_mode"), CONF.get("play_quality"))
     if _NETEASE_URL_CONFIG != config:
         if _NETEASE_URL_CONFIG is not None:
             _cancel_netease_resolutions()
@@ -9090,6 +9091,59 @@ async def _dl_run_encoder(*argv: str) -> int:
                     pass
 
 
+def _dl_media_ext(prefix: bytes, fallback: str) -> str:
+    """只识别交付容器，不将媒体魔数当作实际音质证据。"""
+    if prefix.startswith(b"fLaC"):
+        return "flac"
+    if prefix.startswith(b"ID3"):
+        return "mp3"
+    if len(prefix) >= 2 and prefix[0] == 0xff:
+        if prefix[1] & 0xf6 == 0xf0:
+            return "aac"
+        if prefix[1] & 0xe0 == 0xe0 and prefix[1] & 0x06:
+            return "mp3"
+    if prefix.startswith(b"RIFF") and prefix[8:12] == b"WAVE":
+        return "wav"
+    if prefix.startswith(b"OggS"):
+        return "opus" if b"OpusHead" in prefix else "ogg"
+    if prefix[4:8] == b"ftyp":
+        return "m4a"
+    if prefix.startswith(b"MAC "):
+        return "ape"
+    return fallback
+
+
+async def _dl_check_audio_file(path: str) -> tuple[bool, str]:
+    """下载完整解码使用可取消子进程；保留尾部同步错误兼容规则。"""
+    if not tc.FFMPEG_BIN:
+        return True, "no_ffmpeg"
+    process = await asyncio.create_subprocess_exec(
+        tc.FFMPEG_BIN, "-hide_banner", "-v", "info", "-nostdin", "-xerror",
+        "-progress", "pipe:2", "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn",
+        "-f", "null", "-", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    finished = False
+    try:
+        _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300.0)
+        finished = True
+        detail = (stderr or b"").decode("utf-8", errors="replace")
+        if process.returncode == 0 or _lossless_decode_reached_end(detail):
+            return True, "ok"
+        return False, "decode_error"
+    except TimeoutError:
+        return False, "timeout"
+    finally:
+        if not finished:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            with anyio.CancelScope(shield=True):
+                # 终止后先排空 stderr 管道，否则输出缓冲已满时 wait 可能无法收尾。
+                await process.communicate()
+                await process.wait()
+
+
 async def _dl_produce(task: dict, cred_headers: dict) -> None:
     """按 prepare 捕获的目标档独立取流和产物，不读取播放缓存或全局播放档。"""
     guid = str(task["guid"])
@@ -9184,9 +9238,17 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
                     written += len(chunk)
         if written < 1024 or (expected is not None and written != expected):
             raise RuntimeError(f"download size mismatch written={written} expected={expected}")
+        # 曲库元数据仅声明存在某种版本，不能决定本次下载容器；首网络块也可能
+        # 不足以识别格式，因此读取完整临时文件的有界前缀后再确定最终后缀。
+        with open(source_part, "rb") as downloaded:
+            source_ext = _dl_media_ext(downloaded.read(64), source_ext)
+        source_path = _dl_transcode_path(
+            guid, target_q, source_ext, purpose=purpose, generation=generation,
+            identity=download_id, stage="source",
+        )
         if source_ext in _LOSSLESS_EXTS:
-            # 独立下载不能绕过已有完整无损解码检查，也不污染播放侧坏流状态。
-            valid, _reason = await asyncio.to_thread(_check_audio_file, source_part)
+            # 校验仍完整解码；取消任务时直接回收 ffmpeg，不遗留不可取消线程。
+            valid, _reason = await _dl_check_audio_file(source_part)
             if not valid:
                 raise RuntimeError("download decode validation failed")
         os.replace(source_part, source_path)
