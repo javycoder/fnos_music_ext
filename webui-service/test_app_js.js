@@ -2633,6 +2633,20 @@ test("导航切页：切子页自动展开一级分组并联动高亮", () => {
   assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
 });
 
+test("导航归属：「搜索与直连」并入高级分组并联动展开高亮", () => {
+  reset();
+  const advancedTitle = els.get("#nav-advanced-title");
+  const advancedSubs = els.get("#nav-advanced-subs");
+  const storageSubs = els.get("#nav-storage-subs");
+  global.switchPage("search");
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true", "搜索页应展开高级分组");
+  assert.strictEqual(advancedSubs.hidden, false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), true);
+  assert.notStrictEqual(storageSubs.hidden, undefined, "储存分组仍可独立折叠");
+  global.switchPage("overview");
+  assert.strictEqual(advancedTitle.classList.contains("active"), false, "切走后父级高亮清除");
+});
+
 test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", async () => {
   reset();
   els.get("#cleanup-modal").hidden = true;

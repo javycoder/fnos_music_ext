@@ -326,7 +326,7 @@ function switchPage(page) {
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
 
   const isStorageSub = page === "tee" || page === "dirs";
-  const isAdvancedSub = page === "llm" || page === "lx";
+  const isAdvancedSub = page === "llm" || page === "lx" || page === "search";
 
   const storageTitle = $("#nav-storage-title");
   if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
