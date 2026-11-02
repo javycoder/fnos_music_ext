@@ -14,7 +14,8 @@ ExecStopPost=/usr/bin/python3 "@BASE_DIR@/proxy/takeover.py" restore
 TimeoutStartSec=75
 TimeoutStopSec=20
 KillMode=mixed
-Restart=no
+Restart=on-failure
+RestartSec=5
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
 
