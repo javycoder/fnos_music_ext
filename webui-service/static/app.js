@@ -5,6 +5,17 @@
 // WebUI 自己也会剥掉这个前缀。管理接口只认飞牛网关注入的管理员头。
 const APP_BASE = "/app/fnmusic-ext";
 
+// 直连模式自动跳转：port 8774 直连时维护功能（整理/清理/用户列表）不可用，
+// 自动跳转到飞牛桌面网关以获得完整功能。
+(function redirectToDesktopIfNeeded() {
+  try {
+    if (window.location.port === "8774") {
+      const desktopUrl = window.location.protocol + "//" + window.location.hostname + ":5666/app/fnmusic-ext/";
+      window.location.replace(desktopUrl);
+    }
+  } catch (_) { /* ignore */ }
+})();
+
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 

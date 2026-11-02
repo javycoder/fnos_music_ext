@@ -89,7 +89,10 @@ persist_base_image() {
             --output "${ENV_PATH}" --explicit FNMUSIC_BASE_IMAGE --quiet
     fi
     rm -f "${desired}"
-    chmod 600 "${ENV_PATH}"
+    # 容器内以 appuser(APP_UID/APP_GID) 读 /repo/.env：600 会导致 entrypoint
+    # 认为“未配置任何音源”，healthz 超时后安装回滚。
+    chmod 0640 "${ENV_PATH}"
+    chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
 }
 
 MANUAL="${BASE_IMAGE:-}"
