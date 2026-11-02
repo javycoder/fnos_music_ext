@@ -29,6 +29,42 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Shared outer lock is never acquired by systemd service helpers.
 source "${BASE_DIR}/proxy/install_common.sh"
+
+detect_container_ids() {
+    APP_UID="${PUID:-}"
+    APP_GID="${PGID:-}"
+    local dockerfile="${BASE_DIR}/container/Dockerfile"
+    # Dockerfile 里 useradd/groupadd 常写成 RUN 里的续行，不能用 ^RUN.* 匹配；
+    # 且 grep 无匹配会返回 1，在 set -euo pipefail 下会直接中断安装（安装日志空白）。
+    if [ -z "${APP_UID}" ] && [ -f "${dockerfile}" ]; then
+        APP_UID="$(grep -m1 'useradd' "${dockerfile}" 2>/dev/null \
+            | sed -n 's/.*-u[[:space:]]*\([0-9][0-9]*\).*/\1/p' || true)"
+    fi
+    if [ -z "${APP_GID}" ] && [ -f "${dockerfile}" ]; then
+        APP_GID="$(grep -m1 'groupadd' "${dockerfile}" 2>/dev/null \
+            | sed -n 's/.*-g[[:space:]]*\([0-9][0-9]*\).*/\1/p' || true)"
+    fi
+    if [ -z "${APP_UID}" ] && command -v docker >/dev/null 2>&1; then
+        local img
+        img="$(docker images -q fnmusic-sources:latest 2>/dev/null | head -n1)"
+        if [ -n "${img}" ]; then
+            local user
+            user="$(docker image inspect --format '{{.Config.User}}' "${img}" 2>/dev/null || true)"
+            if [[ "${user}" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                [ -z "${APP_UID}" ] && APP_UID="${BASH_REMATCH[1]}"
+                [ -z "${APP_GID}" ] && APP_GID="${BASH_REMATCH[2]}"
+            elif [[ "${user}" =~ ^([0-9]+)$ ]]; then
+                [ -z "${APP_UID}" ] && APP_UID="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+    APP_UID="${APP_UID:-1000}"
+    APP_GID="${APP_GID:-1000}"
+    export APP_UID APP_GID
+}
+
+detect_container_ids
+
 installation_lock "$@"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
@@ -214,7 +250,7 @@ usage() {
 部署形态二选一：--deploy docker（默认，单容器按需加载，需 Docker）或
 --deploy native（原生宿主机 systemd + supervisord，无需 Docker）；
 同机两种形态互斥，切换部署形态请追加 --adopt。核心代理始终在宿主机 systemd 运行。
-密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
+密钥只写入仓库根目录 .env（chmod 640，容器组可读），不会进入 systemd 文件或日志。
 EOF
 }
 
@@ -1156,7 +1192,7 @@ mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlis
 # 数据卷权限收紧：属主对齐容器 appuser（uid 1000，Dockerfile 固定），group/other 全收——
 # 网易 cookie/state.json 等凭据不可被本机其他用户读取；chown 需 root（fpk 安装即 root），
 # 交互安装时调用者本身即属主（fnOS 默认 admin=1000）兜底
-chown -R 1000:1000 "${SOURCES_DATA_DIR}" 2>/dev/null || true
+chown -R "${APP_UID}:${APP_GID}" "${SOURCES_DATA_DIR}" 2>/dev/null || true
 find "${SOURCES_DATA_DIR}" -type d -exec chmod 0700 {} + 2>/dev/null || true
 find "${SOURCES_DATA_DIR}" -type f -exec chmod 0600 {} + 2>/dev/null || true
 
@@ -1310,7 +1346,7 @@ else
     python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing /dev/null --desired "${ENV_DESIRED}" \
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
-    log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
+    log_info "已生成初始配置 ${ENV_PATH} (chmod 640)。API Key 不会出现在日志中。"
     log_install "mode=fresh-install version=${FNMUSIC_VERSION}"
 fi
 
@@ -1406,7 +1442,11 @@ PY
 migrate_lx_url_between_modes
 
 rm -f "${ENV_DESIRED}"
-chmod 600 "${ENV_PATH}"
+# 容器内 appuser 需按组读取 .env（0600 会让 entrypoint 认为未启用音源）
+chmod 0640 "${ENV_PATH}"
+chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
+rm -f "${ENV_PATH}.lock" 2>/dev/null || true
+rm -f "${ENV_PATH}.webui.bak" 2>/dev/null || true
 
 # --- 代理 Python 环境 ---
 if ! command -v python3 >/dev/null 2>&1; then
@@ -1789,10 +1829,36 @@ lx_verify_and_activate() {
             --explicit "${explicit_keys}" --quiet
         rm -f "${ENV_DESIRED2}"
     fi
-    chmod 600 "${ENV_PATH}"
+    chmod 0640 "${ENV_PATH}"
+    chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
     return 0
 }
 
+
+
+# Repo-internal directories writable by container/group
+for _d in recommend_cache online_favorites playlist_tracks play_history cache preview_image; do
+    if [ -d "${BASE_DIR}/$_d" ]; then
+        chown -R ":${APP_GID:-1000}" "${BASE_DIR}/$_d" 2>/dev/null || true
+        chmod 0770 "${BASE_DIR}/$_d" 2>/dev/null || true
+        find "${BASE_DIR}/$_d" -type d -exec chmod 0770 {} + 2>/dev/null || true
+        find "${BASE_DIR}/$_d" -type f -exec chmod 0660 {} + 2>/dev/null || true
+        setfacl -m "g::rwx" "${BASE_DIR}/$_d" 2>/dev/null || true
+    fi
+done
+for _f in album_registry.json llm_usage.json; do
+    if [ -f "${BASE_DIR}/$_f" ]; then
+        chown ":${APP_GID:-1000}" "${BASE_DIR}/$_f" 2>/dev/null || true
+        chmod 0660 "${BASE_DIR}/$_f" 2>/dev/null || true
+    fi
+done
+chown ":${APP_GID:-1000}" "${BASE_DIR}" 2>/dev/null || true
+chmod 0770 "${BASE_DIR}" 2>/dev/null || true
+# fnOS app center sets an ACL (user:fnmusic-ext:rwx) whose group:: entry is
+# r-x only; chmod 0770 only updates the mask, not group::. The container's
+# appuser (gid=APP_GID) needs group write to create files in /repo (e.g.
+# .env.merge.*, .env.lock, .env.webui.bak). Explicitly set group::rwx.
+setfacl -m "g::rwx" "${BASE_DIR}" 2>/dev/null || true
 
 takeover preflight --base "${BASE_DIR}"
 if [ "${DEPLOY_MODE:-docker}" = "native" ]; then

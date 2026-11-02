@@ -34,13 +34,46 @@ def env_file_lock(path: str | Path):
     """Serialize read/merge/replace across the host proxy and WebUI."""
     with _ENV_LOCK:
         lock_path = Path(str(Path(path).resolve()) + ".lock")
-        with lock_path.open("a+b") as lock:
+
+        def _open_lock():
+            # Stale root-owned 0640 lock files (from older installs) block
+            # non-root callers (appuser / dropped proxy) from opening with
+            # "a+b" (flock LOCK_EX needs write permission). Self-heal by
+            # unlinking the stale file and recreating it group-writable.
+            try:
+                return lock_path.open("a+b")
+            except PermissionError:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                return lock_path.open("a+b")
+
+        with _open_lock() as lock:
             if os.name == "posix":
                 import fcntl
-                if Path(path).exists() and os.geteuid() == 0:
-                    owner = Path(path).stat()
-                    os.fchown(lock.fileno(), owner.st_uid, owner.st_gid)
-                os.fchmod(lock.fileno(), 0o600)
+                import stat as _stat
+                p = Path(path)
+                if p.exists():
+                    st = p.stat()
+                    if os.geteuid() == 0:
+                        try:
+                            os.fchown(lock.fileno(), -1, st.st_gid)
+                        except OSError:
+                            pass
+                    # flock(LOCK_EX) requires the fd to be opened for writing,
+                    # so the lock MUST be group-writable even though .env itself
+                    # is 0640 (group read-only, for secret protection).
+                    lock_mode = _stat.S_IMODE(st.st_mode) | 0o020
+                else:
+                    lock_mode = 0o660
+                try:
+                    os.fchmod(lock.fileno(), lock_mode)
+                except (OSError, PermissionError):
+                    # Non-owner (appuser / dropped proxy) cannot fchmod a
+                    # root-created lock file; the mode was already set correctly
+                    # by the creator, so just continue.
+                    pass
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             else:
                 import msvcrt
@@ -227,7 +260,7 @@ def preserve_user_comments(
     return out
 
 
-def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
+def write_env_atomic(path: str | Path, content: str, mode: int = 0o640) -> None:
     path = Path(path)
     try:
         existing = path.stat()

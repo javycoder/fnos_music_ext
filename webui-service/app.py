@@ -207,6 +207,10 @@ def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
         # with_suffix 会把 ".env" 当后缀替换，产出 ".env.env.webui.bak" 畸形名；拼名字才是 /repo/.env.webui.bak
         backup = ENV_PATH.with_name(ENV_PATH.name + ".webui.bak")
         try:
+            backup.unlink()  # 移除可能由 root 残留的只读备份，避免 appuser 覆盖失败
+        except FileNotFoundError:
+            pass
+        try:
             backup.write_bytes(ENV_PATH.read_bytes())
             os.chmod(backup, 0o600)  # write_bytes 按 umask 落盘（0644），密钥备份必须收紧
         except OSError as exc:  # 备份失败不阻断写入，但要有迹可循
