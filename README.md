@@ -10,7 +10,7 @@
 
 扩展通过可逆接管官方后端 Unix Socket 实现协议中继与数据适配，**不修改官方程序、二进制或 nginx 配置，不直接写入官方数据库**。曲库数据库仅只读访问，收藏、歌单等业务写入通过官方接口完成；停止扩展即可恢复官方直连。
 
-![飞牛桌面里的 fnMusic 扩展管理](preview_image/preview.png)
+![飞牛桌面里的 fnMusic 扩展管理](preview_image/2.11.0_preview.png)
 
 ## 能做什么
 
