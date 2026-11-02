@@ -11,6 +11,20 @@
   <link rel="icon" type="image/png" href="/app/fnmusic-ext/static/icon.png">
 </head>
 <body>
+  <!-- 线性图标精灵：内联 SVG，无外部依赖 -->
+  <svg class="icon-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></symbol>
+    <symbol id="i-source" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.4"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.8v14.4L19 12z"/></symbol>
+    <symbol id="i-storage" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2.2"/><rect x="3" y="13" width="18" height="7" rx="2.2"/><path d="M6.8 7.5h.02M6.8 16.5h.02"/></symbol>
+    <symbol id="i-advanced" viewBox="0 0 24 24"><path d="M4 7.5h9M17.5 7.5H20M4 16.5h3.5M12 16.5h8"/><circle cx="15" cy="7.5" r="2.2"/><circle cx="9.5" cy="16.5" r="2.2"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.8"/><path d="M16 16l4 4"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M9 8l-4.2 4L9 16M15 8l4.2 4L15 16"/></symbol>
+    <symbol id="i-ai" viewBox="0 0 24 24"><rect x="4" y="7.5" width="16" height="11.5" rx="3"/><path d="M9 3.5v4M15 3.5v4M9.2 13.4h.02M14.8 13.4h.02"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.2v2.2M12 18.6v2.2M4.6 7.6l1.9 1.1M17.5 15.3l1.9 1.1M4.6 16.4l1.9-1.1M17.5 8.7l1.9-1.1"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 11v5.4M12 7.7h.02"/></symbol>
+  </svg>
+
   <div class="layout">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
@@ -21,30 +35,31 @@
         </div>
       </div>
       <nav class="nav" id="nav">
-        <button class="nav-item active" data-page="overview">概览</button>
-        <button class="nav-item" data-page="source">音乐源</button>
-        <button class="nav-item" data-page="quality">播放与推荐</button>
-        <button class="nav-item" data-page="search">搜索</button>
+        <button class="nav-item active" data-page="overview" type="button"><svg class="icon" aria-hidden="true"><use href="#i-overview"/></svg><span>概览</span></button>
+        <button class="nav-item" data-page="source" type="button"><svg class="icon" aria-hidden="true"><use href="#i-source"/></svg><span>音乐源</span></button>
+        <button class="nav-item" data-page="quality" type="button"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span>播放与推荐</span></button>
         <div class="nav-group">
           <button class="nav-item nav-group-title" id="nav-storage-title" type="button" aria-expanded="false" aria-controls="nav-storage-subs">
-            <span>储存</span><span class="nav-arrow" aria-hidden="true">▾</span>
+            <svg class="icon" aria-hidden="true"><use href="#i-storage"/></svg><span>储存</span><span class="nav-arrow" aria-hidden="true">▾</span>
           </button>
           <div class="nav-group-subs" id="nav-storage-subs" hidden>
-            <button class="nav-item nav-sub" data-page="tee">边听边存</button>
-            <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
+            <button class="nav-item nav-sub" data-page="tee" type="button"><span>边听边存</span></button>
+            <button class="nav-item nav-sub" data-page="dirs" type="button"><span>目录设置</span></button>
           </div>
         </div>
         <div class="nav-group">
           <button class="nav-item nav-group-title" id="nav-advanced-title" type="button" aria-expanded="false" aria-controls="nav-advanced-subs">
-            <span>高级</span><span class="nav-arrow" aria-hidden="true">▾</span>
+            <svg class="icon" aria-hidden="true"><use href="#i-advanced"/></svg><span>高级</span><span class="nav-arrow" aria-hidden="true">▾</span>
           </button>
           <div class="nav-group-subs" id="nav-advanced-subs" hidden>
-            <button class="nav-item nav-sub" data-page="lx">lx音乐源</button>
-            <button class="nav-item nav-sub" data-page="llm">大模型</button>
+            <button class="nav-item nav-sub" data-page="search" type="button"><span>搜索与直连</span></button>
+            <button class="nav-item nav-sub" data-page="lx" type="button"><span>洛雪播放策略</span></button>
+            <button class="nav-item nav-sub" data-page="llm" type="button"><span>大模型推荐</span></button>
           </div>
         </div>
-        <button class="nav-item" data-page="settings">设置</button>
-        <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
+        <div class="nav-section">系统</div>
+        <button class="nav-item" data-page="settings" type="button"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span>设置</span></button>
+        <button class="nav-item" data-page="about" type="button"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span>关于</span><span class="nav-dot" hidden></span></button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -53,45 +68,56 @@
       <div class="hint warning" id="webui-build-mismatch" role="alert" hidden>
         WebUI 静态资源与后端配置接口版本不匹配。请刷新页面；若提示仍在，请重新打开管理页。
       </div>
+
       <!-- 概览 -->
       <section class="page active" id="page-overview">
-        <h2>概览</h2>
+        <div class="page-head">
+          <div>
+            <h2><span>概览</span><button class="help-btn" type="button" data-help="overview" aria-label="概览帮助">?</button></h2>
+            <p class="page-sub">一眼看清当前音源、后台组件与飞牛音乐服务的实时状态。未启用的音源不会常驻，按需运行节省资源。</p>
+          </div>
+        </div>
         <div class="card" id="ov-provider">
-          <div class="card-title">当前音源</div>
+          <div class="card-title">当前使用音源</div>
           <div id="ov-provider-body" class="muted">加载中…</div>
         </div>
         <div class="card">
-          <div class="card-title">进程状态（按需加载：仅启用音源 + WebUI 常驻）</div>
+          <div class="card-title"><span>后台组件状态</span><button class="help-btn" type="button" data-help="overview" aria-label="后台组件状态帮助">?</button></div>
           <div id="ov-processes" class="chip-grid"></div>
         </div>
         <div class="card">
-          <div class="card-title">服务健康</div>
+          <div class="card-title">服务连通性检查</div>
           <div id="ov-services" class="stack"></div>
         </div>
         <div class="card" id="ov-lx-card" hidden>
-          <div class="card-title">洛雪自定义源</div>
+          <div class="card-title">洛雪源运行摘要</div>
           <div id="ov-lx" class="stack"></div>
         </div>
       </section>
 
       <!-- 音乐源 -->
       <section class="page" id="page-source">
-        <h2><span>音乐源（三选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
+        <div class="page-head">
+          <div>
+            <h2><span>音乐源（三选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
+            <p class="page-sub">主音源决定搜索与在线播放走哪个渠道。选好后点底部「保存并生效」，系统会自动切换对应服务进程。</p>
+          </div>
+        </div>
         <div class="provider-grid">
           <label class="provider-card" data-provider="musicbox">
             <input type="radio" name="provider" value="musicbox">
-            <div class="provider-head">网易云音乐盒子</div>
-            <div class="provider-desc">账号扫码登录，个人曲库/每日推荐原生支持</div>
+            <div class="provider-head">网易云音乐</div>
+            <div class="provider-desc">扫码登录网易账号，同步我的歌单、红心与每日推荐</div>
           </label>
           <label class="provider-card" data-provider="musicdl">
             <input type="radio" name="provider" value="musicdl">
-            <div class="provider-head">musicdl 聚合音源</div>
-            <div class="provider-desc">免登录多平台聚合，自选启用平台</div>
+            <div class="provider-head">多平台聚合 (musicdl)</div>
+            <div class="provider-desc">免登录即用，自由勾选酷我、酷狗、QQ 等多个平台</div>
           </label>
           <label class="provider-card" data-provider="lxmusic">
             <input type="radio" name="provider" value="lxmusic">
             <div class="provider-head">洛雪自定义源</div>
-            <div class="provider-desc">粘贴洛雪自定义源脚本 URL，播放解析全走用户源</div>
+            <div class="provider-desc">导入洛雪 (LX Music) 音源脚本，支持多源自动接力</div>
           </label>
         </div>
 
@@ -110,15 +136,15 @@
           </div>
           <div class="card">
             <div class="card-title"><span>网易账号歌单</span><button class="help-btn" type="button" data-help="netease-playlists" aria-label="网易账号歌单帮助">?</button></div>
-            <label class="switch-row"><span>音乐页显示网易账号歌单</span><input type="checkbox" id="netease-my-playlists"></label>
-            <label class="switch-row"><span>网易云歌单常驻</span><input type="checkbox" id="netease-playlist-resident"></label>
+            <label class="switch-row"><span>同步「我创建的歌单」<span class="sub">在飞牛音乐首页展示你本人创建的网易云歌单（只读，不会写回账号）</span></span><input type="checkbox" id="netease-my-playlists"></label>
+            <label class="switch-row"><span>切换其它音源时仍保留网易歌单<span class="sub">后台保持网易服务常驻，切到聚合或洛雪时也能听网易歌单</span></span><input type="checkbox" id="netease-playlist-resident"></label>
           </div>
         </div>
 
         <!-- musicdl：平台多选 -->
         <div class="subpanel" id="panel-musicdl" hidden>
           <div class="card">
-            <div class="card-title"><span>启用平台（多选）</span><button class="help-btn" type="button" data-help="musicdl-platforms" aria-label="musicdl 平台帮助">?</button></div>
+            <div class="card-title"><span>选择启用的音乐平台（可多选）</span><button class="help-btn" type="button" data-help="musicdl-platforms" aria-label="musicdl 平台帮助">?</button></div>
             <div class="btn-row">
               <input class="input grow" id="platform-search" placeholder="搜索平台…">
               <button class="btn" id="platform-reload">刷新列表</button>
@@ -131,9 +157,9 @@
         <!-- lx：源 URL / 文件上传 -->
         <div class="subpanel" id="panel-lxmusic" hidden>
           <div class="card">
-            <div class="card-title"><span>洛雪自定义源</span><button class="help-btn" type="button" data-help="lx-source-add" aria-label="洛雪源添加帮助">?</button></div>
+            <div class="card-title"><span>添加洛雪音源脚本</span><button class="help-btn" type="button" data-help="lx-source-add" aria-label="洛雪源添加帮助">?</button></div>
             <div class="btn-row">
-              <input class="input grow" id="lx-name" placeholder="名称（可选，留空将自动提取或使用文件名）">
+              <input class="input grow" id="lx-name" placeholder="名称（可选，留空自动提取或使用文件名）">
             </div>
             <div class="btn-row">
               <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js 或 file:///data/lxmusic/uploads/xxx.js">
@@ -149,67 +175,53 @@
             <div id="lx-report" class="report" hidden></div>
           </div>
           <div class="card">
-            <div class="card-title"><span>lx音乐源列表</span><button class="help-btn" type="button" data-help="lx-source-list" aria-label="洛雪源列表帮助">?</button></div>
+            <div class="card-title"><span>已添加的洛雪音源</span><button class="help-btn" type="button" data-help="lx-source-list" aria-label="洛雪源列表帮助">?</button></div>
             <div id="lx-source-list" class="stack"></div>
           </div>
           <div class="card">
-            <div class="card-title"><span>超时设置</span><button class="help-btn" type="button" data-help="lx-timeouts" aria-label="洛雪超时设置帮助">?</button></div>
-            <label class="field"><span>单次解析超时（秒）</span>
-              <input class="input" id="lx-resolver-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
-            </label>
-            <label class="field"><span>取链总超时（秒）</span>
-              <input class="input" id="lx-url-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
-            </label>
-            <label class="field"><span>直链探活超时（秒）</span>
-              <input class="input" id="lx-probe-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
-            </label>
-            <p class="hint">单次解析控制一次取链尝试；总超时覆盖缓存续期、解析、换源和降档；探活验证返回的直链。实际等待始终受剩余总预算限制。</p>
+            <div class="card-title"><span>解析与探活超时</span><button class="help-btn" type="button" data-help="lx-timeouts" aria-label="洛雪超时设置帮助">?</button></div>
+            <details class="adv-fold">
+              <summary>高级：超时参数（慢源可调大）</summary>
+              <div class="adv-body">
+                <label class="field"><span>单次取链超时（秒）</span>
+                  <input class="input" id="lx-resolver-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
+                </label>
+                <label class="field"><span>播放取链总限时（秒）</span>
+                  <input class="input" id="lx-url-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
+                </label>
+                <label class="field"><span>音频链接探活超时（秒）</span>
+                  <input class="input" id="lx-probe-timeout" type="number" min="1" max="300" step="any" inputmode="decimal">
+                </label>
+              </div>
+            </details>
           </div>
         </div>
-
       </section>
 
       <!-- 播放与推荐 -->
       <section class="page" id="page-quality">
-        <h2>播放与推荐</h2>
-        <div class="card">
-          <div class="card-title"><span>播放直连（beta）</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></div>
-          <div class="direct-list">
-            <div class="direct-option">
-              <label for="direct-netease">网易云音乐盒子</label>
-              <input type="checkbox" id="direct-netease">
-              <button class="help-btn" type="button" data-help="direct-netease" aria-label="网易云音乐盒子播放直连帮助">?</button>
-            </div>
-            <div class="direct-option">
-              <label for="direct-musicdl">musicdl 聚合音源</label>
-              <input type="checkbox" id="direct-musicdl">
-              <button class="help-btn" type="button" data-help="direct-musicdl" aria-label="musicdl 播放直连帮助">?</button>
-            </div>
-            <div class="direct-option">
-              <label for="direct-lx">洛雪自定义源</label>
-              <input type="checkbox" id="direct-lx">
-              <button class="help-btn" type="button" data-help="direct-lx" aria-label="洛雪播放直连帮助">?</button>
-            </div>
+        <div class="page-head">
+          <div>
+            <h2><span>播放与推荐</span><button class="help-btn" type="button" data-help="quality" aria-label="在线播放音质帮助">?</button></h2>
+            <p class="page-sub">日常听歌的档位与首页歌单都在这里。所选档位不可用时只向下逐级降档，不会回升。</p>
           </div>
-          <p class="hint">测试功能，如遇播放异常可以尝试关闭</p>
         </div>
         <div class="card">
           <div class="card-title"><span>在线播放音质</span><button class="help-btn" type="button" data-help="quality" aria-label="在线播放音质帮助">?</button></div>
-          <div class="radio-list" id="quality-list">
+          <div class="radio-list radio-grid" id="quality-list">
             <label><input type="radio" name="play-quality" value="standard"><div><b>标准</b><span>128 kbps</span></div></label>
             <label><input type="radio" name="play-quality" value="higher"><div><b>较高</b><span>192 kbps</span></div></label>
             <label><input type="radio" name="play-quality" value="exhigh"><div><b>极高</b><span>320 kbps</span></div></label>
-            <label><input type="radio" name="play-quality" value="lossless"><div><b>无损</b><span>FLAC；默认档位</span></div></label>
+            <label><input type="radio" name="play-quality" value="lossless"><div><b>无损<span class="tag-recommended">默认</span></b><span>FLAC；大多数场景的推荐档位</span></div></label>
             <label><input type="radio" name="play-quality" value="hires"><div><b>Hi-Res</b><span>FLAC 24 bit</span></div></label>
             <label><input type="radio" name="play-quality" value="jymaster"><div><b>超清母带</b><span>需要音源和账号支持</span></div></label>
             <label><input type="radio" name="play-quality" value="sky"><div><b>沉浸声</b><span>需要音源和账号支持</span></div></label>
           </div>
-          <p class="hint">所选档位不可用时只逐级降档，不会回升。实际音质受账号权益和音源能力限制；musicdl 不保证每个平台都提供全部档位。</p>
         </div>
         <div class="card">
           <div class="card-title"><span>APP下载音质</span><button class="help-btn" type="button" data-help="download-quality" aria-label="APP下载音质帮助">?</button></div>
-          <div class="radio-list" id="dl-quality-list">
-            <label><input type="radio" name="download-quality" value="app"><div><b>跟随 App</b><span>默认；使用 App 请求的音质档位</span></div></label>
+          <div class="radio-list radio-grid" id="dl-quality-list">
+            <label><input type="radio" name="download-quality" value="app"><div><b>跟随 App<span class="tag-recommended">默认</span></b><span>使用 App 请求的音质档位</span></div></label>
             <label><input type="radio" name="download-quality" value="standard"><div><b>标准</b><span>128 kbps</span></div></label>
             <label><input type="radio" name="download-quality" value="higher"><div><b>较高</b><span>192 kbps</span></div></label>
             <label><input type="radio" name="download-quality" value="exhigh"><div><b>极高</b><span>320 kbps</span></div></label>
@@ -218,13 +230,12 @@
             <label><input type="radio" name="download-quality" value="jymaster"><div><b>超清母带</b><span>需要音源和账号支持</span></div></label>
             <label><input type="radio" name="download-quality" value="sky"><div><b>沉浸声</b><span>需要音源和账号支持</span></div></label>
           </div>
-          <p class="hint">下载音质独立于在线播放设置。源缺少所选档位时按策略向下选择；不会把低品质文件包装成高品质。</p>
         </div>
         <div class="card">
-          <div class="card-title"><span>推荐与公共歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
-          <label class="switch-row"><span>热门榜单推荐</span><input type="checkbox" id="recommend-hot"></label>
-          <label class="switch-row"><span>每日推荐</span><input type="checkbox" id="recommend-daily"></label>
-          <label class="switch-row"><span>公共歌单</span><input type="checkbox" id="public-playlists-enabled"></label>
+          <div class="card-title"><span>首页推荐歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
+          <label class="switch-row"><span>显示「热门榜单」<span class="sub">在飞牛音乐首页展示飙升榜、新歌榜等热门精选</span></span><input type="checkbox" id="recommend-hot"></label>
+          <label class="switch-row"><span>显示「每日推荐」<span class="sub">每日更新，可由网易原生、AI 或本地曲库生成</span></span><input type="checkbox" id="recommend-daily"></label>
+          <label class="switch-row"><span>启用「精选公共歌单」<span class="sub">订阅各平台官方榜单与分类歌单，可按飞牛音乐用户分别配置</span></span><input type="checkbox" id="public-playlists-enabled"></label>
           <div id="public-users-panel" class="stack" hidden>
             <div class="btn-row">
               <select class="input grow" id="public-user" aria-label="配置公共歌单的飞牛音乐用户" disabled>
@@ -265,76 +276,120 @@
           </div>
         </div>
       </section>
-
-      <!-- 高级：洛雪播放策略与源顺序；不复用音源导入管理面板 -->
+      <!-- 高级：洛雪播放策略 -->
       <section class="page" id="page-lx">
-        <h2>lx音乐源</h2>
-        <p class="hint">仅当洛雪是主音源时影响播放。打开本页或在其他主音源下保存偏好，不会启动洛雪服务。</p>
+        <div class="page-head">
+          <div>
+            <h2><span>洛雪播放策略</span><button class="help-btn" type="button" data-help="lx-page" aria-label="洛雪播放策略帮助">?</button></h2>
+            <p class="page-sub">只在洛雪是主音源时影响播放；打开本页或在其它主音源下保存偏好，都不会启动洛雪服务。</p>
+          </div>
+        </div>
         <div class="card">
-          <div class="card-title">自动切换</div>
-          <label class="switch-row"><span>自动切换可用脚本</span><input type="checkbox" id="lx-auto-switch"></label>
+          <div class="card-title"><span>自动切换</span><button class="help-btn" type="button" data-help="lx-page" aria-label="洛雪自动切换帮助">?</button></div>
+          <label class="switch-row"><span>自动切换可用脚本<span class="sub">当前脚本取不到歌时，按下方顺序换下一个已激活源</span></span><input type="checkbox" id="lx-auto-switch"></label>
           <div id="lx-platform-preferred-row" hidden>
-            <label class="switch-row"><span>跨平台优选同一首歌</span><input type="checkbox" id="lx-platform-preferred"></label>
-            <p class="hint">仅在当前脚本声明的平台范围内尝试匹配，不更改源激活状态。</p>
+            <label class="switch-row"><span>跨平台优选同一首歌<span class="sub">仅在当前脚本声明的平台范围内匹配，不改动源激活状态</span></span><input type="checkbox" id="lx-platform-preferred"></label>
           </div>
         </div>
         <div class="card" id="lx-source-order-card" aria-disabled="true">
-          <div class="card-title">已激活源顺序</div>
-          <p class="hint">同一音质档位按此顺序尝试脚本。停用源保留原位置；重新激活后恢复顺序；删除源会移除其排序 ID。</p>
+          <div class="card-title"><span>已激活源尝试顺序</span><button class="help-btn" type="button" data-help="lx-order" aria-label="源顺序帮助">?</button></div>
           <div id="lx-source-order-list" class="stack" role="list" aria-label="洛雪已激活源顺序"></div>
           <p id="lx-source-order-note" class="hint" role="status"></p>
         </div>
       </section>
 
-      <!-- 搜索 -->
+      <!-- 高级：搜索与播放直连 -->
       <section class="page" id="page-search">
-        <h2>搜索</h2>
-        <div class="card">
-          <div class="card-title"><span>搜索设置</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></div>
-          <label class="switch-row"><span>搜索深分页</span><input type="checkbox" id="search-deep"></label>
+        <div class="page-head">
+          <div>
+            <h2><span>搜索与播放直连</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></h2>
+            <p class="page-sub">低频进阶项：搜索翻页策略与 302 直连。日常使用保持默认即可。</p>
+          </div>
         </div>
         <div class="card">
-          <label class="field"><span>搜索超时时间</span>
-            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
-          </label>
-          <label class="field"><span>深分页页数上限</span>
-            <input class="input" id="search-deep-max" type="number" min="1" max="50" step="1" inputmode="numeric">
-          </label>
+          <div class="card-title"><span>在线搜索与翻页策略</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></div>
+          <label class="switch-row"><span>开启搜索自动深分页<span class="sub">首屏有效结果不够时自动向后翻页补齐，本地歌曲始终置顶</span></span><input type="checkbox" id="search-deep"></label>
+          <details class="adv-fold">
+            <summary>高级：超时与翻页上限</summary>
+            <div class="adv-body">
+              <label class="field"><span>单次搜索等待上限（秒）</span>
+                <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
+              </label>
+              <label class="field"><span>自动翻页最大页数</span>
+                <input class="input" id="search-deep-max" type="number" min="1" max="50" step="1" inputmode="numeric">
+              </label>
+            </div>
+          </details>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>播放直连（302 重定向 · Beta）</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></div>
+          <div class="direct-list">
+            <div class="direct-option">
+              <label for="direct-netease">网易云音乐<span class="sub">登录与取链仍由 NAS 完成，只把媒体地址交给客户端</span></label>
+              <input type="checkbox" id="direct-netease">
+              <button class="help-btn" type="button" data-help="direct-netease" aria-label="网易云音乐盒子播放直连帮助">?</button>
+            </div>
+            <div class="direct-option">
+              <label for="direct-musicdl">多平台聚合<span class="sub">各平台防盗链差异大，播不出来就关掉</span></label>
+              <input type="checkbox" id="direct-musicdl">
+              <button class="help-btn" type="button" data-help="direct-musicdl" aria-label="musicdl 播放直连帮助">?</button>
+            </div>
+            <div class="direct-option">
+              <label for="direct-lx">洛雪自定义源<span class="sub">兼容性取决于脚本与目标 CDN，换脚本后需重新验证</span></label>
+              <input type="checkbox" id="direct-lx">
+              <button class="help-btn" type="button" data-help="direct-lx" aria-label="洛雪播放直连帮助">?</button>
+            </div>
+          </div>
+          <p class="hint">测试功能，如遇播放异常可以尝试关闭</p>
         </div>
       </section>
 
-      <!-- 边听边存 -->
+      <!-- 储存：边听边存 -->
       <section class="page" id="page-tee">
-        <h2>边听边存</h2>
+        <div class="page-head">
+          <div>
+            <h2><span>边听边存</span><button class="help-btn" type="button" data-help="tee-save" aria-label="保存与素材帮助">?</button></h2>
+            <p class="page-sub">在线试听时下载完整即保存，不必听完整首；关闭后仅保留滚动缓存。</p>
+          </div>
+        </div>
         <div class="card">
-          <div class="card-title"><span>保存与素材</span><button class="help-btn" type="button" data-help="tee-save" aria-label="保存与素材帮助">?</button></div>
-          <p class="hint">在线试听下载完整即保存，不必听完整首；关闭后仅保留滚动缓存。</p>
-          <label class="switch-row"><span>边听边存</span><input type="checkbox" id="tee-enabled"></label>
-          <label class="switch-row"><span>自动下载封面</span><input type="checkbox" id="auto-cover"></label>
-          <label class="switch-row"><span>自动下载歌词</span><input type="checkbox" id="lyric-auto-dl"></label>
-          <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
-            <input class="input" id="tee-max" type="number" min="1" max="100">
-          </label>
+          <div class="card-title"><span>自动保存设置</span><button class="help-btn" type="button" data-help="tee-save" aria-label="保存与素材帮助">?</button></div>
+          <label class="switch-row"><span>开启边听边存<span class="sub">缓冲完整即自动存入本地曲库，下次再听免流量</span></span><input type="checkbox" id="tee-enabled"></label>
+          <label class="switch-row"><span>同步保存专辑封面<span class="sub">歌曲落盘后下载高清封面并内嵌到音频文件</span></span><input type="checkbox" id="auto-cover"></label>
+          <label class="switch-row"><span>同步保存歌词 (.lrc)<span class="sub">歌曲落盘后下载同名 .lrc 歌词文件</span></span><input type="checkbox" id="lyric-auto-dl"></label>
+          <details class="adv-fold">
+            <summary>高级：缓存参数</summary>
+            <div class="adv-body">
+              <label class="field"><span>关闭边听边存时的临时缓存曲数 <b id="tee-count-label"></b></span>
+                <input class="input" id="tee-max" type="number" min="1" max="100">
+              </label>
+            </div>
+          </details>
         </div>
         <div class="card">
           <div class="card-title"><span>收藏绑定与续传</span><button class="help-btn" type="button" data-help="tee-binding" aria-label="收藏绑定与续传帮助">?</button></div>
-          <label class="switch-row"><span>收藏自动绑定本地</span><input type="checkbox" id="fav-autobind"></label>
-          <label class="field"><span>官方绑定等待（秒） <b id="bind-timeout-label"></b></span>
-            <input class="input" id="bind-timeout" type="number" min="10" max="3600">
-          </label>
-          <label class="field"><span>切歌续传并行数</span>
-            <input class="input" id="handoff-max" type="number" min="0" max="20">
-          </label>
-          <label class="field"><span>曲库重扫接口（选填）</span>
-            <input class="input" id="scan-path" placeholder="留空=官方自动扫描入库">
-          </label>
-          <label class="field"><span>落盘后延迟（秒） <b id="scan-delay-label"></b></span>
-            <input class="input" id="scan-delay" type="number" min="0" max="600" step="0.5">
-          </label>
-          <label class="field"><span>扫描冷却窗口（秒） <b id="scan-cooldown-label"></b></span>
-            <input class="input" id="scan-cooldown" type="number" min="0" max="3600" step="0.5">
-          </label>
-          <p class="hint">听歌切歌不中断下载，未下完的自动转后台断点续传（并行数 0=关闭续传）。重扫接口填「接口路径|JSON参数」，如 /music/api/v1/shared-library/scan|{"guid":"你的共享库id"}（guid 可在飞牛音乐网页端手动扫库时按 F12 从请求参数获取）。歌曲落盘后延迟指定秒数（合并连续落盘，0=立即发）自动携带登录态调用（Cookie/Token 登录凭据透传，无需额外配置），加速官方入库；冷却窗口内不重复触发；JSON 参数段可省略。留空=官方自动扫描入库。</p>
+          <label class="switch-row"><span>点红心/加歌单时自动下载到本地<span class="sub">收藏或加入歌单后后台下载并关联本地文件；只浏览列表不会触发下载</span></span><input type="checkbox" id="fav-autobind"></label>
+          <details class="adv-fold">
+            <summary>高级：入库等待、断点续传与自动扫库</summary>
+            <div class="adv-body">
+              <label class="field"><span>飞牛曲库收录等待上限（秒） <b id="bind-timeout-label"></b></span>
+                <input class="input" id="bind-timeout" type="number" min="10" max="3600">
+              </label>
+              <label class="field"><span>切歌后后台继续下载任务数（0 = 切歌即停）</span>
+                <input class="input" id="handoff-max" type="number" min="0" max="20">
+              </label>
+              <label class="field"><span>自定义曲库扫描接口（选填）</span>
+                <input class="input" id="scan-path" placeholder="接口路径|JSON参数；留空=官方自动扫描入库">
+              </label>
+              <label class="field"><span>落盘后延迟（秒） <b id="scan-delay-label"></b></span>
+                <input class="input" id="scan-delay" type="number" min="0" max="600" step="0.5">
+              </label>
+              <label class="field"><span>扫描冷却窗口（秒） <b id="scan-cooldown-label"></b></span>
+                <input class="input" id="scan-cooldown" type="number" min="0" max="3600" step="0.5">
+              </label>
+              <p class="hint">不确定就留空：系统会按官方流程自动扫库入库。<button class="help-btn" type="button" data-help="tee-scan" aria-label="扫描参数帮助">?</button></p>
+            </div>
+          </details>
         </div>
         <div class="card">
           <div class="card-title">清理垃圾文件 <span class="badge">Beta</span></div>
@@ -345,12 +400,54 @@
         </div>
       </section>
 
-      <!-- 目录设置 -->
+      <!-- 储存：目录设置 -->
       <section class="page" id="page-dirs">
-        <h2>目录设置</h2>
+        <div class="page-head">
+          <div>
+            <h2><span>目录设置</span><button class="help-btn" type="button" data-help="download-dir" aria-label="目录设置帮助">?</button></h2>
+            <p class="page-sub">决定歌曲存到哪里、怎么分文件夹。建议留空由系统自动探测官方共享曲库，便于飞牛自动入库。</p>
+          </div>
+        </div>
         <div class="card">
-          <div class="card-title"><span>歌曲缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>
-          <label class="field"><span>缓存目录</span>
+          <div class="card-title"><span>歌曲下载目录</span><button class="help-btn" type="button" data-help="download-dir" aria-label="下载目录帮助">?</button></div>
+          <label class="field"><span>下载保存目录</span>
+            <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
+          </label>
+          <label class="field"><span>文件夹归类方式（Beta）</span>
+            <select class="input" id="download-layout">
+              <option value="flat">直接放根目录（歌曲）</option>
+              <option value="artist">按歌手（歌手/歌曲）</option>
+              <option value="album">按专辑（专辑/歌曲）</option>
+              <option value="artist_album">按歌手与专辑（歌手/专辑/歌曲）</option>
+            </select>
+          </label>
+          <details class="adv-fold">
+            <summary>高级：文件写入模式（落盘方式）</summary>
+            <div class="adv-body">
+              <label class="field"><span>落盘方式</span>
+                <select class="input" id="tee-save-mode">
+                  <option value="auto">自动判定（推荐）</option>
+                  <option value="direct">直接写入</option>
+                  <option value="staged">本地中转</option>
+                </select>
+              </label>
+              <p class="hint">本地盘自动直写；远程目录先在本地区下载加工再整体写入，避免残留 .part 文件。保存后立即生效。</p>
+            </div>
+          </details>
+          <div class="btn-row">
+            <button class="btn" id="dir-download-pick" hidden>从 NAS 选择</button>
+            <span id="dir-download-check" class="dir-check" hidden></span>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="organize-open-btn" type="button">按所选方式整理现有曲库</button>
+          </div>
+          <p class="hint">仅影响后续下载；「整理」会按所选结构移动下载目录内的全部歌曲，包括自行放入的文件。</p>
+          <p id="organize-status" role="status" aria-live="polite"></p>
+          <pre class="update-changelog" id="organize-details" hidden></pre>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>临时缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>
+          <label class="field"><span>试听与转码缓存路径</span>
             <input class="input" id="dir-cache" placeholder="留空=安装目录 cache">
           </label>
           <div class="btn-row">
@@ -358,69 +455,49 @@
             <span id="dir-cache-check" class="dir-check" hidden></span>
           </div>
         </div>
-        <div class="card">
-          <div class="card-title"><span>下载目录</span><button class="help-btn" type="button" data-help="download-dir" aria-label="下载目录帮助">?</button></div>
-          <label class="field"><span>下载目录</span>
-            <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
-          </label>
-          <label class="field"><span>存放方式(beta)</span>
-            <select class="input" id="download-layout">
-              <option value="flat">歌曲</option>
-              <option value="artist">歌手/歌曲</option>
-              <option value="album">专辑/歌曲</option>
-              <option value="artist_album">歌手/专辑/歌曲</option>
-            </select>
-          </label>
-          <p class="hint">仅影响后续下载，已有歌曲可点击「整理」调整目录。整理会移动下载目录内的全部歌曲，包括用户自行放入的文件。</p>
-          <div class="btn-row">
-            <button class="btn" id="dir-download-pick" hidden>从 NAS 选择</button>
-            <span id="dir-download-check" class="dir-check" hidden></span>
-          </div>
-          <div class="btn-row">
-            <button class="btn" id="organize-open-btn" type="button">整理</button>
-          </div>
-          <p id="organize-status" role="status" aria-live="polite"></p>
-          <pre class="update-changelog" id="organize-details" hidden></pre>
-          <label class="field"><span>落盘方式</span>
-            <select class="input" id="tee-save-mode">
-              <option value="auto">自动判定（推荐）</option>
-              <option value="direct">直接写入</option>
-              <option value="staged">本地中转</option>
-            </select>
-          </label>
-          <p class="hint">边听边存与收藏绑定共用此设置。自动判定会让本地盘直接写入，远程目录先在缓存区下载和加工，再写入目标文件；也可手动选择本地中转。中转模式不在下载目录创建 .part 文件，上传失败会尽力清理本次创建的残件并保留本地缓存。直接写入仅建议用于本地盘。保存后立即生效。</p>
-        </div>
       </section>
 
-      <!-- LLM -->
+      <!-- 高级：大模型 -->
       <section class="page" id="page-llm">
-        <h2><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
-        <div class="card">
-          <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
-          <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
-          <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
-          <label class="field"><span>接口协议</span>
-            <select class="input" id="llm-protocol">
-              <option value="chat">Chat Completions（/chat/completions）</option>
-              <option value="responses">Responses（/responses）</option>
-            </select>
-          </label>
-          <label class="field"><span>单次输出上限（token）</span><input class="input" id="llm-max-tokens" type="number" min="256" max="131072" step="1" value="8192"></label>
-          <label class="field"><span>每日 token 上限（0=不限制）</span><input class="input" id="llm-daily-limit" type="number" min="0" step="1" value="1000000"></label>
-          <label class="field"><span>附加请求参数（JSON 对象，选填）</span><input class="input" id="llm-extra-body" placeholder='{"thinking":{"type":"disabled"}}'></label>
-          <div class="switch-grid">
-            <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
-            <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
+        <div class="page-head">
+          <div>
+            <h2><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
+            <p class="page-sub">接入 OpenAI 兼容大模型，按你的曲库与收听偏好生成推荐歌单。填好接口不会自动启用，需在上方勾选用途。</p>
           </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>AI 推荐用途</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></div>
+          <label class="switch-row"><span>启用 AI「猜你喜欢」<span class="sub">根据听歌偏好定期生成专属歌单</span></span><input type="checkbox" id="llm-liked"></label>
+          <label class="switch-row"><span>启用 AI「每日推荐」<span class="sub">每日生成；原生推荐优先，其次模型，最后本地曲库兜底</span></span><input type="checkbox" id="llm-daily"></label>
           <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
           <div id="llm-liked-settings" hidden>
-            <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
-            <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
+            <label class="field"><span>猜你喜欢刷新间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
+            <label class="field"><span>每次生成歌曲数量（首）</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
           </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>接口连接</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型连接帮助">?</button></div>
+          <label class="field"><span>接口地址 (Base URL)</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
+          <label class="field"><span>接口密钥 (API Key)</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
+          <label class="field"><span>模型名称 (Model)</span><input class="input" id="llm-model" placeholder="留空使用 gpt-4o-mini"></label>
+          <details class="adv-fold">
+            <summary>高级：协议、Token 限额与自定义请求体</summary>
+            <div class="adv-body">
+              <label class="field"><span>接口协议</span>
+                <select class="input" id="llm-protocol">
+                  <option value="chat">Chat Completions（/chat/completions）</option>
+                  <option value="responses">Responses（/responses）</option>
+                </select>
+              </label>
+              <label class="field"><span>单次最大输出 Token</span><input class="input" id="llm-max-tokens" type="number" min="256" max="131072" step="1" value="8192"></label>
+              <label class="field"><span>每日 Token 消耗上限（0 为不限制）</span><input class="input" id="llm-daily-limit" type="number" min="0" step="1" value="1000000"></label>
+              <label class="field"><span>附加请求参数（JSON 对象，选填）</span><input class="input" id="llm-extra-body" placeholder='{"thinking":{"type":"disabled"}}'></label>
+            </div>
+          </details>
         </div>
         <div class="card" id="llm-usage-card">
           <div class="card-title">
-            <span>大模型用量与记录</span>
+            <span>Token 用量统计与调用记录</span>
             <button class="btn small" id="llm-usage-refresh" type="button">刷新</button>
           </div>
           <p class="hint" id="llm-usage-line" role="status">今日 token 用量：加载中…</p>
@@ -436,11 +513,16 @@
 
       <!-- 设置 -->
       <section class="page" id="page-settings">
-        <h2>设置</h2>
+        <div class="page-head">
+          <div>
+            <h2><span>设置</span></h2>
+            <p class="page-sub">外观偏好只保存在当前浏览器，不写入 NAS 配置，也不需要点保存条。</p>
+          </div>
+        </div>
         <div class="card">
-          <div class="card-title">外观</div>
+          <div class="card-title"><span>界面外观</span><button class="help-btn" type="button" data-help="settings-theme" aria-label="界面外观帮助">?</button></div>
           <div class="radio-list" id="theme-list">
-            <label><input type="radio" name="theme" value="auto"><div><b>跟随系统</b><span>默认。跟随设备与飞牛 OS 的浅色/深色设置，切换后界面立即生效</span></div></label>
+            <label><input type="radio" name="theme" value="auto"><div><b>跟随系统<span class="tag-recommended">默认</span></b><span>跟随设备与飞牛 OS 的浅色/深色设置，切换后立即生效</span></div></label>
             <label><input type="radio" name="theme" value="light"><div><b>浅色</b><span>始终使用浅色界面</span></div></label>
             <label><input type="radio" name="theme" value="dark"><div><b>深色</b><span>始终使用深色界面</span></div></label>
           </div>
@@ -505,28 +587,32 @@
     </main>
   </div>
 
-  <!-- 移动端底部导航 -->
+  <!-- 移动端底部导航：7 个一级入口，储存/高级内含向上弹出的二级菜单 -->
   <nav class="bottom-nav" id="bottom-nav">
-    <button class="nav-item active" data-page="overview">概览</button>
-    <button class="nav-item" data-page="source">音源</button>
-    <button class="nav-item" data-page="quality">播放</button>
-    <button class="nav-item" data-page="search">搜索</button>
+    <button class="nav-item active" data-page="overview" type="button"><svg class="icon" aria-hidden="true"><use href="#i-overview"/></svg><span>概览</span></button>
+    <button class="nav-item" data-page="source" type="button"><svg class="icon" aria-hidden="true"><use href="#i-source"/></svg><span>音源</span></button>
+    <button class="nav-item" data-page="quality" type="button"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span>播放</span></button>
     <div class="bottom-nav-group">
-      <button class="nav-item bottom-nav-trigger" id="bottom-storage-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-storage-menu">储存</button>
+      <button class="nav-item bottom-nav-trigger" id="bottom-storage-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-storage-menu">
+        <svg class="icon" aria-hidden="true"><use href="#i-storage"/></svg><span>储存</span>
+      </button>
       <div class="bottom-sub-menu" id="bottom-storage-menu" role="menu" hidden>
-        <button class="bottom-sub-item nav-item" data-page="tee" role="menuitem">边听边存</button>
-        <button class="bottom-sub-item nav-item" data-page="dirs" role="menuitem">目录设置</button>
+        <button class="bottom-sub-item" data-page="tee" role="menuitem" type="button">边听边存</button>
+        <button class="bottom-sub-item" data-page="dirs" role="menuitem" type="button">目录设置</button>
       </div>
     </div>
     <div class="bottom-nav-group">
-      <button class="nav-item bottom-nav-trigger" id="bottom-advanced-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-advanced-menu">高级</button>
+      <button class="nav-item bottom-nav-trigger" id="bottom-advanced-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-advanced-menu">
+        <svg class="icon" aria-hidden="true"><use href="#i-advanced"/></svg><span>高级</span>
+      </button>
       <div class="bottom-sub-menu" id="bottom-advanced-menu" role="menu" hidden>
-        <button class="bottom-sub-item nav-item" data-page="lx" role="menuitem">lx音乐源</button>
-        <button class="bottom-sub-item nav-item" data-page="llm" role="menuitem">大模型</button>
+        <button class="bottom-sub-item" data-page="search" role="menuitem" type="button">搜索与直连</button>
+        <button class="bottom-sub-item" data-page="lx" role="menuitem" type="button">洛雪播放策略</button>
+        <button class="bottom-sub-item" data-page="llm" role="menuitem" type="button">大模型推荐</button>
       </div>
     </div>
-    <button class="nav-item" data-page="settings">设置</button>
-    <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
+    <button class="nav-item" data-page="settings" type="button"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span>设置</span></button>
+    <button class="nav-item" data-page="about" type="button"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span>关于</span><span class="nav-dot" hidden></span></button>
   </nav>
 
   <!-- 保存条 -->
@@ -534,19 +620,26 @@
     <span id="save-note" class="muted"></span>
     <button class="btn primary" id="save-btn">保存并生效</button>
   </div>
-
+  <!-- 帮助文案：一句话结论 + 怎么选 + 细节，全部收进 ? 弹窗 -->
+  <template data-help-id="overview">
+    <p><b>怎么读这一页？</b>绿色圆点表示正常，橙色表示正在准备，红色表示异常。</p>
+    <p><b>后台组件</b>按需启动：只运行当前主音源需要的服务，其余保持休眠，避免占内存；切回某音源时它会自动拉起。</p>
+    <p><b>服务连通性检查</b>会实际访问各组件的健康接口。若某项显示不可达，先看卡片里的原因，再检查对应音源是否配置正确。</p>
+  </template>
   <template data-help-id="providers">
-    <p>主音源三选一：保存后 WebUI 会切换对应音源进程。musicdl 面向多平台聚合，网易盒子适合账号曲库与每日推荐，洛雪使用你自己的源脚本解析播放。</p>
+    <p><b>一句话：</b>主音源三选一，决定平时搜歌、听歌走哪个渠道。切换后点底部「保存并生效」，系统会自动切换对应进程。</p>
+    <p><b>怎么选？</b><br>· <b>网易云音乐</b>：有网易账号/会员，想同步歌单与每日推荐。<br>· <b>多平台聚合 (musicdl)</b>：不想登录，一次搜酷我、酷狗、QQ 等多个平台。<br>· <b>洛雪自定义源</b>：手里有洛雪 <code>.js</code> 音源脚本的进阶玩家。</p>
   </template>
   <template data-help-id="netease-login">
-    <p>手机网易云音乐 App 扫码授权。登录态保存在数据卷，重启不丢失。</p>
+    <p>用手机「网易云音乐 App」扫一扫即可授权。登录状态保存在 NAS 数据目录，重启容器或设备都不会掉线。</p>
   </template>
   <template data-help-id="netease-playlists">
-    <p>账号歌单需要网易盒子启用并扫码登录；开启后自己创建的歌单会出现在热门推荐和官方歌单之间，收藏的他人歌单不显示。歌单只读，不会写回网易。</p>
-    <p>歌单常驻开启后，即使切换到其它音源，账号歌单和公共歌单仍可显示播放，网易盒子进程保持常驻。搜索结果仍只在网易盒子为主音源时使用网易。</p>
+    <p><b>同步「我创建的歌单」：</b>登录后，你自建的歌单会显示在飞牛音乐首页（收藏他人的歌单暂不显示）。歌单为只读，不会写回你的网易账号。</p>
+    <p><b>切换其它音源时仍保留：</b>开启后即使主音源切到聚合或洛雪，后台仍保持网易服务常驻，歌单继续可看可播。</p>
   </template>
   <template data-help-id="musicdl-platforms">
-    <p>按需勾选 musicdl 平台。平台列表来自当前服务注册项，搜索与播放只使用已启用集合；平台不可达时可能返回空结果或播放失败。</p>
+    <p>点击标签即开启或关闭对应平台，蓝色高亮表示已启用。</p>
+    <p><b>建议：</b>勾选 3–5 个常用平台即可。勾太多会明显拖慢搜索；个别平台临时维护不可达时会自动跳过。</p>
   </template>
   <template data-help-id="lx-source-add">
     <p>可粘贴 http/https 源脚本地址、上传 .js 文件，或在桌面环境从 NAS 选择。可填写自定义名称后点击“添加”，保存时确认目标脚本初始化状态并加入源列表。</p>
@@ -556,59 +649,82 @@
     <p>部分失败时保留已确认的修改，并分别提示失败、未执行或结果待核实。超时不会重放写请求；请先刷新运行状态再决定是否重试。</p>
   </template>
   <template data-help-id="lx-timeouts">
-    <p>慢源可调大超时。建议总超时至少覆盖一次解析和一次探活；调大后保存即生效，无需重启服务。</p>
+    <p>控制洛雪解析歌曲链接的等待时间，改完保存即热更新，无需重启：</p>
+    <p>· <b>单次取链超时</b>：单次调用某个源脚本解析链接的最长等待（默认 8 秒）。<br>· <b>播放取链总限时</b>：含缓存续期、多源重试与音质降档的总预算（默认 15 秒）。<br>· <b>音频链接探活超时</b>：拿到直链后验证能否连通的超时（默认 3 秒）。</p>
+    <p>源响应慢就适当调大前两项；实际等待始终受剩余总预算限制。</p>
+  </template>
+  <template data-help-id="lx-page">
+    <p><b>自动切换可用脚本：</b>当前源取不到歌时，按下方顺序依次尝试其它已激活源。关闭后只用当前源，失败即报错。</p>
+    <p><b>跨平台优选同一首歌：</b>在当前脚本声明的平台范围内找同一首歌，不会改动源的激活状态。</p>
+    <p>本页只影响播放策略，不会启动或停止洛雪服务。</p>
+  </template>
+  <template data-help-id="lx-order">
+    <p>同一音质档位会按这个顺序尝试脚本：可拖动排序，也可用「上移/下移」按钮（键盘同样可用）。</p>
+    <p>停用的源保留原位置，重新激活后恢复；删除源会移除它的排序项。若自动切换已关闭，排序会被禁用，但已保存顺序不会清空。</p>
   </template>
   <template data-help-id="direct-play">
-    <p>开启后，本地曲库和完整缓存未命中的原文件在线播放会由扩展代理返回音乐源 HTTPS 地址的 302，不再由 NAS 前台转发音频正文。默认关闭，保存后经代理热重载生效；关闭文件监听时需重启代理。</p>
-    <p>标准音质 HLS、App 下载、收藏和歌单协议不改为直连。本地或完整缓存命中仍从 NAS 文件供流。边听边存开启时，客户端直连的同时 NAS 仍会去重启动后台保存。</p>
-    <p>302 不能让播放器自动带上 NAS 使用的 UA、Referer、Cookie 或 TLS 指纹；手机与 NAS 不同公网出口、CORS 或临时链接限制都可能导致失败。NAS 取链或探活成功不代表客户端一定能播。失败时关闭对应开关并重新起播，即可恢复代理流程。</p>
-    <p>客户端 IP 和播放请求会直接暴露给音乐源。NAS 仍承担搜索、鉴权、取链及有限探活，不是完全不访问音源。</p>
-    <p>已交付的临时链接无法撤回，关闭开关影响后续经过 NAS 的请求。相同凭证同时播放同一歌曲时，客户端没有独立会话标识，短期目标可能共享；续传失效需重新起播。</p>
+    <p><b>是什么：</b>默认在线歌曲由 NAS 代理下载再转发给播放器。开启直连后，本地与缓存都未命中时，NAS 用 <code>302</code> 把音乐平台的原始音频地址直接交给播放器，减轻 NAS 带宽与 CPU。</p>
+    <p><b>哪些仍走 NAS：</b>本地/已缓存歌曲、标准音质 HLS、App 下载、收藏与歌单协议。开启边听边存时，客户端直连的同时 NAS 仍会在后台下载保存。</p>
+    <p><b>为什么会失败：</b>部分平台会校验 UA/Referer 或限制跨网络 IP。点歌不响或报错时，关掉对应音源开关并重新起播即可恢复。</p>
+    <p><b>隐私提醒：</b>客户端 IP 与播放请求会直接暴露给音乐源，NAS 仍承担搜索、鉴权、取链与有限探活。</p>
   </template>
   <template data-help-id="direct-netease">
-    <p>登录、会员权益和取链仍由 NAS 上的网易盒子完成；302 只交付解析后的媒体 URL。链接到期时间、跨出口有效性和源站限制取决于网易 CDN。</p>
+    <p>登录、会员鉴权与取链仍由 NAS 上的网易服务完成，302 只交付解析后的媒体地址。链接有效期、跨出口可用性取决于网易 CDN；外网播不动就关掉此项。</p>
   </template>
   <template data-help-id="direct-musicdl">
-    <p>不同平台的兼容性差异较大。NAS 使用的下载头和 TLS 模拟不能通过 302 传给客户端；某些平台可能拒绝其它 UA、Referer 或出口 IP。解析失败或目标不安全时不会回退成代理成功。</p>
+    <p>各聚合平台防盗链差异大：有的要求特定请求头，有的限制 IP，客户端直连可能被拒。某个平台播不出来就关掉这一项，改回 NAS 代理转发。</p>
   </template>
   <template data-help-id="direct-lx">
-    <p>实际兼容性取决于洛雪脚本和目标 CDN，部分平台依赖 UA/Referer 或 Cookie。更换脚本后需要重新验证；脚本选出的原文件表示不会被伪装成客户端已可播。</p>
+    <p>兼容性取决于你用的洛雪脚本与目标 CDN。换脚本后若出现「能搜到但播不出」，优先关闭此项。</p>
   </template>
   <template data-help-id="quality">
-    <p>只影响在线播放取歌。七档从标准到沉浸声排列，默认无损；所选档位缺失时严格向下选择，不会回升。实际音质受音源能力与账号权益限制。</p>
-    <p>musicdl 各平台支持档位不同，不能保证每个平台都有全部选项。扩展不会把低品质音频重新编码后标成 Hi-Res 或母带。</p>
+    <p><b>在线播放音质</b>只影响在线听歌取哪个档位（保存后立即生效）：从「标准」到「沉浸声」共七档，默认「无损」。</p>
+    <p>所选档位缺失时<b>只向下逐级降档，不会回升</b>。实际音质受账号权益与音源能力限制；musicdl 不保证每个平台都提供全部档位，也绝不会把低品质音频重新编码后标成 Hi-Res 或母带。</p>
   </template>
   <template data-help-id="download-quality">
-    <p>下载音质与在线播放音质独立。默认“跟随 App”会按 App 请求选择目标档位；固定档位缺失时只向下选择。实际交付仍取决于账号权益和音源能力。</p>
+    <p><b>APP下载音质</b>独立于在线播放设置，只影响在飞牛音乐 App 里点「下载」拿到的文件。</p>
+    <p>默认「跟随 App」按 App 请求的档位交付；固定档位缺失时只向下选择，不会把低品质文件包装成高品质。实际交付仍取决于账号权益与音源能力。</p>
   </template>
   <template data-help-id="recommend">
-    <p>热门榜单与每日推荐是两个独立歌单。公共歌单可浏览并勾选网易/洛雪的原生榜单和分类歌单，作为只读歌单展示；musicdl 没有统一推荐歌单发现接口。</p>
+    <p>热门榜单与每日推荐是两个独立歌单，可分别开关。</p>
+    <p><b>精选公共歌单</b>开启后，可按飞牛音乐用户分别勾选网易/洛雪的官方榜单与分类歌单，作为只读歌单展示（单个歌单最多载入前 1,000 首）。musicdl 没有统一的歌单发现接口。</p>
   </template>
   <template data-help-id="search">
-    <p>深分页在在线歌曲不够填满当前页时继续取下一页，本地歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>
-    <p>搜索超时默认 15 秒，到时未返回就只交本地结果。深分页页数上限默认 10，防止无限翻页打爆音源。</p>
+    <p><b>自动深分页：</b>首屏有效结果不够填满列表时，自动向后翻页补齐。本地曲库歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>
+    <p><b>超时与页数：</b>单次搜索默认最多等 15 秒，超时只交付本地结果；自动翻页默认最多 10 页，避免频繁请求触发音源风控。</p>
   </template>
   <template data-help-id="tee-save">
-    <p>边听边存开启时，代理完整获取的在线歌曲会自动保存到本地曲库，不必听完整首。关闭后仅保留滚动缓存；restore 会一并清理这些滚动缓存。</p>
-    <p>封面仅在歌曲保存成功后下载并嵌入音频；歌词仅在歌曲成功后下载为同名 .lrc。不会产生只有素材没有歌曲的垃圾文件。酷我歌词接口当前不可用。</p>
+    <p><b>边听边存：</b>在线试听时只要音频在后台缓冲下载完整，就自动保存进本地曲库，无需把整首听完。关闭后仅保留少量临时滚动缓存。</p>
+    <p><b>封面与歌词：</b>只在歌曲音频成功保存后才下载封面（内嵌到音频文件）与同名 <code>.lrc</code>，不会产生只有素材、没有歌曲的碎片文件。</p>
   </template>
   <template data-help-id="tee-binding">
     <p>显式收藏后，后台下载并绑定本地歌曲；浏览列表不会触发音频下载，已有文件会重试绑定。默认关闭。</p>
     <p>官方客户端搜索点播后会把整份搜索结果批量加入其自动创建的播放列表，该操作与用户主动保存无法区分，因此加入歌单不会触发自动下载，歌单内容本身照常保存（issue #120）。</p>
     <p>绑定等待是下载落库后等待官方收录并完成写入的上限，超时保留映射并自动重试。切歌续传让未完成下载转后台；并行数 0 表示关闭续传。重扫接口可用日志取证后填写以加速入库。</p>
   </template>
+  <template data-help-id="tee-scan">
+    <p><b>自定义曲库扫描接口（选填）：</b>格式为「接口路径|JSON参数」，例如 <code>/music/api/v1/shared-library/scan|{"guid":"你的共享库id"}</code>，guid 可在飞牛音乐网页端手动扫库时按 F12 从请求参数中获取。留空则由官方自动扫描入库。</p>
+    <p><b>落盘后延迟：</b>歌曲写入磁盘后等待多少秒再触发扫描，用于合并连续落盘（0 表示立即触发）。<b>扫描冷却窗口：</b>该时间内的重复触发会被合并，避免短时间内反复扫库。</p>
+    <p>调用会自动携带当前登录凭据（Cookie/Token 透传），无需额外配置。不确定就全部留空，功能不受影响。</p>
+  </template>
   <template data-help-id="cache-dir">
-    <p>存放在线试听滚动缓存、转码缓存和去重标记等临时文件，留空使用安装目录 cache。更换目录后旧缓存不迁移，去重标记会带到新目录。</p>
+    <p>存放试听滚动缓存、转码过渡文件与去重标记。<b>一般留空即可</b>，默认使用安装目录下的 <code>cache</code>。</p>
+    <p>注意：缓存目录不能与下载目录相同，也不能互为父子目录；更换目录后旧缓存不会自动迁移。</p>
   </template>
   <template data-help-id="download-dir">
-    <p>边听边存、收藏或歌单自动下载的歌曲落盘目录，留空自动探测飞牛官方共享曲库。建议使用官方共享曲库目录，便于官方扫描后进入本地列表。</p>
+    <p><b>下载保存目录：</b>边听边存、收藏或歌单自动下载的歌曲都存到这里。建议留空由系统自动探测飞牛官方共享曲库，便于音乐自动扫描入库。</p>
+    <p><b>文件夹归类方式：</b>可平铺存放，或按「歌手/专辑」自动建目录。点「按所选方式整理现有曲库」会把下载目录内的全部歌曲（含手动放入的文件）按所选结构移动。</p>
+    <p><b>落盘方式：</b>「自动判定」会在本地盘直接高速写入，远程目录先在本地区下载加工再整体写入，避免产生 <code>.part</code> 残件；直接写入仅建议用于本地盘。</p>
+  </template>
+  <template data-help-id="settings-theme">
+    <p>外观偏好只保存在当前浏览器，不写入 NAS 配置，也不需要点保存条。</p>
+    <p>「跟随系统」会优先跟随飞牛 OS 的浅色/深色设置（飞牛 Web 桌面内实时联动）；在手机 App 内嵌页或独立浏览器中则跟随设备系统设置。</p>
   </template>
   <template data-help-id="llm">
-    <p>配置 OpenAI 兼容接口不会自动启用推荐用途；“猜你喜欢”和“每日推荐”需分别勾选。每日推荐仍受总开关控制：原生推荐优先，其次模型，最后本地曲库兜底。</p>
-    <p>协议默认 Chat Completions；Responses 请求 Base URL/responses。单次输出上限 256–131072，每日 token 限额达到后当天暂停调用。附加参数可关闭推理模型的思考或传服务商专属字段。</p>
-    <p>猜你喜欢间隔至少 0.5 小时，数量 0–100；数量 0 在此用途生效时停止生成且不展示猜你喜欢。第一批生成后，从首次被客户端获取开始计时；尚未获取的批次不会到期或轮换，间隔不是缓存失效时间。取消用途会保留参数并回到本地推荐，本地有效、未收藏候选至少 20 首的门槛不变。</p>
-    <p>保存后代理热重载生效。模型留空使用 gpt-4o-mini；每日 token 限额 0 表示不限制，达到限额后当日走本地兜底，次日重置。单次输出上限默认 8192，包含推理 token。</p>
-    <p>DeepSeek 等推理模型若正文为空，可在附加请求参数中填写 {"thinking":{"type":"disabled"}} 关闭思考，或调大单次输出上限。猜你喜欢默认间隔 0.5 小时、数量 20，间隔须为有限数字且无上限，数量须为整数且不可留空。启用并保存后后台预生成首批，不必先打开歌单。</p>
+    <p><b>用途：</b>接入 OpenAI 兼容大模型（如 DeepSeek、GPT-4o-mini），按你的曲库与收听偏好生成推荐歌单。填好接口<b>不会自动启用</b>推荐用途，需分别勾选「猜你喜欢」与「每日推荐」。每日推荐优先级：网易原生推荐 &gt; 大模型 &gt; 本地曲库兜底。</p>
+    <p><b>生成规则：</b>猜你喜欢间隔至少 0.5 小时，数量 0–100；数量为 0 时<b>停止生成且不展示猜你喜欢</b>。首批生成后从<b>首次被客户端获取</b>开始计时，尚未被获取的批次<b>不会到期或轮换</b>，间隔不是缓存失效时间。取消用途或当日 Token 用尽会回到本地推荐，本地推荐门槛不变：<b>本地有效、未收藏候选至少 20 首</b>。</p>
+    <p><b>接口参数：</b>模型留空使用 <code>gpt-4o-mini</code>；每日 Token 上限填 <code>0</code> 表示不限制，达到上限当天暂停调用、次日重置。单次最大输出默认 8192，包含推理 token。</p>
+    <p><b>推理模型返回为空：</b>可在附加请求参数填 <code>{"thinking":{"type":"disabled"}}</code> 关闭思考，或调大单次最大输出。保存后代理热重载生效；启用后会后台预生成首批，不必先打开歌单。</p>
   </template>
   <template data-help-id="logs">
     <p>日志本地滚动保留 3 天，卸载时随应用删除。导出为标准 ZIP，包含近 3 天全部日志与环境快照；密钥会脱敏，但仍建议只在需要排查问题时提供给可信对象。</p>
@@ -665,5 +781,9 @@
   <div class="toast" id="toast" hidden></div>
 
   <script src="/app/fnmusic-ext/static/app.js?build=__WEBUI_BUILD__"></script>
+</body>
+</html>
+
+
 </body>
 </html>
