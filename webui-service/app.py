@@ -72,6 +72,29 @@ CONF = {
 }
 
 ENV_PATH = Path(CONF["repo_dir"]) / ".env"
+
+MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+
+async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> dict | None:
+    """Try to call the host maintenance socket directly (for direct-mode access).
+
+    Returns the JSON payload on success, or None if the socket is unavailable
+    or the call fails (caller should fall back to 501).
+    """
+    if not os.path.exists(MAINTENANCE_SOCKET):
+        return None
+    try:
+        transport = httpx.AsyncHTTPTransport(uds=MAINTENANCE_SOCKET)
+        async with httpx.AsyncClient(transport=transport, base_url="http://unix", timeout=35.0) as client:
+            if method == "GET":
+                resp = await client.get(path)
+            else:
+                resp = await client.post(path, json=body or {})
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -1858,34 +1881,61 @@ async def netease_qr(unikey: str = Query(...)):
 
 
 @app.post("/api/fs-check")
-async def api_fs_check():
-    """目录权限校验占位端点（直连 8774 场景）。
-
-    桌面链路（统一网关）中该路径由宿主机侧 webui_gateway（root）拦截应答，
-    不会到达这里；能到达说明是独立浏览器/直连端口环境，WebUI 容器内看不到
-    宿主机真实目录，无法给出可信的可写性结论，明确回 501 让前端降级放行。
-    """
+async def api_fs_check(request: Request = None):
+    """目录权限校验。优先通过挂载的 maintenance socket 直连宿主；不可用时降级。"""
+    body = {}
+    if request:
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+    result = await _try_maintenance_socket("POST", "/api/fs-check", body)
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
 @app.post("/api/maintenance/cleanup")
 @app.get("/api/maintenance/cleanup/{job_id}")
 async def api_maintenance_cleanup(job_id: str = ""):
-    """与 fs-check 一致：真实清理由宿主网关处理，直连不得访问或删除文件。"""
+    """清理垃圾文件。优先通过 maintenance socket 直连宿主。"""
+    if job_id:
+        result = await _try_maintenance_socket("GET", f"/api/maintenance/cleanup/{job_id}")
+    else:
+        result = await _try_maintenance_socket("POST", "/api/maintenance/cleanup", {"confirm_beta": True})
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台")
 
 
 @app.get("/api/maintenance/music-users")
 async def api_maintenance_music_users():
-    """Music users are read by the host proxy through the desktop gateway."""
+    """读取飞牛音乐用户。优先通过 maintenance socket 直连宿主。"""
+    result = await _try_maintenance_socket("GET", "/api/maintenance/music-users")
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台")
 
 
 @app.get("/api/maintenance/organize")
 @app.get("/api/maintenance/organize/{job_id}")
 @app.post("/api/maintenance/organize")
-async def api_maintenance_organize(job_id: str = ""):
-    """真实整理同样只经宿主网关执行，直连 WebUI 不接触宿主文件。"""
+async def api_maintenance_organize(job_id: str = "", request: Request = None):
+    """整理下载目录。优先通过 maintenance socket 直连宿主。"""
+    if job_id:
+        result = await _try_maintenance_socket("GET", f"/api/maintenance/organize/{job_id}")
+    else:
+        method = request.method if request else "GET"
+        if method == "POST":
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            result = await _try_maintenance_socket("POST", "/api/maintenance/organize", body)
+        else:
+            result = await _try_maintenance_socket("GET", "/api/maintenance/organize")
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持整理下载目录，请在飞牛桌面内打开管理台")
 
 

@@ -34,6 +34,10 @@ services:
     volumes:
       - ./sources-data:/data
       - .:/repo
+      # Expose the host maintenance socket so the WebUI can handle maintenance
+      # endpoints (organize/cleanup/music-users) even when the fnOS desktop
+      # gateway fails to intercept the request.
+      - /run/fnmusic-ext:/run/fnmusic-ext:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
