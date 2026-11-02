@@ -23,6 +23,11 @@ from proxy.app import (
     _FAKE_ALBUM_REGISTRY,
     _transcode_source,
     _MEDIA_UA_PC,
+    _netease_pin_media,
+    _netease_url_pin_drop,
+    _netease_url_pin_store,
+    _ext_from_netease_media,
+    _sniff_audio_ext,
 )
 
 
@@ -661,7 +666,8 @@ def test_stream_track_early_disconnect_background_tee(tmp_path, monkeypatch):
 
 def test_stream_track_netease_mpeg_content_type_override_to_flac(tmp_path, monkeypatch):
     """Bug2 回归测试：网易 CDN 返回 content-type audio/mpeg 但 info 有 sq → 落盘为 .flac 且响应 content-type 为 audio/flac。"""
-    audio_content = b"FLAC_AUDIO_CONTENT_WITH_MPEG_HEADER" * 40
+    # issue IKS5FW：前缀真实 fLaC 魔数，info 竞速无论哪侧获胜都判 flac（魔数嗅探兜底）
+    audio_content = b"fLaC" + b"FLAC_AUDIO_CONTENT_WITH_MPEG_HEADER" * 40
     content_len = str(len(audio_content))
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -739,6 +745,249 @@ def test_stream_track_netease_mpeg_content_type_override_to_flac(tmp_path, monke
             assert f.read() == audio_content
 
         assert not os.path.exists(os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3"))
+
+
+# =========================================================================
+# issue IKS5FW：网易无损流被误存为 .mp3（实为 FLAC）
+#   取链响应的 type/level 是实际交付格式的权威来源；网易 CDN 会把 flac 错报为
+#   audio/mpeg，扩展名不得依赖 Content-Type，也不得盲信目录启发式（has_sq→flac）。
+#   以下流式用例用慢 /info（info 竞速必输）保证确定性，不依赖元数据恰好先完成。
+# =========================================================================
+@pytest.fixture(autouse=True)
+def _portable_layout_dirs(monkeypatch):
+    """Windows 本地跑法：入库路径经 organize._ensure_target_dir 依赖 POSIX
+    os.O_DIRECTORY；按 test_stale_ref_redirection 先例替换为纯 makedirs，
+    Linux CI 仍走真实实现（符号链接检查在 CI 侧覆盖）。"""
+    if not hasattr(os, "O_DIRECTORY"):
+        monkeypatch.setattr(
+            "proxy.app.ensure_layout_dir",
+            lambda root, target, create_root=False: os.makedirs(target, exist_ok=True),
+        )
+
+
+_IKS5FW_SLOW_INFO_S = 0.15
+
+
+def _iks5fw_musicbox_handler(url_responder, info_data):
+    """musicbox mock：/url 按 quality 应答；/info 延迟应答（输掉流打开竞速）。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/song/186016/url":
+            payload = url_responder(str(request.url.params.get("quality") or ""))
+            return httpx.Response(200, json={"ok": True, "data": payload})
+        if request.url.path == "/api/v1/song/186016/info":
+            await asyncio.sleep(_IKS5FW_SLOW_INFO_S)
+            return httpx.Response(200, json={"ok": True, "data": info_data})
+        return httpx.Response(404)
+
+    return handler
+
+
+def _iks5fw_cdn_handler(audio_content: bytes, content_type: str = "audio/mpeg"):
+    def direct_stream_handler(request: httpx.Request) -> httpx.Response:
+        if "audio.test" in str(request.url):
+            return httpx.Response(
+                200, content=audio_content,
+                headers={
+                    "Content-Type": content_type,
+                    "Content-Length": str(len(audio_content)),
+                    "Accept-Ranges": "bytes",
+                },
+            )
+        return httpx.Response(404)
+
+    return direct_stream_handler
+
+
+def _iks5fw_wire_clients(monkeypatch, musicbox_handler, cdn_handler):
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(500)), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    orig_async_client_init = httpx.AsyncClient.__init__
+
+    def mock_client_init(self, *args, **kwargs):
+        if "base_url" not in kwargs and not kwargs.get("transport"):
+            kwargs["transport"] = httpx.MockTransport(cdn_handler)
+        orig_async_client_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", mock_client_init)
+
+
+def _wait_for_file(path: str, timeout_s: float = 5.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_iks5fw_lossless_saved_flac_by_resolve_type_not_cdn_content_type(tmp_path, monkeypatch):
+    """核心复现：取链 type=flac + CDN 错报 audio/mpeg + info 未就绪 → 落盘 .flac。"""
+    audio_content = b"fLaC" + b"IKS5FW_LOSSLESS_BODY" * 60
+
+    def url_responder(quality: str) -> dict:
+        assert quality == "lossless"
+        return {"code": 200, "url": "http://audio.test/song.flac", "expi": 1200,
+                "type": "flac", "level": "lossless", "br": 844000}
+
+    musicbox_handler = _iks5fw_musicbox_handler(
+        url_responder,
+        {"name": "晴天", "ar": [{"name": "周杰伦"}], "al": {"name": "叶惠美"},
+         "dt": 269000, "sq": {"size": len(audio_content)}},
+    )
+    _iks5fw_wire_clients(monkeypatch, musicbox_handler, _iks5fw_cdn_handler(audio_content))
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:netease:186016")
+        assert resp.status_code == 200
+        assert resp.content == audio_content
+        # 响应头 content-type 按解析结果修正，App 端格式/码率不再显示 mp3 档
+        assert resp.headers.get("content-type") == "audio/flac"
+
+    saved = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
+    assert _wait_for_file(saved), f"expected {saved}"
+    with open(saved, "rb") as f:
+        assert f.read() == audio_content
+    assert not os.path.exists(os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3"))
+
+
+def test_iks5fw_downgraded_mp3_named_by_resolve_type_not_catalog_sq(tmp_path, monkeypatch):
+    """降档交付：无损 404 → exhigh(type=mp3)，目录仍有 sq → 落盘 .mp3 而非 .flac。"""
+    audio_content = b"ID3\x04" + b"IKS5FW_DOWNLOADED_MP3_BODY" * 48
+
+    def url_responder(quality: str) -> dict:
+        if quality == "lossless":
+            return {"code": 404, "url": None}
+        assert quality == "exhigh", quality
+        return {"code": 200, "url": "http://audio.test/song.mp3", "expi": 1200,
+                "type": "mp3", "level": "exhigh", "br": 320000}
+
+    musicbox_handler = _iks5fw_musicbox_handler(
+        url_responder,
+        {"name": "晴天", "ar": [{"name": "周杰伦"}], "al": {"name": "叶惠美"},
+         "dt": 269000, "sq": {"size": 40000000}},
+    )
+    _iks5fw_wire_clients(monkeypatch, musicbox_handler, _iks5fw_cdn_handler(audio_content))
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:netease:186016")
+        assert resp.status_code == 200
+        assert resp.content == audio_content
+        assert resp.headers.get("content-type") == "audio/mpeg"
+
+    saved = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
+    assert _wait_for_file(saved), f"expected {saved}"
+    assert not os.path.exists(os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac"))
+
+
+def test_iks5fw_sniff_flac_magic_when_resolve_lacks_type(tmp_path, monkeypatch):
+    """嗅探兜底：取链缺 type/level 且 info 未就绪 → 首字节 fLaC 魔数 → 落盘 .flac。"""
+    audio_content = b"fLaC" + b"IKS5FW_NO_TYPE_FIELD_BODY" * 60
+
+    def url_responder(quality: str) -> dict:
+        assert quality == "lossless"
+        return {"code": 200, "url": "http://audio.test/song.bin", "expi": 1200}
+
+    musicbox_handler = _iks5fw_musicbox_handler(
+        url_responder,
+        {"name": "晴天", "ar": [{"name": "周杰伦"}], "al": {"name": "叶惠美"}, "dt": 269000},
+    )
+    _iks5fw_wire_clients(monkeypatch, musicbox_handler, _iks5fw_cdn_handler(audio_content))
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:netease:186016")
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type") == "audio/flac"
+
+    saved = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
+    assert _wait_for_file(saved), f"expected {saved}"
+    assert not os.path.exists(os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3"))
+
+
+def test_iks5fw_sniff_mp3_magic_when_resolve_lacks_type(tmp_path, monkeypatch):
+    """嗅探兜底：首字节 ID3（mp3）→ 落盘 .mp3，即便 CDN 同样错报也无碍。"""
+    # body 需 >=1024 字节才满足 tee 落盘门槛（written >= 1024）
+    audio_content = b"ID3\x04" + b"IKS5FW_MP3_MAGIC_BODY" * 60
+
+    def url_responder(quality: str) -> dict:
+        assert quality == "lossless"
+        return {"code": 200, "url": "http://audio.test/song.bin", "expi": 1200}
+
+    musicbox_handler = _iks5fw_musicbox_handler(
+        url_responder,
+        {"name": "晴天", "ar": [{"name": "周杰伦"}], "al": {"name": "叶惠美"}, "dt": 269000},
+    )
+    _iks5fw_wire_clients(monkeypatch, musicbox_handler, _iks5fw_cdn_handler(audio_content))
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/stream?guid=online:netease:186016")
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type") == "audio/mpeg"
+
+    saved = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
+    assert _wait_for_file(saved), f"expected {saved}"
+    assert not os.path.exists(os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac"))
+
+
+def test_iks5fw_sniff_audio_ext_magic_unit():
+    assert _sniff_audio_ext(b"fLaC\x00\x00\x00\x22") == "flac"
+    assert _sniff_audio_ext(b"ID3\x04\x00\x00\x00") == "mp3"
+    assert _sniff_audio_ext(b"\xff\xfb\x90\x00") == "mp3"
+    assert _sniff_audio_ext(b"OggS\x00\x02") == "ogg"
+    assert _sniff_audio_ext(b"RIFF\x24\x08\x00\x00WAVEfmt") == "wav"
+    assert _sniff_audio_ext(b"\x00\x01\x02\x03") is None
+    assert _sniff_audio_ext(b"") is None
+
+
+def test_iks5fw_ext_from_netease_media_mapping_unit():
+    # type 权威
+    assert _ext_from_netease_media({"type": "flac", "level": "lossless"}) == "flac"
+    assert _ext_from_netease_media({"type": "mp3", "level": "exhigh"}) == "mp3"
+    assert _ext_from_netease_media({"type": "ape"}) == "ape"
+    assert _ext_from_netease_media({"type": "hires", "level": "lossless"}) == "flac"  # 未知名不猜
+    # level 兜底
+    assert _ext_from_netease_media({"level": "lossless"}) == "flac"
+    assert _ext_from_netease_media({"level": "jymaster"}) == "flac"
+    assert _ext_from_netease_media({"level": "exhigh"}) == "mp3"
+    # 均缺失 → None（不做请求档位猜测）
+    assert _ext_from_netease_media({}) is None
+
+
+@pytest.mark.anyio
+async def test_iks5fw_pin_media_carries_delivered_format():
+    """钉链携带实际交付格式：命中复用不重解析，meta 仍可用；失效标记保留 meta。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "data": {
+            "code": 200, "url": "http://audio.test/1.flac", "expi": 1200,
+            "type": "flac", "level": "lossless", "br": 844000}})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8770"
+    )
+    try:
+        u1 = await resolve_netease_url(client, "186016")
+        assert u1 == "http://audio.test/1.flac"
+        assert _netease_pin_media("186016") == {"ext": "flac", "type": "flac", "level": "lossless"}
+        # 钉链命中不重解析，meta 原样保留
+        assert await resolve_netease_url(client, "186016") == u1
+        assert _netease_pin_media("186016")["ext"] == "flac"
+        # 失效标记只把 deadline 置 0，meta 保留（同 rendition 格式判定可复用）
+        _netease_url_pin_drop("186016")
+        pin = _NETEASE_URL_PIN["186016"]
+        assert pin[1] == 0.0 and pin[2]["ext"] == "flac"
+        assert _netease_pin_media("186016")["ext"] == "flac"
+    finally:
+        await client.aclose()
+    # 旧形态兼容：无 meta 写入/手工二元组 → 空 dict，调用方回落旧链路
+    _netease_url_pin_store("999", "http://audio.test/legacy.mp3", 60.0)
+    assert _netease_pin_media("999") == {}
+    _NETEASE_URL_PIN["998"] = ("http://audio.test/legacy2.mp3", time.monotonic() + 60.0)
+    assert _netease_pin_media("998") == {}
 
 
 def test_stream_track_netease_range_no_cache_no_coroutine_warning(tmp_path, monkeypatch):

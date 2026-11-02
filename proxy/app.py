@@ -2890,6 +2890,27 @@ def ext_from_content_type(content_type: str) -> str:
     return play_format_from_ext(ct.split("/")[-1] if "/" in ct else "mp3")
 
 
+def _sniff_audio_ext(first: bytes) -> "str | None":
+    """按首字节魔数识别音频容器（issue IKS5FW 网易路径兜底）。
+
+    只在扩展名完全未知时补空使用：绝不覆盖取链解析结果或既有判定，
+    避免非标容器（如罕见 ID3 前缀文件）被误改判。
+    """
+    if not first:
+        return None
+    if first[:4] == b"fLaC":
+        return "flac"
+    if first[:4] == b"OggS":
+        return "ogg"
+    if first[:4] == b"RIFF" and first[8:12] == b"WAVE":
+        return "wav"
+    if first[:3] == b"ID3":
+        return "mp3"
+    if len(first) >= 2 and first[0] == 0xFF and (first[1] & 0xE0) == 0xE0:
+        return "mp3"
+    return None
+
+
 def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
     if not range_header:
         return None
@@ -3410,6 +3431,31 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
+# issue IKS5FW：网易取链响应的容器声明（type）与档位（level）→ 扩展名映射。
+_NETEASE_MEDIA_TYPE_EXTS = {
+    "flac": "flac", "mp3": "mp3", "aac": "aac", "m4a": "m4a", "wav": "wav",
+    "ape": "ape", "ogg": "ogg", "opus": "opus",
+}
+
+
+def _ext_from_netease_media(inner: dict) -> "str | None":
+    """从网易取链响应行推导实际交付格式（issue IKS5FW）。
+
+    只认权威字段：type 是网易 API 对该直链的容器声明；缺失时按 level 推断
+    （无损档 lossless/hires/jymaster 等按 flac 交付，有损档按 mp3）。均缺失
+    返回 None，不做请求档位猜测，由 info 启发式/首字节魔数/Content-Type 兜底。
+    """
+    media_type = str((inner or {}).get("type") or "").strip().lower()
+    if media_type in _NETEASE_MEDIA_TYPE_EXTS:
+        return _NETEASE_MEDIA_TYPE_EXTS[media_type]
+    level = str((inner or {}).get("level") or "").strip().lower()
+    if level in ("lossless", "hires", "hr", "jymaster", "sky", "master"):
+        return "flac"
+    if level in ("standard", "higher", "exhigh", "mp3"):
+        return "mp3"
+    return None
+
+
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
                          meta: "dict | None" = None, max_quality: "str | None" = None,
                          quality_override: str | None = None, purpose: str = "playback",
@@ -3799,7 +3845,10 @@ def _online_meta_for_request(request: Request, guid: str) -> "dict | None":
 # 缓存 600s，缓存边界后重解析可能因音质阶梯降档拿到不同 rendition——新旧文件
 # 字节布局不同，带偏移的续拉会 416/错位断流，表象即"播到一半跳歌"。同一首歌
 # 在直链有效期内钉住同一条 CDN URL，全部调用点自动一致。
-_NETEASE_URL_PIN: "dict[str, tuple[str, float]]" = {}
+# 第三位 meta（issue IKS5FW）：{"ext","type","level"} 为取链实际交付格式，
+# 供取流/直连路径决定扩展名（网易 CDN 会把 flac 错报 audio/mpeg）；
+# 旧代码/测试注入的二元组仍按"无 meta"兼容。
+_NETEASE_URL_PIN: "dict[str, tuple[str, float, dict]]" = {}
 # 钉链表容量上限：过期是惰性清理（同 key 再查才剔），必须配硬顶防进程
 # 生命周期内无限增长（与洛雪取链缓存同思路）
 _NETEASE_URL_PIN_MAX = 1024
@@ -3874,12 +3923,13 @@ def _netease_url_pin_drop(song_id: str, reason: str = "invalid_response") -> Non
     pin = _NETEASE_URL_PIN.get(key)
     if pin:
         # 保留有界的失效标记，让后台普通调用也旁路旧成功缓存；不是负缓存。
-        _NETEASE_URL_PIN[key] = (pin[0], 0.0)
+        # meta 随失效标记保留：URL 虽已不可信，格式判定仍可复用（同 rendition）。
+        _NETEASE_URL_PIN[key] = (pin[0], 0.0, pin[2] if len(pin) > 2 else {})
         _NETEASE_PREHEATED_PINS.pop(key, None)
         fn_diag(logger, "netease_pin_invalid", song_id=key, reason=reason)
 
 
-def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
+def _netease_url_pin_store(song_id: str, url: str, ttl: float, meta: "dict | None" = None) -> None:
     """写入钉链并做容量治理：先清已过期项，仍满则淘汰最早过期者。"""
     now = time.monotonic()
     if len(_NETEASE_URL_PIN) >= _NETEASE_URL_PIN_MAX:
@@ -3890,7 +3940,19 @@ def _netease_url_pin_store(song_id: str, url: str, ttl: float) -> None:
             oldest = min(_NETEASE_URL_PIN, key=lambda k: _NETEASE_URL_PIN[k][1])
             _NETEASE_URL_PIN.pop(oldest, None)
             _NETEASE_PREHEATED_PINS.pop(oldest, None)
-    _NETEASE_URL_PIN[str(song_id)] = (url, now + ttl)
+    _NETEASE_URL_PIN[str(song_id)] = (url, now + ttl, dict(meta or {}))
+
+
+def _netease_pin_media(song_id: str) -> dict:
+    """读取网易钉链携带的实际交付格式元数据（issue IKS5FW）。
+
+    兼容旧形态/测试注入的二元组：无 meta 时返回空 dict，调用方回落旧链路。
+    """
+    pin = _NETEASE_URL_PIN.get(str(song_id))
+    if not pin or len(pin) < 3:
+        return {}
+    meta = pin[2]
+    return meta if isinstance(meta, dict) else {}
 
 
 def _sync_netease_quality() -> None:
@@ -4119,14 +4181,25 @@ async def _resolve_netease_url_uncached(client: httpx.AsyncClient, song_id: str,
                             ttl = min(max(expi - 60.0, 1.0), 1800.0) if expi > 0 else 300.0
                             if inner.get("reuse_for_s") is not None:
                                 ttl = min(ttl, max(0.0, float(inner["reuse_for_s"])))
+                            # issue IKS5FW：随钉链/解析详情携带实际交付格式（type/level
+                            # 权威）——网易 CDN 会把 flac 错报为 audio/mpeg，Content-Type
+                            # 不可作判据；网易行无 ext 字段，由 type/level 推导，缺失时
+                            # 回落旧 ext 字段，仍无则交由既有兜底链（info/魔数/CT）。
+                            media_meta = {
+                                "ext": _ext_from_netease_media(inner),
+                                "type": str(inner.get("type") or ""),
+                                "level": str(inner.get("level") or ""),
+                            }
                             result = {
-                                "url": url, "ext": str(inner.get("ext") or "").lower(),
+                                "url": url,
+                                "ext": str(media_meta["ext"] or inner.get("ext") or "").lower(),
                                 "actual_quality": _netease_quality_evidence(inner),
                                 "requested_quality": q, "reuse_for_s": ttl,
                             }
                             if quality_override is None and purpose == "playback":
-                                _netease_url_pin_store(key, url, ttl)
+                                _netease_url_pin_store(key, url, ttl, media_meta)
                             fn_diag(logger, "netease_resolved", song_id=key, quality=q,
+                                    ext=media_meta["ext"] or "?", media_type=media_meta["type"] or "?",
                                     ms=int((time.monotonic()-started)*1000), fresh=fresh, purpose=purpose)
                             return result if return_details else url
         except Exception as e:
@@ -6924,6 +6997,12 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             finally:
                 if info_task is not None and not info_task.done():
                     info_task.cancel()
+            if source == "netease":
+                # issue IKS5FW：扩展名以取链钉链携带的实际交付格式（type/level）
+                # 为准；目录启发式（info.ext 按 has_sq/has_hr 推 flac）只作兜底
+                # ——无损无权限降档交付 mp3 时，按目录命名 .flac 同样是错标。
+                resolve_ext = str(_netease_pin_media(song_id).get("ext") or "").lower()
+                ext = resolve_ext or ext
             ext = ext or (info or {}).get("ext")
             # Read timeout must tolerate CDN throttling mid-file: a flat 10s
             # timeout kills long pauses between chunks and surfaces as playback
@@ -6996,6 +7075,11 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if fresh_url:
                     _lx_fresh_cooldown_mark(lx_pin_key or song_id)
             return None
+        if source == "netease" and not ext:
+            # issue IKS5FW 兜底：取链响应缺 type/level（或钉链为旧形态无 meta）
+            # 时，用首字节魔数识别实际容器；网易 CDN 的 Content-Type 不可信
+            # （flac 错报 audio/mpeg）。只补空，绝不覆盖已有解析结果。
+            ext = _sniff_audio_ext(first)
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
         # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
@@ -7227,12 +7311,15 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
         url = await upgrade_netease_media_url(url)
         pin = _NETEASE_URL_PIN.get(song_id)
         info = _online_meta_for_request(request, guid) or {}
+        # issue IKS5FW：直连保存的扩展名同样以取链结果（钉链 meta）为准，
+        # 目录启发式只作兜底；网易 CDN Content-Type 不可信。
+        ext = str(_netease_pin_media(song_id).get("ext") or info.get("ext") or "")
         return DirectMediaTarget(
             provider=provider, platform="netease", canonical_id=song_id, url=str(url),
-            server_headers={"User-Agent": _MEDIA_UA_PC}, ext=str(info.get("ext") or ""),
+            server_headers={"User-Agent": _MEDIA_UA_PC}, ext=ext,
             resolved_at=now, reuse_deadline=_pin_deadline(pin[1] if pin else None),
             expiry_source="policy", source_generation=generation,
-            representation_key=_representation_key(url, "netease", info.get("ext")),
+            representation_key=_representation_key(url, "netease", ext),
         )
     if source == "lx":
         song_id = song_id_from_online_guid(guid)
@@ -7515,7 +7602,12 @@ async def _open_direct_save(request: Request, guid: str, target: DirectMediaTarg
         first = await anext(chunks, b"")
         if not first:
             return None
-        result = (response, owned, target.ext or ext_from_content_type(content_type),
+        ext = target.ext
+        if not ext and target.provider == "netease":
+            # issue IKS5FW：网易 CDN 会把 flac 错报为 audio/mpeg；扩展名缺失时
+            # 先按首字节魔数识别，Content-Type 只作最后兜底。
+            ext = _sniff_audio_ext(first)
+        result = (response, owned, ext or ext_from_content_type(content_type),
                   _online_meta_for_request(request, guid), chunks, first)
         response = owned = None
         return result

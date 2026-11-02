@@ -477,6 +477,80 @@ async def test_app_resolve_direct_target_netease_upgrades_http_to_https(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_app_resolve_direct_target_netease_ext_prefers_pin_meta(monkeypatch):
+    """issue IKS5FW：直连目标扩展名以取链钉链 meta（实际交付格式）为准。"""
+    song_id = "5257138"
+    guid = f"online:netease:{song_id}"
+    http_url = "http://m801.music.126.net/20261028/audio.flac?wsSecret=xyz"
+
+    async def mock_resolve(_client, _id):
+        return http_url
+
+    monkeypatch.setattr(proxy_app, "resolve_netease_url", mock_resolve)
+    monkeypatch.setattr(proxy_app, "_NETEASE_URL_PIN", {
+        song_id: (http_url, time.monotonic() + 300.0,
+                  {"ext": "flac", "type": "flac", "level": "lossless"})})
+
+    def probe_handler(_req):
+        return httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 0-1023/12764517"},
+            content=b"fLaC\x00\x00\x00\x22" + b"\x00" * 1014,
+        )
+
+    real_upgrade = netease_direct_mod.upgrade_netease_media_url
+
+    async def patched_upgrade(raw_url, **kwargs):
+        return await real_upgrade(
+            raw_url,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(probe_handler),
+        )
+
+    monkeypatch.setattr(netease_direct_mod, "upgrade_netease_media_url", patched_upgrade)
+
+    target = await proxy_app._resolve_direct_target(make_request(), guid, "netease")
+    assert target.ext == "flac"
+
+
+@pytest.mark.asyncio
+async def test_app_resolve_direct_target_netease_ext_legacy_pin_falls_back(monkeypatch):
+    """issue IKS5FW：旧形态二元组钉链（无 meta）且无在线元数据 → ext 为空，不误报格式。"""
+    song_id = "5257139"
+    guid = f"online:netease:{song_id}"
+    http_url = "http://m801.music.126.net/20261028/audio.flac?wsSecret=xyz"
+
+    async def mock_resolve(_client, _id):
+        return http_url
+
+    monkeypatch.setattr(proxy_app, "resolve_netease_url", mock_resolve)
+    monkeypatch.setattr(proxy_app, "_NETEASE_URL_PIN", {
+        song_id: (http_url, time.monotonic() + 300.0)})
+    monkeypatch.setattr(proxy_app, "_online_meta_for_request", lambda _req, _guid: None)
+
+    def probe_handler(_req):
+        return httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 0-1023/12764517"},
+            content=b"fLaC\x00\x00\x00\x22" + b"\x00" * 1014,
+        )
+
+    real_upgrade = netease_direct_mod.upgrade_netease_media_url
+
+    async def patched_upgrade(raw_url, **kwargs):
+        return await real_upgrade(
+            raw_url,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(probe_handler),
+        )
+
+    monkeypatch.setattr(netease_direct_mod, "upgrade_netease_media_url", patched_upgrade)
+
+    target = await proxy_app._resolve_direct_target(make_request(), guid, "netease")
+    assert target.ext == ""
+
+
+@pytest.mark.asyncio
 async def test_app_resolve_direct_target_netease_fails_on_probe_failure(monkeypatch):
     song_id = "4040404"
     guid = f"online:netease:{song_id}"
