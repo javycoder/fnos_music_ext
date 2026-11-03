@@ -279,6 +279,14 @@ def test_redact_masks_secret_values():
     assert safe == "FNMUSIC_QUALITY_MODE=high port=8774"
 
 
+def test_redact_covers_llm_provider_and_auto_cache_keys():
+    """任务 4.3：脱敏覆盖新字段（密钥只走环境变量，不进日志缓存）。"""
+    out = fnlog.redact("FNMUSIC_LLM_PROVIDER=kilo FNMUSIC_LLM_API_KEY='sk-new' FNMUSIC_AUTO_CACHE_FIRST=true")
+    assert "sk-new" not in out
+    assert "API_KEY=***" in out
+    assert "FNMUSIC_LLM_PROVIDER=kilo" in out
+
+
 @pytest.mark.parametrize("text,secrets", [
     ("Authorization: Bearer " + "a" * 800 + "AUTH_TAIL", ["a" * 20, "AUTH_TAIL"]),
     ('"Authorization": "Bearer ' + "b" * 800 + 'AUTH_TAIL", "status": 200', ["b" * 20, "AUTH_TAIL"]),

@@ -31,6 +31,7 @@ def clean_album_state(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "recommend_cache"))
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("FNMUSIC_LLM_PROVIDER", "none")
     # persist 落盘路径与节流指针指向临时目录：任何 persist 登记都不得写到仓库/用户目录
     from proxy import app as app_mod
     monkeypatch.setattr(app_mod, "_ALBUM_REGISTRY_PATH", str(tmp_path / "album_registry.json"))

@@ -34,6 +34,7 @@ def setup_recommend_env(tmp_path, monkeypatch):
     monkeypatch.delenv("FNMUSIC_LLM_LIKED_ENABLED", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("FNMUSIC_LLM_PROVIDER", "none")
     # lxmusic 客户端默认 mock（404），防止每日推荐链路在测试中触达真实 127.0.0.1:8772
     app.state.lx_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
@@ -1421,6 +1422,7 @@ async def test_daily_case1_no_source_no_llm_local_random(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
+    monkeypatch.setenv("FNMUSIC_LLM_PROVIDER", "none")
     from proxy.app import build_online_track
 
     async with httpx.AsyncClient(

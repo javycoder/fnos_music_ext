@@ -335,11 +335,14 @@ def current_source_fingerprint(conf: dict | None = None) -> str:
     fields = {
         "musicdl_enabled": ("FNMUSIC_MUSICDL_ENABLED", False),
         "netease_enabled": ("FNMUSIC_NETEASE_ENABLED", False),
+        "neteasefree_enabled": ("FNMUSIC_NETEASEFREE_ENABLED", False),
         "lx_enabled": ("FNMUSIC_LX_ENABLED", False),
         "online_sources": ("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
         "lx_sources": ("LX_SOURCES", ""),
         "lx_source_url": ("LX_SOURCE_URL", ""),
         "lx_source_list": ("LX_SOURCE_LIST", "[]"),
+        "neteasefree_url": ("FNMUSIC_NETEASEFREE_URL", ""),
+        "netease_api_base": ("FNMUSIC_NETEASE_API_BASE", ""),
     }
     aliases = {"kugou": "kg", "kuwo": "kw", "netease": "wy", "163": "wy",
                "migu": "mg", "qq": "tx", "tencent": "tx"}
@@ -367,7 +370,8 @@ def current_source_fingerprint(conf: dict | None = None) -> str:
 
 def liked_config_fingerprint(source_fingerprint: str | None = None) -> str:
     material = json.dumps({
-        "engine": _LLM_ENGINE, "enabled": rec.llm_liked_enabled(), "base": rec.llm_base_url(),
+        "engine": _LLM_ENGINE, "enabled": rec.llm_liked_enabled(), "provider": rec.llm_provider(),
+        "base": rec.llm_base_url(),
         "key": hashlib.sha256(rec.llm_api_key().encode()).hexdigest(),
         "model": rec.llm_model(), "size": rec.llm_liked_size(),
         "source": current_source_fingerprint() if source_fingerprint is None else source_fingerprint,
@@ -581,12 +585,14 @@ async def _live_lx_sources(client, permitted: list[str] | None) -> list[str]:
 
 
 async def _fetch_new_candidates(musicbox_client, netease_enabled: bool,
-                                lx_client, lx_enabled: bool, lx_sources: list[str] | None) -> list[dict]:
+                                lx_client, lx_enabled: bool, lx_sources: list[str] | None,
+                                neteasefree_client=None) -> list[dict]:
     candidates = []
-    if netease_enabled and musicbox_client is not None:
+    active_client = musicbox_client if musicbox_client is not None else neteasefree_client
+    if netease_enabled and active_client is not None:
         try:
             candidates.extend(await rec.fetch_musicbox_recommend(
-                musicbox_client, "/api/v1/toplist", {"index": 1, "limit": 100}))
+                active_client, "/api/v1/toplist", {"index": 1, "limit": 100}))
         except Exception as error:
             logger.warning("liked netease new-song fetch failed: %s", error)
     if lx_enabled and lx_client is not None:
@@ -661,6 +667,7 @@ async def build_llm_bundle(
     source_fingerprint: str | None = None, *, publication_guard=None,
     get_source_fingerprint=None, source_enabled=None, verify_playable=None,
     online_favorites=None, online_history: list[dict] | None = None,
+    neteasefree_client=None, neteasefree_enabled: bool = False,
 ) -> dict:
     """Build privately, then publish under the account lock without an intervening await.
 
@@ -739,7 +746,7 @@ async def build_llm_bundle(
     excluded_ids, favorite_keys = rec.collect_exclude_sets(favorites)
     excluded_keys.update(favorite_keys)
     try:
-        items = await _fetch_new_candidates(musicbox_client, netease_enabled, lx_client, lx_enabled, lx_sources)
+        items = await _fetch_new_candidates(musicbox_client, netease_enabled, lx_client, lx_enabled, lx_sources, neteasefree_client)
     except Exception as error:
         logger.warning("liked new candidates unavailable: %s", error)
         items = []
@@ -780,8 +787,21 @@ async def build_llm_bundle(
             if (not str(track.get("title") or "").strip() or built_key in excluded_keys
                     or built_key in online_keys or not allowed(track)):
                 continue
-            playable = (await _await_value(verify_playable(track)) if verify_playable is not None
-                        else await rec.verify_track_playable(track, None, musicbox_client, lx_client))
+            if verify_playable is not None:
+                try:
+                    playable = await _await_value(verify_playable(track))
+                except Exception:
+                    continue
+            else:
+                # 兼容旧单测四参桩（track/musicdl/musicbox/lx）与新五参签名。
+                try:
+                    playable = await _await_value(rec.verify_track_playable(
+                        track, None, musicbox_client, lx_client, neteasefree_client=neteasefree_client))
+                except TypeError:
+                    playable = await _await_value(rec.verify_track_playable(
+                        track, None, musicbox_client, lx_client))
+                except Exception:
+                    continue
             if not playable:
                 continue
             online_ids.add(identifier)

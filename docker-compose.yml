@@ -1,5 +1,5 @@
-# fnmusic-ext v2.0.0：三音源 + WebUI 合并为单容器 fnmusic-sources（supervisor 按需加载）。
-# 音源三选一：FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_LX_ENABLED
+# fnmusic-ext v2.0.0：四音源 + WebUI 合并为单容器 fnmusic-sources（supervisor 按需加载）。
+# 音源四选一：FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED / FNMUSIC_NETEASEFREE_ENABLED / FNMUSIC_LX_ENABLED
 # 只写一个 true；entrypoint.sh 按 /repo/.env 只启动所选音源进程，未启用的不驻留内存。
 # 运行期切源在 WebUI（8774）内完成：写 .env + 同容器 supervisorctl stop/start，秒级生效。
 #
@@ -29,6 +29,7 @@ services:
     ports:
       - "127.0.0.1:8768:8001"  # musicdl（代理访问）
       - "127.0.0.1:8770:8002"  # musicbox（仅本机；扫码走已登录的 WebUI）
+      - "127.0.0.1:8776:8006"  # neteasefree（免扫码后端；对外 8776，容器内 8006）
       - "127.0.0.1:8772:8003"  # lxmusic（代理访问）
       - "127.0.0.1:8774:8004"  # WebUI（仅本机；浏览器走飞牛网关）
     volumes:

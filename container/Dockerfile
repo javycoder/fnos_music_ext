@@ -1,4 +1,4 @@
-# fnmusic-sources 统一镜像：musicdl + musicbox + lxmusic + webui 四进程（supervisor 管理，按需启动）
+# fnmusic-sources 统一镜像：musicdl + musicbox + neteasefree + lxmusic + webui 六进程（supervisor 管理，按需启动）
 # 基础镜像引用可由 build args 覆盖（默认官方源；国内网络自动回退见根目录 ensure_base_image.sh）
 ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE}
@@ -66,11 +66,12 @@ RUN set -eu; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
 
-# 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装）
+# 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装；现为五个服务，含 neteasefree）
 # 构建容器 DNS 失败自愈同 apt 步骤（resolv.conf 改写不跨 RUN 层持久，需每步自带）；
 # 镜像源安装失败自动回退官方 PyPI 重试
 COPY musicdl-service/requirements.txt /srv/req.musicdl
 COPY musicbox-service/requirements.txt /srv/req.musicbox
+COPY neteasefree-service/requirements.txt /srv/req.neteasefree
 COPY lxmusic-service/requirements.txt /srv/req.lxmusic
 COPY webui-service/requirements.txt /srv/req.webui
 RUN set -eu; \
@@ -82,10 +83,10 @@ RUN set -eu; \
         cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     fix_dns; \
-    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui \
+    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui
     || { echo "[WARN] pip 镜像源（${PIP_INDEX_URL}）安装失败，回退官方 PyPI 重试..." >&2; \
          pip install --no-cache-dir -i https://pypi.org/simple \
-            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
+            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
 RUN groupadd -g 1000 appuser \
@@ -155,6 +156,7 @@ RUN set -eu; \
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
 COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/worker.py /srv/musicdl-service/
 COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py /srv/musicbox-service/
+COPY --chown=appuser:appuser neteasefree-service/app.py neteasefree-service/netease_api.py neteasefree-service/netease_ext.py /srv/neteasefree-service/
 # 音质 + 播放编排新模块随本轮一并分发：
 #   proxy/quality_policy.py        —— A 组（主智能体）共享七档音质策略
 #   lxmusic-service/playback_policy.py —— B 组（洛雪）播放编排
@@ -165,7 +167,7 @@ COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_cli
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui/lxmusic/musicbox 复用 proxy 模块（.env 安全合并 + 统一日志 fnlog），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/publicplaylists.py proxy/quality_policy.py proxy/version.py /srv/proxy/
+COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/customplaylists.py proxy/publicplaylists.py proxy/quality_policy.py proxy/recommend.py proxy/version.py /srv/proxy/
 COPY --chown=appuser:appuser VERSION RELEASE_CHANNEL /srv/
 RUN chmod 0644 /srv/VERSION /srv/RELEASE_CHANNEL \
     && find /srv -name "*.py" -exec chmod 0644 {} + \
@@ -180,7 +182,7 @@ RUN chmod 0755 /usr/local/bin/env_flag.sh /usr/local/bin/entrypoint.sh /usr/loca
     && chmod 0644 /etc/supervisor/supervisord.conf
 
 USER appuser
-EXPOSE 8001 8002 8003 8004
+EXPOSE 8001 8002 8003 8004 8006
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/healthcheck.sh"]

@@ -181,7 +181,7 @@ def test_put_rejects_multi_provider(env_file):
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_LX_ENABLED": "true"}})
         assert r.status_code == 400
-        assert "三选一" in r.json()["error"]
+        assert "四选一" in r.json()["error"]
 
 
 def test_put_rejects_zero_provider(env_file):
@@ -615,6 +615,75 @@ def test_llm_protocol_roundtrip_and_rejects_bad_enum(env_file):
         bad = client.put("/api/config", json={"values": {"FNMUSIC_LLM_PROTOCOL": "graphql"}})
         assert bad.status_code == 400
         assert "chat/responses" in bad.json()["error"]
+
+
+def test_llm_provider_defaults_and_switch_clears_custom_key(env_file):
+    """任务 4.3：三档接入默认 kilo；切换到内置/关闭时清空自定义密钥。"""
+    with authed_client() as client:
+        view = client.get("/api/config").json()
+        assert view["values"]["FNMUSIC_LLM_PROVIDER"] == "kilo"
+        assert view["schema"]["FNMUSIC_LLM_PROVIDER"]["values"] == ["kilo", "custom", "none"]
+        assert view["schema"]["FNMUSIC_LLM_PROVIDER"]["reload"] == "hot"
+        bad = client.put("/api/config", json={"values": {"FNMUSIC_LLM_PROVIDER": "other"}})
+        assert bad.status_code == 400
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_PROVIDER": "custom",
+            "FNMUSIC_LLM_BASE_URL": "https://api.example.com/v1",
+            "FNMUSIC_LLM_API_KEY": "sk-secret",
+        }})
+        assert saved.status_code == 200
+        assert client.get("/api/config").json()["values"]["FNMUSIC_LLM_PROVIDER"] == "custom"
+        # 切换到内置时清空自定义密钥。
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_LLM_PROVIDER": "kilo"}})
+        assert saved.status_code == 200
+        values = client.get("/api/config").json()["values"]
+        assert values["FNMUSIC_LLM_PROVIDER"] == "kilo"
+        assert values["FNMUSIC_LLM_API_KEY"] == ""
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_LLM_API_KEY=''" in text
+
+
+def test_llm_provider_ui_bindings():
+    """任务 4.3：前端三档下拉与灰化联动接线齐全。"""
+    html = open("webui-service/static/index.html", encoding="utf-8").read()
+    js = open("webui-service/static/app.js", encoding="utf-8").read()
+    assert 'id="llm-provider"' in html
+    for val in ("kilo", "custom", "none"):
+        assert f'value="{val}"' in html
+    assert "FNMUSIC_LLM_PROVIDER" in js
+    assert '$("#llm-base").disabled' in js or '$("#llm-base")).disabled' in js
+
+
+def test_auto_cache_config_schema_and_hot_reload(env_file):
+    """任务 4.1/4.2：自动缓存与定时清理开关进 SCHEMA 且热重载。"""
+    with authed_client() as client:
+        view = client.get("/api/config").json()
+        for key in ("FNMUSIC_AUTO_CACHE_FIRST", "FNMUSIC_AUTO_CACHE_NEXT",
+                    "FNMUSIC_AUTO_CACHE_CLEANUP"):
+            assert view["values"][key] == "false"
+            assert view["schema"][key]["kind"] == "bool"
+            assert view["schema"][key]["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_AUTO_CACHE_FIRST": True,
+            "FNMUSIC_AUTO_CACHE_NEXT": True,
+            "FNMUSIC_AUTO_CACHE_CLEANUP": True,
+        }})
+        assert saved.status_code == 200
+        values = client.get("/api/config").json()["values"]
+        assert values["FNMUSIC_AUTO_CACHE_FIRST"] == "true"
+        assert values["FNMUSIC_AUTO_CACHE_NEXT"] == "true"
+        assert values["FNMUSIC_AUTO_CACHE_CLEANUP"] == "true"
+
+
+def test_auto_cache_ui_bindings():
+    """任务 4.1/4.2：缓存页与大模型页同步接线齐全。"""
+    html = open("webui-service/static/index.html", encoding="utf-8").read()
+    js = open("webui-service/static/app.js", encoding="utf-8").read()
+    for el in ("auto-cache-first", "auto-cache-next", "auto-cache-cleanup"):
+        assert f'id="{el}"' in html, el
+    assert "FNMUSIC_AUTO_CACHE_FIRST" in js
+    assert "FNMUSIC_AUTO_CACHE_NEXT" in js
+    assert "FNMUSIC_AUTO_CACHE_CLEANUP" in js
 
 
 @pytest.mark.parametrize("raw,expected", [

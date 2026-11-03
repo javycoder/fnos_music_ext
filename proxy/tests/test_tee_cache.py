@@ -444,6 +444,51 @@ async def test_full_fetch_dedup_and_failure_cooldown(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_auto_cache_first_and_prefetch_share_single_download(monkeypatch):
+    """任务 4.1：同一曲目同时命中预取与边听边存只下载一次（去重标记）。"""
+    guid = "online:migu:auto1"
+    calls = []
+    release = asyncio.Event()
+
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False):
+        calls.append(g)
+        await release.wait()
+        return None
+
+    monkeypatch.setattr(p, "_open_online_stream", fake_open)
+    monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
+    monkeypatch.setitem(p.CONF, "auto_cache_first", True)
+    monkeypatch.setitem(p.CONF, "auto_cache_next", True)
+    assert p.maybe_auto_cache_first(_fake_request(), guid) is True
+    # 同一 guid 再走边听边存/预取：已有在途任务，去重不再注册。
+    p._register_full_fetch(_fake_request(), guid)
+    assert p.maybe_prefetch_next(_fake_request(), "online:migu:other", next_guid=guid) is False
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*p._full_fetch_tasks.values()), timeout=5.0)
+    assert calls == [guid]
+
+
+@pytest.mark.anyio
+async def test_auto_cache_cleanup_keeps_library_files(monkeypatch, tmp_path):
+    """任务 4.2：定时清理只清滚动缓存与同名歌词，落库歌曲豁免。"""
+    from proxy import app as pa
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    rolling = cache / "online_kuwo_9.flac"
+    rolling.write_bytes(b"x" * 2048)
+    (cache / "online_kuwo_9.lrc").write_text("[00:00.00]x")
+    kept = lib / "artist - title.flac"
+    kept.write_bytes(b"y" * 2048)
+    monkeypatch.setitem(pa.CONF, "cache_dir", str(cache))
+    removed = pa.run_auto_cache_cleanup(str(cache))
+    assert str(rolling) in removed
+    assert not rolling.exists()
+    assert kept.exists()
+
+
+@pytest.mark.anyio
 async def test_full_fetch_skips_when_cached_or_tee_off(monkeypatch):
     """缓存已命中或边听边存关闭时不注册下载任务。"""
     called = []

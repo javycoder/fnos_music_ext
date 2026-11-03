@@ -52,6 +52,27 @@ def test_proxy_interval_parser_matches_persisted_configuration(raw):
     assert pa._safe_liked_number(raw, .5) == float(raw)
 
 
+def test_llm_provider_defaults_kilo_and_hot_reload(monkeypatch, tmp_path):
+    """任务 4.3：默认 kilo 免配置可用；三档支持热重载。"""
+    from proxy import app as pa
+    monkeypatch.delenv("FNMUSIC_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
+    assert rec.llm_provider() == "kilo"
+    assert rec.llm_enabled() is True
+    monkeypatch.setenv("FNMUSIC_LLM_PROVIDER", "none")
+    assert rec.llm_enabled() is False
+    monkeypatch.setenv("FNMUSIC_LLM_PROVIDER", "custom")
+    monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "")
+    monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "")
+    assert rec.llm_enabled() is False
+    env = tmp_path / "settings.env"
+    env.write_text("FNMUSIC_LLM_PROVIDER=custom\n")
+    monkeypatch.setitem(pa.CONF, "llm_provider", "kilo")
+    assert pa.apply_env_hot_reload(str(env)) == ["llm_provider"]
+    assert pa.CONF["llm_provider"] == "custom"
+
+
 def test_large_liked_interval_applies_on_hot_reload(tmp_path, monkeypatch):
     from proxy import app as pa
     monkeypatch.setitem(pa.CONF, "liked_refresh_hours", .5)

@@ -313,6 +313,7 @@ test("大模型：取消猜你喜欢隐藏但不清空，保存不覆盖已存�
 test("大模型：任一用途显式勾选且接口不完整才警告，输入即时更新", async () => {
   for (const flag of ["#llm-liked", "#llm-daily"]) {
     reset();
+    enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LLM_PROVIDER: "custom" } });
     await global.loadConfig();
     els.get(flag).checked = true;
     els.get(flag).dispatch("change");
@@ -776,6 +777,43 @@ test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", asyn
   enqueue("/app/fnmusic-ext/api/config", { values: {} });
   await global.loadConfig();
   assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
+});
+
+test("大模型三档：内置灰化禁用，仅自定义档可填，切换清空密钥", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LLM_PROVIDER: "kilo" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#llm-provider").value, "kilo");
+  assert.strictEqual(els.get("#llm-base").disabled, true);
+  assert.strictEqual(els.get("#llm-key").disabled, true);
+  els.get("#llm-provider").value = "custom";
+  els.get("#llm-provider").dispatch("change");
+  assert.strictEqual(els.get("#llm-base").disabled, false);
+  assert.strictEqual(els.get("#llm-key").disabled, false);
+  els.get("#llm-base").value = "https://api.example.com/v1";
+  els.get("#llm-key").value = "sk-secret";
+  const customValues = global.collectConfig();
+  assert.strictEqual(customValues.FNMUSIC_LLM_PROVIDER, "custom");
+  assert.strictEqual(customValues.FNMUSIC_LLM_API_KEY, "sk-secret");
+  els.get("#llm-provider").value = "kilo";
+  els.get("#llm-provider").dispatch("change");
+  assert.strictEqual(els.get("#llm-key").value, "");
+  assert.strictEqual(global.collectConfig().FNMUSIC_LLM_API_KEY, "");
+});
+
+test("自动缓存：边听边存页与目录设置页回填收集", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_AUTO_CACHE_FIRST: "true", FNMUSIC_AUTO_CACHE_NEXT: "true", FNMUSIC_AUTO_CACHE_CLEANUP: "true",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#auto-cache-first").checked, true);
+  assert.strictEqual(els.get("#auto-cache-next").checked, true);
+  assert.strictEqual(els.get("#auto-cache-cleanup").checked, true);
+  const values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_AUTO_CACHE_FIRST, true);
+  assert.strictEqual(values.FNMUSIC_AUTO_CACHE_NEXT, true);
+  assert.strictEqual(values.FNMUSIC_AUTO_CACHE_CLEANUP, true);
 });
 
 test("储存目录：loadConfig 回填 + collectConfig 收集 + 格式/互斥校验", async () => {

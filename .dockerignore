@@ -1,7 +1,8 @@
-# 统一镜像构建上下文：只送四个服务目录 + container/，仓库其余内容（数据/缓存/密钥）不进镜像
+# 统一镜像构建上下文：只送五个服务目录 + container/，仓库其余内容（数据/缓存/密钥）不进镜像
 *
 !musicdl-service/
 !musicbox-service/
+!neteasefree-service/
 !lxmusic-service/
 !webui-service/
 !container/
@@ -18,6 +19,8 @@ proxy/*
 !proxy/version.py
 !proxy/llm_usage.py
 !proxy/media_url.py
+!proxy/customplaylists.py
+!proxy/recommend.py
 # A 组（主智能体）共享七档音质策略，逐團隊并行合入期间先放行
 !proxy/quality_policy.py
 **/__pycache__/

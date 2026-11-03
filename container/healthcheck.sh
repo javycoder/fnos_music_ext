@@ -15,9 +15,10 @@ export_source_env
 # 单个服务的 HTTP 探活上限；健康检查整体还要给 Docker 的 --timeout=10s 让路，
 # 因此取 3s：慢初始化不会拖死健康检查，也不至于把瞬时抖动判成故障。
 HEALTH_HTTP_TIMEOUT="${HEALTH_HTTP_TIMEOUT:-3}"
-# 容器形态的固定内部端口；native 形态的服务借用 ENTRY 时由环境覆盖。
+# 容器形态的固定内部端口（8006=neteasefree）；native 形态的服务借用 ENTRY 时由环境覆盖。
 LX_MUSIC_HEALTH_URL="${LX_MUSIC_HEALTH_URL:-http://127.0.0.1:8003/healthz}"
 LX_SERVER_HEALTH_URL="${LX_SERVER_HEALTH_URL:-http://127.0.0.1:8005/api/status}"
+NETEASEFREE_HEALTH_URL="${NETEASEFREE_HEALTH_URL:-http://127.0.0.1:8006/healthz}"
 
 running() {
     supervisorctl -c "$SUP_CONF" status "$1" 2>/dev/null | grep -q "RUNNING"
@@ -83,10 +84,21 @@ check_lx_http() {
 
 check musicdl FNMUSIC_MUSICDL_ENABLED
 check musicbox FNMUSIC_NETEASE_ENABLED
+# 第四源 neteasefree：进程层 + HTTP 层双探活（与 musicbox 同级）。
+if [ "$(env_flag FNMUSIC_NETEASEFREE_ENABLED)" = "true" ]; then
+    checked=$((checked + 1))
+    if ! running neteasefree; then
+        echo "[healthcheck] neteasefree 应运行但状态异常" >&2
+        fail=1
+    elif ! check_lx_http neteasefree "$NETEASEFREE_HEALTH_URL"; then
+        fail=1
+    fi
+fi
 # 网易云歌单常驻（issue #38）：musicbox 非当前音源但常驻开启时应常驻运行。
 # 只捕捉崩溃循环（FATAL/BACKOFF）；webui 对账的主动停止（如未登录回收）属
 # 正常态，不算失败——避免 cookie 失效期间容器长期 unhealthy。
 if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
+   && [ "$(env_flag FNMUSIC_NETEASEFREE_ENABLED)" != "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_PLAYLIST_RESIDENT)" = "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ]; then
     checked=$((checked + 1))

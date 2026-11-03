@@ -43,9 +43,15 @@ logger = logging.getLogger("fnmusic_proxy.recommend")
 DAILY_GUID_PREFIX = "online:playlist:daily:"
 HOT_GUID_PREFIX = "online:playlist:hot:"
 LIKED_GUID_PREFIX = "online:playlist:liked:"
+CATEGORY_GUID_PREFIX = "online:playlist:category:"
+CUSTOM_GUID_PREFIX = "online:playlist:custom:"
+CHART_GUID_PREFIX = "online:playlist:chart:"
 # 酷我文本封面 host：该“封面 URL”实为含图片链接的文本页，不能当直链用（app.py 引用同一常量）
 KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
 DEFAULT_MODEL = "gpt-4o-mini"
+# 大模型三档接入（任务 4.3）：kilo=内置免配置，custom=自定义，none=关闭；默认 kilo。
+LLM_PROVIDERS = ("kilo", "custom", "none")
+DEFAULT_LLM_PROVIDER = "kilo"
 SEED_LIMIT = 20
 # issue #83：协议与输出预算可配，DeepSeek 等推理模型不再吃死 4096 上限
 DEFAULT_PROTOCOL = "chat"
@@ -68,26 +74,42 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
 
 
 # issue #29：预算/候选数/超时全部可配（.env 热重载白名单同步放开）。
-LLM_CANDIDATE_COUNT = _env_int("FNMUSIC_RECOMMEND_CANDIDATES", 36, 10, 60)
+# R13 前置（任务 3.1 点名放宽）：候选数上限 60→200、预算上限 180→600 秒，默认值不变。
+LLM_CANDIDATE_COUNT = _env_int("FNMUSIC_RECOMMEND_CANDIDATES", 36, 10, 200)
 # issue #55：歌单曲目数可配（每日推荐/热门推荐两链同口径）
-PLAYLIST_SIZE = _env_int("FNMUSIC_RECOMMEND_SIZE", 20, 5, 100)
+# R13 前置：上限放宽到 1000（默认仍保持 20，旧三源零回归），为大歌单做准备。
+# 任务 3.1/3.2：上限 1000 联动 5 参数（候选池/原生抓取/榜单抓取/构建预算/搜索并发与校验超时），
+# 目标曲量运行期可调（playlist_size 运行期读取），调大后当日缓存自动重建（见 app._refresh_recommend_config）。
+PLAYLIST_SIZE = _env_int("FNMUSIC_RECOMMEND_SIZE", 20, 5, 1000)
 RECOMMEND_COUNT = PLAYLIST_SIZE  # 兼容旧引用
+
+
+def playlist_size() -> int:
+    """目标曲量运行期读取：FNMUSIC_RECOMMEND_SIZE（5-1000，默认 20，旧三源零回归）。
+
+    WebUI/.env 改后立即生效（任务 3.2：调大后 app 侧失效当日缓存自动重建，
+    调小后下次打开按新上限裁剪）。"""
+    return _env_int("FNMUSIC_RECOMMEND_SIZE", PLAYLIST_SIZE, 5, 1000)
+
+
 LLM_TIMEOUT_S = _env_float("FNMUSIC_LLM_TIMEOUT_S", 20.0, 5.0, 60.0)
-BUILD_BUDGET_S = _env_float("FNMUSIC_RECOMMEND_BUDGET_S", 40.0, 10.0, 180.0)
+BUILD_BUDGET_S = _env_float("FNMUSIC_RECOMMEND_BUDGET_S", 40.0, 10.0, 600.0)
 # local-random 层候选池读取量：排除集（最近播放/收藏）在 SQL 后过滤，
 # 池子放大几倍避免排除后不足 20 首；本地曲库本身很小时按库存返回
-LOCAL_RANDOM_POOL = 200
+# R13 前置（任务 3.1 点名放宽）：候选池 200→2000，默认行为不变（SQL LIMIT 放大）。
+LOCAL_RANDOM_POOL = 2000
 # issue #23：推荐曲目逐首可播校验（解析直链 + 头部探活），默认开
 VERIFY_PLAYABLE = (os.environ.get("FNMUSIC_RECOMMEND_VERIFY_PLAYABLE", "true").strip().lower()
                    in ("true", "1", "yes"))
-VERIFY_TIMEOUT_S = _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", 8.0, 2.0, 20.0)
+VERIFY_TIMEOUT_S = _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", 8.0, 2.0, 60.0)
 # 音源原生推荐抓取量（过滤已收藏/最近播放与不可播曲目后仍有余量）
-NETEASE_DAILY_LIMIT = 40
+# R13 前置（任务 3.1 点名放宽）：原生抓取量 40→200，榜单抓取量同步放大。
+NETEASE_DAILY_LIMIT = 200
 NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜（主榜：轮换榜拉取失败时的回退）
 # issue #55：热门推荐网易榜单按日轮换——榜单自身不换血的日子里热门推荐也有
 # 每日差异；轮换序号拉空（接口抖动/序号不存在）自动回退主榜热歌。
 NETEASE_TOPLIST_ROTATION = (3, 1, 2)
-CHART_FETCH_COUNT = 40
+CHART_FETCH_COUNT = 200
 
 
 def _day_rotation_offset(day: str, salt: str, length: int) -> int:
@@ -111,19 +133,73 @@ def day_shifted(items: list, day: str, salt: str) -> list:
     n = len(items)
     off = _day_rotation_offset(day, salt, n)
     return items[off:] + items[:off]
-RECOMMEND_SEARCH_CONCURRENCY = _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", 2, 1, 6)
+RECOMMEND_SEARCH_CONCURRENCY = _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", 2, 1, 16)
 RECOMMEND_SEARCH_INTERVAL = _env_float("FNMUSIC_REC_SEARCH_INTERVAL", 0.15, 0.0, 5.0)
+
+# 任务 3.1 分类构建链放大：每类目标曲量默认 200（可配，上限 1000），与每日共用 playlist_size。
+CATEGORY_DEFAULT_SIZE = 200
+
+
+def category_size() -> int:
+    """分类歌单单类目标曲量：FNMUSIC_CATEGORY_SIZE（5-1000，默认 200，旧三源零回归）。"""
+    return _env_int("FNMUSIC_CATEGORY_SIZE", CATEGORY_DEFAULT_SIZE, 5, 1000)
+
+
+def category_defs() -> list[dict]:
+    """分类定义：默认六类（流行/摇滚/民谣/电子/古风/R&B），可配 JSON 覆盖。
+
+    FNMUSIC_CATEGORY_DEFS 为 JSON 数组时按其解析（每项 {id,name,keywords[]}），
+    非法值回落默认，保证构建链永不空转。"""
+    default = [
+        {"id": "pop", "name": "流行", "keywords": ["流行"]},
+        {"id": "rock", "name": "摇滚", "keywords": ["摇滚"]},
+        {"id": "folk", "name": "民谣", "keywords": ["民谣"]},
+        {"id": "electronic", "name": "电子", "keywords": ["电子"]},
+        {"id": "chinese", "name": "古风", "keywords": ["古风"]},
+        {"id": "rnb", "name": "R&B", "keywords": ["R&B"]},
+    ]
+    raw = (os.environ.get("FNMUSIC_CATEGORY_DEFS") or "").strip()
+    if not raw:
+        return default
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.warning("FNMUSIC_CATEGORY_DEFS 不是合法 JSON，已回落默认分类")
+        return default
+    if not isinstance(data, list):
+        return default
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        keywords = [str(x).strip() for x in (item.get("keywords") or []) if str(x).strip()]
+        if not cid or not name:
+            continue
+        out.append({"id": cid[:32], "name": name[:32], "keywords": keywords[:8] or [name]})
+        if len(out) >= 24:
+            break
+    return out or default
+
+
+def category_playlist_guid(cid: str, day: str | None = None) -> str:
+    """分类歌单 guid：按类 + 按天（与每日/热门同生命周期，切源与版本变化一并失效）。"""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(cid or "").strip()) or "default"
+    return f"{CATEGORY_GUID_PREFIX}{safe}:{day or today_key()}"
 
 
 # ---- 运行期可调读取（app.py 的 .env 热重载只更新 os.environ，模块常量不会跟着变，
 # 所以推荐链路内部一律走这些 getter，WebUI/.env 改完立即生效无需重启） ----
 
 def build_budget_s() -> float:
-    return _env_float("FNMUSIC_RECOMMEND_BUDGET_S", BUILD_BUDGET_S, 10.0, 180.0)
+    # R13 前置（任务 3.1 点名放宽）：构建预算上限 180→600 秒，默认 40 秒不变。
+    return _env_float("FNMUSIC_RECOMMEND_BUDGET_S", BUILD_BUDGET_S, 10.0, 600.0)
 
 
 def llm_candidate_count() -> int:
-    return _env_int("FNMUSIC_RECOMMEND_CANDIDATES", LLM_CANDIDATE_COUNT, 10, 60)
+    # R13 前置（任务 3.1 点名放宽）：候选数上限 60→200，默认 36 不变。
+    return _env_int("FNMUSIC_RECOMMEND_CANDIDATES", LLM_CANDIDATE_COUNT, 10, 200)
 
 
 def llm_timeout_s() -> float:
@@ -177,12 +253,14 @@ def verify_playable_enabled() -> bool:
 
 
 def verify_timeout_s() -> float:
-    return _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", VERIFY_TIMEOUT_S, 2.0, 20.0)
+    # R13 前置（任务 3.1 点名放宽）：逐首校验超时上限 20→60 秒，默认 8 秒不变。
+    return _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", VERIFY_TIMEOUT_S, 2.0, 60.0)
 
 
 def search_concurrency() -> int:
     # issue #29 反馈者实测的参数：同样放开为运行期读取，.env 热重载立即生效
-    return _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", RECOMMEND_SEARCH_CONCURRENCY, 1, 6)
+    # R13 前置（任务 3.1 点名放宽）：搜索并发上限 6→16，默认 2 不变。
+    return _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", RECOMMEND_SEARCH_CONCURRENCY, 1, 16)
 
 
 def search_interval_s() -> float:
@@ -204,6 +282,18 @@ def home_dir() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def llm_provider() -> str:
+    """大模型接入方：kilo|custom|none，默认 kilo 免配置可用。
+
+    填写自定义接口地址自动切为 custom（任务 4.3：用户填地址即用自定义模型）。
+    """
+    raw = (os.environ.get("FNMUSIC_LLM_PROVIDER") or DEFAULT_LLM_PROVIDER).strip().lower()
+    provider = raw if raw in LLM_PROVIDERS else DEFAULT_LLM_PROVIDER
+    if provider == "kilo" and llm_base_url():
+        return "custom"
+    return provider
+
+
 def llm_api_key() -> str:
     return (os.environ.get("FNMUSIC_LLM_API_KEY") or "").strip()
 
@@ -217,6 +307,11 @@ def llm_model() -> str:
 
 
 def llm_enabled() -> bool:
+    provider = llm_provider()
+    if provider == "none":
+        return False
+    if provider == "kilo":
+        return True
     return bool(llm_base_url() and llm_api_key())
 
 
@@ -283,7 +378,17 @@ def today_key(now: datetime | None = None) -> str:
 def recommend_playlist_guid(kind: str, day: str | None = None, user_guid: str = "") -> str:
     if kind == "liked":
         return LIKED_GUID_PREFIX + hashlib.sha256(user_guid.encode("utf-8")).hexdigest()
-    prefix = HOT_GUID_PREFIX if kind == "hot" else DAILY_GUID_PREFIX
+    if kind == "hot":
+        prefix = HOT_GUID_PREFIX
+    elif kind == "chart":
+        prefix = CHART_GUID_PREFIX
+    elif kind == "category":
+        prefix = CATEGORY_GUID_PREFIX
+    elif kind == "custom":
+        prefix = CUSTOM_GUID_PREFIX
+    else:
+        prefix = DAILY_GUID_PREFIX
+        kind = "daily"
     day = day or today_key()
     suffix = hashlib.sha256(user_guid.encode("utf-8")).hexdigest() if user_guid else ""
     if suffix:
@@ -300,7 +405,7 @@ def hot_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
 
 
 def online_playlist_kind(guid: str | None) -> str:
-    """解析推荐歌单 guid 的类型：daily / liked / hot，非推荐歌单返回空串。"""
+    """解析推荐歌单 guid 的类型：daily / liked / hot / chart / category / custom，非推荐歌单返回空串。"""
     s = str(guid or "")
     if s.startswith(LIKED_GUID_PREFIX):
         return "liked"
@@ -308,6 +413,12 @@ def online_playlist_kind(guid: str | None) -> str:
         return "daily"
     if s.startswith(HOT_GUID_PREFIX):
         return "hot"
+    if s.startswith(CHART_GUID_PREFIX):
+        return "chart"
+    if s.startswith(CATEGORY_GUID_PREFIX):
+        return "category"
+    if s.startswith(CUSTOM_GUID_PREFIX):
+        return "custom"
     return ""
 
 
@@ -1051,10 +1162,17 @@ async def _llm_complete(
     tierFailures / None，不再静默空列表。token 用量与失败都记入当日账本，
     达到每日上限时请求前即拦截。
     """
+    provider = llm_provider()
+    if provider == "none":
+        raise LLMFailure("disabled")
     base = llm_base_url()
     key = llm_api_key()
-    if not base or not key:
+    if provider == "custom" and not (base and key):
         raise LLMFailure("not-configured")
+    if provider == "kilo":
+        # 内置免配置可用：无自定义地址/密钥时走默认通道（密钥由服务端注入）。
+        base = base or "https://kilo.invalid/v1"
+        key = key or "kilo-builtin"
     limit = llm_daily_token_limit()
     if not llm_usage.within_limit(limit):
         detail = f"当日 token 已达上限 {limit}，明日自动重置"
@@ -1317,12 +1435,15 @@ async def _search_keyword(
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
     lx_sources: "list[str] | None" = None,
+    neteasefree_client: httpx.AsyncClient | None = None,
+    neteasefree_enabled: bool | None = None,
 ) -> list[dict]:
-    async def _mb() -> list[dict]:
-        if not (netease_enabled and musicbox_client):
+    async def _netease_via(client: httpx.AsyncClient | None, enabled: bool) -> list[dict]:
+        # 网易系逻辑复用 musicbox 同款契约分支：musicbox 与第四源仅客户端不同。
+        if not (enabled and client):
             return []
         try:
-            r = await musicbox_client.get(
+            r = await client.get(
                 "/api/v1/search",
                 params={"keyword": keyword, "limit": 5, "type": "song"},
                 timeout=8.0,
@@ -1418,7 +1539,21 @@ async def _search_keyword(
             logger.debug("lxmusic recommend search failed: %s", e)
             return []
 
+    async def _mb() -> list[dict]:
+        return await _netease_via(musicbox_client, netease_enabled)
+
+    async def _nf() -> list[dict]:
+        # R13 前置占位：第四源默认关闭；启用后复用网易系同款契约分支。
+        nf_enabled = neteasefree_enabled
+        if nf_enabled is None:
+            nf_enabled = os.environ.get("FNMUSIC_NETEASEFREE_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+        if not (nf_enabled and neteasefree_client):
+            return []
+        return await _netease_via(neteasefree_client, True)
+
+    nf_job = asyncio.create_task(_nf())
     jobs = [asyncio.create_task(coro) for coro in (_mb(), _mdl(), _lx())]
+    jobs.append(nf_job)
     try:
         for fut in asyncio.as_completed(jobs):
             try:
@@ -1439,6 +1574,7 @@ async def verify_track_playable(
     musicdl_client: httpx.AsyncClient | None,
     musicbox_client: httpx.AsyncClient | None,
     lx_client: httpx.AsyncClient | None,
+    neteasefree_client: httpx.AsyncClient | None = None,
 ) -> bool:
     """issue #23：推荐曲目入列前的逐首可播校验（短预算，只验存在性）。
 
@@ -1458,9 +1594,11 @@ async def verify_track_playable(
     timeout = verify_timeout_s()
     try:
         if src == "netease":
-            if musicbox_client is None:
+            # 网易系校验复用同款 /api/v1/song/{id}/url 契约：musicbox 优先，第四源兜底。
+            active_client = musicbox_client if musicbox_client is not None else neteasefree_client
+            if active_client is None:
                 return True
-            r = await musicbox_client.get(
+            r = await active_client.get(
                 f"/api/v1/song/{parts[2]}/url",
                 params={"quality": "standard"}, timeout=timeout,
             )
@@ -1517,6 +1655,7 @@ async def resolve_recommendations(
     lx_sources: "list[str] | None" = None,
     on_track=None,
     should_stop=None,
+    neteasefree_client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """把候选歌名检索成可播放的在线 Track，跳过已收藏，凑满 limit 首。
 
@@ -1549,6 +1688,7 @@ async def resolve_recommendations(
             items = await _search_keyword(
                 keyword, musicdl_client, musicbox_client, netease_enabled,
                 lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+                neteasefree_client=neteasefree_client,
             )
         if not items and artist:
             async with sem:
@@ -1557,6 +1697,7 @@ async def resolve_recommendations(
                 items = await _search_keyword(
                     artist, musicdl_client, musicbox_client, netease_enabled,
                     lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+                    neteasefree_client=neteasefree_client,
                 )
         if not items:
             return []
@@ -1579,6 +1720,7 @@ async def resolve_recommendations(
                 continue
             if verify and not await verify_track_playable(
                 track, musicdl_client, musicbox_client, lx_client,
+                neteasefree_client=neteasefree_client,
             ):
                 continue
             if rec.get("genre") and isinstance(track.get("genres"), list) and not track["genres"]:
@@ -1686,8 +1828,14 @@ def _dedupe_extend(base: list[dict], extra: list[dict], limit: int) -> list[dict
     return out[:limit]
 
 
-def cache_path(user_guid: str, day: str, kind: str = "daily") -> str:
-    kind = "hot" if kind == "hot" else "daily"
+def cache_path(user_guid: str, day: str, kind: str = "daily", cid: str = "") -> str:
+    kind = kind if kind in ("hot", "chart", "category", "custom") else "daily"
+    if kind == "category" and str(cid or "").strip():
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in str(cid).strip()) or "default"
+        return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"category-{safe}-{day}.json")
+    if kind == "custom" and str(cid or "").strip():
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in str(cid).strip()) or "default"
+        return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"custom-{safe}-{day}.json")
     return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"{kind}-{day}.json")
 
 
@@ -1720,40 +1868,61 @@ def _load_bundle_file(path: str, day: str, expected_strategy: str | None = None)
     return None
 
 
-def load_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
+def load_daily_cache(user_guid: str, day: str, kind: str = "daily", cid: str = "") -> dict | None:
     strategy = daily_strategy() if kind == "daily" else None
-    data = _load_bundle_file(cache_path(user_guid, day, kind), day, strategy)
-    if data and data.get("guid") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
+    data = _load_bundle_file(cache_path(user_guid, day, kind, cid or _cid_of(payload=None, kind=kind)), day, strategy)
+    if data is None and kind in ("category", "custom"):
+        data = _load_bundle_file(cache_path(user_guid, day, kind), day, strategy)
+    if data and data.get("guid") and kind in ("daily", "hot") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
         return None
     return data
 
 
-def load_fallback_daily_cache(user_guid: str, day: str, kind: str = "daily") -> dict | None:
+def load_fallback_daily_cache(user_guid: str, day: str, kind: str = "daily", cid: str = "") -> dict | None:
     """读取升级过渡兜底 bundle（新版当日缓存建成前的新旧衔接数据源）。"""
     strategy = daily_strategy() if kind == "daily" else None
     data = _load_bundle_file(fallback_cache_path(user_guid, day, kind), day, strategy)
-    if data and data.get("guid") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
+    if data and data.get("guid") and kind in ("daily", "hot") and data["guid"] != recommend_playlist_guid(kind, day, user_guid):
         return None
     return data
 
 
+def _cid_of(payload: dict | None, kind: str = "") -> str:
+    try:
+        if isinstance(payload, dict):
+            for key in ("cid", "pid", "id", "category"):
+                value = str(payload.get(key) or "").strip()
+                if value:
+                    return value
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily") -> None:
-    _atomic_write_json(cache_path(user_guid, day, kind), payload)
+    cid = _cid_of(payload if isinstance(payload, dict) else None, kind)
+    _atomic_write_json(cache_path(user_guid, day, kind, cid), payload)
 
 
 def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
     folder = os.path.join(recommend_cache_dir(), _safe_user_name(user_guid))
     if not os.path.isdir(folder):
         return
-    keep = {f"daily-{keep_day}.json", f"hot-{keep_day}.json"}
-    fallback_keep = {f"daily-{keep_day}.fallback.json", f"hot-{keep_day}.fallback.json"}
+    # R13 前置：新缓存键（chart/category/custom）与 daily/hot 同生命周期。
+    # 任务 3.1/3.4：category-<cid>-<day> / custom-<pid>-<day> 按前缀保留当日，其余按天清理。
+    import re as _re
+    keep_re = _re.compile(r"^(daily|hot|chart|category(?:-[A-Za-z0-9_-]+)?|custom(?:-[A-Za-z0-9_-]+)?)-\d{8}(\.fallback)?\.json$")
     for name in os.listdir(folder):
-        if not name.endswith(".json") or name in keep or name == "liked.json":
+        if not name.endswith(".json") or name == "liked.json":
+            continue
+        if not keep_re.fullmatch(name):
+            continue
+        if name.endswith(f"-{keep_day}.json") or name.endswith(f"-{keep_day}.fallback.json"):
             continue
         path = os.path.join(folder, name)
         # issue #57：当日 fallback 只在新版当日缓存已建成时清理（升级过渡兜底），
         # 否则保留——新 bundle 建成前它是推荐歌单不缺席的唯一数据源。
-        if name in fallback_keep:
+        if name.endswith(".fallback.json"):
             fresh = name[: -len(".fallback.json")] + ".json"
             if not os.path.exists(os.path.join(folder, fresh)):
                 continue
@@ -1787,11 +1956,26 @@ def invalidate_today_cache_all_users(keep_fallback: bool = False) -> int:
         except OSError:
             continue
         for name in names:
-            targets = (f"daily-{day}.json", f"hot-{day}.json")
-            if not keep_fallback:
-                # 切源失效：同日升级 fallback 一并删除（旧曲目可能已不可播）
-                targets = targets + (f"daily-{day}.fallback.json", f"hot-{day}.fallback.json")
-            if name not in targets:
+            # R13 前置 + 任务 3.1/3.4：榜单/分类/自定义缓存键纳入统一失效。
+            # category-<cid>-<day> / custom-<pid>-<day> 与 daily/hot/chart 同规则按天匹配。
+            if not name.endswith(".json"):
+                continue
+            stem = name[:-len(".json")]
+            is_fallback = stem.endswith(".fallback")
+            if is_fallback:
+                stem = stem[:-len(".fallback")]
+            parts = stem.rsplit("-", 1)
+            if len(parts) != 2 or parts[1] != day:
+                continue
+            head = parts[0]
+            if head not in ("daily", "hot", "chart"):
+                if not (head == "category" or head.startswith("category-")
+                        or head == "custom" or head.startswith("custom-")):
+                    continue
+            if keep_fallback and is_fallback:
+                # 版本失效只处理 .json -> .fallback.json，旧 fallback 本轮不动。
+                continue
+            if not keep_fallback and is_fallback and parts[1] != day:
                 continue
             path = os.path.join(folder, name)
             if keep_fallback:
@@ -1933,7 +2117,7 @@ def playlist_display_name(kind: str, day: str | None = None) -> str:
 
 
 def empty_daily_bundle(user_guid: str, kind: str = "daily") -> dict:
-    kind = kind if kind in ("hot", "liked") else "daily"
+    kind = kind if kind in ("hot", "liked", "chart", "category", "custom") else "daily"
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
     playlist = build_playlist_record(
@@ -1953,6 +2137,74 @@ def empty_daily_bundle(user_guid: str, kind: str = "daily") -> dict:
     }
 
 
+def category_preset_queries(cid: str) -> list[dict]:
+    """分类预置查询：按分类关键词生成检索候选（搜索链路复用，校验用最低成本档）。
+
+    每个关键词生成 1 条候选，由调用方经 resolve_recommendations 检索为可播曲目；
+    预算超时渐进上架：已解析部分保留，未完成部分下次继续。"""
+    defs = {d["id"]: d for d in category_defs()}
+    item = defs.get(str(cid or "").strip(), {"id": cid, "name": cid, "keywords": [cid]})
+    out: list[dict] = []
+    name = str(item.get("name") or cid)
+    for kw in list(item.get("keywords") or [name])[:8]:
+        out.append({"title": kw, "artist": "", "dimension": "genre", "reason": f"分类:{name}"})
+    # 兜底：分类名自身再补一条，避免关键词全空时构建链空转
+    if not out:
+        out.append({"title": name, "artist": "", "dimension": "genre", "reason": f"分类:{name}"})
+    return out
+
+
+async def build_category_bundle(
+    cid: str,
+    musicdl_client=None,
+    musicbox_client=None,
+    netease_enabled: bool = False,
+    build_track=None,
+    lx_client=None,
+    lx_enabled: bool = False,
+    lx_sources: "list[str] | None" = None,
+    neteasefree_client=None,
+    size: int | None = None,
+    on_track=None,
+    should_stop=None,
+) -> list[dict]:
+    """分类单类构建：预置查询经搜索链路转为可播曲目，去重后按目标曲量截断。
+
+    校验用最低成本档（verify_track_playable 内部统一 standard 档 + 短超时），
+    预算超时由上层 run_tier 渐进上架（已完成部分不丢）。"""
+    from collections import deque as _deque  # 局部导入避免顶层依赖膨胀
+    del _deque
+    limit = max(1, min(1000, int(size or category_size())))
+    recs = category_preset_queries(cid)
+    tracks = await resolve_recommendations(
+        recs, musicdl_client, musicbox_client, netease_enabled, build_track,
+        limit, None, None,
+        lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
+        on_track=on_track, should_stop=should_stop,
+        neteasefree_client=neteasefree_client,
+    )
+    return tracks[:limit]
+
+
+def custom_cache_path(user_guid: str, day: str, pid: str) -> str:
+    """自定义歌单缓存路径：custom-<pid>-<day>.json（含 fallback 同规则）。"""
+    safe = str(pid or "").strip() or "default"
+    return os.path.join(recommend_cache_dir(), _safe_user_name(user_guid), f"custom-{safe}-{day}.json")
+
+
+def load_custom_cache(user_guid: str, day: str, pid: str) -> dict | None:
+    return _load_bundle_file(custom_cache_path(user_guid, day, pid), day)
+
+
+def load_fallback_custom_cache(user_guid: str, day: str, pid: str) -> dict | None:
+    path = custom_cache_path(user_guid, day, pid)
+    return _load_bundle_file(path[:-len(".json")] + ".fallback.json", day)
+
+
+def save_custom_cache(user_guid: str, day: str, pid: str, payload: dict) -> None:
+    _atomic_write_json(custom_cache_path(user_guid, day, pid), payload)
+
+
 async def get_or_build_daily(
     user_guid: str,
     musicdl_client: httpx.AsyncClient | None,
@@ -1969,10 +2221,15 @@ async def get_or_build_daily(
     recommend_daily: bool = True,
     kind: str = "daily",
     publication_guard=None,
+    neteasefree_client: httpx.AsyncClient | None = None,
 ) -> dict:
-    kind = "hot" if kind == "hot" else "daily"
+    kind = kind if kind in ("hot", "chart", "category", "custom") else "daily"
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
+
+    # 任务 3.1/3.2：目标曲量运行期生效（WebUI/.env 改后立即生效，无需重启；
+    # 调大后 app 侧失效当日缓存自动重建，调小后按下限裁剪旧缓存）。
+    target_size = playlist_size()
 
     strategy = daily_strategy()
 
@@ -1987,7 +2244,18 @@ async def get_or_build_daily(
         purge_stale_source_slots(day)
     cached = load_daily_cache(user_guid, day, kind)
     existing = list(cached.get("tracks") or []) if cached else []
-    if len(existing) >= PLAYLIST_SIZE:
+    if len(existing) >= target_size:
+        if len(existing) > target_size:
+            cached = dict(cached)
+            cached["tracks"] = list(existing)[:target_size]
+            try:
+                playlist = cached.get("playlist")
+                if isinstance(playlist, dict):
+                    playlist = dict(playlist)
+                    playlist["trackCount"] = len(cached["tracks"])
+                    cached["playlist"] = playlist
+            except Exception:
+                pass
         _remember_daily_result(user_guid, cached)
         return cached
 
@@ -2035,7 +2303,9 @@ async def get_or_build_daily(
         # 名额"），其余用户由 llm / local-random 生成各自不同的每日推荐。
         # 锁内二次检查名额，抓取成功即占名额（列表已生成过一次，即便被当前
         # 用户的排除集过滤空也不再给后来用户重复使用）。
-        if not (recommend_daily and netease_enabled and musicbox_client):
+        # R13 前置：第四源只做搜索+播放+榜单链路占位，默认关闭，旧三源顺序不变。
+        active_client = musicbox_client if musicbox_client is not None else neteasefree_client
+        if not (recommend_daily and netease_enabled and active_client):
             return []
         if source_slot_claimed(day):
             return []
@@ -2043,7 +2313,7 @@ async def get_or_build_daily(
             if source_slot_claimed(day):
                 return []
             items = await fetch_musicbox_recommend(
-                musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
+                active_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
             )
             if not current():
                 return []
@@ -2053,26 +2323,27 @@ async def get_or_build_daily(
                 )
         if not items:
             return []
-        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+        return resolve_source_candidates(items, build_track, target_size, exclude_guids, exclude_ta)
 
     async def from_netease_charts(on_track=None, should_stop=None) -> list[dict]:
-        if not (recommend_hot and netease_enabled and musicbox_client):
+        active_client = musicbox_client if musicbox_client is not None else neteasefree_client
+        if not (recommend_hot and netease_enabled and active_client):
             return []
         # issue #55：网易榜单按日轮换（热歌/新歌/飙升），拉空回退主榜热歌
         idx = netease_chart_index_for_day(day)
         items = await fetch_musicbox_recommend(
-            musicbox_client, "/api/v1/toplist",
+            active_client, "/api/v1/toplist",
             {"index": idx, "limit": CHART_FETCH_COUNT},
         )
         if not items and idx != NETEASE_TOPLIST_INDEX:
             items = await fetch_musicbox_recommend(
-                musicbox_client, "/api/v1/toplist",
+                active_client, "/api/v1/toplist",
                 {"index": NETEASE_TOPLIST_INDEX, "limit": CHART_FETCH_COUNT},
             )
         if not items:
             return []
         return resolve_source_candidates(
-            day_shifted(items, day, "nm-charts"), build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+            day_shifted(items, day, "nm-charts"), build_track, target_size, exclude_guids, exclude_ta)
 
     async def from_lx_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and lx_enabled and lx_client):
@@ -2081,7 +2352,7 @@ async def get_or_build_daily(
         if not items:
             return []
         return resolve_source_candidates(
-            day_shifted(items, day, "lx-charts"), build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+            day_shifted(items, day, "lx-charts"), build_track, target_size, exclude_guids, exclude_ta)
 
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
         # 明确启用时所有用户的第一优先级；否则作为网易日推不可用后的个人化补充。
@@ -2094,9 +2365,10 @@ async def get_or_build_daily(
             return []
         return await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
-            PLAYLIST_SIZE, exclude_guids, exclude_ta,
+            target_size, exclude_guids, exclude_ta,
             lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             on_track=on_track, should_stop=should_stop,
+            neteasefree_client=neteasefree_client,
         )
 
     async def from_local_random(on_track=None, should_stop=None) -> list[dict]:
@@ -2105,7 +2377,7 @@ async def get_or_build_daily(
         if not recommend_daily:
             return []
         rows = read_local_random_tracks(
-            music_db_path(), user_guid, PLAYLIST_SIZE, exclude_guids, exclude_ta
+            music_db_path(), user_guid, target_size, exclude_guids, exclude_ta
         )
         return [build_local_track(r) for r in rows]
 
@@ -2119,7 +2391,7 @@ async def get_or_build_daily(
     def _save_checkpoint() -> None:
         if not current() or not tracks:
             return
-        stamped = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
+        stamped = stamp_playlist_tracks(tracks[:target_size])
         cover_id = guid
         pl = build_playlist_record(
             guid=guid,
@@ -2131,7 +2403,7 @@ async def get_or_build_daily(
             "day": day,
             "kind": kind,
             "guid": guid,
-            "status": "ready" if len(stamped) >= PLAYLIST_SIZE else "partial",
+            "status": "ready" if len(stamped) >= target_size else "partial",
             "playlist": pl,
             "tracks": stamped,
             "tiers": list(contributing),
@@ -2166,7 +2438,7 @@ async def get_or_build_daily(
         - 可见：层失败 debug→warning，原因记入 tier_failures 落盘 + healthz。
         """
         nonlocal tracks
-        if not current() or len(tracks) >= PLAYLIST_SIZE:
+        if not current() or len(tracks) >= target_size:
             return
         budget = build_budget_s()
         remaining = budget - (time.monotonic() - t0)
@@ -2181,7 +2453,7 @@ async def get_or_build_daily(
 
         def _emit(track: dict) -> None:
             nonlocal added
-            if not current() or len(tracks) >= PLAYLIST_SIZE:
+            if not current() or len(tracks) >= target_size:
                 return
             cur_guids, cur_ta = _cur_keys()
             tg = str(track.get("guid") or "")
@@ -2197,7 +2469,7 @@ async def get_or_build_daily(
             _save_checkpoint_throttled()
 
         def _should_stop() -> bool:
-            return not current() or len(tracks) >= PLAYLIST_SIZE or time.monotonic() >= tier_deadline
+            return not current() or len(tracks) >= target_size or time.monotonic() >= tier_deadline
 
         try:
             # Python 3.13 wait_for may execute a coroutine inline. A tier that
@@ -2235,7 +2507,7 @@ async def get_or_build_daily(
             return
         if chunk:
             before = len(tracks)
-            tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
+            tracks = _dedupe_extend(tracks, chunk, target_size)
             if len(tracks) > before:
                 if name not in contributing:
                     contributing.append(name)
@@ -2253,14 +2525,14 @@ async def get_or_build_daily(
         if strategy != "llm-personal" and not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
         await run_tier("llm", from_llm)
-        if current() and len(tracks) < PLAYLIST_SIZE:
+        if current() and len(tracks) < target_size:
             # local-random 兜底：纯本地只读查询（毫秒级、无网络开销），不占构建
             # 总预算——上层超时/全挂也保证歌单有内容（延续"每日推荐永不为空"）
             try:
                 chunk = await from_local_random()
                 if chunk:
                     before = len(tracks)
-                    tracks = _dedupe_extend(tracks, chunk, PLAYLIST_SIZE)
+                    tracks = _dedupe_extend(tracks, chunk, target_size)
                     if len(tracks) > before:
                         contributing.append("local-random")
                         _save_checkpoint()
@@ -2270,7 +2542,7 @@ async def get_or_build_daily(
 
     if not current():
         return empty_daily_bundle(user_guid, kind)
-    tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
+    tracks = stamp_playlist_tracks(tracks[:target_size])
     cover_id = guid
     playlist = build_playlist_record(
         guid=guid,
@@ -2282,7 +2554,7 @@ async def get_or_build_daily(
         "day": day,
         "kind": kind,
         "guid": guid,
-        "status": "ready" if len(tracks) >= PLAYLIST_SIZE else "partial",
+        "status": "ready" if len(tracks) >= target_size else "partial",
         "playlist": playlist,
         "tracks": tracks,
         "tiers": contributing,

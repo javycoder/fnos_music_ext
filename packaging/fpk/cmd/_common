@@ -116,7 +116,9 @@ fnmusic_env_source() {
 
 fnmusic_saved_source() {
     # Map the flags written by install.sh back to a --sources value.
+    # 优先级：musicbox > neteasefree > lxmusic > musicdl，避免升级后源漂移。
     if fnmusic_env_source FNMUSIC_NETEASE_ENABLED; then echo musicbox
+    elif fnmusic_env_source FNMUSIC_NETEASEFREE_ENABLED; then echo neteasefree
     elif fnmusic_env_source FNMUSIC_LX_ENABLED; then echo lxmusic
     elif fnmusic_env_source FNMUSIC_MUSICDL_ENABLED; then echo musicdl
     else echo ""; fi
@@ -125,6 +127,12 @@ fnmusic_saved_source() {
 fnmusic_saved_lx_url() {
     [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
     sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+}
+
+fnmusic_saved_neteasefree_api_base() {
+    # 第四源后端地址透传（类比 lx 的 saved_lx_url）：升级时原样带回 install.sh。
+    [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
+    sed -n 's/^FNMUSIC_NETEASE_API_BASE=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1 | tr -d "'\"" | tr -d '\r'
 }
 
 fnmusic_data_items() {

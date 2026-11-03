@@ -9,7 +9,7 @@
             {
                 "type": "radio",
                 "field": "wizard_sources",
-                "label": "初始音源（三选一）",
+                "label": "初始音源（四选一）",
                 "initValue": "musicdl",
                 "options": [
                     {
@@ -23,6 +23,10 @@
                     {
                         "label": "lxmusic — 洛雪自定义源（安装后在管理页配置源脚本：粘贴 URL / 上传 .js / NAS 选择）",
                         "value": "lxmusic"
+                    },
+                    {
+                        "label": "neteasefree — 网易云·免扫码（第三方后端，默认关闭；后端地址装后在管理台确认，仅支持 https）",
+                        "value": "neteasefree"
                     }
                 ],
                 "rules": [

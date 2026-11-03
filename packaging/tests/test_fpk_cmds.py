@@ -204,13 +204,15 @@ def test_common_repo_dir_precedence(sb):
 
 
 def test_common_saved_source_priority(sb):
-    """.env 三布尔→--sources：musicbox > lxmusic > musicdl，未配置为空。"""
+    """.env 四布尔→--sources：musicbox > neteasefree > lxmusic > musicdl，未配置为空。"""
     cases = [
         ("FNMUSIC_NETEASE_ENABLED=true\n", "musicbox"),
+        ("FNMUSIC_NETEASEFREE_ENABLED=true\n", "neteasefree"),
         ("FNMUSIC_LX_ENABLED=true\n", "lxmusic"),
         ("FNMUSIC_MUSICDL_ENABLED=true\n", "musicdl"),
-        # 三者并存取最高优先级，避免升级后源漂移
-        ("FNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "musicbox"),
+        # 四者并存取最高优先级，避免升级后源漂移
+        ("FNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_NETEASEFREE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "musicbox"),
+        ("FNMUSIC_NETEASEFREE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "neteasefree"),
         ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "lxmusic"),
         ("FNMUSIC_MUSICDL_ENABLED=false\n", ""),
         ("", ""),
@@ -224,6 +226,24 @@ def test_common_saved_source_priority(sb):
         assert out.stdout == expected, (env_text, out.stdout)
         # 用完即弃，下一轮重建干净 repo
         shutil.rmtree(sb.appdest / "repo")
+
+
+def test_common_saved_neteasefree_api_base_passthrough(sb):
+    """第四源后端地址透传：有值原样透传；重复键取最后一行；缺失返回空。"""
+    sb.make_repo(env_text="FNMUSIC_NETEASE_API_BASE='https://api.example.com/v1'\nOTHER=1\n")
+    script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
+              'printf \'%s\' "$(fnmusic_saved_neteasefree_api_base)"\n')
+    out = sb.bash(script)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "https://api.example.com/v1"
+    sb.make_repo(env_text="FNMUSIC_NETEASE_API_BASE='https://old.example/api'\nFNMUSIC_NETEASE_API_BASE='https://new.example/api'\n")
+    out = sb.bash(script)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "https://new.example/api"
+    sb.make_repo(env_text="OTHER=1\n")
+    out = sb.bash(script)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == ""
 
 
 def test_common_saved_lx_url(sb):
@@ -330,6 +350,14 @@ def test_install_callback_defaults_invalid_source_to_musicdl(sb):
     result = sb.run("install_callback", wizard_sources="bogus", wizard_extend="true")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == ["--non-interactive --sources musicdl --webui --adopt --extend"]
+
+
+def test_install_callback_accepts_neteasefree(sb):
+    """第四源向导值原样透传给 install.sh（默认关闭由 install.sh 落盘 false 保证）。"""
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="neteasefree", wizard_extend="true")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == ["--non-interactive --sources neteasefree --webui --adopt --extend"]
 
 
 def test_install_callback_lx_without_url_installs_sourceless(sb):
@@ -640,6 +668,17 @@ def test_upgrade_callback_restores_backup_and_reinstalls_lx(sb):
     assert sb.install_args() == [
         "--non-interactive --sources lxmusic --webui --extend --adopt --lx-source-url http://s/x.js --lx-skip-verify"]
     # 成功后备份目录删除
+    assert not (sb.pkgvar / "upgrade-backup").exists()
+
+
+def test_upgrade_callback_neteasefree_api_base_passthrough(sb):
+    """存量第四源升级：后端地址透传给 install.sh，不回退默认源。"""
+    repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
+    _make_backup(sb, repo, "FNMUSIC_NETEASEFREE_ENABLED=true\nFNMUSIC_NETEASE_API_BASE='https://api.example.com/v1'\n")
+    result = sb.run("upgrade_callback")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == [
+        "--non-interactive --sources neteasefree --webui --extend --adopt --neteasefree-api-base https://api.example.com/v1"]
     assert not (sb.pkgvar / "upgrade-backup").exists()
 
 

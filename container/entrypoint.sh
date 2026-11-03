@@ -114,18 +114,20 @@ wait_ready() {
     return 1
 }
 
-# 三选一音源：只启动 .env 选中的那个（多开视为异常，全部忽略只取第一个命中）
+# 三选一→四选一音源：只启动 .env 选中的那个（多开视为异常，全部忽略只取第一个命中）
 if [ "$(env_flag FNMUSIC_MUSICDL_ENABLED)" = "true" ]; then
     start_prog musicdl
 elif [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" = "true" ]; then
     start_prog musicbox
+elif [ "$(env_flag FNMUSIC_NETEASEFREE_ENABLED)" = "true" ]; then
+    start_prog neteasefree
 elif [ "$(env_flag FNMUSIC_LX_ENABLED)" = "true" ]; then
     start_prog lxserver
     start_prog lxmusic
     # 有界等待整条链路就绪；失败只记录，不停进程也不清空用户音源。
     wait_ready lxmusic "$LXMUSIC_HEALTH_URL" || true
 else
-    log "未配置任何音源（FNMUSIC_MUSICDL_ENABLED/FNMUSIC_NETEASE_ENABLED/FNMUSIC_LX_ENABLED 均未启用）"
+    log "未配置任何音源（FNMUSIC_MUSICDL_ENABLED/FNMUSIC_NETEASE_ENABLED/FNMUSIC_NETEASEFREE_ENABLED/FNMUSIC_LX_ENABLED 均未启用）"
 fi
 
 # 网易云歌单常驻（issue #38）：当前音源不是 musicbox 但勾选常驻，且有网易
@@ -166,6 +168,7 @@ sys.exit(0 if needed else 1)' "$ENV_FILE" "$(dirname "$0")/.."
 }
 
 if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
+   && [ "$(env_flag FNMUSIC_NETEASEFREE_ENABLED)" != "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_PLAYLIST_RESIDENT)" = "true" ] \
    && { public_musicbox_selected \
         || { [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ] && musicbox_cookie_present; }; }; then

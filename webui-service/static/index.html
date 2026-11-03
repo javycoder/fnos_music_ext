@@ -76,12 +76,17 @@
 
       <!-- 音乐源 -->
       <section class="page" id="page-source">
-        <h2><span>音乐源（三选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
+        <h2><span>音乐源（四选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
         <div class="provider-grid">
           <label class="provider-card" data-provider="musicbox">
             <input type="radio" name="provider" value="musicbox">
             <div class="provider-head">网易云音乐盒子</div>
             <div class="provider-desc">账号扫码登录，个人曲库/每日推荐原生支持</div>
+          </label>
+          <label class="provider-card" data-provider="neteasefree">
+            <input type="radio" name="provider" value="neteasefree">
+            <div class="provider-head">网易免扫码音源</div>
+            <div class="provider-desc">默认关闭，启用需填写后端地址并确认第三方风险</div>
           </label>
           <label class="provider-card" data-provider="musicdl">
             <input type="radio" name="provider" value="musicdl">
@@ -112,6 +117,20 @@
             <div class="card-title"><span>网易账号歌单</span><button class="help-btn" type="button" data-help="netease-playlists" aria-label="网易账号歌单帮助">?</button></div>
             <label class="switch-row"><span>音乐页显示网易账号歌单</span><input type="checkbox" id="netease-my-playlists"></label>
             <label class="switch-row"><span>网易云歌单常驻</span><input type="checkbox" id="netease-playlist-resident"></label>
+          </div>
+        </div>
+
+        <!-- neteasefree：后端地址 -->
+        <div class="subpanel" id="panel-neteasefree" hidden>
+          <div class="card">
+            <div class="card-title"><span>免扫码后端地址</span><button class="help-btn" type="button" data-help="neteasefree-backend" aria-label="免扫码后端帮助">?</button></div>
+            <label class="field"><span>后端服务地址（https）</span>
+              <input class="input" id="neteasefree-url" placeholder="https://自建后端地址">
+            </label>
+            <label class="field"><span>第三方后端地址（https 示例占位须确认）</span>
+              <input class="input" id="neteasefree-api-base" placeholder="https://zm.wwoyun.cn">
+            </label>
+            <p class="hint">默认关闭；默认地址仅为示例占位，启用须显式确认第三方风险；只允许 https 地址。</p>
           </div>
         </div>
 
@@ -224,6 +243,13 @@
           <div class="card-title"><span>推荐与公共歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
           <label class="switch-row"><span>热门榜单推荐</span><input type="checkbox" id="recommend-hot"></label>
           <label class="switch-row"><span>每日推荐</span><input type="checkbox" id="recommend-daily"></label>
+          <label class="field"><span>每日/热门目标曲量（5–1000，默认 20；调大后当日缓存自动重建）</span>
+            <input class="input" id="recommend-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
+          </label>
+          <label class="field"><span>分类单类目标曲量（5–1000，默认 200；调大后当日缓存自动重建）</span>
+            <input class="input" id="category-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
+          </label>
+          <label class="switch-row"><span>自定义歌单</span><input type="checkbox" id="custom-enabled"></label>
           <label class="switch-row"><span>公共歌单</span><input type="checkbox" id="public-playlists-enabled"></label>
           <div id="public-users-panel" class="stack" hidden>
             <div class="btn-row">
@@ -263,6 +289,21 @@
               <div id="public-selected" class="stack"></div>
             </div>
           </div>
+        </div>
+        <div class="card" id="custom-playlists-card">
+          <div class="card-title"><span>自定义歌单管理</span><button class="help-btn" type="button" data-help="custom-playlists" aria-label="自定义歌单帮助">?</button></div>
+          <p class="hint">支持 m3u/m3u8/pls/cue 导入解析歌名歌手（异常行跳过并提示计数），或按提示词调用大模型生成并与手动列表去重合并。定义文件落数据卷自定义歌单目录；删除为硬删除需二次确认。</p>
+          <div class="btn-row">
+            <input type="file" id="custom-import-file" accept=".m3u,.m3u8,.pls,.cue" hidden>
+            <button class="btn" id="custom-import-btn" type="button">导入歌单文件</button>
+            <button class="btn" id="custom-refresh-btn" type="button">刷新列表</button>
+          </div>
+          <div class="btn-row">
+            <input class="input grow" id="custom-prompt" placeholder="输入提示词，如：适合深夜加班的轻音乐 20 首" aria-label="生成提示词">
+            <button class="btn" id="custom-generate-btn" type="button">按提示词生成</button>
+          </div>
+          <p class="hint" id="custom-note">自定义歌单关闭时音乐页不展示；改动即时失效缓存并重建。</p>
+          <div id="custom-list" class="stack"></div>
         </div>
       </section>
 
@@ -310,6 +351,8 @@
           <div class="card-title"><span>保存与素材</span><button class="help-btn" type="button" data-help="tee-save" aria-label="保存与素材帮助">?</button></div>
           <p class="hint">在线试听下载完整即保存，不必听完整首；关闭后仅保留滚动缓存。</p>
           <label class="switch-row"><span>边听边存</span><input type="checkbox" id="tee-enabled"></label>
+          <label class="switch-row"><span>自动缓存第一首</span><input type="checkbox" id="auto-cache-first"></label>
+          <label class="switch-row"><span>自动缓存下一首</span><input type="checkbox" id="auto-cache-next"></label>
           <label class="switch-row"><span>自动下载封面</span><input type="checkbox" id="auto-cover"></label>
           <label class="switch-row"><span>自动下载歌词</span><input type="checkbox" id="lyric-auto-dl"></label>
           <label class="field"><span>关闭时滚动缓存 <b id="tee-count-label"></b></span>
@@ -350,8 +393,13 @@
         <h2>目录设置</h2>
         <div class="card">
           <div class="card-title"><span>歌曲缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>
+          <label class="switch-row"><span>每天清理滚动缓存</span><input type="checkbox" id="auto-cache-cleanup"></label>
+          <p class="hint">每天清理滚动缓存与同名歌词，已落库歌曲不受影响。</p>
           <label class="field"><span>缓存目录</span>
             <input class="input" id="dir-cache" placeholder="留空=安装目录 cache">
+          </label>
+          <label class="field"><span>自定义歌单目录</span>
+            <input class="input" id="dir-custom" placeholder="留空=安装目录 custom_playlists">
           </label>
           <div class="btn-row">
             <button class="btn" id="dir-cache-pick" hidden>从 NAS 选择</button>
@@ -396,6 +444,13 @@
       <section class="page" id="page-llm">
         <h2><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
         <div class="card">
+          <label class="field"><span>接入方式</span>
+            <select class="input" id="llm-provider">
+              <option value="kilo">内置（免配置）</option>
+              <option value="custom">自定义</option>
+              <option value="none">关闭</option>
+            </select>
+          </label>
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
@@ -575,6 +630,11 @@
   </template>
   <template data-help-id="recommend">
     <p>热门榜单与每日推荐是两个独立歌单。公共歌单可浏览并勾选网易/洛雪的原生榜单和分类歌单，作为只读歌单展示；musicdl 没有统一推荐歌单发现接口。</p>
+    <p>每日/热门目标曲量（5–1000，默认 20）与分类单类目标曲量（5–1000，默认 200）运行期可调：保存后当日缓存自动重建，构建预算超时渐进上架不丢已完成部分，校验用最低成本档。</p>
+  </template>
+  <template data-help-id="custom-playlists">
+    <p>自定义歌单独立管理：支持 m3u/m3u8/pls/cue 导入解析歌名歌手（异常行跳过并提示计数），或按提示词调用大模型生成并与手动列表去重合并。</p>
+    <p>定义文件落数据卷自定义歌单目录，并纳入缓存目录与下载目录互斥校验；删除为硬删除需二次确认，并同步清理磁盘缓存。</p>
   </template>
   <template data-help-id="search">
     <p>深分页在在线歌曲不够填满当前页时继续取下一页，本地歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>

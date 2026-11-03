@@ -19,8 +19,8 @@ const APP_BASE = "/app/fnmusic-ext";
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", lxmusic: "洛雪自定义源", none: "未配置" };
-const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
+const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", neteasefree: "网易免扫码音源", lxmusic: "洛雪自定义源", none: "未配置" };
+const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", neteasefree: "neteasefree", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
@@ -82,8 +82,14 @@ async function api(path, options) {
 
 function updateLlmLikedSettings() {
   $("#llm-liked-settings").hidden = !$("#llm-liked").checked;
+  const provider = ($("#llm-provider") || {}).value || "kilo";
+  const custom = provider === "custom";
+  if ($("#llm-base")) $("#llm-base").disabled = !custom;
+  if ($("#llm-key")) $("#llm-key").disabled = !custom;
+  if (!custom && $("#llm-key")) $("#llm-key").value = "";
   const selected = $("#llm-liked").checked || $("#llm-daily").checked;
-  $("#llm-api-warning").hidden = !selected || !!($("#llm-base").value.trim() && $("#llm-key").value.trim());
+  const needKeys = selected && custom;
+  $("#llm-api-warning").hidden = !needKeys || !!($("#llm-base").value.trim() && $("#llm-key").value.trim());
 }
 
 let llmUsageOffset = 0;
@@ -161,6 +167,14 @@ function likedNumber(selector, label, min, max, integer = false) {
     throw new Error(label + (integer ? "必须是 0–100 的整数" : "必须是大于或等于 0.5 的有限数字"));
   }
   return num;
+}
+
+function playlistSizeNumber(selector, label) {
+  const value = Number.parseInt(($(selector) || {}).value ?? "", 10);
+  if (!Number.isInteger(value) || value < 5 || value > 1000) {
+    throw new Error(`${label}必须是 5–1000 的整数`);
+  }
+  return value;
 }
 
 function lxTimeoutNumber(selector, label) {
@@ -577,6 +591,7 @@ async function loadConfig() {
 function applyConfigToForm() {
   const v = configValues;
   const provider = v.FNMUSIC_NETEASE_ENABLED === "true" ? "musicbox"
+    : v.FNMUSIC_NETEASEFREE_ENABLED === "true" ? "neteasefree"
     : v.FNMUSIC_MUSICDL_ENABLED === "true" ? "musicdl"
     : v.FNMUSIC_LX_ENABLED === "true" ? "lxmusic" : "";
   $$("input[name=provider]").forEach((el) => { el.checked = el.value === provider; });
@@ -605,6 +620,9 @@ function applyConfigToForm() {
   });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
+  if ($("#recommend-size")) $("#recommend-size").value = v.FNMUSIC_RECOMMEND_SIZE || "20";
+  if ($("#category-size")) $("#category-size").value = v.FNMUSIC_CATEGORY_SIZE || "200";
+  if ($("#custom-enabled")) $("#custom-enabled").checked = v.FNMUSIC_CUSTOM_PLAYLISTS_ENABLED === "true";
   $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
   publicSelectionDetailSeq++;
   publicUserChanges.clear();
@@ -624,6 +642,9 @@ function applyConfigToForm() {
   // 刷新/保存后重建的 publicSelection 只有身份字段：浏览器可见时补回展示名称
   void ensurePublicSelectionDetails();
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
+  if ($("#auto-cache-first")) $("#auto-cache-first").checked = v.FNMUSIC_AUTO_CACHE_FIRST === "true";
+  if ($("#auto-cache-next")) $("#auto-cache-next").checked = v.FNMUSIC_AUTO_CACHE_NEXT === "true";
+  if ($("#auto-cache-cleanup")) $("#auto-cache-cleanup").checked = v.FNMUSIC_AUTO_CACHE_CLEANUP === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
@@ -633,6 +654,7 @@ function applyConfigToForm() {
   $("#tee-save-mode").value = ["auto", "direct", "staged"].includes(v.FNMUSIC_TEE_SAVE_MODE) ? v.FNMUSIC_TEE_SAVE_MODE : "auto";
   $("#tee-save-mode").disabled = !configSchema.FNMUSIC_TEE_SAVE_MODE;
   $("#dir-cache").value = v.FNMUSIC_CACHE_DIR || "";
+  if ($("#dir-custom")) $("#dir-custom").value = v.FNMUSIC_CUSTOM_PLAYLISTS_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   $("#bind-timeout").value = v.FNMUSIC_OFFICIAL_BIND_TIMEOUT_S || "120";
   $("#handoff-max").value = v.FNMUSIC_TEE_HANDOFF_MAX != null ? v.FNMUSIC_TEE_HANDOFF_MAX : "3";
@@ -642,8 +664,9 @@ function applyConfigToForm() {
   updateScanLabels();
   updateTeeCountLabel();
   updateBindTimeoutLabel();
+  if ($("#llm-provider")) $("#llm-provider").value = ["kilo", "custom", "none"].includes(v.FNMUSIC_LLM_PROVIDER) ? v.FNMUSIC_LLM_PROVIDER : "kilo";
   $("#llm-base").value = v.FNMUSIC_LLM_BASE_URL || "";
-  $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
+  $("#llm-key").value = v.FNMUSIC_LLM_PROVIDER === "custom" ? (v.FNMUSIC_LLM_API_KEY || "") : "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
   $("#llm-protocol").value = v.FNMUSIC_LLM_PROTOCOL === "responses" ? "responses" : "chat";
   $("#llm-max-tokens").value = v.FNMUSIC_LLM_MAX_TOKENS || "8192";
@@ -660,6 +683,8 @@ function applyConfigToForm() {
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
   $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
+  if ($("#neteasefree-url")) $("#neteasefree-url").value = v.FNMUSIC_NETEASEFREE_URL || "";
+  if ($("#neteasefree-api-base")) $("#neteasefree-api-base").value = v.FNMUSIC_NETEASE_API_BASE || "";
   $("#lx-url").value = "";
   lxVerifiedUrl = null;
   $("#lx-resolver-timeout").value = v.LX_RESOLVER_TIMEOUT || "8.0";
@@ -701,6 +726,7 @@ function collectConfig() {
   const values = {
     FNMUSIC_MUSICDL_ENABLED: provider === "musicdl",
     FNMUSIC_NETEASE_ENABLED: provider === "musicbox",
+    FNMUSIC_NETEASEFREE_ENABLED: provider === "neteasefree",
     FNMUSIC_LX_ENABLED: provider === "lxmusic",
     ...(configSchema.FNMUSIC_NETEASE_DIRECT_PLAY ? { FNMUSIC_NETEASE_DIRECT_PLAY: $("#direct-netease").checked } : {}),
     ...(configSchema.FNMUSIC_MUSICDL_DIRECT_PLAY ? { FNMUSIC_MUSICDL_DIRECT_PLAY: $("#direct-musicdl").checked } : {}),
@@ -718,8 +744,14 @@ function collectConfig() {
       ? { FNMUSIC_LX_SOURCE_ORDER: JSON.stringify(lxSourceOrder) } : {}),
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
+    ...(configSchema.FNMUSIC_RECOMMEND_SIZE ? { FNMUSIC_RECOMMEND_SIZE: playlistSizeNumber("#recommend-size", "每日/热门目标曲量") } : {}),
+    ...(configSchema.FNMUSIC_CATEGORY_SIZE ? { FNMUSIC_CATEGORY_SIZE: playlistSizeNumber("#category-size", "分类单类目标曲量") } : {}),
+    FNMUSIC_CUSTOM_PLAYLISTS_ENABLED: $("#custom-enabled") ? $("#custom-enabled").checked : false,
     FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: $("#public-playlists-enabled").checked,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
+    ...($("#auto-cache-first") ? { FNMUSIC_AUTO_CACHE_FIRST: $("#auto-cache-first").checked } : {}),
+    ...($("#auto-cache-next") ? { FNMUSIC_AUTO_CACHE_NEXT: $("#auto-cache-next").checked } : {}),
+    ...($("#auto-cache-cleanup") ? { FNMUSIC_AUTO_CACHE_CLEANUP: $("#auto-cache-cleanup").checked } : {}),
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
@@ -727,14 +759,16 @@ function collectConfig() {
     ...(configSchema.FNMUSIC_DOWNLOAD_LAYOUT ? { FNMUSIC_DOWNLOAD_LAYOUT: $("#download-layout").value } : {}),
     ...(configSchema.FNMUSIC_TEE_SAVE_MODE ? { FNMUSIC_TEE_SAVE_MODE: ["auto", "direct", "staged"].includes($("#tee-save-mode").value) ? $("#tee-save-mode").value : "auto" } : {}),
     FNMUSIC_CACHE_DIR: $("#dir-cache").value.trim(),
+    ...(configSchema.FNMUSIC_CUSTOM_PLAYLISTS_DIR ? { FNMUSIC_CUSTOM_PLAYLISTS_DIR: ($("#dir-custom") || {}).value ? $("#dir-custom").value.trim() : "" } : {}),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,
     FNMUSIC_TEE_HANDOFF_MAX: parseInt($("#handoff-max").value || "3", 10) || 0,
     FNMUSIC_LIBRARY_SCAN_PATH: $("#scan-path").value.trim(),
     FNMUSIC_SCAN_DELAY_S: parseFloat($("#scan-delay").value) || 0,
     FNMUSIC_SCAN_COOLDOWN_S: parseFloat($("#scan-cooldown").value) || 0,
+    ...($("#llm-provider") ? { FNMUSIC_LLM_PROVIDER: ["kilo", "custom", "none"].includes($("#llm-provider").value) ? $("#llm-provider").value : "kilo" } : {}),
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
-    FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
+    FNMUSIC_LLM_API_KEY: (($("#llm-provider") || {}).value || "kilo") === "custom" ? $("#llm-key").value.trim() : "",
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
     FNMUSIC_LLM_PROTOCOL: $("#llm-protocol").value === "responses" ? "responses" : "chat",
     FNMUSIC_LLM_MAX_TOKENS: parseInt($("#llm-max-tokens").value || "8192", 10) || 8192,
@@ -747,6 +781,8 @@ function collectConfig() {
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
+    ...(configSchema.FNMUSIC_NETEASEFREE_URL ? { FNMUSIC_NETEASEFREE_URL: $("#neteasefree-url").value.trim() } : {}),
+    ...(configSchema.FNMUSIC_NETEASE_API_BASE ? { FNMUSIC_NETEASE_API_BASE: $("#neteasefree-api-base").value.trim() } : {}),
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
   if (!$("#panel-lxmusic").hidden) {
@@ -784,9 +820,33 @@ function collectConfig() {
   if (dlDir && cacheDir && (dlDir === cacheDir || dlDir.startsWith(cacheDir + "/") || cacheDir.startsWith(dlDir + "/"))) {
     throw new Error("歌曲缓存目录与下载目录不能相同或互为父子目录");
   }
+  const customDir = (values.FNMUSIC_CUSTOM_PLAYLISTS_DIR || "").trim();
+  for (const [label, other] of [["歌曲缓存目录", cacheDir], ["下载目录", dlDir]]) {
+    if (customDir && other && (customDir === other || customDir.startsWith(other + "/") || other.startsWith(customDir + "/"))) {
+      throw new Error(`自定义歌单目录与${label}不能相同或互为父子目录`);
+    }
+  }
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
+  }
+  if (provider === "neteasefree") {
+    const freeUrl = String(values.FNMUSIC_NETEASEFREE_URL || "").trim();
+    const apiBase = String(values.FNMUSIC_NETEASE_API_BASE || "").trim();
+    const target = (apiBase || freeUrl).trim();
+    if (!target) {
+      throw new Error("启用第四源需要填写后端地址并确认第三方风险");
+    }
+    if (!/^https:\/\/[^\s/]+/.test(target)) {
+      throw new Error("第四源后端地址仅支持 https");
+    }
+    const DEFAULT_PLACEHOLDER = "https://zm.wwoyun.cn";
+    if (target.replace(/\/+$/, "") === DEFAULT_PLACEHOLDER) {
+      const ok = typeof window !== "undefined" && typeof window.confirm === "function"
+        ? window.confirm("默认后端地址为第三方示例占位，启用即表示已确认信任该后端并承担风险，继续吗？")
+        : true;
+      if (!ok) throw new Error("已取消启用第四源：请自建后端或确认后再试");
+    }
   }
   if (provider === "lxmusic") {
     let savedAllInactive = false;
@@ -816,7 +876,7 @@ async function saveConfig() {
   try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
   // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
   // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
-  for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
+  for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"], ["FNMUSIC_CUSTOM_PLAYLISTS_DIR", "自定义歌单目录"]]) {
     const next = values[key] || "";
     if (next && next !== (configValues[key] || "")) {
       const res = await fsCheckDir(next);
@@ -920,6 +980,7 @@ $("#save-btn").addEventListener("click", saveConfig);
 function savedProvider() {
   const v = configValues;
   return v.FNMUSIC_NETEASE_ENABLED === "true" ? "musicbox"
+    : v.FNMUSIC_NETEASEFREE_ENABLED === "true" ? "neteasefree"
     : v.FNMUSIC_MUSICDL_ENABLED === "true" ? "musicdl"
     : v.FNMUSIC_LX_ENABLED === "true" ? "lxmusic" : "";
 }
@@ -944,6 +1005,7 @@ function syncProviderPanels(provider) {
   $$(".provider-card").forEach((el) => el.classList.toggle("selected", el.dataset.provider === provider));
   $("#panel-musicbox").hidden = provider !== "musicbox";
   $("#panel-musicdl").hidden = provider !== "musicdl";
+  $("#panel-neteasefree").hidden = provider !== "neteasefree";
   $("#panel-lxmusic").hidden = provider !== "lxmusic";
 }
 $$("input[name=provider]").forEach((el) =>
@@ -2660,6 +2722,14 @@ DIR_FIELDS.forEach(bindDirField);
   updateLlmLikedSettings();
   markDirty();
 }));
+if ($("#llm-provider")) $("#llm-provider").addEventListener("change", () => {
+  updateLlmLikedSettings();
+  markDirty();
+});
+["#auto-cache-first", "#auto-cache-next", "#auto-cache-cleanup"].forEach((sel) => {
+  const el = $(sel);
+  if (el) el.addEventListener("change", () => markDirty());
+});
 ["#llm-base", "#llm-key"].forEach((sel) => $(sel).addEventListener("input", updateLlmLikedSettings));
 $("#lx-url").addEventListener("input", () => {
   // #lx-url 仅为「添加」入口输入框，激活态由列表 active 标记决定，与它无关
@@ -2675,7 +2745,9 @@ $("#lx-auto-switch").addEventListener("change", () => {
   markDirty("洛雪自动切源设置需保存后生效");
 });
 $("#lx-platform-preferred").addEventListener("change", () => markDirty("洛雪平台优选设置需保存后生效"));
-["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident"].forEach((sel) =>
+["#recommend-size", "#category-size"].forEach((sel) =>
+  $(sel).addEventListener("input", () => markDirty("目标曲量保存后当日缓存自动重建")));
+["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident", "#custom-enabled"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 ["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty("播放直连策略需保存后生效")));
@@ -3152,3 +3224,85 @@ $("#organize-modal").addEventListener("click", (ev) => {
   if ($("#public-playlists-enabled").checked) await showPublicBrowser();
   setInterval(loadStatus, 15000);
 })();
+
+/* -------------------------------------------------------------- 自定义歌单 */
+async function loadCustomPlaylists() {
+  const list = $("#custom-list");
+  const note = $("#custom-note");
+  if (!list) return;
+  try {
+    const data = await api("/api/custom-playlists");
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (!items.length) {
+      list.innerHTML = '<p class="hint">暂无自定义歌单，可导入歌单文件或按提示词生成。</p>';
+      return;
+    }
+    list.innerHTML = "";
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "btn-row";
+      const label = document.createElement("span");
+      label.className = "muted";
+      label.textContent = `${item.name || "未命名歌单"}（${item.trackCount || 0} 首）${item.enabled ? "" : "（已停用）"}`;
+      const toggle = document.createElement("button");
+      toggle.className = "btn small";
+      toggle.textContent = item.enabled ? "停用" : "启用";
+      toggle.addEventListener("click", async () => {
+        try {
+          await api(`/api/custom-playlists/${encodeURIComponent(item.id)}/enable`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: !item.enabled }),
+          });
+          toast("已保存", "ok");
+          await loadCustomPlaylists();
+        } catch (exc) { toast(exc.message || "保存失败", "fail"); }
+      });
+      const del = document.createElement("button");
+      del.className = "btn small";
+      del.textContent = "删除";
+      del.addEventListener("click", async () => {
+        if (!window.confirm(`删除自定义歌单「${item.name || item.id}」？定义文件将被硬删除，操作不可恢复。`)) return;
+        try {
+          await api(`/api/custom-playlists/${encodeURIComponent(item.id)}?confirm=true`, { method: "DELETE" });
+          toast("已删除", "ok");
+          await loadCustomPlaylists();
+        } catch (exc) { toast(exc.message || "删除失败", "fail"); }
+      });
+      row.append(label, toggle, del);
+      list.append(row);
+    }
+    if (note) note.textContent = `共 ${items.length} 个自定义歌单；改动即时失效缓存并重建。`;
+  } catch (exc) {
+    list.innerHTML = `<p class="hint">自定义歌单加载失败：${escapeHtml(exc.message || exc)}</p>`;
+  }
+}
+
+$("#custom-refresh-btn")?.addEventListener("click", () => loadCustomPlaylists());
+$("#custom-import-btn")?.addEventListener("click", () => $("#custom-import-file")?.click());
+$("#custom-import-file")?.addEventListener("change", async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  try {
+    const content = await file.text();
+    const data = await api("/api/custom-playlists/import", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, content }),
+    });
+    toast(`导入成功：${data.trackCount || 0} 首${data.skipped ? `（跳过异常行 ${data.skipped} 行）` : ""}`, "ok");
+    await loadCustomPlaylists();
+  } catch (exc) { toast(exc.message || "导入失败", "fail"); }
+});
+$("#custom-generate-btn")?.addEventListener("click", async () => {
+  const prompt = ($("#custom-prompt") || {}).value || "";
+  if (!prompt.trim()) { toast("请先输入提示词", "fail"); return; }
+  try {
+    const data = await api("/api/custom-playlists/generate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: prompt.trim() }),
+    });
+    toast(`生成成功：${data.trackCount || 0} 首${data.added ? `（新增 ${data.added} 首）` : ""}`, "ok");
+    await loadCustomPlaylists();
+  } catch (exc) { toast(exc.message || "生成失败", "fail"); }
+});
+void loadCustomPlaylists();

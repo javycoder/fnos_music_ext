@@ -1,0 +1,4 @@
+# 网易云音源：直连 NeteaseCloudMusicApi 兼容 HTTP 后端（默认 https://zm.wwoyun.cn）
+httpx>=0.27
+fastapi>=0.110
+uvicorn>=0.29

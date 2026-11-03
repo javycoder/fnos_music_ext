@@ -27,7 +27,7 @@ def supervisord_conf():
 def test_supervisord_programs_all_autostart_false(supervisord_conf):
     programs = sorted(s for s in supervisord_conf.sections() if s.startswith("program:"))
     assert programs == [
-        "program:lxmusic", "program:lxserver", "program:musicbox", "program:musicdl", "program:webui",
+        "program:lxmusic", "program:lxserver", "program:musicbox", "program:musicdl", "program:neteasefree", "program:webui",
     ]
     for section in programs:
         assert supervisord_conf.get(section, "autostart") == "false"
@@ -50,6 +50,7 @@ def test_supervisord_ports_and_directories(supervisord_conf):
     expected = {
         "musicdl": ("8001", "/srv/musicdl-service"),
         "musicbox": ("8002", "/srv/musicbox-service"),
+        "neteasefree": ("8006", "/srv/neteasefree-service"),
         "lxmusic": ("8003", "/srv/lxmusic-service"),
         "webui": ("8004", "/srv/webui-service"),
     }
@@ -222,11 +223,12 @@ def entrypoint_env(tmp_path):
     # 单源：只启动所选音源
     ("FNMUSIC_MUSICDL_ENABLED=true\n", ["start musicdl"]),
     ("FNMUSIC_NETEASE_ENABLED=true\n", ["start musicbox"]),
+    ("FNMUSIC_NETEASEFREE_ENABLED=true\n", ["start neteasefree"]),
     ("FNMUSIC_LX_ENABLED=true\n", ["start lxserver", "start lxmusic"]),
     # WebUI 独立开关
     ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\n", ["start lxserver", "start lxmusic", "start webui"]),
     ("FNMUSIC_WEBUI_ENABLED=true\n", ["start webui"]),
-    # 旧多源并存：只取第一个命中（musicdl 优先），不重复拉起
+    # 旧多源并存：只取第一个命中（musicdl > musicbox > neteasefree > lxmusic），不重复拉起
     ("FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\n",
      ["start musicdl"]),
     # 全关：什么源都不启动
@@ -304,6 +306,7 @@ def test_compose_single_service_layout():
     assert sorted(svc["ports"]) == sorted([
         "127.0.0.1:8768:8001",
         "127.0.0.1:8770:8002",
+        "127.0.0.1:8776:8006",
         "127.0.0.1:8772:8003",
         "127.0.0.1:8774:8004",
     ])
@@ -333,6 +336,7 @@ def test_dockerfile_assembly():
     for pkg in ("nodejs", "ffmpeg", "supervisor"):
         assert pkg in text
     for req in ("musicdl-service/requirements.txt", "musicbox-service/requirements.txt",
+                "neteasefree-service/requirements.txt",
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
     assert "container/lxserver.version" in text
@@ -342,7 +346,7 @@ def test_dockerfile_assembly():
     assert "lxmusic-service/js/bridge.js" not in text
     assert text.count("HEALTHCHECK") >= 1
     assert 'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' in text
-    assert "EXPOSE 8001 8002 8003 8004" in text
+    assert "EXPOSE 8001 8002 8003 8004 8006" in text
     # 非特权运行
     assert "USER appuser" in text
     # 数据卷与仓库挂载点；目录不可 world-writable（bind 挂载后跟宿主机权限）
@@ -410,7 +414,7 @@ def test_dockerignore_whitelist_build_context():
     code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     # 白名单模式：先忽略一切，再放行四个服务目录与 container/
     assert code_lines[0] == "*"
-    for keep in ("!musicdl-service/", "!musicbox-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
+    for keep in ("!musicdl-service/", "!musicbox-service/", "!neteasefree-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
         assert keep in code_lines
 
 
@@ -450,7 +454,7 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
     required = {"publicplaylists"} | set(re.findall(r"\bproxy/([A-Za-z_]\w*)\.py\b", copied))
     origins: dict[str, str] = {"publicplaylists": "动态导入（proxy/app.py）"}
-    for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
+    for service_dir in ("musicdl-service", "musicbox-service", "neteasefree-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
             # 测试文件（test_*/conftest）不进镜像、不随服务运行：其跨目录 import
             # （如 lxmusic 测试比对 proxy 的 UA 常量）不构成镜像依赖

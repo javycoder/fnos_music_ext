@@ -53,6 +53,7 @@ try:
     from .organize import _ensure_target_dir as ensure_layout_dir
     from .media_url import hostname_for_log, validate_media_url
     from . import nmplaylists as nmpl
+    from . import customplaylists as custompl
     from . import publicplaylists as pubpl
     from . import transcode as tc
     from . import quality_policy as qp
@@ -70,6 +71,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from organize import _ensure_target_dir as ensure_layout_dir
     from media_url import hostname_for_log, validate_media_url  # type: ignore
     import nmplaylists as nmpl  # type: ignore
+    import customplaylists as custompl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
     import quality_policy as qp  # type: ignore
@@ -144,9 +146,12 @@ def _safe_scan_number(raw: str, default: float, lo: float, hi: float):
 CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
+    "neteasefree_url": os.environ.get("FNMUSIC_NETEASEFREE_URL", "http://127.0.0.1:8776"),
+    "netease_api_base": (os.environ.get("FNMUSIC_NETEASE_API_BASE") or "").strip().rstrip("/"),
     "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+    "neteasefree_enabled": os.environ.get("FNMUSIC_NETEASEFREE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_direct_play": os.environ.get("FNMUSIC_NETEASE_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "musicdl_direct_play": os.environ.get("FNMUSIC_MUSICDL_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
@@ -177,6 +182,11 @@ CONF = {
     # 边听边存：默认开；保存路径空=自动探测飞牛共享曲库，不可用自动回退；
     # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    # 自动缓存预取（任务 4.1）：默认关；首曲自动落库+下一曲预取，复用整轨下载/tee 链路。
+    "auto_cache_first": os.environ.get("FNMUSIC_AUTO_CACHE_FIRST", "false").lower() in ("true", "1", "yes"),
+    "auto_cache_next": os.environ.get("FNMUSIC_AUTO_CACHE_NEXT", "false").lower() in ("true", "1", "yes"),
+    # 定时清理（任务 4.2）：默认关；每天清理滚动缓存与同名歌词，落库歌曲豁免。
+    "auto_cache_cleanup": os.environ.get("FNMUSIC_AUTO_CACHE_CLEANUP", "false").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
     "download_layout": os.environ.get("FNMUSIC_DOWNLOAD_LAYOUT", "flat")
         if os.environ.get("FNMUSIC_DOWNLOAD_LAYOUT", "flat") in
@@ -249,6 +259,7 @@ CONF = {
     "plt_dir": os.environ.get(
         "FNMUSIC_PLT_DIR", os.path.join(_HOME, "playlist_tracks")
     ),
+    "llm_provider": (os.environ.get("FNMUSIC_LLM_PROVIDER") or "kilo").strip().lower() or "kilo",
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
     "llm_daily_enabled": os.environ.get("FNMUSIC_LLM_DAILY_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
@@ -266,6 +277,10 @@ CONF = {
     "dl_quality": (os.environ.get("FNMUSIC_DL_QUALITY") or "app").strip().lower(),
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
+    "recommend_size": os.environ.get("FNMUSIC_RECOMMEND_SIZE", "20"),
+    "category_size": os.environ.get("FNMUSIC_CATEGORY_SIZE", "200"),
+    "custom_enabled": os.environ.get("FNMUSIC_CUSTOM_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "custom_dir": os.environ.get("FNMUSIC_CUSTOM_PLAYLISTS_DIR", ""),
     "public_playlists_enabled": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
     "public_playlists_selection": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""),
     "public_playlists_by_user": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", ""),
@@ -590,6 +605,9 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
 _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_MUSICDL_ENABLED": ("musicdl_enabled", "bool"),
     "FNMUSIC_NETEASE_ENABLED": ("netease_enabled", "bool"),
+    "FNMUSIC_NETEASEFREE_ENABLED": ("neteasefree_enabled", "bool"),
+    "FNMUSIC_NETEASEFREE_URL": ("neteasefree_url", "str"),
+    "FNMUSIC_NETEASE_API_BASE": ("netease_api_base", "netease_api_base"),
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_NETEASE_DIRECT_PLAY": ("netease_direct_play", "direct_bool"),
     "FNMUSIC_MUSICDL_DIRECT_PLAY": ("musicdl_direct_play", "direct_bool"),
@@ -609,6 +627,10 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_NETEASE_QUALITY": ("netease_quality", "netease_quality"),
     "FNMUSIC_DL_QUALITY": ("dl_quality", "dl_quality"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
+    "FNMUSIC_AUTO_CACHE_FIRST": ("auto_cache_first", "bool"),
+    "FNMUSIC_AUTO_CACHE_NEXT": ("auto_cache_next", "bool"),
+    "FNMUSIC_AUTO_CACHE_CLEANUP": ("auto_cache_cleanup", "bool"),
+    "FNMUSIC_LLM_PROVIDER": ("llm_provider", "llm_provider"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
     "FNMUSIC_DOWNLOAD_LAYOUT": ("download_layout", "download_layout"),
     "FNMUSIC_TEE_SAVE_MODE": ("tee_save_mode", "tee_save_mode"),
@@ -626,6 +648,10 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_SCAN_COOLDOWN_S": ("scan_cooldown_s", "scan_cooldown"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
+    "FNMUSIC_RECOMMEND_SIZE": ("recommend_size", "recommend_size"),
+    "FNMUSIC_CATEGORY_SIZE": ("category_size", "category_size"),
+    "FNMUSIC_CUSTOM_PLAYLISTS_ENABLED": ("custom_enabled", "bool"),
+    "FNMUSIC_CUSTOM_PLAYLISTS_DIR": ("custom_dir", "str"),
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
@@ -723,10 +749,26 @@ def _env_watch_parse(raw: str, kind: str):
         return raw.lower() if raw.lower() in ("high", "balanced", "smooth") else None
     if kind == "tee_save_mode":
         return raw.lower() if raw.lower() in ("auto", "direct", "staged") else None
+    if kind == "llm_provider":
+        return raw.lower() if raw.lower() in ("kilo", "custom", "none") else None
     if kind == "dl_quality":
         return raw.lower() if raw.lower() in ("app", "original", "standard") else None
     if kind == "netease_quality":
         return raw.lower() if raw.lower() in _NETEASE_QUALITY_LADDER else None
+    if kind == "netease_api_base":
+        # 第四源第三方后端地址透传：允许空（用服务内置默认），非空仅做去尾斜杠，https 校验在 WebUI 层。
+        text = raw.strip().rstrip("/")
+        return text
+    if kind == "recommend_size":
+        try:
+            return str(max(5, min(1000, int(raw)))) if raw else ""
+        except (TypeError, ValueError):
+            return None
+    if kind == "category_size":
+        try:
+            return str(max(5, min(1000, int(raw)))) if raw else ""
+        except (TypeError, ValueError):
+            return None
     if kind == "lx_sources":
         return _normalize_lx_sources(raw)
     if kind == "llm_url":
@@ -921,8 +963,8 @@ def _env_watch_stat(path: "str | None" = None):
 _LX_CONFIG_KEYS = {"lx_enabled", "lx_quality", "play_quality", "quality_mode", "lx_sources", "lx_source_url", "lx_source_list"}
 _DL_CONFIG_KEYS = {
     "play_quality", "download_quality", "quality_mode", "dl_quality",
-    "netease_quality", "lx_quality", "lx_enabled", "netease_enabled", "musicdl_enabled",
-    "online_sources", "lx_sources", "lx_source_url", "lx_source_list",
+    "netease_quality", "lx_quality", "lx_enabled", "netease_enabled", "neteasefree_enabled", "musicdl_enabled",
+    "online_sources", "lx_sources", "lx_source_url", "lx_source_list", "neteasefree_url", "netease_api_base",
 }
 
 
@@ -960,8 +1002,8 @@ def effective_download_quality_conf() -> str:
     }
     return qp.effective_download_quality(values)
 _SOURCE_CONF_KEYS = {
-    "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
-    "lx_source_url", "lx_source_list",
+    "musicdl_enabled", "netease_enabled", "neteasefree_enabled", "lx_enabled", "online_sources", "lx_sources",
+    "lx_source_url", "lx_source_list", "neteasefree_url", "netease_api_base",
 }
 _DIRECT_PLAY_CONF_KEYS = {
     "netease": "netease_direct_play",
@@ -975,7 +1017,7 @@ _LIKED_TASKS: dict[str, asyncio.Task] = {}
 _LIKED_WAKEUP: asyncio.Event | None = None
 _LIKED_BUILD_LOCK: asyncio.Lock | None = None
 _LIKED_EPOCH = 0
-_DAILY_EPOCHS = {"daily": 0, "hot": 0}
+_DAILY_EPOCHS = {"daily": 0, "hot": 0, "category": 0, "custom": 0}
 
 
 def _cancel_daily_tasks(kinds: set[str] | None = None) -> None:
@@ -1037,8 +1079,10 @@ async def _run_liked_build(
                 db_path=str(CONF.get("music_db") or dailyrec.music_db_path()),
                 llm_http=get_llm_client(fastapi_app),
                 build_track=build_online_track,
-                musicbox_client=get_musicbox_client(fastapi_app) if CONF["netease_enabled"] else None,
-                netease_enabled=CONF["netease_enabled"],
+                musicbox_client=get_musicbox_client(fastapi_app) if _netease_box_enabled() else None,
+                netease_enabled=_netease_box_enabled(),
+                neteasefree_client=get_neteasefree_client(fastapi_app) if _neteasefree_enabled() else None,
+                neteasefree_enabled=_neteasefree_enabled(),
                 lx_client=get_lx_client(fastapi_app) if CONF.get("lx_enabled") else None,
                 lx_enabled=bool(CONF.get("lx_enabled")),
                 lx_sources=CONF.get("lx_sources") or None,
@@ -1133,17 +1177,31 @@ def _invalidate_daily_llm_cache() -> int:
 
     The general source-change invalidator intentionally releases the source
     slot, so usage/LLM connection reloads cannot use it.
+    R13 前置：榜单（chart）、分类（category）、自定义（custom）缓存键纳入统一失效。
     """
     day = dailyrec.today_key()
     removed = 0
-    for suffix in (".json", ".fallback.json"):
-        pattern = os.path.join(dailyrec.recommend_cache_dir(), "*", f"daily-{day}{suffix}")
-        for path in glob.glob(pattern):
-            try:
-                os.remove(path)
-                removed += 1
-            except OSError as error:
-                logger.warning("failed to invalidate daily LLM cache %s: %s", path, error)
+    kinds = ("daily", "chart", "category", "custom")
+    for kind in kinds:
+        for suffix in (".json", ".fallback.json"):
+            filename = f"{kind}-{day}{suffix}" if kind != "daily" else f"daily-{day}{suffix}"
+            pattern = os.path.join(dailyrec.recommend_cache_dir(), "*", filename)
+            for path in glob.glob(pattern):
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError as error:
+                    logger.warning("failed to invalidate daily LLM cache %s: %s", path, error)
+    # 兼容旧版只有 daily 键的缓存目录：按前缀兜底清理新键，避免残留。
+    for extra in ("chart", "category", "custom"):
+        for suffix in (".json", ".fallback.json"):
+            pattern = os.path.join(dailyrec.recommend_cache_dir(), "*", f"{extra}-*{suffix}")
+            for path in glob.glob(pattern):
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError as error:
+                    logger.warning("failed to invalidate %s cache %s: %s", extra, path, error)
     return removed
 
 
@@ -1156,16 +1214,26 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
     global _LIKED_EPOCH
     changes = set(changed)
     source_changed = bool(_SOURCE_CONF_KEYS & changes)
-    connection_changed = bool({"llm_base_url", "llm_model", "FNMUSIC_LLM_API_KEY",
+    connection_changed = bool({"llm_provider", "llm_base_url", "llm_model", "FNMUSIC_LLM_API_KEY",
                                "FNMUSIC_LLM_PROTOCOL", "FNMUSIC_LLM_EXTRA_BODY"} & changes)
     liked_changed = source_changed or connection_changed or bool(
         {"llm_liked_enabled", "liked_size"} & changes
     )
+    size_changed = bool({"recommend_size", "category_size", "FNMUSIC_RECOMMEND_SIZE",
+                            "FNMUSIC_CATEGORY_SIZE"} & changes)
+    custom_changed = bool({"custom_enabled", "custom_dir", "FNMUSIC_CUSTOM_PLAYLISTS_ENABLED",
+                           "FNMUSIC_CUSTOM_PLAYLISTS_DIR"} & changes)
     if source_changed:
         removed = dailyrec.invalidate_today_cache_all_users()
         _cancel_daily_tasks()
         logger.info("音源配置变化(%s)：已失效当日推荐缓存 %d 个",
                     ",".join(sorted(_SOURCE_CONF_KEYS & changes)), removed)
+    elif size_changed or custom_changed:
+        # 任务 3.2：目标曲量调大后当日缓存自动重建；自定义定义/目录变更即时失效重建。
+        # 调大需重建（旧缓存曲量不足），调小由下次读取按新上限裁剪（get_or_build_daily 内处理）。
+        removed = dailyrec.invalidate_today_cache_all_users()
+        _cancel_daily_tasks()
+        logger.info("歌单曲量/自定义配置变化：已失效当日推荐缓存 %d 个", removed)
     elif ("llm_daily_enabled" in changes
           or (connection_changed and CONF.get("llm_daily_enabled"))):
         # LLM usage/connection changes affect daily only. A public hot chart
@@ -1185,6 +1253,41 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
         # An interval-only save keeps the batch and its first-fetch timestamp;
         # the scheduler simply reevaluates the new deadline.
         _wake_liked_scheduler()
+
+
+def auto_cache_cleanup_enabled() -> bool:
+    """定时清理开关：FNMUSIC_AUTO_CACHE_CLEANUP，默认关，支持热重载。"""
+    return bool(CONF.get("auto_cache_cleanup"))
+
+
+def run_auto_cache_cleanup(cache_dir: str | None = None) -> list[str]:
+    """定时清理：每天清理滚动缓存与同名歌词，落库歌曲豁免。
+
+    复用 cache_gc.purge_rolling：只删 online_* 滚动音频与同名 .lrc，.ref 指向
+    已落库文件的条目由 purge 内部保留（落库豁免），与边听边存零回归。
+    """
+    target = str(cache_dir or CONF.get("cache_dir") or "")
+    if not target:
+        return []
+    return purge_rolling(target, keep=0)
+
+
+async def _auto_cache_cleanup_loop() -> None:
+    """每天清理一次滚动缓存（任务 4.2）；开关关闭时空转等待。"""
+    while True:
+        try:
+            if auto_cache_cleanup_enabled():
+                def _sweep_locked():
+                    with _LIBRARY_FILE_LOCK:
+                        return run_auto_cache_cleanup()
+                removed = await asyncio.to_thread(_sweep_locked)
+                if removed:
+                    logger.info("auto-cache cleanup removed %d file(s)", len(removed))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("auto-cache cleanup failed: %s", exc)
+        await asyncio.sleep(86400)
 
 
 async def _env_watch_loop() -> None:
@@ -1231,7 +1334,10 @@ async def _env_watch_loop() -> None:
 
 
 def _source_config() -> dict:
-    return {k: v for k, v in CONF.items() if k.endswith(("_enabled", "_url", "_limit", "_quality", "_sources")) or k == "online_sources"}
+    config = {k: v for k, v in CONF.items() if k.endswith(("_enabled", "_url", "_limit", "_quality", "_sources")) or k == "online_sources"}
+    # 第四源第三方后端地址参与搜索缓存指纹：切后端即换源，必须失效旧缓存。
+    config["netease_api_base"] = CONF.get("netease_api_base") or ""
+    return config
 
 
 def _search_scope(request: Request) -> str:
@@ -1241,14 +1347,43 @@ def _search_scope(request: Request) -> str:
     return hashlib.sha256(json.dumps([auth, config, filters, request.url.path], sort_keys=True).encode()).hexdigest()
 
 
+def _netease_box_usable() -> bool:
+    """musicbox 运行期可用：当前音源是网易盒子，或网易云歌单常驻生效。"""
+    return bool(CONF.get("netease_enabled")) or bool(CONF.get("netease_playlist_resident"))
+
+
 def _netease_runtime_usable() -> bool:
-    """网易盒子歌单/播放运行期链路可用性：当前音源是网易盒子，或网易云歌单常驻生效。
+    """网易系歌单/播放运行期链路可用性：musicbox（含常驻）或第四源启用。
 
     只覆盖歌单注入与已登记网易曲目（播放/歌词/取链等）的放行口径；
-    搜索聚合（_aggregate_search/深分页/专辑搜索）仍只看 netease_enabled——
-    常驻模式下搜索结果不聚合网易（issue #38 需求 1）。
+    搜索聚合（_aggregate_search/深分页/专辑搜索）仍只看各自 enabled 开关——
+    常驻模式下搜索结果不聚合网易（issue #38 需求 1），第四源搜索走独立分支。
     """
-    return bool(CONF.get("netease_enabled")) or bool(CONF.get("netease_playlist_resident"))
+    return _netease_box_usable() or bool(CONF.get("neteasefree_enabled"))
+
+
+def _netease_box_enabled() -> bool:
+    """musicbox 开关（搜索/榜单聚合口径，不含常驻）。"""
+    return bool(CONF.get("netease_enabled"))
+
+
+def _neteasefree_enabled() -> bool:
+    """第四源开关（默认关，与 musicbox 互斥）。"""
+    return bool(CONF.get("neteasefree_enabled"))
+
+
+def _active_netease_client_name() -> str | None:
+    """当前生效的网易系服务端：musicbox（含常驻）优先，其次第四源。"""
+    if _netease_runtime_usable():
+        # musicbox 常驻也视为可用；互斥下 musicbox 优先
+        if _netease_box_enabled() or bool(CONF.get("netease_playlist_resident")):
+            return "musicbox"
+        if _neteasefree_enabled():
+            return "neteasefree"
+        return "musicbox"
+    if _neteasefree_enabled():
+        return "neteasefree"
+    return None
 
 
 def _source_enabled(guid: str) -> bool:
@@ -2962,11 +3097,14 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
         return ""
     src = source_from_online_guid(guid)
     if src == "netease":
-        musicbox_client = get_musicbox_client(request.app)
+        active_client = _active_netease_client(request.app)
+        if active_client is None:
+            active_client = get_musicbox_client(request.app)
+        log_name = "neteasefree" if active_client is get_neteasefree_client(request.app) else "musicbox"
         raw_song_id = song_id_from_online_guid(guid)
         song_id = raw_song_id.split(":")[-1]
         try:
-            r = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
+            r = await active_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
             if r.status_code == 200:
                 res_data = r.json()
                 if isinstance(res_data, dict) and res_data.get("ok") is not False:
@@ -2983,7 +3121,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                             )
                             return lyric_text
         except Exception as e:
-            logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
+            logger.warning("%s lyric fetch failed for %s: %s", log_name, guid, e)
         return ""
 
     data = await _online_info(request, guid)
@@ -3193,6 +3331,26 @@ def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
         client = httpx.AsyncClient(base_url=CONF["musicbox_url"], timeout=20.0)
         fastapi_app.state.musicbox_client = client
     return client
+
+
+def get_neteasefree_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    """第四源免扫码网易客户端：与 musicbox 同款 /api/v1/* 契约，独立超时，默认关闭。"""
+    client = getattr(fastapi_app.state, "neteasefree_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["neteasefree_url"], timeout=20.0)
+        fastapi_app.state.neteasefree_client = client
+    return client
+
+
+def _active_netease_client(fastapi_app: FastAPI) -> httpx.AsyncClient | None:
+    """网易系播放/歌词/取链运行期客户端：musicbox（含常驻）优先，其次第四源。
+
+    搜索聚合不走这里（搜索仅看 enabled 开关，常驻不聚合网易）。"""
+    if _netease_runtime_usable():
+        return get_musicbox_client(fastapi_app)
+    if CONF.get("neteasefree_enabled"):
+        return get_neteasefree_client(fastapi_app)
+    return None
 
 
 def get_lx_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
@@ -5207,9 +5365,11 @@ async def lifespan(fastapi_app: FastAPI):
     log_task = None
     env_task = None
     liked_task = None
+    auto_cache_task = None
     created_upstream = False
     created_musicdl = False
     created_musicbox = False
+    created_neteasefree = False
     created_lx = False
     created_llm = False
 
@@ -5234,6 +5394,13 @@ async def lifespan(fastapi_app: FastAPI):
             timeout=20.0,
         )
         created_musicbox = True
+
+    if getattr(fastapi_app.state, "neteasefree_client", None) is None:
+        fastapi_app.state.neteasefree_client = httpx.AsyncClient(
+            base_url=CONF["neteasefree_url"],
+            timeout=20.0,
+        )
+        created_neteasefree = True
 
     if getattr(fastapi_app.state, "lx_client", None) is None:
         fastapi_app.state.lx_client = httpx.AsyncClient(
@@ -5271,6 +5438,7 @@ async def lifespan(fastapi_app: FastAPI):
         if CONF.get("env_watch", True):
             env_task = asyncio.create_task(_env_watch_loop())
         liked_task = asyncio.create_task(_liked_scheduler_loop(fastapi_app))
+        auto_cache_task = asyncio.create_task(_auto_cache_cleanup_loop())
 
     # 预热 平台→激活脚本名 映射：首次搜索的标记渲染是同步读缓存，映射刷新又是
     # 搜索触发的后台任务，冷启动时来不及完成，第一屏会全部退回 [lx-平台]。
@@ -5323,6 +5491,9 @@ async def lifespan(fastapi_app: FastAPI):
         if liked_task:
             liked_task.cancel()
             await asyncio.gather(liked_task, return_exceptions=True)
+        if auto_cache_task:
+            auto_cache_task.cancel()
+            await asyncio.gather(auto_cache_task, return_exceptions=True)
         _LIKED_EPOCH += 1
         liked_builds = list(_LIKED_TASKS.values())
         _LIKED_TASKS.clear()
@@ -5349,6 +5520,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_musicbox and getattr(fastapi_app.state, "musicbox_client", None):
             await fastapi_app.state.musicbox_client.aclose()
             fastapi_app.state.musicbox_client = None
+        if created_neteasefree and getattr(fastapi_app.state, "neteasefree_client", None):
+            await fastapi_app.state.neteasefree_client.aclose()
+            fastapi_app.state.neteasefree_client = None
         if created_lx and getattr(fastapi_app.state, "lx_client", None):
             await fastapi_app.state.lx_client.aclose()
             fastapi_app.state.lx_client = None
@@ -5418,6 +5592,7 @@ async def ext_healthz(request: Request):
               ("musicdl", CONF.get("musicdl_enabled"), get_musicdl_client, "/healthz"),
               # 网易云歌单常驻：musicbox 非当前音源时仍是健康检查的一部分（issue #38）
               ("musicbox", _netease_runtime_usable(), get_musicbox_client, "/healthz"),
+              ("neteasefree", CONF.get("neteasefree_enabled"), get_neteasefree_client, "/healthz"),
               ("lxmusic", CONF.get("lx_enabled"), get_lx_client, "/healthz")]
     enabled = [(name, getter, path) for name, on, getter, path in checks if on]
     results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
@@ -5425,7 +5600,7 @@ async def ext_healthz(request: Request):
     details.update({name: result for (name, _, _), result in zip(enabled, results)})
     statuses = {name: value["status"] for name, value in details.items()}
     failed = [name for name, status in statuses.items() if status == "fail"]
-    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "lxmusic"))
+    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "neteasefree", "lxmusic"))
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
@@ -5434,6 +5609,7 @@ async def ext_healthz(request: Request):
                 # 推荐口径：每日/热门仍只随当前音源构建（常驻不并入网易），
                 # 与上方 musicbox 探活口径（_netease_runtime_usable）区分
                 "netease": bool(CONF.get("netease_enabled")),
+                "neteasefree": bool(CONF.get("neteasefree_enabled")),
                 "lx": bool(CONF.get("lx_enabled")),
                 "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
                 "source_slot_claimed": dailyrec.source_slot_claimed(),
@@ -5623,6 +5799,9 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
     factories = []
     if CONF.get("netease_enabled"):
         factories.append(lambda: fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
+    # 第四源与 musicbox 同款 /api/v1/* 契约：搜索走同分支，默认关闭，旧三源顺序不变。
+    if CONF.get("neteasefree_enabled"):
+        factories.append(lambda: fetch_musicbox_search(get_neteasefree_client(request.app), keyword, CONF["netease_search_limit"]))
     if CONF.get("musicdl_enabled"):
         factories.append(lambda: fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
     if CONF.get("lx_enabled"):
@@ -5732,8 +5911,8 @@ def _deep_sources_available(entry: dict) -> bool:
     if int(entry.get("deep_round") or 1) >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
         return False
     exhausted = entry.get("exhausted") or set()
-    for name in ("netease", "lx"):
-        if CONF.get(f"{name}_enabled") and name not in exhausted:
+    for name, env_key in (("netease", "netease_enabled"), ("neteasefree", "neteasefree_enabled"), ("lx", "lx_enabled")):
+        if CONF.get(env_key) and name not in exhausted:
             return True
     return False
 
@@ -5751,7 +5930,7 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
     if _user_search_stale(entry, scope):
         return
     if round_no >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
-        entry.setdefault("exhausted", set()).update({"netease", "lx"})
+        entry.setdefault("exhausted", set()).update({"netease", "neteasefree", "lx"})
         return
     token = _FETCH_SCOPE.set(scope)
     try:
@@ -5765,6 +5944,12 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
             n_cursor = cursors.get("netease", 1)
             fetches.append(("netease", _musicbox_search_request(
                 get_musicbox_client(request.app), keyword, limit, offset=n_cursor * limit)))
+        # 第四源只做搜索+榜单链路：深分页沿用网易系同款契约，与首屏聚合分支保持一致。
+        if CONF.get("neteasefree_enabled") and "neteasefree" not in exhausted:
+            limit = int(CONF["netease_search_limit"])
+            n_cursor = cursors.get("neteasefree", 1)
+            fetches.append(("neteasefree", _musicbox_search_request(
+                get_neteasefree_client(request.app), keyword, limit, offset=n_cursor * limit)))
         if CONF.get("lx_enabled") and "lx" not in exhausted:
             lx_cursor = cursors.get("lx", 1)
             fetches.append(("lx", _lx_search_request(
@@ -5799,7 +5984,7 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
             merged = deduplicate_online_items(merged + items)[:2000]
 
         if len(merged) >= 2000:
-            exhausted.update({"netease", "lx"})
+            exhausted.update({"netease", "neteasefree", "lx"})
         entry["items"] = merged
         entry["deep_round"] = round_no + 1
         entry["accessed"] = time.time()
@@ -7043,7 +7228,9 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
     token = _FETCH_SCOPE.set(_credential_scope(request) + ":play")
     try:
         if source == "netease":
-            coro = fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
+            # 第四源网易系走 musicbox 同款契约：取链客户端按运行期可用选择。
+            netease_client = _active_netease_client(request.app) or get_musicbox_client(request.app)
+            coro = fetch_musicbox_search(netease_client, keyword, CONF["netease_search_limit"])
         elif source == "lx":
             # 按目标 GUID 的平台精确重搜（GUID 第 3 段），对齐 musicdl 分支按引擎重搜的行为
             parts = guid.split(":")
@@ -7099,6 +7286,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             try:
                 if source == "netease":
                     song_id = song_id_from_online_guid(guid).split(":")[-1]
+                    netease_client = _active_netease_client(request.app) or get_musicbox_client(request.app)
                     max_q = "exhigh" if ((force_mp3 or _lossless_is_blacklisted(guid)) and not range_header) else None
                     if purpose == "download":
                         netease_download_quality = qp.normalize_quality(
@@ -7106,7 +7294,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                         netease_download_generation = (
                             _DL_CONFIG_GENERATION if generation is None else int(generation))
                         selected = await _resolve_netease_download_media(
-                            get_musicbox_client(request.app), song_id,
+                            netease_client, song_id,
                             netease_download_quality,
                             purpose=purpose, generation=netease_download_generation,
                         )
@@ -7118,7 +7306,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     else:
                         if max_q:
                             fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
-                        url = await resolve_netease_url(get_musicbox_client(request.app), song_id,
+                        url = await resolve_netease_url(netease_client, song_id,
                                                         refresh=refresh or bool(max_q), max_quality=max_q)
                     if not url:
                         return None
@@ -7416,6 +7604,66 @@ def _register_full_fetch(request: Request, guid: str) -> None:
     _register_background_fetch(request, guid, "tee_save_enabled")
 
 
+# === 自动缓存预取（任务 4.1） ===
+# 首曲自动落库 + 下一曲预取，复用现有整轨下载/tee 链路；同一曲目同时命中预取
+# 与边听边存时只下载一次（_register_background_fetch 内已有去重标记：
+# tee 在途 + 后台在途任务 + 失败冷却三重门）。
+_AUTO_CACHE_NEXT_GUIDS: "dict[str, list[str]]" = {}
+
+
+def auto_cache_first_enabled() -> bool:
+    """首曲自动落库开关：FNMUSIC_AUTO_CACHE_FIRST，默认关，支持热重载。"""
+    return bool(CONF.get("auto_cache_first"))
+
+
+def auto_cache_next_enabled() -> bool:
+    """下一曲预取开关：FNMUSIC_AUTO_CACHE_NEXT，默认关，支持热重载。"""
+    return bool(CONF.get("auto_cache_next"))
+
+
+def note_auto_cache_context(scope: str, guids: list[str]) -> None:
+    """登记歌单上下文（按凭证作用域）：供下一曲预取定位紧邻下一首。"""
+    cleaned = [str(g or "").strip() for g in (guids or []) if str(g or "").strip()]
+    if not scope or not cleaned:
+        return
+    _AUTO_CACHE_NEXT_GUIDS[scope] = cleaned[-512:]
+    if len(_AUTO_CACHE_NEXT_GUIDS) > 512:
+        _AUTO_CACHE_NEXT_GUIDS.pop(next(iter(_AUTO_CACHE_NEXT_GUIDS)))
+
+
+def next_guid_for_prefetch(scope: str, current_guid: str) -> str | None:
+    """按上下文取紧邻下一首：单曲播放无上下文时返回 None（不预取）。"""
+    if not scope or not current_guid:
+        return None
+    queue = _AUTO_CACHE_NEXT_GUIDS.get(scope) or []
+    try:
+        idx = queue.index(current_guid)
+    except ValueError:
+        return None
+    nxt = queue[idx + 1] if idx + 1 < len(queue) else None
+    if nxt and is_online_guid(nxt):
+        return nxt
+    return None
+
+
+def maybe_auto_cache_first(request: Request, guid: str) -> bool:
+    """首曲自动落库：开启且播放在线曲时后台整轨下载落库。"""
+    if not auto_cache_first_enabled() or not is_online_guid(guid):
+        return False
+    return _register_background_fetch(request, guid, "tee_save_enabled")
+
+
+def maybe_prefetch_next(request: Request, guid: str, next_guid: str | None = None) -> bool:
+    """下一曲预取：开启且有歌单上下文时后台预取紧邻下一首。"""
+    if not auto_cache_next_enabled():
+        return False
+    target = (str(next_guid or "").strip() or next_guid_for_prefetch(
+        _credential_scope(request), guid))
+    if not target or not is_online_guid(target):
+        return False
+    return _register_background_fetch(request, target, "tee_save_enabled")
+
+
 async def _strict_direct_play_auth(request: Request) -> bool:
     """Fail closed before exposing any external temporary URL."""
     if not any(request.headers.get(key) for key in (
@@ -7470,7 +7718,8 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
         except ImportError:
             from netease_direct import upgrade_netease_media_url  # type: ignore
         song_id = song_id_from_online_guid(guid).split(":")[-1]
-        url = await resolve_netease_url(get_musicbox_client(request.app), song_id)
+        netease_client = _active_netease_client(request.app) or get_musicbox_client(request.app)
+        url = await resolve_netease_url(netease_client, song_id)
         if not url:
             raise RuntimeError("resolve_failed")
         url = await upgrade_netease_media_url(url)
@@ -8932,6 +9181,9 @@ async def stream_track(request: Request, subpath: str = ""):
                 if not should_cache(range_header):
                     # 定长窗口客户端：本响应过不了 tee 写盘门，注册后台整轨下载兜底
                     _register_full_fetch(request, candidate)
+                else:
+                    # 任务 4.1：首曲自动落库（后台整轨下载，与边听边存同 guid 去重）。
+                    maybe_auto_cache_first(request, candidate)
                 localmatch.clear_served(guid)
                 return stream_tee_response(resp, candidate, range_header,
                     coro_factory=lambda: _online_info(request, candidate, include_lyric=bool(CONF.get("lyric_auto_dl"))),
@@ -8968,8 +9220,9 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
     try:
         if source == "netease":
             max_q = "exhigh" if _lossless_is_blacklisted(guid) else None
+            netease_client = _active_netease_client(request.app) or get_musicbox_client(request.app)
             url = await resolve_netease_url(
-                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1],
+                netease_client, song_id_from_online_guid(guid).split(":")[-1],
                 max_quality=max_q)
             if not url:
                 return None, None
@@ -9710,7 +9963,8 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True) 
 async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
     src = source_from_online_guid(guid)
     if src == "netease":
-        musicbox_client = get_musicbox_client(request.app)
+        musicbox_client = _active_netease_client(request.app) or get_musicbox_client(request.app)
+        log_name = "neteasefree" if musicbox_client is get_neteasefree_client(request.app) else "musicbox"
         raw_song_id = song_id_from_online_guid(guid)
         song_id = raw_song_id.split(":")[-1]
         try:
@@ -9753,7 +10007,7 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                                         if isinstance(l_data, dict):
                                             lyric_text = str(l_data.get("lyric") or "").strip()
                             except Exception as l_err:
-                                logger.warning("musicbox lyric fetch in _online_info failed for %s: %s", guid, l_err)
+                                logger.warning("%s lyric fetch in _online_info failed for %s: %s", log_name, guid, l_err)
 
                         return {
                             "id": f"netease:{song_id}",
@@ -9768,7 +10022,7 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                             "lyric": lyric_text,
                         }
         except Exception as e:
-            logger.warning("musicbox /info failed for %s: %s", guid, e)
+            logger.warning("%s /info failed for %s: %s", log_name, guid, e)
         return None
 
     if src == "lx":
@@ -10019,7 +10273,7 @@ async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> 
     cached = _cover_cache_get(key)
     if cached:
         return cached
-    musicbox_client = get_musicbox_client(request.app)
+    musicbox_client = _active_netease_client(request.app) or get_musicbox_client(request.app)
     keyword = " ".join(x for x in (artist, title) if x)
     target = ""
     try:
@@ -10296,6 +10550,9 @@ async def static_cover(request: Request, subpath: str = ""):
             return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
         if playlist_kind == "liked":
             cached = await _load_requested_playlist_bundle(request, user_guid, playlist_kind, guid)
+        elif playlist_kind == "category":
+            cid = (guid.split(":", 3)[-1].split(":")[0] if guid.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
+            cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind, cid)
         else:
             cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
@@ -10991,17 +11248,26 @@ def _sync_recommend_version_marker() -> None:
         )
 
 
+def _custom_playlists_enabled() -> bool:
+    """自定义歌单总开关（任务 3.3/3.4）：默认关闭，开启后已启用定义才注入。"""
+    return bool(CONF.get("custom_enabled", False))
+
+
 def _recommend_kind_enabled(kind: str) -> bool:
     if kind == "liked":
         return not (dailyrec.llm_liked_enabled() and dailyrec.llm_liked_size() == 0)
     if kind == "hot":
         return bool(CONF.get("recommend_hot", True))
+    if kind == "category":
+        return bool(CONF.get("recommend_daily", True))
+    if kind == "custom":
+        return _custom_playlists_enabled()
     return bool(CONF.get("recommend_daily", True))
 
 
 def _recommend_kinds_enabled() -> list[str]:
     """按开关返回要注入的推荐歌单类型（顺序即歌单列表顺序）。"""
-    return [k for k in ("daily", "liked", "hot") if _recommend_kind_enabled(k)]
+    return [k for k in ("daily", "liked", "hot", "category", "custom") if _recommend_kind_enabled(k)]
 
 
 def _is_shared_user_guid(user_guid: str) -> bool:
@@ -11041,7 +11307,9 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
         try:
             if task.exception() is None:
                 result = task.result()
-                if isinstance(result, dict) and len(result.get("tracks") or []) >= dailyrec.PLAYLIST_SIZE:
+                want = dailyrec.playlist_size() if kind in ("daily", "hot") else (
+                    dailyrec.category_size() if kind == "category" else dailyrec.playlist_size())
+                if isinstance(result, dict) and len(result.get("tracks") or []) >= want:
                     return task
                 if isinstance(result, dict) and not result.get("tracks"):
                     # 空结果冷却：音源全挂/LLM 不可用时构建产出 0 首，缓存为空会让
@@ -11061,17 +11329,18 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
         if done is not None:
             return done
     _EMPTY_BUILD_COOLDOWN.pop(key, None)
-    epoch = _DAILY_EPOCHS[kind]
+    epoch = _DAILY_EPOCHS.get(kind, 0)
     async with _FAV_LOCK:
         favs = load_online_favorites(user_guid)
     task = asyncio.create_task(
         dailyrec.get_or_build_daily(
             user_guid=user_guid,
             musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled") else None,
-            musicbox_client=get_musicbox_client(request.app) if CONF["netease_enabled"] else None,
+            musicbox_client=get_musicbox_client(request.app) if _netease_box_enabled() else None,
+            neteasefree_client=get_neteasefree_client(request.app) if _neteasefree_enabled() else None,
             llm_http=get_llm_client(request.app) if dailyrec.llm_enabled() else None,
             build_track=build_online_track,
-            netease_enabled=CONF["netease_enabled"],
+            netease_enabled=_netease_box_enabled(),
             favorite_items=favs,
             lx_client=get_lx_client(request.app) if CONF.get("lx_enabled") else None,
             lx_enabled=bool(CONF.get("lx_enabled")),
@@ -11079,9 +11348,9 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
             recommend_hot=bool(CONF.get("recommend_hot", True)),
             recommend_daily=bool(CONF.get("recommend_daily", True)),
             kind=kind,
-            publication_guard=lambda: (
-                epoch == _DAILY_EPOCHS[kind] and day == dailyrec.today_key()
-                and _recommend_kind_enabled(kind)
+            publication_guard=lambda k=kind: (
+                epoch == _DAILY_EPOCHS.get(k, 0) and day == dailyrec.today_key()
+                and _recommend_kind_enabled(k)
             ),
         )
     )
@@ -11143,6 +11412,134 @@ def _mark_liked_response_fetched(user_guid: str, bundle: dict) -> None:
         _wake_liked_scheduler()
 
 
+def _category_enabled_cids() -> list[str]:
+    """已启用的分类 id 列表：默认全部分类启用，可配 FNMUSIC_CATEGORY_ENABLED_IDS 子集。"""
+    raw = (os.environ.get("FNMUSIC_CATEGORY_ENABLED_IDS") or "").strip()
+    ids = {d["id"] for d in dailyrec.category_defs()}
+    if not raw:
+        return sorted(ids)
+    picked = [x.strip() for x in raw.replace("，", ",").split(",") if x.strip() in ids]
+    return picked or sorted(ids)
+
+
+def _enabled_custom_definitions() -> list[dict]:
+    """已启用的自定义歌单定义（目录缺失/总开关关闭返回空，不抛异常）含 tracks。"""
+    if not _custom_playlists_enabled():
+        return []
+    try:
+        items = custompl.list_definitions(CONF.get("custom_dir") or None)
+    except Exception:
+        return []
+    out = []
+    for row in items:
+        if not row.get("enabled"):
+            continue
+        data = custompl.load_definition(str(row.get("id") or ""), CONF.get("custom_dir") or None)
+        if data:
+            out.append(data)
+    return out
+
+
+async def _ensure_category_task(request: Request, user_guid: str, cid: str) -> asyncio.Task:
+    """分类单类构建任务（渐进上架，预算超时不丢已完成部分；校验用最低成本档）。"""
+    day = dailyrec.today_key()
+    key = f"{user_guid}:category:{cid}:{day}"
+    task = _DAILY_TASKS.get(key)
+    if task is not None and not task.done():
+        return task
+    _DAILY_TASKS.pop(key, None)
+
+    async def _run() -> dict:
+        tracks: list[dict] = []
+        failures: list[str] = []
+        budget = dailyrec.build_budget_s()
+        limit = dailyrec.category_size()
+
+        def _emit(track: dict) -> None:
+            if track and len(tracks) < limit:
+                tracks.append(track)
+                _save_category_checkpoint()
+
+        def _save_category_checkpoint() -> None:
+            if not tracks:
+                return
+            payload = {
+                "day": day,
+                "kind": "category",
+                "cid": cid,
+                "guid": dailyrec.category_playlist_guid(cid, day),
+                "status": "ready" if len(tracks) >= limit else "partial",
+                "playlist": dailyrec.build_playlist_record(
+                    guid=dailyrec.category_playlist_guid(cid, day),
+                    name=f"分类·{cid}",
+                    cover_id=dailyrec.category_playlist_guid(cid, day),
+                    track_count=len(tracks),
+                ),
+                "tracks": dailyrec.stamp_playlist_tracks(list(tracks)[:limit]),
+                "tiers": ["category-preset"],
+                "tierFailures": list(failures),
+                "builtAt": time.time(),
+            }
+            dailyrec.save_daily_cache(user_guid, day, payload, "category")
+
+        async def _tier() -> list[dict]:
+            return await dailyrec.build_category_bundle(
+                cid,
+                musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled") else None,
+                musicbox_client=get_musicbox_client(request.app) if _netease_box_enabled() else None,
+                netease_enabled=_netease_box_enabled(),
+                build_track=build_online_track,
+                lx_client=get_lx_client(request.app) if CONF.get("lx_enabled") else None,
+                lx_enabled=bool(CONF.get("lx_enabled")),
+                lx_sources=CONF.get("lx_sources") or None,
+                neteasefree_client=get_neteasefree_client(request.app) if _neteasefree_enabled() else None,
+                size=limit,
+                on_track=_emit,
+            )
+
+        try:
+            chunk = await asyncio.wait_for(asyncio.create_task(_tier()), timeout=max(1.0, budget))
+        except asyncio.TimeoutError:
+            failures.append("category:timeout")
+            chunk = []
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"category:{type(e).__name__}")
+            chunk = []
+        if chunk:
+            seen = {(str(x.get("guid") or "")) for x in tracks}
+            for track in chunk:
+                g = str(track.get("guid") or "")
+                if g and g not in seen:
+                    seen.add(g)
+                    tracks.append(track)
+            _save_category_checkpoint()
+        _save_category_checkpoint()
+        payload = {
+            "day": day,
+            "kind": "category",
+            "cid": cid,
+            "guid": dailyrec.category_playlist_guid(cid, day),
+            "status": "ready" if len(tracks) >= limit else "partial",
+            "playlist": dailyrec.build_playlist_record(
+                guid=dailyrec.category_playlist_guid(cid, day),
+                name=f"分类·{cid}",
+                cover_id=dailyrec.category_playlist_guid(cid, day),
+                track_count=len(tracks[:limit]),
+            ),
+            "tracks": dailyrec.stamp_playlist_tracks(list(tracks)[:limit]),
+            "tiers": ["category-preset"],
+            "tierFailures": list(failures),
+            "builtAt": time.time(),
+        }
+        if tracks:
+            dailyrec.save_daily_cache(user_guid, day, payload, "category")
+        return payload
+
+    task = asyncio.create_task(_run())
+    _DAILY_TASKS[key] = task
+    return task
+
+
 async def _peek_daily_bundle(request: Request, user_guid: str, kind: str = "daily") -> dict:
     """歌单列表用：有缓存立刻返回；否则等渐进 checkpoint，最多 2s，超时仍返回占位歌单。"""
     if kind not in _recommend_injectable_kinds(user_guid):
@@ -11191,6 +11588,11 @@ def _recommend_request_owned(user_guid: str, kind: str, guid: str) -> bool:
         return False
     if kind == "hot":
         return True
+    if kind == "category":
+        cid = (guid.split(":", 3)[-1].split(":")[0] if guid.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
+        return bool(cid) and guid == dailyrec.category_playlist_guid(cid, dailyrec.today_key())
+    if kind == "custom":
+        return custompl.is_custom_playlist_guid(guid)
     return guid == dailyrec.recommend_playlist_guid(kind, user_guid=user_guid)
 
 
@@ -11469,6 +11871,32 @@ async def playlist_delete(request: Request):
     return JSONResponse(content=envelope, headers=headers)
 
 
+async def _resolve_custom_tracks(request: Request, user_guid: str, data: dict) -> list[dict]:
+    """自定义歌单曲目解析：定义 tracks 经搜索链路转为可播曲目，去重合并。
+
+    任务 3.3/3.4：复用现有大模型链路之外的搜索+校验链路（resolve_recommendations，
+    当前只有 custom 接入，后续 4.3 才抽象三档）；校验用最低成本档
+    （verify_track_playable 内部统一 standard 档），与手动列表去重合并后截断。"""
+    pid = str((data or {}).get("id") or "")
+    recs = [dict(x) for x in ((data or {}).get("tracks") or []) if isinstance(x, dict)]
+    if not recs:
+        return []
+    tracks = await dailyrec.resolve_recommendations(
+        recs,
+        get_musicdl_client(request.app) if CONF.get("musicdl_enabled") else None,
+        get_musicbox_client(request.app) if _netease_box_enabled() else None,
+        _netease_box_enabled(),
+        build_online_track,
+        dailyrec.playlist_size(),
+        None, None,
+        lx_client=get_lx_client(request.app) if CONF.get("lx_enabled") else None,
+        lx_enabled=bool(CONF.get("lx_enabled")),
+        lx_sources=CONF.get("lx_sources") or None,
+        neteasefree_client=get_neteasefree_client(request.app) if _neteasefree_enabled() else None,
+    )
+    return dailyrec.stamp_playlist_tracks(tracks)
+
+
 def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
     cover = str(record.get("guid") or record.get("coverId") or "")
     if cover.startswith("online:"):
@@ -11519,6 +11947,57 @@ async def playlist_list(request: Request):
     recs: list[dict] = []
     consumed_liked = None
     for kind in kinds:
+        if kind == "category":
+            # 任务 3.1：分类歌单按类独立注入（后台预热构建，构建中不阻塞其他歌单）。
+            for cid in _category_enabled_cids():
+                try:
+                    task = await _ensure_category_task(request, user_guid, cid)
+                    try:
+                        bundle = task.result() if task.done() and task.exception() is None else None
+                    except (asyncio.CancelledError, Exception):
+                        bundle = None
+                    if not bundle or not bundle.get("tracks"):
+                        day_now = dailyrec.today_key()
+                        bundle = dailyrec.load_daily_cache(user_guid, day_now, "category", cid)
+                        if not bundle or not bundle.get("tracks"):
+                            continue
+                    tracks = bundle.get("tracks") or []
+                    card = {
+                        "guid": dailyrec.category_playlist_guid(cid, bundle.get("day") or day_now),
+                        "name": f"分类·{cid}（{len(tracks)}）",
+                        "coverId": dailyrec.category_playlist_guid(cid, bundle.get("day") or day_now),
+                        "createdAt": bundle.get("builtAt") or int(time.time()),
+                        "updatedAt": bundle.get("builtAt") or int(time.time()),
+                        "trackCount": len(tracks),
+                        "isDaily": True,
+                    }
+                    recs.append(card)
+                    fake_official_guid(str(card.get("guid") or ""))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("category %s list inject failed: %s", cid, e)
+                    continue
+            continue
+        if kind == "custom":
+            # 任务 3.3/3.4：自定义歌单独立管理（导入/生成），仅注入已启用定义。
+            for data in _enabled_custom_definitions():
+                try:
+                    pid = str(data.get("id") or "")
+                    guid = custompl.playlist_guid(pid)
+                    card = {
+                        "guid": guid,
+                        "name": str(data.get("name") or "未命名歌单"),
+                        "coverId": guid,
+                        "createdAt": int(data.get("createdAt") or time.time()),
+                        "updatedAt": int(data.get("updatedAt") or time.time()),
+                        "trackCount": len(data.get("tracks") or []),
+                        "isDaily": True,
+                    }
+                    recs.append(card)
+                    fake_official_guid(guid)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("custom list inject failed: %s", e)
+                    continue
+            continue
         try:
             bundle = await _peek_daily_bundle(request, user_guid, kind)
         except Exception as e:
@@ -11612,6 +12091,43 @@ async def playlist_detail(request: Request):
             card = {**card, "trackCount": len(tracks)}
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     kind = dailyrec.online_playlist_kind(guid)
+    if kind == "category":
+        # 任务 3.1：分类歌单详情（按类按天缓存，未启用分类返回无歌单）。
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        cid = (guid.split(":", 3)[-1].split(":")[0] if guid.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
+        if cid not in {d["id"] for d in dailyrec.category_defs()}:
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        bundle = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), "category", cid)
+        tracks = (bundle or {}).get("tracks") or []
+        card = {
+            "guid": dailyrec.category_playlist_guid(cid, (bundle or {}).get("day") or dailyrec.today_key()),
+            "name": f"分类·{cid}（{len(tracks)}）",
+            "coverId": dailyrec.category_playlist_guid(cid, (bundle or {}).get("day") or dailyrec.today_key()),
+            "trackCount": len(tracks),
+        }
+        fake_official_guid(str(card.get("guid") or ""))
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
+    if kind == "custom":
+        # 任务 3.3：自定义歌单详情（仅已启用定义可见）。
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        pid = custompl.id_from_guid(guid)
+        data = custompl.load_definition(pid, CONF.get("custom_dir") or None) if pid else None
+        if not data or not data.get("enabled", True) or not _custom_playlists_enabled():
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        card = {
+            "guid": custompl.playlist_guid(pid),
+            "name": str(data.get("name") or "未命名歌单"),
+            "coverId": custompl.playlist_guid(pid),
+            "trackCount": len(data.get("tracks") or []),
+        }
+        fake_official_guid(str(card.get("guid") or ""))
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截修正 trackCount，否则纯透传
         if not plt_dir_has_data():
@@ -11707,6 +12223,27 @@ async def playlist_batch_detail(request: Request):
     consumed_liked = []
     for g in recommend_ids:
         kind = dailyrec.online_playlist_kind(g) or "daily"
+        if kind == "category":
+            cid = (g.split(":", 3)[-1].split(":")[0] if g.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
+            bundle = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), "category", cid)
+            tracks = (bundle or {}).get("tracks") or []
+            recs.append({
+                "guid": dailyrec.category_playlist_guid(cid, (bundle or {}).get("day") or dailyrec.today_key()),
+                "name": f"分类·{cid}（{len(tracks)}）",
+                "trackCount": len(tracks),
+            })
+            continue
+        if kind == "custom":
+            pid = custompl.id_from_guid(g)
+            data = custompl.load_definition(pid, CONF.get("custom_dir") or None) if pid else None
+            if not data or not data.get("enabled", True) or not _custom_playlists_enabled():
+                continue
+            recs.append({
+                "guid": custompl.playlist_guid(pid),
+                "name": str(data.get("name") or "未命名歌单"),
+                "trackCount": len(data.get("tracks") or []),
+            })
+            continue
         bundle = await _load_requested_playlist_bundle(request, user_guid, kind, g)
         if kind == "liked" and bundle.get("tracks"):
             consumed_liked.append(bundle)
@@ -11823,6 +12360,74 @@ async def playlist_track_list(request: Request):
                 "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
             })
         )
+    if kind == "category":
+        # 任务 3.1：分类歌单曲目（按类按天缓存分页下发）。
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        cid = (guid.split(":", 3)[-1].split(":")[0] if guid.startswith(dailyrec.CATEGORY_GUID_PREFIX) else "")
+        bundle = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), "category", cid)
+        tracks = dailyrec.stamp_playlist_tracks(list((bundle or {}).get("tracks") or []))
+        register_online_meta(tracks)
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            size = max(len(tracks), 1)
+        if size < 1:
+            size = 50
+        start = (page - 1) * size
+        page_tracks = _stamp_online_favorite_state(
+            tracks[start:start + size],
+            await _online_favorite_set_for_user(user_guid),
+        )
+        return JSONResponse(content=disguise_client_json({
+            "code": 0, "msg": "ok",
+            "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+        }))
+    if kind == "custom":
+        # 任务 3.3/3.4：自定义歌单曲目（定义检索为可播曲目，去重后分页下发）。
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        pid = custompl.id_from_guid(guid)
+        data = custompl.load_definition(pid, CONF.get("custom_dir") or None) if pid else None
+        if not data or not data.get("enabled", True) or not _custom_playlists_enabled():
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        try:
+            tracks = await _resolve_custom_tracks(request, user_guid, data)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("custom playlist tracks failed (%s): %s", pid, e)
+            return JSONResponse(content={"code": -1, "msg": "custom playlist load failed", "data": None})
+        register_online_meta(tracks)
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            size = max(len(tracks), 1)
+        if size < 1:
+            size = 50
+        start = (page - 1) * size
+        page_tracks = _stamp_online_favorite_state(
+            tracks[start:start + size],
+            await _online_favorite_set_for_user(user_guid),
+        )
+        return JSONResponse(content=disguise_client_json({
+            "code": 0, "msg": "ok",
+            "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+        }))
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截合并，否则纯透传
         if not plt_dir_has_data():
@@ -11901,6 +12506,14 @@ async def playlist_track_list(request: Request):
     bundle = await _load_requested_playlist_bundle(request, user_guid, kind, guid)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
     register_online_meta(tracks)
+    # 任务 4.1：登记歌单上下文，供下一曲预取定位紧邻下一首。
+    try:
+        note_auto_cache_context(
+            _credential_scope(request),
+            [str(t.get("guid") or "") for t in tracks if isinstance(t, dict)],
+        )
+    except Exception:
+        pass
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
@@ -12288,44 +12901,50 @@ def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str] | None
 
 
 async def _netease_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
-    if not CONF.get("netease_enabled"):
-        return []
-    client = get_musicbox_client(request.app)
-    try:
-        r = await client.get(
-            "/api/v1/search",
-            params={"keyword": keyword, "type": "album", "limit": max(limit, 5)},
-            timeout=8.0,
-        )
-    except Exception as e:
-        logger.debug("netease album search failed: %s", e)
-        return []
-    if r.status_code != 200:
-        return []
-    body = r.json() if r.headers.get("content-type", "").startswith(("application/json", "text/json")) else {}
-    rows = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(rows, list):
+    # 专辑搜索只做搜索链：musicbox 与第四源各自按 enabled 开关聚合，常驻不并入。
+    jobs = []
+    if CONF.get("netease_enabled"):
+        jobs.append(get_musicbox_client(request.app))
+    if CONF.get("neteasefree_enabled"):
+        jobs.append(get_neteasefree_client(request.app))
+    if not jobs:
         return []
     out: list[dict] = []
     seen: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict):
+    for client in jobs:
+        try:
+            r = await client.get(
+                "/api/v1/search",
+                params={"keyword": keyword, "type": "album", "limit": max(limit, 5)},
+                timeout=8.0,
+            )
+        except Exception as e:
+            logger.debug("netease album search failed: %s", e)
             continue
-        norm = _normalize_netease_album_row(row)
-        if norm is None:
+        if r.status_code != 200:
             continue
-        album_id, name, artist, cover = norm
-        if album_id in seen:
+        body = r.json() if r.headers.get("content-type", "").startswith(("application/json", "text/json")) else {}
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
             continue
-        seen.add(album_id)
-        # 锚点 guid 仅供专辑伪装登记/反解，不对应任何真实曲目；
-        # 形态对齐曲目锚点约定：专辑 guid = 锚点 + ":album"（register 内部拼）
-        anchor = f"online:netease:album:{album_id}"
-        register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id, persist=True)
-        out.append(_album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0))
-        if len(out) >= limit:
-            break
-    return out
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            norm = _normalize_netease_album_row(row)
+            if norm is None:
+                continue
+            album_id, name, artist, cover = norm
+            if album_id in seen:
+                continue
+            seen.add(album_id)
+            # 锚点 guid 仅供专辑伪装登记/反解，不对应任何真实曲目；
+            # 形态对齐曲目锚点约定：专辑 guid = 锚点 + ":album"（register 内部拼）
+            anchor = f"online:netease:album:{album_id}"
+            register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id, persist=True)
+            out.append(_album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0))
+            if len(out) >= limit:
+                break
+    return out[:limit]
 
 
 async def _aggregate_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
@@ -12554,6 +13173,12 @@ async def event_report(request: Request):
                     if duration_s:
                         snapshot["duration_s"] = duration_s
                     dailyrec.record_online_play(user_guid, guid, snapshot)
+                    # 任务 4.1：播放上报即触发首曲落库 + 下一曲预取（后台整轨下载，去重）。
+                    try:
+                        maybe_auto_cache_first(request, guid)
+                        maybe_prefetch_next(request, guid)
+                    except Exception:
+                        pass
         elif auth_resp is not None and not other_events:
             return auth_resp
 

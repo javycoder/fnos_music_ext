@@ -28,6 +28,12 @@ if [ "${SOURCES}" = "lxmusic" ]; then
     # 跳过可用性校验，只做激活；源状态装好后在管理页 WebUI 查看
     ARGS+=(--lx-skip-verify)
 fi
+if [ "${SOURCES}" = "neteasefree" ]; then
+    # 第四源后端地址透传（类比 lx）：升级不丢用户自建后端地址；
+    # install.sh 侧只做透保留，启用确认与 https 校验在 WebUI 层。
+    API_BASE="$(fnmusic_saved_neteasefree_api_base)"
+    [ -n "${API_BASE}" ] && ARGS+=(--neteasefree-api-base "${API_BASE}")
+fi
 
 cd "${FNMUSIC_REPO_DIR}"
 if ! fnmusic_run_logged bash ./install.sh "${ARGS[@]}"; then

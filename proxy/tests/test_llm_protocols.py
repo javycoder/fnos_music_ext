@@ -183,6 +183,7 @@ async def test_responses_incomplete_empty_text_raises(monkeypatch):
 
 @pytest.mark.anyio
 async def test_not_configured_raises(monkeypatch):
+    monkeypatch.setenv("FNMUSIC_LLM_PROVIDER", "custom")
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     async with httpx.AsyncClient() as client:
