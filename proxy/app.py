@@ -2488,6 +2488,11 @@ _PRIV_STATE = [os.geteuid() if hasattr(os, "geteuid") else -1,
                os.getegid() if hasattr(os, "getegid") else -1]
 
 
+def _posix_euid() -> int:
+    """当前有效 uid；Windows 开发机无 geteuid，返回 -1 表示无权限切换语义。"""
+    return os.geteuid() if hasattr(os, "geteuid") else -1
+
+
 def _staged_socket_path():
     import sys
     argv = sys.argv
@@ -2505,8 +2510,9 @@ def _drop_privileges(fallback=None):
     uvicorn 0.54 在 lifespan 结束后才 bind --uds，因此先由本函数把暂存
     socket 目录 chown/chmod 给目标用户，再 seteuid，bind 才能成功。
     """
-    if os.geteuid() != 0:
-        return os.geteuid(), os.getegid()
+    euid = _posix_euid()
+    if euid != 0:
+        return euid, (os.getegid() if hasattr(os, "getegid") else -1)
     primary_uid = primary_gid = 0
     for candidate in (tee_save_dir(), str(CONF.get('cache_dir') or '')):
         if not candidate:
@@ -2587,6 +2593,8 @@ def _reevaluate_privileges():
     以 root 身份重新探测（music.db 可能仅 root 可读）；若新路径属于 root
     或其他不可用属主，则回退到当前运行身份，绝不永久提权。
     """
+    if not hasattr(os, "seteuid"):
+        return  # Windows 开发机无权限切换语义，无可重估
     if os.geteuid() != 0:
         try:
             os.setegid(0)
@@ -2607,7 +2615,9 @@ def _reevaluate_privileges():
 
 
 def _re_raise_and_drop():
-    if os.geteuid() == 0:
+    if not hasattr(os, "seteuid"):
+        return
+    if _posix_euid() == 0:
         try:
             _drop_privileges()
         except SystemExit:
@@ -4201,7 +4211,7 @@ async def _resolve_netease_download_media(client: httpx.AsyncClient, song_id: st
             except asyncio.TimeoutError:
                 result = None
             if result:
-                ttl = max(0.0, float(result.get("reuse_for_s") or 300.0))
+                ttl = max(0.0, float(result.get("reuse_for_s", 300.0)))
                 if len(_NETEASE_DOWNLOAD_CACHE) >= _NETEASE_URL_PIN_MAX:
                     oldest = min(_NETEASE_DOWNLOAD_CACHE, key=lambda key: _NETEASE_DOWNLOAD_CACHE[key][1])
                     _NETEASE_DOWNLOAD_CACHE.pop(oldest, None)
@@ -5338,7 +5348,7 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
-        if os.geteuid() != 0:
+        if hasattr(os, "seteuid") and os.geteuid() != 0:
             try:
                 os.setegid(0)
                 os.seteuid(0)
@@ -7216,7 +7226,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             finally:
                 if info_task is not None and not info_task.done():
                     info_task.cancel()
-            if source == "netease":
+            if source == "netease" and purpose != "download":
+                # 下载已携带独立解析的格式，不能被同曲播放钉链的另一表示覆盖。
                 # issue IKS5FW：扩展名以取链钉链携带的实际交付格式（type/level）
                 # 为准；目录启发式（info.ext 按 has_sq/has_hr 推 flac）只作兜底
                 # ——无损无权限降档交付 mp3 时，按目录命名 .flac 同样是错标。
