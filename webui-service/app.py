@@ -1200,12 +1200,17 @@ def validate_updates(values: dict) -> dict[str, str]:
         if str(final.get("FNMUSIC_LLM_API_KEY") or "").strip():
             updates["FNMUSIC_LLM_API_KEY"] = ""
     # 第四源第三方后端地址：只允许 https；默认示例占位须在前端显式确认后才可启用。
+    # 本地回环地址（127.0.0.1/localhost/::1）允许 http，因为 neteasefree 服务运行在本机。
     for url_key in ("FNMUSIC_NETEASEFREE_URL", "FNMUSIC_NETEASE_API_BASE"):
         if url_key in updates:
             text = str(updates[url_key] or "").strip()
             if text:
                 parsed = urllib.parse.urlparse(text)
-                if parsed.scheme != "https" or not parsed.netloc:
+                host = (parsed.hostname or "").lower()
+                is_local = host in ("", "127.0.0.1", "localhost", "::1", "0.0.0.0")
+                if not parsed.netloc:
+                    raise ValueError(f"{url_key}: 仅支持 https 地址")
+                if parsed.scheme != "https" and not is_local:
                     raise ValueError(f"{url_key}: 仅支持 https 地址")
             updates[url_key] = text.rstrip("/") if text else ""
     final_neteasefree = str(final.get("FNMUSIC_NETEASEFREE_ENABLED", "false")).lower() in ("true", "1", "yes")
