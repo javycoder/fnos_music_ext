@@ -16,7 +16,6 @@ import math
 import json
 import logging
 import os
-import grp
 import re
 import shutil
 import sqlite3
@@ -2484,7 +2483,9 @@ def _get_repo_root():
 _REPO_ROOT = _get_repo_root()
 
 # 进程启动时的身份（root）；成功降权后记录实际运行身份，供配置热重载时回退。
-_PRIV_STATE = [os.geteuid(), os.getegid()]
+# Windows 开发机没有 geteuid/getegid（离线测试套件需要可导入），按无特权 (-1) 处理。
+_PRIV_STATE = [os.geteuid() if hasattr(os, "geteuid") else -1,
+               os.getegid() if hasattr(os, "getegid") else -1]
 
 
 def _staged_socket_path():
@@ -5074,6 +5075,50 @@ async def _run_cleanup_locked(job: dict) -> None:
         job.update(status="completed", phase="清理完成")
 
 
+def _probe_dir_writable(directory: str) -> bool:
+    probe = os.path.join(directory, f".fnmusic-fscheck-{os.getpid()}-{uuid4().hex}")
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
+def _fs_check_target(path: str) -> tuple[bool, bool]:
+    """目录存在性与可写性探测（与 webui_gateway.handle_fs_check 同语义）。
+
+    以当前（降权后）proxy 身份探测——下载/缓存目录的真实落盘方就是它，
+    结论比 root 视角更贴近实际。无副作用：不创建目录，临时探测文件即落
+    即删；目录不存在时用最近存在祖先目录的可写性代表"能否创建"。
+    """
+    exists = writable = False
+    ancestor = path
+    while True:
+        try:
+            os.stat(ancestor)
+        except FileNotFoundError:
+            # 只能跳过真正缺失的路径；悬空链接本身占位，mkdir 无法替换它。
+            if os.path.islink(ancestor) or os.path.dirname(ancestor) == ancestor:
+                break
+            ancestor = os.path.dirname(ancestor)
+            continue
+        except OSError:
+            # ENOTDIR（文件祖先）、EACCES 等不能当作缺失后继续向上放行。
+            break
+        if os.path.isdir(ancestor):
+            exists = ancestor == path
+            writable = _probe_dir_writable(ancestor)
+        # 首个存在节点不是目录时同样停止，不能跳过普通文件。
+        break
+    return exists, writable
+
+
 async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int, dict]:
     global _maintenance_task, _organize_task, _last_organize_job
     if method == "GET":
@@ -5106,6 +5151,15 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
 
     if method != "POST":
         return 400, {"ok": False, "error": "不支持的维护请求"}
+    if path == "/api/fs-check":
+        # 传输层 _validate_body 已做相同校验；此处再守一道，纵深防御。
+        target = body.get("path")
+        if (not isinstance(target, str) or not target.startswith("/")
+                or ".." in target.split("/")
+                or any(char in target for char in "\r\n\x00")):
+            return 400, {"ok": False, "error": "路径必须是绝对路径且不含 .."}
+        exists, writable = _fs_check_target(target)
+        return 200, {"ok": True, "path": target, "exists": exists, "writable": writable}
     if path == "/api/maintenance/cleanup":
         if body != {"confirm_beta": True}:
             return 400, {"ok": False, "error": "必须明确确认 Beta 风险"}

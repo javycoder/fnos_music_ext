@@ -29,6 +29,20 @@ def test_organize_body_rejects_invalid_layout_type(layout):
                          {"confirm_beta": True, "root": "/music", "layout": layout})
 
 
+def test_fs_check_body_accepts_absolute_path():
+    assert m._validate_body("POST", m.FS_CHECK_PATH, {"path": "/vol1/music"}) == {
+        "path": "/vol1/music"}
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"path": 1}, {"path": None}, {"path": "/x", "extra": 1},
+    {"path": "relative"}, {"path": "/a/../b"}, {"path": "/a\n"}, {"path": "/a\x00"},
+])
+def test_fs_check_body_rejects_invalid_paths(body):
+    with pytest.raises(ValueError):
+        m._validate_body("POST", m.FS_CHECK_PATH, body)
+
+
 async def exchange(path, raw):
     reader, writer = await asyncio.open_unix_connection(str(path))
     writer.write(raw)
