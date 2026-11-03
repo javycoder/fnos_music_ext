@@ -351,6 +351,16 @@ env_newer_than_container() {
     [ "${epoch_env}" -gt "${epoch_start}" ]
 }
 
+compose_newer_than_container() {
+    # docker-compose.yml 比容器启动新（卷挂载/端口/环境变量变更）时，compose 不会
+    # 自动重建容器：需要显式重建让新挂载生效。
+    local started epoch_start epoch_compose
+    started="$(run_docker inspect -f '{{.State.StartedAt}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
+    epoch_start="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
+    epoch_compose="$(stat -c %Y "${BASE_DIR}/docker-compose.yml" 2>/dev/null)" || return 1
+    [ "${epoch_compose}" -gt "${epoch_start}" ]
+}
+
 diagnose_sources_container() {
     # healthz 超时取证：supervisor 进程状态 + 容器日志尾部随安装日志落盘，
     # 让「进程集与 .env 不一致 / 程序启动失败」一眼可辨（issue 反馈可直接贴）。

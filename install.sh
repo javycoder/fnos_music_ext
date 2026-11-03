@@ -1613,7 +1613,13 @@ install_sources_container() {
     # 所选音源与旧进程集不一致时，下方 healthz 必然等满超时，先重启对齐再等待。
     # 同参数幂等重跑（所选服务全部已健康）不重启，保持快速路径；restart 亦会重新
     # 解析 bind mount，治愈 target 回滚重建目录后容器挂旧 inode 的现场。
-    if env_newer_than_container && ! sources_quick_ready; then
+    # docker-compose.yml 比容器启动新（卷挂载/端口变更）时，compose 不会自动重建：
+    # 需要显式 rm + up -d 让新挂载生效。
+    if compose_newer_than_container; then
+        log_info "检测到 docker-compose.yml 更新（卷挂载/端口变更），重建容器..."
+        run_docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d || return 1
+    elif env_newer_than_container && ! sources_quick_ready; then
         log_info "检测到 .env 更新且所选音源未运行，重启容器使音源开关生效..."
         run_docker restart "${CONTAINER_NAME}" || return 1
     fi

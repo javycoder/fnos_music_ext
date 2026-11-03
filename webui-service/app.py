@@ -86,11 +86,12 @@ ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 
 MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
 
-async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> dict | None:
+
+async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> tuple[int, dict] | None:
     """Try to call the host maintenance socket directly (for direct-mode access).
 
-    Returns the JSON payload on success, or None if the socket is unavailable
-    or the call fails (caller should fall back to 501).
+    Returns (status_code, payload) on success, or None if the socket is
+    unavailable or returns 5xx (caller should fall back to 501).
     """
     if not os.path.exists(MAINTENANCE_SOCKET):
         return None
@@ -101,11 +102,14 @@ async def _try_maintenance_socket(method: str, path: str, body: dict | None = No
                 resp = await client.get(path)
             else:
                 resp = await client.post(path, json=body or {})
-            if resp.status_code == 200:
-                return resp.json()
+            if resp.status_code < 500:
+                return resp.status_code, resp.json()
     except Exception:  # noqa: BLE001
         pass
     return None
+
+MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -2461,7 +2465,8 @@ async def api_fs_check(request: Request = None):
             body = {}
     result = await _try_maintenance_socket("POST", "/api/fs-check", body)
     if result is not None:
-        return result
+        status, payload = result
+        return JSONResponse(content=payload, status_code=status)
     raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
@@ -2474,7 +2479,8 @@ async def api_maintenance_cleanup(job_id: str = ""):
     else:
         result = await _try_maintenance_socket("POST", "/api/maintenance/cleanup", {"confirm_beta": True})
     if result is not None:
-        return result
+        status, payload = result
+        return JSONResponse(content=payload, status_code=status)
     raise HTTPException(status_code=501, detail="直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台")
 
 
@@ -2651,7 +2657,8 @@ async def api_maintenance_music_users():
     """读取飞牛音乐用户。优先通过 maintenance socket 直连宿主。"""
     result = await _try_maintenance_socket("GET", "/api/maintenance/music-users")
     if result is not None:
-        return result
+        status, payload = result
+        return JSONResponse(content=payload, status_code=status)
     raise HTTPException(status_code=501, detail="直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台")
 
 
@@ -2673,7 +2680,8 @@ async def api_maintenance_organize(job_id: str = "", request: Request = None):
         else:
             result = await _try_maintenance_socket("GET", "/api/maintenance/organize")
     if result is not None:
-        return result
+        status, payload = result
+        return JSONResponse(content=payload, status_code=status)
     raise HTTPException(status_code=501, detail="直连模式不支持整理下载目录，请在飞牛桌面内打开管理台")
 
 
