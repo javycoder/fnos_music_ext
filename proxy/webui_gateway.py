@@ -276,8 +276,15 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM) -> None:
     os.chmod(sock_path, 0o666)
     server.listen(64)
     while True:
-        client, _addr = server.accept()
-        threading.Thread(target=_handle, args=(client, upstream), daemon=True).start()
+        try:
+            client, _addr = server.accept()
+            threading.Thread(target=_handle, args=(client, upstream), daemon=True).start()
+        except OSError:
+            # Socket closed during shutdown.
+            break
+        except Exception:  # noqa: BLE001
+            # Transient error (e.g. resource limit) — brief pause then retry.
+            time.sleep(0.1)
 
 
 def _post_request_path(head_raw: bytes) -> "str | None":

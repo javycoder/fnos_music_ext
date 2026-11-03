@@ -199,7 +199,21 @@ async def start(loop, callback, path=DEFAULT_SOCKET):
             os.umask(old_umask)
         st = path.lstat()
         identity = (st.st_dev, st.st_ino)
-        os.chmod(path, 0o600)
+        # 0660 (not 0600) so the container's appuser (gid=APP_GID, shared with
+        # the host's Administrators group) can connect directly when the socket
+        # is bind-mounted into the container.  This lets maintenance endpoints
+        # (organize/cleanup/music-users) work even when the fnOS desktop gateway
+        # fails to intercept the request.
+        os.chmod(path, 0o660)
+        # Chown group to .env's group (APP_GID) so the container's appuser
+        # can connect when the socket is mounted into the container.
+        try:
+            _env = os.environ.get("FNMUSIC_ENV_FILE") or os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+            if os.path.isfile(_env):
+                os.chown(path, 0, os.stat(_env).st_gid)
+        except OSError:
+            pass
         sock.setblocking(False)
         server = await asyncio.start_unix_server(handle, sock=sock, limit=MAX_HEADER)
     except BaseException:
