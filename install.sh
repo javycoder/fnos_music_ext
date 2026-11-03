@@ -465,7 +465,10 @@ read_dotenv_value() {
     local file="${1:-}"
     local key="${2:-}"
     [ -n "${file}" ] && [ -f "${file}" ] || return 0
-    grep -E "^\s*(export\s+)?${key}=" "${file}" 2>/dev/null | tail -n1 | sed -E "s/^\s*(export\s+)?${key}=//" | sed -E "s/^['\"]|['\"]$//g" | tr -d '\r'
+    # 缺少键是正常存量配置，不应因 grep=1 + pipefail 中断覆盖安装。
+    { grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "${file}" 2>/dev/null || true; } \
+        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" \
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]|['\"]$//g"
 }
 
 parse_sources() {
@@ -482,14 +485,14 @@ parse_sources() {
 
     if [ "${explicit}" -eq 0 ] && [ -n "${BASE_DIR:-}" ] && [ -f "${env_file}" ]; then
         local keep_mdl keep_box keep_lx
-        keep_mdl="$(read_dotenv_value "${env_file}" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]')"
-        keep_box="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]')"
-        keep_lx="$(read_dotenv_value "${env_file}" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]')"
+        keep_mdl="$(read_dotenv_value "${env_file}" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        keep_box="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        keep_lx="$(read_dotenv_value "${env_file}" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         if [ -n "${keep_mdl}${keep_box}${keep_lx}" ]; then
             ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
-            [ "${keep_mdl}" = "true" ] || [ "${keep_mdl}" = "1" ] && ENABLE_MUSICDL=1
-            [ "${keep_box}" = "true" ] || [ "${keep_box}" = "1" ] && ENABLE_MUSICBOX=1
-            [ "${keep_lx}" = "true" ] || [ "${keep_lx}" = "1" ] && ENABLE_LX=1
+            case "${keep_mdl}" in true|1|yes|on) ENABLE_MUSICDL=1 ;; esac
+            case "${keep_box}" in true|1|yes|on) ENABLE_MUSICBOX=1 ;; esac
+            case "${keep_lx}" in true|1|yes|on) ENABLE_LX=1 ;; esac
             KEEP_SOURCES_FROM_ENV=1
             MDL_EXPLICIT=0
             MDL_PLATFORMS=""
@@ -1493,8 +1496,8 @@ rm -f "${ENV_DESIRED}"
 # 容器内 appuser 需按组读取 .env（0600 会让 entrypoint 认为未启用音源）
 chmod 0640 "${ENV_PATH}"
 chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
-rm -f "${ENV_PATH}.lock" 2>/dev/null || true
-rm -f "${ENV_PATH}.webui.bak" 2>/dev/null || true
+# 锁文件是跨进程同步身份，删除会让旧持锁者与新写入者锁住不同 inode。
+# 不在安装期间清理 .env.lock；备份权限由 WebUI 原子替换独立管理。
 
 # --- 代理 Python 环境 ---
 if ! command -v python3 >/dev/null 2>&1; then

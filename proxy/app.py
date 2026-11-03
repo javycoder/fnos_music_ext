@@ -2513,6 +2513,13 @@ def _drop_privileges(fallback=None):
     euid = _posix_euid()
     if euid != 0:
         return euid, (os.getegid() if hasattr(os, "getegid") else -1)
+    # socket 的0660限制访问者；父目录必须可遍历，即使本次保留root身份。
+    run_dir = '/run/fnmusic-ext'
+    if os.path.isdir(run_dir):
+        try:
+            os.chmod(run_dir, 0o711)
+        except OSError as exc:
+            logger.warning('could not make %s traversable: %s', run_dir, exc)
     primary_uid = primary_gid = 0
     for candidate in (tee_save_dir(), str(CONF.get('cache_dir') or '')):
         if not candidate:
@@ -2549,12 +2556,6 @@ def _drop_privileges(fallback=None):
                         pass
         except OSError as exc:
             logger.warning('could not prepare proxy venv %s: %s', venv_dir, exc)
-    run_dir = '/run/fnmusic-ext'
-    if os.path.isdir(run_dir):
-        try:
-            os.chmod(run_dir, 0o711)
-        except OSError as exc:
-            logger.warning('could not make %s traversable: %s', run_dir, exc)
     staged = _staged_socket_path()
     if staged:
         staged_dir = os.path.dirname(staged)

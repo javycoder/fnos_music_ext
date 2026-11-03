@@ -961,6 +961,79 @@ def test_search_result_never_reports_unsupported_as_playable(monkeypatch):
     assert resp.json()["items"] == []
 
 
+@pytest.mark.parametrize("mode", ["expired", "fetch_error", "http_error"])
+def test_stream_refresh_rechecks_media_delivery(monkeypatch, mode):
+    app_module = _load_app()
+    original = {"ts": 0 if mode == "expired" else app_module.time.time(),
+                "item": {"id": "kuwo:1", "download_url": "https://cdn.example/old.mp3", "ext": "mp3"}}
+    refreshed = {"ts": app_module.time.time(), "item": {
+        "id": "kuwo:1", "download_url": "https://cdn.example/new.m3u8", "ext": "m3u8"}}
+    monkeypatch.setattr(app_module, "_cache_get", lambda _id: original)
+    monkeypatch.setattr(app_module, "_head_probe_sync", lambda *args: False)
+
+    async def refresh(_id):
+        return refreshed
+
+    class Response:
+        status_code = 403
+        def close(self):
+            pass
+
+    calls = []
+    async def fetch(url, headers):
+        calls.append(url)
+        assert url == "https://cdn.example/old.mp3", "unsupported refreshed media was fetched"
+        if mode == "fetch_error":
+            raise OSError("offline fixture")
+        return Response()
+
+    monkeypatch.setattr(app_module, "_refresh_by_keyword", refresh)
+    monkeypatch.setattr(app_module, "_fetch_upstream_stream", fetch)
+    with pytest.raises(app_module.HTTPException) as err:
+        asyncio.run(app_module.stream(id="kuwo:1", proxy=mode != "expired", quality="", range_header=None))
+    assert err.value.status_code == 409
+    assert len(calls) == (0 if mode == "expired" else 1)
+
+
+@pytest.mark.parametrize("status, fail_read", [(206, False), (403, False), (206, True)])
+def test_httpx_decode_probe_reads_bounded_prefix_and_closes(monkeypatch, status, fail_read):
+    app_module = _load_app()
+    state = {"response_closed": False, "client_closed": False, "decoded": False}
+
+    class Response:
+        status_code = status
+        headers = {"Content-Type": "audio/flac"}
+        def iter_bytes(self, chunk_size):
+            if fail_read:
+                raise OSError("fixture read failed")
+            yield b"fLaC" + b"x" * 100
+        def close(self):
+            state["response_closed"] = True
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        def build_request(self, method, url, headers):
+            return None
+        def send(self, request, stream):
+            return Response()
+        def close(self):
+            state["client_closed"] = True
+
+    def decode(path):
+        state["decoded"] = True
+        assert Path(path).read_bytes().startswith(b"fLaC")
+        return True
+
+    monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
+    monkeypatch.setattr(app_module.httpx, "Client", Client)
+    monkeypatch.setattr(app_module, "ffmpeg_bin", lambda: "offline-ffmpeg")
+    monkeypatch.setattr(app_module, "_decode_probe_ok", decode)
+    assert app_module._head_probe_sync("https://cdn.example/a.flac", {}) is (status == 206 and not fail_read)
+    assert state["response_closed"] and state["client_closed"]
+    assert state["decoded"] is (status == 206 and not fail_read)
+
+
 # --------------------------------------------- 8. PLATFORMS.md 与真实注册表
 
 def test_info_exposes_protocol_and_delivery_without_headers():

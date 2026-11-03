@@ -748,19 +748,17 @@ class CandidateFinder:
         matched: list[dict] = []
         cacheable = False
         try:
-            async with self._sem():
-                remaining = deadline - self._clock()
-                rows: Sequence[Mapping[str, Any]] = ()
-                if remaining > 0:
-                    try:
-                        async with asyncio.timeout(remaining):
-                            rows = await searcher(normalized_platform, keyword, _DEFAULT_SEARCH_LIMIT)
-                    except TimeoutError:
-                        # 预算耗尽不是平台/脚本失效，也不写负缓存。
-                        logger.debug("candidate search timeout platform=%s keyword=%s",
-                                     normalized_platform, keyword)
-                    else:
+            rows: Sequence[Mapping[str, Any]] = ()
+            try:
+                # 排队也消耗本请求预算，不能等其他慢请求释放信号量才检查过期。
+                async with asyncio.timeout(remaining):
+                    async with self._sem():
+                        rows = await searcher(normalized_platform, keyword, _DEFAULT_SEARCH_LIMIT)
                         cacheable = True
+            except TimeoutError:
+                # 预算耗尽不是平台/脚本失效，也不写负缓存。
+                logger.debug("candidate search timeout platform=%s keyword=%s",
+                             normalized_platform, keyword)
             matched = self._match(item, rows)
             if cacheable:
                 self._cache_put(key, matched, self._clock())

@@ -106,6 +106,10 @@ _STANDARD_ENCODE_TYPES = {
 def _safe_level_and_encode_type(quality: str) -> tuple[str, str]:
     """验证真实 NEMbox helper 能力；未知档位（特别是 sky）绝不能被静默改低。"""
     clean_q = str(quality or "").strip().lower()
+    # 七档是本服务的固定协议契约；旧版 helper 对未知档位返回非空默认值，
+    # 尤其 sky 可能被编码为 mp3，不能让默认值静默改写请求。
+    if clean_q in _STANDARD_LEVELS:
+        return _STANDARD_LEVELS[clean_q], _STANDARD_ENCODE_TYPES[clean_q]
     level = None
     try:
         from NEMbox.api import music_quality_to_level

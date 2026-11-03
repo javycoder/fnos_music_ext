@@ -834,7 +834,9 @@ def test_head_probe_sync_without_ffmpeg_passes_if_bytes_received(monkeypatch):
     monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
 
     class _Resp:
-        def iter_content(self, chunk_size):
+        status_code = 206
+
+        def iter_bytes(self, chunk_size):
             yield b"fLaC" + b"\x00" * 1024
 
         def close(self):
@@ -850,6 +852,9 @@ def test_head_probe_sync_without_ffmpeg_passes_if_bytes_received(monkeypatch):
         def send(self, req, stream=False):
             return _Resp()
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(app_module.httpx, "Client", _Client)
     assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) is True
 
@@ -860,7 +865,9 @@ def test_head_probe_sync_returns_false_when_stream_fetch_empty(monkeypatch):
     monkeypatch.setattr(app_module, "HAS_CURL_CFFI", False)
 
     class _Resp:
-        def iter_content(self, chunk_size):
+        status_code = 206
+
+        def iter_bytes(self, chunk_size):
             return []
 
         def close(self):
@@ -875,6 +882,9 @@ def test_head_probe_sync_returns_false_when_stream_fetch_empty(monkeypatch):
 
         def send(self, req, stream=False):
             return _Resp()
+
+        def close(self):
+            pass
 
     monkeypatch.setattr(app_module.httpx, "Client", _Client)
     assert app_module._head_probe_sync("http://fake.stream/test.flac", {}) is False

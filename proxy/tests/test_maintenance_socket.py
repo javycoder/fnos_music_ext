@@ -68,7 +68,7 @@ def test_private_permissions_delegation_and_stop(tmp_path):
         server = await m.start(loop, callback, path)
         try:
             assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == 0o660
             status, data = await exchange(path, request())
             assert status == 202 and data["state"] == "real proxy state"
             assert calls == [("POST", m.CLEANUP_PATH, {"confirm_beta": True})]
@@ -134,7 +134,7 @@ def test_stale_socket_recovered(tmp_path):
 
         server = await m.start(asyncio.get_running_loop(), callback, path)
         try:
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == 0o660
             assert await exchange(path, request()) == (200, {"recovered": True})
         finally:
             await m.stop(server)
@@ -239,7 +239,7 @@ def test_disappearing_socket_probe_retries_safely(tmp_path, monkeypatch):
         server = await m.start(asyncio.get_running_loop(), None, path)
         try:
             assert len(probes) == 1
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == 0o660
         finally:
             await m.stop(server)
     asyncio.run(run())

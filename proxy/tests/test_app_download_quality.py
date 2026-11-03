@@ -503,6 +503,70 @@ async def test_netease_download_resolution_isolated_by_quality_and_purpose(monke
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("playback_ext,download_ext", [("flac", "mp3"), ("mp3", "flac")])
+async def test_netease_download_format_does_not_use_playback_pin(monkeypatch, playback_ext, download_ext):
+    async def resolve(*args, **kwargs):
+        return {"url": "https://media.test/download", "ext": download_ext,
+                "actual_quality": "unknown"}
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/octet-stream"}
+
+        async def aiter_bytes(self):
+            yield b"audio-without-recognizable-prefix"
+
+        async def aclose(self):
+            pass
+
+    class Client:
+        def build_request(self, method, url, **kwargs):
+            return httpx.Request(method, url)
+
+        async def send(self, request, **kwargs):
+            return Response()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(appmod, "_retained_track", lambda *args: ({"ext": playback_ext}, None))
+    monkeypatch.setattr(appmod, "_NETEASE_URL_PIN", {
+        "FORMAT_ISOLATION": ("https://media.test/playback", 9999999999, {"ext": playback_ext})})
+    monkeypatch.setattr(appmod, "get_musicbox_client", lambda *args: object())
+    monkeypatch.setattr(appmod, "_resolve_netease_download_media", resolve)
+    monkeypatch.setattr(appmod.httpx, "AsyncClient", lambda **kwargs: Client())
+    opened = await appmod._open_online_stream(
+        appmod._synth_request({}), "online:netease:FORMAT_ISOLATION", None,
+        quality_override="lossless", purpose="download", generation=7, include_quality=True)
+    try:
+        assert opened[2] == download_ext
+    finally:
+        await opened[0].aclose()
+        await opened[1].aclose()
+
+
+@pytest.mark.anyio
+async def test_netease_download_zero_reuse_lifetime_is_not_cached(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={
+            "ok": True, "data": {"code": 200, "url": "https://media.test/one-shot.mp3",
+                                  "type": "mp3", "reuse_for_s": 0},
+        })
+
+    monkeypatch.setattr(appmod, "_NETEASE_DOWNLOAD_CACHE", {})
+    monkeypatch.setattr(appmod, "_NETEASE_DOWNLOAD_INFLIGHT", {})
+    monkeypatch.setattr(appmod, "_NETEASE_DOWNLOAD_FAILED", {})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://musicbox.test") as client:
+        for _ in range(2):
+            result = await appmod._resolve_netease_download_media(client, "ZERO_TTL", "exhigh", generation=7)
+            assert result["reuse_for_s"] == 0
+    assert len(seen) == 2, "明确不可复用的临时直链不能被默认缓存五分钟"
+
+
+@pytest.mark.anyio
 async def test_netease_missing_quality_evidence_stays_unknown(monkeypatch):
     """网易结果没有真实档位字段时不得把请求档或扩展名伪作实际音质。"""
     def handler(request):
