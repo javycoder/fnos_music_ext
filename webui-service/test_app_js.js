@@ -1150,7 +1150,9 @@ test("openUpdateModal：填充版本/日期/changelog/升级链接（跟随检�
   assert.strictEqual(els.get("#update-modal").hidden, false);
   assert.strictEqual(els.get("#update-modal-version").textContent, "v2.9.0");
   assert.strictEqual(els.get("#update-modal-date").textContent, "2026-10-11");
-  assert.strictEqual(els.get("#update-modal-changelog").textContent, "关于页新增检查更新");
+  // 任务 1.3：下载失败回退手动安装，弹窗固定给出应用中心指引。
+  assert.ok(els.get("#update-modal-changelog").textContent.startsWith("关于页新增检查更新"));
+  assert.ok(els.get("#update-modal-changelog").textContent.includes("应用中心 → 手动安装"));
   assert.strictEqual(els.get("#update-upgrade-btn").href, "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0");
 });
 
@@ -1387,9 +1389,10 @@ async function themeHarness(options = {}) {
     return true;
   } }) };
   const radios = ["auto", "light", "dark"].map((value) => Object.assign(stubEl(), { value }));
-  const pages = ["overview", "settings", "llm", "tee"].map((page) =>
+  // 任务 5.1：五项导航（概览/音乐源/歌单/边听边存/关于），settings→about、llm→playlist。
+  const pages = ["overview", "about", "playlist", "tee"].map((page) =>
     Object.assign(stubEl(), { id: "page-" + page }));
-  const nav = ["settings", "settings", "llm", "tee"].map((page) =>
+  const nav = ["about", "about", "playlist", "tee"].map((page) =>
     Object.assign(stubEl(), { dataset: { page } }));
   const media = Object.assign(stubEl(), { matches: !!options.dark });
   const saved = new Map(options.saved == null ? [] : [["fnmusic-theme", options.saved]]);
@@ -1494,16 +1497,18 @@ test("主题：存储拒绝写入仍在本次页面生效，手动偏好不受�
   assert.strictEqual(h.root.dataset.theme, "dark");
 });
 
-test("设置导航：桌面和移动入口切换同一页面，不破坏 LLM/储存导航", async () => {
+test("设置导航：settings 按映射跳转到关于（5.1 收敛），主题 radio 保留", async () => {
   const h = await themeHarness();
   for (const button of h.nav.slice(0, 2)) {
-    h.context.switchPage("tee");
+    // 任务 5.1：settings 并入关于，旧路由跳转不 404。
+    h.context.switchPage("settings");
+    assert.deepStrictEqual(h.pages.filter((el) => el.classList.contains("active")).map((el) => el.id), ["page-about"]);
     button.dispatch("click");
-    assert.deepStrictEqual(h.pages.filter((el) => el.classList.contains("active")).map((el) => el.id), ["page-settings"]);
+    assert.deepStrictEqual(h.pages.filter((el) => el.classList.contains("active")).map((el) => el.id), ["page-about"]);
     assert.ok(h.nav.slice(0, 2).every((el) => el.classList.contains("active")));
-    assert.strictEqual(h.elements.get("#nav-storage-title").classList.contains("active"), false);
+    // 旧 llm 页按映射并入歌单。
     h.context.switchPage("llm");
-    assert.strictEqual(h.pages.find((el) => el.id === "page-llm").classList.contains("active"), true);
+    assert.strictEqual(h.pages.find((el) => el.id === "page-playlist").classList.contains("active"), true);
   }
 });
 
@@ -2436,76 +2441,31 @@ test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保�
   assert.strictEqual("LX_PROBE_TIMEOUT" in cfg, false);
 });
 
-test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆状态", async () => {
+test("导航收敛：双导航仅五项，旧路由跳转不 404（5.1）", () => {
   reset();
-  const storageTitle = els.get("#nav-storage-title");
-  const storageSubs = els.get("#nav-storage-subs");
-  const advancedTitle = els.get("#nav-advanced-title");
-  const advancedSubs = els.get("#nav-advanced-subs");
-
-  // 首访收起
-  global.setNavGroupExpanded("storage", false, false);
-  global.setNavGroupExpanded("advanced", false, false);
-  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
-  assert.strictEqual(storageSubs.hidden, true);
-  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "false");
-  assert.strictEqual(advancedSubs.hidden, true);
-
-  // 点击展开储存
-  await storageTitle.dispatch("click");
-  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "true");
-  assert.strictEqual(storageSubs.hidden, false);
-  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-storage-expanded"), "true");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
-
-  // 再次点击收起
-  await storageTitle.dispatch("click");
-  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
-  assert.strictEqual(storageSubs.hidden, true);
-  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-storage-expanded"), "false");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
-
-  // 点击展开高级
-  await advancedTitle.dispatch("click");
-  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true");
-  assert.strictEqual(advancedSubs.hidden, false);
-  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-advanced-expanded"), "true");
-  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
-});
-
-test("导航切页：切子页自动展开一级分组并联动高亮", () => {
-  reset();
-  const storageTitle = els.get("#nav-storage-title");
-  const storageSubs = els.get("#nav-storage-subs");
-  const advancedTitle = els.get("#nav-advanced-title");
-  const advancedSubs = els.get("#nav-advanced-subs");
-  const bottomStorage = els.get("#bottom-storage-trigger");
-  const bottomAdvanced = els.get("#bottom-advanced-trigger");
-
-  // 切到 tee（边听边存）
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  // 桌面侧栏与移动底栏均为五项：概览/音乐源/歌单/边听边存/关于。
+  for (const page of ["overview", "source", "playlist", "tee", "about"]) {
+    assert.ok(html.includes(`data-page="${page}"`), `导航缺失 ${page}`);
+  }
+  assert.ok(!html.includes('data-page="quality"'), "旧 quality 入口应收敛");
+  assert.ok(!html.includes('data-page="search"'), "旧 search 入口应收敛");
+  assert.ok(!html.includes('data-page="settings"'), "旧 settings 入口应收敛");
+  // 旧深链按映射跳转，不 404。
+  const cases = { quality: "source", search: "source", lx: "source", dirs: "tee", llm: "playlist", settings: "about" };
+  for (const [oldPage, newPage] of Object.entries(cases)) {
+    assert.strictEqual(vm.runInThisContext(`resolveNavPage("${oldPage}")`), newPage, `${oldPage} 应跳转 ${newPage}`);
+  }
+  for (const page of ["overview", "source", "playlist", "tee", "about"]) {
+    assert.strictEqual(vm.runInThisContext(`resolveNavPage("${page}")`), page);
+  }
+  // 切页高亮五项，不依赖旧分组元素。
   global.switchPage("tee");
-  assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "true");
-  assert.strictEqual(storageSubs.hidden, false);
-  assert.strictEqual(storageTitle.classList.contains("active"), true);
-  assert.strictEqual(bottomStorage.classList.contains("active"), true);
-  assert.strictEqual(advancedTitle.classList.contains("active"), false);
-  assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
-
-  // 切到 llm（大模型）
-  global.switchPage("llm");
-  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true");
-  assert.strictEqual(advancedSubs.hidden, false);
-  assert.strictEqual(advancedTitle.classList.contains("active"), true);
-  assert.strictEqual(bottomAdvanced.classList.contains("active"), true);
-  assert.strictEqual(storageTitle.classList.contains("active"), false);
-  assert.strictEqual(bottomStorage.classList.contains("active"), false);
-
-  // 切到 settings（常规页）
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+  global.switchPage("quality");
+  assert.strictEqual(vm.runInThisContext("currentPage"), "source");
   global.switchPage("settings");
-  assert.strictEqual(storageTitle.classList.contains("active"), false);
-  assert.strictEqual(advancedTitle.classList.contains("active"), false);
-  assert.strictEqual(bottomStorage.classList.contains("active"), false);
-  assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+  assert.strictEqual(vm.runInThisContext("currentPage"), "about");
 });
 
 test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", async () => {
@@ -2802,7 +2762,9 @@ test("HTML/CSS：高级洛雪子页、七档官方标签与排序可访问性完
   for (const id of ["lx-auto-switch", "lx-platform-preferred", "lx-source-order-list"]) {
     assert.ok(html.includes(`id="${id}"`), `HTML 缺少 ${id}`);
   }
-  assert.ok(html.includes('data-page="lx"'));
+  // 任务 5.1：lx 并入音乐源页，不再有独立 data-page="lx" 入口，但面板保留。
+  assert.ok(html.includes('id="page-source"'));
+  assert.ok(html.includes('id="panel-lxmusic"') || html.includes('lx-auto-switch'));
   assert.ok(js.includes('draggable="${disabled ? "false" : "true"}"'));
   assert.ok(js.includes("上移") && js.includes("下移"), "排序必须提供键盘可达按钮");
   assert.ok(!js.includes("FNMUSIC_QUALITY_MODE") && !js.includes("FNMUSIC_DL_QUALITY"));
@@ -2813,8 +2775,8 @@ test("HTML/CSS 规范：?视觉与触屏规范、大模型页面标题、APP下�
   const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
   const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
 
-  // 页面标题大模型
-  assert.ok(html.includes('<h2><span>大模型</span><button class="help-btn"'), "大模型标题需符合规范");
+  // 页面标题大模型（5.1 收敛：大模型并入歌单页，标题降级为 h3 仍保留规范结构）
+  assert.ok(html.includes('>大模型</span>'), "大模型标题需符合规范");
 
   // 所有下载音质显示改APP下载音质
   assert.ok(html.includes("APP下载音质"), "需包含 APP下载音质 显示");

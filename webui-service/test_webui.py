@@ -158,15 +158,64 @@ def test_config_view_merges_defaults(env_file):
         page = client.get("/").text
         assert f'window.FNMUSIC_WEBUI_BUILD = "{webui.STATIC_BUILD_ID}"' in page
         assert f"app.js?build={webui.STATIC_BUILD_ID}" in page
+        # 任务 1.5：入口脚本同样带构建指纹强刷。
+        assert f"theme-boot.js?build={webui.STATIC_BUILD_ID}" in page
+
+
+def test_nav_converges_to_five_pages_with_legacy_redirects():
+    """任务 5.1：双导航收敛五项，旧路由跳转不 404，settings 主题搬到关于。"""
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    import re as _re
+    for nav_id in ("nav", "bottom-nav"):
+        nav = _re.search(rf'<nav[^>]*id="{nav_id}".*?</nav>', html, _re.S).group(0)
+        pages = _re.findall(r'data-page="([^"]+)"', nav)
+        assert pages == ["overview", "source", "playlist", "tee", "about"], pages
+    # settings 并入关于：主题 radio 保留在关于页。
+    about = _re.search(r'<section[^>]*id="page-about".*?</section>', html, _re.S).group(0)
+    assert 'name="theme"' in about
+    # 旧路由占位保留跳转映射，不 404。
+    legacy = _re.search(r'<div[^>]*id="legacy-route-map".*?</div>', html, _re.S).group(0)
+    for old, new in {"quality": "source", "search": "source", "lx": "source",
+                      "dirs": "tee", "llm": "playlist", "settings": "about"}.items():
+        assert f'data-{old}="{new}"' in legacy
+
+
+def test_playlist_unified_list_present():
+    """任务 5.2：歌单统一列表容器存在。"""
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'id="page-playlist"' in html
+    assert 'id="playlist-unified-list"' in html
+    assert 'id="playlist-unified-note"' in html
 
 
 # ------------------------------------------------------------------ PUT 校验 ---
 
-def test_put_rejects_unknown_key(env_file):
+def test_put_ignores_unknown_key_and_returns_ignored_keys(env_file):
+    """任务 1.4：未知键忽略回传，有效配置照常保存，不整单失败。"""
+    before = env_file.read_bytes()
     with authed_client() as client:
-        r = client.put("/api/config", json={"values": {"NOT_A_KEY": "1"}})
-        assert r.status_code == 400
-        assert "不支持的配置键" in r.json()["error"]
+        r = client.put("/api/config", json={"values": {
+            "NOT_A_KEY": "1", "FNMUSIC_SEARCH_PROBE": True,
+            "FNMUSIC_SEARCH_TIMEOUT": 11,
+        }})
+        assert r.status_code == 200
+        rj = r.json()
+        assert rj["ignored_keys"] == ["FNMUSIC_SEARCH_PROBE", "NOT_A_KEY"]
+        assert "FNMUSIC_SEARCH_TIMEOUT" in rj["changed"]
+        only_unknown = client.put("/api/config", json={"values": {"NOT_A_KEY": "1"}})
+        assert only_unknown.status_code == 200
+        assert only_unknown.json()["ignored_keys"] == ["NOT_A_KEY"]
+        assert only_unknown.json()["changed"] == []
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_SEARCH_TIMEOUT='11'" in text
+    assert "NOT_A_KEY" not in text
+    assert "FNMUSIC_SEARCH_PROBE" not in text
+    # 仅未知键时不写盘：有效集合仍以 SCHEMA 为准。
+    assert env_file.read_bytes() != before  # 首轮有效写入已落盘
+    second_before = env_file.read_bytes()
+    with authed_client() as client:
+        client.put("/api/config", json={"values": {"ANOTHER_UNKNOWN": "x"}})
+    assert env_file.read_bytes() == second_before
 
 
 def test_put_rejects_bad_enum(env_file):
@@ -271,16 +320,18 @@ def test_search_probe_is_ignored_while_valid_settings_save_atomically(env_file):
         assert saved.status_code == 200
         assert saved.json()["ignored_keys"] == ["FNMUSIC_SEARCH_PROBE"]
         assert "FNMUSIC_SEARCH_TIMEOUT" in saved.json()["changed"]
-        before_rejected = env_file.read_bytes()
-        rejected = client.put("/api/config", json={"values": {
+        # 任务 1.4：未知键忽略回传，有效键照常保存。
+        ignored = client.put("/api/config", json={"values": {
             "FNMUSIC_SEARCH_PROBE": False, "FNMUSIC_SEARCH_TIMEOUT": 12, "UNKNOWN_KEY": 1,
         }})
-        assert rejected.status_code == 400
+        assert ignored.status_code == 200
+        assert ignored.json()["ignored_keys"] == ["FNMUSIC_SEARCH_PROBE", "UNKNOWN_KEY"]
+        assert "FNMUSIC_SEARCH_TIMEOUT" in ignored.json()["changed"]
     text = env_file.read_text(encoding="utf-8")
-    assert "FNMUSIC_SEARCH_TIMEOUT='11'" in text
+    assert "FNMUSIC_SEARCH_TIMEOUT='12'" in text
     assert env_file.read_bytes() != before
-    assert env_file.read_bytes() == before_rejected
     assert "FNMUSIC_SEARCH_PROBE" not in text
+    assert "UNKNOWN_KEY" not in text
 
 
 def test_search_probe_ignored_alone_does_not_write_env(env_file):
@@ -2918,6 +2969,7 @@ def test_update_check_gitee_fallback_on_network_error(env_file, update_cache_cle
 
 
 def test_update_check_both_fail_degrades(env_file, update_cache_clean):
+    """主源双败回退 update.json 辅源：三源皆败才降级，错误含三源。"""
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2927,14 +2979,53 @@ def test_update_check_both_fail_degrades(env_file, update_cache_clean):
     with authed_client() as client:
         _mock_http(handler)
         r = client.get("/api/update-check")
-    assert r.status_code == 200  # 双源皆败不报 500，前端静默降级
+    assert r.status_code == 200  # 三源皆败不报 500，前端静默降级
     rj = r.json()
     assert rj["ok"] is True
     assert rj["has_update"] is False
-    assert "github" in rj["error"] and "gitee" in rj["error"]
+    assert "github" in rj["error"] and "gitee" in rj["error"] and "update.json" in rj["error"]
     # 失败负缓存生效：缓存期内重复请求不再出网
     client.get("/api/update-check")
-    assert len(calls) == 2
+    assert len(calls) == 3
+
+
+def test_update_check_falls_back_to_update_json(env_file, update_cache_clean, monkeypatch):
+    """任务 1.3：Releases 双败时回退 update.json，清单版本高于本地才提示。"""
+    calls = []
+    monkeypatch.setattr(webui, "UPDATE_JSON_URL", "https://example.invalid/update.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "example.invalid/update.json" in str(request.url):
+            return httpx.Response(200, json={
+                "version": "9.9.9", "date": "2026-11-03", "notes": "回归验证清单",
+            })
+        raise httpx.ConnectError("timeout")
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["ok"] is True
+    assert rj["source"] == "update.json"
+    assert rj["has_update"] is True
+    assert rj["latest"]["version"] == "9.9.9"
+    assert "回归验证清单" in rj["latest"]["changelog"]
+
+
+def test_update_check_proxy_order_and_override(env_file, update_cache_clean, monkeypatch):
+    """任务 1.3：加速代理可配，直连优先、按序回退。"""
+    monkeypatch.setenv("WEBUI_UPDATE_PROXIES", "https://p1.example/, https://p2.example/")
+    assert webui._update_proxies() == ["https://p1.example/", "https://p2.example/"]
+    assert webui._with_update_proxies("https://raw.example/update.json") == [
+        "https://raw.example/update.json",
+        "https://p1.example/https://raw.example/update.json",
+        "https://p2.example/https://raw.example/update.json",
+    ]
+    monkeypatch.delenv("WEBUI_UPDATE_PROXIES", raising=False)
+    assert webui._update_proxies() == []
+    assert webui._with_update_proxies("https://raw.example/update.json") == [
+        "https://raw.example/update.json",
+    ]
 
 
 def test_update_check_success_cached_no_refetch(env_file, update_cache_clean):

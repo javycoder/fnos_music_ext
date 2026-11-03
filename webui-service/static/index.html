@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>fnmusic-ext 管理台</title>
-  <!-- 先定主题再加载样式，深色模式下避免首屏白闪 -->
-  <script src="/app/fnmusic-ext/static/theme-boot.js"></script>
+  <!-- 先定主题再加载样式，深色模式下避免首屏白闪；入口脚本带构建指纹强刷 -->
+  <script src="/app/fnmusic-ext/static/theme-boot.js?build=__WEBUI_BUILD__"></script>
   <script>window.FNMUSIC_WEBUI_BUILD = "__WEBUI_BUILD__";</script>
   <link rel="stylesheet" href="/app/fnmusic-ext/static/style.css?build=__WEBUI_BUILD__">
   <link rel="icon" type="image/png" href="/app/fnmusic-ext/static/icon.png">
@@ -23,27 +23,8 @@
       <nav class="nav" id="nav">
         <button class="nav-item active" data-page="overview">概览</button>
         <button class="nav-item" data-page="source">音乐源</button>
-        <button class="nav-item" data-page="quality">播放与推荐</button>
-        <button class="nav-item" data-page="search">搜索</button>
-        <div class="nav-group">
-          <button class="nav-item nav-group-title" id="nav-storage-title" type="button" aria-expanded="false" aria-controls="nav-storage-subs">
-            <span>储存</span><span class="nav-arrow" aria-hidden="true">▾</span>
-          </button>
-          <div class="nav-group-subs" id="nav-storage-subs" hidden>
-            <button class="nav-item nav-sub" data-page="tee">边听边存</button>
-            <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
-          </div>
-        </div>
-        <div class="nav-group">
-          <button class="nav-item nav-group-title" id="nav-advanced-title" type="button" aria-expanded="false" aria-controls="nav-advanced-subs">
-            <span>高级</span><span class="nav-arrow" aria-hidden="true">▾</span>
-          </button>
-          <div class="nav-group-subs" id="nav-advanced-subs" hidden>
-            <button class="nav-item nav-sub" data-page="lx">lx音乐源</button>
-            <button class="nav-item nav-sub" data-page="llm">大模型</button>
-          </div>
-        </div>
-        <button class="nav-item" data-page="settings">设置</button>
+        <button class="nav-item" data-page="playlist">歌单</button>
+        <button class="nav-item" data-page="tee">边听边存</button>
         <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
@@ -75,7 +56,9 @@
       </section>
 
       <!-- 音乐源 -->
+            <!-- 音乐源（收敛：播放与推荐、搜索、lx 并入） -->
       <section class="page" id="page-source">
+
         <h2><span>音乐源（四选一）</span><button class="help-btn" type="button" data-help="providers" aria-label="音乐源帮助">?</button></h2>
         <div class="provider-grid">
           <label class="provider-card" data-provider="musicbox">
@@ -186,12 +169,8 @@
           </div>
         </div>
 
-      </section>
-
-      <!-- 播放与推荐 -->
-      <section class="page" id="page-quality">
-        <h2>播放与推荐</h2>
-        <div class="card">
+      
+<div class="card">
           <div class="card-title"><span>播放直连（beta）</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></div>
           <div class="direct-list">
             <div class="direct-option">
@@ -212,7 +191,8 @@
           </div>
           <p class="hint">测试功能，如遇播放异常可以尝试关闭</p>
         </div>
-        <div class="card">
+        
+<div class="card">
           <div class="card-title"><span>在线播放音质</span><button class="help-btn" type="button" data-help="quality" aria-label="在线播放音质帮助">?</button></div>
           <div class="radio-list" id="quality-list">
             <label><input type="radio" name="play-quality" value="standard"><div><b>标准</b><span>128 kbps</span></div></label>
@@ -225,7 +205,8 @@
           </div>
           <p class="hint">所选档位不可用时只逐级降档，不会回升。实际音质受账号权益和音源能力限制；musicdl 不保证每个平台都提供全部档位。</p>
         </div>
-        <div class="card">
+        
+<div class="card">
           <div class="card-title"><span>APP下载音质</span><button class="help-btn" type="button" data-help="download-quality" aria-label="APP下载音质帮助">?</button></div>
           <div class="radio-list" id="dl-quality-list">
             <label><input type="radio" name="download-quality" value="app"><div><b>跟随 App</b><span>默认；使用 App 请求的音质档位</span></div></label>
@@ -239,10 +220,59 @@
           </div>
           <p class="hint">下载音质独立于在线播放设置。源缺少所选档位时按策略向下选择；不会把低品质文件包装成高品质。</p>
         </div>
+        
+
+        <h3 class="sub-h2">搜索</h3>
         <div class="card">
+          <div class="card-title"><span>搜索设置</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></div>
+          <label class="switch-row"><span>搜索深分页</span><input type="checkbox" id="search-deep"></label>
+        </div>
+        <div class="card">
+          <label class="field"><span>搜索超时时间</span>
+            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
+          </label>
+          <label class="field"><span>深分页页数上限</span>
+            <input class="input" id="search-deep-max" type="number" min="1" max="50" step="1" inputmode="numeric">
+          </label>
+        </div>
+      
+
+        <h3 class="sub-h2">lx音乐源</h3>
+        <p class="hint">仅当洛雪是主音源时影响播放。打开本页或在其他主音源下保存偏好，不会启动洛雪服务。</p>
+        <div class="card">
+          <div class="card-title">自动切换</div>
+          <label class="switch-row"><span>自动切换可用脚本</span><input type="checkbox" id="lx-auto-switch"></label>
+          <div id="lx-platform-preferred-row" hidden>
+            <label class="switch-row"><span>跨平台优选同一首歌</span><input type="checkbox" id="lx-platform-preferred"></label>
+            <p class="hint">仅在当前脚本声明的平台范围内尝试匹配，不更改源激活状态。</p>
+          </div>
+        </div>
+        <div class="card" id="lx-source-order-card" aria-disabled="true">
+          <div class="card-title">已激活源顺序</div>
+          <p class="hint">同一音质档位按此顺序尝试脚本。停用源保留原位置；重新激活后恢复顺序；删除源会移除其排序 ID。</p>
+          <div id="lx-source-order-list" class="stack" role="list" aria-label="洛雪已激活源顺序"></div>
+          <p id="lx-source-order-note" class="hint" role="status"></p>
+        </div>
+      
+      </section>
+      <!-- 歌单（收敛：推荐/公共/自定义统一列表 + 大模型并入） -->
+      <section class="page" id="page-playlist">
+        <h2>歌单</h2>
+        <div id="playlist-unified-note" class="hint">内置与自定义歌单在同一列表管理，每行标注类型与启用状态，支持进入编辑。</div>
+        <div id="playlist-unified-list" class="stack"></div>
+<div class="card">
           <div class="card-title"><span>推荐与公共歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
           <label class="switch-row"><span>热门榜单推荐</span><input type="checkbox" id="recommend-hot"></label>
           <label class="switch-row"><span>每日推荐</span><input type="checkbox" id="recommend-daily"></label>
+          <label class="switch-row"><span>排行榜歌单（38 榜）</span><input type="checkbox" id="recommend-charts"></label>
+          <label class="switch-row"><span>酷狗榜单来源</span><input type="checkbox" id="kg-charts"></label>
+          <label class="switch-row"><span>网易榜单来源</span><input type="checkbox" id="wy-charts"></label>
+          <label class="field"><span>启用榜单白名单（逗号分隔榜单 ID，空=全部）</span>
+            <input class="input" id="enabled-charts" placeholder="如 kg_8888,wy_3778678">
+          </label>
+          <label class="field"><span>单榜曲量上限（10–200，默认 100）</span>
+            <input class="input" id="chart-limit" type="number" min="10" max="200" step="1" inputmode="numeric">
+          </label>
           <label class="field"><span>每日/热门目标曲量（5–1000，默认 20；调大后当日缓存自动重建）</span>
             <input class="input" id="recommend-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
           </label>
@@ -290,7 +320,8 @@
             </div>
           </div>
         </div>
-        <div class="card" id="custom-playlists-card">
+        
+<div class="card" id="custom-playlists-card">
           <div class="card-title"><span>自定义歌单管理</span><button class="help-btn" type="button" data-help="custom-playlists" aria-label="自定义歌单帮助">?</button></div>
           <p class="hint">支持 m3u/m3u8/pls/cue 导入解析歌名歌手（异常行跳过并提示计数），或按提示词调用大模型生成并与手动列表去重合并。定义文件落数据卷自定义歌单目录；删除为硬删除需二次确认。</p>
           <div class="btn-row">
@@ -305,47 +336,58 @@
           <p class="hint" id="custom-note">自定义歌单关闭时音乐页不展示；改动即时失效缓存并重建。</p>
           <div id="custom-list" class="stack"></div>
         </div>
-      </section>
+      
 
-      <!-- 高级：洛雪播放策略与源顺序；不复用音源导入管理面板 -->
-      <section class="page" id="page-lx">
-        <h2>lx音乐源</h2>
-        <p class="hint">仅当洛雪是主音源时影响播放。打开本页或在其他主音源下保存偏好，不会启动洛雪服务。</p>
+        <h3 class="sub-h2"><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h3>
         <div class="card">
-          <div class="card-title">自动切换</div>
-          <label class="switch-row"><span>自动切换可用脚本</span><input type="checkbox" id="lx-auto-switch"></label>
-          <div id="lx-platform-preferred-row" hidden>
-            <label class="switch-row"><span>跨平台优选同一首歌</span><input type="checkbox" id="lx-platform-preferred"></label>
-            <p class="hint">仅在当前脚本声明的平台范围内尝试匹配，不更改源激活状态。</p>
+          <label class="field"><span>接入方式</span>
+            <select class="input" id="llm-provider">
+              <option value="kilo">内置（免配置）</option>
+              <option value="custom">自定义</option>
+              <option value="none">关闭</option>
+            </select>
+          </label>
+          <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
+          <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
+          <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+          <label class="field"><span>接口协议</span>
+            <select class="input" id="llm-protocol">
+              <option value="chat">Chat Completions（/chat/completions）</option>
+              <option value="responses">Responses（/responses）</option>
+            </select>
+          </label>
+          <label class="field"><span>单次输出上限（token）</span><input class="input" id="llm-max-tokens" type="number" min="256" max="131072" step="1" value="8192"></label>
+          <label class="field"><span>每日 token 上限（0=不限制）</span><input class="input" id="llm-daily-limit" type="number" min="0" step="1" value="1000000"></label>
+          <label class="field"><span>附加请求参数（JSON 对象，选填）</span><input class="input" id="llm-extra-body" placeholder='{"thinking":{"type":"disabled"}}'></label>
+          <div class="switch-grid">
+            <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
+            <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
+          </div>
+          <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
+          <div id="llm-liked-settings" hidden>
+            <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
+            <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
           </div>
         </div>
-        <div class="card" id="lx-source-order-card" aria-disabled="true">
-          <div class="card-title">已激活源顺序</div>
-          <p class="hint">同一音质档位按此顺序尝试脚本。停用源保留原位置；重新激活后恢复顺序；删除源会移除其排序 ID。</p>
-          <div id="lx-source-order-list" class="stack" role="list" aria-label="洛雪已激活源顺序"></div>
-          <p id="lx-source-order-note" class="hint" role="status"></p>
+        <div class="card" id="llm-usage-card">
+          <div class="card-title">
+            <span>大模型用量与记录</span>
+            <button class="btn small" id="llm-usage-refresh" type="button">刷新</button>
+          </div>
+          <p class="hint" id="llm-usage-line" role="status">今日 token 用量：加载中…</p>
+          <div id="llm-usage-summary" class="stack"></div>
+          <div id="llm-usage-history" class="stack"></div>
+          <div class="btn-row">
+            <button class="btn small" id="llm-usage-prev" type="button">上一页</button>
+            <span id="llm-usage-page" class="muted">1</span>
+            <button class="btn small" id="llm-usage-next" type="button">下一页</button>
+          </div>
         </div>
+      
       </section>
-
-      <!-- 搜索 -->
-      <section class="page" id="page-search">
-        <h2>搜索</h2>
-        <div class="card">
-          <div class="card-title"><span>搜索设置</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></div>
-          <label class="switch-row"><span>搜索深分页</span><input type="checkbox" id="search-deep"></label>
-        </div>
-        <div class="card">
-          <label class="field"><span>搜索超时时间</span>
-            <input class="input" id="search-timeout" type="number" min="1" max="60" step="1" inputmode="numeric">
-          </label>
-          <label class="field"><span>深分页页数上限</span>
-            <input class="input" id="search-deep-max" type="number" min="1" max="50" step="1" inputmode="numeric">
-          </label>
-        </div>
-      </section>
-
-      <!-- 边听边存 -->
+      <!-- 边听边存（收敛：目录设置并入） -->
       <section class="page" id="page-tee">
+
         <h2>边听边存</h2>
         <div class="card">
           <div class="card-title"><span>保存与素材</span><button class="help-btn" type="button" data-help="tee-save" aria-label="保存与素材帮助">?</button></div>
@@ -386,11 +428,9 @@
           <p id="cleanup-status" role="status" aria-live="polite"></p>
           <pre class="update-changelog" id="cleanup-details" hidden></pre>
         </div>
-      </section>
+      
 
-      <!-- 目录设置 -->
-      <section class="page" id="page-dirs">
-        <h2>目录设置</h2>
+        <h3 class="sub-h2">目录设置</h3>
         <div class="card">
           <div class="card-title"><span>歌曲缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>
           <label class="switch-row"><span>每天清理滚动缓存</span><input type="checkbox" id="auto-cache-cleanup"></label>
@@ -438,70 +478,8 @@
           </label>
           <p class="hint">边听边存与收藏绑定共用此设置。自动判定会让本地盘直接写入，远程目录先在缓存区下载和加工，再写入目标文件；也可手动选择本地中转。中转模式不在下载目录创建 .part 文件，上传失败会尽力清理本次创建的残件并保留本地缓存。直接写入仅建议用于本地盘。保存后立即生效。</p>
         </div>
+      
       </section>
-
-      <!-- LLM -->
-      <section class="page" id="page-llm">
-        <h2><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h2>
-        <div class="card">
-          <label class="field"><span>接入方式</span>
-            <select class="input" id="llm-provider">
-              <option value="kilo">内置（免配置）</option>
-              <option value="custom">自定义</option>
-              <option value="none">关闭</option>
-            </select>
-          </label>
-          <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
-          <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
-          <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
-          <label class="field"><span>接口协议</span>
-            <select class="input" id="llm-protocol">
-              <option value="chat">Chat Completions（/chat/completions）</option>
-              <option value="responses">Responses（/responses）</option>
-            </select>
-          </label>
-          <label class="field"><span>单次输出上限（token）</span><input class="input" id="llm-max-tokens" type="number" min="256" max="131072" step="1" value="8192"></label>
-          <label class="field"><span>每日 token 上限（0=不限制）</span><input class="input" id="llm-daily-limit" type="number" min="0" step="1" value="1000000"></label>
-          <label class="field"><span>附加请求参数（JSON 对象，选填）</span><input class="input" id="llm-extra-body" placeholder='{"thinking":{"type":"disabled"}}'></label>
-          <div class="switch-grid">
-            <label class="switch-row"><span>大模型用于“猜你喜欢”</span><input type="checkbox" id="llm-liked"></label>
-            <label class="switch-row"><span>大模型用于“每日推荐”</span><input type="checkbox" id="llm-daily"></label>
-          </div>
-          <p class="hint warning" id="llm-api-warning" role="status" hidden>已勾选大模型用途，但 Base URL 或 API Key 未填完整：不会调用模型，暂用未启用大模型时的推荐链路；勾选状态和参数仍可保存。</p>
-          <div id="llm-liked-settings" hidden>
-            <label class="field"><span>猜你喜欢生成间隔（小时）</span><input class="input" id="liked-refresh-hours" type="number" min="0.5" step="any" value="0.5"></label>
-            <label class="field"><span>猜你喜欢歌曲数量</span><input class="input" id="liked-size" type="number" min="0" max="100" step="1" value="20"></label>
-          </div>
-        </div>
-        <div class="card" id="llm-usage-card">
-          <div class="card-title">
-            <span>大模型用量与记录</span>
-            <button class="btn small" id="llm-usage-refresh" type="button">刷新</button>
-          </div>
-          <p class="hint" id="llm-usage-line" role="status">今日 token 用量：加载中…</p>
-          <div id="llm-usage-summary" class="stack"></div>
-          <div id="llm-usage-history" class="stack"></div>
-          <div class="btn-row">
-            <button class="btn small" id="llm-usage-prev" type="button">上一页</button>
-            <span id="llm-usage-page" class="muted">1</span>
-            <button class="btn small" id="llm-usage-next" type="button">下一页</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- 设置 -->
-      <section class="page" id="page-settings">
-        <h2>设置</h2>
-        <div class="card">
-          <div class="card-title">外观</div>
-          <div class="radio-list" id="theme-list">
-            <label><input type="radio" name="theme" value="auto"><div><b>跟随系统</b><span>默认。跟随设备与飞牛 OS 的浅色/深色设置，切换后界面立即生效</span></div></label>
-            <label><input type="radio" name="theme" value="light"><div><b>浅色</b><span>始终使用浅色界面</span></div></label>
-            <label><input type="radio" name="theme" value="dark"><div><b>深色</b><span>始终使用深色界面</span></div></label>
-          </div>
-        </div>
-      </section>
-
       <!-- 关于 -->
       <section class="page" id="page-about">
         <div class="about-wrap">
@@ -548,32 +526,30 @@
               </div>
             </div>
           </div>
+        <div class="card">
+          <div class="card-title">外观</div>
+          <div class="radio-list" id="theme-list">
+            <label><input type="radio" name="theme" value="auto"><div><b>跟随系统</b><span>默认。跟随设备与飞牛 OS 的浅色/深色设置，切换后界面立即生效</span></div></label>
+            <label><input type="radio" name="theme" value="light"><div><b>浅色</b><span>始终使用浅色界面</span></div></label>
+            <label><input type="radio" name="theme" value="dark"><div><b>深色</b><span>始终使用深色界面</span></div></label>
+          </div>
+        </div>
         </div>
       </section>
+      <!-- 旧路由跳转映射：quality/search/lx → source，dirs → tee，llm → playlist，settings → about -->
+      <!-- 占位不用 .page 类：仅供 switchPage 识别跳转，不参与页面显隐，避免 hidden 断言误伤 -->
+      <div id="legacy-route-map" hidden
+        data-quality="source" data-search="source" data-lx="source"
+        data-dirs="tee" data-llm="playlist" data-settings="about"></div>
     </main>
   </div>
 
-  <!-- 移动端底部导航 -->
+  <!-- 移动端底部导航：与桌面侧栏同为五项 -->
   <nav class="bottom-nav" id="bottom-nav">
     <button class="nav-item active" data-page="overview">概览</button>
-    <button class="nav-item" data-page="source">音源</button>
-    <button class="nav-item" data-page="quality">播放</button>
-    <button class="nav-item" data-page="search">搜索</button>
-    <div class="bottom-nav-group">
-      <button class="nav-item bottom-nav-trigger" id="bottom-storage-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-storage-menu">储存</button>
-      <div class="bottom-sub-menu" id="bottom-storage-menu" role="menu" hidden>
-        <button class="bottom-sub-item nav-item" data-page="tee" role="menuitem">边听边存</button>
-        <button class="bottom-sub-item nav-item" data-page="dirs" role="menuitem">目录设置</button>
-      </div>
-    </div>
-    <div class="bottom-nav-group">
-      <button class="nav-item bottom-nav-trigger" id="bottom-advanced-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-advanced-menu">高级</button>
-      <div class="bottom-sub-menu" id="bottom-advanced-menu" role="menu" hidden>
-        <button class="bottom-sub-item nav-item" data-page="lx" role="menuitem">lx音乐源</button>
-        <button class="bottom-sub-item nav-item" data-page="llm" role="menuitem">大模型</button>
-      </div>
-    </div>
-    <button class="nav-item" data-page="settings">设置</button>
+    <button class="nav-item" data-page="source">音乐源</button>
+    <button class="nav-item" data-page="playlist">歌单</button>
+    <button class="nav-item" data-page="tee">边听边存</button>
     <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
   </nav>
 

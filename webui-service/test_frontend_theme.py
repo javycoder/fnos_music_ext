@@ -32,8 +32,9 @@ def blocks(selector):
 
 def test_theme_boot_is_synchronous_before_stylesheet():
     tags = elements()
+    # 任务 1.5：入口脚本带构建指纹 ?build=，路径比较只看 path 部分。
     boot = next(i for i, (tag, attrs) in enumerate(tags)
-                if tag == "script" and attrs.get("src", "").endswith("/theme-boot.js"))
+                if tag == "script" and urlsplit(attrs.get("src", "")).path.endswith("/theme-boot.js"))
     style = next(i for i, (tag, attrs) in enumerate(tags)
                  if tag == "link" and attrs.get("rel") == "stylesheet")
     app = next(i for i, (tag, attrs) in enumerate(tags)
@@ -47,9 +48,17 @@ def test_theme_boot_is_synchronous_before_stylesheet():
 
 
 def test_settings_has_desktop_mobile_navigation_and_three_local_preferences():
+    """任务 5.1：双导航收敛五项，settings 并入关于（主题 radio 保留在关于页）。"""
     tags = elements()
-    assert len([a for tag, a in tags if tag == "button" and a.get("data-page") == "settings"]) == 2
-    assert len([a for tag, a in tags if tag == "section" and a.get("id") == "page-settings"]) == 1
+    assert len([a for tag, a in tags if tag == "button" and a.get("data-page") == "about"]) == 2
+    assert len([a for tag, a in tags if tag == "section" and a.get("id") == "page-about"]) == 1
+    # settings 并入关于：主题 radio 保留在关于页内。
+    about_idx = next(i for i, (tag, attrs) in enumerate(tags)
+                     if tag == "section" and attrs.get("id") == "page-about")
+    theme_idx = next(i for i, (tag, attrs) in enumerate(tags)
+                     if tag == "input" and attrs.get("name") == "theme")
+    assert theme_idx > about_idx
+    assert len([a for tag, a in tags if tag == "button" and a.get("data-page") == "settings"]) == 0
     radios = [a for tag, a in tags if tag == "input" and a.get("name") == "theme"]
     assert [a["value"] for a in radios] == ["auto", "light", "dark"]
     assert all(a.get("type") == "radio" for a in radios)

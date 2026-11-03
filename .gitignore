@@ -35,6 +35,8 @@ __pycache__/
 AGENTS.md
 # 需求文档仅作本地协作依据，不纳入版本管理
 REQUIREMENTS.md
+# OpenSpec 本地规划工件（提案/规格/设计/任务），不纳入版本管理
+openspec/
 *.part
 *.log
 # 收款码：本地测试/CI 从对应 QRCODE secret 生成，绝不入库

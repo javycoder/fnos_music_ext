@@ -46,6 +46,7 @@ except ImportError:  # 兼容脚本式启动（无包上下文）
 
 try:
     from . import recommend as dailyrec
+    from . import charts as chartrec
     from .direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
     from . import localrecommend as localrec
     from . import localmatch
@@ -64,6 +65,7 @@ try:
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    import charts as chartrec  # type: ignore
     from direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
@@ -277,6 +279,11 @@ CONF = {
     "dl_quality": (os.environ.get("FNMUSIC_DL_QUALITY") or "app").strip().lower(),
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
+    "recommend_charts": os.environ.get("FNMUSIC_RECOMMEND_CHARTS", "true").lower() in ("true", "1", "yes"),
+    "kg_charts": os.environ.get("FNMUSIC_KG_CHARTS", "true").lower() in ("true", "1", "yes"),
+    "wy_charts": os.environ.get("FNMUSIC_WY_CHARTS", "true").lower() in ("true", "1", "yes"),
+    "enabled_charts": os.environ.get("FNMUSIC_ENABLED_CHARTS", ""),
+    "chart_limit": os.environ.get("FNMUSIC_CHART_LIMIT", "100"),
     "recommend_size": os.environ.get("FNMUSIC_RECOMMEND_SIZE", "20"),
     "category_size": os.environ.get("FNMUSIC_CATEGORY_SIZE", "200"),
     "custom_enabled": os.environ.get("FNMUSIC_CUSTOM_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
@@ -648,6 +655,11 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_SCAN_COOLDOWN_S": ("scan_cooldown_s", "scan_cooldown"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
+    "FNMUSIC_RECOMMEND_CHARTS": ("recommend_charts", "bool"),
+    "FNMUSIC_KG_CHARTS": ("kg_charts", "bool"),
+    "FNMUSIC_WY_CHARTS": ("wy_charts", "bool"),
+    "FNMUSIC_ENABLED_CHARTS": ("enabled_charts", "str"),
+    "FNMUSIC_CHART_LIMIT": ("chart_limit", "recommend_size"),
     "FNMUSIC_RECOMMEND_SIZE": ("recommend_size", "recommend_size"),
     "FNMUSIC_CATEGORY_SIZE": ("category_size", "category_size"),
     "FNMUSIC_CUSTOM_PLAYLISTS_ENABLED": ("custom_enabled", "bool"),
@@ -1220,7 +1232,10 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
         {"llm_liked_enabled", "liked_size"} & changes
     )
     size_changed = bool({"recommend_size", "category_size", "FNMUSIC_RECOMMEND_SIZE",
-                            "FNMUSIC_CATEGORY_SIZE"} & changes)
+                            "FNMUSIC_CATEGORY_SIZE", "chart_limit", "FNMUSIC_CHART_LIMIT"} & changes)
+    chart_changed = bool({"recommend_charts", "kg_charts", "wy_charts", "enabled_charts",
+                            "FNMUSIC_RECOMMEND_CHARTS", "FNMUSIC_KG_CHARTS",
+                            "FNMUSIC_WY_CHARTS", "FNMUSIC_ENABLED_CHARTS"} & changes)
     custom_changed = bool({"custom_enabled", "custom_dir", "FNMUSIC_CUSTOM_PLAYLISTS_ENABLED",
                            "FNMUSIC_CUSTOM_PLAYLISTS_DIR"} & changes)
     if source_changed:
@@ -1228,8 +1243,9 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
         _cancel_daily_tasks()
         logger.info("音源配置变化(%s)：已失效当日推荐缓存 %d 个",
                     ",".join(sorted(_SOURCE_CONF_KEYS & changes)), removed)
-    elif size_changed or custom_changed:
+    elif size_changed or custom_changed or chart_changed:
         # 任务 3.2：目标曲量调大后当日缓存自动重建；自定义定义/目录变更即时失效重建。
+        # 榜单开关/来源/白名单/曲量上限变更同样失效并取消在途任务。
         # 调大需重建（旧缓存曲量不足），调小由下次读取按新上限裁剪（get_or_build_daily 内处理）。
         removed = dailyrec.invalidate_today_cache_all_users()
         _cancel_daily_tasks()
@@ -5344,6 +5360,30 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
 
 
 @asynccontextmanager
+async def _chart_warmup_loop(fastapi_app: FastAPI) -> None:
+    """榜单后台预热：启动后平滑补齐当日缺失榜单（失败静默，访问路径自带兜底）。"""
+    try:
+        await asyncio.sleep(5.0)
+        if not CONF.get("recommend_charts", True):
+            return
+        enabled = chartrec.list_enabled_charts(
+            enable_charts=bool(CONF.get("recommend_charts", True)),
+            enable_kg=bool(CONF.get("kg_charts", True)),
+            enable_wy=bool(CONF.get("wy_charts", True)),
+            custom_whitelist=str(CONF.get("enabled_charts") or ""),
+        )
+        # 网易系二选一：musicbox 优先，其次 neteasefree；均未启用则回落 lx。
+        netease_on = bool(CONF.get("netease_enabled"))
+        neteasefree_on = bool(CONF.get("neteasefree_enabled"))
+        await chartrec.warmup_charts_background(
+            enabled, netease_enabled=netease_on, neteasefree_enabled=neteasefree_on,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("chart warmup loop failed: %s", exc)
+
+
 async def lifespan(fastapi_app: FastAPI):
     global _LX_SCRIPT_MAP_TASK, _LIKED_EPOCH, _LIKED_BUILD_LOCK
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
@@ -5439,6 +5479,15 @@ async def lifespan(fastapi_app: FastAPI):
             env_task = asyncio.create_task(_env_watch_loop())
         liked_task = asyncio.create_task(_liked_scheduler_loop(fastapi_app))
         auto_cache_task = asyncio.create_task(_auto_cache_cleanup_loop())
+
+    # 榜单预热：冷启动先把磁盘缓存读回内存并建索引，随后后台补齐当日缺失榜单。
+    if CONF.get("recommend_charts", True):
+        try:
+            loaded = chartrec.preload_local_caches()
+            logger.info("chart cache preload: %d charts", loaded)
+        except Exception as exc:
+            logger.debug("chart preload failed: %s", exc)
+        asyncio.create_task(_chart_warmup_loop(fastapi_app))
 
     # 预热 平台→激活脚本名 映射：首次搜索的标记渲染是同步读缓存，映射刷新又是
     # 搜索触发的后台任务，冷启动时来不及完成，第一屏会全部退回 [lx-平台]。

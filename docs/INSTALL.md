@@ -31,8 +31,8 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 v2.8.0 起支持两种音源部署形态（`.env` 的 `FNMUSIC_DEPLOY_MODE`），核心代理始终在宿主机 systemd 运行：
 
 1. **核心代理（宿主机 systemd，两形态相同）**：`fnmusic-ext.service` 运行在项目内独立虚拟环境 `.venv-proxy`，负责零侵入接管 `/var/run/trim_music.socket`。核心代理必须在宿主机运行——塞入容器会面临跨容器 socket 权限穿透问题。
-2. **音源 · Docker 单容器（默认）**：`fnmusic-sources` 一个容器内含 musicdl / musicbox / lxmusic / WebUI 四个程序（supervisor 管理），**按 `.env` 只启动当前所选音源进程**，其余不驻留内存。运行期切源在 WebUI 内完成（写配置 + 同容器秒级 stop/start），无需重建容器。
-3. **音源 · 原生宿主机（无 Docker）**：同四个程序由宿主机 systemd unit `fnmusic-sources.service` 内的 supervisord 按需拉起，代码直接运行在仓库目录，Python 依赖装在 `.venv-sources`，lxserver 预编译包落位 `.lxserver/`，进程套接字与日志在 `sources-native/`。音源直接监听与容器发布一致的 `127.0.0.1` 端口，对外契约（端口/接口/`.env`/数据目录）与 Docker 形态完全一致。
+2. **音源 · Docker 单容器（默认）**：`fnmusic-sources` 一个容器内含 musicdl / musicbox / neteasefree / lxmusic / WebUI 五个程序（supervisor 管理），**按 `.env` 只启动当前所选音源进程**，其余不驻留内存。运行期切源在 WebUI 内完成（写配置 + 同容器秒级 stop/start），无需重建容器。
+3. **音源 · 原生宿主机（无 Docker）**：同五个程序由宿主机 systemd unit `fnmusic-sources.service` 内的 supervisord 按需拉起，代码直接运行在仓库目录，Python 依赖装在 `.venv-sources`，lxserver 预编译包落位 `.lxserver/`，进程套接字与日志在 `sources-native/`。音源直接监听与容器发布一致的 `127.0.0.1` 端口，对外契约（端口/接口/`.env`/数据目录）与 Docker 形态完全一致。
 
 两种形态共用同一份 `.env` 与 `sources-data/` 数据目录；**同机互斥**，切换形态用 `./install.sh --deploy docker|native`（跨目录追加 `--adopt`）。
 
@@ -41,6 +41,7 @@ v2.8.0 起支持两种音源部署形态（`.env` 的 `FNMUSIC_DEPLOY_MODE`）�
 | 8768 | 127.0.0.1 | musicdl 音源（仅代理访问） |
 | 8770 | 127.0.0.1 | musicbox 音源（仅本机；扫码走已登录的管理页） |
 | 8772 | 127.0.0.1 | lxmusic 音源（仅代理访问） |
+| 8776 | 127.0.0.1 | neteasefree 免扫码音源（容器内 8006，仅代理访问；默认关闭，第三方后端） |
 | 8774 | 127.0.0.1 | 管理 WebUI（仅本机；浏览器走飞牛网关，仅管理员） |
 
 数据卷：项目目录 `sources-data/`（网易登录态、洛雪源脚本缓存与状态）；仓库目录挂载到容器 `/repo`（WebUI 读写 `.env` 用）。容器无特权、不挂 docker.sock。
@@ -53,7 +54,7 @@ v2.8.0 起支持两种音源部署形态（`.env` 的 `FNMUSIC_DEPLOY_MODE`）�
 
 从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件：
 
-1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic，选 lxmusic 需填写源脚本 URL）；
+1. 向导中选择**初始音源**（musicdl / musicbox / lxmusic / neteasefree，选 lxmusic 装后在管理页配置源脚本；neteasefree 为免扫码第四源，默认关闭，后端地址装后在管理页确认）；
 2. 保持「安装完成后立即启用扩展」开启，安装即自动完成容器构建、代理接管与全链路验收；
 3. 桌面出现「fnMusic 扩展管理」图标，用飞牛管理员点击打开管理页（`/app/fnmusic-ext`）。
 
@@ -81,10 +82,11 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 向导自动执行环境预检，依次引导：
 
-1. **音源三选一**（v2.0.0 起互斥单选）：
+1. **音源四选一**（v2.0.0 起互斥单选，默认仍为 musicdl；v2.12.0-4 起新增第四源）：
    - `1` 网易云 musicbox：安装后自动进入扫码登录；
    - `2` musicdl：进入平台多选子菜单（默认精选酷我+咪咕；全部平台编号见 [../musicdl-service/PLATFORMS.md](../musicdl-service/PLATFORMS.md)）；
    - `3` 洛雪 lxmusic：直接安装（无源状态），源脚本装好在管理页 WebUI 配置；也可在安装命令附 `--lx-source-url`（URL / 本机 `.js` 路径），安装时进行「下载→初始化→搜索→解析→探活」全链路校验；
+   - `4` 网易云免扫码 neteasefree（v2.12.0-4 新增，可选第四源，默认关闭）：免扫码搜索播放走第三方后端，`--neteasefree-api-base` 仅透传保留，后端地址须在管理页确认（仅支持 https，默认示例占位须显式确认风险），与网易云歌单常驻互斥；
 2. **是否安装管理 WebUI**（仅本机 8774，默认否；打开时走飞牛管理员登录）；
 3. **大模型接口（可选）**：OpenAI 兼容 API；仅保存接口不会启用用途。安装后在管理页明确勾选「大模型用于猜你喜欢 / 每日推荐」，两个用途默认都关闭；
 4. **一键启用**：确认后自动调用 `./extend.sh` 接管验收。
@@ -111,7 +113,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
   --llm-api-key '<KEY>' --llm-model 'gpt-4o-mini' --extend
 ```
 
-常用参数：`--sources`（音源三选一）、`--lx-source-url`（可选：http(s) URL 或
+常用参数：`--sources`（音源四选一，默认 musicdl）、`--neteasefree-api-base`（第四源后端地址透传保留，启用确认与 https 校验在管理页）、`--lx-source-url`（可选：http(s) URL 或
 宿主机 `.js` 路径，路径会自动复制进数据卷）、`--lx-skip-verify`
 （跳过洛雪源可用性校验直接激活，源是否可用装好后在管理页 WebUI 查看）、
 `--webui` / `--no-webui`、`--extend`（安装后自动接管）、`--deploy docker|native`
@@ -120,7 +122,7 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 ### 方式 C：原生部署（无 Docker）
 
-机器上没有 Docker（或不想依赖它）时，音源四程序以宿主机 systemd + supervisord
+机器上没有 Docker（或不想依赖它）时，音源五程序以宿主机 systemd + supervisord
 直接运行，功能与 Docker 形态完全一致：
 
 ```bash
@@ -248,6 +250,8 @@ ls sources-native/                           # supervisor 套接字与各程序�
 
 用户登录飞牛音乐后，左侧歌单顶部显示每日、热门推荐及满足条件的猜你喜欢。每日与热门各有独立总开关（默认开启）；大模型的两个用途默认关闭，仅填写 API 接口不会自动启用。
 
+目标曲量运行期可配（改后即时生效，无需重启）：`FNMUSIC_RECOMMEND_SIZE` 控制每日 / 热门目标曲量（5–1000，默认 20）；`FNMUSIC_CATEGORY_SIZE` 控制分类单类目标曲量（5–1000，默认 200）。调大后当日缓存自动失效重建，调小后下次打开按新上限裁剪。构建链路联动放宽上限以支撑大歌单：构建预算 `FNMUSIC_RECOMMEND_BUDGET_S`（默认 40 秒，上限 600 秒）、候选池上限 200、原生抓取量 200、榜单抓取量 200、搜索并发上限 16、逐首校验超时上限 60 秒（各默认值不变，旧三源行为零回归）。分类默认六类（流行 / 摇滚 / 民谣 / 电子 / 古风 / R&B），可用 `FNMUSIC_CATEGORY_DEFS` 以 JSON 数组覆盖（每项 `{id,name,keywords[]}`，非法值回落默认）。构建超时不丢已完成部分，渐进上架；推荐缓存键（daily / hot / chart / category / custom）纳入统一失效规则，切源与版本变化时一并失效。
+
 **「每日推荐 MM-DD」**（`FNMUSIC_RECOMMEND_DAILY` 总开关控制），按账户隔离、按以下顺序补齐：
 
 1. **音源原生推荐**：musicbox 源且已扫码登录时，网易每日推荐每天由第一个打开的用户使用；
@@ -261,6 +265,20 @@ ls sources-native/                           # supervisor 套接字与各程序�
 1. **网易热歌榜**：musicbox 源（免登录）；
 2. **洛雪榜单**：lxmusic 源启用时聚合酷狗 TOP500 / 酷我飙升榜 / 网易新歌速递
    （按 `LX_SOURCES` 平台过滤）；全部榜单不可用时该歌单不显示。
+
+以上热门链路保持不变；38 榜排行榜为独立歌单，与热门推荐并列存在、互不替代。
+
+**「排行榜歌单（38 榜）」**：酷狗 20 榜与网易云官方 18 榜，共 38 榜。每榜独立成歌单，榜单曲目与热门推荐的聚合逻辑并存，榜单 GUID 以 `online:playlist:chart:` 开头，与每日、热门前缀互不冲突。
+
+缓存为内存加磁盘双层，按天重建：启动时先把磁盘已有缓存读回内存建索引，榜单列表即时可见；后台再逐榜预热当日数据，榜间带礼貌间隔，避免突发流量。缺失当天缓存时回落最近历史缓存，升级与切源时榜单缓存键与每日、分类、自定义一并失效。白名单可用 `FNMUSIC_ENABLED_CHARTS` 按榜 ID 逗号分隔限定范围，留空即全部，改后热重载生效。
+
+**「分类歌单」**：默认流行、摇滚、民谣、电子、古风、R&B 六类，单类目标曲量默认 200，可用 `FNMUSIC_CATEGORY_SIZE` 调整，启用范围可用 `FNMUSIC_CATEGORY_ENABLED_IDS` 按逗号分隔子集限定。构建超时保留已完成部分渐进上架，不返回空歌单。
+
+**「自定义歌单」**：总开关 `FNMUSIC_CUSTOM_PLAYLISTS_ENABLED` 默认关闭，定义目录 `FNMUSIC_CUSTOM_PLAYLISTS_DIR` 留空使用安装目录 custom_playlists，并与歌曲缓存、下载目录互斥。支持 m3u、m3u8、pls、cue 导入解析歌名歌手，异常行跳过并提示计数；支持按提示词调用大模型生成并与手动列表去重合并。删除为硬删除，需二次确认并同步清理磁盘缓存。
+
+**「自动缓存」**：`FNMUSIC_AUTO_CACHE_FIRST` 首曲自动落库与 `FNMUSIC_AUTO_CACHE_NEXT` 下一曲预取默认关闭，复用边听边存整轨下载链路，同一曲目同时命中只下载一次。下一曲预取依赖歌单上下文，单曲播放无上下文时不预取。`FNMUSIC_AUTO_CACHE_CLEANUP` 每天清理滚动缓存与同名歌词，落库歌曲豁免。
+
+**「大模型三档」**：`FNMUSIC_LLM_PROVIDER` 取 kilo、custom、none，默认 kilo 内置免配置可用。内置档 Base URL 与 API Key 灰化禁用，仅自定义档可填；密钥只走环境变量，不进日志与缓存。从自定义切回内置或关闭时清空已保存密钥。选择关闭后大模型链路跳过，不阻塞其他推荐层。
 
 **「猜你喜欢」**：未勾选大模型用途时保留原本的纯本地行为：当前账户排除本地收藏后至少有 20 首有效本地候选才展示，最多 20 首；首次读取生成，缓存 30 分钟后下次读取更新。在线收藏不作为本地候选排除条件。
 
@@ -289,6 +307,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 curl -s http://127.0.0.1:8768/healthz   # musicdl（若启用）
 curl -s http://127.0.0.1:8770/healthz   # musicbox（若启用）
 curl -s http://127.0.0.1:8772/healthz   # lxmusic（若启用；含 user_source 状态）
+curl -s http://127.0.0.1:8776/healthz   # neteasefree（若启用；第三方后端）
 curl -s http://127.0.0.1:8774/healthz   # WebUI（若启用）
 
 # 本地自动化测试集（无需 Docker/飞牛环境）
@@ -379,8 +398,8 @@ v2.0.0 结构变化较大（三容器→单容器、数据目录迁移、配置�
 `git pull` → `./restore.sh`（先还原官方直连并清理旧部署，兼容 v1.x 旧容器/宿主机服务；
 `.env` 与数据保留）→ `./install.sh` 全新安装。直接原地升级同样支持。
 
-v1.x 允许多音源并存，v2.0.0 起三音源互斥单选。升级安装时检测到旧 `.env` 多源
-并存会要求重新三选一（非交互需 `--sources` 指定唯一音源）。此后换源在 WebUI
+v1.x 允许多音源并存，v2.0.0 起音源互斥单选（三选一；2.12.0-4 起扩展为四选一）。升级安装时检测到旧 `.env` 多源
+并存会要求重新四选一（非交互需 `--sources` 指定唯一音源）。此后换源在 WebUI
 里秒级完成，不必重装。
 
 ### 洛雪源测试失败

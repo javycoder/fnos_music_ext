@@ -125,8 +125,9 @@ def _static_build_id() -> str:
 STATIC_BUILD_ID = _static_build_id()
 
 # ------------------------------------------------------------------ 检查更新 --
-# 双源顺序即回退顺序：优先 GitHub Releases，被墙/限流/超时等失败时回退 Gitee。
-# 命中哪个源，前端"升级"按钮就跳哪个源的 release 页。
+# 主源为现有 Releases API（GitHub 优先，Gitee 回退），update.json 为辅。
+# 直连不可达时按序走加速代理（WEBUI_UPDATE_PROXIES，可配，逗号分隔，留空仅直连）。
+# 命中哪个源，前端"升级"按钮就跳哪个源的 release 页；清单版本高于本地才提示。
 UPDATE_SOURCES = (
     {
         "name": "github",
@@ -139,6 +140,20 @@ UPDATE_SOURCES = (
         "page": "https://gitee.com/javycoder/fnos_music_ext/releases",
     },
 )
+# 仓库根目录更新清单（update.json）：Releases API 双源皆败时回退到它，同样支持代理。
+# 可用 WEBUI_UPDATE_URL 覆盖；代理为前缀式：<代理>/<原始 URL>。
+UPDATE_JSON_URL = os.environ.get(
+    "WEBUI_UPDATE_URL",
+    "https://raw.githubusercontent.com/javycoder/fnos_music_ext/main/update.json",
+)
+
+
+def _update_proxies() -> list[str]:
+    """加速代理列表：WEBUI_UPDATE_PROXIES 逗号分隔，留空仅直连。"""
+    raw = os.environ.get("WEBUI_UPDATE_PROXIES", "")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
 # 成功缓存 6 小时（GitHub 匿名限额 60 次/小时），双源皆败负缓存 10 分钟——
 # 前端进页面即查但不轮询，命中缓存不出网
 _UPDATE_OK_TTL = 6 * 3600.0
@@ -156,6 +171,8 @@ PROVIDERS = {
 }
 
 # #98：仅兼容旧客户端仍会提交的退休键；不进入公开配置 Schema。
+# 未知键忽略回传：提交里不在 SCHEMA 但在 RETIRED/未知集合的键一律忽略并回传
+# ignored_keys，可写集合仍以 SCHEMA 为准，避免旧前端提交旧键整单失败。
 RETIRED_CONFIG_KEYS = frozenset({"FNMUSIC_SEARCH_PROBE"})
 
 # WebUI 可管理的配置键与元数据（kind/default/reload 驱动前端渲染与校验）。
@@ -185,6 +202,11 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_DOWNLOAD_QUALITY": {"kind": "enum", "values": ["app", *QUALITY_LEVELS], "default": "app", "group": "quality", "reload": "hot", "label": "APP下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
+    "FNMUSIC_RECOMMEND_CHARTS": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "排行榜歌单"},
+    "FNMUSIC_KG_CHARTS": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "酷狗榜单来源"},
+    "FNMUSIC_WY_CHARTS": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "网易榜单来源"},
+    "FNMUSIC_ENABLED_CHARTS": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "启用榜单白名单（逗号分隔，空=全部）"},
+    "FNMUSIC_CHART_LIMIT": {"kind": "int", "default": "100", "min": 10, "max": 200, "group": "recommend", "reload": "hot", "label": "单榜曲量上限"},
     "FNMUSIC_RECOMMEND_SIZE": {"kind": "int", "default": "20", "min": 5, "max": 1000, "group": "recommend", "reload": "hot", "label": "每日/热门目标曲量（5-1000）"},
     "FNMUSIC_CATEGORY_SIZE": {"kind": "int", "default": "200", "min": 5, "max": 1000, "group": "recommend", "reload": "hot", "label": "分类单类目标曲量（5-1000）"},
     "FNMUSIC_CATEGORY_ENABLED_IDS": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "启用分类（逗号分隔，空=全部）"},
@@ -1062,15 +1084,20 @@ def _translate_legacy_quality(values: dict, existing: dict[str, str]) -> dict[st
 
 
 def validate_updates(values: dict) -> dict[str, str]:
+    """校验并归一化 SCHEMA 内的可写键。
+
+    未知键由 api_config_put 在入口忽略并回传（任务 1.4），这里不再拒绝；
+    可写集合仍以 SCHEMA 为准。"""
     values = dict(values or {})
     existing = read_env()
+    # 旧版兼容键（质量模式）先转换：它们不在 SCHEMA 但合法，不计入未知忽略。
     legacy_updates = _translate_legacy_quality(values, existing)
     updates: dict[str, str] = {}
     for key, raw in values.items():
         if key in ("FNMUSIC_QUALITY_MODE", "FNMUSIC_DL_QUALITY"):
             continue
         if key not in SCHEMA:
-            raise ValueError(f"不支持的配置键: {key}")
+            continue
         updates[key] = _normalize_value(key, raw)
     updates.update(legacy_updates)
     if "LX_SOURCE_LIST" in updates:
@@ -1332,23 +1359,55 @@ def _strip_release_body(body: str) -> str:
     return "\n".join(out)
 
 
+def _with_update_proxies(url: str) -> list[str]:
+    """直连候选 + 按序加速代理候选：直连优先，代理按 WEBUI_UPDATE_PROXIES 顺序回退。"""
+    urls = [url]
+    for prefix in _update_proxies():
+        urls.append(f"{prefix.rstrip('/')}/{url.lstrip()}")
+    return urls
+
+
+async def _fetch_json_url(request: Request, source_name: str, url: str) -> "tuple[bool, dict | str]":
+    """按直连→代理顺序拉取单个 JSON 地址，返回原始字典。"""
+    client = get_http(request)
+    last_err = f"{source_name} 不可达"
+    for candidate in _with_update_proxies(url):
+        try:
+            resp = await client.get(candidate, timeout=5.0, headers=_UPDATE_HEADERS)
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"{source_name} {exc}"
+            continue
+        if resp.status_code != 200:
+            last_err = f"{source_name} HTTP {resp.status_code}"
+            continue
+        try:
+            data = resp.json() if resp.content else None
+        except Exception:  # noqa: BLE001
+            last_err = f"{source_name} 响应非 JSON"
+            continue
+        if isinstance(data, dict):
+            return True, data
+        # gitee 对"无发行版"返回 200 + null body（release.yml 实测），换下一候选
+        last_err = f"{source_name} 无发行版数据"
+    return False, last_err
+
+
+async def _fetch_release_url(request: Request, source_name: str, url: str) -> "tuple[bool, dict | str]":
+    """按直连→代理顺序拉取单个 release 源地址（要求含 tag_name）。"""
+    ok, data = await _fetch_json_url(request, source_name, url)
+    if not ok or not isinstance(data, dict):
+        return False, data if isinstance(data, str) else f"{source_name} 响应非 JSON"
+    if not data.get("tag_name"):
+        return False, f"{source_name} 无发行版数据"
+    return True, data
+
+
 async def _fetch_release(request: Request, source: dict) -> "tuple[bool, dict | str]":
     """拉取单个源的 latest release。成功返回 (True, 规范化后的发行版信息)，
-    失败返回 (False, 错误描述)。"""
-    client = get_http(request)
-    try:
-        resp = await client.get(source["api"], timeout=5.0, headers=_UPDATE_HEADERS)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{source['name']} {exc}"
-    if resp.status_code != 200:
-        return False, f"{source['name']} HTTP {resp.status_code}"
-    try:
-        data = resp.json() if resp.content else None
-    except Exception:  # noqa: BLE001
-        return False, f"{source['name']} 响应非 JSON"
-    if not isinstance(data, dict) or not data.get("tag_name"):
-        # gitee 对"无发行版"返回 200 + null body（release.yml 实测），不能只看 HTTP 码
-        return False, f"{source['name']} 无发行版数据"
+    失败返回 (False, 错误描述)。直连不可达时按序回退加速代理。"""
+    ok, data = await _fetch_release_url(request, source["name"], source["api"])
+    if not ok or not isinstance(data, dict):
+        return False, data if isinstance(data, str) else f"{source['name']} 响应非 JSON"
     return True, {
         "version": str(data["tag_name"]).strip().lstrip("vV"),
         "name": str(data.get("name") or "").strip(),
@@ -1356,6 +1415,28 @@ async def _fetch_release(request: Request, source: dict) -> "tuple[bool, dict | 
         "changelog": _strip_release_body(str(data.get("body") or "")),
         # tag 页 URL 缺失时按 tag 名兜底构造（两边仓库发行版页同构 /releases/tag/<tag>）
         "html_url": str(data.get("html_url") or f"{source['page']}/tag/{data['tag_name']}"),
+    }
+
+
+async def _fetch_update_json(request: Request) -> "tuple[bool, dict | str]":
+    """拉取仓库根目录 update.json（辅源）。成功返回规范化发行版信息。
+
+    清单字段：version/date/notes；直连不可达同样按序走加速代理。"""
+    ok, data = await _fetch_json_url(request, "update.json", UPDATE_JSON_URL)
+    if not ok or not isinstance(data, dict):
+        return False, data if isinstance(data, str) else "update.json 响应非 JSON"
+    version = str(data.get("version") or "").strip().lstrip("vV")
+    if not version:
+        return False, "update.json 无版本数据"
+    notes = data.get("notes")
+    changelog = notes if isinstance(notes, str) else "\n".join(
+        str(line) for line in notes) if isinstance(notes, list) else ""
+    return True, {
+        "version": version,
+        "name": str(data.get("name") or "").strip(),
+        "published_at": str(data.get("date") or "").strip(),
+        "changelog": _strip_release_body(changelog),
+        "html_url": "https://github.com/javycoder/fnos_music_ext/releases",
     }
 
 
@@ -1696,10 +1777,15 @@ async def api_preview(body: PreviewBody, request: Request):
 
 @app.put("/api/config")
 async def api_config_put(body: ConfigBody, request: Request):
+    # 任务 1.4：未知键忽略回传——不在 SCHEMA 但在 RETIRED/未知集合的键忽略
+    # 并回传 ignored_keys，可写集合仍以 SCHEMA 为准。
     before = read_env()
     supplied = body.values or {}
-    ignored_keys = sorted(key for key in supplied if key in RETIRED_CONFIG_KEYS)
-    supported_values = {key: value for key, value in supplied.items() if key not in RETIRED_CONFIG_KEYS}
+    # 旧版兼容键走转换通道，不计入未知忽略。
+    legacy_keys = {"FNMUSIC_QUALITY_MODE", "FNMUSIC_DL_QUALITY"}
+    ignored_keys = sorted(key for key in supplied if key not in SCHEMA and key not in legacy_keys)
+    supported_values = {key: value for key, value in supplied.items()
+                          if key in SCHEMA or key in legacy_keys}
     try:
         updates = validate_updates(supported_values)
     except ValueError as exc:
@@ -2765,10 +2851,11 @@ async def api_about():
 
 @app.get("/api/update-check")
 async def api_update_check(request: Request):
-    """检查更新：GitHub Releases 优先，不可达（被墙/限流）回退 Gitee。
+    """检查更新：Releases API 为主（GitHub 优先，Gitee 回退），update.json 为辅。
 
-    结果缓存（成功 6h / 双源皆败 10min，按响应里有无 source 键区分）：
-    前端进页面即查但不轮询，命中缓存不出网。双源皆败不报 500——前端静默降级，
+    直连不可达时按序回退加速代理（WEBUI_UPDATE_PROXIES，可配）；清单版本高于
+    本地才提示。结果缓存（成功 6h / 全败 10min，按响应里有无 source 键区分）：
+    前端进页面即查但不轮询，命中缓存不出网。全败不报 500——前端静默降级，
     红点只是锦上添花，不能因检查失败打扰用户。"""
     now = time.time()
     cached = _update_cache.get("data")
@@ -2793,6 +2880,21 @@ async def api_update_check(request: Request):
         _update_cache.clear()
         _update_cache.update({"ts": now, "data": result})
         return result
+    # 主源双败：回退仓库根目录 update.json（同样支持加速代理）。
+    ok, payload = await _fetch_update_json(request)
+    if ok and isinstance(payload, dict):
+        result = {
+            "ok": True,
+            "current_version": current,
+            "has_update": _version_newer(str(payload["version"]), current),
+            "source": "update.json",
+            "checked_at": int(now),
+            "latest": payload,
+        }
+        _update_cache.clear()
+        _update_cache.update({"ts": now, "data": result})
+        return result
+    errors.append(str(payload))
     result = {
         "ok": True,
         "current_version": current,
@@ -2839,9 +2941,11 @@ async def api_logs_export():
 
 
 # ------------------------------------------------------------------ 静态前端 --
+# 任务 1.5 版本强刷：首页带 ?v=版本号，静态资源 no-cache/回源校验，升级后不展示旧界面。
 
 @app.get("/")
 async def index():
+    """首页：静态资源 URL 带构建指纹，HTML 本体 no-cache 回源校验。"""
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     return HTMLResponse(content=html.replace("__WEBUI_BUILD__", STATIC_BUILD_ID))
 

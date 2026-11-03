@@ -127,6 +127,55 @@ function renderLlmUsage(u) {
   if ($("#llm-usage-page")) $("#llm-usage-page").textContent = `第 ${Math.floor(llmUsageOffset / LLM_USAGE_PAGE_SIZE) + 1} 页，共 ${usageNumber(u.totalDays)} 个记录日`;
 }
 
+/* 任务 5.2：歌单统一列表化——内置与自定义在同一列表管理，每行标注类型与启用状态。 */
+async function renderPlaylistUnified() {
+  const list = $("#playlist-unified-list");
+  if (!list) return;
+  const rows = [];
+  const v = configValues || {};
+  const builtin = [
+    ["每日推荐", "内置", v.FNMUSIC_RECOMMEND_DAILY === "true", "page-playlist", "#recommend-daily"],
+    ["热门榜单推荐", "内置", v.FNMUSIC_RECOMMEND_HOT === "true", "page-playlist", "#recommend-hot"],
+    ["排行榜歌单", "内置", v.FNMUSIC_RECOMMEND_CHARTS === "true", "page-playlist", "#recommend-charts"],
+    ["公共歌单", "内置", v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true", "page-playlist", "#public-playlists-enabled"],
+    ["自定义歌单", "内置", !($("#custom-enabled") && !$("#custom-enabled").checked), "page-playlist", "#custom-enabled"],
+  ];
+  for (const [name, kind, enabled] of builtin) {
+    rows.push({ name, kind, enabled: !!enabled, custom: false });
+  }
+  try {
+    const data = await api("/api/custom-playlists");
+    const items = Array.isArray(data.items) ? data.items : [];
+    for (const item of items) {
+      rows.push({
+        name: item.name || "未命名歌单", kind: "自定义",
+        enabled: !!item.enabled, custom: true, id: item.id,
+        trackCount: item.trackCount || 0,
+      });
+    }
+  } catch (_) { /* 自定义列表失败不阻断内置行展示 */ }
+  list.innerHTML = rows.map((r, idx) =>
+    `<div class="playlist-row"><span>${escapeHtml(r.name)}${r.trackCount ? `（${r.trackCount} 首）` : ""}</span>` +
+    `<span class="badge dim">${escapeHtml(r.kind)}</span>` +
+    `<span class="badge ${r.enabled ? "" : "dim"}">${r.enabled ? "启用" : "停用"}</span>` +
+    `<button class="btn small" data-unified-edit="${idx}" type="button">进入编辑</button></div>`
+  ).join("") || '<p class="hint">暂无歌单。</p>';
+  list.querySelectorAll("[data-unified-edit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const row = rows[Number(btn.dataset.unifiedEdit)];
+      if (!row) return;
+      // 内置行聚焦到对应开关，自定义行聚焦到自定义管理区。
+      const target = document.querySelector(row.custom ? "#custom-playlists-card" : ({
+        "每日推荐": "#recommend-daily", "热门榜单推荐": "#recommend-hot",
+        "排行榜歌单": "#recommend-charts",
+        "公共歌单": "#public-playlists-enabled", "自定义歌单": "#custom-enabled",
+      }[row.name] || "#custom-playlists-card"));
+      if (target && typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "nearest" });
+      if (target && typeof target.focus === "function") try { target.focus({ preventScroll: true }); } catch (_) {}
+    });
+  });
+}
+
 async function refreshLlmUsage() {
   const el = $("#llm-usage-line");
   if (!el) return;
@@ -273,8 +322,20 @@ window.addEventListener("keydown", (ev) => {
 });
 
 /* -------------------------------------------------------------- 导航 */
+// 任务 5.1：双导航收敛为五项（概览/音乐源/歌单/边听边存/关于），旧路由跳转不 404。
+// 映射：quality/search/lx → source，dirs → tee，llm → playlist，settings → about。
 let activeBottomMenu = null;
 let activeBottomTrigger = null;
+
+const NAV_PAGES = ["overview", "source", "playlist", "tee", "about"];
+const NAV_REDIRECT = {
+  quality: "source", search: "source", lx: "source",
+  dirs: "tee", llm: "playlist", settings: "about",
+};
+
+function resolveNavPage(page) {
+  return NAV_REDIRECT[page] || page;
+}
 
 function isNavGroupExpanded(group) {
   try {
@@ -332,38 +393,41 @@ function openBottomSubMenu(trigger, menu) {
 }
 
 function switchPage(page) {
+  // 旧深链跳转：quality/search/settings/dirs/lx/llm 按映射表收敛，不 404。
+  page = resolveNavPage(page);
   currentPage = page;
-  $$(".page").forEach((el) => el.classList.toggle("active", el.id === "page-" + page));
-  $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
+  $$(".page").forEach((el) => {
+    el.classList.toggle("active", el.id === "page-" + page);
+  });
+  $$("[data-page]").forEach((el) => el.classList.toggle("active", resolveNavPage(el.dataset.page) === page));
 
-  const isStorageSub = page === "tee" || page === "dirs";
-  const isAdvancedSub = page === "llm" || page === "lx";
-
+  // 存量折叠/底栏子菜单逻辑保留为兼容桩：新导航无分组时直接空转。
   const storageTitle = $("#nav-storage-title");
-  if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
+  if (storageTitle) storageTitle.classList.toggle("active", false);
   const advancedTitle = $("#nav-advanced-title");
-  if (advancedTitle) advancedTitle.classList.toggle("active", isAdvancedSub);
+  if (advancedTitle) advancedTitle.classList.toggle("active", false);
 
   const bottomStorage = $("#bottom-storage-trigger");
-  if (bottomStorage) bottomStorage.classList.toggle("active", isStorageSub);
+  if (bottomStorage) bottomStorage.classList.toggle("active", false);
   const bottomAdvanced = $("#bottom-advanced-trigger");
-  if (bottomAdvanced) bottomAdvanced.classList.toggle("active", isAdvancedSub);
-
-  if (isStorageSub) setNavGroupExpanded("storage", true, true);
-  if (isAdvancedSub) setNavGroupExpanded("advanced", true, true);
+  if (bottomAdvanced) bottomAdvanced.classList.toggle("active", false);
 
   closeBottomSubMenu(false);
 
   if (typeof setLlmUsageActive === "function") {
-    setLlmUsageActive(page === "llm");
+    setLlmUsageActive(page === "playlist");
   }
 
+  if (page === "playlist") {
+    if (typeof loadCustomPlaylists === "function") loadCustomPlaylists().catch(() => {});
+    if (typeof renderPlaylistUnified === "function") renderPlaylistUnified().catch(() => {});
+  }
   if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
 }
 
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
 
-// 一级菜单纯折叠：不跳页、不标脏、首访收起、记忆到 localStorage
+// 兼容旧分组折叠：新导航无分组元素时空转，不标脏。
 ["storage", "advanced"].forEach((group) => {
   const expanded = isNavGroupExpanded(group);
   setNavGroupExpanded(group, expanded, false);
@@ -377,7 +441,7 @@ $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPag
   }
 });
 
-// 移动端底导航父项弹子菜单：外点、Escape、focus 返回
+// 兼容旧底栏子菜单：新底栏无分组时空转。
 [
   ["#bottom-storage-trigger", "#bottom-storage-menu"],
   ["#bottom-advanced-trigger", "#bottom-advanced-menu"],
@@ -620,6 +684,11 @@ function applyConfigToForm() {
   });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
+  if ($("#recommend-charts")) $("#recommend-charts").checked = v.FNMUSIC_RECOMMEND_CHARTS === "true";
+  if ($("#kg-charts")) $("#kg-charts").checked = v.FNMUSIC_KG_CHARTS === "true";
+  if ($("#wy-charts")) $("#wy-charts").checked = v.FNMUSIC_WY_CHARTS === "true";
+  if ($("#enabled-charts")) $("#enabled-charts").value = v.FNMUSIC_ENABLED_CHARTS || "";
+  if ($("#chart-limit")) $("#chart-limit").value = v.FNMUSIC_CHART_LIMIT || "100";
   if ($("#recommend-size")) $("#recommend-size").value = v.FNMUSIC_RECOMMEND_SIZE || "20";
   if ($("#category-size")) $("#category-size").value = v.FNMUSIC_CATEGORY_SIZE || "200";
   if ($("#custom-enabled")) $("#custom-enabled").checked = v.FNMUSIC_CUSTOM_PLAYLISTS_ENABLED === "true";
@@ -744,6 +813,11 @@ function collectConfig() {
       ? { FNMUSIC_LX_SOURCE_ORDER: JSON.stringify(lxSourceOrder) } : {}),
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
+    FNMUSIC_RECOMMEND_CHARTS: $("#recommend-charts") ? $("#recommend-charts").checked : true,
+    FNMUSIC_KG_CHARTS: $("#kg-charts") ? $("#kg-charts").checked : true,
+    FNMUSIC_WY_CHARTS: $("#wy-charts") ? $("#wy-charts").checked : true,
+    FNMUSIC_ENABLED_CHARTS: $("#enabled-charts") ? $("#enabled-charts").value.trim() : "",
+    ...(configSchema.FNMUSIC_CHART_LIMIT ? { FNMUSIC_CHART_LIMIT: playlistSizeNumber("#chart-limit", "单榜曲量上限") } : {}),
     ...(configSchema.FNMUSIC_RECOMMEND_SIZE ? { FNMUSIC_RECOMMEND_SIZE: playlistSizeNumber("#recommend-size", "每日/热门目标曲量") } : {}),
     ...(configSchema.FNMUSIC_CATEGORY_SIZE ? { FNMUSIC_CATEGORY_SIZE: playlistSizeNumber("#category-size", "分类单类目标曲量") } : {}),
     FNMUSIC_CUSTOM_PLAYLISTS_ENABLED: $("#custom-enabled") ? $("#custom-enabled").checked : false,
@@ -895,7 +969,8 @@ async function saveConfig() {
     && Boolean(configSchema.FNMUSIC_LX_SOURCE_ORDER);
   const requestedOrder = lxSourceOrder.slice();
   if (syncOrderThroughProxy) delete values.FNMUSIC_LX_SOURCE_ORDER;
-  if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
+  // 任务 5.1：lx 已并入音乐源页；在音乐源页未改源列表时同样跳过重复提交。
+  if ((currentPage === "lx" || currentPage === "source") && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
   try {
     const result = await api("/api/config", {
       method: "PUT",
@@ -2745,9 +2820,9 @@ $("#lx-auto-switch").addEventListener("change", () => {
   markDirty("洛雪自动切源设置需保存后生效");
 });
 $("#lx-platform-preferred").addEventListener("change", () => markDirty("洛雪平台优选设置需保存后生效"));
-["#recommend-size", "#category-size"].forEach((sel) =>
+["#recommend-size", "#category-size", "#chart-limit"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty("目标曲量保存后当日缓存自动重建")));
-["#recommend-hot", "#recommend-daily", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident", "#custom-enabled"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#recommend-charts", "#kg-charts", "#wy-charts", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident", "#custom-enabled"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 ["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty("播放直连策略需保存后生效")));
@@ -2914,7 +2989,9 @@ function openUpdateModal() {
   $("#update-modal-version").textContent = formatVersionLabel(latest.version || updateInfo.current_version);
   $("#update-modal-date").textContent = fmtDate(latest.published_at);
   // release 说明来自外部仓库，textContent 注入防 XSS
-  $("#update-modal-changelog").textContent = latest.changelog || "暂无更新说明";
+  // 下载失败回退手动安装：弹窗固定给出应用中心手动安装指引，不静默失败。
+  $("#update-modal-changelog").textContent =
+    `${latest.changelog || "暂无更新说明"}\n\n下载失败时请前往「应用中心 → 手动安装」选择安装包。`;
   // 升级跳转跟随检查源：GitHub 查到跳 GitHub release 页，Gitee 查到跳 Gitee 发行版页
   $("#update-upgrade-btn").href = latest.html_url || "#";
   $("#update-modal").hidden = false;
