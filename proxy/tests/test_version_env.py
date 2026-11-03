@@ -310,13 +310,13 @@ def test_write_env_atomic_real_nonroot_shared_group(shared_permission_dir, share
     if os.geteuid() != 0:
         pytest.skip("isolated cross-uid regression requires root")
     root = shared_permission_dir
-    root.chmod(0o711)
+    original = root.stat()
     uid, primary_gid, shared_gid = 24561, 24562, 24563
-    os.chown(root, uid, primary_gid)
-    root.chmod(0o700)
+    # 只依赖CHOWN/SETUID/SETGID：先以属主身份完成内容和权限准备，最后chown。
+    # 0711只允许第二个UID按已知文件名访问，不允许列目录或写入。
+    root.chmod(0o711)
     out = root / ".env"
     out.write_text("A='old'\n", encoding="utf-8")
-    os.chown(out, uid, shared_gid)
     out.chmod(0o640)
     # 模块在降权前导入，不要求测试 checkout 对测试 uid 开放遍历。
     code = """
@@ -338,20 +338,28 @@ else:
     assert member
 assert p.stat().st_gid == shared
 assert p.stat().st_mode & 0o777 == 0o640
-if member:
-    assert p.read_text() == "A='new'\\n"
+assert p.read_text() == ("A='new'\\n" if member else "A='old'\\n")
 assert not list(p.parent.glob('.env.merge.*'))
 """
-    result = subprocess.run([sys.executable, "-I", "-c", code, str(Path(env_merge.__file__).resolve()),
-                             str(out), str(uid), str(primary_gid), str(shared_gid),
-                             "1" if shared_membership else "0"], capture_output=True, text=True, timeout=20)
-    assert result.returncode == 0, result.stderr
-    assert out.read_text() == ("A='new'\n" if shared_membership else "A='old'\n")
-    reader = "import os,pathlib,sys;os.setgroups([]);os.setgid(int(sys.argv[2]));os.setuid(24564);assert pathlib.Path(sys.argv[1]).read_text()==sys.argv[3]"
-    root.chmod(0o711)
-    result = subprocess.run([sys.executable, "-I", "-c", reader, str(out), str(shared_gid), out.read_text()],
-                            capture_output=True, text=True, timeout=20)
-    assert result.returncode == 0, result.stderr
+    try:
+        os.chown(out, uid, shared_gid)
+        os.chown(root, uid, primary_gid)
+        result = subprocess.run([sys.executable, "-I", "-c", code, str(Path(env_merge.__file__).resolve()),
+                                 str(out), str(uid), str(primary_gid), str(shared_gid),
+                                 "1" if shared_membership else "0"], capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+        reader = "import os,pathlib,sys;os.setgroups([]);os.setgid(int(sys.argv[2]));os.setuid(24564);assert pathlib.Path(sys.argv[1]).read_text()==sys.argv[3]"
+        expected = "A='new'\n" if shared_membership else "A='old'\n"
+        result = subprocess.run([sys.executable, "-I", "-c", reader, str(out), str(shared_gid), expected],
+                                capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+    finally:
+        # CAP_CHOWN不要求文件属主；先恢复目录，root才可列举并清理所有失败残留。
+        os.chown(root, original.st_uid, original.st_gid)
+        root.chmod(0o700)
+        for artifact in root.iterdir():
+            os.chown(artifact, original.st_uid, original.st_gid)
+            artifact.chmod(0o600)
 
 
 def test_write_env_atomic_nonroot_does_not_chown(tmp_path, monkeypatch):
