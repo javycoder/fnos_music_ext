@@ -83,7 +83,7 @@ RUN set -eu; \
         cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     fix_dns; \
-    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui
+    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui \
     || { echo "[WARN] pip 镜像源（${PIP_INDEX_URL}）安装失败，回退官方 PyPI 重试..." >&2; \
          pip install --no-cache-dir -i https://pypi.org/simple \
             -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.neteasefree -r /srv/req.lxmusic -r /srv/req.webui; } \

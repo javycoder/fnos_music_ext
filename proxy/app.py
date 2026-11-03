@@ -2680,23 +2680,30 @@ def _drop_privileges(fallback=None):
             return 0, 0
     venv_dir = os.path.join(_REPO_ROOT, '.venv-proxy')
     if os.path.isdir(venv_dir):
+        # Idempotent fast path: once the venv is owned by the target user
+        # (done at first startup), skip the expensive walk on subsequent
+        # restores (e.g. per-request music-users reads).
         try:
-            for root, dirs, files in os.walk(venv_dir):
-                try:
-                    os.chown(root, primary_uid, primary_gid)
-                except OSError:
-                    pass
-                for name in files:
+            vst = os.stat(venv_dir)
+            if (vst.st_uid, vst.st_gid) != (primary_uid, primary_gid):
+                for root, dirs, files in os.walk(venv_dir):
                     try:
-                        os.chown(os.path.join(root, name), primary_uid, primary_gid)
+                        os.chown(root, primary_uid, primary_gid)
                     except OSError:
                         pass
+                    for name in files:
+                        try:
+                            os.chown(os.path.join(root, name), primary_uid, primary_gid)
+                        except OSError:
+                            pass
         except OSError as exc:
             logger.warning('could not prepare proxy venv %s: %s', venv_dir, exc)
     run_dir = '/run/fnmusic-ext'
     if os.path.isdir(run_dir):
         try:
-            os.chmod(run_dir, 0o711)
+            rst = os.stat(run_dir)
+            if (rst.st_mode & 0o777) != 0o711:
+                os.chmod(run_dir, 0o711)
         except OSError as exc:
             logger.warning('could not make %s traversable: %s', run_dir, exc)
     staged = _staged_socket_path()
@@ -2704,8 +2711,10 @@ def _drop_privileges(fallback=None):
         staged_dir = os.path.dirname(staged)
         if staged_dir and os.path.isdir(staged_dir):
             try:
-                os.chown(staged_dir, primary_uid, primary_gid)
-                os.chmod(staged_dir, 0o700)
+                sst = os.stat(staged_dir)
+                if (sst.st_uid, sst.st_gid) != (primary_uid, primary_gid) or (sst.st_mode & 0o777) != 0o700:
+                    os.chown(staged_dir, primary_uid, primary_gid)
+                    os.chmod(staged_dir, 0o700)
             except OSError as exc:
                 logger.warning('could not prepare staged socket directory %s: %s', staged_dir, exc)
     repo_gid = 0
@@ -5252,8 +5261,41 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
     global _maintenance_task, _organize_task, _last_organize_job
     if method == "GET":
         if path == "/api/maintenance/music-users":
+            # music.db parent dir is root:root 0770 with an app-center ACL that
+            # grants rx only to the trim.music user; the privilege-dropped proxy
+            # (xlight) cannot traverse it. Temporarily re-raise to root for the
+            # DB read, then restore identity. The read is synchronous (no await)
+            # so no other request can observe the elevated UID.
+            _was_dropped = os.geteuid() != 0
+            _saved_identity = tuple(_PRIV_STATE)
+            _elevated = False
+            if _was_dropped:
+                try:
+                    os.setegid(0)
+                    os.seteuid(0)
+                    _elevated = True
+                except OSError as exc:
+                    logger.warning("could not re-raise for music-users: %s", exc)
             try:
-                users = await asyncio.to_thread(list_music_users)
+                users = list_music_users()  # synchronous, no await in elevated span
+            except (ValueError, OSError) as exc:
+                if _elevated:
+                    try:
+                        _drop_privileges(_saved_identity)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return 503, {"ok": False, "error": str(exc)}
+            # Restore identity before any further work (including .env merge).
+            if _elevated:
+                try:
+                    _drop_privileges(_saved_identity)
+                except SystemExit:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("restore after music-users failed: %s", exc)
+                    return 503, {"ok": False, "error": "privilege restore failed"}
+            # .env merge as the dropped user (no root needed).
+            try:
                 await asyncio.to_thread(migrate_public_playlist_users, users)
                 values = dict(parse_env_file(_env_watch_path(), strict=True)[0])
                 CONF["public_playlists_by_user"] = values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "")
@@ -5359,7 +5401,6 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
     return 200, {"ok": True, "job": dict(job)}
 
 
-@asynccontextmanager
 async def _chart_warmup_loop(fastapi_app: FastAPI) -> None:
     """榜单后台预热：启动后平滑补齐当日缺失榜单（失败静默，访问路径自带兜底）。"""
     try:
