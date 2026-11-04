@@ -2422,13 +2422,19 @@ def detect_library_dir() -> str:
     if _DETECTED_LIBRARY_DIR:
         return _DETECTED_LIBRARY_DIR
     db = str(CONF.get("music_db") or "")
-    if db and os.path.exists(db):
+    if db:
         try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-            finally:
-                con.close()
+            from . import musicdb
+        except ImportError:
+            import musicdb
+        try:
+            # 配置热重载时已降权，官方库目录仅 root 可读，探测期间临时恢复。
+            with musicdb.privileged_read():
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                try:
+                    rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
+                finally:
+                    con.close()
             for (path,) in rows:
                 if path and os.path.isdir(path):
                     _DETECTED_LIBRARY_DIR = path
@@ -5017,16 +5023,29 @@ _last_organize_job: dict | None = None
 def list_music_users(db_path: str = "") -> list[dict]:
     """Read active users from the official music database without mutating it."""
     path = db_path or str(CONF.get("music_db") or dailyrec.music_db_path())
-    if not path or not os.path.exists(path):
+    if not path:
         raise ValueError(f"飞牛音乐数据库不可用: {path}")
     try:
-        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
-            rows = con.execute(
-                """SELECT guid, name, role
-                     FROM user
-                    WHERE status != 'deleted' AND TRIM(guid) != ''
-                    ORDER BY id"""
-            ).fetchall()
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    try:
+        # 官方库目录按用户 ACL 授权，降权后的运行身份无法遍历；读取期间临时
+        # 恢复 root 有效身份。exists() 会把权限拒绝误报成文件缺失，故改为在
+        # 提权后打开，由异常区分缺失与权限问题。
+        with musicdb.privileged_read():
+            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
+                rows = con.execute(
+                    """SELECT guid, name, role
+                         FROM user
+                        WHERE status != 'deleted' AND TRIM(guid) != ''
+                        ORDER BY id"""
+                ).fetchall()
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "unable to open" in message or "not a database" in message:
+            raise ValueError(f"飞牛音乐数据库不可用: {path}") from exc
+        raise ValueError(f"读取飞牛音乐用户失败: {exc}") from exc
     except sqlite3.Error as exc:
         raise ValueError(f"读取飞牛音乐用户失败: {exc}") from exc
     users = [

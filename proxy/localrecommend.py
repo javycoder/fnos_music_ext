@@ -53,7 +53,12 @@ def _features(row: dict) -> dict[str, tuple[str, ...]]:
 
 
 def read_library(db_path: str, user_guid: str) -> list[dict]:
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+    try:
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    with musicdb.privileged_read():
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
     con.row_factory = sqlite3.Row
     try:
         con.execute("BEGIN")
@@ -209,7 +214,12 @@ def select_tracks(
 def _validate_cached_tracks(db_path: str, user_guid: str, guids: list[str]) -> bool:
     if len(guids) != PLAYLIST_SIZE or len(set(guids)) != PLAYLIST_SIZE:
         return False
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+    try:
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    with musicdb.privileged_read():
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
     try:
         con.execute("BEGIN")
         user = con.execute("SELECT id FROM user WHERE guid = ?", (user_guid,)).fetchone()
@@ -319,7 +329,12 @@ def _account(user_guid: str) -> bool:
 def list_user_guids(db_path: str) -> list[str]:
     con = None
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            from . import musicdb
+        except ImportError:
+            import musicdb
+        with musicdb.privileged_read():
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
         return [str(row[0]) for row in con.execute("SELECT guid FROM user ORDER BY id")
                 if row[0] and _account(str(row[0]))]
     except sqlite3.Error as error:

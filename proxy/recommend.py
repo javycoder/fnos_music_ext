@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -276,6 +277,21 @@ def music_db_path() -> str:
     )
 
 
+@contextlib.contextmanager
+def _music_db(db_path: str):
+    """只读打开官方库；降权后的运行身份无 ACL，读取期间临时恢复 root。"""
+    try:
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    with musicdb.privileged_read():
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            yield con
+        finally:
+            con.close()
+
+
 def today_key(now: datetime | None = None) -> str:
     return (now or datetime.now()).strftime("%Y%m%d")
 
@@ -427,15 +443,12 @@ def remove_online_play(user_guid: str, guid: str) -> bool:
 
 
 def user_id_from_guid(db_path: str, user_guid: str) -> int | None:
-    if not db_path or not os.path.exists(db_path) or not user_guid:
+    if not db_path or not user_guid:
         return None
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
+        with _music_db(db_path) as con:
             row = con.execute("SELECT id FROM user WHERE guid = ? LIMIT 1", (user_guid,)).fetchone()
             return int(row[0]) if row else None
-        finally:
-            con.close()
     except Exception as e:
         logger.warning("failed to map user guid: %s", e)
         return None
@@ -465,11 +478,8 @@ def read_local_recent_tracks(db_path: str, user_guid: str, limit: int = SEED_LIM
     """
     out: list[dict] = []
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
+        with _music_db(db_path) as con:
             rows = con.execute(sql, (uid, limit)).fetchall()
-        finally:
-            con.close()
     except Exception as e:
         logger.warning("failed to read local play_history: %s", e)
         return []
@@ -513,11 +523,8 @@ def read_local_favorite_tracks(db_path: str, user_guid: str, limit: int = 200) -
     """
     out: list[dict] = []
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
+        with _music_db(db_path) as con:
             rows = con.execute(sql, (uid, limit)).fetchall()
-        finally:
-            con.close()
     except Exception as e:
         logger.warning("failed to read local favorite_track: %s", e)
         return []
@@ -578,11 +585,8 @@ def read_local_random_tracks(
          LIMIT ?
     """
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
+        with _music_db(db_path) as con:
             rows = con.execute(sql, (uid, LOCAL_RANDOM_POOL)).fetchall()
-        finally:
-            con.close()
     except Exception as e:
         logger.warning("failed to read local random tracks: %s", e)
         return []
