@@ -87,12 +87,11 @@ ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 
 MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
 
-
-async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> tuple[int, dict] | None:
+async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> dict | JSONResponse | None:
     """Try to call the host maintenance socket directly (for direct-mode access).
 
-    Returns (status_code, payload) on success, or None if the socket is
-    unavailable or returns 5xx (caller should fall back to 501).
+    Returns JSON on success, an error response preserving the host status,
+    or None when the socket is unavailable (caller should fall back to 501).
     """
     if not os.path.exists(MAINTENANCE_SOCKET):
         return None
@@ -103,8 +102,11 @@ async def _try_maintenance_socket(method: str, path: str, body: dict | None = No
                 resp = await client.get(path)
             else:
                 resp = await client.post(path, json=body or {})
-            if resp.status_code < 500:
-                return resp.status_code, resp.json()
+            payload = _resp_json(resp)
+            if 200 <= resp.status_code < 300:
+                return payload
+            # 保留宿主门禁/忙状态等真实错误，不能伪装成 socket 不可用。
+            return JSONResponse(content=payload, status_code=resp.status_code)
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -305,12 +307,9 @@ def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
         # with_suffix 会把 ".env" 当后缀替换，产出 ".env.env.webui.bak" 畸形名；拼名字才是 /repo/.env.webui.bak
         backup = ENV_PATH.with_name(ENV_PATH.name + ".webui.bak")
         try:
-            backup.unlink()  # 移除可能由 root 残留的只读备份，避免 appuser 覆盖失败
-        except FileNotFoundError:
-            pass
-        try:
-            backup.write_bytes(ENV_PATH.read_bytes())
-            os.chmod(backup, 0o600)  # write_bytes 按 umask 落盘（0644），密钥备份必须收紧
+            # 使用私有临时文件再原子替换，写入期间也不能暴露密钥；旧备份
+            # 不可写时无需先 unlink，失败仍保留旧备份且不阻断配置保存。
+            write_env_atomic(backup, ENV_PATH.read_text(encoding="utf-8"), mode=0o600)
         except OSError as exc:  # 备份失败不阻断写入，但要有迹可循
             logger.warning("webui env backup failed: %s", exc)
     merged = [(k, updates.get(k, v)) if k in updates else (k, v) for k, v in existing_kv]
@@ -2647,12 +2646,16 @@ async def api_fs_check(request: Request = None):
 
 @app.post("/api/maintenance/cleanup")
 @app.get("/api/maintenance/cleanup/{job_id}")
-async def api_maintenance_cleanup(job_id: str = ""):
-    """清理垃圾文件。优先通过 maintenance socket 直连宿主。"""
+async def api_maintenance_cleanup(request: Request, job_id: str = ""):
+    """清理垃圾文件。确认必须来自调用者，不得由代理自行补齐。"""
     if job_id:
         result = await _try_maintenance_socket("GET", f"/api/maintenance/cleanup/{job_id}")
     else:
-        result = await _try_maintenance_socket("POST", "/api/maintenance/cleanup", {"confirm_beta": True})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await _try_maintenance_socket("POST", "/api/maintenance/cleanup", body)
     if result is not None:
         status, payload = result
         return JSONResponse(content=payload, status_code=status)

@@ -30,6 +30,37 @@ from lxserver_client import LxServerClient, SourceOperationBusy, management_oper
 # ---------------------------------------------------------------- 测试辅助 --
 
 
+@pytest.mark.asyncio
+async def test_candidate_semaphore_queue_respects_deadline():
+    finder = policy.CandidateFinder(concurrency=1)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def searcher(platform, keyword, limit):
+        calls.append(platform)
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=2.0)
+        return []
+
+    first = asyncio.create_task(finder.find(searcher, _target(), "wy", time.monotonic() + 2))
+    tasks = [first]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        queued = asyncio.create_task(finder.find(searcher, _target(), "kg", time.monotonic() + 0.03))
+        tasks.append(queued)
+        done, _ = await asyncio.wait({queued}, timeout=0.2)
+        assert queued in done, "queued candidate search exceeded its own deadline"
+        assert queued.result() == []
+        assert calls == ["wy"]
+        assert all(key[1] != "kg" for key in finder._inflight)
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.0)
+
+
 def _script(sid: str, platforms, *, ready: bool = True, name: str = "") -> policy.ScriptInfo:
     return policy.ScriptInfo(
         id=sid,

@@ -514,3 +514,46 @@ def test_entrypoint_creates_log_root_before_supervisord(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert log_root.is_dir(), "entrypoint 应在 supervisord 启动前创建日志根目录"
+
+
+def _install_function(name):
+    text = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+    start = text.index(name + "() {")
+    return text[start:text.index("\n}\n", start) + 3]
+
+
+def _safe_install_shell(tmp_path, body):
+    # shell 的 cwd 位于独占临时目录，且所有参数使用正斜杠路径。
+    # 禁止把 Windows 反斜杠路径插入 bash 源码（会吞反斜杠并在仓库内写坏路径）。
+    script = "set -euo pipefail\n" + _install_function("read_dotenv_value") + body
+    return subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+        timeout=15, env=os.environ.copy(),
+    )
+
+
+def test_install_missing_dotenv_key_is_empty_not_failure(tmp_path):
+    (tmp_path / ".env").write_text("CUSTOM_KEY='keep'\n", encoding="utf-8")
+    result = _safe_install_shell(tmp_path, '\nvalue="$(read_dotenv_value .env FNMUSIC_LX_ENABLED)"\nprintf "ok:%s" "$value"\n')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ok:"
+
+
+@pytest.mark.parametrize("enabled", ["true", "1", "yes", "on", "TRUE"])
+def test_install_preserves_partial_existing_source_flags(tmp_path, enabled):
+    (tmp_path / ".env").write_text(
+        f'export FNMUSIC_NETEASE_ENABLED = "{enabled}"\r\n', encoding="utf-8")
+    body = _install_function("parse_sources") + '''
+BASE_DIR="$PWD"
+log_info() { :; }
+parse_sources ""
+printf '%s:%s:%s:%s' "$ENABLE_MUSICDL" "$ENABLE_MUSICBOX" "$ENABLE_LX" "$KEEP_SOURCES_FROM_ENV"
+'''
+    result = _safe_install_shell(tmp_path, body)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0:1:0:1"
+
+
+def test_install_does_not_unlink_shared_env_lock():
+    text = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+    assert 'rm -f "${ENV_PATH}.lock"' not in text

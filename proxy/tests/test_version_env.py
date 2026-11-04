@@ -228,7 +228,7 @@ def test_merge_same_version_reinstall_keeps_everything():
 def test_write_env_atomic_permissions_and_content(tmp_path):
     out = tmp_path / ".env"
     env_merge.write_env_atomic(out, env_merge.render_env(DESIRED))
-    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert stat.S_IMODE(out.stat().st_mode) == 0o640
     kv, _ = env_merge.parse_env_file(out)
     assert dict(kv)["FNMUSIC_VERSION"] == "1.1.0"
 
@@ -243,7 +243,7 @@ def test_write_env_atomic_root_preserves_existing_owner(tmp_path, monkeypatch):
     env_merge.write_env_atomic(out, "A='new'\n")
     assert calls == [(owner.st_uid, owner.st_gid)]
     assert out.read_text(encoding="utf-8") == "A='new'\n"
-    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert stat.S_IMODE(out.stat().st_mode) == 0o640
     assert not list(tmp_path.glob(".env.merge.*"))
 
 
@@ -260,6 +260,106 @@ def test_write_env_atomic_chown_failure_keeps_old_config(tmp_path, monkeypatch):
         env_merge.write_env_atomic(out, "A='new'\n")
     assert out.read_text(encoding="utf-8") == "A='old'\n"
     assert not list(tmp_path.glob(".env.merge.*"))
+
+
+@pytest.mark.parametrize("deny", [False, True])
+def test_write_env_atomic_nonroot_preserves_shared_gid(tmp_path, monkeypatch, deny):
+    out = tmp_path / ".env"
+    out.write_text("A='old'\n", encoding="utf-8")
+    owner = out.stat()
+    calls = []
+    from types import SimpleNamespace
+    fake_os = SimpleNamespace(**vars(env_merge.os))
+    fake_os.geteuid = lambda: 12345
+    fake_os.fstat = lambda fd: SimpleNamespace(st_gid=owner.st_gid + 1)
+    monkeypatch.setattr(env_merge, "os", fake_os)
+
+    def chown(fd, uid, gid):
+        calls.append((uid, gid))
+        if deny:
+            raise PermissionError("shared group unavailable")
+
+    monkeypatch.setattr(env_merge.os, "fchown", chown, raising=False)
+    if deny:
+        with pytest.raises(PermissionError, match="shared group"):
+            env_merge.write_env_atomic(out, "A='new'\n")
+        assert out.read_text(encoding="utf-8") == "A='old'\n"
+    else:
+        env_merge.write_env_atomic(out, "A='new'\n")
+        assert out.read_text(encoding="utf-8") == "A='new'\n"
+    assert calls == [(-1, owner.st_gid)]
+    assert not list(tmp_path.glob(".env.merge.*"))
+
+
+@pytest.fixture
+def shared_permission_dir():
+    import tempfile
+
+    # root可遍历的系统临时目录，绝不chmod pytest之外的宿主目录。
+    with tempfile.TemporaryDirectory(prefix="fnmusic-env-gid-") as directory:
+        yield Path(directory)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires real POSIX uid/gid permissions")
+@pytest.mark.parametrize("shared_membership", [False, True])
+def test_write_env_atomic_real_nonroot_shared_group(shared_permission_dir, shared_membership):
+    """独立子进程降权；只在临时目录验证补充组读取与失败原子性。"""
+    import subprocess
+    import sys
+
+    if os.geteuid() != 0:
+        pytest.skip("isolated cross-uid regression requires root")
+    root = shared_permission_dir
+    original = root.stat()
+    uid, primary_gid, shared_gid = 24561, 24562, 24563
+    # 只依赖CHOWN/SETUID/SETGID：先以属主身份完成内容和权限准备，最后chown。
+    # 0711只允许第二个UID按已知文件名访问，不允许列目录或写入。
+    root.chmod(0o711)
+    out = root / ".env"
+    out.write_text("A='old'\n", encoding="utf-8")
+    out.chmod(0o640)
+    # 模块在降权前导入，不要求测试 checkout 对测试 uid 开放遍历。
+    code = """
+import importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location('isolated_env_merge', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+p = pathlib.Path(sys.argv[2])
+uid, primary, shared = map(int, sys.argv[3:6])
+member = sys.argv[6] == '1'
+os.setgroups([shared] if member else [])
+os.setgid(primary)
+os.setuid(uid)
+try:
+    m.write_env_atomic(p, "A='new'\\n")
+except PermissionError:
+    assert not member
+else:
+    assert member
+assert p.stat().st_gid == shared
+assert p.stat().st_mode & 0o777 == 0o640
+assert p.read_text() == ("A='new'\\n" if member else "A='old'\\n")
+assert not list(p.parent.glob('.env.merge.*'))
+"""
+    try:
+        os.chown(out, uid, shared_gid)
+        os.chown(root, uid, primary_gid)
+        result = subprocess.run([sys.executable, "-I", "-c", code, str(Path(env_merge.__file__).resolve()),
+                                 str(out), str(uid), str(primary_gid), str(shared_gid),
+                                 "1" if shared_membership else "0"], capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+        reader = "import os,pathlib,sys;os.setgroups([]);os.setgid(int(sys.argv[2]));os.setuid(24564);assert pathlib.Path(sys.argv[1]).read_text()==sys.argv[3]"
+        expected = "A='new'\n" if shared_membership else "A='old'\n"
+        result = subprocess.run([sys.executable, "-I", "-c", reader, str(out), str(shared_gid), expected],
+                                capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+    finally:
+        # CAP_CHOWN不要求文件属主；先恢复目录，root才可列举并清理所有失败残留。
+        os.chown(root, original.st_uid, original.st_gid)
+        root.chmod(0o700)
+        for artifact in root.iterdir():
+            os.chown(artifact, original.st_uid, original.st_gid)
+            artifact.chmod(0o600)
 
 
 def test_write_env_atomic_nonroot_does_not_chown(tmp_path, monkeypatch):
@@ -372,7 +472,7 @@ def test_cli_end_to_end_merge(tmp_path, capsys):
     assert m["FNMUSIC_MY_EXTRA"] == "x"
     assert m["FNMUSIC_CACHE_DIR"] == "/default/home/cache"
     assert m["FNMUSIC_VERSION"] == "1.1.0"
-    assert stat.S_IMODE(existing.stat().st_mode) == 0o600
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o640
     summary = capsys.readouterr().err
     assert "preserved" in summary and "added" in summary
 

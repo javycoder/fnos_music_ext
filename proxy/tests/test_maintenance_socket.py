@@ -29,6 +29,20 @@ def test_organize_body_rejects_invalid_layout_type(layout):
                          {"confirm_beta": True, "root": "/music", "layout": layout})
 
 
+def test_fs_check_body_accepts_absolute_path():
+    assert m._validate_body("POST", m.FS_CHECK_PATH, {"path": "/vol1/music"}) == {
+        "path": "/vol1/music"}
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"path": 1}, {"path": None}, {"path": "/x", "extra": 1},
+    {"path": "relative"}, {"path": "/a/../b"}, {"path": "/a\n"}, {"path": "/a\x00"},
+])
+def test_fs_check_body_rejects_invalid_paths(body):
+    with pytest.raises(ValueError):
+        m._validate_body("POST", m.FS_CHECK_PATH, body)
+
+
 async def exchange(path, raw):
     reader, writer = await asyncio.open_unix_connection(str(path))
     writer.write(raw)
@@ -54,7 +68,7 @@ def test_private_permissions_delegation_and_stop(tmp_path):
         server = await m.start(loop, callback, path)
         try:
             assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == 0o660
             status, data = await exchange(path, request())
             assert status == 202 and data["state"] == "real proxy state"
             assert calls == [("POST", m.CLEANUP_PATH, {"confirm_beta": True})]
@@ -120,7 +134,7 @@ def test_stale_socket_recovered(tmp_path):
 
         server = await m.start(asyncio.get_running_loop(), callback, path)
         try:
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == 0o660
             assert await exchange(path, request()) == (200, {"recovered": True})
         finally:
             await m.stop(server)
@@ -225,7 +239,7 @@ def test_disappearing_socket_probe_retries_safely(tmp_path, monkeypatch):
         server = await m.start(asyncio.get_running_loop(), None, path)
         try:
             assert len(probes) == 1
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == 0o660
         finally:
             await m.stop(server)
     asyncio.run(run())

@@ -543,7 +543,9 @@ def test_track_lyric_endpoint(test_app_client):
     assert "[00:00.00]" in data["data"]["lyric"]
 
 
-def test_source_management_endpoints(test_app_client, fake_lx):
+def test_source_management_endpoints(test_app_client, fake_lx, tmp_path, monkeypatch):
+    source_dir = tmp_path / "lxserver"
+    monkeypatch.setattr(lxapp, "LXSERVER_DATA_DIR", source_dir.as_posix())
     # GET /api/v1/source
     res = test_app_client.get("/api/v1/source")
     assert res.status_code == 200
@@ -557,7 +559,7 @@ def test_source_management_endpoints(test_app_client, fake_lx):
     assert res.status_code == 200
     assert res.json()["ok"] is True
     data = res.json()["data"]
-    assert data["url"] == "file:///data/lxserver/users/source/_open/MyTest.js"
+    assert data["url"] == f"file://{source_dir.as_posix()}/users/source/_open/MyTest.js"
     assert data["meta"]["name"] == "MyTest"
 
     # 同一脚本重复上传：复用既有源，不报错（多源列表的常规操作）

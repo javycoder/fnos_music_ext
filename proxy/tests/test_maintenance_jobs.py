@@ -12,6 +12,50 @@ def anyio_backend():
     return "asyncio"
 
 
+def test_root_owned_library_still_prepares_maintenance_directory(monkeypatch):
+    from types import SimpleNamespace
+
+    permissions = []
+    monkeypatch.setattr(runtime, "_posix_euid", lambda: 0)
+    monkeypatch.setattr(runtime, "tee_save_dir", lambda: "/isolated/library")
+    monkeypatch.setitem(runtime.CONF, "cache_dir", "/isolated/cache")
+    fake_os = SimpleNamespace(**vars(runtime.os))
+    fake_os.path = SimpleNamespace(**vars(runtime.os.path))
+    fake_os.makedirs = lambda *args, **kwargs: None
+    fake_os.stat = lambda *args, **kwargs: SimpleNamespace(st_uid=0, st_gid=0)
+    fake_os.path.isdir = lambda path: path == "/run/fnmusic-ext"
+    fake_os.chmod = lambda path, mode: permissions.append((path, mode))
+    monkeypatch.setattr(runtime, "os", fake_os)
+    assert runtime._drop_privileges() == (0, 0)
+    assert permissions == [("/run/fnmusic-ext", 0o711)]
+
+
+def test_fs_check_existing_and_missing_directory_leave_no_probe(tmp_path):
+    assert runtime._fs_check_target(str(tmp_path)) == (True, True)
+    assert runtime._fs_check_target(str(tmp_path / "missing" / "child")) == (False, True)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("suffix", ["", "/child", "/child/grandchild"])
+def test_fs_check_file_ancestor_cannot_be_created(tmp_path, suffix):
+    obstacle = tmp_path / "file"
+    obstacle.write_bytes(b"unchanged")
+    assert runtime._fs_check_target(str(obstacle) + suffix) == (False, False)
+    assert obstacle.read_bytes() == b"unchanged"
+    assert list(tmp_path.iterdir()) == [obstacle]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", [None, 1, "relative", "/music/../other", "/music\x00", "/music\n"])
+async def test_fs_check_callback_rejects_invalid_path_before_probe(monkeypatch, path):
+    def unexpected(*args):
+        pytest.fail("invalid path reached filesystem probe")
+
+    monkeypatch.setattr(runtime, "_fs_check_target", unexpected)
+    status, payload = await runtime._maintenance_request("POST", "/api/fs-check", {"path": path})
+    assert status == 400 and payload["ok"] is False
+
+
 @pytest.mark.anyio
 async def test_jobs_confirmation_dedup_status_and_failure(monkeypatch):
     gate = asyncio.Event()

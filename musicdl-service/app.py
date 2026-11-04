@@ -329,21 +329,23 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
     probe_headers = {k: v for k, v in headers.items() if k.lower() != "range"}
     probe_headers["Range"] = f"bytes=0-{_PROBE_BYTES - 1}"
     tmp_path = ""
+    resp = client = None
     try:
         if HAS_CURL_CFFI:
             resp = curl_requests.get(url, headers=probe_headers, impersonate="chrome",
                                      stream=True, timeout=(10, 60))
         else:
             client = httpx.Client(follow_redirects=True, timeout=30)
-            resp = client.build_request("GET", url, headers=probe_headers)
-            resp = client.send(resp, stream=True)
+            request = client.build_request("GET", url, headers=probe_headers)
+            resp = client.send(request, stream=True)
+        if resp.status_code not in (200, 206):
+            return False
+        iterator = resp.iter_content(256 * 1024) if HAS_CURL_CFFI else resp.iter_bytes(256 * 1024)
         buf = b""
-        for chunk in resp.iter_content(256 * 1024):
-            buf += chunk
+        for chunk in iterator:
+            buf += chunk[:_PROBE_BYTES - len(buf)]
             if len(buf) >= _PROBE_BYTES:
                 break
-        if hasattr(resp, "close"):
-            resp.close()
         if not buf:
             return False
         if not ffmpeg_bin():
@@ -358,6 +360,12 @@ def _head_probe_sync(url: str, headers: dict) -> bool:
     except Exception:
         return False
     finally:
+        if resp is not None:
+            with suppress(Exception):
+                resp.close()
+        if client is not None:
+            with suppress(Exception):
+                client.close()
         if tmp_path:
             with suppress(Exception):
                 os.unlink(tmp_path)
@@ -464,6 +472,7 @@ async def _resolve_entry(song_id: str, auto_refresh: bool = True):
     if auto_refresh:
         refreshed = await _refresh_by_keyword(song_id)
         if refreshed:
+            await _reject_unsupported_entry(song_id, refreshed)
             return refreshed
     raise HTTPException(502, f"playable URL expired for {song_id!r}; bounded refresh failed, re-search keyword and source")
 
@@ -866,6 +875,7 @@ async def stream(
         refreshed_entry = await _refresh_by_keyword(id)
         if refreshed_entry and refreshed_entry["item"].get("download_url"):
             entry = refreshed_entry
+            await _reject_unsupported_entry(id, entry)
             url = entry["item"]["download_url"]
             url, src_headers = await _maybe_downgrade(id, entry, url, quality, range_header)
             resp = await _fetch_upstream_stream(url, src_headers)
@@ -880,6 +890,7 @@ async def stream(
         refreshed_entry = await _refresh_by_keyword(id)
         if refreshed_entry and refreshed_entry["item"].get("download_url") and refreshed_entry["item"]["download_url"] != url:
             entry = refreshed_entry
+            await _reject_unsupported_entry(id, entry)
             url = entry["item"]["download_url"]
             url, src_headers = await _maybe_downgrade(id, entry, url, quality, range_header)
             resp = await _fetch_upstream_stream(url, src_headers)

@@ -8,7 +8,7 @@ install.sh 在写入 .env 前先收集“本次安装期望的配置”，再调
 - 新版本引入的新配置项 / 缺失配置项自动安全补齐；
 - 用户手工添加的自定义键原样保留；
 - 用户手写的注释/非赋值行按原顺序去重后保留在文件末尾（合并多次不堆积）；
-- 合并结果原子写入并保持 0600 权限，合并前由调用方负责备份。
+- 合并结果原子写入并保持 0640 权限及已有共享组，合并前由调用方负责备份。
 
 CLI:
     python3 proxy/env_merge.py --existing .env --desired desired.env \
@@ -295,10 +295,13 @@ def write_env_atomic(path: str | Path, content: str, mode: int = 0o640) -> None:
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             f.write(content)
-            # Native WebUI runs as root, but the installer user's private .env
-            # must remain readable by that user after an atomic replacement.
-            if existing is not None and getattr(os, "geteuid", lambda: -1)() == 0 and hasattr(os, "fchown"):
-                os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
+            # 原子替换不能丢失已有共享组。root保留完整属主；非root只改组，
+            # 内核允许使用补充组，拒绝时必须在replace之前失败并保留旧配置。
+            if existing is not None and hasattr(os, "fchown"):
+                if getattr(os, "geteuid", lambda: -1)() == 0:
+                    os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
+                elif os.fstat(f.fileno()).st_gid != existing.st_gid:
+                    os.fchown(f.fileno(), -1, existing.st_gid)
             if hasattr(os, "fchmod"):
                 os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, str(path))

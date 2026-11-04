@@ -16,7 +16,6 @@ import math
 import json
 import logging
 import os
-import grp
 import re
 import shutil
 import sqlite3
@@ -2635,7 +2634,14 @@ def _get_repo_root():
 _REPO_ROOT = _get_repo_root()
 
 # 进程启动时的身份（root）；成功降权后记录实际运行身份，供配置热重载时回退。
-_PRIV_STATE = [os.geteuid(), os.getegid()]
+# Windows 开发机没有 geteuid/getegid（离线测试套件需要可导入），按无特权 (-1) 处理。
+_PRIV_STATE = [os.geteuid() if hasattr(os, "geteuid") else -1,
+               os.getegid() if hasattr(os, "getegid") else -1]
+
+
+def _posix_euid() -> int:
+    """当前有效 uid；Windows 开发机无 geteuid，返回 -1 表示无权限切换语义。"""
+    return os.geteuid() if hasattr(os, "geteuid") else -1
 
 
 def _staged_socket_path():
@@ -2655,8 +2661,16 @@ def _drop_privileges(fallback=None):
     uvicorn 0.54 在 lifespan 结束后才 bind --uds，因此先由本函数把暂存
     socket 目录 chown/chmod 给目标用户，再 seteuid，bind 才能成功。
     """
-    if os.geteuid() != 0:
-        return os.geteuid(), os.getegid()
+    euid = _posix_euid()
+    if euid != 0:
+        return euid, (os.getegid() if hasattr(os, "getegid") else -1)
+    # socket 的0660限制访问者；父目录必须可遍历，即使本次保留root身份。
+    run_dir = '/run/fnmusic-ext'
+    if os.path.isdir(run_dir):
+        try:
+            os.chmod(run_dir, 0o711)
+        except OSError as exc:
+            logger.warning('could not make %s traversable: %s', run_dir, exc)
     primary_uid = primary_gid = 0
     for candidate in (tee_save_dir(), str(CONF.get('cache_dir') or '')):
         if not candidate:
@@ -2746,6 +2760,8 @@ def _reevaluate_privileges():
     以 root 身份重新探测（music.db 可能仅 root 可读）；若新路径属于 root
     或其他不可用属主，则回退到当前运行身份，绝不永久提权。
     """
+    if not hasattr(os, "seteuid"):
+        return  # Windows 开发机无权限切换语义，无可重估
     if os.geteuid() != 0:
         try:
             os.setegid(0)
@@ -2766,7 +2782,9 @@ def _reevaluate_privileges():
 
 
 def _re_raise_and_drop():
-    if os.geteuid() == 0:
+    if not hasattr(os, "seteuid"):
+        return
+    if _posix_euid() == 0:
         try:
             _drop_privileges()
         except SystemExit:
@@ -4390,7 +4408,7 @@ async def _resolve_netease_download_media(client: httpx.AsyncClient, song_id: st
             except asyncio.TimeoutError:
                 result = None
             if result:
-                ttl = max(0.0, float(result.get("reuse_for_s") or 300.0))
+                ttl = max(0.0, float(result.get("reuse_for_s", 300.0)))
                 if len(_NETEASE_DOWNLOAD_CACHE) >= _NETEASE_URL_PIN_MAX:
                     oldest = min(_NETEASE_DOWNLOAD_CACHE, key=lambda key: _NETEASE_DOWNLOAD_CACHE[key][1])
                     _NETEASE_DOWNLOAD_CACHE.pop(oldest, None)
@@ -5264,6 +5282,50 @@ async def _run_cleanup_locked(job: dict) -> None:
         job.update(status="completed", phase="清理完成")
 
 
+def _probe_dir_writable(directory: str) -> bool:
+    probe = os.path.join(directory, f".fnmusic-fscheck-{os.getpid()}-{uuid4().hex}")
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
+def _fs_check_target(path: str) -> tuple[bool, bool]:
+    """目录存在性与可写性探测（与 webui_gateway.handle_fs_check 同语义）。
+
+    以当前（降权后）proxy 身份探测——下载/缓存目录的真实落盘方就是它，
+    结论比 root 视角更贴近实际。无副作用：不创建目录，临时探测文件即落
+    即删；目录不存在时用最近存在祖先目录的可写性代表"能否创建"。
+    """
+    exists = writable = False
+    ancestor = path
+    while True:
+        try:
+            os.stat(ancestor)
+        except FileNotFoundError:
+            # 只能跳过真正缺失的路径；悬空链接本身占位，mkdir 无法替换它。
+            if os.path.islink(ancestor) or os.path.dirname(ancestor) == ancestor:
+                break
+            ancestor = os.path.dirname(ancestor)
+            continue
+        except OSError:
+            # ENOTDIR（文件祖先）、EACCES 等不能当作缺失后继续向上放行。
+            break
+        if os.path.isdir(ancestor):
+            exists = ancestor == path
+            writable = _probe_dir_writable(ancestor)
+        # 首个存在节点不是目录时同样停止，不能跳过普通文件。
+        break
+    return exists, writable
+
+
 async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int, dict]:
     global _maintenance_task, _organize_task, _last_organize_job
     if method == "GET":
@@ -5329,6 +5391,15 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
 
     if method != "POST":
         return 400, {"ok": False, "error": "不支持的维护请求"}
+    if path == "/api/fs-check":
+        # 传输层 _validate_body 已做相同校验；此处再守一道，纵深防御。
+        target = body.get("path")
+        if (not isinstance(target, str) or not target.startswith("/")
+                or ".." in target.split("/")
+                or any(char in target for char in "\r\n\x00")):
+            return 400, {"ok": False, "error": "路径必须是绝对路径且不含 .."}
+        exists, writable = _fs_check_target(target)
+        return 200, {"ok": True, "path": target, "exists": exists, "writable": writable}
     if path == "/api/maintenance/cleanup":
         if body != {"confirm_beta": True}:
             return 400, {"ok": False, "error": "必须明确确认 Beta 风险"}
@@ -5549,7 +5620,7 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
-        if os.geteuid() != 0:
+        if hasattr(os, "seteuid") and os.geteuid() != 0:
             try:
                 os.setegid(0)
                 os.seteuid(0)
@@ -7447,7 +7518,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             finally:
                 if info_task is not None and not info_task.done():
                     info_task.cancel()
-            if source == "netease":
+            if source == "netease" and purpose != "download":
+                # 下载已携带独立解析的格式，不能被同曲播放钉链的另一表示覆盖。
                 # issue IKS5FW：扩展名以取链钉链携带的实际交付格式（type/level）
                 # 为准；目录启发式（info.ext 按 has_sq/has_hr 推 flac）只作兜底
                 # ——无损无权限降档交付 mp3 时，按目录命名 .flac 同样是错标。

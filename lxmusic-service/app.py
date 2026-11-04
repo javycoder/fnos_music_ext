@@ -380,6 +380,10 @@ async def _resolve_url_inflight(
         if _URL_INFLIGHT.get(inflight_key) is fut:
             _URL_INFLIGHT.pop(inflight_key, None)
 
+    # 切源/重排期间完成的旧任务不仅不能回写，也不能交付给领队或跟随者。
+    if _URL_CACHE_GEN != gen:
+        result = None
+
     # issue #45：留档每次真实上游解析（领队），与 hit/join 对比可核对额度消耗
     fn_diag(logger, "url_resolve", op="ok" if result else "none",
             song=str(key[0])[:60], quality=str(key[1]))
@@ -1381,6 +1385,9 @@ async def resolve_and_probe(
                 probe_timeout=effective_probe_timeout,
                 exclude_sources=exclude_sources,
             )
+            # await 解析/探活期间可能发生切源；旧代结果与熔断状态均不得交付。
+            if active_generation != _URL_CACHE_GEN:
+                return None
             if attempt.service_error:
                 # 内部服务故障上浮为 503：不写负缓存、不写脚本熔断，也不继续消耗预算。
                 raise SourceStateQueryError("lxserver 播放解析内部故障")

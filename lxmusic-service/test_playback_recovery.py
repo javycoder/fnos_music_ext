@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -116,6 +117,68 @@ def runtime(tmp_path, monkeypatch):
     for cache in (lxapp._SONG_CACHE, lxapp._URL_CACHE, lxapp._URL_INFLIGHT, lxapp._CHAIN_HEALTH):
         cache.clear()
     lxapp._CANDIDATES.invalidate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_refresh", [False, True])
+@pytest.mark.parametrize("uptime_s", [None, 10.0], ids=["host-uptime", "short-uptime"])
+async def test_source_generation_change_discards_inflight_result(
+    runtime, monkeypatch, cached_refresh, uptime_s,
+):
+    # 仅替换 app 的时钟视图，不修改 asyncio 计时依赖的全局 time 模块。
+    if uptime_s is not None:
+        monkeypatch.setattr(lxapp, "time", SimpleNamespace(monotonic=lambda: uptime_s))
+    entered, release = asyncio.Event(), asyncio.Event()
+    old = {"url": "https://media.test/old.flac", "ext": "flac"}
+    key = (_item()["id"], "lossless")
+    if cached_refresh:
+        lxapp._URL_CACHE[key] = {
+            "data": old,
+            "ts": lxapp.time.monotonic() - lxapp.CONF["url_cache_ttl"] - 1.0,
+        }
+
+    async def delayed(*args, **kwargs):
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=2.0)
+        return old
+
+    monkeypatch.setattr(lxapp, "_refresh_cached_url", delayed)
+    monkeypatch.setattr(lxapp, "resolve_and_probe", delayed)
+    async with _media_client() as client:
+        leader = asyncio.create_task(lxapp._resolve_url_cached(client, "kw", _item()))
+        tasks = [leader]
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            follower = asyncio.create_task(lxapp._resolve_url_cached(client, "kw", _item()))
+            tasks.append(follower)
+            await asyncio.sleep(0)
+            lxapp._url_cache_reset()
+            release.set()
+            assert await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0) == [None, None]
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.0)
+    assert key not in lxapp._URL_CACHE
+
+
+@pytest.mark.asyncio
+async def test_generation_change_during_last_attempt_does_not_record_old_success(
+    fake_lx, runtime, monkeypatch,
+):
+    fake_lx.sources = [_ready("a.js", ["kw"])]
+
+    async def changed(*args, **kwargs):
+        lxapp._url_cache_reset()
+        return lxapp._AttemptResult(data={"url": "https://media.test/old.mp3",
+                                        "resolution_quality": "standard"})
+
+    monkeypatch.setattr(lxapp, "_attempt_pinned", changed)
+    async with _media_client() as client:
+        assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard") is None
+    assert not lxapp._CHAIN_HEALTH
 
 
 # =========================================================== 1 音质阶梯 ==

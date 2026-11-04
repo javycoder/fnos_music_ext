@@ -737,7 +737,7 @@ def test_base_image_manual_reference_only(tmp_path):
     assert "pull --quiet reg.local/py:3.13" in log
     assert "docker.1ms.run" not in log
     assert "FNMUSIC_BASE_IMAGE='reg.local/py:3.13'" in env_file.read_text(encoding="utf-8")
-    assert (env_file.stat().st_mode & 0o777) == 0o600
+    assert (env_file.stat().st_mode & 0o777) == 0o640
 
 
 def test_base_image_local_short_circuits_pull(tmp_path):

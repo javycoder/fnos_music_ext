@@ -2299,6 +2299,73 @@ def test_put_dirs_known_default_allows_separate_download(env_file):
     assert "FNMUSIC_CACHE_DIR=''" in env_file.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("payload", [{}, {"confirm_beta": False}, {"confirm_beta": True}])
+def test_cleanup_forwards_callers_confirmation(env_file, monkeypatch, payload):
+    calls = []
+
+    async def maintenance(method, path, body=None):
+        calls.append((method, path, body))
+        return {"ok": body == {"confirm_beta": True}}
+
+    monkeypatch.setattr(webui, "_try_maintenance_socket", maintenance)
+    with authed_client() as client:
+        response = client.post("/api/maintenance/cleanup", json=payload)
+    assert response.status_code == 200
+    assert calls == [("POST", "/api/maintenance/cleanup", payload)]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 500])
+def test_maintenance_preserves_host_error_status(env_file, monkeypatch, tmp_path, status):
+    socket_marker = tmp_path / "maintenance.sock"
+    socket_marker.touch()
+    monkeypatch.setattr(webui, "MAINTENANCE_SOCKET", str(socket_marker))
+    real_client = httpx.AsyncClient
+
+    def make_client(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(lambda request: httpx.Response(
+            status, json={"ok": False, "error": "host rejection"}))
+        return real_client(**kwargs)
+
+    with authed_client() as client:
+        monkeypatch.setattr(webui.httpx, "AsyncClient", make_client)
+        response = client.post("/api/maintenance/cleanup", json={"confirm_beta": False})
+    assert response.status_code == status
+    assert response.json() == {"ok": False, "error": "host rejection"}
+
+
+def test_env_backup_is_private_from_creation(env_file, monkeypatch):
+    backup = env_file.with_name(env_file.name + ".webui.bak")
+    before = env_file.read_text(encoding="utf-8")
+    real_write = webui.write_env_atomic
+    calls = []
+
+    def write(path, content, mode=0o640):
+        calls.append((path, mode))
+        return real_write(path, content, mode=mode)
+
+    monkeypatch.setattr(webui, "write_env_atomic", write)
+    webui.write_env({"FNMUSIC_RECOMMEND_HOT": "false"})
+    assert calls[0] == (backup, 0o600)
+    assert backup.read_text(encoding="utf-8") == before
+    assert webui.read_env()["FNMUSIC_RECOMMEND_HOT"] == "false"
+
+
+def test_env_backup_failure_does_not_block_save(env_file, monkeypatch):
+    backup = env_file.with_name(env_file.name + ".webui.bak")
+    backup.write_text("old backup", encoding="utf-8")
+    real_write = webui.write_env_atomic
+
+    def write(path, content, mode=0o640):
+        if path == backup:
+            raise PermissionError("read-only backup")
+        return real_write(path, content, mode=mode)
+
+    monkeypatch.setattr(webui, "write_env_atomic", write)
+    webui.write_env({"FNMUSIC_RECOMMEND_HOT": "false"})
+    assert backup.read_text(encoding="utf-8") == "old backup"
+    assert webui.read_env()["FNMUSIC_RECOMMEND_HOT"] == "false"
+
+
 def test_fs_check_endpoint_placeholder(env_file):
     """直连 8774（无宿主网关拦截）到达 WebUI：明确 501；且要求管理员。"""
     with authed_client() as client:

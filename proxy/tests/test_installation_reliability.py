@@ -634,7 +634,13 @@ def test_data_migration_musicbox_to_sources_data(tmp_path):
     login = tmp_path/'musicbox-data/netease-musicbox/login.json'
     login.parent.mkdir(parents=True)
     login.write_text('{"cookie":"x"}', encoding='utf-8')
-    script = f'set -euo pipefail\nlog_info() {{ :; }}\nBASE_DIR={tmp_path}\n{block}\n'
+    # 抽取片段必须像安装入口一样初始化运行身份；Windows Bash 使用 POSIX 路径，
+    # 禁止把 C:\\... 插入未引用的 shell 语句而在工作区创建嵌套坏目录。
+    shell_root = tmp_path.as_posix()
+    if os.name == 'nt':
+        shell_root = '/' + shell_root[0].lower() + shell_root[2:]
+    script = (f'set -euo pipefail\nlog_info() {{ :; }}\nBASE_DIR="{shell_root}"\n'
+              f'APP_UID=1000\nAPP_GID=1000\n{block}\n')
     subprocess.run(['bash', '-c', script], check=True)
     assert not (tmp_path/'musicbox-data').exists()
     assert (tmp_path/'sources-data/netease-musicbox/login.json').read_text(encoding='utf-8') == '{"cookie":"x"}'
@@ -653,7 +659,7 @@ def test_sources_data_permissions_hardened():
     extend = (BASE/'extend.sh').read_text(encoding='utf-8')
     assert 'chmod -R 0755 "${SOURCES_DATA_DIR}"' not in install
     assert 'chmod -R 0755 "${BASE_DIR}/sources-data"' not in extend
-    assert 'chown -R 1000:1000 "${SOURCES_DATA_DIR}"' in install
+    assert 'chown -R "${APP_UID}:${APP_GID}" "${SOURCES_DATA_DIR}"' in install
     assert 'chown -R 1000:1000 "${BASE_DIR}/sources-data"' in extend
 
 
@@ -828,7 +834,7 @@ def test_unit_uses_canonical_template_and_explicit_interpreters(tmp_path):
     output = subprocess.check_output([sys.executable, str(BASE/'proxy/takeover.py'), 'render-unit', '--base', str(BASE)], text=True)
     assert '@BASE_DIR@' not in output
     assert 'ExecStart=/bin/bash ' in output and 'ExecStartPost=/usr/bin/python3 ' in output
-    assert '[ -S ' not in output and 'Restart=no' in output
+    assert '[ -S ' not in output and 'Restart=on-failure' in output
 
 
 def test_install_decline_recommend_never_wipes_llm_config():
