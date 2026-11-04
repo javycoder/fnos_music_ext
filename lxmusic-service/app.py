@@ -2770,17 +2770,23 @@ async def source_set(body: SourceBody):
                         status_code=500,
                     )
             else:
-                # 外部下载由 lxserver 执行；此处 HTTP 异常仅来自内部通信。
-                try:
-                    res = await LXSERVER.import_custom_source(url)
-                    source_id = str(res.get("id") or "")
-                except Exception as exc:
-                    if isinstance(exc, UnsafeVmRequired):
-                        return _unsafe_vm_response(exc)
-                    if "已存在" not in str(exc):
-                        raise
-                    existing = await _find_lxserver_source(by_url=url)
-                    source_id = str((existing or {}).get("id") or "")
+                # 同一 sourceUrl 已导入时直接复用，不在每次保存/启动恢复中
+                # 重新下载并临时执行同一脚本，再因“已存在”回退复用。
+                existing = await _find_lxserver_source(by_url=url)
+                if existing:
+                    source_id = str(existing.get("id") or "")
+                if not source_id:
+                    # 外部下载由 lxserver 执行；此处 HTTP 异常仅来自内部通信。
+                    try:
+                        res = await LXSERVER.import_custom_source(url)
+                        source_id = str(res.get("id") or "")
+                    except Exception as exc:
+                        if isinstance(exc, UnsafeVmRequired):
+                            return _unsafe_vm_response(exc)
+                        if "已存在" not in str(exc):
+                            raise
+                        existing = await _find_lxserver_source(by_url=url)
+                        source_id = str((existing or {}).get("id") or "")
                 if not source_id:
                     existing = await _find_lxserver_source(by_url=url)
                     source_id = str((existing or {}).get("id") or "")

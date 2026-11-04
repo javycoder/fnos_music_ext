@@ -254,7 +254,7 @@ def test_source_list_invalid_success_payload_is_not_empty_config(payload):
 
 
 @pytest.fixture
-def verification(monkeypatch):
+def verification(monkeypatch, tmp_path):
     """全链路使用真实客户端 + 内存 HTTP transport，脚本内容绝不执行。"""
     import verify_source
 
@@ -335,8 +335,13 @@ def verification(monkeypatch):
     monkeypatch.setattr(verify_source, "_new_temp_client", factory)
     monkeypatch.setattr(verify_source, "download_script", download)
     monkeypatch.setattr(verify_source.asyncio, "sleep", no_wait)
+    # 已有源复用必须以实际存储内容为证据，不能只凭同名列表项。
+    root = tmp_path / "users" / "source" / "_open"
+    root.mkdir(parents=True)
+    (root / "existing").write_text("/*! @name X */ /* inert fixture: never executed */", encoding="utf-8")
     # verify 只会在解析成功后使用探活客户端；当前 fixture 在搜索即返回空列表。
-    monkeypatch.setitem(sys.modules, "app", SimpleNamespace(app=object(), get_http=lambda app: None))
+    monkeypatch.setitem(sys.modules, "app", SimpleNamespace(
+        app=object(), get_http=lambda app: None, LXSERVER_DATA_DIR=str(tmp_path)))
     return verify_source, state
 
 

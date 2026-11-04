@@ -497,6 +497,59 @@ test("洛雪源列表：轮询只同步运行徽标，不覆盖待保存激活�
   assert.ok(ovHtml.includes("就绪 0 · 失败 0 · 待定 1"), "escapeHtml(0) 不得把数字 0 抹空");
 });
 
+test("洛雪源列表：状态刷新失败撤掉旧就绪徽标，但保留待保存编辑", async () => {
+  reset();
+  const items = [
+    { name: "甲", url: "file:///a.js", active: true },
+    { name: "乙", url: "file:///b.js", active: false },
+    { name: "丙", url: "file:///c.js", active: false },
+  ];
+  enqueue("/app/fnmusic-ext/api/config", { values: { LX_SOURCE_LIST: JSON.stringify(items) } });
+  await global.loadConfig();
+  global.deactivateLxSource(0);
+  global.activateLxSource(1);
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: { state: "ready", sources: [{ url: "file:///a.js", status: "success" }] },
+  });
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes("运行就绪"));
+  const draft = vm.runInThisContext("JSON.stringify(lxSourceList)");
+  const note = els.get("#save-note").textContent;
+  enqueue("/app/fnmusic-ext/api/status", new Error("服务暂不可用"));
+  await global.loadStatus();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.ok(!html.includes("运行就绪"));
+  assert.ok(!html.includes('dot ok'));
+  assert.ok(html.includes("待保存取消"));
+  assert.ok(html.includes("待保存激活"));
+  assert.ok(!html.includes("未运行"), "快照获取失败不能按配置推断未运行");
+  assert.strictEqual((html.match(/运行状态未知/g) || []).length, items.length);
+  assert.strictEqual(vm.runInThisContext("lxRuntimeSnapshot"), null);
+  assert.strictEqual(vm.runInThisContext("JSON.stringify(lxSourceList)"), draft);
+  assert.strictEqual(vm.runInThisContext("dirty && lxSourceListDirty"), true);
+  assert.ok(els.get("#save-bar").classList.contains("show"));
+  assert.strictEqual(els.get("#save-note").textContent, note);
+});
+
+test("洛雪源列表：空运行快照下已启用与未启用源均显示未知", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { LX_SOURCE_LIST: JSON.stringify([
+    { name: "甲", url: "file:///a.js", active: true },
+    { name: "乙", url: "file:///b.js", active: false },
+  ]) } });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t", current_provider: "lxmusic", processes: {}, services: {}, lx_source: null,
+  });
+  await global.loadStatus();
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.strictEqual((html.match(/运行状态未知/g) || []).length, 2);
+  assert.ok(!html.includes("未运行"));
+  assert.ok(!html.includes('dot ok'));
+  assert.strictEqual(vm.runInThisContext("dirty"), false);
+});
+
 test("洛雪源列表：本地上传源缺失 sourceUrl 时按 id/文件名兜底匹配运行状态", async () => {
   reset();
   const items = [
@@ -567,6 +620,63 @@ test("collectConfig：有激活源时提交列表且不提交 LX_SOURCE_URL（�
     ]);
   } finally {
     global.document.querySelectorAll = qsa;
+  }
+});
+
+test("saveConfig：保存失败后刷新成功或失败均保留草稿和 dirty", async () => {
+  for (const refreshFails of [false, true]) {
+    reset();
+    const items = [
+      { name: "甲", url: "file:///a.js", active: true, id: "a" },
+      { name: "乙", url: "file:///b.js", active: false, id: "b" },
+    ];
+    enqueue("/app/fnmusic-ext/api/config", { values: {
+      FNMUSIC_LX_ENABLED: "true", LX_SOURCE_LIST: JSON.stringify(items),
+      FNMUSIC_LX_SOURCE_ORDER: '["a","b"]',
+    } });
+    await global.loadConfig();
+    const status = { version: "t", current_provider: "lxmusic",
+      processes: { lxmusic: { state: "RUNNING" } }, services: { lxmusic: { reachable: true } },
+      lx_source: { state: "ready", sources: [{ url: "file:///a.js", status: "success" }] } };
+    enqueue("/app/fnmusic-ext/api/status", status);
+    await global.loadStatus();
+    global.deactivateLxSource(0);
+    global.activateLxSource(1);
+    els.get("#lx-url").value = "https://example.com/draft.js";
+    const draft = vm.runInThisContext("JSON.stringify([lxSourceList, lxSourceOrder, configValues])");
+    const note = els.get("#save-note").textContent;
+    enqueue("/app/fnmusic-ext/api/config", new Error("写入失败"));
+    enqueue("/app/fnmusic-ext/api/status", refreshFails ? new Error("刷新失败") : status);
+    const qsa = global.document.querySelectorAll;
+    global.document.querySelectorAll = (sel) => sel === "input[name=provider]"
+      ? [{ value: "lxmusic", checked: true }] : qsa(sel);
+    try { await global.saveConfig(); } finally { global.document.querySelectorAll = qsa; }
+    assert.strictEqual(vm.runInThisContext("JSON.stringify([lxSourceList, lxSourceOrder, configValues])"), draft);
+    assert.strictEqual(vm.runInThisContext("dirty && lxSourceListDirty"), true);
+    assert.ok(els.get("#save-bar").classList.contains("show"));
+    assert.strictEqual(els.get("#save-note").textContent, note);
+    assert.strictEqual(els.get("#lx-url").value, "https://example.com/draft.js");
+    assert.strictEqual(els.get("#save-btn").disabled, false);
+    assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
+    assert.strictEqual(els.get("#toast").className, "toast fail");
+    assert.ok(els.get("#toast").textContent.includes("保存失败：写入失败"));
+    assert.strictEqual(fetchCalls.filter((c) => c.path.endsWith("/api/config") && c.method === "GET").length, 1,
+      "保存失败不能重新加载配置覆盖草稿");
+    assert.strictEqual(fetchCalls.filter((c) => c.path.endsWith("/api/config") && c.method === "PUT").length, 1);
+    assert.strictEqual(fetchCalls.filter((c) => c.path.endsWith("/api/status")).length, 2);
+    const html = els.get("#lx-source-list").innerHTML;
+    assert.ok(html.includes("待保存取消"));
+    assert.ok(html.includes("待保存激活"));
+    if (refreshFails) {
+      assert.ok(!html.includes("运行就绪"));
+      assert.strictEqual((html.match(/运行状态未知/g) || []).length, items.length);
+      for (const sel of ["#ov-processes", "#ov-services", "#ov-lx"]) {
+        assert.ok(/未知|获取失败/.test(els.get(sel).innerHTML), sel);
+        assert.ok(!els.get(sel).innerHTML.includes('dot ok'), sel);
+      }
+    } else {
+      assert.ok(html.includes("运行就绪"), "刷新成功仍应显示真实运行状态");
+    }
   }
 });
 
@@ -1286,6 +1396,55 @@ test("loadStatus：概览进程含 lxserver，不可达透出 healthz 详情并�
   assert.ok(svcHtml.includes("lxserver unreachable"), "healthz 失败详情应透出，便于定位底层进程故障");
   assert.ok(!svcHtml.includes("<script>"), "错误详情必须 HTML 转义");
   assert.ok(svcHtml.includes("&lt;script&gt;"));
+});
+
+test("loadStatus：刷新失败清除概览旧健康状态，恢复后重绘", async () => {
+  reset();
+  const status = {
+    version: "t", current_provider: "lxmusic",
+    processes: { lxserver: { state: "RUNNING" }, lxmusic: { state: "RUNNING" } },
+    services: { lxmusic: { reachable: true } },
+    lx_source: { state: "ready", sources: [{ name: "旧就绪源", status: "success" }] },
+  };
+  enqueue("/app/fnmusic-ext/api/status", status);
+  await global.loadStatus();
+  const selectors = ["#ov-provider-body", "#ov-processes", "#ov-services", "#ov-lx"];
+  const healthy = selectors.map((sel) => els.get(sel).innerHTML);
+  assert.ok(els.get("#ov-processes").innerHTML.includes('dot ok'));
+  assert.ok(els.get("#ov-services").innerHTML.includes("正常"));
+  assert.ok(els.get("#ov-lx").innerHTML.includes("运行就绪"));
+  assert.strictEqual(els.get("#ov-lx-card").hidden, false);
+  enqueue("/app/fnmusic-ext/api/status", new Error("状态请求失败 <script>bad</script>"));
+  await global.loadStatus();
+  // 最小 DOM 桩的 textContent 不会联动 innerHTML；当前音源用 textContent 安全替换。
+  assert.strictEqual(els.get("#ov-provider-body").textContent, "状态加载失败：状态请求失败 <script>bad</script>");
+  for (const sel of selectors.slice(1)) {
+    const html = els.get(sel).innerHTML;
+    assert.ok(!html.includes('dot ok'), sel + " 不可保留绿色");
+    assert.ok(!html.includes("RUNNING"), sel + " 不可保留旧进程状态");
+    assert.ok(!html.includes("运行就绪"), sel + " 不可保留旧源状态");
+    assert.ok(!html.includes("就绪 1"), sel + " 不可保留旧统计");
+    assert.ok(!html.includes("<script>"), sel + " 错误不可注入 HTML");
+    assert.ok(/未知|获取失败|加载失败/.test(html + els.get(sel).textContent), sel);
+  }
+  assert.strictEqual(els.get("#ov-lx-card").hidden, false);
+  assert.ok(!els.get("#ov-lx").innerHTML.includes("旧就绪源"));
+  enqueue("/app/fnmusic-ext/api/status", status);
+  await global.loadStatus();
+  assert.deepStrictEqual(selectors.map((sel) => els.get(sel).innerHTML), healthy);
+});
+
+test("loadStatus：首次请求失败也显示未知，保留未启用洛雪卡片的隐藏状态", async () => {
+  reset();
+  els.get("#ov-lx-card").hidden = true;
+  enqueue("/app/fnmusic-ext/api/status", new Error("网络中断"));
+  await global.loadStatus();
+  for (const sel of ["#ov-processes", "#ov-services", "#ov-lx"]) {
+    const html = els.get(sel).innerHTML;
+    assert.ok(/未知|获取失败/.test(html), sel);
+    assert.ok(!html.includes('dot ok'), sel);
+  }
+  assert.strictEqual(els.get("#ov-lx-card").hidden, true);
 });
 
 test("loadStatus：洛雪六态与统计、逐源错误原值安全展示", async () => {

@@ -21,6 +21,176 @@ from lxserver_client import (
 )
 
 
+@pytest.mark.parametrize("error_type", [
+    httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError,
+])
+@pytest.mark.parametrize("operation", ["search", "resolve", "list", "import", "upload", "toggle"])
+def test_lxserver_transport_log_preserves_error_without_request(error_type, operation, caplog):
+    """HTTPX 的无 request 异常属性会抛 RuntimeError，日志不得覆盖原异常或重试。"""
+    from types import SimpleNamespace
+
+    client = LxServerClient(base_url="http://test", timeout=8.0)
+    error = error_type("private-error-url?token=private-token")
+    calls = []
+
+    async def fail(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise error
+
+    async def get_client():
+        return SimpleNamespace(get=fail, post=fail)
+
+    client.get_client = get_client
+    operations = {
+        "search": lambda: client.search("private-query"),
+        "resolve": lambda: client.get_music_url({"name": "private-song"}),
+        "list": client.list_custom_sources,
+        "import": lambda: client.import_custom_source("https://private-url/?token=private-token"),
+        "upload": lambda: client.upload_custom_source("private-file.js", "private-body"),
+        "toggle": lambda: client.toggle_custom_source("private-source", True),
+    }
+
+    async def run():
+        with pytest.raises(error_type) as caught:
+            await operations[operation]()
+        assert caught.value is error
+        assert getattr(caught.value, "result_unknown", False) is (
+            operation in ("import", "upload", "toggle"))
+
+    asyncio.run(run())
+    assert len(calls) == 1
+    records = [record for record in caplog.records if record.name == "fnmusic.lxserver"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert f"operation={operation} error={error_type.__name__}" in message
+    assert "elapsed_s=" in message
+    assert f"budget_s={20.0 if operation in ('import', 'upload') else 8.0:.3f}" in message
+    assert "private" not in message
+    assert records[0].exc_info is None
+    if operation in ("import", "upload", "toggle"):
+        assert "result_unknown=True" in message
+
+
+def test_lxserver_transport_log_keeps_stage_without_credentials(caplog):
+    client = LxServerClient(base_url="http://test", admin_password="private-password")
+    request = httpx.Request("POST", "http://private-host/private-path?token=private-token",
+                            content="private-body", headers={"Authorization": "private-auth"})
+    error = httpx.RemoteProtocolError("private-error", request=request)
+
+    def handler(_request):
+        raise error
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            with pytest.raises(httpx.RemoteProtocolError) as caught:
+                await client.upload_custom_source("private-name.js", "private-script")
+            assert caught.value is error
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert "operation=upload error=RemoteProtocolError" in caplog.text
+    assert "elapsed_s=" in caplog.text
+    assert "budget_s=20.000" in caplog.text
+    assert "private" not in caplog.text
+
+
+@pytest.mark.parametrize("resolver_timeout", [8.0, 0.03, 32.0])
+def test_lxserver_management_budget_is_independent_of_resolver(resolver_timeout):
+    """全局客户端的 resolver=8s 不得截断管理初始化；搜索/取链预算不变。"""
+    captured = []
+    client = LxServerClient(base_url="http://test", timeout=resolver_timeout)
+    assert client.management_timeout == 20.0
+    assert client.management_timeout < 30.0  # WebUI 上传 HTTP 外层预算
+
+    def handler(request):
+        captured.append((request.url.path, request.extensions["timeout"]))
+        if request.url.path in ("/api/music/search", "/api/custom-source/list"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"success": True, "url": "https://media.test/a.mp3"})
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            await client.import_custom_source("https://source.test/a.js")
+            await client.upload_custom_source("a.js", "script")
+            await client.search("song")
+            await client.get_music_url({"songmid": "1"})
+            await client.get_music_url({"songmid": "1"}, request_timeout=1.25)
+            await client.get_music_url({"songmid": "1"}, "128k", None, 2.5)
+            await client.list_custom_sources()
+            await client.toggle_custom_source("a.js", True)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    expected = [20.0, 20.0, resolver_timeout, resolver_timeout, 1.25, 2.5,
+                resolver_timeout, resolver_timeout]
+    assert len(captured) == len(expected)
+    for (_, timeout), budget in zip(captured, expected):
+        assert timeout == {phase: budget for phase in ("connect", "read", "write", "pool")}
+
+
+@pytest.mark.parametrize("operation", ["import", "upload"])
+def test_lxserver_management_total_deadline_does_not_replay(operation, caplog):
+    """即使传输持续不结束，也有总 deadline；超时只能报告结果未知，不能重放写请求。"""
+    client = LxServerClient(base_url="http://test", timeout=8.0)
+    client.management_timeout = 0.02
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        await asyncio.Event().wait()
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            async with asyncio.timeout(1.0):
+                with pytest.raises(httpx.ReadTimeout, match="result unknown") as caught:
+                    if operation == "import":
+                        await client.import_custom_source("https://source.test/a.js")
+                    else:
+                        await client.upload_custom_source("a.js", "script")
+                assert caught.value.result_unknown is True
+            assert not client.mgmt_lock.locked()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert len(requests) == 1
+    assert f"operation={operation} error=ReadTimeout" in caplog.text
+    assert "budget_s=0.020 result_unknown=True" in caplog.text
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_lxserver_resolve_log_uses_explicit_request_budget(positional, caplog):
+    client = LxServerClient(base_url="http://test", timeout=8.0)
+
+    def handler(request):
+        raise httpx.ReadTimeout("private-error", request=request)
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                if positional:
+                    await client.get_music_url({}, "128k", None, 1.25)
+                else:
+                    await client.get_music_url({}, request_timeout=1.25)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert "operation=resolve error=ReadTimeout" in caplog.text
+    assert "budget_s=1.250" in caplog.text
+    assert "private" not in caplog.text
+
+
 # ------------------------------------------------------------- 映射函数单测 --
 
 def test_normalize_source():
@@ -1046,6 +1216,20 @@ def test_source_set_http_url_activates_target(test_app_client, fake_lx):
     states = {s["id"]: s["enabled"] for s in fake_lx.sources}
     assert states.get("remote_source.js") is True
     assert states.get("source1") is True
+
+
+def test_source_set_reuses_matching_import_url_without_reimport(test_app_client, fake_lx):
+    """保存/启动恢复不得重复下载并临时执行相同 sourceUrl 的脚本。"""
+    url = "https://example.com/xinghai/latest.js"
+    res = test_app_client.post("/api/v1/source", json={"url": url})
+    assert res.status_code == 200
+    assert fake_lx.import_calls == [url]
+    for source in fake_lx.sources:
+        source["status"] = "success"
+    res = test_app_client.post("/api/v1/source", json={"url": url})
+    assert res.status_code == 200
+    assert res.json()["source_id"] == "latest.js"
+    assert fake_lx.import_calls == [url]
 
 
 def test_activate_nonexistent_source_does_not_disable_existing():

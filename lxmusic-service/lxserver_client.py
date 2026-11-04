@@ -74,6 +74,36 @@ def is_lxserver_unreachable(exc: BaseException) -> bool:
     )
 
 
+def log_lxserver_transport_errors(operation, *, timeout_attr="timeout"):
+    """仅记录固定操作名、异常类型、耗时和预算；绝不读取异常 request/正文。"""
+    def decorate(call):
+        signature = inspect.signature(call)
+
+        @wraps(call)
+        async def logged(self, *args, **kwargs):
+            budget = signature.bind(self, *args, **kwargs).arguments.get("request_timeout")
+            if budget is None:
+                budget = getattr(self, timeout_attr)
+            started = time.monotonic()
+            try:
+                return await call(self, *args, **kwargs)
+            except Exception as exc:
+                if is_lxserver_unreachable(exc):
+                    result_unknown = (operation in ("import", "upload", "toggle")
+                                      and isinstance(exc, _LXSERVER_CONNECT_ERRORS))
+                    if result_unknown:
+                        # 原异常实例上提供机器可读标记；通信失败不能证明写入未生效。
+                        exc.result_unknown = True
+                    logger.error(
+                        "lxserver request failed: operation=%s error=%s elapsed_s=%.3f budget_s=%.3f result_unknown=%s",
+                        operation, type(exc).__name__, time.monotonic() - started, budget,
+                        result_unknown,
+                    )
+                raise
+        return logged
+    return decorate
+
+
 class SourceOperationBusy(RuntimeError):
     """另一任务正在修改或校验音源；调用方可映射为 HTTP 409。"""
 
@@ -304,6 +334,9 @@ class LxServerClient:
         self.base_url = base_url.rstrip("/")
         self.admin_password = admin_password
         self.timeout = timeout
+        # 导入/上传包含下载与脚本初始化，不能继承播放解析的短预算（默认 8s）。
+        # 保留客户端原默认 20s，低于 WebUI 上传 HTTP 的 30s 外层预算。
+        self.management_timeout = 20.0
         self._client: httpx.AsyncClient | None = None
         # songInfo 反查缓存: track_id -> songInfo dict
         self._song_info_cache: dict[str, dict] = {}
@@ -505,6 +538,7 @@ class LxServerClient:
         return status is not None
 
     # ------------------------------------------------------------- 搜索端点 --
+    @log_lxserver_transport_errors("search")
     async def search(
         self,
         keyword: str,
@@ -549,6 +583,7 @@ class LxServerClient:
         return results
 
     # ------------------------------------------------------------- 播放链接解析 --
+    @log_lxserver_transport_errors("resolve")
     async def get_music_url(
         self,
         song_info: dict,
@@ -776,6 +811,7 @@ class LxServerClient:
         return items
 
     # ------------------------------------------------------------- 自定义音源管理 --
+    @log_lxserver_transport_errors("list")
     async def list_custom_sources(self) -> list[dict]:
         """获取所有已导入的自定义音源列表。"""
         client = await self.get_client()
@@ -789,7 +825,20 @@ class LxServerClient:
             return data["sources"]
         raise ValueError("lxserver custom-source/list returned invalid payload")
 
+    async def _post_source_initialization(self, path: str, body: dict) -> httpx.Response:
+        """管理写请求只发送一次；总超时不代表上游未保存/未执行，结果须再核对。"""
+        client = await self.get_client()
+        deadline = asyncio.timeout(self.management_timeout)
+        try:
+            async with deadline:
+                return await client.post(path, json=body, timeout=self.management_timeout)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            raise httpx.ReadTimeout("source management timed out; result unknown") from None
+
     @serialize_source_operation
+    @log_lxserver_transport_errors("import", timeout_attr="management_timeout")
     async def import_custom_source(self, url: str, *, allow_unsafe_vm: bool = False) -> dict:
         """从 URL 导入自定义源。lxserver 端点期望 JSON {url}，成功返回 {success,id,metadata,...}。
 
@@ -798,15 +847,14 @@ class LxServerClient:
         ``UnsafeVmRequired``，由上层明确报告“需要不安全运行环境、未做验证”，
         既不静默重试，也不伪装成普通脚本失败。
         """
-        client = await self.get_client()
-        resp = await client.post(
+        resp = await self._post_source_initialization(
             "/api/custom-source/import",
-            json={"url": url, "allowUnsafeVM": bool(allow_unsafe_vm)},
-            timeout=self.timeout,
+            {"url": url, "allowUnsafeVM": bool(allow_unsafe_vm)},
         )
         return self._parse_unsafe_aware(resp, "导入自定义源")
 
     @serialize_source_operation
+    @log_lxserver_transport_errors("upload", timeout_attr="management_timeout")
     async def upload_custom_source(self, filename: str, script_content: str,
                                    *, allow_unsafe_vm: bool = False) -> dict:
         """上传自定义源脚本文本。lxserver 端点期望 JSON {filename, content}，成功返回 {success,id,metadata,...}。
@@ -814,16 +862,15 @@ class LxServerClient:
         与 import 同契约：默认显式 allowUnsafeVM=false，只在调用方明确要求时
         才允许；需要不安全 VM 的脚本抛 ``UnsafeVmRequired``，不做自动重放。
         """
-        client = await self.get_client()
-        resp = await client.post(
+        resp = await self._post_source_initialization(
             "/api/custom-source/upload",
-            json={"filename": filename, "content": script_content,
-                  "allowUnsafeVM": bool(allow_unsafe_vm)},
-            timeout=self.timeout,
+            {"filename": filename, "content": script_content,
+             "allowUnsafeVM": bool(allow_unsafe_vm)},
         )
         return self._parse_unsafe_aware(resp, "上传自定义源")
 
     @serialize_source_operation
+    @log_lxserver_transport_errors("toggle")
     async def toggle_custom_source(self, source_id: str, enable: bool) -> bool:
         """启用或禁用某音源（lxserver 端点键名为 enabled）。"""
         client = await self.get_client()

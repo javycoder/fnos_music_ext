@@ -554,7 +554,13 @@ async function loadStatus() {
       lxCard.hidden = true;
     }
   } catch (exc) {
+    // 旧快照不能无限期显示绿色“运行就绪”；保留用户尚未保存的编辑。
+    lxRuntimeSnapshot = null;
+    renderLxSourceList();
     $("#ov-provider-body").textContent = "状态加载失败：" + exc.message;
+    $("#ov-processes").innerHTML = '<span class="chip"><span class="dot"></span>进程状态未知（获取失败）</span>';
+    $("#ov-services").innerHTML = '<span class="state-line"><span class="dot"></span>服务状态未知（获取失败）</span>';
+    $("#ov-lx").innerHTML = '<div class="kv"><b>状态</b>运行状态未知（获取失败）</div>';
   }
 }
 
@@ -908,7 +914,10 @@ async function saveConfig() {
     await loadStatus();
     refreshLlmUsage();
   } catch (exc) {
+    lxRuntimeSnapshot = null;
+    renderLxSourceList();
     toast("保存失败：" + exc.message, "fail");
+    await loadStatus();
   } finally {
     btn.disabled = false;
     btn.textContent = "保存并生效";
@@ -2329,7 +2338,8 @@ function renderLxSourceList() {
       ? (isActive ? "待保存激活" : "待保存取消") : wasActive ? "已配置启用" : "未启用";
     const runtime = findLxRuntimeSource(item, (lxRuntimeSnapshot || {}).sources);
     const status = runtime?.status || "unknown";
-    const runtimeLabel = lxRuntimeSnapshot?.state === "unavailable" ? "服务不可用"
+    const runtimeLabel = !lxRuntimeSnapshot ? "运行状态未知"
+      : lxRuntimeSnapshot.state === "unavailable" ? "服务不可用"
       : runtime ? (LX_SOURCE_STATUS_LABEL[status] || status) : wasActive ? "运行状态未知" : "未运行";
     const runtimeError = runtime?.error || "";
     const displayName = escapeHtml(item.name || lxDefaultName(item.url));

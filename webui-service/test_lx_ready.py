@@ -668,6 +668,35 @@ def test_verify_nonterminal_does_not_write_or_disable(env_file, procs, lx_http, 
     assert lx_http["calls"] == ["/api/v1/source/verify"]
 
 
+@pytest.mark.parametrize('category,complete,expected', [
+    ('timeout', False, 'timeout'), ('identity_conflict', False, 'identity_conflict'),
+    ('unsafe_vm_required', False, 'unsafe_vm_required'), ('resolve', False, 'resolve'),
+    ('', False, 'incomplete'),
+])
+def test_verify_unfinished_without_evidence_protects_entire_save(
+        env_file, procs, lx_http, client, category, complete, expected):
+    lx_http['business']['/api/v1/source/verify'] = lambda request: httpx.Response(200, json={
+        'ok': False, 'data': {'category': category, 'complete': complete,
+                               'ok': False, 'attempts': [], 'message': 'not verified'}})
+    before = env_file.read_bytes()
+    response = client.put('/api/config', json={'values': {'LX_SOURCE_LIST': json.dumps([
+        {'url': 'https://s/new.js', 'active': True}]), 'LX_SOURCES': 'kg'}})
+    assert response.status_code in (409, 503, 504), response.text
+    assert response.json()['category'] == expected
+    assert env_file.read_bytes() == before
+    assert lx_http['calls'] == ['/api/v1/source/verify']
+
+
+def test_verify_partial_success_can_still_be_saved(env_file, procs, lx_http, client):
+    lx_http['business']['/api/v1/source/verify'] = lambda request: httpx.Response(200, json={
+        'ok': True, 'data': {'ok': True, 'category': 'partial', 'complete': False,
+                            'attempts': [{'result': 'ok'}], 'platforms': ['kg']}})
+    response = client.put('/api/config', json={'values': {'LX_SOURCE_LIST': json.dumps([
+        {'url': 'https://s/new.js', 'active': True}])}})
+    assert response.status_code == 200, response.text
+    assert webui._list_active_urls(webui.read_env()) == {'https://s/new.js'}
+
+
 @pytest.mark.parametrize("state,statuses", [("unconfigured", []), ("loading", ["loading"]),
     ("ready", ["success"]), ("degraded", ["failed", "success"]), ("failed", ["failed"]),
     ("unavailable", [])])

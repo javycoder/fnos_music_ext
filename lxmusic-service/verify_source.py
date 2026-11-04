@@ -43,6 +43,7 @@ VERIFY_KEYWORDS = ("晴天", "江南", "十年", "倔强")
 _LX_QUALITY_ORDER = tuple(to_lx_quality(q) for q in reversed(QUALITY_LEVELS))
 _PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
+_VERIFY_BUDGET_S = 110.0  # 外层 120s 之前预留 cleanup/close 的 4s 及调度余量。
 _CLEANUP_TIMEOUT_S = 3.0
 _CLOSE_TIMEOUT_S = 1.0
 logger = logging.getLogger("lxmusic_service")
@@ -190,6 +191,20 @@ def _verification_headers(lx_app, platform: str, resolved: dict) -> dict:
     return headers
 
 
+def _stored_script_matches(lx_app, source: dict, script: str) -> bool:
+    """只信 lxserver _open 实际存储内容；名称、版本和 sourceUrl 不是身份凭据。"""
+    source_id = str(source.get("id") or "")
+    if not source_id or source_id in (".", "..") or re.search(r"[\\/:]", source_id):
+        return False
+    root = Path(getattr(lx_app, "LXSERVER_DATA_DIR", os.environ.get("LXSERVER_DATA_DIR", "/data/lxserver")))
+    try:
+        root = (root / "users" / "source" / "_open").resolve()
+        path = (root / source_id).resolve()
+        return path.parent == root and path.read_text(encoding="utf-8") == script
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
 async def _verification_samples(lx_app, temp_client, sources, target_src, report, keywords):
     """顺序抽样且受调用方总超时约束；一项成功不会跳过其他平台。"""
     client = lx_app.get_http(lx_app.app)
@@ -201,6 +216,10 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
             base = {"keyword": keyword, "platform": platform, "result": "", "error": ""}
             try:
                 songs = await temp_client.search(keyword, source=platform, page=1, limit=3)
+            except httpx.ReadTimeout:
+                report["complete"] = False
+                report["attempts"].append(dict(base, result="timeout", stage="search", error="ReadTimeout"))
+                continue
             except Exception as exc:
                 if is_lxserver_unreachable(exc):
                     raise
@@ -221,6 +240,10 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
                     try:
                         resolved = await temp_client.get_music_url(
                             sinfo, quality, exclude_api_sources=excluded, auto_switch_api_source=False)
+                    except httpx.ReadTimeout:
+                        report["complete"] = False
+                        report["attempts"].append(dict(attempt, result="timeout", stage="resolve", error="ReadTimeout"))
+                        continue
                     except Exception as exc:
                         if is_lxserver_unreachable(exc):
                             raise
@@ -253,6 +276,7 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
 @serialize_source_operation
 async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict:
     """端到端校验一个源 URL 并返回结构化报告。"""
+    deadline = time.monotonic() + _VERIFY_BUDGET_S
     import app as lx_app  # 延迟导入
 
     keywords = list(keywords) if keywords else list(VERIFY_KEYWORDS)
@@ -297,9 +321,10 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
     )
 
     temp_filename = f"verify_tmp_{int(time.time())}.js"
-    # lxserver 上传后以脚本 @name 生成唯一 id；已存在同 id 源时复用既有源（测毕还原其启用态）
+    # lxserver 以 @name 生成 id；同名冲突必须比对实际存储内容后才能复用。
     temp_source_id: str | None = None
     changed_reused_id: str | None = None
+    management_stage = "upload"
     try:
         # 上传为临时源
         try:
@@ -310,26 +335,32 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
                           message="脚本需要不安全VM运行环境；本项目未自动授权，本次未验证")
             return report
         except Exception as upload_exc:
+            # 通信故障（尤其写入结果未知）不能按错误文案转入复用或重放。
+            if is_lxserver_unreachable(upload_exc):
+                raise
             if "已存在" not in str(upload_exc):
-                # 内部通信故障上浮，不能归为脚本错误。
-                if is_lxserver_unreachable(upload_exc):
-                    raise
                 report.update(category="internal", message=f"临时源上传失败: {upload_exc}")
                 return report
+        management_stage = "list"
         # 等待源在沙箱初始化并查询平台
         await asyncio.sleep(1.0)
         sources = await temp_client.list_custom_sources()
-        target_src = None
-        for s in sources:
-            if (s.get("id") == temp_source_id if temp_source_id else s.get("name") == meta["name"]):
-                target_src = s
-                break
+        candidates = [s for s in sources
+                      if (s.get("id") == temp_source_id if temp_source_id else s.get("name") == meta["name"])]
+        target_src = candidates[0] if len(candidates) == 1 else None
+        if temp_source_id is None and (
+            target_src is None or not _stored_script_matches(lx_app, target_src, script)
+        ):
+            report.update(category="identity_conflict", complete=False,
+                          message="同名源已存在，但无法确认其实际脚本内容与本次一致；本次未验证，未改动既有源")
+            return report
         if target_src is None:
             report.update(category="internal", message="临时源上传后未在 lxserver 列表中找到")
             return report
 
         # lxserver 解析只走 enabled 的源（isSourceSupported 跳过禁用源）：
         # 新上传的临时源默认禁用，须临时启用；复用既有源时记住原状态，测毕还原
+        management_stage = "toggle"
         if temp_source_id is None:
             if not target_src.get("enabled"):
                 reused_id = str(target_src.get("id") or "")
@@ -343,6 +374,7 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         else:
             await temp_client.toggle_custom_source(temp_source_id, True)
 
+        management_stage = "samples"
         declared = []
         # lxserver 列表项的平台字段是 supportedSources（数组）
         raw_platforms = target_src.get("supportedSources") or target_src.get("sources") or []
@@ -366,15 +398,19 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
             report.update(category="no_platform", message="源未声明任何支持的音乐平台")
             return report
 
-        # 验证所有平台；总预算到期时保留已完成证据，不伪装成脚本失效。
-        try:
-            async with asyncio.timeout(_SAMPLE_BUDGET_S):
-                await _verification_samples(lx_app, temp_client, sources, target_src, report, keywords)
-        except TimeoutError:
-            report.update(category="timeout", message="校验总预算已耗尽，未完成项保持未测", complete=False)
-            return report
-        report["complete"] = True
-        if report["ok"]:
+        # 验证所有平台；单项读超时和总预算耗尽都保留已经取得的成功证据。
+        sample_budget = min(_SAMPLE_BUDGET_S, deadline - time.monotonic())
+        report["complete"] = sample_budget > 0
+        if sample_budget > 0:
+            try:
+                async with asyncio.timeout(sample_budget):
+                    await _verification_samples(lx_app, temp_client, sources, target_src, report, keywords)
+            except TimeoutError:
+                report["complete"] = False
+        if not report["complete"]:
+            report.update(category="partial" if report["ok"] else "timeout",
+                          message="校验发生读超时或总预算耗尽；保留已完成证据，未完成项不判失效")
+        elif report["ok"]:
             report.update(category="partial" if any(v != "ok" for v in report["platform_results"].values()) else "ok",
                           message="抽样完成；各平台和音质结果请分别查看")
         else:
@@ -382,12 +418,19 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
         return report
 
     except Exception as exc:
+        if isinstance(exc, httpx.ReadTimeout) and management_stage in ("upload", "toggle"):
+            report.update(ok=False, category="timeout", complete=False, result_unknown=True,
+                          stage=management_stage,
+                          message="源管理写请求超时，结果未知；未重放请求，请先核对源状态")
+            return report
         if not is_lxserver_unreachable(exc):
             raise
         report.update(
-            ok=False, category="service_unavailable", stage="lxmusic_to_lxserver",
+            ok=False, category="service_unavailable", stage="lxmusic_to_lxserver", complete=False,
             message="洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
         )
+        if getattr(exc, "result_unknown", False):
+            report["result_unknown"] = True
         return report
     finally:
         # 只删除上传返回的本次创建 ID；既有源只恢复本次成功切换的状态。

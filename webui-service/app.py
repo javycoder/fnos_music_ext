@@ -1734,17 +1734,22 @@ async def api_config_put(body: ConfigBody, request: Request):
             report = {"ok": False, "data": {"message": str(exc)},
                       "category": "service_unavailable", "stage": "webui_to_lxmusic"}
         if not verify_ok:
-            message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
-            category = report.get("category") or (report.get("data") or {}).get("category")
-            protected = category in ("initialization_pending", "source_operation_busy", "internal")
+            data = report.get("data") or {}
+            message = data.get("message") or report.get("error") or "校验失败"
+            category = report.get("category") or data.get("category")
+            has_evidence = bool(data.get("ok")) or any(
+                isinstance(a, dict) and a.get("result") == "ok" for a in data.get("attempts") or [])
+            incomplete = data.get("complete", report.get("complete")) is False and not has_evidence
+            protected = category in ("initialization_pending", "source_operation_busy", "internal",
+                                     "timeout", "identity_conflict", "unsafe_vm_required") or incomplete or bool(data.get("result_unknown"))
             if _is_service_unavailable(verify_status, report) or protected or verify_status >= 500 and not category:
-                category = category if protected and category != "internal" else "service_unavailable"
+                category = (category or "incomplete") if protected and category != "internal" else "service_unavailable"
                 return JSONResponse(
                     content={"ok": False, "error": f"洛雪音源暂未就绪，未改动配置：{message}",
                              "category": category,
                              "stage": report.get("stage") or (report.get("data") or {}).get("stage")
                                       or "webui_to_lxmusic"},
-                    status_code=409 if category == "source_operation_busy" else 504 if category == "initialization_pending" else 503,
+                    status_code=409 if category == "source_operation_busy" else 504 if category in ("initialization_pending", "timeout") else 503,
                 )
             if lx_reconcile:
                 disable_failed_source(url, message)
