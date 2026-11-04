@@ -148,9 +148,35 @@
             <div class="btn-row">
               <input class="input grow" id="platform-search" placeholder="搜索平台…">
               <button class="btn" id="platform-reload">刷新列表</button>
+              <button class="btn" id="platform-test-btn">批量测试平台</button>
             </div>
             <div id="platform-list" class="chip-grid pad"></div>
             <p class="hint" id="platform-note"></p>
+            <!-- 批量测试面板 -->
+            <div id="platform-test-panel" class="card" hidden>
+              <div class="card-title"><span>平台批量测试</span></div>
+              <div class="btn-row">
+                <label class="field"><span>测试关键词</span><input class="input" id="platform-test-keyword" value="周杰伦" placeholder="如 周杰伦"></label>
+                <label class="field"><span>并发数</span><input class="input" id="platform-test-concurrency" type="number" min="1" max="8" value="4" style="width:60px"></label>
+                <button class="btn primary" id="platform-test-start">开始测试</button>
+                <button class="btn" id="platform-test-stop" disabled>停止</button>
+              </div>
+              <div class="progress-bar" id="platform-test-progress-wrap" hidden>
+                <div class="progress-fill" id="platform-test-progress" style="width:0%"></div>
+                <span id="platform-test-progress-text">0/0</span>
+              </div>
+              <div id="platform-test-summary" class="hint"></div>
+              <div class="btn-row" id="platform-test-actions" hidden>
+                <button class="btn" id="platform-test-enable-ok">启用成功的 (0)</button>
+                <button class="btn" id="platform-test-disable-fail">关闭无效的 (0)</button>
+                <button class="btn" id="platform-test-enable-all">启用全部</button>
+                <button class="btn" id="platform-test-disable-all">停用全部</button>
+              </div>
+              <table id="platform-test-table" class="data-table" hidden>
+                <thead><tr><th>平台</th><th>状态</th><th>耗时</th><th>结果数</th><th>示例</th></tr></thead>
+                <tbody id="platform-test-tbody"></tbody>
+              </table>
+            </div>
           </div>
         </div>
 
