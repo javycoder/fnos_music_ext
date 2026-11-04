@@ -671,3 +671,12 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   .about-donate-badge { padding: 1px 8px; font-size: 12px; margin-right: 4px; }
   .chip { padding: 6px 12px; }
 }
+
+/* platform test table */
+.data-table { width:100%; border-collapse:collapse; font-size:13px; }
+.data-table th, .data-table td { padding:6px 8px; border-bottom:1px solid #eee; text-align:left; }
+.data-table tr.ok td:nth-child(2) { color:#2e7d32; font-weight:bold; }
+.data-table tr.err td:nth-child(2) { color:#c62828; font-weight:bold; }
+.progress-bar { position:relative; height:18px; background:#eee; border-radius:9px; overflow:hidden; margin:8px 0; }
+.progress-fill { height:100%; background:#1976d2; transition:width .3s; }
+.progress-bar span { position:absolute; top:0; left:50%; transform:translateX(-50%); font-size:12px; line-height:18px; }

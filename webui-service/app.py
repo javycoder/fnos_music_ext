@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -223,7 +224,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_DAILY_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于每日推荐"},
     "FNMUSIC_LIKED_REFRESH_HOURS": {"kind": "float", "default": "0.5", "min": 0.5, "step": "any", "group": "llm", "reload": "hot", "label": "猜你喜欢生成间隔（小时）"},
     "FNMUSIC_LIKED_SIZE": {"kind": "int", "default": "20", "min": 0, "max": 100, "strict": True, "group": "llm", "reload": "hot", "label": "猜你喜欢歌曲数量"},
-    "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
+    "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "30", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
@@ -2272,6 +2273,175 @@ async def api_platforms(request: Request):
             status_code=503,
         )
     return {"ok": True, "enabled": data.get("enabled") or [], "registered": data.get("registered") or []}
+
+
+# 平台批量测试任务存储（进程内，TTL 10 分钟）
+_platform_test_jobs: dict[str, dict] = {}
+_PLATFORM_TEST_JOB_TTL = 600.0
+_PLATFORM_TEST_DEFAULT_KEYWORD = "周杰伦"
+_PLATFORM_TEST_DEFAULT_CONCURRENCY = 4
+_PLATFORM_TEST_MAX_CONCURRENCY = 8
+_PLATFORM_TEST_PER_PLATFORM_TIMEOUT = 30.0
+_PLATFORM_TEST_MUSICDL_TIMEOUT = 20.0
+
+
+def _cleanup_platform_test_jobs() -> None:
+    now = time.monotonic()
+    expired = [jid for jid, j in _platform_test_jobs.items()
+               if now - j.get("updated_at", j.get("created_at", now)) > _PLATFORM_TEST_JOB_TTL]
+    for jid in expired:
+        _platform_test_jobs.pop(jid, None)
+
+
+async def _test_one_platform(client: httpx.AsyncClient, platform: str, keyword: str) -> dict:
+    started = time.monotonic()
+    result = {"platform": platform, "status": "error", "latency_ms": 0,
+              "count": 0, "title": "", "titles": [], "error": ""}
+    try:
+        resp = await client.get(
+            f"{CONF['musicdl_url']}/search",
+            params={"keyword": keyword, "sources": platform, "limit": 5},
+            timeout=httpx.Timeout(_PLATFORM_TEST_PER_PLATFORM_TIMEOUT, connect=5.0),
+        )
+        data = _resp_json(resp)
+        elapsed = time.monotonic() - started
+        result["latency_ms"] = int(elapsed * 1000)
+        if not (200 <= resp.status_code < 300):
+            result["error"] = f"HTTP {resp.status_code}"
+            return result
+        items = data.get("items") if isinstance(data, dict) else None
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if isinstance(items, list) and items:
+            result["status"] = "ok"
+            result["count"] = len(items)
+            result["titles"] = [str(it.get("title") or it.get("name") or "") for it in items]
+            first = items[0]
+            result["title"] = str(first.get("title") or first.get("name") or "")
+            return result
+        # 无结果：分类错误原因
+        if isinstance(errors, dict) and errors:
+            # 取第一个错误
+            first_err = next(iter(errors.values()))
+            result["error"] = str(first_err)
+        elif isinstance(data, dict) and data.get("error"):
+            result["error"] = str(data.get("error"))
+        else:
+            result["error"] = "no results"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        elapsed = time.monotonic() - started
+        result["latency_ms"] = int(elapsed * 1000)
+        result["error"] = f"timeout" if "timeout" in str(exc).lower() or "timed out" in str(exc).lower() else str(exc)[:120]
+        return result
+
+
+async def _run_platform_test_job(job_id: str, platforms: list[str], keyword: str, concurrency: int) -> None:
+    job = _platform_test_jobs.get(job_id)
+    if not job:
+        return
+    sem = asyncio.Semaphore(concurrency)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(_PLATFORM_TEST_PER_PLATFORM_TIMEOUT, connect=5.0))
+
+    async def _one(p: str):
+        async with sem:
+            if job.get("cancelled"):
+                return
+            r = await _test_one_platform(client, p, keyword)
+            job["results"].append(r)
+            job["done"] = len(job["results"])
+            job["updated_at"] = time.monotonic()
+
+    try:
+        await asyncio.gather(*[_one(p) for p in platforms], return_exceptions=True)
+    finally:
+        await client.aclose()
+    job["status"] = "done"
+    job["updated_at"] = time.monotonic()
+    ok_count = sum(1 for r in job["results"] if r.get("status") == "ok")
+    job["ok_count"] = ok_count
+    job["fail_count"] = len(job["results"]) - ok_count
+
+
+@app.post("/api/platforms/test/start")
+async def api_platform_test_start(request: Request):
+    preview_renew("musicdl")
+    _cleanup_platform_test_jobs()
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    keyword = str(body.get("keyword") or _PLATFORM_TEST_DEFAULT_KEYWORD).strip() or _PLATFORM_TEST_DEFAULT_KEYWORD
+    try:
+        concurrency = int(body.get("concurrency", _PLATFORM_TEST_DEFAULT_CONCURRENCY))
+    except (TypeError, ValueError):
+        concurrency = _PLATFORM_TEST_DEFAULT_CONCURRENCY
+    if concurrency < 1 or concurrency > _PLATFORM_TEST_MAX_CONCURRENCY:
+        concurrency = _PLATFORM_TEST_DEFAULT_CONCURRENCY
+
+    ok, data = await _fetch_json(request, f"{CONF['musicdl_url']}/sources")
+    if not ok:
+        return JSONResponse(
+            content={"ok": False, "error": data.get("error", "musicdl 服务不可达"),
+                     "hint": "musicdl 进程未启用时无法获取平台列表"},
+            status_code=503,
+        )
+    registered = data.get("registered") or []
+    if not registered:
+        return JSONResponse(content={"ok": False, "error": "musicdl 未注册任何平台"}, status_code=503)
+
+    job_id = uuid.uuid4().hex
+    job = {
+        "id": job_id,
+        "status": "running",
+        "keyword": keyword,
+        "concurrency": concurrency,
+        "total": len(registered),
+        "done": 0,
+        "results": [],
+        "created_at": time.monotonic(),
+        "updated_at": time.monotonic(),
+        "cancelled": False,
+    }
+    _platform_test_jobs[job_id] = job
+    asyncio.create_task(_run_platform_test_job(job_id, list(registered), keyword, concurrency))
+    return {"ok": True, "job_id": job_id, "total": len(registered)}
+
+
+@app.get("/api/platforms/test/status")
+async def api_platform_test_status(request: Request, job: str = ""):
+    _cleanup_platform_test_jobs()
+    job_id = (job or "").strip()
+    if not job_id or job_id not in _platform_test_jobs:
+        return JSONResponse(content={"ok": False, "error": "job not found or expired"}, status_code=404)
+    j = _platform_test_jobs[job_id]
+    return {
+        "ok": True,
+        "job_id": j["id"],
+        "status": j["status"],
+        "progress": {"done": j["done"], "total": j["total"]},
+        "keyword": j["keyword"],
+        "concurrency": j["concurrency"],
+        "results": j["results"],
+        "ok_count": j.get("ok_count", sum(1 for r in j["results"] if r.get("status") == "ok")),
+        "fail_count": j.get("fail_count", sum(1 for r in j["results"] if r.get("status") != "ok")),
+    }
+
+
+@app.post("/api/platforms/test/stop")
+async def api_platform_test_stop(request: Request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    job_id = str(body.get("job_id") or "").strip()
+    if not job_id or job_id not in _platform_test_jobs:
+        return JSONResponse(content={"ok": False, "error": "job not found or expired"}, status_code=404)
+    _platform_test_jobs[job_id]["cancelled"] = True
+    return {"ok": True}
 
 
 _public_discovery_cache: dict[tuple, tuple[float, bytes, str]] = {}

@@ -692,7 +692,7 @@ function applyConfigToForm() {
   $("#liked-size").value = v.FNMUSIC_LIKED_SIZE ?? "20";
   updateLlmLikedSettings();
   refreshLlmUsage();
-  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
+  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "30";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
@@ -779,7 +779,7 @@ function collectConfig() {
     FNMUSIC_LLM_EXTRA_BODY: $("#llm-extra-body").value.trim(),
     FNMUSIC_LLM_LIKED_ENABLED: $("#llm-liked").checked,
     FNMUSIC_LLM_DAILY_ENABLED: $("#llm-daily").checked,
-    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
+    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "30", 10) || 30,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
@@ -1073,6 +1073,153 @@ function renderPlatformChips() {
 }
 $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
+$("#platform-test-btn").addEventListener("click", () => {
+  const panel = $("#platform-test-panel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden && !$("#platform-test-tbody").children.length) renderPlatformTestTable([]);
+});
+
+/* -------------------------------------------------------------- 平台批量测试 */
+let platformTestJob = null;
+let platformTestTimer = null;
+let platformTestPolling = false;
+let platformTestResults = [];
+
+function renderPlatformTestTable(results) {
+  const tbody = $("#platform-test-tbody");
+  const table = $("#platform-test-table");
+  if (!results || !results.length) { table.hidden = true; tbody.innerHTML = ""; return; }
+  table.hidden = false;
+  const enabledSet = new Set(platforms.enabled);
+  tbody.innerHTML = results.map((r) => {
+    const ok = r.status === "ok";
+    const status = ok ? "✓" : "✗";
+    const cls = ok ? "ok" : "err";
+    const titles = ok ? (r.titles || [r.title]).filter(Boolean).join("、") : (r.error || "");
+    const isOn = enabledSet.has(r.platform);
+    return `<tr class="${cls}"><td>${escapeHtml(r.platform)}</td><td>${status} <button class="btn small platform-toggle" data-platform="${escapeHtml(r.platform)}" data-on="${isOn}">${isOn ? "关闭" : "开启"}</button></td><td>${r.latency_ms}ms</td><td>${r.count}</td><td title="${escapeHtml(titles)}">${escapeHtml(titles)}</td></tr>`;
+  }).join("");
+  tbody.querySelectorAll(".platform-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = btn.dataset.platform;
+      const set = new Set(platforms.enabled);
+      if (set.has(p)) set.delete(p); else set.add(p);
+      platforms.enabled = Array.from(set);
+      renderPlatformChips();
+      renderPlatformTestTable(platformTestJob ? platformTestJob.results : results);
+      markDirty("musicdl 平台已修改");
+    });
+  });
+}
+
+function updatePlatformTestProgress(done, total) {
+  const wrap = $("#platform-test-progress-wrap");
+  const fill = $("#platform-test-progress");
+  const text = $("#platform-test-progress-text");
+  wrap.hidden = false;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  fill.style.width = pct + "%";
+  text.textContent = `${done}/${total}`;
+}
+
+async function pollPlatformTestJob() {
+  if (platformTestPolling || !platformTestJob || platformTestJob.status === "done") return;
+  platformTestPolling = true;
+  try {
+    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(platformTestJob.job_id));
+    if (!data.ok) throw new Error(data.error || "status failed");
+    platformTestJob.status = data.status;
+    platformTestJob.results = data.results || [];
+    platformTestJob.progress = data.progress || platformTestJob.progress;
+    renderPlatformTestTable(platformTestJob.results);
+    updatePlatformTestProgress(platformTestJob.progress.done, platformTestJob.progress.total);
+    const okCount = data.ok_count ?? platformTestJob.results.filter((r) => r.status === "ok").length;
+    const failCount = (data.fail_count ?? platformTestJob.results.filter((r) => r.status !== "ok").length);
+    $("#platform-test-summary").textContent = `已完成 ${platformTestJob.progress.done}/${platformTestJob.progress.total}，成功 ${okCount}，失败 ${failCount}`;
+    $("#platform-test-enable-ok").textContent = `启用成功的 (${okCount})`;
+    $("#platform-test-disable-fail").textContent = `关闭无效的 (${failCount})`;
+    if (data.status === "done") {
+      $("#platform-test-actions").hidden = false;
+      $("#platform-test-start").disabled = false;
+      $("#platform-test-stop").disabled = true;
+      clearTimeout(platformTestTimer);
+      platformTestTimer = null;
+    } else {
+      platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+    }
+  } catch (exc) {
+    $("#platform-test-summary").textContent = `查询失败：${exc.message}`;
+  } finally {
+    platformTestPolling = false;
+  }
+}
+
+async function startPlatformTest() {
+  const keyword = $("#platform-test-keyword").value.trim() || "周杰伦";
+  const concurrency = parseInt($("#platform-test-concurrency").value, 10) || 4;
+  $("#platform-test-start").disabled = true;
+  $("#platform-test-stop").disabled = false;
+  $("#platform-test-actions").hidden = true;
+  $("#platform-test-summary").textContent = "正在启动…";
+  platformTestResults = [];
+  renderPlatformTestTable([]);
+  updatePlatformTestProgress(0, 0);
+  try {
+    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) });
+    if (!data.ok) throw new Error(data.error || "start failed");
+    platformTestJob = { job_id: data.job_id, status: "running", results: [], progress: { done: 0, total: data.total } };
+    updatePlatformTestProgress(0, data.total);
+    platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+  } catch (exc) {
+    $("#platform-test-summary").textContent = `启动失败：${exc.message}`;
+    $("#platform-test-start").disabled = false;
+    $("#platform-test-stop").disabled = true;
+  }
+}
+
+function stopPlatformTest() {
+  if (platformTestJob) {
+    api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: platformTestJob.job_id }) }).catch(() => {});
+  }
+  clearTimeout(platformTestTimer);
+  platformTestTimer = null;
+  platformTestJob = null;
+  $("#platform-test-start").disabled = false;
+  $("#platform-test-stop").disabled = true;
+  $("#platform-test-summary").textContent = "已停止";
+}
+
+$("#platform-test-start").addEventListener("click", startPlatformTest);
+$("#platform-test-stop").addEventListener("click", stopPlatformTest);
+$("#platform-test-enable-ok").addEventListener("click", () => {
+  const okPlatforms = platformTestJob ? platformTestJob.results.filter((r) => r.status === "ok").map((r) => r.platform) : [];
+  const set = new Set(platforms.enabled);
+  okPlatforms.forEach((p) => set.add(p));
+  platforms.enabled = Array.from(set);
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已启用测试成功的平台");
+});
+$("#platform-test-disable-fail").addEventListener("click", () => {
+  const failPlatforms = platformTestJob ? platformTestJob.results.filter((r) => r.status !== "ok").map((r) => r.platform) : [];
+  const set = new Set(platforms.enabled);
+  failPlatforms.forEach((p) => set.delete(p));
+  platforms.enabled = Array.from(set);
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已关闭测试失败的平台");
+});
+$("#platform-test-enable-all").addEventListener("click", () => {
+  const all = platformTestJob ? platformTestJob.results.map((r) => r.platform) : platforms.registered;
+  platforms.enabled = Array.from(new Set(all));
+  renderPlatformChips();
+  markDirty("已启用全部测试平台");
+});
+$("#platform-test-disable-all").addEventListener("click", () => {
+  platforms.enabled = [];
+  renderPlatformChips();
+  markDirty("已停用全部平台");
+});
 
 /* -------------------------------------------------------------- 公共歌单 */
 const PUBLIC_PROVIDER_OPTIONS = [
