@@ -24,6 +24,7 @@
         <button class="nav-item active" data-page="overview">概览</button>
         <button class="nav-item" data-page="source">音乐源</button>
         <button class="nav-item" data-page="playlist">歌单</button>
+        <button class="nav-item" data-page="llm">大模型</button>
         <button class="nav-item" data-page="tee">边听边存</button>
         <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
       </nav>
@@ -124,9 +125,35 @@
             <div class="btn-row">
               <input class="input grow" id="platform-search" placeholder="搜索平台…">
               <button class="btn" id="platform-reload">刷新列表</button>
+              <button class="btn" id="platform-test-btn">批量测试平台</button>
             </div>
             <div id="platform-list" class="chip-grid pad"></div>
             <p class="hint" id="platform-note"></p>
+            <!-- 批量测试面板 -->
+            <div id="platform-test-panel" class="card" hidden>
+              <div class="card-title"><span>平台批量测试</span></div>
+              <div class="btn-row">
+                <label class="field"><span>测试关键词</span><input class="input" id="platform-test-keyword" value="周杰伦" placeholder="如 周杰伦"></label>
+                <label class="field"><span>并发数</span><input class="input" id="platform-test-concurrency" type="number" min="1" max="8" value="4" style="width:60px"></label>
+                <button class="btn primary" id="platform-test-start">开始测试</button>
+                <button class="btn" id="platform-test-stop" disabled>停止</button>
+              </div>
+              <div class="progress-bar" id="platform-test-progress-wrap" hidden>
+                <div class="progress-fill" id="platform-test-progress" style="width:0%"></div>
+                <span id="platform-test-progress-text">0/0</span>
+              </div>
+              <div id="platform-test-summary" class="hint"></div>
+              <div class="btn-row" id="platform-test-actions" hidden>
+                <button class="btn" id="platform-test-enable-ok">启用成功的 (0)</button>
+                <button class="btn" id="platform-test-disable-fail">关闭无效的 (0)</button>
+                <button class="btn" id="platform-test-enable-all">启用全部</button>
+                <button class="btn" id="platform-test-disable-all">停用全部</button>
+              </div>
+              <table id="platform-test-table" class="data-table" hidden>
+                <thead><tr><th>平台</th><th>状态</th><th>耗时</th><th>结果数</th><th>示例</th></tr></thead>
+                <tbody id="platform-test-tbody"></tbody>
+              </table>
+            </div>
           </div>
         </div>
 
@@ -255,90 +282,104 @@
         </div>
       
       </section>
-      <!-- 歌单（收敛：推荐/公共/自定义统一列表 + 大模型并入） -->
+      <!-- 歌单（列表 + 侧边详情面板） -->
       <section class="page" id="page-playlist">
         <h2>歌单</h2>
-        <div id="playlist-unified-note" class="hint">内置与自定义歌单在同一列表管理，每行标注类型与启用状态，支持进入编辑。</div>
-        <div id="playlist-unified-list" class="stack"></div>
-<div class="card">
-          <div class="card-title"><span>推荐与公共歌单</span><button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button></div>
-          <label class="switch-row"><span>热门榜单推荐</span><input type="checkbox" id="recommend-hot"></label>
-          <label class="switch-row"><span>每日推荐</span><input type="checkbox" id="recommend-daily"></label>
-          <label class="switch-row"><span>排行榜歌单（38 榜）</span><input type="checkbox" id="recommend-charts"></label>
-          <label class="switch-row"><span>酷狗榜单来源</span><input type="checkbox" id="kg-charts"></label>
-          <label class="switch-row"><span>网易榜单来源</span><input type="checkbox" id="wy-charts"></label>
-          <label class="field"><span>启用榜单白名单（逗号分隔榜单 ID，空=全部）</span>
-            <input class="input" id="enabled-charts" placeholder="如 kg_8888,wy_3778678">
-          </label>
-          <label class="field"><span>单榜曲量上限（10–200，默认 100）</span>
-            <input class="input" id="chart-limit" type="number" min="10" max="200" step="1" inputmode="numeric">
-          </label>
-          <label class="field"><span>每日/热门目标曲量（5–1000，默认 20；调大后当日缓存自动重建）</span>
-            <input class="input" id="recommend-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
-          </label>
-          <label class="field"><span>分类单类目标曲量（5–1000，默认 200；调大后当日缓存自动重建）</span>
-            <input class="input" id="category-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
-          </label>
-          <label class="switch-row"><span>自定义歌单</span><input type="checkbox" id="custom-enabled"></label>
-          <label class="switch-row"><span>公共歌单</span><input type="checkbox" id="public-playlists-enabled"></label>
-          <div id="public-users-panel" class="stack" hidden>
-            <div class="btn-row">
-              <select class="input grow" id="public-user" aria-label="配置公共歌单的飞牛音乐用户" disabled>
-                <option value="">请先选择飞牛音乐用户</option>
-              </select>
-              <button class="btn" id="public-users-retry">刷新用户</button>
-            </div>
-            <p class="hint" id="public-users-note">读取飞牛音乐用户后，分别配置每位用户的公共歌单。</p>
+        <div id="playlist-unified-note" class="hint">点击歌单查看详情；内置歌单开关保存后生效，自定义歌单开关即时生效。</div>
+        <div id="playlist-grid">
+          <div id="playlist-list-panel">
+            <ul id="playlist-unified-list" class="stack playlist-rows"></ul>
           </div>
-          <div id="public-playlists-browser" class="stack" hidden>
-            <div class="btn-row">
-              <select class="input" id="public-provider" aria-label="歌单音源"></select>
-              <select class="input" id="public-channel" aria-label="歌单入口"></select>
-              <select class="input" id="public-source" aria-label="洛雪平台" hidden></select>
-              <select class="input" id="public-sort" aria-label="排序" hidden></select>
-            </div>
-            <div class="btn-row">
-              <select class="input grow" id="public-category" aria-label="分类"></select>
-              <button class="btn" id="public-refresh">刷新</button>
-            </div>
-            <div class="btn-row">
-              <input class="input grow" id="public-keyword" placeholder="输入歌单名称关键词搜索公共歌单" aria-label="搜索公共歌单">
-              <button class="btn" id="public-search">搜索</button>
-              <button class="btn" id="public-search-clear" hidden>清除搜索</button>
-            </div>
-            <p class="hint" id="public-note">选择音源后加载歌单。</p>
-            <div id="public-list" class="public-list"></div>
-            <div class="btn-row">
-              <button class="btn small" id="public-prev">上一页</button>
-              <span id="public-page" class="muted">1</span>
-              <button class="btn small" id="public-next">下一页</button>
-              <button class="btn small" id="public-load-rest" hidden>加载剩余歌单</button>
-            </div>
-            <div>
-              <div class="card-title">已选歌单（音乐页展示顺序）</div>
-              <div id="public-selected" class="stack"></div>
-            </div>
+          <div id="playlist-detail-panel" class="playlist-detail-panel">
+            <div id="playlist-detail-empty" class="playlist-detail-empty">选择一个歌单查看详情</div>
           </div>
         </div>
-        
-<div class="card" id="custom-playlists-card">
-          <div class="card-title"><span>自定义歌单管理</span><button class="help-btn" type="button" data-help="custom-playlists" aria-label="自定义歌单帮助">?</button></div>
-          <p class="hint">支持 m3u/m3u8/pls/cue 导入解析歌名歌手（异常行跳过并提示计数），或按提示词调用大模型生成并与手动列表去重合并。定义文件落数据卷自定义歌单目录；删除为硬删除需二次确认。</p>
-          <div class="btn-row">
-            <input type="file" id="custom-import-file" accept=".m3u,.m3u8,.pls,.cue" hidden>
-            <button class="btn" id="custom-import-btn" type="button">导入歌单文件</button>
-            <button class="btn" id="custom-refresh-btn" type="button">刷新列表</button>
+
+        <!-- 固定 id 的 canonical 控件：供 applyConfigToForm/saveConfig 与既有监听使用；界面控件在详情面板内代理 -->
+        <div id="playlist-canonical-inputs" hidden>
+          <input type="checkbox" id="recommend-hot">
+          <input type="checkbox" id="recommend-daily">
+          <input type="checkbox" id="recommend-charts">
+          <input type="checkbox" id="public-playlists-enabled">
+          <input type="checkbox" id="custom-enabled">
+          <input type="checkbox" id="kg-charts">
+          <input type="checkbox" id="wy-charts">
+          <input class="input" id="enabled-charts">
+          <input class="input" id="chart-limit" type="number" min="10" max="200" step="1" inputmode="numeric">
+          <input class="input" id="recommend-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
+          <input class="input" id="category-size" type="number" min="5" max="1000" step="1" inputmode="numeric">
+        </div>
+
+        <div id="playlist-controls-host" hidden>
+          <div id="public-playlists-body" class="playlist-detail-controls">
+            <div class="playlist-detail-settings-head">
+              <span>公共歌单浏览</span>
+              <button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button>
+            </div>
+            <p class="hint">开启列表中的「公共歌单」总开关后，在这里浏览、搜索并选择要展示的公共歌单。</p>
+            <div id="public-users-panel" class="stack" hidden>
+              <div class="btn-row">
+                <select class="input grow" id="public-user" aria-label="配置公共歌单的飞牛音乐用户" disabled>
+                  <option value="">请先选择飞牛音乐用户</option>
+                </select>
+                <button class="btn" id="public-users-retry">刷新用户</button>
+              </div>
+              <p class="hint" id="public-users-note">读取飞牛音乐用户后，分别配置每位用户的公共歌单。</p>
+            </div>
+            <div id="public-playlists-browser" class="stack" hidden>
+              <div class="btn-row">
+                <select class="input" id="public-provider" aria-label="歌单音源"></select>
+                <select class="input" id="public-channel" aria-label="歌单入口"></select>
+                <select class="input" id="public-source" aria-label="洛雪平台" hidden></select>
+                <select class="input" id="public-sort" aria-label="排序" hidden></select>
+              </div>
+              <div class="btn-row">
+                <select class="input grow" id="public-category" aria-label="分类"></select>
+                <button class="btn" id="public-refresh">刷新</button>
+              </div>
+              <div class="btn-row">
+                <input class="input grow" id="public-keyword" placeholder="输入歌单名称关键词搜索公共歌单" aria-label="搜索公共歌单">
+                <button class="btn" id="public-search">搜索</button>
+                <button class="btn" id="public-search-clear" hidden>清除搜索</button>
+              </div>
+              <p class="hint" id="public-note">选择音源后加载歌单。</p>
+              <div id="public-list" class="public-list"></div>
+              <div class="btn-row">
+                <button class="btn small" id="public-prev">上一页</button>
+                <span id="public-page" class="muted">1</span>
+                <button class="btn small" id="public-next">下一页</button>
+                <button class="btn small" id="public-load-rest" hidden>加载剩余歌单</button>
+              </div>
+              <div>
+                <div class="card-title">已选歌单（音乐页展示顺序）</div>
+                <div id="public-selected" class="stack"></div>
+              </div>
+            </div>
           </div>
-          <div class="btn-row">
-            <input class="input grow" id="custom-prompt" placeholder="输入提示词，如：适合深夜加班的轻音乐 20 首" aria-label="生成提示词">
-            <button class="btn" id="custom-generate-btn" type="button">按提示词生成</button>
+          <div id="custom-playlists-body" class="playlist-detail-controls">
+            <div class="playlist-detail-settings-head">
+              <span>自定义歌单管理</span>
+              <button class="help-btn" type="button" data-help="custom-playlists" aria-label="自定义歌单帮助">?</button>
+            </div>
+            <p class="hint">支持 m3u/m3u8/pls/cue 导入解析歌名歌手（异常行跳过并提示计数），或按提示词调用大模型生成并与手动列表去重合并。定义文件落数据卷自定义歌单目录；删除为硬删除需二次确认。</p>
+            <div class="btn-row">
+              <input type="file" id="custom-import-file" accept=".m3u,.m3u8,.pls,.cue" hidden>
+              <button class="btn" id="custom-import-btn" type="button">导入歌单文件</button>
+              <button class="btn" id="custom-refresh-btn" type="button">刷新列表</button>
+            </div>
+            <div class="btn-row">
+              <input class="input grow" id="custom-prompt" placeholder="输入提示词，如：适合深夜加班的轻音乐 20 首" aria-label="生成提示词">
+              <button class="btn" id="custom-generate-btn" type="button">按提示词生成</button>
+            </div>
+            <p class="hint" id="custom-note">自定义歌单关闭时音乐页不展示；改动即时失效缓存并重建。</p>
           </div>
-          <p class="hint" id="custom-note">自定义歌单关闭时音乐页不展示；改动即时失效缓存并重建。</p>
-          <div id="custom-list" class="stack"></div>
         </div>
       
 
-        <h3 class="sub-h2"><span>大模型</span><button class="help-btn" type="button" data-help="llm" aria-label="大模型帮助">?</button></h3>
+      </section>
+      <!-- 大模型 -->
+      <section class="page" id="page-llm">
+        <h2>大模型</h2>
         <div class="card">
           <label class="field"><span>接入方式</span>
             <select class="input" id="llm-provider">
@@ -383,8 +424,8 @@
             <button class="btn small" id="llm-usage-next" type="button">下一页</button>
           </div>
         </div>
-      
       </section>
+
       <!-- 边听边存（收敛：目录设置并入） -->
       <section class="page" id="page-tee">
 
@@ -540,7 +581,7 @@
       <!-- 占位不用 .page 类：仅供 switchPage 识别跳转，不参与页面显隐，避免 hidden 断言误伤 -->
       <div id="legacy-route-map" hidden
         data-quality="source" data-search="source" data-lx="source"
-        data-dirs="tee" data-llm="playlist" data-settings="about"></div>
+        data-dirs="tee" data-llm="llm" data-settings="about"></div>
     </main>
   </div>
 
@@ -549,6 +590,7 @@
     <button class="nav-item active" data-page="overview">概览</button>
     <button class="nav-item" data-page="source">音乐源</button>
     <button class="nav-item" data-page="playlist">歌单</button>
+    <button class="nav-item" data-page="llm">大模型</button>
     <button class="nav-item" data-page="tee">边听边存</button>
     <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>
   </nav>

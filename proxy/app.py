@@ -249,7 +249,7 @@ CONF = {
     "lx_resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "8.0")),
     "lx_probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
-    "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "30")),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
     "search_empty_retry_delay": float(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY_DELAY", "1.2")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
@@ -3501,6 +3501,13 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
                     raw_items = data.get("items")
                     if isinstance(raw_items, list):
                         data["items"] = [it for it in raw_items if is_playable_online_track(it)]
+                    errors = data.get("errors")
+                    if isinstance(errors, dict):
+                        # “skipped (fast return/grace elapsed)” 是已经拿到结果后
+                        # 主动不等慢源，不是失败；混进 errors 会让聚合层误判为
+                        # 部分失败而拒绝缓存，并在每次搜索时重复打警告。
+                        data["errors"] = {k: v for k, v in errors.items()
+                                          if not str(v).startswith("skipped ")}
                     return data
         except Exception as e:
             logger.warning("Failed to fetch online search from musicdl: %s", e)
@@ -5935,8 +5942,8 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                     ordered = entry["items"] + items
                 entry["items"] = deduplicate_online_items(ordered)[:2000]
             if (not pending and not entry["items"] and failed
-                    and not entry.get("abandoned") and not _user_search_stale(entry, scope)
-                    and retries < max(0, min(1, int(CONF.get("search_empty_retry", 1))))):
+                    and not _user_search_stale(entry, scope)
+                    and retries < max(0, int(CONF.get("search_empty_retry", 2)))):
                 delay = max(0.0, float(CONF.get("search_empty_retry_delay", 1.2)))
                 if deadline - asyncio.get_running_loop().time() > delay:
                     logger.info("搜索首屏空结果触发重试: attempt=%d", retries + 1)

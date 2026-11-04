@@ -145,6 +145,81 @@ h2 { display: flex; align-items: center; justify-content: space-between; gap: 10
 .stack[hidden] { display: none; }
 .pad { padding: 8px 0 2px; }
 
+/* -------------------------------------------------- 歌单：列表 + 详情 */
+#playlist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+#playlist-list-panel, #playlist-detail-panel { min-width: 0; }
+
+.playlist-rows { list-style: none; margin: 0; padding: 0; }
+.playlist-row {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 10px;
+}
+.playlist-row.selected { border-color: var(--accent); background: var(--accent-soft); }
+.playlist-toggle { width: 20px; height: 20px; flex: none; }
+.playlist-row-main {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start;
+  gap: 4px; padding: 2px 0; border: 0; border-radius: 6px; background: transparent;
+  color: var(--text); font: inherit; text-align: left; cursor: pointer;
+}
+.playlist-row-main:focus-visible, .playlist-toggle:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.playlist-row-name {
+  max-width: 100%; font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.playlist-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+
+.playlist-detail-panel {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 16px 18px; box-shadow: var(--shadow);
+}
+.playlist-detail-empty { color: var(--muted); font-size: 14px; padding: 28px 8px; text-align: center; }
+.playlist-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.playlist-detail-title { font-size: 16px; font-weight: 700; min-width: 0; overflow-wrap: anywhere; }
+.playlist-detail-sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.playlist-detail-list {
+  display: grid; grid-template-columns: auto 1fr; gap: 6px 12px;
+  margin: 12px 0; font-size: 13px;
+}
+.playlist-detail-list dt { color: var(--muted); white-space: nowrap; }
+.playlist-detail-list dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.playlist-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.playlist-detail-status { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+.playlist-detail-status.error { color: var(--err); }
+.playlist-tracks { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+.playlist-track-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.playlist-track-list.expanded { max-height: 320px; overflow: auto; padding-right: 4px; }
+.playlist-track {
+  display: flex; align-items: baseline; gap: 8px; min-width: 0;
+  padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 13px;
+}
+.playlist-track:last-child { border-bottom: 0; }
+.playlist-track-title {
+  min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.playlist-track-artist {
+  max-width: 45%; flex: none; color: var(--muted); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 详情面板内嵌设置与控件 */
+.playlist-detail-controls { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.playlist-detail-settings { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.playlist-detail-settings-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px; font-weight: 600; font-size: 14px;
+}
+.playlist-detail-settings .switch-row { padding: 6px 0; }
+.playlist-detail-settings .field { margin: 8px 0; }
+
 /* -------------------------------------------------- 音源卡片 */
 .provider-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .provider-card {
@@ -534,3 +609,12 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   .about-donate-note { font-size: 12px; }
   .about-donate-badge { padding: 1px 8px; font-size: 12px; margin-right: 4px; }
 }
+
+/* platform test table */
+.data-table { width:100%; border-collapse:collapse; font-size:13px; }
+.data-table th, .data-table td { padding:6px 8px; border-bottom:1px solid #eee; text-align:left; }
+.data-table tr.ok td:nth-child(2) { color:#2e7d32; font-weight:bold; }
+.data-table tr.err td:nth-child(2) { color:#c62828; font-weight:bold; }
+.progress-bar { position:relative; height:18px; background:#eee; border-radius:9px; overflow:hidden; margin:8px 0; }
+.progress-fill { height:100%; background:#1976d2; transition:width .3s; }
+.progress-bar span { position:absolute; top:0; left:50%; transform:translateX(-50%); font-size:12px; line-height:18px; }

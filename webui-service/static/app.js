@@ -127,55 +127,509 @@ function renderLlmUsage(u) {
   if ($("#llm-usage-page")) $("#llm-usage-page").textContent = `第 ${Math.floor(llmUsageOffset / LLM_USAGE_PAGE_SIZE) + 1} 页，共 ${usageNumber(u.totalDays)} 个记录日`;
 }
 
-/* 任务 5.2：歌单统一列表化——内置与自定义在同一列表管理，每行标注类型与启用状态。 */
+/* 歌单：列表 + 详情面板（层 1 元数据 / 层 2 自定义曲目预览）。 */
+const PLAYLIST_BUILTINS = [
+  {
+    key: "daily", name: "每日推荐", toggle: "recommend-daily",
+    configKey: "FNMUSIC_RECOMMEND_DAILY", source: () => "网易云每日推荐",
+    count: (v) => `${v.FNMUSIC_RECOMMEND_SIZE || "20"} 首`,
+  },
+  {
+    key: "hot", name: "热门榜单推荐", toggle: "recommend-hot",
+    configKey: "FNMUSIC_RECOMMEND_HOT", source: () => "网易云热门榜单",
+    count: (v) => `${v.FNMUSIC_RECOMMEND_SIZE || "20"} 首`,
+  },
+  {
+    key: "charts", name: "排行榜歌单", toggle: "recommend-charts",
+    configKey: "FNMUSIC_RECOMMEND_CHARTS",
+    source: (v) => {
+      const parts = [];
+      if (v.FNMUSIC_KG_CHARTS === "true") parts.push("酷狗");
+      if (v.FNMUSIC_WY_CHARTS === "true") parts.push("网易");
+      return parts.join("/") || "未选择榜单来源";
+    },
+    count: (v) => `${v.FNMUSIC_CHART_LIMIT || "100"} 首/榜`,
+  },
+  {
+    key: "public", name: "公共歌单", toggle: "public-playlists-enabled",
+    configKey: "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", source: () => "公共歌单选择",
+    count: () => `已选 ${publicSelection.length} 个歌单`,
+  },
+  {
+    key: "custom", name: "自定义歌单", toggle: "custom-enabled",
+    configKey: "FNMUSIC_CUSTOM_PLAYLISTS_ENABLED", source: () => "自定义定义文件",
+    count: () => {
+      const total = playlistCustomItems.reduce((sum, item) => sum + Number(item.trackCount || 0), 0);
+      return `${playlistCustomItems.length} 个 / ${total} 首`;
+    },
+  },
+];
+
+let selectedPlaylist = null;        // { kind: "内置"|"自定义", key: "builtin:daily"|"custom:<pid>" }
+let playlistRows = [];              // 最近一次渲染的行（详情面板按稳定 key 查找）
+let playlistCustomItems = [];       // 最近一次 /api/custom-playlists 结果
+let playlistDetailSeq = 0;          // 详情请求序号，避免快速切换时旧响应覆盖
+let playlistDetailItem = null;      // 当前自定义歌单的完整定义（含 tracks）
+let playlistDetailExpanded = false; // 是否展开全部曲目
+
+function playlistRowByKey(key) {
+  return playlistRows.find((row) => row.key === key) || null;
+}
+
+function buildPlaylistRows() {
+  const v = configValues || {};
+  const rows = PLAYLIST_BUILTINS.map((item) => ({
+    key: `builtin:${item.key}`, kind: "内置", name: item.name,
+    enabled: v[item.configKey] === "true", toggle: item.toggle,
+    source: item.source, count: item.count, builtin: item,
+  }));
+  for (const item of playlistCustomItems) {
+    rows.push({
+      key: `custom:${item.id}`, kind: "自定义", name: item.name || "未命名歌单",
+      enabled: !!item.enabled, customId: item.id,
+      trackCount: Number(item.trackCount || 0), item,
+    });
+  }
+  return rows;
+}
+
+function playlistRowHtml(row) {
+  const selected = Boolean(selectedPlaylist && selectedPlaylist.key === row.key);
+  const toggleAttrs = row.toggle
+    ? `data-toggle-for="${escapeHtml(row.toggle)}"`
+    : `data-custom-toggle="${escapeHtml(row.customId)}"`;
+  const count = row.trackCount ? `<span class="muted">${row.trackCount} 首</span>` : "";
+  return `<li class="playlist-row${selected ? " selected" : ""}" data-playlist-key="${escapeHtml(row.key)}">` +
+    `<input type="checkbox" class="playlist-toggle" ${toggleAttrs}` +
+    ` aria-label="${row.enabled ? "停用" : "启用"} ${escapeHtml(row.name)}"${row.enabled ? " checked" : ""}>` +
+    `<button type="button" class="playlist-row-main" data-select-key="${escapeHtml(row.key)}"` +
+    `${selected ? ' aria-current="true"' : ""}>` +
+    `<span class="playlist-row-name">${escapeHtml(row.name)}</span>` +
+    `<span class="playlist-row-meta"><span class="badge dim">${escapeHtml(row.kind)}</span>` +
+    `${count}<span class="badge ${row.enabled ? "" : "dim"}">${row.enabled ? "启用" : "停用"}</span></span>` +
+    `</button></li>`;
+}
+
 async function renderPlaylistUnified() {
   const list = $("#playlist-unified-list");
   if (!list) return;
-  const rows = [];
-  const v = configValues || {};
-  const builtin = [
-    ["每日推荐", "内置", v.FNMUSIC_RECOMMEND_DAILY === "true", "page-playlist", "#recommend-daily"],
-    ["热门榜单推荐", "内置", v.FNMUSIC_RECOMMEND_HOT === "true", "page-playlist", "#recommend-hot"],
-    ["排行榜歌单", "内置", v.FNMUSIC_RECOMMEND_CHARTS === "true", "page-playlist", "#recommend-charts"],
-    ["公共歌单", "内置", v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true", "page-playlist", "#public-playlists-enabled"],
-    ["自定义歌单", "内置", !($("#custom-enabled") && !$("#custom-enabled").checked), "page-playlist", "#custom-enabled"],
-  ];
-  for (const [name, kind, enabled] of builtin) {
-    rows.push({ name, kind, enabled: !!enabled, custom: false });
-  }
   try {
     const data = await api("/api/custom-playlists");
-    const items = Array.isArray(data.items) ? data.items : [];
-    for (const item of items) {
-      rows.push({
-        name: item.name || "未命名歌单", kind: "自定义",
-        enabled: !!item.enabled, custom: true, id: item.id,
-        trackCount: item.trackCount || 0,
-      });
+    playlistCustomItems = Array.isArray(data.items) ? data.items : [];
+  } catch (_) {
+    playlistCustomItems = []; // 自定义列表失败不阻断内置行展示
+  }
+  playlistRows = buildPlaylistRows();
+  if (selectedPlaylist) {
+    const found = playlistRowByKey(selectedPlaylist.key);
+    selectedPlaylist = found ? { kind: found.kind, key: found.key } : null;
+  }
+  list.innerHTML = playlistRows.map(playlistRowHtml).join("") || '<li class="hint">暂无歌单。</li>';
+  syncPlaylistRowToggles();
+}
+
+function syncPlaylistRowToggles() {
+  const list = $("#playlist-unified-list");
+  if (!list) return;
+  list.querySelectorAll("[data-toggle-for]").forEach((input) => {
+    const canonical = document.getElementById(input.dataset.toggleFor);
+    if (!canonical) return;
+    input.checked = canonical.checked;
+    const row = playlistRows.find((item) => item.toggle === input.dataset.toggleFor);
+    if (!row) return;
+    row.enabled = canonical.checked;
+    input.setAttribute("aria-label", `${canonical.checked ? "停用" : "启用"} ${row.name}`);
+    const badge = input.closest(".playlist-row")?.querySelector(".playlist-row-meta .badge:last-child");
+    if (badge) {
+      badge.textContent = canonical.checked ? "启用" : "停用";
+      badge.classList.toggle("dim", !canonical.checked);
     }
-  } catch (_) { /* 自定义列表失败不阻断内置行展示 */ }
-  list.innerHTML = rows.map((r, idx) =>
-    `<div class="playlist-row"><span>${escapeHtml(r.name)}${r.trackCount ? `（${r.trackCount} 首）` : ""}</span>` +
-    `<span class="badge dim">${escapeHtml(r.kind)}</span>` +
-    `<span class="badge ${r.enabled ? "" : "dim"}">${r.enabled ? "启用" : "停用"}</span>` +
-    `<button class="btn small" data-unified-edit="${idx}" type="button">进入编辑</button></div>`
-  ).join("") || '<p class="hint">暂无歌单。</p>';
-  list.querySelectorAll("[data-unified-edit]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const row = rows[Number(btn.dataset.unifiedEdit)];
-      if (!row) return;
-      // 内置行聚焦到对应开关，自定义行聚焦到自定义管理区。
-      const target = document.querySelector(row.custom ? "#custom-playlists-card" : ({
-        "每日推荐": "#recommend-daily", "热门榜单推荐": "#recommend-hot",
-        "排行榜歌单": "#recommend-charts",
-        "公共歌单": "#public-playlists-enabled", "自定义歌单": "#custom-enabled",
-      }[row.name] || "#custom-playlists-card"));
-      if (target && typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "nearest" });
-      if (target && typeof target.focus === "function") try { target.focus({ preventScroll: true }); } catch (_) {}
-    });
   });
 }
 
+function selectPlaylist(key) {
+  const row = playlistRowByKey(key);
+  if (!row) return;
+  selectedPlaylist = { kind: row.kind, key: row.key };
+  $$("#playlist-unified-list .playlist-row").forEach((el) => {
+    const selected = el.dataset.playlistKey === key;
+    el.classList.toggle("selected", selected);
+    const button = el.querySelector("[data-select-key]");
+    if (!button) return;
+    if (selected) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
+  });
+  renderPlaylistDetail();
+  const panel = $("#playlist-detail-panel");
+  if (panel && typeof panel.scrollIntoView === "function") {
+    panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+}
+
+function onBuiltinPlaylistToggle(input, targetId) {
+  const canonical = document.getElementById(targetId);
+  if (!canonical) return;
+  canonical.checked = input.checked;
+  canonical.dispatchEvent(new Event("change", { bubbles: true }));
+  const row = playlistRows.find((item) => item.toggle === targetId);
+  if (!row) return;
+  row.enabled = input.checked;
+  input.setAttribute("aria-label", `${input.checked ? "停用" : "启用"} ${row.name}`);
+  const badge = input.closest(".playlist-row")?.querySelector(".playlist-row-meta .badge:last-child");
+  if (badge) {
+    badge.textContent = input.checked ? "启用" : "停用";
+    badge.classList.toggle("dim", !input.checked);
+  }
+  if (selectedPlaylist && selectedPlaylist.key === row.key) renderPlaylistDetail();
+}
+
+async function setCustomPlaylistEnabled(pid, enabled) {
+  try {
+    await api(`/api/custom-playlists/${encodeURIComponent(pid)}/enable`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !!enabled }),
+    });
+    toast("已保存", "ok");
+    await refreshPlaylistViews();
+    return true;
+  } catch (exc) {
+    toast(exc.message || "保存失败", "fail");
+    return false;
+  }
+}
+
+async function onCustomPlaylistToggle(input, pid) {
+  input.disabled = true;
+  const desired = input.checked;
+  const ok = await setCustomPlaylistEnabled(pid, desired);
+  if (!ok) input.checked = !desired;
+  if (input.isConnected) input.disabled = false;
+}
+
+function formatPlaylistTime(value) {
+  const ts = Number(value);
+  if (!ts) return "—";
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch (_) {
+    return "—";
+  }
+}
+
+function canonicalValue(id, fallback = "") {
+  const el = document.getElementById(id);
+  return el ? String(el.value ?? fallback) : fallback;
+}
+
+function canonicalChecked(id) {
+  const el = document.getElementById(id);
+  return Boolean(el && el.checked);
+}
+
+function playlistConfigSnapshot() {
+  const v = { ...(configValues || {}) };
+  const map = {
+    FNMUSIC_RECOMMEND_HOT: "recommend-hot",
+    FNMUSIC_RECOMMEND_DAILY: "recommend-daily",
+    FNMUSIC_RECOMMEND_CHARTS: "recommend-charts",
+    FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "public-playlists-enabled",
+    FNMUSIC_CUSTOM_PLAYLISTS_ENABLED: "custom-enabled",
+    FNMUSIC_KG_CHARTS: "kg-charts",
+    FNMUSIC_WY_CHARTS: "wy-charts",
+    FNMUSIC_ENABLED_CHARTS: "enabled-charts",
+    FNMUSIC_CHART_LIMIT: "chart-limit",
+    FNMUSIC_RECOMMEND_SIZE: "recommend-size",
+    FNMUSIC_CATEGORY_SIZE: "category-size",
+  };
+  for (const [key, id] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    v[key] = el.type === "checkbox" ? (el.checked ? "true" : "false") : String(el.value ?? "");
+  }
+  return v;
+}
+
+function builtinPlaylistSettingsHtml(row) {
+  const key = row.builtin?.key;
+  if (key === "daily" || key === "hot") {
+    const category = key === "daily" ? `
+      <label class="field"><span>分类单类目标曲量（5–1000，默认 200）</span>
+        <input class="input" type="number" min="5" max="1000" step="1" inputmode="numeric" data-input-for="category-size" value="${escapeHtml(canonicalValue("category-size", "200"))}">
+      </label>
+      <p class="hint">分类歌单跟随每日推荐开关；修改后点击底部「保存并生效」，当日缓存自动重建。</p>` : "";
+    const shared = key === "hot" ? '<p class="hint">与每日推荐共用目标曲量。</p>' : "";
+    return `<div class="playlist-detail-settings">
+      <div class="playlist-detail-settings-head">
+        <span>推荐设置</span>
+        <button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button>
+      </div>
+      <label class="field"><span>目标曲量（5–1000，默认 20）</span>
+        <input class="input" type="number" min="5" max="1000" step="1" inputmode="numeric" data-input-for="recommend-size" value="${escapeHtml(canonicalValue("recommend-size", "20"))}">
+      </label>
+      ${category}
+      ${shared}
+    </div>`;
+  }
+  if (key === "charts") {
+    return `<div class="playlist-detail-settings">
+      <div class="playlist-detail-settings-head">
+        <span>榜单设置</span>
+        <button class="help-btn" type="button" data-help="recommend" aria-label="推荐与公共歌单帮助">?</button>
+      </div>
+      <label class="switch-row"><span>酷狗榜单来源</span><input type="checkbox" data-toggle-for="kg-charts"${canonicalChecked("kg-charts") ? " checked" : ""}></label>
+      <label class="switch-row"><span>网易榜单来源</span><input type="checkbox" data-toggle-for="wy-charts"${canonicalChecked("wy-charts") ? " checked" : ""}></label>
+      <label class="field"><span>启用榜单白名单（逗号分隔榜单 ID，空=全部）</span>
+        <input class="input" data-input-for="enabled-charts" value="${escapeHtml(canonicalValue("enabled-charts", ""))}" placeholder="如 kg_8888,wy_3778678">
+      </label>
+      <label class="field"><span>单榜曲量上限（10–200，默认 100）</span>
+        <input class="input" type="number" min="10" max="200" step="1" inputmode="numeric" data-input-for="chart-limit" value="${escapeHtml(canonicalValue("chart-limit", "100"))}">
+      </label>
+      <p class="hint">修改后点击底部「保存并生效」。</p>
+    </div>`;
+  }
+  return "";
+}
+
+function builtinPlaylistDetailHtml(row) {
+  const v = playlistConfigSnapshot();
+  const enabled = Boolean(row.enabled);
+  const source = row.source(v);
+  const count = row.count(v);
+  const key = row.builtin?.key;
+  const sourceLine = key === "charts"
+    ? `<dt>来源</dt><dd id="playlist-detail-source">${escapeHtml(source)}</dd>`
+    : `<dt>来源</dt><dd>${escapeHtml(source)}</dd>`;
+  let countLine = "";
+  if (key === "custom") countLine = `<dt>歌单</dt><dd>${escapeHtml(count)}</dd>`;
+  else if (key === "public") countLine = `<dt>已选</dt><dd id="playlist-detail-public-count">已选 ${publicSelection.length} 个歌单</dd>`;
+  const controls = (key === "public" || key === "custom")
+    ? `<div id="playlist-detail-controls" class="playlist-detail-controls"></div>` : "";
+  const note = (key === "public" || key === "custom")
+    ? `<p class="playlist-detail-status">${key === "public" ? "公共歌单的浏览与选择在下方完成；修改后保存生效。" : "导入、生成与刷新在下方完成；自定义歌单开关即时生效。"}</p>`
+    : `<p class="playlist-detail-status">内置歌单暂不提供曲目预览；可在音乐页查看实际内容。</p>`;
+  return `<div class="playlist-detail-head"><div>` +
+    `<div class="playlist-detail-title">${escapeHtml(row.name)}</div>` +
+    `<div class="playlist-detail-sub">内置歌单</div></div>` +
+    `<span class="badge ${enabled ? "" : "dim"}">${enabled ? "启用" : "停用"}</span></div>` +
+    `<dl class="playlist-detail-list">` +
+    `<dt>类型</dt><dd>内置</dd>` +
+    `<dt>状态</dt><dd>${enabled ? "已启用" : "已停用"}</dd>` +
+    sourceLine + countLine +
+    `</dl>` +
+    builtinPlaylistSettingsHtml(row) +
+    controls +
+    note;
+}
+
+function customPlaylistDetailHtml(row) {
+  const item = row.item || {};
+  const enabled = Boolean(item.enabled);
+  const source = ({ manual: "手动", import: "导入", prompt: "提示词生成" })[item.source] || item.source || "未知";
+  const trackCount = Number(item.trackCount || 0);
+  return `<div class="playlist-detail-head"><div>` +
+    `<div class="playlist-detail-title">${escapeHtml(row.name)}</div>` +
+    `<div class="playlist-detail-sub">自定义歌单</div></div>` +
+    `<span class="badge ${enabled ? "" : "dim"}">${enabled ? "启用" : "停用"}</span></div>` +
+    `<dl class="playlist-detail-list">` +
+    `<dt>类型</dt><dd>自定义</dd>` +
+    `<dt>状态</dt><dd>${enabled ? "已启用" : "已停用"}</dd>` +
+    `<dt>来源</dt><dd>${escapeHtml(source)}</dd>` +
+    `<dt>曲目数</dt><dd>${trackCount} 首</dd>` +
+    `<dt>创建时间</dt><dd>${escapeHtml(formatPlaylistTime(item.createdAt))}</dd>` +
+    `<dt>更新时间</dt><dd>${escapeHtml(formatPlaylistTime(item.updatedAt))}</dd>` +
+    `</dl>` +
+    `<div class="playlist-detail-actions">` +
+    `<button class="btn small" data-detail-action="toggle-custom" data-custom-id="${escapeHtml(row.customId)}">${enabled ? "停用" : "启用"}</button>` +
+    `<button class="btn small" data-detail-action="delete-custom" data-custom-id="${escapeHtml(row.customId)}">删除</button>` +
+    `<button class="btn small" data-detail-action="manage-custom">管理自定义歌单</button>` +
+    `</div>` +
+    `<div class="playlist-tracks" id="playlist-detail-tracks"><p class="playlist-detail-status">加载中…</p></div>`;
+}
+
+function detachPlaylistControls() {
+  const host = $("#playlist-controls-host");
+  if (!host) return;
+  ["#public-playlists-body", "#custom-playlists-body"].forEach((sel) => {
+    const body = $(sel);
+    if (body && body.parentElement !== host) host.appendChild(body);
+  });
+}
+
+function attachPlaylistControls(key) {
+  const slot = $("#playlist-detail-controls");
+  if (!slot) return;
+  const body = key === "public" ? $("#public-playlists-body") : key === "custom" ? $("#custom-playlists-body") : null;
+  if (!body) return;
+  slot.appendChild(body);
+  if (key === "public") {
+    renderMusicUsers();
+    renderPublicSelected();
+  }
+}
+
+function syncPlaylistDetailControls() {
+  const panel = $("#playlist-detail-panel");
+  if (!panel) return;
+  panel.querySelectorAll("[data-toggle-for]").forEach((input) => {
+    const canonical = document.getElementById(input.dataset.toggleFor);
+    if (!canonical) return;
+    input.checked = canonical.checked;
+  });
+  panel.querySelectorAll("[data-input-for]").forEach((input) => {
+    const canonical = document.getElementById(input.dataset.inputFor);
+    if (!canonical) return;
+    if (document.activeElement !== input) input.value = canonical.value;
+  });
+}
+
+function updatePlaylistDetailMeta() {
+  const row = selectedPlaylist ? playlistRowByKey(selectedPlaylist.key) : null;
+  if (!row || row.kind !== "内置") return;
+  const key = row.builtin?.key;
+  if (key === "charts") {
+    const el = $("#playlist-detail-source");
+    if (el) el.textContent = row.source(playlistConfigSnapshot());
+  }
+  if (key === "public") {
+    const el = $("#playlist-detail-public-count");
+    if (el) el.textContent = `已选 ${publicSelection.length} 个歌单`;
+  }
+}
+
+function renderPlaylistDetail() {
+  const panel = $("#playlist-detail-panel");
+  if (!panel) return;
+  const seq = ++playlistDetailSeq;
+  playlistDetailExpanded = false;
+  playlistDetailItem = null;
+  detachPlaylistControls();
+  const row = selectedPlaylist ? playlistRowByKey(selectedPlaylist.key) : null;
+  if (!row) {
+    selectedPlaylist = null;
+    panel.innerHTML = '<div id="playlist-detail-empty" class="playlist-detail-empty">选择一个歌单查看详情</div>';
+    return;
+  }
+  if (row.kind === "自定义") {
+    panel.innerHTML = customPlaylistDetailHtml(row);
+    syncPlaylistDetailControls();
+    void loadPlaylistTracks(row.item, seq);
+    return;
+  }
+  panel.innerHTML = builtinPlaylistDetailHtml(row);
+  syncPlaylistDetailControls();
+  attachPlaylistControls(row.builtin?.key);
+  updatePlaylistDetailMeta();
+}
+
+async function loadPlaylistTracks(item, seq) {
+  const box = $("#playlist-detail-tracks");
+  if (!box || !item) return;
+  box.innerHTML = '<p class="playlist-detail-status">加载中…</p>';
+  try {
+    const data = await api(`/api/custom-playlists/${encodeURIComponent(item.id)}`, { cache: "no-store" });
+    if (seq !== playlistDetailSeq) return;
+    playlistDetailItem = data.item || {};
+    renderPlaylistTracks();
+  } catch (exc) {
+    if (seq !== playlistDetailSeq) return;
+    box.innerHTML = `<p class="playlist-detail-status error">曲目加载失败：${escapeHtml(exc.message || exc)}</p>` +
+      `<div class="playlist-detail-actions"><button class="btn small" data-detail-action="retry-tracks">重试</button></div>`;
+  }
+}
+
+function renderPlaylistTracks() {
+  const box = $("#playlist-detail-tracks");
+  const item = playlistDetailItem;
+  if (!box || !item) return;
+  const tracks = Array.isArray(item.tracks) ? item.tracks : [];
+  if (!tracks.length) {
+    box.innerHTML = '<p class="playlist-detail-status">暂无曲目</p>';
+    return;
+  }
+  const shown = playlistDetailExpanded ? tracks : tracks.slice(0, 5);
+  const rows = shown.map((track) =>
+    `<li class="playlist-track"><span class="playlist-track-title">${escapeHtml(track.title || "")}</span>` +
+    `<span class="playlist-track-artist">${escapeHtml(track.artist || "")}</span></li>`
+  ).join("");
+  box.innerHTML = `<div class="card-title"><span>曲目预览</span><span class="muted">共 ${tracks.length} 首</span></div>` +
+    `<ul class="playlist-track-list${playlistDetailExpanded ? " expanded" : ""}">${rows}</ul>` +
+    (tracks.length > 5
+      ? `<div class="playlist-detail-actions"><button class="btn small" data-detail-action="toggle-tracks">${playlistDetailExpanded ? "收起" : "展开全部"}</button></div>`
+      : "");
+}
+
+async function deleteCustomPlaylistFromDetail(pid) {
+  const row = playlistRows.find((item) => item.customId === pid);
+  const name = row ? row.name : pid;
+  if (!window.confirm(`删除自定义歌单「${name}」？定义文件将被硬删除，操作不可恢复。`)) return;
+  try {
+    await api(`/api/custom-playlists/${encodeURIComponent(pid)}?confirm=true`, { method: "DELETE" });
+    toast("已删除", "ok");
+    if (selectedPlaylist && selectedPlaylist.key === `custom:${pid}`) selectedPlaylist = null;
+    await refreshPlaylistViews();
+  } catch (exc) {
+    toast(exc.message || "删除失败", "fail");
+  }
+}
+
+async function refreshPlaylistViews() {
+  await renderPlaylistUnified();
+  renderPlaylistDetail();
+}
+
+$("#playlist-unified-list")?.addEventListener("click", (ev) => {
+  const button = ev.target.closest("[data-select-key]");
+  if (button) selectPlaylist(button.dataset.selectKey);
+});
+$("#playlist-unified-list")?.addEventListener("change", (ev) => {
+  const input = ev.target.closest(".playlist-toggle");
+  if (!input) return;
+  if (input.dataset.customToggle) void onCustomPlaylistToggle(input, input.dataset.customToggle);
+  else if (input.dataset.toggleFor) onBuiltinPlaylistToggle(input, input.dataset.toggleFor);
+});
+$("#playlist-detail-panel")?.addEventListener("click", (ev) => {
+  const helpBtn = ev.target.closest(".playlist-detail-settings [data-help]");
+  if (helpBtn) {
+    openHelp(helpBtn.dataset.help, helpBtn);
+    return;
+  }
+  const button = ev.target.closest("[data-detail-action]");
+  if (!button) return;
+  const action = button.dataset.detailAction;
+  if (action === "toggle-tracks") {
+    playlistDetailExpanded = !playlistDetailExpanded;
+    renderPlaylistTracks();
+  } else if (action === "retry-tracks") {
+    if (selectedPlaylist) renderPlaylistDetail();
+  } else if (action === "toggle-custom") {
+    const row = playlistRowByKey(selectedPlaylist ? selectedPlaylist.key : "");
+    if (row) void setCustomPlaylistEnabled(button.dataset.customId, !row.enabled);
+  } else if (action === "delete-custom") {
+    void deleteCustomPlaylistFromDetail(button.dataset.customId);
+  } else if (action === "manage-custom") {
+    selectPlaylist("builtin:custom");
+  }
+});
+$("#playlist-detail-panel")?.addEventListener("change", (ev) => {
+  const input = ev.target.closest("[data-toggle-for]");
+  if (!input) return;
+  const canonical = document.getElementById(input.dataset.toggleFor);
+  if (!canonical) return;
+  canonical.checked = input.checked;
+  canonical.dispatchEvent(new Event("change", { bubbles: true }));
+  syncPlaylistRowToggles();
+  syncPlaylistDetailControls();
+  updatePlaylistDetailMeta();
+});
+$("#playlist-detail-panel")?.addEventListener("input", (ev) => {
+  const input = ev.target.closest("[data-input-for]");
+  if (!input) return;
+  const canonical = document.getElementById(input.dataset.inputFor);
+  if (!canonical) return;
+  canonical.value = input.value;
+  canonical.dispatchEvent(new Event("input", { bubbles: true }));
+  updatePlaylistDetailMeta();
+});
 async function refreshLlmUsage() {
   const el = $("#llm-usage-line");
   if (!el) return;
@@ -327,10 +781,10 @@ window.addEventListener("keydown", (ev) => {
 let activeBottomMenu = null;
 let activeBottomTrigger = null;
 
-const NAV_PAGES = ["overview", "source", "playlist", "tee", "about"];
+const NAV_PAGES = ["overview", "source", "playlist", "llm", "tee", "about"];
 const NAV_REDIRECT = {
   quality: "source", search: "source", lx: "source",
-  dirs: "tee", llm: "playlist", settings: "about",
+  dirs: "tee", llm: "llm", settings: "about",
 };
 
 function resolveNavPage(page) {
@@ -415,12 +869,11 @@ function switchPage(page) {
   closeBottomSubMenu(false);
 
   if (typeof setLlmUsageActive === "function") {
-    setLlmUsageActive(page === "playlist");
+    setLlmUsageActive(page === "llm");
   }
 
   if (page === "playlist") {
-    if (typeof loadCustomPlaylists === "function") loadCustomPlaylists().catch(() => {});
-    if (typeof renderPlaylistUnified === "function") renderPlaylistUnified().catch(() => {});
+    if (typeof refreshPlaylistViews === "function") refreshPlaylistViews().catch(() => {});
   }
   if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
 }
@@ -648,7 +1101,7 @@ async function loadConfig() {
     || Boolean(expectedBuild && !apiBuild);
   $("#webui-build-mismatch").hidden = !mismatch;
   applyConfigToForm();
-  clearDirty();
+  if (!dirty) clearDirty();
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) await loadMusicUsers();
 }
 
@@ -747,7 +1200,7 @@ function applyConfigToForm() {
   $("#liked-size").value = v.FNMUSIC_LIKED_SIZE ?? "20";
   updateLlmLikedSettings();
   refreshLlmUsage();
-  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
+  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "30";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
@@ -786,6 +1239,15 @@ function applyConfigToForm() {
   updateLxAutoSwitchSettings();
   renderLxSourceList();
   renderLxSourceOrder();
+  syncPlaylistRowToggles();
+  syncPlaylistDetailControls();
+  // 公共网易榜单已选但常驻进程未开启时，自动勾选并提示保存
+  if ($("#public-playlists-enabled") && $("#public-playlists-enabled").checked
+      && typeof anyPublicMusicboxSelection === "function" && anyPublicMusicboxSelection()
+      && $("#netease-playlist-resident") && !$("#netease-playlist-resident").checked) {
+    $("#netease-playlist-resident").checked = true;
+    markDirty("公共网易歌单需常驻进程支持，已自动开启，请保存");
+  }
   syncLxAddButton();
   renderPlatformChips();
 }
@@ -850,11 +1312,12 @@ function collectConfig() {
     FNMUSIC_LLM_EXTRA_BODY: $("#llm-extra-body").value.trim(),
     FNMUSIC_LLM_LIKED_ENABLED: $("#llm-liked").checked,
     FNMUSIC_LLM_DAILY_ENABLED: $("#llm-daily").checked,
-    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
+    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "30", 10) || 30,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
-    FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
+    FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked
+      || (typeof anyPublicMusicboxSelection === "function" && anyPublicMusicboxSelection()),
     ...(configSchema.FNMUSIC_NETEASEFREE_URL ? { FNMUSIC_NETEASEFREE_URL: $("#neteasefree-url").value.trim() } : {}),
     ...(configSchema.FNMUSIC_NETEASE_API_BASE ? { FNMUSIC_NETEASE_API_BASE: $("#neteasefree-api-base").value.trim() } : {}),
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
@@ -1142,6 +1605,153 @@ function renderPlatformChips() {
 }
 $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
+$("#platform-test-btn").addEventListener("click", () => {
+  const panel = $("#platform-test-panel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden && !$("#platform-test-tbody").children.length) renderPlatformTestTable([]);
+});
+
+/* -------------------------------------------------------------- 平台批量测试 */
+let platformTestJob = null;
+let platformTestTimer = null;
+let platformTestPolling = false;
+let platformTestResults = [];
+
+function renderPlatformTestTable(results) {
+  const tbody = $("#platform-test-tbody");
+  const table = $("#platform-test-table");
+  if (!results || !results.length) { table.hidden = true; tbody.innerHTML = ""; return; }
+  table.hidden = false;
+  const enabledSet = new Set(platforms.enabled);
+  tbody.innerHTML = results.map((r) => {
+    const ok = r.status === "ok";
+    const status = ok ? "✓" : "✗";
+    const cls = ok ? "ok" : "err";
+    const titles = ok ? (r.titles || [r.title]).filter(Boolean).join("、") : (r.error || "");
+    const isOn = enabledSet.has(r.platform);
+    return `<tr class="${cls}"><td>${escapeHtml(r.platform)}</td><td>${status} <button class="btn small platform-toggle" data-platform="${escapeHtml(r.platform)}" data-on="${isOn}">${isOn ? "关闭" : "开启"}</button></td><td>${r.latency_ms}ms</td><td>${r.count}</td><td title="${escapeHtml(titles)}">${escapeHtml(titles)}</td></tr>`;
+  }).join("");
+  tbody.querySelectorAll(".platform-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = btn.dataset.platform;
+      const set = new Set(platforms.enabled);
+      if (set.has(p)) set.delete(p); else set.add(p);
+      platforms.enabled = Array.from(set);
+      renderPlatformChips();
+      renderPlatformTestTable(platformTestJob ? platformTestJob.results : results);
+      markDirty("musicdl 平台已修改");
+    });
+  });
+}
+
+function updatePlatformTestProgress(done, total) {
+  const wrap = $("#platform-test-progress-wrap");
+  const fill = $("#platform-test-progress");
+  const text = $("#platform-test-progress-text");
+  wrap.hidden = false;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  fill.style.width = pct + "%";
+  text.textContent = `${done}/${total}`;
+}
+
+async function pollPlatformTestJob() {
+  if (platformTestPolling || !platformTestJob || platformTestJob.status === "done") return;
+  platformTestPolling = true;
+  try {
+    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(platformTestJob.job_id));
+    if (!data.ok) throw new Error(data.error || "status failed");
+    platformTestJob.status = data.status;
+    platformTestJob.results = data.results || [];
+    platformTestJob.progress = data.progress || platformTestJob.progress;
+    renderPlatformTestTable(platformTestJob.results);
+    updatePlatformTestProgress(platformTestJob.progress.done, platformTestJob.progress.total);
+    const okCount = data.ok_count ?? platformTestJob.results.filter((r) => r.status === "ok").length;
+    const failCount = (data.fail_count ?? platformTestJob.results.filter((r) => r.status !== "ok").length);
+    $("#platform-test-summary").textContent = `已完成 ${platformTestJob.progress.done}/${platformTestJob.progress.total}，成功 ${okCount}，失败 ${failCount}`;
+    $("#platform-test-enable-ok").textContent = `启用成功的 (${okCount})`;
+    $("#platform-test-disable-fail").textContent = `关闭无效的 (${failCount})`;
+    if (data.status === "done") {
+      $("#platform-test-actions").hidden = false;
+      $("#platform-test-start").disabled = false;
+      $("#platform-test-stop").disabled = true;
+      clearTimeout(platformTestTimer);
+      platformTestTimer = null;
+    } else {
+      platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+    }
+  } catch (exc) {
+    $("#platform-test-summary").textContent = `查询失败：${exc.message}`;
+  } finally {
+    platformTestPolling = false;
+  }
+}
+
+async function startPlatformTest() {
+  const keyword = $("#platform-test-keyword").value.trim() || "周杰伦";
+  const concurrency = parseInt($("#platform-test-concurrency").value, 10) || 4;
+  $("#platform-test-start").disabled = true;
+  $("#platform-test-stop").disabled = false;
+  $("#platform-test-actions").hidden = true;
+  $("#platform-test-summary").textContent = "正在启动…";
+  platformTestResults = [];
+  renderPlatformTestTable([]);
+  updatePlatformTestProgress(0, 0);
+  try {
+    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) });
+    if (!data.ok) throw new Error(data.error || "start failed");
+    platformTestJob = { job_id: data.job_id, status: "running", results: [], progress: { done: 0, total: data.total } };
+    updatePlatformTestProgress(0, data.total);
+    platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+  } catch (exc) {
+    $("#platform-test-summary").textContent = `启动失败：${exc.message}`;
+    $("#platform-test-start").disabled = false;
+    $("#platform-test-stop").disabled = true;
+  }
+}
+
+function stopPlatformTest() {
+  if (platformTestJob) {
+    api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: platformTestJob.job_id }) }).catch(() => {});
+  }
+  clearTimeout(platformTestTimer);
+  platformTestTimer = null;
+  platformTestJob = null;
+  $("#platform-test-start").disabled = false;
+  $("#platform-test-stop").disabled = true;
+  $("#platform-test-summary").textContent = "已停止";
+}
+
+$("#platform-test-start").addEventListener("click", startPlatformTest);
+$("#platform-test-stop").addEventListener("click", stopPlatformTest);
+$("#platform-test-enable-ok").addEventListener("click", () => {
+  const okPlatforms = platformTestJob ? platformTestJob.results.filter((r) => r.status === "ok").map((r) => r.platform) : [];
+  const set = new Set(platforms.enabled);
+  okPlatforms.forEach((p) => set.add(p));
+  platforms.enabled = Array.from(set);
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已启用测试成功的平台");
+});
+$("#platform-test-disable-fail").addEventListener("click", () => {
+  const failPlatforms = platformTestJob ? platformTestJob.results.filter((r) => r.status !== "ok").map((r) => r.platform) : [];
+  const set = new Set(platforms.enabled);
+  failPlatforms.forEach((p) => set.delete(p));
+  platforms.enabled = Array.from(set);
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已关闭测试失败的平台");
+});
+$("#platform-test-enable-all").addEventListener("click", () => {
+  const all = platformTestJob ? platformTestJob.results.map((r) => r.platform) : platforms.registered;
+  platforms.enabled = Array.from(new Set(all));
+  renderPlatformChips();
+  markDirty("已启用全部测试平台");
+});
+$("#platform-test-disable-all").addEventListener("click", () => {
+  platforms.enabled = [];
+  renderPlatformChips();
+  markDirty("已停用全部平台");
+});
 
 /* -------------------------------------------------------------- 公共歌单 */
 const PUBLIC_PROVIDER_OPTIONS = [
@@ -1426,6 +2036,7 @@ function renderPublicSelected() {
       updateResidentAvailability();
       renderPublicSelected(); renderPublicList(); markDirty("公共歌单选择已修改");
     }));
+  if (typeof updatePlaylistDetailMeta === "function") updatePlaylistDetailMeta();
 }
 
 function renderPublicList() {
@@ -2041,6 +2652,7 @@ async function showPublicBrowser() {
 
 $("#public-playlists-enabled").addEventListener("change", async () => {
   const enabled = $("#public-playlists-enabled").checked;
+  if (enabled && (!selectedPlaylist || selectedPlaylist.key !== "builtin:public")) selectPlaylist("builtin:public");
   updateResidentAvailability();
   markDirty(enabled ? "公共歌单已开启" : "公共歌单已关闭");
   renderMusicUsers();
@@ -2125,7 +2737,13 @@ function updateResidentAvailability() {
   // 账号歌单仍需登录；公共网易歌单可匿名常驻，因此仅在两者都无需求时置灰。
   const publicNeedsMusicbox = $("#public-playlists-enabled").checked
     && anyPublicMusicboxSelection();
-  $("#netease-playlist-resident").disabled = !neteaseLoggedIn && !publicNeedsMusicbox;
+  const resident = $("#netease-playlist-resident");
+  resident.disabled = !neteaseLoggedIn && !publicNeedsMusicbox;
+  // 公共网易榜单已选时，自动开启常驻进程，避免榜单被 _selection_runtime_usable 过滤掉。
+  if (publicNeedsMusicbox && !resident.checked) {
+    resident.checked = true;
+    markDirty("公共网易歌单需常驻进程支持，已自动开启");
+  }
 }
 
 async function syncNeteaseAccount(retries = 0) {
@@ -2822,6 +3440,7 @@ $("#lx-auto-switch").addEventListener("change", () => {
 $("#lx-platform-preferred").addEventListener("change", () => markDirty("洛雪平台优选设置需保存后生效"));
 ["#recommend-size", "#category-size", "#chart-limit"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty("目标曲量保存后当日缓存自动重建")));
+if ($("#enabled-charts")) $("#enabled-charts").addEventListener("input", () => markDirty("榜单白名单保存后生效"));
 ["#recommend-hot", "#recommend-daily", "#recommend-charts", "#kg-charts", "#wy-charts", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-playlist-resident", "#custom-enabled"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 ["#direct-netease", "#direct-musicdl", "#direct-lx"].forEach((sel) =>
@@ -3303,58 +3922,7 @@ $("#organize-modal").addEventListener("click", (ev) => {
 })();
 
 /* -------------------------------------------------------------- 自定义歌单 */
-async function loadCustomPlaylists() {
-  const list = $("#custom-list");
-  const note = $("#custom-note");
-  if (!list) return;
-  try {
-    const data = await api("/api/custom-playlists");
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (!items.length) {
-      list.innerHTML = '<p class="hint">暂无自定义歌单，可导入歌单文件或按提示词生成。</p>';
-      return;
-    }
-    list.innerHTML = "";
-    for (const item of items) {
-      const row = document.createElement("div");
-      row.className = "btn-row";
-      const label = document.createElement("span");
-      label.className = "muted";
-      label.textContent = `${item.name || "未命名歌单"}（${item.trackCount || 0} 首）${item.enabled ? "" : "（已停用）"}`;
-      const toggle = document.createElement("button");
-      toggle.className = "btn small";
-      toggle.textContent = item.enabled ? "停用" : "启用";
-      toggle.addEventListener("click", async () => {
-        try {
-          await api(`/api/custom-playlists/${encodeURIComponent(item.id)}/enable`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ enabled: !item.enabled }),
-          });
-          toast("已保存", "ok");
-          await loadCustomPlaylists();
-        } catch (exc) { toast(exc.message || "保存失败", "fail"); }
-      });
-      const del = document.createElement("button");
-      del.className = "btn small";
-      del.textContent = "删除";
-      del.addEventListener("click", async () => {
-        if (!window.confirm(`删除自定义歌单「${item.name || item.id}」？定义文件将被硬删除，操作不可恢复。`)) return;
-        try {
-          await api(`/api/custom-playlists/${encodeURIComponent(item.id)}?confirm=true`, { method: "DELETE" });
-          toast("已删除", "ok");
-          await loadCustomPlaylists();
-        } catch (exc) { toast(exc.message || "删除失败", "fail"); }
-      });
-      row.append(label, toggle, del);
-      list.append(row);
-    }
-    if (note) note.textContent = `共 ${items.length} 个自定义歌单；改动即时失效缓存并重建。`;
-  } catch (exc) {
-    list.innerHTML = `<p class="hint">自定义歌单加载失败：${escapeHtml(exc.message || exc)}</p>`;
-  }
-}
-
-$("#custom-refresh-btn")?.addEventListener("click", () => loadCustomPlaylists());
+$("#custom-refresh-btn")?.addEventListener("click", () => refreshPlaylistViews());
 $("#custom-import-btn")?.addEventListener("click", () => $("#custom-import-file")?.click());
 $("#custom-import-file")?.addEventListener("change", async (ev) => {
   const file = ev.target.files && ev.target.files[0];
@@ -3367,7 +3935,7 @@ $("#custom-import-file")?.addEventListener("change", async (ev) => {
       body: JSON.stringify({ filename: file.name, content }),
     });
     toast(`导入成功：${data.trackCount || 0} 首${data.skipped ? `（跳过异常行 ${data.skipped} 行）` : ""}`, "ok");
-    await loadCustomPlaylists();
+    await refreshPlaylistViews();
   } catch (exc) { toast(exc.message || "导入失败", "fail"); }
 });
 $("#custom-generate-btn")?.addEventListener("click", async () => {
@@ -3379,7 +3947,6 @@ $("#custom-generate-btn")?.addEventListener("click", async () => {
       body: JSON.stringify({ prompt: prompt.trim() }),
     });
     toast(`生成成功：${data.trackCount || 0} 首${data.added ? `（新增 ${data.added} 首）` : ""}`, "ok");
-    await loadCustomPlaylists();
+    await refreshPlaylistViews();
   } catch (exc) { toast(exc.message || "生成失败", "fail"); }
 });
-void loadCustomPlaylists();

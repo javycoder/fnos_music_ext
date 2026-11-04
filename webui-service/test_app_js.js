@@ -1389,8 +1389,8 @@ async function themeHarness(options = {}) {
     return true;
   } }) };
   const radios = ["auto", "light", "dark"].map((value) => Object.assign(stubEl(), { value }));
-  // 任务 5.1：五项导航（概览/音乐源/歌单/边听边存/关于），settings→about、llm→playlist。
-  const pages = ["overview", "about", "playlist", "tee"].map((page) =>
+  // 任务 5.1：六项导航（概览/音乐源/歌单/大模型/边听边存/关于），settings→about、llm→llm。
+  const pages = ["overview", "about", "playlist", "llm", "tee"].map((page) =>
     Object.assign(stubEl(), { id: "page-" + page }));
   const nav = ["about", "about", "playlist", "tee"].map((page) =>
     Object.assign(stubEl(), { dataset: { page } }));
@@ -1506,9 +1506,9 @@ test("设置导航：settings 按映射跳转到关于（5.1 收敛），主题 
     button.dispatch("click");
     assert.deepStrictEqual(h.pages.filter((el) => el.classList.contains("active")).map((el) => el.id), ["page-about"]);
     assert.ok(h.nav.slice(0, 2).every((el) => el.classList.contains("active")));
-    // 旧 llm 页按映射并入歌单。
+    // 旧 llm 页现在是独立页面。
     h.context.switchPage("llm");
-    assert.strictEqual(h.pages.find((el) => el.id === "page-playlist").classList.contains("active"), true);
+    assert.strictEqual(h.pages.find((el) => el.id === "page-llm").classList.contains("active"), true);
   }
 });
 
@@ -2444,19 +2444,19 @@ test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保�
 test("导航收敛：双导航仅五项，旧路由跳转不 404（5.1）", () => {
   reset();
   const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
-  // 桌面侧栏与移动底栏均为五项：概览/音乐源/歌单/边听边存/关于。
-  for (const page of ["overview", "source", "playlist", "tee", "about"]) {
+  // 桌面侧栏与移动底栏均为六项：概览/音乐源/歌单/大模型/边听边存/关于。
+  for (const page of ["overview", "source", "playlist", "llm", "tee", "about"]) {
     assert.ok(html.includes(`data-page="${page}"`), `导航缺失 ${page}`);
   }
   assert.ok(!html.includes('data-page="quality"'), "旧 quality 入口应收敛");
   assert.ok(!html.includes('data-page="search"'), "旧 search 入口应收敛");
   assert.ok(!html.includes('data-page="settings"'), "旧 settings 入口应收敛");
   // 旧深链按映射跳转，不 404。
-  const cases = { quality: "source", search: "source", lx: "source", dirs: "tee", llm: "playlist", settings: "about" };
+  const cases = { quality: "source", search: "source", lx: "source", dirs: "tee", llm: "llm", settings: "about" };
   for (const [oldPage, newPage] of Object.entries(cases)) {
     assert.strictEqual(vm.runInThisContext(`resolveNavPage("${oldPage}")`), newPage, `${oldPage} 应跳转 ${newPage}`);
   }
-  for (const page of ["overview", "source", "playlist", "tee", "about"]) {
+  for (const page of ["overview", "source", "playlist", "llm", "tee", "about"]) {
     assert.strictEqual(vm.runInThisContext(`resolveNavPage("${page}")`), page);
   }
   // 切页高亮五项，不依赖旧分组元素。
@@ -2775,8 +2775,8 @@ test("HTML/CSS 规范：?视觉与触屏规范、大模型页面标题、APP下�
   const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
   const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
 
-  // 页面标题大模型（5.1 收敛：大模型并入歌单页，标题降级为 h3 仍保留规范结构）
-  assert.ok(html.includes('>大模型</span>'), "大模型标题需符合规范");
+  // 页面标题大模型（独立大模型页，标题为 h2）
+  assert.ok(html.includes('<h2>大模型</h2>'), "大模型标题需符合规范");
 
   // 所有下载音质显示改APP下载音质
   assert.ok(html.includes("APP下载音质"), "需包含 APP下载音质 显示");
@@ -2840,6 +2840,21 @@ test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐�
   alipayImg.onerror();
   assert.strictEqual(alipayWrap.hidden, true);
   assert.strictEqual(donateCard.hidden, true);
+});
+
+test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
+  for (const id of ["platform-test-btn", "platform-test-panel", "platform-test-keyword",
+                    "platform-test-concurrency", "platform-test-start", "platform-test-stop",
+                    "platform-test-progress-wrap", "platform-test-progress", "platform-test-progress-text",
+                    "platform-test-summary", "platform-test-actions", "platform-test-enable-ok",
+                    "platform-test-disable-fail", "platform-test-enable-all", "platform-test-disable-all",
+                    "platform-test-table", "platform-test-tbody"]) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 必须包含 id="${id}"`);
+  }
+  assert.ok(css.includes(".data-table"), "CSS 必须包含 .data-table 样式");
+  assert.ok(css.includes(".progress-bar"), "CSS 必须包含 .progress-bar 样式");
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

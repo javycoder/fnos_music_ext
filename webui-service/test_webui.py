@@ -162,30 +162,82 @@ def test_config_view_merges_defaults(env_file):
         assert f"theme-boot.js?build={webui.STATIC_BUILD_ID}" in page
 
 
-def test_nav_converges_to_five_pages_with_legacy_redirects():
-    """任务 5.1：双导航收敛五项，旧路由跳转不 404，settings 主题搬到关于。"""
+def test_nav_converges_to_six_pages_with_legacy_redirects():
+    """任务 5.1：双导航收敛六项（含大模型），旧路由跳转不 404，settings 主题搬到关于。"""
     html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
     import re as _re
     for nav_id in ("nav", "bottom-nav"):
         nav = _re.search(rf'<nav[^>]*id="{nav_id}".*?</nav>', html, _re.S).group(0)
         pages = _re.findall(r'data-page="([^"]+)"', nav)
-        assert pages == ["overview", "source", "playlist", "tee", "about"], pages
+        assert pages == ["overview", "source", "playlist", "llm", "tee", "about"], pages
     # settings 并入关于：主题 radio 保留在关于页。
     about = _re.search(r'<section[^>]*id="page-about".*?</section>', html, _re.S).group(0)
     assert 'name="theme"' in about
     # 旧路由占位保留跳转映射，不 404。
     legacy = _re.search(r'<div[^>]*id="legacy-route-map".*?</div>', html, _re.S).group(0)
     for old, new in {"quality": "source", "search": "source", "lx": "source",
-                      "dirs": "tee", "llm": "playlist", "settings": "about"}.items():
+                      "dirs": "tee", "llm": "llm", "settings": "about"}.items():
         assert f'data-{old}="{new}"' in legacy
 
 
 def test_playlist_unified_list_present():
-    """任务 5.2：歌单统一列表容器存在。"""
+    """任务 5.1：歌单统一列表容器与两栏详情结构存在，重复列表/误导按钮已移除。"""
     html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
     assert 'id="page-playlist"' in html
     assert 'id="playlist-unified-list"' in html
     assert 'id="playlist-unified-note"' in html
+    assert 'id="playlist-grid"' in html
+    assert 'id="playlist-detail-panel"' in html
+    assert 'id="playlist-canonical-inputs"' in html
+    assert 'id="playlist-controls-host"' in html
+    assert 'id="public-playlists-body"' in html
+    assert 'id="custom-playlists-body"' in html
+    assert 'id="playlist-settings"' not in html
+    assert 'id="public-playlists-section"' not in html
+    assert 'id="custom-playlists-card"' not in html
+    assert 'id="custom-list"' not in html
+    assert "进入编辑" not in html
+
+
+def _write_custom_definition(directory: Path, payload: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{payload['id']}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_custom_playlist_detail_returns_tracks(env_file, tmp_path):
+    """任务 1.2：详情接口返回定义与曲目，缺失/非法 id 返回 404。"""
+    custom_dir = tmp_path / "custom_playlists"
+    env_file.write_text(BASE_ENV + f"FNMUSIC_CUSTOM_PLAYLISTS_DIR='{custom_dir}'\n", encoding="utf-8")
+    _write_custom_definition(custom_dir, {
+        "id": "daily-mix", "name": "Daily Mix", "enabled": True, "source": "import",
+        "tracks": [{"title": "A", "artist": "B"}, {"title": "C", "artist": "D"}],
+        "createdAt": 1700000000, "updatedAt": 1700000100,
+    })
+    with authed_client() as client:
+        r = client.get("/api/custom-playlists/daily-mix")
+        assert r.status_code == 200
+        item = r.json()["item"]
+        assert item["name"] == "Daily Mix"
+        assert item["tracks"] == [{"title": "A", "artist": "B"}, {"title": "C", "artist": "D"}]
+        assert isinstance(item["createdAt"], int) and item["createdAt"] == 1700000000
+        assert isinstance(item["updatedAt"], int) and item["updatedAt"] == 1700000100
+        assert client.get("/api/custom-playlists/missing").status_code == 404
+        assert client.get("/api/custom-playlists/bad.id").status_code == 404
+
+
+def test_custom_playlist_detail_caps_tracks(env_file, tmp_path):
+    """任务 1.3：load_definition 仍把曲目截到 1000；时间戳保持 Unix 秒。"""
+    custom_dir = tmp_path / "custom_playlists"
+    env_file.write_text(BASE_ENV + f"FNMUSIC_CUSTOM_PLAYLISTS_DIR='{custom_dir}'\n", encoding="utf-8")
+    _write_custom_definition(custom_dir, {
+        "id": "big", "name": "Big", "enabled": True, "source": "manual",
+        "tracks": [{"title": f"t{i}", "artist": "a"} for i in range(1005)],
+        "createdAt": 1700000000, "updatedAt": 1700000000,
+    })
+    with authed_client() as client:
+        item = client.get("/api/custom-playlists/big").json()["item"]
+        assert len(item["tracks"]) == 1000
+        assert item["createdAt"] == 1700000000  # Unix 秒；前端展示时需 *1000
 
 
 # ------------------------------------------------------------------ PUT 校验 ---
@@ -290,11 +342,25 @@ def test_put_noop_returns_empty_change(env_file):
         assert r.json()["changed"] == []
 
 
+def test_platform_test_start_returns_503_when_musicdl_unreachable(env_file):
+    with authed_client() as client:
+        resp = client.post("/api/platforms/test/start", json={"keyword": "周杰伦", "concurrency": 4})
+        assert resp.status_code == 503
+        assert resp.json().get("ok") is False
+
+
+def test_platform_test_status_unknown_job_returns_404(env_file):
+    with authed_client() as client:
+        resp = client.get("/api/platforms/test/status?job=nonexistent")
+        assert resp.status_code == 404
+        assert resp.json().get("error") == "job not found or expired"
+
+
 def test_search_timeout_defaults_and_saves(env_file):
     with authed_client() as client:
         view = client.get("/api/config")
         assert view.status_code == 200
-        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
+        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "30"
         assert "FNMUSIC_SEARCH_PROBE" not in view.json()["values"]
         assert "FNMUSIC_SEARCH_PROBE" not in view.json()["schema"]
         saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})
