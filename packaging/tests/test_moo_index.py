@@ -104,6 +104,13 @@ def test_formal_tag_and_fpk_version_rules():
     assert mod.package_version("fnmusic-ext-2.11.0-4.fpk") == "2.11.0-4"
     assert mod.package_version("fnmusic-ext-2.11.0.fpk") == "2.11.0"
     assert mod.package_version("fnmusic-ext-2.10.2.fpk") == "2.10.2"
+    # 3.0.0 起架构后缀属于文件名的一部分，不属于安装版本
+    assert mod.package_version("fnmusic-ext-3.0.0-0-amd64.fpk") == "3.0.0-0"
+    assert mod.package_version("fnmusic-ext-3.0.0-0-arm64.fpk") == "3.0.0-0"
+    assert mod.package_arch("fnmusic-ext-3.0.0-0-amd64.fpk") == "amd64"
+    assert mod.package_arch("fnmusic-ext-3.0.0-0-arm64.fpk") == "arm64"
+    assert mod.package_arch("fnmusic-ext-2.11.0-4.fpk") is None
+    assert mod.package_arch("fnmusic-ext-3.0.0-0-x86.fpk") is None  # 只认 amd64/arm64
     assert mod.package_version("fnmusic-ext-2.11.0-04.fpk") is None
     assert mod.package_version("fnmusic-ext-2.11.fpk") is None
     assert mod.package_version("fnmusic-ext-2.11.0-4.fpk.sha256") is None
@@ -177,6 +184,84 @@ def test_select_formal_release_rejects_missing_or_ambiguous_fpk():
     rel = _github_release("v2.11.0", "2.11.0-4")
     rel.pop("assets")
     assert mod.select_formal_release(rel) is None
+
+
+def _arch_asset(version: str, arch: str, sha: str, tag: "str | None" = None) -> dict:
+    name = f"fnmusic-ext-{version}-{arch}.fpk"
+    tag = tag or f"v{version.partition('-')[0]}"
+    return {
+        "name": name,
+        "browser_download_url": f"https://github.com/x/y/releases/download/{tag}/{name}",
+        "size": 23456,
+        "digest": f"sha256:{sha}",
+    }
+
+
+def _dual_arch_release(tag: str, version: str, sha_x86: str, sha_arm: str) -> dict:
+    """3.0.0 起的正式发行：amd64/arm64 两个 FPK 资产共用同一安装版本。"""
+    return {
+        "tag_name": tag,
+        "draft": False,
+        "prerelease": False,
+        "body": f"{tag} 更新说明",
+        "published_at": "2026-11-06T12:00:00Z",
+        "assets": [
+            _arch_asset(version, "amd64", sha_x86, tag),
+            _arch_asset(version, "arm64", sha_arm, tag),
+        ],
+    }
+
+
+def test_select_formal_release_maps_dual_arch_assets():
+    entry = mod.select_formal_release(_dual_arch_release("v3.0.0", "3.0.0-0", _SHA_A, _SHA_B))
+    assert entry is not None
+    assert entry["version"] == "3.0.0-0"
+    assert entry["tag_base"] == "3.0.0"
+    assert entry["fpk"]["name"] == "fnmusic-ext-3.0.0-0-amd64.fpk"
+    assert entry["fpk_by_platform"]["x86"]["name"] == "fnmusic-ext-3.0.0-0-amd64.fpk"
+    assert entry["fpk_by_platform"]["arm"]["name"] == "fnmusic-ext-3.0.0-0-arm64.fpk"
+
+
+@pytest.mark.parametrize("assets", [
+    # 只有单架构：架构不全，拒绝
+    [_arch_asset("3.0.0-0", "amd64", _SHA_A)],
+    # 双架构与无后缀通用包混发：口径歧义，拒绝
+    [_arch_asset("3.0.0-0", "amd64", _SHA_A), _arch_asset("3.0.0-0", "arm64", _SHA_B),
+     _asset("3.0.0-0", _SHA_C)],
+    # 同架构重复资产：歧义，拒绝
+    [_arch_asset("3.0.0-0", "amd64", _SHA_A), _arch_asset("3.0.0-0", "amd64", _SHA_B)],
+    # 两架构安装版本不一致：拒绝
+    [_arch_asset("3.0.0-0", "amd64", _SHA_A), _arch_asset("3.0.0-1", "arm64", _SHA_B)],
+])
+def test_select_formal_release_rejects_incomplete_or_mixed_arch(assets):
+    rel = _dual_arch_release("v3.0.0", "3.0.0-0", _SHA_A, _SHA_B)
+    rel["assets"] = assets
+    assert mod.select_formal_release(rel) is None
+
+
+def test_update_index_dual_arch_release_points_platforms_to_own_assets():
+    rel = mod.select_formal_release(_dual_arch_release("v3.0.0", "3.0.0-0", _SHA_A, _SHA_B))
+    index: dict = {}
+    mod.update_index(index, [rel], "t")
+    mod.validate_index(index)
+    app = index["apps"]["fnmusic-ext"]
+    assert app["version"] == "3.0.0-0"
+    # 顶层口径沿用 x86（amd64）资产
+    assert app["download_url"].endswith("/v3.0.0/fnmusic-ext-3.0.0-0-amd64.fpk")
+    assert app["sha256"] == _SHA_A
+    entry = app["releases"]["3.0.0-0"]
+    assert entry["packages"]["x86"]["sha256"] == _SHA_A
+    assert entry["packages"]["x86"]["download_url"].endswith("fnmusic-ext-3.0.0-0-amd64.fpk")
+    assert entry["packages"]["arm"]["sha256"] == _SHA_B
+    assert entry["packages"]["arm"]["download_url"].endswith("fnmusic-ext-3.0.0-0-arm64.fpk")
+
+
+def test_update_index_rejects_swapped_platform_arch_mapping():
+    rel = mod.select_formal_release(_dual_arch_release("v3.0.0", "3.0.0-0", _SHA_A, _SHA_B))
+    rel["fpk_by_platform"] = {"x86": rel["fpk_by_platform"]["arm"],
+                              "arm": rel["fpk_by_platform"]["x86"]}
+    with pytest.raises(ValueError):
+        mod.update_index({}, [rel], "t")
 
 
 def test_build_release_entry_rejects_version_downgrade():
@@ -400,7 +485,8 @@ def test_packaging_uses_install_version_in_fpk_name_and_manifest():
     build = (root / "packaging/fpk/build.sh").read_text(encoding="utf-8")
     manifest = (root / "packaging/fpk/manifest.in").read_text(encoding="utf-8")
     assert 'VERSION="$(python3 "${REPO_ROOT}/proxy/version.py" --format version)"' in build
-    assert 'FINAL="${OUT_DIR}/fnmusic-ext-${VERSION}.fpk"' in build
+    # 3.0.0 起镜像归档 FPK 按架构后缀命名（无资产时后缀为空，保持历史口径）
+    assert 'FINAL="${OUT_DIR}/fnmusic-ext-${VERSION}${ASSET_ARCH_SUFFIX}.fpk"' in build
     assert 'sed "s/@VERSION@/${VERSION}/"' in build
     assert "version               = @VERSION@" in manifest
 
