@@ -56,6 +56,17 @@ from proxy.fnlog import (  # noqa: E402
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
 from proxy import publicplaylists as pubpl
+from config_jobs import ConfigJobStore
+
+job_store = ConfigJobStore()
+_config_job_tasks: set[asyncio.Task] = set()
+
+
+def compute_config_revision(env_dict: dict | None = None) -> str:
+    values = read_env() if env_dict is None else env_dict
+    content = "\n".join(f"{k}={v}" for k, v in sorted(values.items()))
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
 from proxy.quality_policy import (  # noqa: E402
     QUALITY_LEVELS,
     effective_download_quality,
@@ -1149,6 +1160,11 @@ async def _lifespan(_app: FastAPI):
     finally:
         reaper.cancel()
         resident_task.cancel()
+        tasks = list(_config_job_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         client = getattr(_app.state, "http", None)
         if client is not None:
             await client.aclose()
@@ -1542,11 +1558,17 @@ async def api_config():
         "schema": SCHEMA,
         "webui_build": STATIC_BUILD_ID,
         "env_path": str(ENV_PATH),
+        "revision": compute_config_revision(values),
     }
 
 
 class ConfigBody(BaseModel):
     values: dict
+    base_revision: str | None = None
+
+
+class ConfigJobCreateBody(ConfigBody):
+    idempotency_key: str | None = None
 
 
 class PreviewBody(BaseModel):
@@ -1896,6 +1918,9 @@ async def api_config_put(body: ConfigBody, request: Request):
 
 async def _save_config(body: ConfigBody, request: Request, result: dict):
     before = read_env()
+    if body.base_revision and body.base_revision != compute_config_revision(before):
+        return JSONResponse(status_code=409, content={
+            "ok": False, "category": "config_conflict", "error": "配置已变更，请刷新后重新提交"})
     supplied = body.values or {}
     ignored_keys = sorted(key for key in supplied if key in RETIRED_CONFIG_KEYS)
     supported_values = {key: value for key, value in supplied.items() if key not in RETIRED_CONFIG_KEYS}
@@ -1982,9 +2007,77 @@ async def _save_config(body: ConfigBody, request: Request, result: dict):
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
     result.update(restart_keys=restart_keys, complete=not warnings and all(a["ok"] for a in actions),
+                  new_revision=compute_config_revision(after),
                   values={key: value for key, value in after.items() if key in SCHEMA
                           and SCHEMA[key].get("kind") != "secret"})
     return result
+
+
+async def _run_config_job(job_id: str, request: Request) -> None:
+    job = job_store.get_job(job_id)
+    if job is None:
+        return
+    job_store.update_job(job_id, status="running", phase="validating", progress=5,
+                         message="正在保存配置，一分钟内返回")
+    try:
+        response = await api_config_put(
+            ConfigBody(values=job.payload, base_revision=job.base_revision), request)
+        if isinstance(response, JSONResponse):
+            result = json.loads(response.body)
+            status = "conflict" if response.status_code == 409 else "failed"
+        else:
+            result = response
+            status = "success" if result.get("complete", True) else "partial"
+        job_store.update_job(
+            job_id, status=status, phase="done", progress=100,
+            result=result, new_revision=result.get("new_revision"),
+            error=result.get("error"), message=result.get("error") or "配置保存完成")
+    except asyncio.CancelledError:
+        job_store.update_job(job_id, status="failed", phase="done", progress=100,
+                             error="服务停止，保存结果待核实", message="请刷新运行状态后重试")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("配置保存任务执行异常")
+        job_store.update_job(job_id, status="failed", phase="done", progress=100,
+                             error=redact(str(exc)), message="配置保存失败")
+
+
+@app.post("/api/config/jobs")
+async def api_config_jobs_create(body: ConfigJobCreateBody, request: Request):
+    if body.idempotency_key:
+        existing = job_store.find_by_idempotency_key(body.idempotency_key)
+        if existing is not None:
+            return {"ok": True, "job": existing.to_dict(), "deduplicated": True}
+    active = job_store.get_active_job()
+    if active or _config_save_lock.locked():
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "已有正在处理的配置保存任务，请稍候",
+            "active_job_id": active.job_id if active else None})
+    try:
+        validate_updates({k: v for k, v in body.values.items() if k not in RETIRED_CONFIG_KEYS})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+    job = job_store.create_job(payload=body.values, base_revision=body.base_revision,
+                               idempotency_key=body.idempotency_key)
+    task = asyncio.create_task(_run_config_job(job.job_id, request))
+    _config_job_tasks.add(task)
+    task.add_done_callback(_config_job_tasks.discard)
+    return JSONResponse(status_code=202, content={
+        "ok": True, "job_id": job.job_id, "status": job.status, "phase": job.phase})
+
+
+@app.get("/api/config/jobs/active")
+async def api_config_jobs_active():
+    job = job_store.get_active_job()
+    return {"ok": True, "active": bool(job), "job": job.to_dict() if job else None}
+
+
+@app.get("/api/config/jobs/{job_id}")
+async def api_config_jobs_get(job_id: str):
+    job = job_store.get_job(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "任务不存在"})
+    return {"ok": True, "job": job.to_dict()}
 
 
 @app.get("/api/llm/usage")

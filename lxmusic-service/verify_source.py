@@ -274,8 +274,12 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
 
 
 @serialize_source_operation
-async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict:
-    """端到端校验一个源 URL 并返回结构化报告。"""
+async def verify_url(url: str, *, keywords: Sequence[str] | None = None, quick: bool = False) -> dict:
+    """端到端校验一个源 URL 并返回结构化报告。
+
+    quick=True 时仅执行下载、格式、语法、依赖沙箱及声明平台检查（秒级快速门禁），
+    跳过耗时的多平台歌曲搜索与探活抽样，适用于配置保存前的轻量校验。
+    """
     deadline = time.monotonic() + _VERIFY_BUDGET_S
     import app as lx_app  # 延迟导入
 
@@ -398,7 +402,15 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None) -> dict
             report.update(category="no_platform", message="源未声明任何支持的音乐平台")
             return report
 
-        # 验证所有平台；单项读超时和总预算耗尽都保留已经取得的成功证据。
+        # 快速门禁模式：脚本已成功在 lxserver 沙箱中加载并解析出有效平台，无需进一步抽样探活
+        if quick:
+            report["ok"] = True
+            report["complete"] = True
+            report["category"] = "quick_gate"
+            report["message"] = f"快速门禁校验通过，声明支持平台：{', '.join(usable)}"
+            return report
+
+        # 深度检测模式：验证所有平台；单项读超时和总预算耗尽都保留已经取得的成功证据。
         sample_budget = min(_SAMPLE_BUDGET_S, deadline - time.monotonic())
         report["complete"] = sample_budget > 0
         if sample_budget > 0:

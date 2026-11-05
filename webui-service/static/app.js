@@ -25,6 +25,7 @@ const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserv
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
 let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
+let currentConfigRevision = "";
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let currentPage = "overview";
@@ -598,6 +599,7 @@ async function loadConfig(timeoutMs = 0) {
   const cfg = await api("/api/config", undefined, timeoutMs);
   configValues = cfg.values;
   configPresence = cfg.presence || {};
+  currentConfigRevision = cfg.revision || "";
   configSchema = cfg.schema || {};
   const expectedBuild = typeof window !== "undefined" ? window.FNMUSIC_WEBUI_BUILD || "" : "";
   const apiBuild = cfg.webui_build || "";
@@ -846,6 +848,49 @@ function filterConfigBySchema(values) {
   return Object.fromEntries(Object.entries(values).filter(([key]) => supported.has(key)));
 }
 
+async function pollConfigJob(jobId, onProgress, timeoutMs = 60000) {
+  const deadline = performance.now() + timeoutMs;
+  const interval = globalThis.CONFIG_JOB_POLL_INTERVAL ?? 600;
+  while (performance.now() < deadline) {
+    try {
+      const data = await api(`/api/config/jobs/${encodeURIComponent(jobId)}`, undefined,
+        Math.max(1, deadline - performance.now()));
+      const job = data.job;
+      if (!job) throw new Error("无法获取任务详情");
+      if (onProgress) onProgress(job);
+      if (["success", "partial"].includes(job.status)) return job.result || {};
+      if (["failed", "conflict"].includes(job.status)) throw Object.assign(
+        new Error(job.error || job.message || "保存失败"), {terminal: true});
+    } catch (exc) {
+      if (exc.status === 404 || exc.terminal) throw exc;
+    }
+    if (interval > 0) await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  throw new Error("保存已达到时限，请刷新运行状态查看结果");
+}
+
+async function checkActiveConfigJob() {
+  try {
+    const data = await api("/api/config/jobs/active", undefined, 3000);
+    if (!data.active || !data.job) return;
+    const btn = $("#save-btn");
+    btn.disabled = true;
+    try {
+      await pollConfigJob(data.job.job_id, (job) => {
+        btn.textContent = `保存中（${job.progress || 0}%）…`;
+      });
+      await loadConfig(3000);
+      clearDirty();
+      toast("配置已保存生效", "ok");
+    } catch (exc) {
+      toast("保存任务失败：" + exc.message, "fail");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "保存并生效";
+    }
+  } catch (_) { /* 旧后端可无任务接口 */ }
+}
+
 async function saveConfig() {
   const btn = $("#save-btn");
   if (btn.disabled) return;
@@ -870,11 +915,17 @@ async function saveConfig() {
       ? `保存中（快速确认 ${pendingNew} 个新源，一分钟内返回）…`
       : "保存中（一分钟内返回）…";
     if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
-    const result = await api("/api/config", {
+    let result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values }),
+      body: JSON.stringify({ values, base_revision: currentConfigRevision || null }),
     }, remaining());
+    if (result.job_id && ["pending", "running"].includes(result.status)) {
+      result = await pollConfigJob(result.job_id, (job) => {
+        btn.textContent = `保存中（${job.progress || 0}%）…`;
+      }, remaining());
+    }
+    if (result.new_revision) currentConfigRevision = result.new_revision;
     const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
     const warnings = result.warnings || [];
     const parts = [];
@@ -3365,6 +3416,7 @@ $("#organize-modal").addEventListener("click", (ev) => {
   await loadOrganizeStatus();
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
+  void checkActiveConfigJob();
   if ($("#public-playlists-enabled").checked) await showPublicBrowser();
   setInterval(loadStatus, 15000);
 })();
