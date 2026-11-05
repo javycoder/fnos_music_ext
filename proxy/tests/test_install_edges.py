@@ -75,7 +75,12 @@ log_err() { printf '[ERROR] %s\n' "$*" >&2; }
 cleanup_legacy_sources() { :; }
 remove_conflicting_native_unit() { return 0; }
 reclaim_container() { return 0; }
-ensure_image_current() {
+stage_begin() { :; }
+stage_end() { :; }
+# 3.0.0+：镜像保障统一入口 ensure_app_image（离线资产/现场构建分流见
+# proxy/install_common.sh 与 test_image_bundle.py；此处只验证失败即停在
+# 镜像阶段、不进入健康等待，原始错误保留）
+ensure_app_image() {
     printf 'ensure-image\n' >> "$CALLS"
     if [ "$FAILURE" = ensure ]; then
         printf 'original-ensure-error\n' >&2

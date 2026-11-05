@@ -323,3 +323,21 @@ class TestPayload:
         repo = stage / "app" / "repo"
         assert not list(repo.rglob("__pycache__"))
         assert not [p for p in repo.iterdir() if p.name.startswith(".venv")]
+
+    def test_stage_only_has_no_image_bundle(self, stage: Path):
+        """3.0.0+：--stage-only 结构组装默认不构建镜像（CI runner 有 Docker 也不触发
+        数分钟构建）；镜像资产只由 FPK_IMAGE_ASSETS=require 的正式/CI 打包注入。"""
+        repo = stage / "app" / "repo"
+        assert not (repo / "assets" / "image").exists(), \
+            "stage-only 不应携带镜像资产（FPK_IMAGE_ASSETS 未显式设置时）"
+
+    def test_image_bundle_installer_files_shipped(self, stage: Path):
+        """安装端离线镜像路径依赖的文件必须随包分发。"""
+        repo = stage / "app" / "repo"
+        assert (repo / "proxy/image_bundle.py").is_file(), "payload 缺少 proxy/image_bundle.py"
+        for script, needle in (("install.sh", "ensure_app_image"),
+                               ("extend.sh", "ensure_app_image"),
+                               ("proxy/install_common.sh", "ensure_app_image"),
+                               ("proxy/install_common.sh", "assets/image")):
+            content = (repo / script).read_text(encoding="utf-8")
+            assert needle in content, f"{script} 缺少离线镜像接线（{needle}）"

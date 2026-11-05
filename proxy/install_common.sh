@@ -11,6 +11,19 @@ fi
 # they must print with plain echo instead of log_warn/log_err.
 INSTALL_LOCK_FILE="${FNMUSIC_INSTALL_LOCK_FILE:-/run/fnmusic-ext-install/operation.lock}"
 
+# ------------------------------------------------------------------------------
+# 安装阶段计时（3.0.0+）：单槽顺序计时器，帮助把慢安装归因到具体阶段。
+# 用法：stage_begin "代理依赖" … stage_end "代理依赖"
+# ------------------------------------------------------------------------------
+FNMUSIC_STAGE_T0=0
+stage_begin() {
+    FNMUSIC_STAGE_T0=${SECONDS}
+    log_info "▶ 阶段开始: $1"
+}
+stage_end() {
+    log_info "✔ 阶段完成: $1（耗时 $((SECONDS - FNMUSIC_STAGE_T0))s）"
+}
+
 installation_lock() {
     # flock parent holds this lock; --close prevents systemd/children inheriting it.
     # A chained install -> extend keeps the parent alive. Services never use it.
@@ -264,6 +277,56 @@ remove_owned_container() {
 
 APP_IMAGE="fnmusic-sources:latest"
 BUILD_FINGERPRINT_LABEL="io.fnmusic-ext.build-fingerprint"
+
+# ------------------------------------------------------------------------------
+# 应用镜像保障入口（3.0.0+）：优先随包离线镜像资产，缺失时回落现场构建。
+# 2026-11-03 实测：NAS 现场构建中 apt(88.6s)+pip(131.3s) 占 begin→done 261s 的
+# 约 84%；FPK 内置 CI 预构建归档后，正常安装不再进入 BuildKit。
+# FNMUSIC_IMAGE_BUNDLE: auto（默认，有 assets/image 走离线）| 1（强制离线，资产
+# 不可用即失败）| 0（强制现场构建，兼容旧流程的逃生口）。
+# ------------------------------------------------------------------------------
+# 资产目录在调用时解析（本文件可能在 BASE_DIR 设置前被 source，set -u 下顶层
+# 展开 ${BASE_DIR} 会让纯函数测试直接失败）
+fnmusic_image_bundle_dir() {
+    printf '%s' "${FNMUSIC_IMAGE_BUNDLE_DIR:-${BASE_DIR}/assets/image}"
+}
+
+fnmusic_docker_prefix() {
+    if docker info >/dev/null 2>&1; then
+        printf '%s' "docker"
+    elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+        printf '%s' "sudo docker"
+    else
+        return 1
+    fi
+}
+
+app_image_bundle_mode() {
+    case "${FNMUSIC_IMAGE_BUNDLE:-auto}" in
+        1|true|yes) echo "bundle" ;;
+        0|false|no) echo "build" ;;
+        *) [ -f "$(fnmusic_image_bundle_dir)/manifest.json" ] && echo "bundle" || echo "build" ;;
+    esac
+}
+
+ensure_app_image() {
+    if [ "$(app_image_bundle_mode)" = "bundle" ]; then
+        if ! fnmusic_docker_prefix >/dev/null; then
+            log_err "镜像资产模式要求 Docker 可用，但当前无法访问 docker。"
+            return 1
+        fi
+        log_info "使用随包预构建应用镜像（离线路径，跳过现场构建）。"
+        if ! python3 "${BASE_DIR}/proxy/image_bundle.py" ensure \
+                --bundle-dir "$(fnmusic_image_bundle_dir)" \
+                --docker-cmd "$(fnmusic_docker_prefix)"; then
+            log_err "随包镜像资产校验/导入失败（回退现场构建请设 FNMUSIC_IMAGE_BUNDLE=0）。"
+            return 1
+        fi
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build --pull never || return 1
+        return 0
+    fi
+    ensure_image_current
+}
 
 compute_build_fingerprint() {
     # Compose 自己解析插值/合并；Python 只哈希最终 build 配置与构建输入，

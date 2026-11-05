@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, v2.9.0]
+    branches: [main, dev, "3.0.0", v2.9.0]
   pull_request:
 
 permissions:
@@ -272,3 +272,72 @@ jobs:
           test "$(docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf pid lxserver)" = "$lx_pid"
           docker exec "$name" python -c 'import urllib.request,json; d=json.load(urllib.request.urlopen("http://127.0.0.1:8003/healthz", timeout=3)); assert d.get("ok") is True'
           docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf status lxmusic | grep -q RUNNING
+
+  # 3.0.0+：FPK 内嵌预构建应用镜像归档的完整链路验证——
+  # build.sh 从最终 staging 构建 amd64 镜像并 docker save 归档 → 组装 FPK →
+  # 用 image_bundle.py ensure 把归档重新 load 回 docker 并核对镜像身份，
+  # 确认 NAS 侧离线导入路径（免 apt/pip 现场构建）在 CI 上真实可走。
+  # arm64 归档由 release 侧按同一 build.sh 流程产出（QEMU 交叉构建，耗时较长）。
+  fpk-image-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o /tmp/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64"
+          chmod +x /tmp/fnpack
+      - name: Build FPK with embedded image archive
+        env:
+          FPK_IMAGE_ASSETS: require
+          FPK_IMAGE_ARCH: amd64
+        run: |
+          ./packaging/fpk/build.sh --fnpack /tmp/fnpack --out dist
+          test -s dist/fnmusic-ext-*-amd64.fpk
+          test -s dist/fnmusic-ext-*-amd64.fpk.sha256
+      - name: Reload staged archive and verify image identity
+        run: |
+          staging="$(ls -d packaging/fpk/.build/fpk)"
+          bundle="${staging}/app/repo/assets/image"
+          test -f "${bundle}/manifest.json"
+          # 按清单里的镜像 ID 彻底移除本地镜像（仅删标签会留下悬空镜像，
+          # ensure 会走“补引用”而不是真实 docker load 导入路径）
+          image_id="$(python3 -c "import json,sys;print(json.load(open('${bundle}/manifest.json'))['image_id'])")"
+          docker rmi fnmusic-sources:latest >/dev/null 2>&1 || true
+          docker rmi "${image_id}" >/dev/null 2>&1 || true
+          python3 proxy/image_bundle.py ensure --bundle-dir "${bundle}"
+          python3 - <<'PY'
+          import json, pathlib, subprocess, sys
+          bundle = pathlib.Path("packaging/fpk/.build/fpk/app/repo/assets/image")
+          manifest = json.loads((bundle / "manifest.json").read_text())
+          out = subprocess.run(["docker", "image", "inspect", "fnmusic-sources:latest",
+                                "--format", "{{.Id}} {{.Architecture}}"],
+                               capture_output=True, text=True, check=True).stdout.split()
+          image_id, arch = out[0], out[1]
+          assert image_id == manifest["image_id"], f"{image_id} != {manifest['image_id']}"
+          assert arch == manifest["arch"], f"{arch} != {manifest['arch']}"
+          print(f"bundle reload verified: {image_id[:19]} linux/{arch}")
+          PY
+      - name: Smoke musicdl from the loaded image
+        run: |
+          mkdir -p /tmp/fnrepo-bundle
+          printf '%s\n' 'FNMUSIC_MUSICDL_ENABLED=true' 'FNMUSIC_WEBUI_ENABLED=false' > /tmp/fnrepo-bundle/.env
+          name="fnmusic-ci-bundle"
+          cleanup() { docker logs "$name" 2>&1 | tail -50; docker rm -f "$name"; }
+          trap cleanup EXIT
+          docker run -d --name "$name" --network none -v /tmp/fnrepo-bundle:/repo fnmusic-sources:latest
+          ready=0
+          for attempt in $(seq 1 40); do
+            if docker exec "$name" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8001/healthz", timeout=2)' 2>/dev/null; then
+              ready=1; break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1 || { echo "ERROR: 归档镜像 musicdl 未就绪"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fpk-image-bundle-amd64
+          path: dist/
+          retention-days: 7
