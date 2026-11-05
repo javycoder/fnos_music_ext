@@ -286,7 +286,8 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
                 repo / "container/ensure_lxserver_native.sh")
     shutil.copy(BASE / "container/lxserver_compat.py", repo / "container/lxserver_compat.py")
     compat = _load_module("container/lxserver_compat.py", "native_provision_compat_test")
-    upstream_api = "\n".join((compat.ANCHOR_BTOA, compat.ANCHOR_CALL_OLD, compat.ANCHOR_AES_OLD))
+    upstream_api = "\n".join((compat.ANCHOR_BTOA, compat.ANCHOR_CALL_OLD, compat.ANCHOR_AES_OLD,
+                              compat.ANCHOR_RETRIES))
     for req in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         (repo / req).mkdir()
         (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
@@ -298,6 +299,8 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
         zf.writestr("lx-music-sync-server/index.js", "#!/usr/bin/env node\nrequire('./server/server');\n")
         zf.writestr("lx-music-sync-server/server/server.js", f"#!/usr/bin/env node\n{original_line}\n")
         zf.writestr("lx-music-sync-server/server/server/userApi.js", upstream_api)
+        zf.writestr("lx-music-sync-server/server/server/customSourceHandlers.js",
+                    compat.ANCHOR_CAPABILITIES)
     sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
     native_tarball = repo / "container/lxserver-artifact/music-tag-native-linux-arm64-gnu-0.2.5.tgz"
     package_dir = tmp_path / "native-package" / "package"

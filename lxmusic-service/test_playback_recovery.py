@@ -110,6 +110,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(lxapp, "_POLICY_SIGNATURE", None, raising=False)
     monkeypatch.setattr(lxapp, "_PERSISTED_ENV_CACHE", None, raising=False)
     monkeypatch.setattr(lxapp, "_LAST_UPSTREAM_ORDER", None, raising=False)
+    monkeypatch.setattr(lxapp, "_RESOLVE_TIMEOUT_COOLDOWN", {})
     for cache in (lxapp._SONG_CACHE, lxapp._URL_CACHE, lxapp._URL_INFLIGHT, lxapp._CHAIN_HEALTH):
         cache.clear()
     lxapp._CANDIDATES.invalidate()
@@ -182,6 +183,55 @@ async def test_generation_change_during_last_attempt_does_not_record_old_success
 
 
 # =========================================================== 1 音质阶梯 ==
+
+@pytest.mark.asyncio
+async def test_timeout_cooldown_is_independent_and_recovers(fake_lx, runtime, monkeypatch):
+    fake_lx.sources = [_ready("a.js", ["kw"]), _ready("b.js", ["kw"]), _ready("c.js", ["kw"])]
+    calls = []
+
+    async def attempt(*args, **kwargs):
+        sid = kwargs["script"].id
+        calls.append((sid, kwargs["quality"]))
+        if sid == "a.js":
+            return lxapp._AttemptResult(failure=True)
+        if sid == "b.js":
+            return lxapp._AttemptResult(timeout=True, resolve_timeout=True)
+        return lxapp._AttemptResult(data={"url": "https://media.test/good.mp3",
+            "ext": "mp3", "resolution_quality": kwargs["quality"]})
+
+    monkeypatch.setattr(lxapp, "_attempt_pinned", attempt)
+    async with _media_client() as client:
+        assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard")
+        gen = lxapp._URL_CACHE_GEN
+        key = lxapp._chain_key("b.js", "kw", gen, "standard")
+        assert calls == [("a.js", "standard"), ("b.js", "standard"), ("c.js", "standard")]
+        assert key in lxapp._RESOLVE_TIMEOUT_COOLDOWN
+        assert key not in lxapp._CHAIN_HEALTH
+        calls.clear()
+        assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard")
+        assert calls == [("a.js", "standard"), ("c.js", "standard")]
+        # Other tiers remain independent, and expiry permits another probe.
+        assert lxapp._chain_key("b.js", "kw", gen, "lossless") not in lxapp._RESOLVE_TIMEOUT_COOLDOWN
+        lxapp._RESOLVE_TIMEOUT_COOLDOWN[key] = 0
+        calls.clear()
+        assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard")
+        assert ("b.js", "standard") in calls
+
+
+@pytest.mark.asyncio
+async def test_late_result_after_deadline_is_not_delivered(fake_lx, runtime, monkeypatch):
+    fake_lx.sources = [_ready("a.js", ["kw"])]
+
+    async def late(*args, **kwargs):
+        await asyncio.sleep(.02)
+        return lxapp._AttemptResult(data={"url": "https://media.test/late",
+                                          "resolution_quality": "standard"})
+
+    monkeypatch.setattr(lxapp, "_attempt_pinned", late)
+    async with _media_client() as client:
+        assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard", budget=.01) is None
+    assert not lxapp._CHAIN_HEALTH
+    assert not lxapp._RESOLVE_TIMEOUT_COOLDOWN
 
 
 def test_low_tier_from_first_script_is_stashed_not_returned(

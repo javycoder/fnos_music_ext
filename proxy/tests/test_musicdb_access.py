@@ -80,6 +80,129 @@ def test_privileged_read_raises_then_drops(monkeypatch):
     assert os.getegid() == 1001
 
 
+def test_queries_and_close_stay_inside_privileged_scope(monkeypatch, tmp_path):
+    import sqlite3
+    from proxy import localrecommend as local, recommend
+    ident = _Identity()
+    ident.install(monkeypatch)
+    stages = []
+
+    class Connection:
+        def execute(self, *args, **kwargs):
+            assert os.geteuid() == 0
+            stages.append("query")
+            return self
+
+        def fetchone(self):
+            assert os.geteuid() == 0
+            raise sqlite3.OperationalError("query-stage failure")
+
+        def __iter__(self):
+            assert os.geteuid() == 0
+            return iter([("user",)])
+
+        def close(self):
+            assert os.geteuid() == 0
+            stages.append("close")
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: Connection())
+    assert local.list_user_guids("test") == ["user"]
+    for query in (lambda: local.read_library("test", "user"),
+                  lambda: local._validate_cached_tracks("test", "user", [str(i) for i in range(20)]),
+                  lambda: local._eligible_guids("test", "user")):
+        with pytest.raises(sqlite3.OperationalError, match="query-stage"):
+            query()
+        assert os.geteuid() == 1000
+    assert stages.count("close") == 4
+
+
+def test_concurrent_reader_cannot_borrow_temporary_root(monkeypatch):
+    ident = _Identity()
+    ident.install(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    observations = []
+    errors = []
+
+    def first():
+        try:
+            with musicdb.privileged_read():
+                entered.set()
+                assert release.wait(3)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def second():
+        try:
+            assert entered.wait(3)
+            with musicdb.privileged_read():
+                observations.append(os.geteuid())
+        except BaseException as exc:
+            errors.append(exc)
+
+    a, b = threading.Thread(target=first), threading.Thread(target=second)
+    a.start(); b.start()
+    assert entered.wait(3)
+    b.join(.1)
+    assert b.is_alive()
+    release.set()
+    a.join(3); b.join(3)
+    assert not errors
+    assert observations == [0]
+    assert os.geteuid() == 1000
+
+
+@pytest.mark.skipif(os.name != "posix" or getattr(os, "geteuid", lambda: -1)() != 0,
+                    reason="requires an isolated Linux root test process")
+def test_linux_restricted_sqlite_query_and_identity_restoration(tmp_path):
+    """Exercise real directory traversal, SQLite WAL reads and failing queries."""
+    import sqlite3
+    import subprocess
+    import sys
+    db = tmp_path / "restricted" / "music.db"
+    db.parent.mkdir(mode=0o700)
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE user(id INTEGER, guid TEXT)")
+    con.execute("INSERT INTO user VALUES(1,'user')")
+    con.commit()
+    code = """
+import os,sqlite3,sys,threading
+from proxy import musicdb,localrecommend as local
+path=sys.argv[1]
+os.setegid(65534);os.seteuid(65534)
+try:
+    sqlite3.connect('file:'+path+'?mode=ro',uri=True)
+except sqlite3.OperationalError:
+    pass
+else:
+    raise AssertionError('directory restriction not reproduced')
+assert local.list_user_guids(path)==['user']
+assert os.geteuid()==65534 and os.getegid()==65534
+try:
+    with local.rec._music_db(path) as con:
+        con.execute('SELECT missing FROM user').fetchall()
+except sqlite3.OperationalError:
+    pass
+assert os.geteuid()==65534 and os.getegid()==65534
+seen=[]
+def read():
+    for _ in range(10):
+        assert local.list_user_guids(path)==['user']
+    with musicdb.as_service_user():seen.append(os.geteuid())
+threads=[threading.Thread(target=read) for _ in range(3)]
+for thread in threads:thread.start()
+for thread in threads:thread.join()
+assert seen==[65534]*3
+print('restricted query, WAL, exception and concurrent identity PASS')
+"""
+    try:
+        result = subprocess.run([sys.executable, "-c", code, str(db)], capture_output=True,
+                                text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+    finally:
+        con.close()
+
+
 def test_privileged_read_drops_on_error(monkeypatch):
     ident = _Identity()
     ident.install(monkeypatch)

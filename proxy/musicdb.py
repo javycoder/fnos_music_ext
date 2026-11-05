@@ -24,7 +24,7 @@ import os
 import threading
 
 # root 有效身份的持有计数。非零表示某个只读查询正在以 root 运行。
-_LEASE = threading.Condition(threading.Lock())
+_LEASE = threading.Condition(threading.RLock())
 _LEASED = 0
 
 
@@ -67,20 +67,22 @@ def _drop(saved_uid: int, saved_gid: int) -> None:
 def privileged_read():
     """以 root 有效身份执行一次只读查询，结束时降回并释放租约。"""
     global _LEASED
-    if not _can_raise():
-        yield
-        return
     with _LEASE:
+        # Identity checks and the entire connection lifetime must be serialized.
+        # Another reader must never mistake a temporary root lease for its own
+        # original identity and continue querying after that lease is dropped.
+        if not _can_raise():
+            yield
+            return
         saved = _raise_to_root()
         if saved is None:
             # 无法提权时维持原身份，让调用方得到真实的权限错误。
             yield
             return
         _LEASED += 1
-    try:
-        yield
-    finally:
-        with _LEASE:
+        try:
+            yield
+        finally:
             try:
                 _drop(*saved)
             finally:
@@ -95,8 +97,7 @@ def as_service_user():
     用于写文件、创建目录等必须以降权身份进行的操作，避免撞上另一个线程
     正在进行的官方库只读查询。官方库读取本身不要调用它，否则自死锁。
     """
-    if _can_raise() or getattr(os, "geteuid", lambda: 0)() == 0:
-        with _LEASE:
-            while _LEASED:
-                _LEASE.wait()
-    yield
+    with _LEASE:
+        while _LEASED:
+            _LEASE.wait()
+        yield

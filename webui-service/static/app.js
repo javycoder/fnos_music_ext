@@ -66,6 +66,9 @@ const PUBLIC_FAILED_TTL_MS = 30 * 1000;
 const MAX_PUBLIC_DETAIL_CONCURRENCY = 2;
 const publicDetailAbortControllers = new Set();
 const publicDetailInflight = new Map();
+let publicDetailRun = null;
+let publicDetailRunUser = "";
+let publicProcessSnapshot = null;
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
@@ -501,6 +504,15 @@ function formatVersionLabel(version) {
 async function loadStatus() {
   try {
     const st = await api("/api/status");
+    publicProcessSnapshot = { at: Date.now(), processes: st.processes || {} };
+    for (const item of publicSelection) {
+      if (item._detail_status === "stopped"
+          && publicProcessSnapshot.processes[publicUiProviderOf(item)]?.state === "RUNNING") {
+        item._detail_status = "idle";
+        item._detail_failed = false;
+      }
+    }
+    void ensurePublicSelectionDetails();
     $("#brand-version").textContent = formatVersionLabel(st.version);
     $("#sidebar-foot").textContent = `${PROVIDER_LABEL[st.current_provider] || st.current_provider}`;
     $("#ov-provider-body").innerHTML =
@@ -1082,6 +1094,7 @@ async function loadMusicUsers() {
       $("#public-users-retry").disabled = false;
       renderMusicUsers();
       renderPublicSelected();
+      if (publicUsersReady) void ensurePublicSelectionDetails();
       updateResidentAvailability();
     }
   }
@@ -1096,6 +1109,7 @@ async function selectPublicUser(guid) {
   publicSelection = publicSelectionMap[publicUserGuid] || [];
   renderMusicUsers();
   renderPublicSelected();
+  void ensurePublicSelectionDetails();
   if (publicUserGuid && $("#public-playlists-enabled").checked) await showPublicBrowser();
 }
 
@@ -1132,6 +1146,7 @@ function setPublicSelection(item, selected) {
       provider: item.provider, source: item.source, kind: item.kind, id: String(item.id),
       _name: item.name || "", _cover_url: item.cover_url || "", _track_count: item.track_count || 0,
     });
+    setPublicDetailCache(publicEntryKey(item), item, true);
   } else {
     publicSelection = publicSelection.filter((it) => publicEntryKey(it) !== publicEntryKey(item));
   }
@@ -1140,6 +1155,7 @@ function setPublicSelection(item, selected) {
   updateResidentAvailability();
   markDirty("公共歌单选择已修改");
   renderPublicList();
+  void ensurePublicSelectionDetails();
   return true;
 }
 
@@ -1179,12 +1195,8 @@ function initPublicDetailCacheFromStorage() {
   for (const [key, record] of Object.entries(stored)) {
     if (!record || typeof record !== "object") continue;
     if (record.failed) {
-      if (record.failedAt && (now - record.failedAt < PUBLIC_FAILED_TTL_MS)) {
-        publicDetailCache.set(key, { failed: true, failedAt: record.failedAt });
-      } else {
-        delete stored[key];
-        changed = true;
-      }
+      delete stored[key];
+      changed = true;
     } else if (record.name && String(record.name).trim() && record.cachedAt && (now - record.cachedAt < PUBLIC_METADATA_TTL_MS)) {
       publicDetailCache.set(key, {
         name: String(record.name).trim(),
@@ -1245,13 +1257,12 @@ function renderPublicSelected() {
   const box = $("#public-selected");
   if (!box) return;
   box.innerHTML = publicSelection.length ? publicSelection.map((item, index) => {
-    // 浏览/默认榜单已提供的元数据仅在内存中缓存，避免每次 render 频繁读写 localStorage
+    // Unified cache entry preserves its original expiry when rendering.
     if (item._name) {
       const key = publicEntryKey(item);
       if (!publicDetailCache.has(key)) {
-        publicDetailCache.set(key, {
+        setPublicDetailCache(key, {
           name: item._name, cover_url: item._cover_url || "", track_count: item._track_count || 0,
-          cachedAt: Date.now(),
         });
       }
     }
@@ -1260,14 +1271,18 @@ function renderPublicSelected() {
     let title = "";
     if (item._name) {
       title = escapeHtml(item._name);
+    } else if (item._detail_status === "stopped") {
+      title = "音源未运行";
     } else if (item._detail_status === "unavailable") {
       title = "音源不可用";
     } else if (item._detail_status === "error" || item._detail_failed) {
       title = "名称获取失败";
-    } else {
+    } else if (item._detail_status === "loading") {
       title = "正在获取歌单名称…";
+    } else {
+      title = "等待获取歌单名称";
     }
-    const showRetry = item._detail_failed || item._detail_status === "error" || item._detail_status === "unavailable";
+    const showRetry = item._detail_failed || ["error", "unavailable", "stopped"].includes(item._detail_status);
     return `
     <div class="public-selected">
       <img src="${escapeHtml(item._cover_url || "")}" alt="" ${item._cover_url ? "" : "hidden"}>
@@ -1295,6 +1310,7 @@ function renderPublicSelected() {
     btn.addEventListener("click", () => {
       publicSelection.splice(Number(btn.dataset.publicRemove), 1);
       stashPublicUser(true);
+      void ensurePublicSelectionDetails();
       updateResidentAvailability();
       renderPublicSelected(); renderPublicList(); markDirty("公共歌单选择已修改");
     }));
@@ -1395,30 +1411,53 @@ function abortActivePublicDetailRequests() {
   }
   publicDetailAbortControllers.clear();
   publicDetailInflight.clear();
+  publicDetailRun = null;
 }
 
 async function ensurePublicSelectionDetails() {
-  const browser = $("#public-playlists-browser");
-  if (!browser || browser.hidden) return;
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) return;
+  // Removing entries cancels only their own work. Browsing never cancels names.
+  const keys = new Set(publicSelection.map(publicEntryKey));
+  for (const ctrl of publicDetailAbortControllers) {
+    if (!keys.has(ctrl.publicKey)) ctrl.abort();
+  }
+  if (publicDetailRun && publicDetailRunUser === publicUserGuid) return publicDetailRun;
+  publicDetailRunUser = publicUserGuid;
+  const run = runPublicSelectionDetails();
+  publicDetailRun = run;
+  try {
+    await run;
+  } finally {
+    if (publicDetailRun === run) {
+      publicDetailRun = null;
+      // Entries added while workers were busy join the next bounded queue.
+      if (publicSelection.some((item) => !item._name && !item._detail_failed
+          && !["error", "unavailable"].includes(item._detail_status))) {
+        void ensurePublicSelectionDetails();
+      }
+    }
+  }
+}
+
+async function runPublicSelectionDetails() {
   const seq = ++publicSelectionDetailSeq;
   const currentUserGuid = publicUserGuid;
-  abortActivePublicDetailRequests();
 
-  let hasCacheHit = false;
   for (const item of publicSelection) {
     if (item._name) {
       item._detail_status = "success";
       item._detail_failed = false;
       continue;
     }
-    if (applyPublicDetailCache(item)) {
-      hasCacheHit = true;
-    } else {
-      item._detail_status = "idle";
-      item._detail_failed = false;
+    if (!applyPublicDetailCache(item)) {
+      const process = publicProcessSnapshot?.processes[publicUiProviderOf(item)];
+      const stopped = publicProcessSnapshot && Date.now() - publicProcessSnapshot.at < 30000
+        && ["STOPPED", "EXITED", "FATAL"].includes(process?.state);
+      item._detail_status = stopped ? "stopped" : "idle";
+      item._detail_failed = Boolean(stopped);
     }
   }
-  if (hasCacheHit) renderPublicSelected();
+  renderPublicSelected();
 
   const toFetch = [];
   for (const item of publicSelection) {
@@ -1447,6 +1486,7 @@ async function ensurePublicSelectionDetails() {
         }
         const item = toFetch[queueIndex++];
         const key = publicEntryKey(item);
+        if (!publicSelection.includes(item)) continue;
 
         if (publicDetailInflight.has(key)) {
           activeWorkers++;
@@ -1479,6 +1519,8 @@ async function ensurePublicSelectionDetails() {
         renderPublicSelected();
 
         const controller = new AbortController();
+        controller.publicKey = key;
+        let unavailable = false;
         publicDetailAbortControllers.add(controller);
         const timer = setTimeout(() => {
           try { controller.abort(); } catch (_) {}
@@ -1488,24 +1530,28 @@ async function ensurePublicSelectionDetails() {
         const fetchPromise = (async () => {
           try {
             const detail = await fetchPublicItemDetail(item, controller.signal);
-            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) return;
+            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid
+                || !publicSelection.includes(item)) return;
             setPublicDetailCache(key, {
               name: detail.name || "",
               cover_url: detail.cover_url || "",
               track_count: detail.track_count || 0,
             }, true);
-          } catch (_) {
+          } catch (exc) {
             if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) return;
+            if (!publicSelection.includes(item)) return;
             setPublicDetailCache(key, { failed: true, failedAt: Date.now() });
+            unavailable = exc.status === 503 && /未运行|not.running|not.started/i.test(exc.message);
           } finally {
             clearTimeout(timer);
             publicDetailAbortControllers.delete(controller);
-            publicDetailInflight.delete(key);
+            if (publicDetailInflight.get(key) === fetchPromise) publicDetailInflight.delete(key);
             activeWorkers--;
             if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
+              if (unavailable) item._detail_status = "unavailable";
               renderPublicSelected();
             }
             scheduleNext();
@@ -1539,6 +1585,9 @@ async function retryPublicDetail(index) {
   try {
     await startPreview(uiProvider);
   } catch (_) {}
+  publicProcessSnapshot = null;
+  delete item._detail_failed;
+  item._detail_status = "idle";
   await ensurePublicSelectionDetails();
 }
 
@@ -1670,6 +1719,7 @@ function invalidatePublicBrowse() {
 
 async function reloadPublicBrowser(withCapabilities = false) {
   const seq = invalidatePublicBrowse();
+  void ensurePublicSelectionDetails();
   if (withCapabilities) {
     await loadPublicCapabilities(seq);
     if (seq !== publicState.seq) return;

@@ -53,14 +53,8 @@ def _features(row: dict) -> dict[str, tuple[str, ...]]:
 
 
 def read_library(db_path: str, user_guid: str) -> list[dict]:
-    try:
-        from . import musicdb
-    except ImportError:
-        import musicdb
-    with musicdb.privileged_read():
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-    con.row_factory = sqlite3.Row
-    try:
+    with rec._music_db(db_path) as con:
+        con.row_factory = sqlite3.Row
         con.execute("BEGIN")
         user = con.execute("SELECT id FROM user WHERE guid = ?", (user_guid,)).fetchone()
         if user is None:
@@ -105,8 +99,6 @@ def read_library(db_path: str, user_guid: str) -> list[dict]:
             row["features"] = _features(row)
             result.append(row)
         return result
-    finally:
-        con.close()
 
 
 def _age_days(timestamp, now: float) -> float:
@@ -214,13 +206,7 @@ def select_tracks(
 def _validate_cached_tracks(db_path: str, user_guid: str, guids: list[str]) -> bool:
     if len(guids) != PLAYLIST_SIZE or len(set(guids)) != PLAYLIST_SIZE:
         return False
-    try:
-        from . import musicdb
-    except ImportError:
-        import musicdb
-    with musicdb.privileged_read():
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-    try:
+    with rec._music_db(db_path) as con:
         con.execute("BEGIN")
         user = con.execute("SELECT id FROM user WHERE guid = ?", (user_guid,)).fetchone()
         if user is None:
@@ -243,8 +229,6 @@ def _validate_cached_tracks(db_path: str, user_guid: str, guids: list[str]) -> b
         rows = con.execute(query, (*guids, user_id)).fetchall()
         valid_guids = {row[0] for row in rows}
         return len(valid_guids) == PLAYLIST_SIZE and valid_guids == set(guids)
-    finally:
-        con.close()
 
 
 def _load_or_build(user_guid: str, db_path: str) -> dict:
@@ -327,22 +311,13 @@ def _account(user_guid: str) -> bool:
 
 
 def list_user_guids(db_path: str) -> list[str]:
-    con = None
     try:
-        try:
-            from . import musicdb
-        except ImportError:
-            import musicdb
-        with musicdb.privileged_read():
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-        return [str(row[0]) for row in con.execute("SELECT guid FROM user ORDER BY id")
-                if row[0] and _account(str(row[0]))]
+        with rec._music_db(db_path) as con:
+            return [str(row[0]) for row in con.execute("SELECT guid FROM user ORDER BY id")
+                    if row[0] and _account(str(row[0]))]
     except sqlite3.Error as error:
         logger.warning("liked user discovery failed: %s", error)
         return []
-    finally:
-        if con is not None:
-            con.close()
 
 
 def current_source_fingerprint(conf: dict | None = None) -> str:
@@ -408,8 +383,7 @@ def _unlink(path: str) -> None:
 
 def _eligible_guids(db_path: str, user_guid: str) -> set[str]:
     """Read-only snapshot: account existence and independent 20-song gate."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-    try:
+    with rec._music_db(db_path) as con:
         con.execute("BEGIN")
         user = con.execute("SELECT id FROM user WHERE guid = ?", (user_guid,)).fetchone()
         if user is None or not _account(user_guid):
@@ -422,8 +396,6 @@ def _eligible_guids(db_path: str, user_guid: str) -> set[str]:
                AND NOT EXISTS (SELECT 1 FROM favorite_track ft
                                 WHERE ft.track_id = t.id AND ft.user_id = ?)
         """, (user[0],))}
-    finally:
-        con.close()
 
 
 def _valid_batch(cached: dict | None, user_guid: str, fingerprint: str, db_path: str) -> bool:

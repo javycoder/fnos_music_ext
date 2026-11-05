@@ -155,7 +155,154 @@ function resetTestState() {
   publicSelection = [];
   publicDetailAbortControllers.clear();
   publicDetailInflight.clear();
+  publicDetailRun = null;
+  publicDetailRunUser = "";
+  publicProcessSnapshot = null;
 }
+
+test("浏览名称持久化，刷新后恢复且渲染不延长有效期", async () => {
+  resetTestState();
+  configSchema = {};
+  const item = { provider: "lx", source: "wy", kind: "playlist", id: "browse",
+    name: "已知名称", cover_url: "cover", track_count: 12 };
+  setPublicSelection(item, true);
+  await tick(0);
+  const key = publicEntryKey(item);
+  const before = JSON.parse(localStore.get(PUBLIC_METADATA_STORAGE_KEY))[key].cachedAt;
+  renderPublicSelected();
+  publicDetailCache.clear();
+  initPublicDetailCacheFromStorage();
+  publicSelection = [{ provider: "lx", source: "wy", kind: "playlist", id: "browse" }];
+  await ensurePublicSelectionDetails();
+  assert.strictEqual(publicSelection[0]._name, "已知名称");
+  assert.strictEqual(publicDetailCache.get(key).cachedAt, before);
+  assert.strictEqual(fetchCalls.filter((c) => c.path.endsWith("/browse")).length, 0);
+});
+
+test("分类请求阻塞时仍立即补名，重复浏览不取消名称请求", async () => {
+  resetTestState();
+  configSchema = {};
+  const item = { provider: "lx", source: "wy", kind: "playlist", id: "independent" };
+  publicSelection = [item];
+  const originalCategories = loadPublicCategories;
+  const originalList = loadPublicList;
+  let releaseCategory, releaseDetail, aborted = false;
+  loadPublicCategories = () => new Promise((r) => { releaseCategory = r; });
+  loadPublicList = async () => {};
+  enqueue("/app/fnmusic-ext/api/public-playlists/independent", async (opts) => {
+    opts.signal.addEventListener("abort", () => { aborted = true; });
+    await new Promise((r) => { releaseDetail = r; });
+    return { ok: true, data: { name: "独立补名" } };
+  });
+  try {
+    const browse = reloadPublicBrowser();
+    await tick(0);
+    assert.strictEqual(item._detail_status, "loading");
+    assert.strictEqual(fetchCalls.filter((c) => c.path.endsWith("/independent")).length, 1);
+    const repeat = ensurePublicSelectionDetails();
+    assert.strictEqual(aborted, false);
+    releaseDetail();
+    await repeat;
+    assert.strictEqual(item._name, "独立补名");
+    releaseCategory();
+    await browse;
+  } finally {
+    loadPublicCategories = originalCategories;
+    loadPublicList = originalList;
+  }
+});
+
+test("队列只有实际在途显示加载，移除条目停止其请求", async () => {
+  resetTestState();
+  configSchema = {};
+  publicSelection = ["q1", "q2", "q3"].map((id) => ({
+    provider: "lx", source: "wy", kind: "playlist", id,
+  }));
+  let release1, release2, aborted = false;
+  enqueue("/app/fnmusic-ext/api/public-playlists/q1", async (opts) => {
+    opts.signal.addEventListener("abort", () => { aborted = true; });
+    await new Promise((r) => { release1 = r; });
+    return { ok: true, data: { name: "被移除" } };
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/q2", async () => {
+    await new Promise((r) => { release2 = r; });
+    return { ok: true, data: { name: "第二" } };
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/q3", { ok: true, data: { name: "第三" } });
+  const work = ensurePublicSelectionDetails();
+  await tick(0);
+  assert.strictEqual(publicSelection[2]._detail_status, "idle");
+  assert.ok($("#public-selected").innerHTML.includes("等待获取歌单名称"));
+  publicSelection.shift();
+  void ensurePublicSelectionDetails();
+  assert.ok(aborted);
+  release1(); release2();
+  await work;
+  assert.strictEqual(publicDetailCache.has("lx|wy|playlist|q1"), false);
+  assert.strictEqual(publicSelection[1]._name, "第三");
+});
+
+test("确认音源停止时直接提示，自动补名不启动音源", async () => {
+  resetTestState();
+  configSchema = {};
+  publicSelection = [{provider:"musicbox",source:"netease",kind:"playlist",id:"stopped"}];
+  publicProcessSnapshot = {at:Date.now(),processes:{musicbox:{state:"STOPPED"}}};
+  await ensurePublicSelectionDetails();
+  assert.strictEqual(publicSelection[0]._detail_status, "stopped");
+  assert.ok($("#public-selected").innerHTML.includes("音源未运行"));
+  assert.strictEqual(fetchCalls.length, 0);
+});
+
+test("前端保护到期后退出加载并允许重试", async () => {
+  resetTestState();
+  configSchema = {};
+  const item = {provider:"lx",source:"wy",kind:"playlist",id:"timeout"};
+  publicSelection = [item];
+  const originalTimer = global.setTimeout;
+  global.setTimeout = (fn, ms, ...args) => originalTimer(fn, ms === 10000 ? 15 : ms, ...args);
+  enqueue("/app/fnmusic-ext/api/public-playlists/timeout", (opts) =>
+    new Promise((resolve, reject) => opts.signal.addEventListener("abort", () => {
+      reject(new Error("aborted"));
+    })));
+  try {
+    await Promise.race([ensurePublicSelectionDetails(), tick(500).then(() => {
+      throw new Error("name timeout did not finish");
+    })]);
+    assert.strictEqual(item._detail_status, "error");
+    assert.strictEqual(publicDetailInflight.size, 0);
+    assert.ok($("#public-selected").innerHTML.includes("data-public-retry"));
+  } finally {
+    global.setTimeout = originalTimer;
+  }
+});
+
+test("旧用户任务结束不能删除新用户同身份在途记录", async () => {
+  resetTestState();
+  configSchema = {};
+  const identity = {provider:"lx",source:"wy",kind:"playlist",id:"generation"};
+  publicUserGuid = "a"; publicSelection = [{...identity}];
+  let oldRelease, newRelease;
+  enqueue("/app/fnmusic-ext/api/public-playlists/generation", async () => {
+    await new Promise((r) => {oldRelease = r;});
+    return {ok:true,data:{name:"旧用户"}};
+  }, async () => {
+    await new Promise((r) => {newRelease = r;});
+    return {ok:true,data:{name:"新用户"}};
+  });
+  const old = ensurePublicSelectionDetails();
+  publicSelectionDetailSeq++;
+  abortActivePublicDetailRequests();
+  publicUserGuid = "b"; publicSelection = [{...identity}];
+  const current = ensurePublicSelectionDetails();
+  const key = publicEntryKey(identity);
+  const owner = publicDetailInflight.get(key);
+  oldRelease();
+  await old;
+  assert.strictEqual(publicDetailInflight.get(key), owner);
+  newRelease();
+  await current;
+  assert.strictEqual(publicSelection[0]._name, "新用户");
+});
 
 test("详情状态机：idle -> loading (仅 inflight) -> success，且 localStorage 版本化缓存 7 天", async () => {
   resetTestState();
@@ -373,6 +520,30 @@ test("explicit retry 可通过现有 startPreview 拉起 item provider 再重试
   assert.strictEqual(item._name, "重试成功的歌单");
   assert.strictEqual(item._detail_failed, false);
   assert.strictEqual(item._detail_status, "success");
+});
+
+test("移除后重新添加同一歌单，旧取消失败不污染新任务", async () => {
+  resetTestState();
+  const oldItem = { provider: "musicbox", source: "netease", kind: "chart", id: "readd" };
+  publicSelection = [oldItem];
+  enqueue("/app/fnmusic-ext/api/public-playlists/readd", async (opts) => {
+    await new Promise((resolve) => opts.signal.addEventListener("abort", resolve, { once: true }));
+    throw new Error("old request cancelled");
+  });
+  enqueue("/app/fnmusic-ext/api/public-playlists/readd", {
+    ok: true, data: { name: "重新添加的歌单" },
+  });
+  const oldRun = ensurePublicSelectionDetails();
+  publicSelection = [];
+  void ensurePublicSelectionDetails();
+  const newItem = { ...oldItem };
+  delete newItem._detail_status;
+  publicSelection = [newItem];
+  await oldRun;
+  await ensurePublicSelectionDetails();
+  assert.strictEqual(newItem._name, "重新添加的歌单");
+  assert.strictEqual(newItem._detail_failed, false);
+  assert.strictEqual(publicDetailInflight.size, 0);
 });
 
 /* ------------------------------------------------ 运行测试 ----------------- */

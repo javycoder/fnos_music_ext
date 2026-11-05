@@ -16,6 +16,10 @@ from typing import Any
 import httpx
 import pytest
 
+@pytest.fixture(autouse=True)
+def isolate_timeout_cooldown(monkeypatch):
+    monkeypatch.setattr(lxapp, "_RESOLVE_TIMEOUT_COOLDOWN", {})
+
 # songInfo 磁盘存储（issue #49）路径在 app 导入时定格：先指向临时目录，
 # 测试既不读写真实数据目录，也能覆盖加载/落盘行为
 os.environ.setdefault("LX_DATA_DIR", tempfile.mkdtemp(prefix="lxmusic-test-data-"))

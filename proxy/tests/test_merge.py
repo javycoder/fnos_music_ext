@@ -27,7 +27,7 @@ def _assert_playback_metadata_shape(data: dict, guid: str) -> None:
     assert "name" in track["album"]
     spec = data["audioSpec"]
     assert spec.get("format")
-    assert spec.get("channel") == 2
+    assert "channel" not in spec  # Unknown source specs must not be fabricated.
     assert "size" in spec
 
 
@@ -327,7 +327,7 @@ def test_search_track_preserves_lossless_and_common_formats():
         assert flac["coverId"] == "track_" + fake_official_guid("online:netease:flac1")
         assert by_guid[fake_official_guid("online:migu:m4a1")]["format"] == "m4a"
         assert by_guid[fake_official_guid("online:kuwo:wav1")]["format"] == "wav"
-        assert by_guid[fake_official_guid("online:kuwo:wav1")]["audioSpec"]["bitDepth"] == 16
+        assert "bitDepth" not in by_guid[fake_official_guid("online:kuwo:wav1")]["audioSpec"]
 
 
 def test_search_track_merges_when_upstream_data_null_list_missing():
@@ -862,7 +862,7 @@ def test_online_lyrics_and_metadata():
         assert rj2["data"]["duration_ms"] == 269000
         assert rj2["data"]["audioSpec"]["format"] == "mp3"
         assert rj2["data"]["audioSpec"]["codec"] == "mp3"
-        assert rj2["data"]["audioSpec"]["channel"] == 2
+        assert "channel" not in rj2["data"]["audioSpec"]
         _assert_playback_metadata_shape(rj2["data"], guid="online:kuwo:228908")
         assert rj2["data"]["track"]["hasLyric"] is True
 

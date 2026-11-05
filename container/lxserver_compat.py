@@ -15,7 +15,8 @@
    且 ECB 档 iv 为 undefined 时未放行为 null。
 
 用法：python3 lxserver_compat.py [userApi.js 路径]
-幂等：已应用（或锚点不存在）时跳过；锚点失配说明上游结构变化，直接报错中止
+固定脚本播放不再使用上游内置三次重试；源列表补充初始化登记的平台音质声明。
+幂等：完整新块已存在时跳过；锚点失配说明上游结构变化，直接报错中止
 构建，避免带着残缺补丁发布。
 """
 
@@ -67,6 +68,20 @@ ANCHOR_AES_NEW = """            aesEncrypt: (buffer, mode, key, iv) => {
                 return Buffer.concat([cipher.update(dBuffer), cipher.final()]);
             },"""
 
+ANCHOR_RETRIES = "        const maxRetries = 3;"
+PATCH_RETRIES = "        const maxRetries = enableAutoSwitchApiSource === false ? 1 : 3;"
+ANCHOR_CAPABILITIES = "        const status = (0, userApi_1.getApiStatus)(source.owner, source.id);"
+PATCH_CAPABILITIES = ANCHOR_CAPABILITIES + """
+        // Only expose capabilities registered by this initialized instance.
+        const runtimeInfo = (0, userApi_1.getLoadedApis)().find(
+            api => api.id === source.id && api.owner === source.owner);
+        if (runtimeInfo && runtimeInfo.sources) {
+            source.platforms = Object.fromEntries(Object.entries(runtimeInfo.sources).map(
+                ([platform, capability]) => [platform, {
+                    qualitys: capability && Array.isArray(capability.qualitys) ? [...capability.qualitys] : undefined
+                }]));
+        }"""
+
 
 def apply(text: str) -> str:
     changed = False
@@ -74,6 +89,7 @@ def apply(text: str) -> str:
         ("globals", ANCHOR_BTOA, PATCH_GLOBALS),
         ("callback", ANCHOR_CALL_OLD, ANCHOR_CALL_NEW),
         ("aesEncrypt", ANCHOR_AES_OLD, ANCHOR_AES_NEW),
+        ("fixed-script-retries", ANCHOR_RETRIES, PATCH_RETRIES),
     ):
         if new in text:
             continue  # 已应用（新块完整存在；globals 补丁的新块包含原锚点属正常）
@@ -88,12 +104,25 @@ def apply(text: str) -> str:
     return text
 
 
+def apply_capabilities(text: str) -> str:
+    if PATCH_CAPABILITIES in text:
+        return text
+    if text.count(ANCHOR_CAPABILITIES) != 1:
+        raise SystemExit("ERROR: lxserver 平台能力补丁锚点失配")
+    return text.replace(ANCHOR_CAPABILITIES, PATCH_CAPABILITIES, 1)
+
+
 def main() -> None:
     path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PATH)
     text = path.read_text(encoding="utf-8")
     patched = apply(text)
+    handler = path.with_name("customSourceHandlers.js")
+    handler_text = handler.read_text(encoding="utf-8")
+    patched_handler = apply_capabilities(handler_text)
     if patched != text:
         path.write_text(patched, encoding="utf-8")
+    if patched_handler != handler_text:
+        handler.write_text(patched_handler, encoding="utf-8")
 
 
 if __name__ == "__main__":

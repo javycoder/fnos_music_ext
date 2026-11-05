@@ -159,7 +159,7 @@ function reset() {
   global.helpTemplates = [];
   localStore.clear();
   try {
-    vm.runInThisContext("if (typeof publicDetailInflight !== 'undefined') publicDetailInflight.clear(); if (typeof publicDetailAbortControllers !== 'undefined') publicDetailAbortControllers.clear();");
+    vm.runInThisContext("if (typeof abortActivePublicDetailRequests !== 'undefined') { publicSelectionDetailSeq++; abortActivePublicDetailRequests(); publicProcessSnapshot = null; }");
   } catch (_) {}
 }
 
@@ -1844,7 +1844,7 @@ test("已选歌单：配置回填只有身份字段时按状态显示，详情�
     renderPublicSelected();
   `);
   const before = els.get("#public-selected").innerHTML;
-  assert.ok(before.includes("正在获取歌单名称"));
+  assert.ok(before.includes("等待获取歌单名称"));
   assert.ok(!before.includes("<b>7108</b>"), "数字 ID 不应再作标题");
   enqueue("/app/fnmusic-ext/api/public-playlists/7108", {
     ok: true, data: { name: "华语速爆新歌", cover_url: "", track_count: 30 },
@@ -2143,16 +2143,20 @@ test("已选名称：配置先于预览启动时，音源就绪后自动恢复�
   assert.deepStrictEqual(previews, ["musicbox"]);
 });
 
-test("已选名称：音源就绪时仍在途的旧详情失败不能覆盖恢复结果", async () => {
+test("已选名称：能力刷新保留在途请求，完成失败后显式重试恢复", async () => {
   resetPublicBrowser();
   vm.runInThisContext('publicSelection = [{provider:"musicbox",source:"netease",kind:"playlist",id:"late-detail"}];');
   const old = deferPublicResponse("late-detail");
   const first = global.ensurePublicSelectionDetails();
   enqueue("/app/fnmusic-ext/api/public-playlists/capabilities", { ok: true, sources: [] });
   await global.loadPublicCapabilities();
+  const joined = global.ensurePublicSelectionDetails();
+  assert.strictEqual(fetchCalls.filter(c => c.path.endsWith("/late-detail")).length, 1);
+  old.resolve({ ok: false, error: "旧失败" });
+  await Promise.all([first, joined]);
+  enqueue("/app/fnmusic-ext/api/preview", { ok: true, preview: true });
   enqueue("/app/fnmusic-ext/api/public-playlists/late-detail", { ok: true, data: { name: "恢复名称" } });
-  await global.ensurePublicSelectionDetails();
-  old.resolve({ ok: false, error: "旧失败" }); await first;
+  await global.retryPublicDetail(0);
   assert.ok(els.get("#public-selected").innerHTML.includes("恢复名称"));
   assert.ok(!els.get("#public-selected").innerHTML.includes("名称获取失败"));
 });

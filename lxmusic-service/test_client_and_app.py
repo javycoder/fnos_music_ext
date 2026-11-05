@@ -2365,6 +2365,10 @@ async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_e
         budget=1.0, resolver_timeout=0.03, probe_timeout=0.5,
     )
     assert res1 is None
+    # A timed-out tier is suppressed for 30 seconds; test the next probe after
+    # that independent cooldown has expired.
+    for key in lxapp._RESOLVE_TIMEOUT_COOLDOWN:
+        lxapp._RESOLVE_TIMEOUT_COOLDOWN[key] = 0
     assert fake_lx.url_timeouts[-1] == 0.03
 
     # 2. 调大 resolver_timeout 到 0.5s（大于 0.1s），成功返回

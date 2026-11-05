@@ -1765,15 +1765,11 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
         "container": play_format,
         "duration": duration_ms,
         "size": file_size,
-        "channel": 2,
-        "sampleRate": 44100,
-        "bitDepth": 16 if play_format in ("wav", "flac", "aiff") else None,
-        "bitrate": 1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000,
     }
-    if "audio_spec" in item:
-        for key in ("channel", "sampleRate", "bitDepth", "bitrate"):
-            audio_spec.pop(key, None)
-        audio_spec.update(item["audio_spec"])
+    audio_spec.update(item.get("audio_spec") or {})
+    # A catalog audioSpec may describe another representation. Its path and
+    # container must always agree with this response's selected format.
+    audio_spec.update(path=spec_path, format=play_format, codec=play_format, container=play_format)
     audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
 
     return {
@@ -3061,11 +3057,7 @@ def ext_from_content_type(content_type: str) -> str:
 
 
 def _sniff_audio_ext(first: bytes) -> "str | None":
-    """按首字节魔数识别音频容器（issue IKS5FW 网易路径兜底）。
-
-    只在扩展名完全未知时补空使用：绝不覆盖取链解析结果或既有判定，
-    避免非标容器（如罕见 ID3 前缀文件）被误改判。
-    """
+    """Identify a container only at byte zero; MIME headers may be incorrect."""
     if not first:
         return None
     if first[:4] == b"fLaC":
@@ -3074,6 +3066,10 @@ def _sniff_audio_ext(first: bytes) -> "str | None":
         return "ogg"
     if first[:4] == b"RIFF" and first[8:12] == b"WAVE":
         return "wav"
+    if len(first) >= 12 and first[4:8] == b"ftyp":
+        return "m4a"
+    if len(first) >= 2 and first[0] == 0xFF and (first[1] & 0xF6) == 0xF0:
+        return "aac"
     if first[:3] == b"ID3":
         return "mp3"
     if len(first) >= 2 and first[0] == 0xFF and (first[1] & 0xE0) == 0xE0:
@@ -3635,6 +3631,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
     target_quality = _lx_target_quality(max_quality, quality_override)
     cache_key = _lx_url_cache_key(song_id, target_quality, purpose, generation, max_quality)
     epoch = _LX_RESOLVE_EPOCH
+    deadline = time.monotonic() + _lx_url_request_timeout_s()
     # 不同用途与目标档使用独立冷却及钉链，避免下载失败影响播放解析。
     if fresh and _lx_fresh_cooldown_active(cache_key):
         fn_diag(logger, "lx_fresh_cooldown", guid=key[:80])
@@ -3696,7 +3693,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = 
                         ext = str(inner.get("ext") or "").lower()
                         if max_quality in ("high", "standard", "mp3") and (tier in ("lossless", "flac") or ext in _LOSSLESS_EXTS):
                             continue
-                        if epoch != _LX_RESOLVE_EPOCH:
+                        if epoch != _LX_RESOLVE_EPOCH or time.monotonic() >= deadline:
                             return None
                         _lx_url_pin_store(cache_key, inner)
                         return dict(inner)
@@ -3793,21 +3790,24 @@ def _prefetch_lx(request: Request, guid: str) -> None:
         return
     _sync_lx_config_epoch()
     song_id = song_id_from_online_guid(guid)
-    pin = _LX_URL_PIN.get(song_id)
     max_quality = "high" if _lossless_is_blacklisted(guid) else None
+    target = _lx_target_quality(max_quality)
+    cache_key = _lx_url_cache_key(song_id, target, "playback", None, max_quality)
+    pin = _LX_URL_PIN.get(cache_key)
     if pin and time.monotonic() < pin[1]:
         pinned = pin[0] or {}
         if not max_quality or (str(pinned.get("ext") or "").lower() not in _LOSSLESS_EXTS
                                and str(pinned.get("actual_tier") or "").lower() != "lossless"):
             return
-    if _lx_fresh_cooldown_active(song_id):
+    if _lx_fresh_cooldown_active(cache_key):
         return
-    key = (asyncio.get_running_loop(), song_id, max_quality or "", _LX_RESOLVE_EPOCH, bool(max_quality))
+    key = (asyncio.get_running_loop(), song_id, "playback", target, None,
+           max_quality or "", _LX_RESOLVE_EPOCH, False)
     if key in _LX_URL_INFLIGHT or len(_LX_URL_PREFETCH) >= 2 or len(_LX_URL_INFLIGHT) >= 16:
         return
 
     async def warm():
-        await resolve_lx_url_shared(get_lx_client(request.app), song_id, fresh=bool(max_quality),
+        await resolve_lx_url_shared(get_lx_client(request.app), song_id,
                                     meta=_online_meta_for_request(request, guid), max_quality=max_quality)
 
     task = asyncio.create_task(warm())
@@ -3956,7 +3956,8 @@ def register_online_meta(items) -> int:
             if isinstance(ms, (int, float)) and ms > 1000:
                 duration_s = ms / 1000.0
         register_online_meta_one(guid, title, artist, album, duration_s,
-                                 it.get("cover_url") or it.get("coverUrl") or it.get("coverURL"))
+                                 it.get("cover_url") or it.get("coverUrl") or it.get("coverURL"),
+                                 media=it)
         if not it.get("artist") and isinstance(it.get("artists"), list):
             names = [_person_name(value) for value in it["artists"]]
             _ONLINE_META[guid]["match_artist"] = "\x1f".join(name for name in names if name)
@@ -3965,13 +3966,15 @@ def register_online_meta(items) -> int:
 
 
 def register_online_meta_one(guid: str, title: str, artist: str, album: str = "",
-                             duration_s=None, cover: str = "") -> None:
+                             duration_s=None, cover: str = "", *, media: dict | None = None) -> None:
     try:
         duration = float(duration_s or 0)
     except (TypeError, ValueError):
         duration = 0
-    _ONLINE_META.pop(guid, None)  # move-to-end 语义：重新登记视为最新
+    previous = _ONLINE_META.pop(guid, {})  # move-to-end 语义
     _ONLINE_META[guid] = {
+        **_online_media_fields(previous),
+        **_online_media_fields(media or {}),
         "title": str(title).strip(),
         "artist": str(artist).strip(),
         "album": str(album or "").strip(),
@@ -3992,6 +3995,32 @@ def _online_meta_get(guid: str) -> "dict | None":
     return dict(meta)
 
 
+def _online_media_fields(item: dict) -> dict:
+    spec = item.get("audio_spec") or item.get("audioSpec")
+    spec = spec if isinstance(spec, dict) else {}
+    result = {}
+    ext = item.get("ext") or item.get("format")
+    if ext:
+        result["ext"] = str(ext).lower().lstrip(".")
+    size = item.get("file_size") or spec.get("size")
+    if size:
+        result["file_size"] = size
+    if spec:
+        result["audio_spec"] = dict(spec)
+    return result
+
+
+def _selected_media_metadata(data: dict | None, selected: dict | None) -> dict:
+    result = dict(data or {})
+    if selected and selected.get("ext"):
+        # Catalog specs describe available files, not this selected stream.
+        result.pop("audio_spec", None)
+        result.pop("file_size", None)
+        result.update(_online_media_fields(selected))
+        result.setdefault("audio_spec", {})
+    return result
+
+
 def _online_meta_for_request(request: Request, guid: str) -> "dict | None":
     """播放元数据兜底链：内存搜索会话在前（数据最新），LRU 在后（覆盖无会话场景）。"""
     retained, _entry = _retained_track(request, guid)
@@ -3999,6 +4028,8 @@ def _online_meta_for_request(request: Request, guid: str) -> "dict | None":
         title, artist, album = _tag_fields(retained)
         if _online_meta_worthy(str(guid), title, artist):
             return {
+                **_online_media_fields(_online_meta_get(guid) or {}),
+                **_online_media_fields(retained),
                 "title": title, "artist": artist, "album": album,
                 "match_artist": ("\x1f".join(_person_name(value) for value in retained["artists"]
                                              if _person_name(value))
@@ -7152,6 +7183,10 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
+class DeadOnlineMedia(RuntimeError):
+    """A resolved LX URL returned a definite unusable HTTP body."""
+
+
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
                               force_mp3: bool = False, fresh_url: bool = False, refresh: bool = False,
                               quality_override: str | None = None, purpose: str = "playback",
@@ -7220,7 +7255,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     if max_q:
                         fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
                     resolved = await resolve_lx_url_shared(
-                        get_lx_client(request.app), song_id, fresh=fresh_url or bool(max_q),
+                        get_lx_client(request.app), song_id, fresh=fresh_url,
                         meta=_online_meta_for_request(request, guid), max_quality=max_q,
                         quality_override=quality_override if purpose == "download" else None,
                         purpose=purpose, generation=generation if purpose == "download" else None,
@@ -7302,6 +7337,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     # issue #54：fresh 强刷出的直链也打不开，冷却窗内不再重复重解析
                     if fresh_url:
                         _lx_fresh_cooldown_mark(lx_pin_key or song_id)
+                    if purpose == "playback" and (resp.status_code in (401, 403, 404, 410)
+                            or any(x in content_type for x in ("text/", "json"))):
+                        raise DeadOnlineMedia("cdn_unavailable")
                 return None
             chunks = resp.aiter_bytes()
             first = await anext(chunks, b"")
@@ -7324,19 +7362,29 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 _lx_url_pin_drop(lx_pin_key or song_id, reason="empty_stream")
                 if fresh_url:
                     _lx_fresh_cooldown_mark(lx_pin_key or song_id)
+                if purpose == "playback":
+                    raise DeadOnlineMedia("empty_stream")
             return None
-        if source == "netease" and not ext:
-            # issue IKS5FW 兜底：取链响应缺 type/level（或钉链为旧形态无 meta）
-            # 时，用首字节魔数识别实际容器；网易 CDN 的 Content-Type 不可信
-            # （flac 错报 audio/mpeg）。只补空，绝不覆盖已有解析结果。
-            ext = _sniff_audio_ext(first)
+        detected_ext = None
+        if source in ("netease", "lx") and not _nonzero_range(range_header):
+            # 字节零处的音频签名优先于取链格式和 CDN Content-Type。
+            # 非零 Range 的中间帧不能用于推断整个文件的容器。
+            detected_ext = _sniff_audio_ext(first)
+            ext = detected_ext or ext
+            if source == "lx" and ext and lx_pin_key in _LX_URL_PIN:
+                pin, expiry = _LX_URL_PIN[lx_pin_key]
+                _LX_URL_PIN[lx_pin_key] = ({**pin, "ext": ext}, expiry)
+            elif source == "netease" and purpose != "download" and song_id in _NETEASE_URL_PIN:
+                pin = _NETEASE_URL_PIN[song_id]
+                _NETEASE_URL_PIN[song_id] = (pin[0], pin[1], {**_netease_pin_media(song_id), "ext": ext})
         # 仅 musicdl 通道会服务端透明降级（坏无损流→官方 mp3 档）：以实际
         # content-type 为准修正扩展名，避免 mp3 字节按 .flac 命名入库。
         # 网易/洛雪直链相反——上游会错报 audio/mpeg，扩展名以解析结果为准。
         downgraded = purpose != "download" and (force_mp3 or _lossless_is_blacklisted(guid)) and not range_header
-        if (via_musicdl or downgraded) and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS):
+        if ((via_musicdl or downgraded) and not detected_ext
+                and "audio/mpeg" in content_type and (not ext or ext in _LOSSLESS_EXTS)):
             ext = "mp3"
-        elif downgraded and (not ext or ext in _LOSSLESS_EXTS):
+        elif downgraded and not detected_ext and (not ext or ext in _LOSSLESS_EXTS):
             # NetEase returns a URL, not LX's resolved dict. The capped resolver
             # has selected a lossy tier even if CDN headers retain stale metadata.
             ext = (resolved.get("ext") or "mp3") if source == "lx" else "mp3"
@@ -8987,11 +9035,15 @@ async def stream_track(request: Request, subpath: str = ""):
                         continue
                     break
                 if source_from_online_guid(candidate) == "lx":
-                    fresh_lx = not isinstance(exc, (TimeoutError, httpx.TimeoutException))
+                    fresh_lx = isinstance(exc, DeadOnlineMedia)
+                    if not fresh_lx:
+                        break
                 opened = None
             else:
                 if source_from_online_guid(candidate) == "lx" and not opened:
-                    fresh_lx = True
+                    # No playable result already has the adapter's negative
+                    # cache. Only a proven dead CDN URL warrants one refresh.
+                    break
             if opened:
                 resp, owned, ext, info, chunks, first = opened
                 fn_diag(logger, "stream_startup", guid=candidate, first_bytes=len(first),
@@ -9958,6 +10010,24 @@ async def track_metadata(request: Request, subpath: str = ""):
 
     # 本地命中：直接用本地音频规格（格式/大小/时长），跳过网易直链预取与在线详情请求
     local = await resolve_local_play(request, guid)
+    if local is None:
+        cached = find_cache_file(guid, playback=True)
+        if cached:
+            def cached_match():
+                try:
+                    stat = os.stat(cached)
+                    with open(cached, "rb") as fp:
+                        ext = _sniff_audio_ext(fp.read(64))
+                    return {"path": cached, "size": stat.st_size, "mtime": stat.st_mtime,
+                            "ext": ext or os.path.splitext(cached)[1].lstrip(".")}
+                except OSError:
+                    return None
+            match = await asyncio.to_thread(cached_match)
+            if match:
+                spec = await localmatch.probe_audio_async(match)
+                if spec:
+                    local = {**match, **spec,
+                             "meta": _online_meta_for_request(request, guid) or {}}
     if local is not None:
         meta = local.get("meta") or {}
         data = {
@@ -9970,16 +10040,32 @@ async def track_metadata(request: Request, subpath: str = ""):
             "cover_url": str(meta.get("cover_url") or ""),
             "audio_spec": local.get("audio_spec") or {},
         }
-    elif source_from_online_guid(guid) == "netease":
-        _prefetch_netease(request, guid)
+    elif source_from_online_guid(guid) in ("netease", "lx"):
         data = _online_meta_for_request(request, guid)
-        if not data or not data.get("duration_s"):
-            data = await _online_info(request, guid, include_lyric=False)
-    elif source_from_online_guid(guid) == "lx":
-        _prefetch_lx(request, guid)
-        data = _online_meta_for_request(request, guid)
-        if not data or not data.get("duration_s"):
-            data = await _online_info(request, guid, include_lyric=False)
+        async def tags():
+            if data and data.get("duration_s"):
+                return data
+            return await _online_info(request, guid, include_lyric=False) or data
+
+        async def media():
+            if not _source_enabled(guid):
+                return None
+            binding = _DIRECT_TARGET_BINDINGS.get(_direct_scope(request), guid)
+            provider = source_from_online_guid(guid)
+            if (binding and CONF.get(_DIRECT_PLAY_CONF_KEYS[provider])
+                    and binding.generation == _DIRECT_PLAY_GENERATIONS[provider]):
+                return {"ext": binding.target.ext, "file_size": binding.target.file_size}
+            if source_from_online_guid(guid) == "netease":
+                song_id = song_id_from_online_guid(guid).split(":")[-1]
+                max_q = "exhigh" if _lossless_is_blacklisted(guid) else None
+                url = await resolve_netease_url(get_musicbox_client(request.app), song_id, max_quality=max_q)
+                return _netease_pin_media(song_id) if url else None
+            max_q = "high" if _lossless_is_blacklisted(guid) else None
+            return await resolve_lx_url_shared(get_lx_client(request.app),
+                song_id_from_online_guid(guid), meta=data, max_quality=max_q)
+
+        tag_info, selected = await asyncio.gather(tags(), media())
+        data = _selected_media_metadata(tag_info, selected)
     else:
         data = await _online_info(request, guid)
     data = data or stub_online_info(guid)

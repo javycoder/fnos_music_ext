@@ -677,6 +677,7 @@ class _AttemptResult:
     resolution_quality: str = ""
     failure: bool = False
     timeout: bool = False
+    resolve_timeout: bool = False
     service_error: bool = False
 
 
@@ -797,6 +798,7 @@ async def _attempt_pinned(
     # 让配置的单次解析超时按原值下发（否则日志/断言会出现 0.0299 这种尾数）。
     resolve_budget = (resolver_timeout if resolver_timeout - remaining <= _CLOCK_EPSILON
                       else max(0.01, remaining))
+    resolve_started = time.monotonic()
     try:
         async with asyncio.timeout(resolve_budget):
             response = await LXSERVER.get_music_url(
@@ -806,17 +808,20 @@ async def _attempt_pinned(
                 request_timeout=resolve_budget,
                 auto_switch_api_source=False,
             )
-    except TimeoutError:
+    except (TimeoutError, httpx.ReadTimeout):
         # 单次解析超时由外层继续下一个脚本/档位；预算耗尽与取消都不能算脚本失败。
-        return _AttemptResult(timeout=True)
+        return _AttemptResult(timeout=True, resolve_timeout=True)
     except Exception as exc:
         if is_lxserver_unreachable(exc):
             logger.warning("lxserver 播放解析内部故障: %s", exc)
             return _AttemptResult(service_error=True)
         logger.debug("lxserver get_music_url 失败 script=%s platform=%s: %s",
-                     script.id, platform, exc)
+                     script.id, platform, type(exc).__name__)
         return _AttemptResult(failure=True)
 
+    fn_diag(logger, "play_attempt", stage="resolve", script=script.id, platform=platform,
+            quality=quality, ms=int((time.monotonic() - resolve_started) * 1000),
+            result="url" if response and response.get("url") else "no_playable_result")
     if not response or not response.get("url"):
         # 200 空 url（脚本静默空返回）按该脚本/平台失败处理，交由计划换脚本。
         return _AttemptResult(failure=True)
@@ -840,6 +845,7 @@ async def _attempt_pinned(
     probe_allowance = min(remaining, max(slot_remaining, _PROBE_SLOT_FLOOR))
     probe_budget = (probe_timeout if probe_timeout - probe_allowance <= _CLOCK_EPSILON
                     else max(0.01, probe_allowance))
+    probe_started = time.monotonic()
     try:
         async with asyncio.timeout(probe_budget):
             ok, final_url, content_type, size = await probe_url(
@@ -849,6 +855,9 @@ async def _attempt_pinned(
         ok = False
         final_url, content_type, size = raw_url, "", 0
 
+    fn_diag(logger, "play_attempt", stage="probe", script=script.id, platform=platform,
+            quality=quality, ms=int((time.monotonic() - probe_started) * 1000),
+            result="audio" if ok else "unusable_media")
     if not ok:
         # 日志只留媒体主机与阶段：直链通常带签名，不能进日志。
         logger.info("探活拒绝 %s quality=%s ct=%s script=%s platform=%s host=%s stage=probe_reject",
@@ -1056,6 +1065,8 @@ _CHAIN_FAIL_THRESHOLD = 3
 _CHAIN_OPEN_SECONDS = 600
 _CHAIN_RETRY_SECONDS = 30
 _CHAIN_HEALTH: dict[str, dict] = {}
+_RESOLVE_TIMEOUT_COOLDOWN: dict[str, float] = {}
+_RESOLVE_TIMEOUT_COOLDOWN_S = 30.0
 
 
 def _chain_available(name: str) -> bool:
@@ -1340,6 +1351,10 @@ async def resolve_and_probe(
             continue
 
         chain_key = _chain_key(step.script_id, step.platform, active_generation, step.quality)
+        if _RESOLVE_TIMEOUT_COOLDOWN.get(chain_key, 0) > time.monotonic():
+            fn_diag(logger, "play_attempt", stage="cooldown", script=step.script_id,
+                    platform=step.platform, quality=step.quality, result="timeout_cooldown")
+            continue
         if not _chain_available(chain_key):
             continue
 
@@ -1370,6 +1385,10 @@ async def resolve_and_probe(
         exclude_sources = _exclude_others(step.script_id, catalog)
         step_failed = False
         for resolved_id, song_info in attempts:
+            if time.monotonic() >= deadline:
+                budget_exhausted = True
+                break
+            attempt_started = time.monotonic()
             attempt = await _attempt_pinned(
                 client,
                 script=scripts_by_id[step.script_id],
@@ -1388,10 +1407,19 @@ async def resolve_and_probe(
             # await 解析/探活期间可能发生切源；旧代结果与熔断状态均不得交付。
             if active_generation != _URL_CACHE_GEN:
                 return None
+            fn_diag(logger, "play_attempt", stage="resolve_probe", script=step.script_id,
+                    platform=step.platform, quality=step.quality,
+                    ms=int((time.monotonic() - attempt_started) * 1000),
+                    result=("service_error" if attempt.service_error else "timeout" if attempt.timeout
+                            else "success" if attempt.data else "no_playable_result"))
+            if time.monotonic() >= deadline:
+                budget_exhausted = True
+                break
             if attempt.service_error:
                 # 内部服务故障上浮为 503：不写负缓存、不写脚本熔断，也不继续消耗预算。
                 raise SourceStateQueryError("lxserver 播放解析内部故障")
             if attempt.data:
+                _RESOLVE_TIMEOUT_COOLDOWN.pop(chain_key, None)
                 _chain_record_success(chain_key)
                 # 排序依据是上游解析档回显，不是空的实测档位。
                 resolved_rank = quality_rank(str(attempt.data.get("resolution_quality") or ""))
@@ -1414,7 +1442,16 @@ async def resolve_and_probe(
                 if deadline - time.monotonic() <= 0:
                     budget_exhausted = True
                     break
-                continue
+                if not attempt.resolve_timeout:
+                    break
+                now = time.monotonic()
+                for key, expiry in list(_RESOLVE_TIMEOUT_COOLDOWN.items()):
+                    if expiry <= now:
+                        _RESOLVE_TIMEOUT_COOLDOWN.pop(key, None)
+                if len(_RESOLVE_TIMEOUT_COOLDOWN) >= 2048:
+                    _RESOLVE_TIMEOUT_COOLDOWN.pop(next(iter(_RESOLVE_TIMEOUT_COOLDOWN)))
+                _RESOLVE_TIMEOUT_COOLDOWN[chain_key] = now + _RESOLVE_TIMEOUT_COOLDOWN_S
+                break
             step_failed = True
         if step_failed:
             failed_steps.add((step.script_id, step.platform, step.quality))
@@ -1422,7 +1459,8 @@ async def resolve_and_probe(
             break
 
     _record_step_failures(failed_steps, active_generation)
-    if unknown_stashed and active_generation == _URL_CACHE_GEN:
+    if (unknown_stashed and not budget_exhausted and time.monotonic() < deadline
+            and active_generation == _URL_CACHE_GEN):
         fallback = next(iter(unknown_stashed.values()))
         fallback["fallback_reason"] = (
             f"requested {target_quality}; upstream parse tier unknown; "
