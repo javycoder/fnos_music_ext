@@ -167,12 +167,19 @@ if [ "${IMAGE_ASSET_MODE}" != "skip" ]; then
         mkdir -p "${BUNDLE_DIR}"
         echo "[fpk] 从最终 staging 构建应用镜像归档 (linux/${IMAGE_ARCH})..."
         GIT_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+        # buildx 默认 attestation 会让产物成为 manifest list，inspect/save 拿不到
+        # RootFS.DiffIds；需要经典单平台镜像（支持的 docker 上显式关闭）。
+        ASSET_BUILD_FLAGS=()
+        if docker build --help 2>&1 | grep -q -- '--provenance'; then
+            ASSET_BUILD_FLAGS+=(--provenance=false --sbom=false)
+        fi
         DOCKER_BUILDKIT=1 docker build \
             --platform "linux/${IMAGE_ARCH}" \
             -f "${STAGE}/app/repo/container/Dockerfile" \
             --build-arg BASE_IMAGE="${FPK_IMAGE_BASE:-python:3.13-slim}" \
             --build-arg PIP_INDEX_URL="${FPK_IMAGE_PIP_INDEX:-https://pypi.org/simple}" \
             --build-arg APT_MIRROR="${FPK_IMAGE_APT_MIRROR:-}" \
+            "${ASSET_BUILD_FLAGS[@]}" \
             -t fnmusic-sources:latest \
             "${STAGE}/app/repo"
         IMAGE_ID="$(docker image inspect fnmusic-sources:latest --format '{{.Id}}')"

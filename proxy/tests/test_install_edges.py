@@ -301,6 +301,8 @@ log_warn() { printf 'warn %s\\n' "$*"; }
 log_err() { printf 'err %s\\n' "$*" >&2; }
 warn_unregistered_mdl_platforms() { :; }
 get_fnos_gateway_ports() { printf '5666 5667\\n'; }
+# 以下用例锁的是 6b 外网搜索验收语义；3.0.0 起 6b 默认跳过，须显式开启
+FNMUSIC_VERIFY_SEARCH=1
 TARGET_SOCK=/tmp/verify.sock
 MUSICDL_URL=http://mdl.test
 MUSICBOX_URL=http://mb.test

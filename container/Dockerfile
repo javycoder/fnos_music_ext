@@ -162,7 +162,7 @@ COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py 
 # 这是刻意保留的硬失败——不能删掉 COPY 行绕过，否则容器里缺少模块会在
 # 运行期才报 ModuleNotFoundError。集成时请先确认两个文件已落盘。
 COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py lxmusic-service/playback_policy.py /srv/lxmusic-service/
-COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
+COPY --chown=appuser:appuser webui-service/app.py webui-service/config_jobs.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui/lxmusic/musicbox 复用 proxy 模块（.env 安全合并 + 统一日志 fnlog），必须随镜像分发
 COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/publicplaylists.py proxy/quality_policy.py proxy/version.py /srv/proxy/
