@@ -1380,7 +1380,8 @@ async def test_llm_timeout_falls_back_to_local_random(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
-    monkeypatch.setattr(dailyrec, "build_budget_s", lambda: 3.0)
+    # 本用例验证"超时→回退"语义，不需要真实等满生产预算。
+    monkeypatch.setattr(dailyrec, "build_budget_s", lambda: 0.3)
     from proxy.app import build_online_track
 
     slow_llm = _SlowTransport(30.0, httpx.Response(200, json={"choices": [{"message": {"content": "[]"}}]}))
@@ -1497,6 +1498,8 @@ async def test_daily_case3_all_users_llm(tmp_path, monkeypatch, order, concurren
     db = tmp_path / "music.db"
     _make_local_db(db, n_tracks=30)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    # 本用例验证层选择与并发顺序，不需要生产限速间隔。
+    monkeypatch.setenv("FNMUSIC_REC_SEARCH_INTERVAL", "0")
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9/v1")
     monkeypatch.setenv("FNMUSIC_LLM_DAILY_ENABLED", "true")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "test-key")

@@ -476,8 +476,10 @@ async def test_library_scan_disabled_by_default():
 
 @pytest.mark.anyio
 async def test_library_scan_debounce_and_ttl(monkeypatch):
-    """合并窗口内多次落盘只发一次；90 秒 TTL 内（含失败）不再重发。"""
+    """合并窗口内多次落盘只发一次；冷却 TTL 内（含失败）不再重发。"""
     monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/shared-library/scan")
+    # 合并窗口保持非零以验证防抖，但不必等生产默认的 3 秒。
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0.2)
     posts = []
 
     class ScanTransport(httpx.AsyncBaseTransport):
@@ -1022,6 +1024,8 @@ async def test_library_scan_config_body_and_headers(monkeypatch):
     但绝不透传绑定特定路径的不可重放 authx 签名。"""
     monkeypatch.setitem(p.CONF, "library_scan_path",
                         '/music/api/v1/shared-library/scan|{"guid":"64d1b8ca"}')
+    # 本用例只验请求形态，不需要防抖窗口。
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
     posts = []
 
     class ScanTransport(httpx.AsyncBaseTransport):
@@ -1057,6 +1061,8 @@ async def test_library_scan_config_body_and_headers(monkeypatch):
 async def test_library_scan_legacy_path_without_body(monkeypatch):
     """旧格式（纯路径无竖线）：POST 无 body，不设 content-type。"""
     monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/shared-library/scan")
+    # 本用例只验请求体形态，不需要防抖窗口。
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
     posts = []
 
     class ScanTransport(httpx.AsyncBaseTransport):
@@ -1147,7 +1153,7 @@ async def test_scan_delay_zero_fires_immediately(monkeypatch):
 async def test_scan_custom_delay_and_cooldown(monkeypatch):
     """自定义延迟与冷却窗口生效（热重载后的 CONF 值直接读取）。"""
     monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x")
-    monkeypatch.setitem(p.CONF, "scan_delay_s", 1.0)
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0.2)
     monkeypatch.setitem(p.CONF, "scan_cooldown_s", 5.0)
     posts = []
 
@@ -1162,7 +1168,7 @@ async def test_scan_custom_delay_and_cooldown(monkeypatch):
         p._schedule_library_scan({"cookie": "sid=x"})
         t0 = time.monotonic()
         await asyncio.wait_for(p._scan_task, timeout=5.0)
-        assert time.monotonic() - t0 >= 0.9  # 等 1 秒延迟
+        assert time.monotonic() - t0 >= 0.15  # 等自定义延迟
         assert posts == ["/music/api/v1/x"]
         # 冷却 5 秒内不重发
         p._schedule_library_scan({"cookie": "sid=y"})

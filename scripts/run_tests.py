@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Run the offline suites without sharing app/conftest/environment globals.
 
-Usage: python3 scripts/run_tests.py [--jobs 1] [--suite webui] [--coverage]
-Proxy/socket/deployment tests and infrastructure tests run exclusively. Only
-service suites may overlap, in separate interpreters; no xdist is involved.
+Usage: python3 scripts/run_tests.py [--jobs 2] [--shards 2] [--suite webui]
+
+Each configured root in pytest.ini is scheduled exactly once. proxy tests are
+split into balanced file shards running in separate interpreters (never threads,
+never xdist); files that bind host resources or mutate process-global state stay
+in one exclusive shard. Every shard gets its own app home, registries, caches and
+pytest basetemp, so two shards never write the same file.
 Node behavior tests are already included by webui-service/test_app_js.py.
 """
 from __future__ import annotations
@@ -35,6 +39,52 @@ SUITES = {name: paths for phase in PHASES for name, paths in phase.items()}
 COVERAGE_TARGETS = (
     "proxy", "lxmusic-service", "musicdl-service", "musicbox-service", "webui-service",
 )
+PROXY_ROOT = "proxy/tests"
+# Files whose tests bind host-level resources (shell scripts, sockets, nginx,
+# real subprocess services) or mutate process-global state. One serial shard.
+PROXY_EXCLUSIVE = (
+    "test_build_fingerprint.py",
+    "test_fnlog.py",
+    "test_image_bundle.py",
+    "test_install_edges.py",
+    "test_installation_no_download.py",
+    "test_installation_reliability.py",
+    "test_log_retention.py",
+    "test_maintenance.py",
+    "test_maintenance_jobs.py",
+    "test_maintenance_socket.py",
+    "test_musicbox_service.py",
+    "test_musicdl_distribution.py",
+    "test_native_deploy.py",
+    "test_netease_sky_quality.py",
+    "test_organize_review.py",
+    "test_reverse_proxy.py",
+    "test_transcode_compat.py",
+    "test_version_env.py",
+    "test_webui_gateway.py",
+)
+# Cost hints for balancing only; correctness never depends on them. Unknown or
+# new files get DEFAULT_FILE_WEIGHT and still land in exactly one shard.
+PROXY_FILE_WEIGHTS = {
+    "test_public_playlists.py": 6.0,
+    "test_issue75_lx_playback.py": 5.0,
+    "test_lxmusic.py": 4.0,
+    "test_source_tag.py": 4.0,
+    "test_proxy_reliability.py": 3.5,
+    "test_recommend.py": 3.0,
+    "test_local_cover.py": 3.0,
+    "test_merge.py": 3.0,
+    "test_tee_cache.py": 3.0,
+    "test_official_bind.py": 2.5,
+    "test_netease.py": 2.5,
+    "test_direct_play_https.py": 2.0,
+    "test_fav_rolling_promote.py": 2.0,
+    "test_nm_playlists.py": 2.0,
+    "test_playlist_tracks.py": 2.0,
+    "test_v2_features.py": 1.5,
+    "test_direct_play.py": 1.5,
+}
+DEFAULT_FILE_WEIGHT = 1.0
 
 
 @dataclass
@@ -82,6 +132,37 @@ def stop_children(running: dict[str, Running]) -> None:
         item.log.close()
 
 
+def proxy_test_files() -> list[str]:
+    """Discover proxy test files dynamically so a new file is never dropped."""
+    root = ROOT / PROXY_ROOT
+    return sorted(p.name for p in root.glob("test_*.py") if p.is_file())
+
+
+def proxy_shards(count: int) -> list[tuple[str, ...]]:
+    """Split proxy files into balanced, disjoint shards, then one exclusive shard.
+
+    Every discovered file lands in exactly one shard: new files are scheduled by
+    default instead of silently skipped, and no file is scheduled twice.
+    """
+    files = proxy_test_files()
+    if not files:
+        return []
+    if count <= 1:
+        return [(PROXY_ROOT,)]
+    exclusive = [f for f in files if f in PROXY_EXCLUSIVE]
+    shared = [f for f in files if f not in PROXY_EXCLUSIVE]
+    shards: list[list[str]] = [[] for _ in range(count)]
+    loads = [0.0] * count
+    for name in sorted(shared, key=lambda n: (-PROXY_FILE_WEIGHTS.get(n, DEFAULT_FILE_WEIGHT), n)):
+        index = loads.index(min(loads))
+        shards[index].append(name)
+        loads[index] += PROXY_FILE_WEIGHTS.get(name, DEFAULT_FILE_WEIGHT)
+    plan = [tuple(f"{PROXY_ROOT}/{name}" for name in shard) for shard in shards if shard]
+    if exclusive:
+        plan.append(tuple(f"{PROXY_ROOT}/{name}" for name in exclusive))
+    return plan
+
+
 def run_phase(
     suites: dict[str, tuple[str, ...]], jobs: int, work: Path, coverage: bool,
 ) -> dict[str, int]:
@@ -101,8 +182,24 @@ def run_phase(
                 # Each process owns its cache and coverage output. tmp_path uses
                 # pytest's unique per-session base (short enough for Unix sockets).
                 env["COVERAGE_FILE"] = str(work / "coverage" / f".coverage.{name}")
+                # Shards share one checkout, so give each interpreter its own app
+                # home, registry and caches; no two processes write the same file.
+                isolated = work / name
+                for sub in ("home", "logs", "cache", "library", "fav", "tmp"):
+                    (isolated / sub).mkdir(parents=True, exist_ok=True)
+                env.update({
+                    "FNMUSIC_HOME": str(isolated / "home"),
+                    "FNMUSIC_LOG_DIR": str(isolated / "logs"),
+                    "FNMUSIC_ALBUM_REGISTRY": str(isolated / "home" / "album_registry.json"),
+                    "FNMUSIC_CACHE_DIR": str(isolated / "cache"),
+                    "FNMUSIC_LIBRARY_DIR": str(isolated / "library"),
+                    "FNMUSIC_FAV_DIR": str(isolated / "fav"),
+                })
                 command = pytest_command(paths, coverage)
-                command.extend(["-o", f"cache_dir={work / name / 'cache'}"])
+                command.extend([
+                    "-o", f"cache_dir={isolated / 'cache' / 'pytest'}",
+                    f"--basetemp={isolated / 'tmp'}",
+                ])
                 log = (work / f"{name}.log").open("w+b")
                 print(f"=== {name}: starting ===", flush=True)
                 try:
@@ -149,11 +246,13 @@ def coverage_report(work: Path) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jobs", type=int, choices=(1, 2, 3), default=2,
-                        help="parallel service interpreters (default: 2; 1 disables overlap)")
+                        help="parallel interpreters (default: 2; 1 disables overlap)")
     parser.add_argument("--suite", action="append", choices=tuple(SUITES),
                         help="select suites; repeat to select more (default: all)")
     parser.add_argument("--coverage", action="store_true",
                         help="combine per-process coverage; requires pytest-cov")
+    parser.add_argument("--shards", type=int, choices=(1, 2, 3), default=2,
+                        help="proxy file shards (default: 2; 1 runs proxy in one pass)")
     return parser.parse_args(argv)
 
 
@@ -167,12 +266,19 @@ def main(argv: list[str] | None = None) -> int:
     selected = set(args.suite or SUITES)
     started = time.monotonic()
     results: dict[str, int] = {}
+    shards = proxy_shards(args.shards)
     try:
         with tempfile.TemporaryDirectory(prefix="fn-tests-") as directory:
             work = Path(directory)
             (work / "coverage").mkdir()
-            for phase in PHASES:
+            for index, phase in enumerate(PHASES):
                 suites = {name: paths for name, paths in phase.items() if name in selected}
+                if index == 0 and "proxy" in suites:
+                    # Separate interpreters, never threads or xdist.
+                    suites = {
+                        f"proxy-{number + 1}": paths
+                        for number, paths in enumerate(shards)
+                    }
                 results.update(run_phase(suites, args.jobs, work, args.coverage))
             report_code = coverage_report(work) if args.coverage else 0
     except KeyboardInterrupt:

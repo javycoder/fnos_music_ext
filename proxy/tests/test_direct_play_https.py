@@ -18,6 +18,13 @@ from proxy.direct_play import DirectMediaTarget, DirectTargetBindings
 from proxy.media_url import MediaURLDecision
 
 
+class _MediaServer(ThreadingHTTPServer):
+    """Shutdown polling is test cleanup, not a behaviour under test."""
+
+    def serve_forever(self, poll_interval=0.01):
+        return super().serve_forever(poll_interval=poll_interval)
+
+
 @pytest.fixture
 def synthetic_cdns(tmp_path, monkeypatch):
     if not shutil.which("openssl"):
@@ -115,7 +122,7 @@ def synthetic_cdns(tmp_path, monkeypatch):
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certificate, private_key)
-    servers = [ThreadingHTTPServer(("127.0.0.1", 0), MediaHandler) for _ in range(2)]
+    servers = [_MediaServer(("127.0.0.1", 0), MediaHandler) for _ in range(2)]
     first, second = servers
     threads = []
     for server in servers:

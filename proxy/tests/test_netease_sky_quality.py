@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "musicbox
 import app as mb_app
 import playback as mb_playback
 from proxy.app import CONF, _NETEASE_QUALITY_LADDER, _resolve_netease_url_uncached
-from proxy import quality_policy as qp
 import httpx
 
 
@@ -106,10 +105,8 @@ async def test_playback_sky_does_not_forge_high_tier_via_weapi_fallback(monkeypa
     assert result.get("code") == 404
 
 
-def test_seven_quality_levels_defined_with_sky():
-    """验证统一共享模块质量策略中包含完整的七档（含 sky）。"""
-    assert "sky" in qp.QUALITY_LEVELS
-    assert qp.QUALITY_LEVELS == ("standard", "higher", "exhigh", "lossless", "hires", "jymaster", "sky")
+# 七档枚举与阶梯由 test_quality_policy.py 对同一共享模块做更强约束，
+# 此处不再重复断言；保留下方 sky 专属的防降档/钉链行为测试。
 
 
 @pytest.mark.anyio

@@ -1838,6 +1838,8 @@ def title_from_track(item: dict) -> str:
 _LX_STREAM_STARTUP_SLACK_S = 5.0
 _LX_URL_REQUEST_SLACK_S = 1.0
 _STREAM_STARTUP_S = 12.0
+# 单次取链尝试上限：留出换源重试的时间窗，又不能吃满整个首播预算。
+_STREAM_ATTEMPT_S = 6.0
 
 
 def _lx_url_request_timeout_s() -> float:
@@ -9026,7 +9028,8 @@ async def stream_track(request: Request, subpath: str = ""):
                 opened = await asyncio.wait_for(
                     _open_online_stream(request, candidate, range_header,
                                         fresh_url=fresh_lx, refresh=refresh_netease),
-                    timeout=remaining if source_from_online_guid(candidate) == "lx" else min(6.0, remaining),
+                    timeout=remaining if source_from_online_guid(candidate) == "lx"
+                    else min(_STREAM_ATTEMPT_S, remaining),
                 )
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)

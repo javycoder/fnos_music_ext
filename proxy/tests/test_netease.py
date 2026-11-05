@@ -1204,9 +1204,10 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         guids3 = {it["guid"] for it in list3}
         assert guids2.isdisjoint(guids3)
 
-        # 等待 TTL 过期
-        time.sleep(2.1)
+        # TTL 过期：直接回拨缓存时间戳到 TTL 之外，验证同词重新取数。
+        # 过期判定读的就是这个字段，不需要真实睡满一个 TTL。
         entry = next(e for e in _SEARCH_CACHE.values() if e.get("keyword") == "周杰伦")
+        entry["ts"] = time.time() - 3.0
         assert time.time() - entry["ts"] >= 2.0
         # Revalidate this credential/config session without replacing its shown prefix.
         resp3 = client.get("/music/api/v1/search/track?q=周杰伦&page=1&size=50")
