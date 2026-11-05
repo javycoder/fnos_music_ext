@@ -42,9 +42,60 @@ else
     deps_write_state() { :; }
     deps_imports_ok() { return 0; }
 fi
-VENV_DIR="${FNMUSIC_VENV_DIR:-${BASE_DIR}/.venv-proxy}"
+# venv 位置解析（3.0.0+ 升级提速）：
+#   1. 显式 FNMUSIC_VENV_DIR（测试/特殊部署）永远优先；
+#   2. repo 内已存在真实 .venv-proxy 目录 → 原地沿用（老安装不打扰，下次 FPK
+#      升级替换 target 时自然消失，随后落到持久位置）；
+#   3. repo 内已是符号链接且目标可用 → 沿用其目标；
+#   4. FPK 安装（TRIM_PKGVAR 指向应用持久目录，升级不随 target 替换）→
+#      ${TRIM_PKGVAR}/runtime/proxy-venv，并在 repo 内维护兼容符号链接，
+#      takeover.py/run_proxy.sh 等消费方继续读 <repo>/.venv-proxy 不变；
+#   5. 其余（git 检出手动部署）→ 维持 repo 内 .venv-proxy 旧布局。
+resolve_proxy_venv_dir() {
+    local link="${BASE_DIR}/.venv-proxy" target
+    if [ -n "${FNMUSIC_VENV_DIR:-}" ]; then
+        printf '%s' "${FNMUSIC_VENV_DIR}"
+        return 0
+    fi
+    if [ -d "${link}" ] && [ ! -L "${link}" ]; then
+        printf '%s' "${link}"
+        return 0
+    fi
+    if [ -L "${link}" ]; then
+        target="$(readlink -f -- "${link}" 2>/dev/null || true)"
+        if [ -n "${target}" ] && [ -x "${target}/bin/python" ]; then
+            printf '%s' "${target}"
+            return 0
+        fi
+    fi
+    if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "${TRIM_PKGVAR}" ]; then
+        printf '%s' "${TRIM_PKGVAR%/}/runtime/proxy-venv"
+        return 0
+    fi
+    printf '%s' "${link}"
+}
+
+# repo 内 .venv-proxy 兼容入口：当真实 venv 位于 repo 之外（持久目录）时，
+# 用原子方式维护指向它的符号链接。绝不删除/移动已存在的真实目录。
+ensure_proxy_venv_compat_link() {
+    [ "${VENV_DIR}" != "${BASE_DIR}/.venv-proxy" ] || return 0
+    case "${VENV_DIR}" in
+        "${BASE_DIR}/"*) return 0 ;;  # repo 内其他位置无需链接
+    esac
+    [ -x "${VENV_DIR}/bin/python" ] || return 0
+    local link="${BASE_DIR}/.venv-proxy" tmp="${BASE_DIR}/.venv-proxy.link-new"
+    if [ -L "${link}" ] && [ "$(readlink -- "${link}" 2>/dev/null)" = "${VENV_DIR}" ]; then
+        return 0
+    fi
+    [ -e "${link}" ] && [ ! -L "${link}" ] && return 0  # 真实目录在场：本轮已原地沿用
+    rm -f "${tmp}"
+    ln -s "${VENV_DIR}" "${tmp}" && mv -T "${tmp}" "${link}"
+    log_info "代理 venv 位于持久目录 ${VENV_DIR}，已建立兼容入口 ${link} → ${VENV_DIR}。"
+}
+
+VENV_DIR="$(resolve_proxy_venv_dir)"
 REQ_FILE="${BASE_DIR}/proxy/requirements.txt"
-FNMUSIC_DEPS_REVISION="proxy-20261019-1"
+FNMUSIC_DEPS_REVISION="proxy-20261105-1"
 PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
 FALLBACK_INDEXES="https://mirrors.aliyun.com/pypi/simple/ https://pypi.tuna.tsinghua.edu.cn/simple https://pypi.org/simple"
 
@@ -82,6 +133,7 @@ if [ "${FNMUSIC_REFRESH_DEPS:-0}" != "1" ] \
    && deps_state_valid "${VENV_DIR}" "${FNMUSIC_DEPS_REVISION}" "${VENV_PYTHON}" \
         "${REQ_DIGEST}" fastapi uvicorn httpx mutagen; then
     log_info "代理依赖已就绪，跳过联网安装。"
+    ensure_proxy_venv_compat_link
     exit 0
 fi
 rm -f "${VENV_DIR}/.fnmusic-deps"
@@ -115,4 +167,5 @@ if ! "${PIP_BIN}" check >/dev/null 2>&1 \
     exit 1
 fi
 deps_write_state "${VENV_DIR}" "${FNMUSIC_DEPS_REVISION}" "${VENV_PYTHON}" "${REQ_DIGEST}"
+ensure_proxy_venv_compat_link
 log_info "代理依赖安装完成（pip 源: ${ok_index}）。"
