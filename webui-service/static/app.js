@@ -25,6 +25,7 @@ const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserv
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
 let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
+let currentConfigRevision = ""; // GET /api/config 携带的配置版本哈希，用于 CAS 防并发冲突
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let currentPage = "overview";
@@ -582,6 +583,7 @@ async function loadConfig() {
   configValues = cfg.values;
   configPresence = cfg.presence || {};
   configSchema = cfg.schema || {};
+  currentConfigRevision = cfg.revision || "";
   const expectedBuild = typeof window !== "undefined" ? window.FNMUSIC_WEBUI_BUILD || "" : "";
   const apiBuild = cfg.webui_build || "";
   const mismatch = Boolean(expectedBuild && apiBuild && expectedBuild !== apiBuild)
@@ -589,7 +591,9 @@ async function loadConfig() {
   $("#webui-build-mismatch").hidden = !mismatch;
   applyConfigToForm();
   clearDirty();
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) await loadMusicUsers();
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    try { await loadMusicUsers(); } catch (err) { console.warn("加载歌单用户列表异常", err); }
+  }
 }
 
 function applyConfigToForm() {
@@ -829,37 +833,135 @@ function filterConfigBySchema(values) {
   return Object.fromEntries(Object.entries(values).filter(([key]) => supported.has(key)));
 }
 
+async function pollConfigJob(jobId, onProgress) {
+  const startTime = Date.now();
+  const maxWaitMs = 180000;
+  const pollInterval = (typeof globalThis !== "undefined" && typeof globalThis.CONFIG_JOB_POLL_INTERVAL === "number")
+    ? globalThis.CONFIG_JOB_POLL_INTERVAL
+    : (typeof window !== "undefined" && typeof window.CONFIG_JOB_POLL_INTERVAL === "number")
+      ? window.CONFIG_JOB_POLL_INTERVAL
+      : 600;
+  const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+  while (Date.now() - startTime < maxWaitMs) {
+    let res;
+    try {
+      res = await api(`/api/config/jobs/${encodeURIComponent(jobId)}`);
+    } catch (err) {
+      if (err.status === 404) throw err;
+      await sleep(pollInterval);
+      continue;
+    }
+    const job = res && res.job;
+    if (!job) throw new Error("无法获取任务详情");
+    if (typeof onProgress === "function") onProgress(job);
+    if (job.status === "success" || job.status === "partial") {
+      return job.result || { ok: true, actions: [], changed: [] };
+    }
+    if (job.status === "failed") {
+      throw new Error(job.error || job.message || "任务执行失败");
+    }
+    if (job.status === "conflict") {
+      throw new Error(job.error || "配置存在并发修改冲突，请刷新页面重新配置");
+    }
+    await sleep(pollInterval);
+  }
+  throw new Error("任务执行超时，请稍后刷新页面查看状态");
+}
+
+async function checkActiveConfigJob() {
+  try {
+    const res = await api("/api/config/jobs/active");
+    if (res && res.active && res.job) {
+      const job = res.job;
+      const btn = $("#save-btn");
+      btn.disabled = true;
+      btn.textContent = `恢复保存中（${job.progress || 0}%）…`;
+      toast(`检测到未完成的配置保存任务（${job.message || "执行中"}），正在同步…`, "info");
+      try {
+        await pollConfigJob(job.job_id, (j) => {
+          btn.textContent = `保存中（${j.progress || 0}%）…`;
+        });
+        toast("配置已保存生效", "ok");
+        clearDirty();
+        try { await loadConfig(); } catch (_) {}
+        try { await loadStatus(); } catch (_) {}
+      } catch (err) {
+        toast("保存任务失败：" + err.message, "fail");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "保存并生效";
+      }
+    }
+  } catch (_) {
+    // 忽略检查活动任务的非阻断异常
+  }
+}
+
 async function saveConfig() {
+  const btn = $("#save-btn");
+  if (btn.disabled) return;
+  // 即时禁用防抖
+  btn.disabled = true;
+  btn.textContent = "准备保存…";
+
   let values;
-  try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
+  try {
+    values = filterConfigBySchema(collectConfig());
+  } catch (exc) {
+    toast(exc.message, "fail");
+    btn.disabled = false;
+    btn.textContent = "保存并生效";
+    return;
+  }
+
   // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
   // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
   for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
     const next = values[key] || "";
     if (next && next !== (configValues[key] || "")) {
       const res = await fsCheckDir(next);
-      if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
+      if (res.mode === "fail") {
+        toast(label + "不可用：" + res.message, "fail");
+        btn.disabled = false;
+        btn.textContent = "保存并生效";
+        return;
+      }
     }
   }
-  const btn = $("#save-btn");
-  btn.disabled = true;
-  // 新激活的源保存时要逐个端到端校验（每源可达 1-2 分钟），给出预期提示
+
+  // 新激活的源保存时执行轻量快速门禁校验（秒级），给出准确进度指引
   const pendingNew = lxPendingActivationCount();
   btn.textContent = pendingNew > 0
-    ? `保存中（校验 ${pendingNew} 个新激活源，可能需要 1-2 分钟）…`
+    ? `保存中（快速校验 ${pendingNew} 个新激活源）…`
     : "保存中…";
+
   const syncOrderThroughProxy = values.FNMUSIC_LX_ENABLED === true
     && $("#lx-auto-switch").checked
     && Boolean(configSchema.FNMUSIC_LX_SOURCE_ORDER);
   const requestedOrder = lxSourceOrder.slice();
   if (syncOrderThroughProxy) delete values.FNMUSIC_LX_SOURCE_ORDER;
   if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
+
+  const idempotencyKey = "cfg_save_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
   try {
-    const result = await api("/api/config", {
+    let result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values }),
+      body: JSON.stringify({
+        values,
+        base_revision: currentConfigRevision || null,
+        idempotency_key: idempotencyKey,
+      }),
     });
+
+    if (result && result.job_id && (result.status === "pending" || result.status === "running")) {
+      result = await pollConfigJob(result.job_id, (j) => {
+        const pct = typeof j.progress === "number" ? `${j.progress}%` : "";
+        const phaseMsg = j.message || "处理中";
+        btn.textContent = `保存中 ${pct} (${phaseMsg})…`;
+      });
+    }
+
     let orderApplied = false;
     if (syncOrderThroughProxy) {
       // 配置保存可能为新激活源补入 lxserver ID；将它们追加到用户排序之后再调用专用代理。
@@ -881,8 +983,8 @@ async function saveConfig() {
           orderApplied = Boolean((reorder.changed || []).includes("FNMUSIC_LX_SOURCE_ORDER"));
           if (orderApplied) result.changed = [...new Set([...(result.changed || []), "FNMUSIC_LX_SOURCE_ORDER"])];
         } catch (exc) {
-          await loadConfig();
-          await loadStatus();
+          try { await loadConfig(); } catch (_) {}
+          try { await loadStatus(); } catch (_) {}
           const isBusy = exc.status === 409 || exc.body?.category === "source_operation_busy";
           const reason = isBusy
             ? (exc.message && exc.message.includes("忙") ? exc.message : "洛雪源正忙，请稍候重试")
@@ -922,9 +1024,9 @@ async function saveConfig() {
       toast(parts.join("；") || "配置无变化", "ok");
     }
     clearDirty();
-    await loadConfig();
-    await loadStatus();
-    refreshLlmUsage();
+    try { await loadConfig(); } catch (err) { console.warn("配置加载失败", err); }
+    try { await loadStatus(); } catch (err) { console.warn("状态加载失败", err); }
+    try { refreshLlmUsage(); } catch (err) { console.warn("LLM用量加载失败", err); }
   } catch (exc) {
     lxRuntimeSnapshot = null;
     renderLxSourceList();
@@ -3207,6 +3309,7 @@ $("#organize-modal").addEventListener("click", (ev) => {
   await loadConfig();
   await loadStatus();
   await loadOrganizeStatus();
+  checkActiveConfigJob().catch(() => {});  // 恢复可能仍在执行的配置保存任务
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   if ($("#public-playlists-enabled").checked) await showPublicBrowser();

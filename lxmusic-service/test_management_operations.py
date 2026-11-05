@@ -555,3 +555,22 @@ def test_describe_source_snapshot_derives_file_url_and_ignores_non_dict_entries(
     caps = lx_app._source_capabilities_snapshot([None, "bad", {"id": "a.js", "enabled": True, "status": "success"}])
     assert caps["kw"]["playback_available"] is True
 
+
+def test_verify_url_quick_gate_skips_sampling(verification, monkeypatch):
+    module, state = verification
+
+    async def fail_sampling(*args, **kwargs):
+        raise AssertionError("quick=True should not run sampling")
+
+    monkeypatch.setattr(module, "_verification_samples", fail_sampling)
+
+    async def run():
+        res = await module.verify_url("https://example.test/inert.js", quick=True)
+        assert res["ok"] is True
+        assert res["category"] == "quick_gate"
+        assert res["complete"] is True
+        assert "kw" in res["platforms"]
+        assert state.closed
+
+    asyncio.run(run())
+

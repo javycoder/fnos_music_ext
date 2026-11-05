@@ -3013,10 +3013,94 @@ test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐�
   assert.strictEqual(alipayWrap.hidden, false);
   assert.strictEqual(donateCard.hidden, false);
 
-  // 支付宝二维码也加载失败 → 隐藏支付宝项并收起外层打赏卡片
+  // 支付宝二维码也加载失败 → 隐藏支付宝项并收起外层卡片
   alipayImg.onerror();
   assert.strictEqual(alipayWrap.hidden, true);
   assert.strictEqual(donateCard.hidden, true);
+});
+
+test("saveConfig 异步任务模式：PUT 返回 202 job_id 后轮询进度至成功", async () => {
+  reset();
+  global.CONFIG_JOB_POLL_INTERVAL = 0;
+  const schema = { FNMUSIC_QUALITY_MODE: { kind: "str" } };
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: { FNMUSIC_QUALITY_MODE: "standard" }, revision: "rev_1" });
+  await global.loadConfig();
+
+  // 1. PUT 提交返回 job_id
+  enqueue("/app/fnmusic-ext/api/config", {
+    ok: true,
+    job_id: "cfg_job_test_123",
+    status: "pending",
+  });
+  // 2. 第一次轮询：running 50%
+  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_job_test_123", {
+    ok: true,
+    job: {
+      job_id: "cfg_job_test_123",
+      status: "running",
+      progress: 50,
+      message: "正在快速门禁校验...",
+    },
+  });
+  // 3. 第二次轮询：success 100%
+  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_job_test_123", {
+    ok: true,
+    job: {
+      job_id: "cfg_job_test_123",
+      status: "success",
+      progress: 100,
+      message: "保存成功",
+      result: {
+        ok: true,
+        changed: ["FNMUSIC_QUALITY_MODE"],
+        actions: [],
+      },
+    },
+  });
+  // 4. 保存完成后 loadConfig 与 loadStatus
+  enqueue("/app/fnmusic-ext/api/config", { schema, values: { FNMUSIC_QUALITY_MODE: "lossless" }, revision: "rev_2" });
+  enqueue("/app/fnmusic-ext/api/status", { ok: true, current_provider: "none", processes: {} });
+
+  await global.saveConfig();
+
+  const toastText = els.get("#toast").textContent;
+  assert.ok(toastText.includes("已保存 1 项"));
+  assert.strictEqual(els.get("#save-btn").disabled, false);
+  assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
+});
+
+test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => {
+  reset();
+  global.CONFIG_JOB_POLL_INTERVAL = 0;
+  // 1. 查询活动任务：发现进行中任务
+  enqueue("/app/fnmusic-ext/api/config/jobs/active", {
+    ok: true,
+    active: true,
+    job: {
+      job_id: "cfg_active_999",
+      status: "running",
+      progress: 80,
+      message: "正在激活洛雪音源...",
+    },
+  });
+  // 2. 轮询至完成
+  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_active_999", {
+    ok: true,
+    job: {
+      job_id: "cfg_active_999",
+      status: "success",
+      progress: 100,
+      result: { ok: true, changed: [], actions: [] },
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  enqueue("/app/fnmusic-ext/api/status", { ok: true, current_provider: "none", processes: {} });
+
+  await global.checkActiveConfigJob();
+
+  assert.strictEqual(els.get("#save-btn").disabled, false);
+  assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
+  assert.ok(els.get("#toast").textContent.includes("配置已保存生效"));
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

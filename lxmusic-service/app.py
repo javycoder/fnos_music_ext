@@ -2454,6 +2454,7 @@ class SourceBody(BaseModel):
     url: str = ""
     script: str = ""
     enabled: bool = True  # false 表示停用该源（多源叠加语义下的取消激活）
+    quick: bool = False  # true 表示快速门禁校验（仅语法/平台解析，跳过耗时抽样）
 
 
 class ReorderBody(BaseModel):
@@ -2601,8 +2602,9 @@ async def source_verify(body: SourceBody):
         return _err("url 必须以 http:// 、https:// 或 file:// 开头", 400)
     try:
         # asyncio.timeout 保持同一任务执行 verify_url，避免子任务身份破坏管理锁重入。
-        async with asyncio.timeout(120.0):
-            report = await verify_url(url)
+        timeout_budget = 30.0 if body.quick else 120.0
+        async with asyncio.timeout(timeout_budget):
+            report = await verify_url(url, quick=body.quick)
     except SourceOperationBusy:
         raise
     except asyncio.TimeoutError:

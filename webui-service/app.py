@@ -109,6 +109,19 @@ async def _try_maintenance_socket(method: str, path: str, body: dict | None = No
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+from config_jobs import ConfigJobStore
+
+job_store = ConfigJobStore()
+
+
+def compute_config_revision(env_dict: dict[str, str] | None = None) -> str:
+    if env_dict is None:
+        env_dict = read_env()
+    items = sorted((str(k), str(v)) for k, v in env_dict.items())
+    content = "\n".join(f"{k}={v}" for k, v in items).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()[:16]
+
+
 
 def _static_build_id() -> str:
     """以 HTML、JS、CSS 内容生成指纹，区分缓存错配和后端 Schema 版本。"""
@@ -1558,11 +1571,21 @@ async def api_config():
         "schema": SCHEMA,
         "webui_build": STATIC_BUILD_ID,
         "env_path": str(ENV_PATH),
+        "revision": compute_config_revision(values),
     }
 
 
 class ConfigBody(BaseModel):
     values: dict
+    base_revision: str | None = None
+    idempotency_key: str | None = None
+
+
+class ConfigJobCreateBody(BaseModel):
+    values: dict = {}
+    base_revision: str | None = None
+    idempotency_key: str | None = None
+
 
 
 class PreviewBody(BaseModel):
@@ -1630,17 +1653,27 @@ async def api_preview(body: PreviewBody, request: Request):
     return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
 
 
-@app.put("/api/config")
-async def api_config_put(body: ConfigBody, request: Request):
+async def _do_apply_config(
+    supplied: dict,
+    base_revision: str | None = None,
+    job_id: str | None = None,
+    request: Request | None = None,
+) -> dict | JSONResponse:
+    def _report_progress(phase: str, progress: int, message: str) -> None:
+        if job_id:
+            job_store.update_job(job_id, phase=phase, progress=progress, message=message)
+
+    _report_progress("validating", 10, "正在验证配置参数格式...")
     before = read_env()
-    supplied = body.values or {}
     ignored_keys = sorted(key for key in supplied if key in RETIRED_CONFIG_KEYS)
     supported_values = {key: value for key, value in supplied.items() if key not in RETIRED_CONFIG_KEYS}
     try:
         updates = validate_updates(supported_values)
     except ValueError as exc:
-        return JSONResponse(content={"ok": False, "error": str(exc),
-                                     "ignored_keys": ignored_keys}, status_code=400)
+        err_res = JSONResponse(content={"ok": False, "error": str(exc), "ignored_keys": ignored_keys}, status_code=400)
+        if job_id:
+            job_store.update_job(job_id, status="failed", error=str(exc), message=f"参数校验失败: {exc}")
+        return err_res
 
     after_preview = dict(before)
     after_preview.update(updates)
@@ -1648,11 +1681,18 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     # 服务故障不得按脚本失效取消激活，也不得落盘。
     if lx_provider:
+        _report_progress("gate_checking", 20, "正在确认洛雪音源服务就绪...")
         ready = await _lx_ensure_ready(request, preview=current_provider(before) != "lxmusic")
         if not ready["ok"]:
-            return JSONResponse(content={"ok": False, "error": ready["error"],
-                                         "category": "service_unavailable",
-                                         "stage": ready["stage"]}, status_code=ready["status"])
+            err_res = JSONResponse(
+                content={"ok": False, "error": ready["error"],
+                         "category": "service_unavailable",
+                         "stage": ready["stage"]},
+                status_code=ready["status"],
+            )
+            if job_id:
+                job_store.update_job(job_id, status="failed", error=ready["error"], message=ready["error"])
+            return err_res
 
     # lx 多源激活集合：active_items 待激活列表、to_activate 新激活（需校验）、to_deactivate 被取消激活
     active_items: list[dict] = []
@@ -1691,9 +1731,12 @@ async def api_config_put(body: ConfigBody, request: Request):
             and not before.get("LX_SOURCE_URL")
         )
         if not active_items and not saved_all_inactive:
-            return JSONResponse(
+            err_res = JSONResponse(
                 content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
             )
+            if job_id:
+                job_store.update_job(job_id, status="failed", error="请至少激活一个洛雪源", message="请至少激活一个洛雪源")
+            return err_res
         if active_items or saved_all_inactive:
             lx_reconcile = True
             # LX_SOURCE_URL 退化为派生兼容字段 = 第一个激活项
@@ -1708,7 +1751,7 @@ async def api_config_put(body: ConfigBody, request: Request):
                              for url in before_active if url not in new_active]
             updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
 
-    # lx 换源前置校验：列表中失效的新源自动取消激活，其余配置继续保存。
+    # lx 换源前置快速门禁校验：跳过耗时数分钟的歌曲抽样，秒级校验语法与平台
     lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
     verify_urls: list[str] = []
     if lx_provider:
@@ -1716,16 +1759,20 @@ async def api_config_put(body: ConfigBody, request: Request):
             verify_urls = [str(i["url"]).strip() for i in to_activate]
         elif lx_url_changed:
             verify_urls = [str(updates["LX_SOURCE_URL"] or "").strip()]
-    client = get_http(request)
+
+    client = get_http(request) if request is not None else getattr(app.state, "http", None) or httpx.AsyncClient(timeout=30.0)
     union_acc: list[str] = []  # LX_SOURCES 推导：新激活源声明平台 ∪ 现有启用源声明平台
-    for url in verify_urls:
+    total_verify = len(verify_urls)
+    for idx, url in enumerate(verify_urls):
         if not url:
             continue
+        _report_progress("gate_checking", 25 + int((idx / max(1, total_verify)) * 25), f"正在快速校验新源 ({idx + 1}/{total_verify})...")
         verify_ok = False
         verify_status = 0
         try:
+            # 关键优化：传入 quick=True，只做轻量门禁，跳过深层歌曲搜索/探活
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
-                                     json={"url": url}, timeout=130.0)
+                                     json={"url": url, "quick": True}, timeout=30.0)
             report = _resp_json(resp)
             verify_ok = resp.status_code == 200 and bool(report.get("ok"))
             verify_status = resp.status_code
@@ -1744,19 +1791,25 @@ async def api_config_put(body: ConfigBody, request: Request):
                                      "timeout", "identity_conflict", "unsafe_vm_required") or incomplete or bool(data.get("result_unknown"))
             if _is_service_unavailable(verify_status, report) or protected or verify_status >= 500 and not category:
                 category = (category or "incomplete") if protected and category != "internal" else "service_unavailable"
-                return JSONResponse(
+                err_res = JSONResponse(
                     content={"ok": False, "error": f"洛雪音源暂未就绪，未改动配置：{message}",
                              "category": category,
                              "stage": report.get("stage") or (report.get("data") or {}).get("stage")
                                       or "webui_to_lxmusic"},
                     status_code=409 if category == "source_operation_busy" else 504 if category in ("initialization_pending", "timeout") else 503,
                 )
+                if job_id:
+                    job_store.update_job(job_id, status="failed", error=message, message=f"音源未就绪: {message}")
+                return err_res
             if lx_reconcile:
                 disable_failed_source(url, message)
                 continue
-            return JSONResponse(
+            err_res = JSONResponse(
                 content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
             )
+            if job_id:
+                job_store.update_job(job_id, status="failed", error=message, message=f"洛雪源校验未通过: {message}")
+            return err_res
         # LX_SOURCES 推导累计各新激活源声明平台
         verified_platforms[url] = (report.get("data") or {}).get("platforms") or []
         for p in (report.get("data") or {}).get("platforms") or []:
@@ -1778,10 +1831,28 @@ async def api_config_put(body: ConfigBody, request: Request):
         updates["LX_SOURCES"] = ""
 
     old_provider = current_provider(before)
+    _report_progress("writing", 55, "正在写入并提交配置文件...")
+
+    # CAS 乐观版本控制：核验基线 revision 防并发覆盖
     try:
+        current_disk_env = read_env()
+        if base_revision:
+            disk_rev = compute_config_revision(current_disk_env)
+            if disk_rev != base_revision:
+                conflicts = [k for k in updates if current_disk_env.get(k) != before.get(k)]
+                if conflicts:
+                    err_msg = f"配置存在并发冲突（项已被修改：{', '.join(conflicts)}），请刷新后重新提交"
+                    if job_id:
+                        job_store.update_job(job_id, status="conflict", phase="done", progress=100, error=err_msg, message=err_msg)
+                    return JSONResponse(content={"ok": False, "error": err_msg, "conflict_keys": conflicts}, status_code=409)
+
         changed = write_env(updates)
     except ValueError as exc:
-        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=409)
+        err_res = JSONResponse(content={"ok": False, "error": str(exc)}, status_code=409)
+        if job_id:
+            job_store.update_job(job_id, status="failed", error=str(exc), message=str(exc))
+        return err_res
+
     after = read_env()
     new_provider = current_provider(after)
     # 网易云歌单常驻：切源 musicbox→其它时保留其进程，交由收尾对账校验登录并保活
@@ -1806,14 +1877,16 @@ async def api_config_put(body: ConfigBody, request: Request):
         and bool(after.get("LX_SOURCE_URL") or after.get("LX_SOURCE_LIST"))
     )
 
-    # 常驻开启（非 musicbox 音源）时每次保存都过一遍对账：顺带自愈被手动
-    # 停掉/意外退出的 musicbox 进程
     resident_bypass = resident_keep and new_provider != "musicbox"
     if not changed and not force_lx_activate and not _preview_until and not resident_bypass:
-        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化",
-                "ignored_keys": ignored_keys}
+        res = {"ok": True, "changed": [], "actions": [], "note": "配置无变化",
+               "ignored_keys": ignored_keys, "new_revision": compute_config_revision(after)}
+        if job_id:
+            job_store.update_job(job_id, status="success", phase="done", progress=100, message="配置无变化", result=res, new_revision=res["new_revision"])
+        return res
 
     # 音源切换（先停旧再起新）
+    _report_progress("applying_processes", 70, "正在切换音源服务进程...")
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, "" if new_provider == "lxmusic" else new_provider,
                                                keep_musicbox=resident_keep))
@@ -1838,7 +1911,6 @@ async def api_config_put(body: ConfigBody, request: Request):
                 req_base = urllib.parse.unquote(req_url).replace("\\", "/").rsplit("/", 1)[-1] if req_url.startswith("file://") else ""
                 req_stem = req_base[:-3] if req_base.lower().endswith(".js") else req_base
                 entries = [entry for entry in data.get("sources") or [] if isinstance(entry, dict)]
-                # 强身份优先；文件名/名称兜底只接受唯一候选，不能误用同名源状态。
                 for matches in (
                     [entry for entry in entries if sid and str(entry.get("id") or "") == sid],
                     [entry for entry in entries if req_url and entry.get("url") == req_url],
@@ -1855,7 +1927,6 @@ async def api_config_put(body: ConfigBody, request: Request):
                     ok, category = False, "runtime"
                     err = target.get("error") or err or "源初始化失败"
                 elif ok and (not target or target.get("status") != "success"):
-                    # source_id、initialized=true 或另一个成功源都不能证明目标已就绪。
                     ok, category = False, "initialization_pending"
                     err = "源初始化结果待定，请稍后查看运行状态"
                 elif not ok and not category:
@@ -1875,6 +1946,7 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
     if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
+        _report_progress("reconciling_sources", 80, "正在激活并对账洛雪音源...")
         if lx_reconcile:
             for item in to_deactivate:
                 url = str(item.get("url") or "").strip()
@@ -1888,7 +1960,6 @@ async def api_config_put(body: ConfigBody, request: Request):
                 sid = await _lx_source_post({"url": url},
                                             str(item.get("name") or "") or url, "activate")
                 if sid:
-                    # 保存 lxserver 返回的身份 ID，后续停用、重排和重新激活共用同一身份。
                     item["id"] = sid
                     target_ids.add(sid)
                     order_ids = json.loads(updates.get(
@@ -1900,18 +1971,14 @@ async def api_config_put(body: ConfigBody, request: Request):
                 if not actions[-1]["ok"]:
                     if actions[-1].get("category") not in ("runtime", "runtime_error"):
                         activation_service_failed = True
-                        # 忙、初始化待定、通信故障均保留配置，不误删正在运行的源。
                         warnings.append({"source": str(item.get("name") or "") or url,
                                          "url": url, "message": actions[-1]["error"],
                                          "category": actions[-1].get("category") or "initialization_pending"})
                     else:
                         disable_failed_source(url, actions[-1]["error"])
                         actions[-1]["auto_disabled"] = True
-            # 激活失败也写回取消激活状态，避免重开页面仍显示已激活。
             sync_lx_updates()
             new_active = {str(i["url"]).strip() for i in active_items}
-            # 不仅比较已写入的 .env：失败的停用仍会出现在实际启用集合中。
-            # 已自动停用失败项，按最终激活集合清理实际仍启用的脚本。
             try:
                 actual = [] if activation_service_failed else await _lx_enabled_sources(request)
                 for s in actual:
@@ -1943,7 +2010,6 @@ async def api_config_put(body: ConfigBody, request: Request):
                 changed.extend(k for k in corrections if k not in changed)
                 after = read_env()
             else:
-                # 初次激活会返回真正 source.id；保存后非 LX 主音源也能只读展示稳定顺序。
                 corrections = write_env({
                     "LX_SOURCE_LIST": updates["LX_SOURCE_LIST"],
                     "FNMUSIC_LX_SOURCE_ORDER": updates.get(
@@ -1960,10 +2026,11 @@ async def api_config_put(body: ConfigBody, request: Request):
         actions.append({"kind": "process", "program": "musicdl", "op": "restart",
                         "ok": code == 0, "error": "" if code == 0 else out})
 
-    # 预览收尾：保存启用的转正常驻，其余预览进程立即停止（常驻生效时保留 musicbox）
+    # 预览收尾
     actions.extend(preview_reconcile_after_save(keep_musicbox=resident_keep))
 
-    # 网易云歌单常驻对账收口：切源保留的进程验证登录、开启/关闭/自愈拉起
+    # 网易云歌单常驻对账收口
+    _report_progress("verifying_runtime", 92, "正在核对歌单常驻与运行态...")
     if new_provider != "musicbox":
         await _reconcile_musicbox_resident(
             client, after, actions,
@@ -1972,8 +2039,100 @@ async def api_config_put(body: ConfigBody, request: Request):
         )
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
-    return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys,
-            "warnings": warnings, "ignored_keys": ignored_keys}
+    final_rev = compute_config_revision(after)
+    res = {
+        "ok": True,
+        "changed": changed,
+        "actions": actions,
+        "restart_keys": restart_keys,
+        "warnings": warnings,
+        "ignored_keys": ignored_keys,
+        "new_revision": final_rev,
+    }
+    has_failed_actions = any(not a.get("ok") and not a.get("auto_disabled") for a in actions)
+    status = "partial" if has_failed_actions else "success"
+    if job_id:
+        job_store.update_job(job_id, status=status, phase="done", progress=100, message="配置保存生效成功", result=res, new_revision=final_rev)
+    return res
+
+
+async def _run_config_job(job_id: str) -> None:
+    job = job_store.get_job(job_id)
+    if not job:
+        return
+    job_store.update_job(job_id, status="running", phase="validating", progress=5, message="任务开始执行...")
+    try:
+        await _do_apply_config(
+            supplied=job.payload,
+            base_revision=job.base_revision,
+            job_id=job_id,
+            request=None,
+        )
+    except Exception as exc:
+        logger.exception("配置保存任务执行异常: %s", exc)
+        job_store.update_job(job_id, status="failed", phase="done", progress=100, error=str(exc), message=f"执行异常: {exc}")
+
+
+@app.post("/api/config/jobs")
+async def api_config_jobs_create(body: ConfigJobCreateBody, request: Request):
+    """提交配置保存异步任务，支持幂等去重与 CAS 冲突防御。"""
+    if body.idempotency_key:
+        existing = job_store.find_by_idempotency_key(body.idempotency_key)
+        if existing:
+            return JSONResponse(content={"ok": True, "job": existing.to_dict(), "deduplicated": True}, status_code=200)
+
+    active = job_store.get_active_job()
+    if active:
+        return JSONResponse(
+            content={"ok": False, "error": "已有正在处理的配置保存任务，请稍候", "active_job_id": active.job_id},
+            status_code=409,
+        )
+
+    try:
+        validate_updates({k: v for k, v in (body.values or {}).items() if k not in RETIRED_CONFIG_KEYS})
+    except ValueError as exc:
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
+
+    job = job_store.create_job(
+        payload=body.values or {},
+        base_revision=body.base_revision,
+        idempotency_key=body.idempotency_key,
+    )
+    asyncio.create_task(_run_config_job(job.job_id))
+    return JSONResponse(
+        content={"ok": True, "job_id": job.job_id, "status": job.status, "phase": job.phase},
+        status_code=202,
+    )
+
+
+@app.get("/api/config/jobs/active")
+async def api_config_jobs_active():
+    """获取当前正在执行中的保存任务（用于页面刷新与断网重连恢复）。"""
+    job = job_store.get_active_job()
+    if not job:
+        return {"ok": True, "active": False}
+    return {"ok": True, "active": True, "job": job.to_dict()}
+
+
+@app.get("/api/config/jobs/{job_id}")
+async def api_config_jobs_get(job_id: str):
+    """查询指定任务状态与最终结果。"""
+    job = job_store.get_job(job_id)
+    if not job:
+        return JSONResponse(content={"ok": False, "error": "任务不存在"}, status_code=404)
+    return {"ok": True, "job": job.to_dict()}
+
+
+@app.put("/api/config")
+async def api_config_put(body: ConfigBody, request: Request):
+    """兼容旧接口的配置保存：内部调用统一执行内核。"""
+    res = await _do_apply_config(
+        supplied=body.values or {},
+        base_revision=body.base_revision,
+        job_id=None,
+        request=request,
+    )
+    return res
 
 
 @app.get("/api/llm/usage")
