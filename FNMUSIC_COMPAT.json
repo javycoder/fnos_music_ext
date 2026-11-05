@@ -1,8 +1,8 @@
 {
-  "extension_version": "2.12.0-8",
+  "extension_version": "3.0.0-0",
   "music_versions": [
     "1.0.10"
   ],
   "checked_at": "2026-11-05",
-  "notes": "2026-11-05 20:57 本次正式发布准备期间通过已核实的 SSH 主机身份（StrictHostKeyChecking=yes）只读重新检查官方音乐 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10，与既有适配基线一致。未修改官方程序、生产配置或曲库；仅记录适配基线，不控制运行时行为。"
+  "notes": "音乐侧基线承继 2026-11-05 20:57 的核对：通过已核实的 SSH 主机身份（StrictHostKeyChecking=yes）只读检查官方音乐 /var/apps/trim.music/manifest，appname=trim.music，version=1.0.10，与既有适配基线一致。3.0.0-0 为安装加速改造分支基线，尚未发布；其对音乐 1.0.10 的真机安装/升级实测仍在待办，未验证项不得视为已通过。未修改官方程序、生产配置或曲库；仅记录适配基线，不控制运行时行为。"
 }
