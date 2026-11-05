@@ -90,7 +90,8 @@ def test_resolution_priority(tmp_path):
     r = run_scenario(scenario("", ""))
     assert f"RESOLVED={target}" in r.stdout
 
-    # 5. 无 TRIM_PKGVAR（git 检出）→ repo 内旧布局
+    # 5. 无 TRIM_PKGVAR（git 检出，清除上一场景的符号链接还原干净仓库）→ repo 内旧布局
+    (repo / ".venv-proxy").unlink()
     code = textwrap.dedent(f"""
         set -euo pipefail
         log_info() {{ echo "[INFO] $*"; }}
@@ -153,6 +154,7 @@ def test_persistent_venv_state_survives_repo_replacement(tmp_path):
     (venv / "bin").mkdir(parents=True)
     (venv / ".fnmusic-deps").write_text("state-marker")
     repo = tmp_path / "repo"
+    repo.mkdir()
     (repo / ".venv-proxy").symlink_to(venv, target_is_directory=True)
 
     # fnOS 升级：target 整体替换（等价于删除重建 repo 目录）

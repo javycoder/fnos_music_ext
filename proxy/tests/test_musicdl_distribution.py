@@ -164,6 +164,8 @@ def test_musicdl_unified_logger_rotates_and_webui_archive_includes_it(tmp_path):
         root, isolated = map(Path, sys.argv[1:])
         sys.path.insert(0, str(root))
         sys.path.insert(0, str(root / "musicdl-service"))
+        # webui app 以自身目录为工作目录运行，config_jobs 等同目录模块可导入
+        sys.path.insert(0, str(root / "webui-service"))
         fake = types.ModuleType("musicdl")
         fake.musicdl = types.SimpleNamespace(SUPPORTED_MUSIC_SOURCES=["KuwoMusicClient", "MiguMusicClient"])
         sys.modules["musicdl"] = fake
