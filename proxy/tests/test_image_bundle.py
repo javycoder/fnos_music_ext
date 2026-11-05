@@ -165,6 +165,34 @@ def test_ensure_rejects_identity_drift_after_load(tmp_path, monkeypatch):
         ib.ensure(bundle, docker_cmd="docker")
 
 
+def test_ensure_accepts_inspect_without_diff_ids(tmp_path, monkeypatch):
+    """containerd image store 的 inspect 不暴露 RootFS.DiffIds。
+
+    image_id（config 摘要）+ os/arch 匹配即视为同一镜像，不得因 inspect
+    缺字段而误判不符、反复导入。
+    """
+    bundle = write_bundle(tmp_path)
+    monkeypatch.setattr(ib, "host_arch", lambda: "amd64")
+    monkeypatch.setattr(
+        ib, "inspect_image",
+        lambda docker, ref: {k: v for k, v in matching_local().items()
+                             if k != "diff_ids"})
+    monkeypatch.setattr(ib, "load_archive",
+                        lambda *_a: (_ for _ in ()).throw(AssertionError("不应导入")))
+    ib.ensure(bundle, docker_cmd="docker")
+
+
+def test_ensure_rejects_diff_ids_drift_when_inspect_provides(tmp_path, monkeypatch):
+    """inspect 提供了 diff_ids 且与清单不一致（同 id 不同层描述）仍须拒绝。"""
+    bundle = write_bundle(tmp_path)
+    monkeypatch.setattr(ib, "host_arch", lambda: "amd64")
+    monkeypatch.setattr(ib, "inspect_image", lambda docker, ref: {
+        **matching_local(), "diff_ids": ["sha256:" + "e" * 64]})
+    monkeypatch.setattr(ib, "load_archive", lambda *_a: None)
+    with pytest.raises(ib.BundleError, match="身份与清单不符"):
+        ib.ensure(bundle, docker_cmd="docker")
+
+
 def test_ensure_arch_mismatch_guarded(tmp_path, monkeypatch):
     bundle = write_bundle(tmp_path, arch="arm64")
     monkeypatch.setattr(ib, "host_arch", lambda: "amd64")

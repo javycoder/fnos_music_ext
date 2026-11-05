@@ -119,7 +119,11 @@ def image_matches(local: dict | None, manifest: dict) -> bool:
         return False
     if local["id"] != manifest["image_id"]:
         return False
-    if list(local.get("diff_ids") or []) != list(manifest["rootfs_diff_ids"]):
+    # image_id 是 config 摘要，相等即蕴含 rootfs 描述一致；diff_ids 仅在
+    # inspect 提供（经典 docker 存储）时作加强校验——containerd image store
+    # 的 inspect 不暴露 RootFS.DiffIds，不能据此判不符。
+    local_diffs = list(local.get("diff_ids") or [])
+    if local_diffs and local_diffs != list(manifest["rootfs_diff_ids"]):
         return False
     return local.get("os") == "linux" and local.get("arch") == manifest["arch"]
 
