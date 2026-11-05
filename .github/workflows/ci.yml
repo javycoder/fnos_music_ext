@@ -55,10 +55,10 @@ jobs:
       - name: Verify official music compatibility record
         run: python scripts/check_music_compat.py
 
-      # 服务各用独立解释器，避免 app/conftest/环境变量污染；仅服务之间限2并行。
-      # proxy/socket/部署与打包用例保守串行；覆盖率跨进程合并，仅展示不设门槛。
+      # 每个测试根只调度一次；proxy 按整文件拆成独立进程分片（非 xdist、非线程），
+      # 分片间无重叠，新增测试文件自动纳入。覆盖率跨进程合并，仅展示不设门槛。
       - name: Run tests
-        run: python scripts/run_tests.py --jobs 2 --coverage
+        run: python scripts/run_tests.py --jobs 2 --shards 2 --coverage
 
   shellcheck:
     runs-on: ubuntu-latest

@@ -544,12 +544,20 @@ async def test_startup_stall_is_bounded_and_closes_transport(monkeypatch):
     audio = Stalled()
     p.app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda req: httpx.Response(200, stream=audio)), base_url="http://test")
+    # 生产默认单次尝试预算是 6 秒；这里只缩小预算数值，验证"到点必被掐断、
+    # 并释放传输"的语义，取消与关闭路径和生产一致。
+    monkeypatch.setattr(p, "_STREAM_ATTEMPT_S", 0.3)
     before = time.monotonic()
     response = await p.stream_track(request("guid=online:kuwo:1"))
     assert response.status_code == 404
-    # 单次解析预算 6 秒（与进程内取链+网络抖动余量对齐），stall 必须被掐断
-    assert 5.8 < time.monotonic() - before < 6.6
+    assert 0.25 < time.monotonic() - before < 2.0
     assert audio.closed
+
+
+def test_stream_attempt_budget_keeps_production_floor():
+    """预算常量本身仍是 6 秒：提速只改测试注入值，不改变线上等待。"""
+    assert p._STREAM_ATTEMPT_S == 6.0
+    assert p._STREAM_STARTUP_S == 12.0
 
 
 @pytest.mark.anyio
