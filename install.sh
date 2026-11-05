@@ -1506,7 +1506,9 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 log_info "安装代理依赖..."
 # venv 创建 + 多源回退（阿里→清华→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
+stage_begin "代理依赖保障"
 PIP_INDEX="${PIP_INDEX}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
+stage_end "代理依赖保障"
 
 install_unit() {
     local src="$1" dest="$2"
@@ -1569,11 +1571,14 @@ install_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || return 1
     fi
-    if ! ensure_image_current; then
-        log_err "Docker 镜像保障失败（复用或重建应用镜像未成功），请查看上方原始错误。"
+    stage_begin "应用镜像保障"
+    if ! ensure_app_image; then
+        stage_end "应用镜像保障（失败）"
+        log_err "Docker 镜像保障失败（离线导入或现场构建未成功），请查看上方原始错误。"
         log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
         return 1
     fi
+    stage_end "应用镜像保障"
     # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的
     # 运行中容器不会重启（切源/升级恢复 .env 后输出仍是 "Container ... Running"）：
     # 所选音源与旧进程集不一致时，下方 healthz 必然等满超时，先重启对齐再等待。

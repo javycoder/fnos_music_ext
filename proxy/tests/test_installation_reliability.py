@@ -714,14 +714,18 @@ def test_extend_docker_only_and_single_container_probe():
 def test_extend_image_ensure_delegates_to_shared_fingerprint_reuse():
     """issue #70：extend.sh 不再自带"无条件 compose up --build"的镜像保障；收敛到
     proxy/install_common.sh 的 ensure_image_current——按构建指纹复用镜像（不探测/
-    拉取基础镜像），缺失或输入变化才重建。行为矩阵见 test_build_fingerprint.py。"""
+    拉取基础镜像），缺失或输入变化才重建。行为矩阵见 test_build_fingerprint.py。
+    3.0.0+：入口统一为 ensure_app_image——有随包离线资产走导入/复用（image_bundle.py），
+    无资产回落 ensure_image_current 现场构建，git 检出行为与 issue #70 保持一致。"""
     extend = (BASE/'extend.sh').read_text(encoding='utf-8')
     common = (BASE/'proxy/install_common.sh').read_text(encoding='utf-8')
-    # extend 只有容器保障壳，无本地 ensure_image_current 遮蔽定义
+    # extend 只有容器保障壳，无本地 ensure_image_current/ensure_app_image 遮蔽定义
     assert 'ensure_image_current()' not in extend
+    assert 'ensure_app_image()' not in extend
     assert 'ensure_sources_container' in extend
-    assert 'ensure_image_current || exit 1' in extend
-    # 共享函数三条路径：指纹复用（不探测）、探测后复用、探测后重建
+    assert 'ensure_app_image || exit 1' in extend
+    # 分发入口回落共享指纹路径；共享函数三条路径：复用（不探测）、探测后复用、重建
+    assert 'ensure_image_current' in common
     assert 'up -d --no-build --pull never' in common
     assert 'up -d --build' in common
     assert 'ensure_base_image.sh' in common

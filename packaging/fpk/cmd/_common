@@ -73,8 +73,9 @@ fnmusic_log_tail_brief() {
 fnmusic_run_logged() {
     # Run a command, appending a timestamped copy of its combined output to
     # FNMUSIC_DURABLE_LOG. The return status is the command's, not tee's.
-    local stamp rc pipefail_on=0
+    local stamp rc pipefail_on=0 start_secs
     stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)"
+    start_secs="${SECONDS}"
     printf '\n===== %s %s =====\n' "${stamp}" "$*" >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
     if set -o | grep -q 'pipefail[[:space:]]*on'; then
         pipefail_on=1
@@ -85,6 +86,12 @@ fnmusic_run_logged() {
     if [ "${pipefail_on}" -eq 1 ]; then
         set -o pipefail
     fi
+    # 3.0.0+：补记结束时间与总耗时。install.sh 事件 done 之后仍会 exec extend
+    # 接管与验收（2026-11-03 实测尾段可观），只有本行能给出 hook 级完整时长。
+    stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)"
+    printf '===== %s exit=%s elapsed=%ss %s =====\n' \
+        "${stamp}" "${rc}" "$((SECONDS - start_secs))" "$*" \
+        >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
     return "${rc}"
 }
 
