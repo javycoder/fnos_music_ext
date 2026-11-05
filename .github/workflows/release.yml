@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       formal: ${{ steps.release-kind.outputs.formal }}
+      install_version: ${{ steps.release-kind.outputs.version }}
     env:
       # 打赏二维码文本（可选）：两个渠道独立生成，不把文本或图片提交到仓库
       ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
@@ -174,17 +175,15 @@ jobs:
               "$fpk_file" "$fpk_file.sha256"
           fi
 
-      # 后续 job（moo 索引、Gitee 镜像）需要同一份产物：重新打包会引入字节差异，
-      # 镜像与 GitHub 资产的 sha256 就不再一致。发行说明一并带上，避免各 job
-      # 重复截取 CHANGELOG 产生口径漂移。
+      # Gitee 只同步发行说明和 GitHub 下载链接，不传递或上传安装包。
       - name: Stage release artifacts
         run: cp /tmp/release-notes.md dist/release-notes.md
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-dist
-          path: dist/
+          name: release-notes
+          path: dist/release-notes.md
           retention-days: 1
 
   # issue #36：moo 商店协议源索引自动回填。从 GitHub Release API 取真实资产
@@ -230,9 +229,8 @@ jobs:
           git commit -m "chore(ci): 自动更新 moo 商店协议源索引 [skip ci]"
           git push
 
-  # Gitee 镜像只同步分支/标签/提交，发行版需经 API 发布；发布的是同一份
-  # fpk（字节一致，sha256 两边相同，取自 release job 的 artifact）。未配置
-  # GITEE_TOKEN 密钥时跳过。
+  # Gitee 仅发布说明及 GitHub 的 FPK / SHA256 下载链接，不自动上传附件。
+  # 既有 Gitee 附件保留；未配置 GITEE_TOKEN 时跳过说明发布。
   #
   # 严格排在 update-moo-index 之后：索引提交推到 main 后，Gitee 侧的仓库镜像
   # 才会连带同步到最新 moo.json；若两者并行，Gitee 可能停在旧索引上，用户
@@ -247,6 +245,7 @@ jobs:
       GITEE_REPO: javycoder/fnos_music_ext
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
       TAG: ${{ inputs.tag || github.ref_name }}
+      FPK_NAME: fnmusic-ext-${{ needs.release.outputs.install_version }}.fpk
     steps:
       - uses: actions/checkout@v4
         with:
@@ -254,17 +253,15 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: release-dist
+          name: release-notes
           path: dist
 
       # v2.7.0 实测：runner→gitee.com TLS 间歇失败（curl exit 35），故所有
       # 小请求 API 调用必须带重试。
       - name: Publish release to Gitee
         if: env.GITEE_TOKEN != ''
-        # 整体上界：tag 轮询 ≤10min + 查询/创建（gcurl 最长 4×120s 各两次）+
-        # 文件级预算（fpk 1800s + sha256 600s）+ PATCH。没有它时单个请求的重试
-        # 会把 job 拖到一小时以上。
-        timeout-minutes: 90
+        # tag 轮询最多 10 分钟，其余仅有有界的元数据小请求。
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           tag="${TAG}"
@@ -276,14 +273,13 @@ jobs:
               ;;
           esac
           notes_file="dist/release-notes.md"
-          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          fpk_name="${FPK_NAME:?缺少数字安装版本对应的 FPK 文件名}"
           api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
 
           gcurl() {
-            # 仅用于小请求（查询/创建/PATCH）。大文件上传走 upload_attach，
-            # 因为 --retry 会整段重发请求体。
-            curl -sS --connect-timeout 15 --max-time 120 \
-              --retry 3 --retry-all-errors --retry-delay 4 "$@"
+            # 只用于发行说明的查询、创建与更新，不发送附件。
+            curl -sS --connect-timeout 15 --max-time 30 \
+              --retry 2 --retry-all-errors --retry-delay 4 "$@"
           }
 
           # 镜像同步有延迟，轮询等 tag 出现在 Gitee（公开仓库 ls-remote 无需认证）
@@ -313,17 +309,7 @@ jobs:
             exit 1
           fi
           ver="${tag#v}"
-          if [ -n "${release_id}" ]; then
-            # 重发时清理同名旧附件（不动 gitee 自动生成的源码包）；by-tag 响应的
-            # assets 不带附件 id，需走附件列表接口
-            gcurl -f -o /tmp/gitee-att-list.json \
-              "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
-            for attach_id in $(jq -r --arg fpk "$(basename "${fpk_file}")" --arg sum "$(basename "${fpk_file}").sha256" \
-                '.[]? | select(.name == $fpk or .name == $sum) | .id' /tmp/gitee-att-list.json); do
-              gcurl -o /dev/null -X DELETE \
-                "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
-            done
-          else
+          if [ -z "${release_id}" ]; then
             # 创建：gitee 要求 target_commitish 必传（tag 已存在时仅作落点声明）
             create_http="$(gcurl -o /tmp/gitee-create.json -w '%{http_code}' "${api}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
@@ -339,98 +325,17 @@ jobs:
             release_id="$(jq -r '.id' /tmp/gitee-create.json)"
           fi
 
-          # 上传 fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
-          # 保留数组/对象兼容解析以防变动）。
-          #
-          # 大文件上传不能用 gcurl 的 --retry：那会把 28MB 请求体整段重发，叠加
-          # --max-time 时最坏数倍于上限才以 curl exit 28 失败（v2.10.0 实测单个
-          # 文件烧掉 65 分钟）。这里改为文件级总预算 + 停滞即弃：
-          #
-          # v2.10.1（3×300s）与 v2.10.2（2×1200s）两次实测，fpk 全部在 --max-time
-          # 处耗尽——v2.10.2 从 12:31:02 到 13:11:32 整整 2400s 零产出，说明坏路径
-          # 上是"几乎不推进"而非"稍慢"。单纯放大时限只会把预算烧在同一根连接上，
-          # 因此改为：
-          #   - 文件级总预算（大文件 1800s / 小文件 600s），重试次数不再线性放大
-          #     耗时；
-          #   - 大文件低于 20KB/s（28MB 需 ~1400s，留出余量才能传完）持续 90s
-          #     就判这条连接不可用，立刻断开换新连接重试；只要还在推进就让
-          #     curl 传完；
-          #   - 每次失败先查附件列表，服务端已落盘就直接复用，绝不重传大文件。
-          upload_attach() {
-            local file="$1" name size budget stall deadline attempt=0 http url left
-            local -a throttle=()
-            name="$(basename "${file}")"
-            size="$(stat -c%s "${file}")"
-            budget=1800; stall=20480
-            if [ "${size}" -le 5242880 ]; then
-              budget=600; stall=0
-            fi
-            # 小文件不设速率闸（--speed-limit 0 的语义按 curl 版本而异，不依赖它）
-            if [ "${stall}" -gt 0 ]; then
-              throttle=(--speed-limit "${stall}" --speed-time 90)
-            fi
-            deadline=$(( $(date +%s) + budget ))
-            while :; do
-              attempt=$(( attempt + 1 ))
-              left=$(( deadline - $(date +%s) ))
-              [ "${left}" -ge 60 ] || break
-              # 单次上限压到剩余预算，绝不超出文件级上界
-              [ "${left}" -gt 1500 ] && left=1500
-              http="$(curl -sS --connect-timeout 20 --max-time "${left}" \
-                "${throttle[@]}" \
-                -o /tmp/gitee-att-one.json -w '%{http_code}' \
-                "${api}/releases/${release_id}/attach_files" \
-                -F "access_token=${GITEE_TOKEN}" \
-                -F "file=@${file}")" || http="000"
-              if [ "${http}" = 200 ] || [ "${http}" = 201 ]; then
-                url="$(jq -r 'if type == "array" then .[0].url else (.url // .browser_download_url) end' /tmp/gitee-att-one.json 2>/dev/null || true)"
-                if [ -n "${url}" ] && [ "${url}" != "null" ]; then
-                  printf '%s' "${url}"
-                  return 0
-                fi
-              fi
-              echo "[gitee] 第 ${attempt} 次上传 ${name} 未完成（HTTP ${http}，剩余 $(( deadline - $(date +%s) ))s）" >&2
-              # 响应丢失但附件其实已落盘时，直接复用，绝不重传大文件
-              url="$(curl -sS --connect-timeout 15 --max-time 60 \
-                "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}" \
-                | jq -r --arg n "${name}" '.[]? | select(.name == $n) | .url' 2>/dev/null | head -n1 || true)"
-              if [ -n "${url}" ] && [ "${url}" != "null" ]; then
-                echo "[gitee] ${name} 已在服务端，复用现有附件" >&2
-                printf '%s' "${url}"
-                return 0
-              fi
-              sleep $(( attempt < 5 ? attempt * 10 : 50 ))
-            done
-            return 1
-          }
-
-          # 镜像失败不拖垮发版：Gitee 是辅助渠道，GitHub Release 已发布且 moo 索引
-          # 已先行提交（本 job 排在它之后）；镜像不可用时把发行版说明的附件链接
-          # 回指 GitHub 资产（字节与 sha256 完全一致），并打 warning 让失败可见。
-          attach_links=""
-          mirrored=1
-          for f in "${fpk_file}" "${fpk_file}.sha256"; do
-            if url="$(upload_attach "${f}")"; then
-              attach_links="${attach_links}- [$(basename "${f}")](${url})"$'\n'
-            else
-              mirrored=0
-              name="$(basename "${f}")"
-              echo "::warning::Gitee 附件 ${name} 未能上传（镜像链路不可用），发行版说明改为回指 GitHub 资产"
-              attach_links="${attach_links}- [${name}](https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${name})"$'\n'
-            fi
-          done
-
-          # 更新说明 = changelog + 附件下载链接；PATCH 必须重传 tag_name 与 name
+          # 下载链接使用数字安装版本（保留 -N），不从展示 tag 拼安装包名。
+          download_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          # 更新说明 = changelog + GitHub 下载链接；不删除已有 Gitee 附件。
           {
             cat "${notes_file}"
             echo
-            if [ "${mirrored}" != 1 ]; then
-              echo "> **附件说明**：本次 Gitee 镜像的安装包上传失败（镜像链路不可用），"
-              echo "> 上方链接指向 GitHub 发行版；文件与镜像本应发布的字节一致（sha256 相同）。"
-              echo
-            fi
-            echo "### 附件"
-            printf '%s' "${attach_links}"
+            echo "> **下载说明**：安装包及校验文件统一由 GitHub Release 提供，Gitee 不自动上传附件。"
+            echo
+            echo "### 下载"
+            printf -- '- [%s](%s/%s)\n' "${fpk_name}" "${download_base}" "${fpk_name}"
+            printf -- '- [%s.sha256](%s/%s.sha256)\n' "${fpk_name}" "${download_base}" "${fpk_name}"
           } > /tmp/gitee-body.md
           patch_http="$(gcurl -o /tmp/gitee-patch.json -w '%{http_code}' -X PATCH \
             "${api}/releases/${release_id}?access_token=${GITEE_TOKEN}" \
@@ -442,14 +347,4 @@ jobs:
             cat /tmp/gitee-patch.json >&2 || true
             exit 1
           fi
-          if [ "${mirrored}" != 1 ]; then
-            {
-              echo "### Gitee 镜像降级"
-              echo
-              echo "安装包未上传成功，发行版说明已回指 GitHub 资产。"
-              echo "镜像链路恢复后可用 workflow_dispatch 对 ${tag} 重跑本工作流补齐。"
-            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            echo "[gitee] 发行版与说明已更新，但安装包未镜像（见 warning）"
-            exit 0
-          fi
-          echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
+          echo "[gitee] 发行说明已更新，下载链接指向 GitHub；不上传 FPK 或校验附件"

@@ -55,7 +55,7 @@
 
 ### 2. 安装扩展
 
-1. 前往 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载正式版 `.fpk`。访问困难时可查看 [Gitee 发行页](https://gitee.com/javycoder/fnos_music_ext/releases)，以该页实际资产与下载说明为准。
+1. 前往 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载正式版 `.fpk`。[Gitee 发行页](https://gitee.com/javycoder/fnos_music_ext/releases) 同步更新说明和 GitHub 下载链接，后续版本不再自动向 Gitee 上传安装包；已有附件保留。
 2. 打开 fnOS **应用中心 → 手动安装**，选择 FPK，按向导选择初始音源并安装。
 3. 从飞牛桌面打开 **fnMusic 扩展管理**，完成下表中的配置并保存。
 
