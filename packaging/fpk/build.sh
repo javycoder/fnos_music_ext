@@ -182,18 +182,39 @@ if [ "${IMAGE_ASSET_MODE}" != "skip" ]; then
             "${ASSET_BUILD_FLAGS[@]}" \
             -t fnmusic-sources:latest \
             "${STAGE}/app/repo"
-        IMAGE_ID="$(docker image inspect fnmusic-sources:latest --format '{{.Id}}')"
-        DIFF_IDS="$(docker image inspect fnmusic-sources:latest --format '{{json .RootFS.DiffIds}}')"
         DOCKERFILE_SHA="$(sha256sum "${STAGE}/app/repo/container/Dockerfile" | awk '{print $1}')"
         ARCHIVE="${BUNDLE_DIR}/fnmusic-sources-image.tar.gz"
         echo "[fpk] docker save | gzip → ${ARCHIVE} ..."
         docker save fnmusic-sources:latest | gzip "-${FPK_IMAGE_GZIP_LEVEL:-6}" > "${ARCHIVE}"
         ARCHIVE_SHA="$(sha256sum "${ARCHIVE}" | awk '{print $1}')"
         ARCHIVE_BYTES="$(stat -c %s "${ARCHIVE}")"
-        python3 - "${BUNDLE_DIR}" "${IMAGE_ARCH}" "${IMAGE_ID}" "${DIFF_IDS}" \
+        # 镜像身份（image_id = config 摘要 / rootfs.diff_ids / 架构）直接从导出
+        # 归档提取：不依赖 docker image inspect（buildx/containerd 形态下 inspect
+        # 的 Go 模板可能拿到 manifest list 而缺 RootFS），且校验的正是实际随包
+        # 交付的产物。
+        python3 - "${BUNDLE_DIR}" "${IMAGE_ARCH}" \
             "${ARCHIVE_SHA}" "${ARCHIVE_BYTES}" "${DOCKERFILE_SHA}" "${VERSION}" "${GIT_COMMIT}" <<'PY'
-import datetime, json, pathlib, sys
-(bundle, arch, image_id, diff_ids, sha, size, dockerfile_sha, version, commit) = sys.argv[1:]
+import datetime, hashlib, json, pathlib, sys, tarfile
+(bundle, arch, sha, size, dockerfile_sha, version, commit) = sys.argv[1:]
+archive = pathlib.Path(bundle, "fnmusic-sources-image.tar.gz")
+with tarfile.open(archive, "r:gz") as tar:
+    member = tar.extractfile("manifest.json")
+    if member is None:
+        raise SystemExit("归档缺少 manifest.json（docker save 输出异常）")
+    saved = json.load(member)
+    if not isinstance(saved, list) or len(saved) != 1:
+        raise SystemExit(f"docker save 归档应恰好含一个镜像条目: {saved!r}")
+    config_path = saved[0].get("Config") or ""
+    if not config_path:
+        raise SystemExit(f"归档 manifest.json 缺少 Config: {saved[0]!r}")
+    config_bytes = tar.extractfile(config_path).read()
+    config = json.loads(config_bytes)
+image_id = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+diff_ids = (config.get("rootfs") or {}).get("diff_ids")
+if not isinstance(diff_ids, list) or not diff_ids:
+    raise SystemExit(f"镜像 config 缺少 rootfs.diff_ids: {config.get('rootfs')!r}")
+if config.get("architecture") != arch:
+    raise SystemExit(f"镜像架构 {config.get('architecture')!r} 与目标 {arch!r} 不符")
 manifest = {
     "schema": 1,
     "app": "fnmusic-ext",
@@ -202,7 +223,7 @@ manifest = {
     "platform": f"linux/{arch}",
     "image_tag": "fnmusic-sources:latest",
     "image_id": image_id,
-    "rootfs_diff_ids": json.loads(diff_ids),
+    "rootfs_diff_ids": diff_ids,
     "archive": "fnmusic-sources-image.tar.gz",
     "archive_sha256": sha,
     "archive_bytes": int(size),
@@ -212,7 +233,9 @@ manifest = {
 }
 pathlib.Path(bundle, "manifest.json").write_text(
     json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(f"[fpk] 镜像身份: {image_id} ({len(diff_ids)} 层, {config.get('architecture')})")
 PY
+        IMAGE_ID="$(python3 -c "import json,pathlib; print(json.loads(pathlib.Path('${BUNDLE_DIR}/manifest.json').read_text(encoding='utf-8'))['image_id'])")"
         echo "[fpk] 镜像资产就绪: ${IMAGE_ID#sha256:} 归档 $(du -m "${ARCHIVE}" | cut -f1)MB"
         # 内嵌镜像的 FPK 按架构命名，避免双架构产物同名混淆（manifest 内版本号不变）
         ASSET_ARCH_SUFFIX="-${IMAGE_ARCH}"
