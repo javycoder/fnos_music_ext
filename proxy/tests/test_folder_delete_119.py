@@ -66,6 +66,14 @@ def test_permission_and_upstream_failure_do_not_modify_online_data(state, role, 
     assert len(recommend.load_online_play_history("u1")) == 2
 
 
+def test_official_only_request_preserves_official_validation(state):
+    calls = []
+    with client_for(handler_for(calls, status=123)) as client:
+        result = client.post("/music/api/v1/folder-view/delete", json={"folderPaths": ["/library"]})
+    assert result.json()["code"] == 123
+    assert [r.url.path for r in calls] == ["/music/api/v1/folder-view/delete"]
+
+
 def test_favorite_write_failure_reports_error(state, monkeypatch):
     calls = []
     with client_for(handler_for(calls)) as client:

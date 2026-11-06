@@ -13351,17 +13351,20 @@ async def folder_view_delete(request: Request):
     if not isinstance(body, dict):
         return await forward_to_upstream(request, client)
     tracks = body.get("trackGUIDs", [])
-    folders = body.get("folderPaths", [])
-    if (not isinstance(tracks, list) or len(tracks) > 1000
-            or any(not isinstance(g, str) or not g.strip() for g in tracks)
-            or not isinstance(folders, list) or len(folders) > 1000
-            or any(not isinstance(path, str) for path in folders)
-            or not isinstance(body.get("isPermanent"), bool)):
+    if not isinstance(tracks, list):
+        # 未识别为在线删除时，不更改官方协议的校验和响应。
+        return await forward_to_upstream(request, client)
+    if len(tracks) > 1000:
         return JSONResponse({"code": -1, "msg": "删除请求无效", "data": None}, status_code=400)
-    resolved = [(g, resolve_real_guid(g.strip())) for g in tracks]
+    resolved = [(g, resolve_real_guid(g.strip())) for g in tracks if isinstance(g, str) and g.strip()]
     online = {real for _, real in resolved if is_online_guid(real)}
     if not online:
         return await forward_to_upstream(request, client)
+    folders = body.get("folderPaths", [])
+    if (len(resolved) != len(tracks) or not isinstance(folders, list) or len(folders) > 1000
+            or any(not isinstance(path, str) for path in folders)
+            or not isinstance(body.get("isPermanent"), bool)):
+        return JSONResponse({"code": -1, "msg": "删除请求无效", "data": None}, status_code=400)
 
     # 普通的 _probe_upstream_auth 允许异常降级 shared，不适用于删除。
     try:
