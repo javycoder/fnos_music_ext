@@ -691,3 +691,305 @@ def test_play_history_keeps_heart_after_online_favorite_is_bound(env):
     assert resp.status_code == 200
     by_title = {item.get("title"): item for item in resp.json()["data"]["list"]}
     assert by_title["晴天"]["isFavorite"] is True
+
+
+def _write_audio(path: str, size: int = 64) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(b"m" * size)
+    return path
+
+
+def make_scanned_library(db_path: str, tracks: list[dict]) -> None:
+    """带 audio_file 的官方库，供按落盘路径反查。"""
+    con = sqlite3.connect(db_path)
+    con.executescript("""
+        DROP TABLE IF EXISTS track;
+        DROP TABLE IF EXISTS artist;
+        DROP TABLE IF EXISTS track_artist;
+        DROP TABLE IF EXISTS album;
+        DROP TABLE IF EXISTS audio_file;
+        DROP TABLE IF EXISTS user;
+        DROP TABLE IF EXISTS favorite_track;
+        CREATE TABLE track (
+            id INTEGER PRIMARY KEY,
+            guid TEXT,
+            title TEXT,
+            duration_ms INTEGER DEFAULT 0,
+            year INTEGER,
+            album_id INTEGER,
+            audio_file_id INTEGER,
+            is_audio_file_deleted INTEGER DEFAULT 0,
+            is_admin_deleted INTEGER DEFAULT 0,
+            is_cue INTEGER DEFAULT 0
+        );
+        CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE track_artist (track_id INTEGER, artist_id INTEGER);
+        CREATE TABLE album (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE audio_file (
+            id INTEGER PRIMARY KEY,
+            path TEXT,
+            size INTEGER,
+            suffix TEXT,
+            is_physical_file_deleted INTEGER DEFAULT 0
+        );
+        CREATE TABLE user (id INTEGER PRIMARY KEY, guid TEXT);
+        CREATE TABLE favorite_track (user_id INTEGER, track_id INTEGER, updated_at INTEGER);
+    """)
+    artist_ids: dict[str, int] = {}
+    for index, track in enumerate(tracks, start=1):
+        track_id = int(track.get("id") or index * 10)
+        names = track.get("artists")
+        if not isinstance(names, list):
+            names = [str(track.get("artist") or "")]
+        con.execute("INSERT INTO album (id, name) VALUES (?, ?)", (index, track.get("album") or ""))
+        con.execute(
+            "INSERT INTO audio_file (id, path, size, suffix, is_physical_file_deleted) VALUES (?, ?, ?, ?, ?)",
+            (
+                index,
+                track["path"],
+                int(track.get("size") or 0),
+                "mp3",
+                int(track.get("physical_deleted") or 0),
+            ),
+        )
+        con.execute(
+            """INSERT INTO track (
+                   id, guid, title, duration_ms, year, album_id, audio_file_id,
+                   is_audio_file_deleted, is_admin_deleted, is_cue
+               ) VALUES (?, ?, ?, ?, 2003, ?, ?, ?, ?, ?)""",
+            (
+                track_id,
+                track["guid"],
+                track["title"],
+                int(track.get("duration_ms") or 1000),
+                index,
+                index,
+                int(track.get("deleted") or 0),
+                int(track.get("admin_deleted") or 0),
+                int(track.get("cue") or 0),
+            ),
+        )
+        for name in names:
+            artist_id = artist_ids.get(name)
+            if artist_id is None:
+                artist_id = len(artist_ids) + 1
+                artist_ids[name] = artist_id
+                con.execute("INSERT INTO artist (id, name) VALUES (?, ?)", (artist_id, name))
+            con.execute(
+                "INSERT INTO track_artist (track_id, artist_id) VALUES (?, ?)",
+                (track_id, artist_id),
+            )
+    con.commit()
+    con.close()
+
+
+class _ServiceIdentity:
+    """把进程有效身份做成可观察的降权/提权开关（Windows 测试机没有 seteuid）。"""
+
+    def __init__(self):
+        self.uid = 1000
+        self.gid = 1001
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: self.uid, raising=False)
+        monkeypatch.setattr(os, "getegid", lambda: self.gid, raising=False)
+        monkeypatch.setattr(os, "seteuid", lambda uid: setattr(self, "uid", uid), raising=False)
+        monkeypatch.setattr(os, "setegid", lambda gid: setattr(self, "gid", gid), raising=False)
+
+
+def test_saved_path_binds_even_when_tags_differ(env):
+    """洛雪标签和扫描结果不一致时，认本次落盘文件，不认另一首同名曲。"""
+    saved = _write_audio(os.path.join(env["dirs"]["library"], "saved.mp3"), 80)
+    other = _write_audio(os.path.join(env["dirs"]["library"], "other.mp3"), 80)
+    make_scanned_library(env["db_path"], [
+        {
+            "guid": OFFICIAL_GUID, "title": "扫描标题", "artist": "扫描歌手",
+            "album": "扫描专辑", "path": saved, "size": 80,
+        },
+        {
+            "id": 20, "guid": "other-guid", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "path": other, "size": 80,
+        },
+    ])
+    assert appmod.official_track_guid_by_tags("晴天", "周杰伦", "未知专辑", saved) == OFFICIAL_GUID
+
+
+def test_saved_path_not_indexed_does_not_bind_same_title(env):
+    """文件还没被扫进库时，不把另一条同名标签曲目写进歌单。"""
+    pending = _write_audio(os.path.join(env["dirs"]["library"], "pending.mp3"), 70)
+    other = _write_audio(os.path.join(env["dirs"]["library"], "already.mp3"), 70)
+    make_scanned_library(env["db_path"], [{
+        "guid": "other-guid", "title": "晴天", "artist": "周杰伦",
+        "album": "叶惠美", "path": other, "size": 70,
+    }])
+    guid, reason = appmod._lookup_official_track_guid("晴天", "周杰伦", "叶惠美", pending)
+    assert guid is None and reason == "path-not-indexed"
+
+
+def test_ambiguous_basename_and_size_does_not_bind(env):
+    saved = _write_audio(os.path.join(env["dirs"]["library"], "nested", "晴天.mp3"), 90)
+    make_scanned_library(env["db_path"], [
+        {
+            "guid": "a", "title": "甲", "artist": "甲", "album": "",
+            "path": os.path.join(env["dirs"]["library"], "one", "晴天.mp3"), "size": 90,
+        },
+        {
+            "id": 20, "guid": "b", "title": "乙", "artist": "乙", "album": "",
+            "path": os.path.join(env["dirs"]["library"], "two", "晴天.mp3"), "size": 90,
+        },
+    ])
+    guid, reason = appmod._lookup_official_track_guid("晴天", "周杰伦", "", saved)
+    assert guid is None and reason == "path-ambiguous"
+
+
+def test_soft_deleted_saved_path_is_not_bound(env):
+    saved = _write_audio(os.path.join(env["dirs"]["library"], "gone.mp3"), 40)
+    other = _write_audio(os.path.join(env["dirs"]["library"], "live.mp3"), 40)
+    make_scanned_library(env["db_path"], [
+        {
+            "guid": OFFICIAL_GUID, "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "path": saved, "size": 40, "deleted": 1,
+        },
+        {
+            "id": 20, "guid": "live-guid", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "path": other, "size": 40,
+        },
+    ])
+    guid, reason = appmod._lookup_official_track_guid("晴天", "周杰伦", "叶惠美", saved)
+    assert guid is None and reason == "path-not-indexed"
+
+
+def test_normalized_tags_bind_split_artists_without_dest(env):
+    """没有可靠路径时，洛雪的「A/B」歌手集合仍能唯一命中拆开的官方歌手。"""
+    audio = _write_audio(os.path.join(env["dirs"]["library"], "split.mp3"), 50)
+    make_scanned_library(env["db_path"], [{
+        "guid": OFFICIAL_GUID, "title": "晴天", "artists": ["周杰伦", "方文山"],
+        "album": "叶惠美", "path": audio, "size": 50,
+    }])
+    assert appmod.official_track_guid_by_tags("晴天", "周杰伦/方文山", "未知专辑", "") == OFFICIAL_GUID
+
+
+def test_normalized_tags_skip_ambiguous_title_artist(env):
+    first = _write_audio(os.path.join(env["dirs"]["library"], "one.mp3"), 50)
+    second = _write_audio(os.path.join(env["dirs"]["library"], "two.mp3"), 50)
+    make_scanned_library(env["db_path"], [
+        {
+            "guid": "a", "title": "晴天", "artist": "周杰伦",
+            "album": "叶惠美", "path": first, "size": 50,
+        },
+        {
+            "id": 20, "guid": "b", "title": "晴天", "artist": "周杰伦",
+            "album": "十一月的萧邦", "path": second, "size": 50,
+        },
+    ])
+    guid, reason = appmod._lookup_official_track_guid("晴天", "周杰伦", "未知专辑", "")
+    assert guid is None and reason == "no-tag-match"
+
+
+def test_playlist_readd_sets_pending_and_binds(env, monkeypatch):
+    """（意图判定证实显式保存时）开关开启后再次加入已在歌单里的在线曲，
+    要补 pending 并完成官方改绑（issue #117）。"""
+    _force_explicit_save_intent(monkeypatch)
+    make_official_db(env["db_path"], with_track=True)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: env["dirs"]["library"] + "/f.mp3")
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "track": snapshot}],
+    })
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/playlist/add-track",
+            json={"guid": PL_CUSTOM, "trackGUIDs": [fake_official_guid(FAKE_KUWO1)]},
+        )
+        assert resp.status_code == 200
+        assert wait_for(lambda: upstream_posts(env["upstream_calls"], "/playlist/add-track"))
+
+    posts = upstream_posts(env["upstream_calls"], "/playlist/add-track")
+    assert posts[0]["json"] == {"guid": PL_CUSTOM, "trackGUIDs": [OFFICIAL_GUID]}
+    assert appmod.load_playlist_tracks("user-a") == {}
+
+
+def test_playlist_retry_uses_remembered_path_without_download(env, monkeypatch):
+    """（意图判定证实显式保存时）重启后只剩 .ref：打开歌单按落盘路径重试
+    绑定，不重新下载（issue #117）。"""
+    _force_explicit_save_intent(monkeypatch)
+    downloads = _no_download_guards(monkeypatch)
+    saved = _write_audio(os.path.join(env["dirs"]["library"], "lx-saved.mp3"), 60)
+    make_scanned_library(env["db_path"], [{
+        "guid": OFFICIAL_GUID, "title": "库内标题", "artist": "库内歌手",
+        "album": "库内专辑", "path": saved, "size": 60,
+    }])
+    appmod.remember_media_path(FAKE_KUWO1, saved)
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot}],
+    })
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": PL_CUSTOM, "page": 1, "size": 50},
+            cookies={"music-token": "t"},
+        )
+        assert resp.status_code == 200
+        assert wait_for(lambda: upstream_posts(env["upstream_calls"], "/playlist/add-track"))
+
+    assert downloads == []
+    posts = upstream_posts(env["upstream_calls"], "/playlist/add-track")
+    assert posts[0]["json"]["trackGUIDs"] == [OFFICIAL_GUID]
+    assert appmod.load_playlist_tracks("user-a") == {}
+
+
+def test_bind_reads_db_inside_privileged_lease(env, monkeypatch):
+    """（意图判定证实显式保存时）降权身份打不开官方库；绑定必须在 root
+    租约内打开，结束后降回（issue #117）。"""
+    _force_explicit_save_intent(monkeypatch)
+    saved = _write_audio(os.path.join(env["dirs"]["library"], "priv.mp3"), 48)
+    make_scanned_library(env["db_path"], [{
+        "guid": OFFICIAL_GUID, "title": "不是晴天", "artist": "不是周杰伦",
+        "album": "不是叶惠美", "path": saved, "size": 48,
+    }])
+    identity = _ServiceIdentity()
+    identity.install(monkeypatch)
+    real_exists = os.path.exists
+    db_path = env["db_path"]
+
+    def exists(path):
+        if os.path.normcase(str(path)) == os.path.normcase(db_path) and os.geteuid() != 0:
+            return False
+        return real_exists(path)
+
+    real_connect = sqlite3.connect
+
+    def connect(target, *args, **kwargs):
+        text = target if isinstance(target, str) else ""
+        if os.geteuid() != 0 and os.path.basename(db_path) in text:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "exists", exists)
+    monkeypatch.setattr(appmod.sqlite3, "connect", connect)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: saved)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/playlist/add-track",
+            json={"guid": PL_CUSTOM, "trackGUIDs": [fake_official_guid(FAKE_KUWO1)]},
+        )
+        assert resp.status_code == 200
+        assert wait_for(lambda: upstream_posts(env["upstream_calls"], "/playlist/add-track"))
+        assert wait_for(lambda: appmod.load_playlist_tracks("user-a") == {})
+        # 关闭 TestClient 时 lifespan 会故意提回 root，身份断言必须放在那之前。
+        assert os.geteuid() == 1000
+        assert os.getegid() == 1001
+
+    posts = upstream_posts(env["upstream_calls"], "/playlist/add-track")
+    assert posts[0]["json"] == {"guid": PL_CUSTOM, "trackGUIDs": [OFFICIAL_GUID]}
