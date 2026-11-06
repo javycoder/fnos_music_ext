@@ -8453,9 +8453,12 @@ def _guid_by_exact_tags(con: sqlite3.Connection, title: str, artist: str, album:
         collate = " COLLATE NOCASE" if nocase else ""
         sql = (
             "SELECT t.guid FROM track t "
+            "JOIN audio_file af ON af.id = t.audio_file_id "
             "JOIN track_artist ta ON ta.track_id = t.id "
             "JOIN artist a ON a.id = ta.artist_id "
-            f"WHERE t.title = ?{collate} AND a.name = ?{collate}"
+            "WHERE t.is_audio_file_deleted = 0 AND t.is_admin_deleted = 0 "
+            "AND af.is_physical_file_deleted = 0 "
+            f"AND t.title = ?{collate} AND a.name = ?{collate}"
         )
         params: list = [title, artist]
         if album:
@@ -8602,7 +8605,9 @@ def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | Non
                     "JOIN audio_file a ON a.id = t.audio_file_id "
                     "JOIN track_artist ta ON ta.track_id = t.id "
                     "JOIN artist ar ON ar.id = ta.artist_id "
-                    f"WHERE t.title = ?{collate} AND ar.name = ?{collate}"
+                    "WHERE t.is_audio_file_deleted = 0 AND t.is_admin_deleted = 0 "
+                    "AND a.is_physical_file_deleted = 0 "
+                    f"AND t.title = ?{collate} AND ar.name = ?{collate}"
                 )
                 params: list = [title_s, artist_s]
                 if album_s:
@@ -11202,12 +11207,16 @@ def _bound_favorite_guids(user_guid: str, entries: dict) -> set[str]:
         return set()
     db = str(CONF.get("music_db") or dailyrec.music_db_path())
     try:
-        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)) as con:
-            favorites = {row[0] for row in con.execute("""
-                SELECT t.guid FROM favorite_track ft
-                JOIN track t ON t.id = ft.track_id
-                JOIN user u ON u.id = ft.user_id WHERE u.guid = ?
-            """, (user_guid,))}
+        with _musicdb_privileged_read():
+            with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)) as con:
+                favorites = {row[0] for row in con.execute("""
+                    SELECT t.guid FROM favorite_track ft
+                    JOIN track t ON t.id = ft.track_id
+                    JOIN audio_file af ON af.id = t.audio_file_id
+                    JOIN user u ON u.id = ft.user_id
+                    WHERE u.guid = ? AND t.is_audio_file_deleted = 0
+                      AND t.is_admin_deleted = 0 AND af.is_physical_file_deleted = 0
+                """, (user_guid,))}
         return {guid for guid, official in mapped.items() if official in favorites}
     except sqlite3.Error as error:
         logger.debug("bound favorite state unavailable: %s", error)

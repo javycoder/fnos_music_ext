@@ -135,7 +135,11 @@ def env(setup_official_bind_env):
 def make_official_db(db_path: str, with_track: bool = True):
     con = sqlite3.connect(db_path)
     con.executescript("""
-        CREATE TABLE track (id INTEGER PRIMARY KEY, guid TEXT, title TEXT, year INTEGER, album_id INTEGER);
+        CREATE TABLE track (id INTEGER PRIMARY KEY, guid TEXT, title TEXT, year INTEGER, album_id INTEGER,
+                            audio_file_id INTEGER, is_audio_file_deleted INTEGER DEFAULT 0,
+                            is_admin_deleted INTEGER DEFAULT 0, is_cue INTEGER DEFAULT 0);
+        CREATE TABLE audio_file (id INTEGER PRIMARY KEY, path TEXT, size INTEGER, suffix TEXT,
+                                 is_physical_file_deleted INTEGER DEFAULT 0);
         CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE track_artist (track_id INTEGER, artist_id INTEGER);
         CREATE TABLE album (id INTEGER PRIMARY KEY, name TEXT);
@@ -145,8 +149,13 @@ def make_official_db(db_path: str, with_track: bool = True):
     if with_track:
         con.execute("INSERT INTO album (id, name) VALUES (1, '叶惠美')")
         con.execute("INSERT INTO artist (id, name) VALUES (1, '周杰伦')")
+        audio = os.path.join(os.path.dirname(db_path), "library", "f.mp3")
+        os.makedirs(os.path.dirname(audio), exist_ok=True)
+        with open(audio, "wb") as handle:
+            handle.write(b"test-audio")
+        con.execute("INSERT INTO audio_file VALUES (1, ?, 10, 'mp3', 0)", (audio,))
         con.execute(
-            "INSERT INTO track (id, guid, title, year, album_id) VALUES (10, ?, '晴天', 2003, 1)",
+            "INSERT INTO track (id, guid, title, year, album_id, audio_file_id) VALUES (10, ?, '晴天', 2003, 1, 1)",
             (OFFICIAL_GUID,),
         )
         con.execute("INSERT INTO track_artist (track_id, artist_id) VALUES (10, 1)")
@@ -858,6 +867,21 @@ def test_soft_deleted_saved_path_is_not_bound(env):
     ])
     guid, reason = appmod._lookup_official_track_guid("晴天", "周杰伦", "叶惠美", saved)
     assert guid is None and reason == "path-not-indexed"
+
+
+@pytest.mark.parametrize("flag", ["deleted", "admin_deleted", "physical_deleted"])
+def test_deleted_rows_do_not_match_tags_or_favorite(env, flag):
+    audio = _write_audio(os.path.join(env["dirs"]["library"], "removed.mp3"), 50)
+    make_scanned_library(env["db_path"], [{
+        "guid": OFFICIAL_GUID, "title": "晴天", "artist": "周杰伦",
+        "album": "叶惠美", "path": audio, "size": 50, flag: 1,
+    }])
+    assert appmod.official_track_guid_by_tags("晴天", "周杰伦", "叶惠美") is None
+    assert appmod.library_file_by_tags("晴天", "周杰伦", "叶惠美") is None
+    with sqlite3.connect(env["db_path"]) as con:
+        con.execute("INSERT INTO user VALUES (1, 'user-a')")
+        con.execute("INSERT INTO favorite_track VALUES (1, 10, 1)")
+    assert appmod._bound_favorite_guids("user-a", {FAKE_KUWO1: {"official": OFFICIAL_GUID}}) == set()
 
 
 def test_normalized_tags_bind_split_artists_without_dest(env):
