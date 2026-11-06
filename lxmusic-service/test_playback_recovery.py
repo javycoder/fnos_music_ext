@@ -203,7 +203,8 @@ async def test_timeout_cooldown_is_independent_and_recovers(fake_lx, runtime, mo
     async with _media_client() as client:
         assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard")
         gen = lxapp._URL_CACHE_GEN
-        key = lxapp._chain_key("b.js", "kw", gen, "standard")
+        key = lxapp._timeout_cooldown_key(
+            "b.js", "kw", gen, "standard", _item()["id"])
         assert calls == [("a.js", "standard"), ("b.js", "standard"), ("c.js", "standard")]
         assert key in lxapp._RESOLVE_TIMEOUT_COOLDOWN
         assert key not in lxapp._CHAIN_HEALTH
@@ -211,7 +212,9 @@ async def test_timeout_cooldown_is_independent_and_recovers(fake_lx, runtime, mo
         assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard")
         assert calls == [("a.js", "standard"), ("c.js", "standard")]
         # Other tiers remain independent, and expiry permits another probe.
-        assert lxapp._chain_key("b.js", "kw", gen, "lossless") not in lxapp._RESOLVE_TIMEOUT_COOLDOWN
+        assert lxapp._timeout_cooldown_key(
+            "b.js", "kw", gen, "lossless", _item()["id"]
+        ) not in lxapp._RESOLVE_TIMEOUT_COOLDOWN
         lxapp._RESOLVE_TIMEOUT_COOLDOWN[key] = 0
         calls.clear()
         assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard")
@@ -229,7 +232,8 @@ async def test_late_result_after_deadline_is_not_delivered(fake_lx, runtime, mon
 
     monkeypatch.setattr(lxapp, "_attempt_pinned", late)
     async with _media_client() as client:
-        assert await lxapp.resolve_and_probe(client, "kw", _item(), "standard", budget=.01) is None
+        with pytest.raises(lxapp._ResolutionIncomplete):
+            await lxapp.resolve_and_probe(client, "kw", _item(), "standard", budget=.01)
     assert not lxapp._CHAIN_HEALTH
     assert not lxapp._RESOLVE_TIMEOUT_COOLDOWN
 
@@ -452,8 +456,8 @@ def test_attempt_rejects_response_from_other_script_then_uses_pinned_one(
 
 
 @pytest.mark.asyncio
-async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, runtime, monkeypatch):
-    """熔断键含音质档：无损档连续失败不会把标准档一起熔断。"""
+async def test_song_high_tier_failure_does_not_quarantine_standard(fake_lx, runtime, monkeypatch):
+    """同曲缺少无损档不污染脚本状态，标准档仍会真实发起解析。"""
     fake_lx.sources = [_ready("a.js", ["kw"])]
 
     async def without_flac(song_info, quality="128k", exclude_api_sources=None,
@@ -475,9 +479,8 @@ async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, run
             )
             assert result is not None and result["resolution_quality"] == "exhigh"
             assert result["actual_quality"] == ""
-        # 只有无损档被记失败，标准档没有被牵连
-        assert any(key.endswith(":lossless") for key in lxapp._CHAIN_HEALTH), lxapp._CHAIN_HEALTH
-        assert not any(key.endswith(":standard") for key in lxapp._CHAIN_HEALTH)
+        # 明确的歌曲级空结果不计入跨歌曲脚本熔断。
+        assert lxapp._CHAIN_HEALTH == {}
 
         calls_before = len(fake_lx.url_calls)
         standard = await lxapp.resolve_and_probe(
@@ -492,8 +495,8 @@ async def test_high_tier_failure_does_not_open_circuit_for_standard(fake_lx, run
 
 
 @pytest.mark.asyncio
-async def test_stash_delivery_preserves_earlier_tier_failures(fake_lx, runtime, monkeypatch):
-    """无损明确失败后，低档暂存成功仍需登记无损失败，不能误伤标准档。"""
+async def test_stash_delivery_does_not_record_song_failure_in_script_circuit(fake_lx, runtime, monkeypatch):
+    """无损明确失败后低档暂存成功，不把单曲缺档写入脚本级共享熔断。"""
     fake_lx.sources = [_ready("a.js", ["kw"])]
 
     async def downgrade(song_info, quality="128k", **kwargs):
@@ -505,9 +508,7 @@ async def test_stash_delivery_preserves_earlier_tier_failures(fake_lx, runtime, 
     async with _media_client() as client:
         result = await lxapp.resolve_and_probe(client, "kw", _item(), quality="lossless", budget=2)
     assert result["quality_evidence"]["from_stash"] is True
-    key = f"policy:{lxapp._URL_CACHE_GEN}:a.js:kw:lossless"
-    assert key in lxapp._CHAIN_HEALTH
-    assert not any(entry.endswith(":standard") for entry in lxapp._CHAIN_HEALTH)
+    assert lxapp._CHAIN_HEALTH == {}
 
 
 @pytest.mark.asyncio
@@ -537,24 +538,25 @@ async def test_cancellation_and_budget_exhaustion_do_not_record_failure(
             await task
         assert lxapp._CHAIN_HEALTH == {}
 
-        # 预算耗尽：单次尝试超时后总预算也归零，同样不记失败
-        assert await lxapp.resolve_and_probe(
-            client, "kw", _item(), quality="standard",
-            budget=0.2, resolver_timeout=0.05, probe_timeout=0.02,
-        ) is None
+        # 预算耗尽属于未完成，不是确认无资源；不得转成 404/负缓存。
+        with pytest.raises(lxapp._ResolutionIncomplete):
+            await lxapp.resolve_and_probe(
+                client, "kw", _item(), quality="standard",
+                budget=0.2, resolver_timeout=0.05, probe_timeout=0.02,
+            )
     finally:
         await client.aclose()
     assert lxapp._CHAIN_HEALTH == {}
 
 
 @pytest.mark.asyncio
-async def test_script_failure_then_budget_exhaustion_records_only_true_failure(
+async def test_song_failure_then_budget_exhaustion_does_not_open_global_circuit(
     fake_lx, runtime, monkeypatch,
 ):
-    """同一轮里「真失败」与「超时」要分开记账：只有超时不该留永久失败。
+    """明确的单曲无链接与后继超时都不应污染跨歌曲脚本状态。
 
-    a.js 明确返回空链接（预算充足时发生的真实脚本失败）可以记熔断；
-    b.js 只是慢到单次超时，属于预算侧问题，不能写成脚本永久失效。
+    a.js 对这首歌明确返回空链接，b.js 则慢到耗尽本轮预算；下次其他曲目仍可
+    再试 a.js，而此曲本次应作为未完成，而非确定无可播放链接。
     """
     fake_lx.sources = [_ready("a.js", ["kw"]), _ready("b.js", ["kw"])]
     calls: list[str] = []
@@ -572,18 +574,16 @@ async def test_script_failure_then_budget_exhaustion_records_only_true_failure(
     monkeypatch.setattr(fake_lx, "get_music_url", fail_then_hang)
     client = _media_client()
     try:
-        # 单次解析超时上限远大于总预算：b.js 会把剩余预算耗尽后才结束
-        assert await lxapp.resolve_and_probe(
-            client, "kw", _item(), quality="standard",
-            budget=0.12, resolver_timeout=5.0, probe_timeout=0.5,
-        ) is None
+        # 单次解析上限远大于当前 slot：b.js 被预算截断，整次应标记未完成。
+        with pytest.raises(lxapp._ResolutionIncomplete):
+            await lxapp.resolve_and_probe(
+                client, "kw", _item(), quality="standard",
+                budget=0.12, resolver_timeout=5.0, probe_timeout=0.5,
+            )
     finally:
         await client.aclose()
     assert calls == ["a.js", "b.js"]
-    recorded = set(lxapp._CHAIN_HEALTH)
-    assert recorded == {f"policy:{lxapp._URL_CACHE_GEN}:a.js:kw:standard"}, recorded
-    # 超时脚本不得留下熔断记录
-    assert not any("b.js" in key for key in recorded)
+    assert lxapp._CHAIN_HEALTH == {}
 
 
 # ======================================= 4 歌手/版本/时长可信匹配 ==

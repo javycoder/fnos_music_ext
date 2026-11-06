@@ -1762,34 +1762,26 @@ async def test_track_url_refresh_backfills_ua(fake_lx, fresh_url_cache):
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_scoped_per_platform(fake_lx, fresh_url_cache):
-    """脚本+平台级熔断：tx 上的脚本连续失败只熔断该脚本/tx，kw 解析不受牵连。
-
-    2026-10-10 回归：全局 user_source 熔断下 tx/mg 第三方源故障（tx 只产出加密
-    mflac、mg 后端全挂）连累 kw/kg/wy 全平台 404，表现为"几乎所有洛雪曲目不可播"。"""
+async def test_song_failures_do_not_circuit_break_other_tracks(fake_lx, fresh_url_cache):
+    """歌曲级无链接不能触发跨歌曲的脚本/平台熔断。"""
     probe_client = mock_client(_flac_probe_handler)
     fake_lx.url_result = None
     fake_lx.sources[0]["supportedSources"] = ["kw", "kg", "wy", "tx"]
     try:
-        # 3 首不同 tx 曲目各失败一次（同曲会命中失败负缓存不再打音源）→ 触发该脚本 tx 熔断
-        for i, songmid in enumerate(["001abc", "002def", "003ghi"]):
+        # 三首不同歌曲均明确无链接；每首都独立走完音质阶梯。
+        for songmid in ["001abc", "002def", "003ghi"]:
             r = await lxapp._resolve_url_cached(
                 probe_client, "tx", {"id": f"lx:tx:{songmid}", "lx_source": "tx"}, "lossless", 20.0)
             assert r is None
         tx_calls = len(fake_lx.url_calls)
-        assert tx_calls == 12  # 3 次解析 × 七档阶梯中的四档（flac/320k/192k/128k）
+        assert tx_calls == 12
+        assert lxapp._CHAIN_HEALTH == {}
 
-        # 第 4 首 tx 曲目被该脚本+平台熔断直接跳过：不再消耗音源调用
+        # 第四首可能使用同一脚本立即成功；不能被前三首的单曲失败屏蔽。
+        fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
         r4 = await lxapp._resolve_url_cached(
             probe_client, "tx", {"id": "lx:tx:004jkl", "lx_source": "tx"}, "lossless", 20.0)
-        assert r4 is None
-        assert len(fake_lx.url_calls) == tx_calls
-
-        # kw 是不同平台、不同熔断键，不受 tx 脚本熔断影响，正常解析成功
-        fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
-        rw = await lxapp._resolve_url_cached(
-            probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
-        assert rw and rw["url"] == "https://media.test/song.flac"
+        assert r4 and r4["url"] == "https://media.test/song.flac"
         assert len(fake_lx.url_calls) == tx_calls + 1
     finally:
         await probe_client.aclose()
@@ -2359,14 +2351,13 @@ async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_e
 
     client = mock_client(probe_handler)
 
-    # 1. resolver_timeout 设为 0.03s（小于 0.1s），应该超时失败
-    res1 = await lxapp.resolve_and_probe(
-        client, "kw", {"id": "lx:kw:SLOW", "songmid": "SLOW"}, quality="128k",
-        budget=1.0, resolver_timeout=0.03, probe_timeout=0.5,
-    )
-    assert res1 is None
-    # A timed-out tier is suppressed for 30 seconds; test the next probe after
-    # that independent cooldown has expired.
+    # 1. resolver_timeout 设为 0.03s（小于 0.1s）：返回“未完成”，不是确定无资源。
+    with pytest.raises(lxapp._ResolutionIncomplete):
+        await lxapp.resolve_and_probe(
+            client, "kw", {"id": "lx:kw:SLOW", "songmid": "SLOW"}, quality="128k",
+            budget=1.0, resolver_timeout=0.03, probe_timeout=0.5,
+        )
+    # 同一歌曲冷却到期后可以再探；冷却键仍只约束这个候选。
     for key in lxapp._RESOLVE_TIMEOUT_COOLDOWN:
         lxapp._RESOLVE_TIMEOUT_COOLDOWN[key] = 0
     assert fake_lx.url_timeouts[-1] == 0.03

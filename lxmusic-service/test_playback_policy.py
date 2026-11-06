@@ -732,11 +732,11 @@ async def test_resolver_timeout_does_not_trip_script_circuit(fake_lx, policy_run
     client = mock_client(_flac_response)
     try:
         for _ in range(2):
-            result = await lxapp.resolve_and_probe(
-                client, "kw", {"id": "lx:kw:slow", "songmid": "slow"},
-                quality="standard", budget=0.2, resolver_timeout=0.02, probe_timeout=0.1,
-            )
-            assert result is None
+            with pytest.raises(lxapp._ResolutionIncomplete):
+                await lxapp.resolve_and_probe(
+                    client, "kw", {"id": "lx:kw:slow", "songmid": "slow"},
+                    quality="standard", budget=0.2, resolver_timeout=0.02, probe_timeout=0.1,
+                )
     finally:
         await client.aclose()
     assert lxapp._CHAIN_HEALTH == {}
