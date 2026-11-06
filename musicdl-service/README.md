@@ -17,7 +17,7 @@ musicdl HTTP 服务：基于 FastAPI 包装 musicdl 库的共享音源微服务�
 | :--- | :--- | :--- | :--- |
 | `/healthz` | GET | 无 | 健康检查，返回状态、启用音源列表、缓存容量与统计数据 |
 | `/sources` | GET | 无 | 查看当前启用音源及 musicdl 库支持的所有注册音源 |
-| `/search` | GET | `keyword` (必填), `limit` (可选), `sources` (可选) | 聚合搜索曲目。每源并发异步执行，单源失败/超时不阻断整体返回 |
+| `/search` | GET | `keyword` (必填), `limit` (可选), `sources` (可选) | 聚合搜索曲目。各源独立预算、按站累加返回；单源失败/超时只记在该源 `errors` 里，不阻断其他源，也未跑完的源不计熔断 |
 | `/info` | GET | `id` (必填) | 获取指定曲目的详细元数据（包含原文歌词 `lyric`、封面 `cover_url`、时长等），未命中返回 404 |
 | `/stream` | GET | `id` (必填), `proxy` (布尔值, 默认 false), `range` (可选) | `proxy=false` 时 302 重定向到直链；`proxy=true` 时流式透传字节流并透传 `Range`/`206 Partial Content` |
 
@@ -26,8 +26,9 @@ musicdl HTTP 服务：基于 FastAPI 包装 musicdl 库的共享音源微服务�
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `MUSICDL_SOURCES` | `NeteaseMusicClient,KuwoMusicClient,MiguMusicClient` | 默认启用的音源列表（英文逗号分隔） |
-| `MUSICDL_SEARCH_TIMEOUT` | `25` | 单源搜索超时时间（秒） |
-| `MUSICDL_LIMIT_PER_SOURCE` | `10` | 单源默认最大返回条数 |
+| `MUSICDL_SEARCH_TIMEOUT` | `12` | 单源搜索超时时间（秒），同时是整轮聚合的硬截止下限 |
+| `MUSICDL_LIMIT_PER_SOURCE` | `10` | 单源默认最大返回条数（库不支持安全翻页，单站上限为一页） |
+| `MUSICDL_SEARCH_CONCURRENCY` | `3` | 同时进行的源搜索数。站点选多时避免一次拉起过多重进程，排队的源不计入自身预算 |
 | `MUSICDL_URL_TTL` | `1800` | 下载直链缓存有效期（秒） |
 | `MUSICDL_CACHE_MAX` | `3000` | 内存缓存最大条目数（超限淘汰旧数据） |
 | `MUSICDL_WORK_DIR` | `/tmp/musicdl_outputs` | musicdl 工作输出目录，避免容器内写权限问题 |

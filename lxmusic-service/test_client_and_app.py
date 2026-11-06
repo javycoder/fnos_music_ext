@@ -18,6 +18,7 @@ from lxserver_client import (
     map_lxserver_song,
     normalize_source,
     parse_interval_to_seconds,
+    parse_size_bytes,
 )
 
 
@@ -213,6 +214,56 @@ def test_parse_interval_to_seconds():
     assert parse_interval_to_seconds(180.5) == 180
     assert parse_interval_to_seconds("") == 0
     assert parse_interval_to_seconds(None) == 0
+
+
+def test_parse_size_bytes():
+    """issue #116：lx 的 size 既有字节整数，也有 "4.5 MB" 这类带单位文本。"""
+    assert parse_size_bytes(12345678) == 12345678
+    assert parse_size_bytes(4.0) == 4
+    assert parse_size_bytes("12345678") == 12345678
+    assert parse_size_bytes("30MB") == 30 * 1024 * 1024
+    assert parse_size_bytes("4.5 MB") == int(4.5 * 1024 * 1024)
+    assert parse_size_bytes("4500KB") == 4500 * 1024
+    assert parse_size_bytes("1.5 GB") == int(1.5 * 1024 ** 3)
+    # 解析不了一律 0（未知），绝不按码率估算字节数
+    assert parse_size_bytes("") == 0
+    assert parse_size_bytes(None) == 0
+    assert parse_size_bytes("unknown") == 0
+    assert parse_size_bytes("-5 MB") == 0
+    assert parse_size_bytes(True) == 0
+
+
+def test_map_lxserver_song_file_size_follows_display_container():
+    """搜索行按当前展示的容器挑对应档位大小；取不到就是 0，不跨档借用。"""
+    raw = {
+        "name": "海阔天空",
+        "singer": "Beyond",
+        "source": "kw",
+        "songmid": "5886682",
+        "interval": "05:24",
+        "types": [
+            {"type": "128k", "size": "3.9 MB"},
+            {"type": "320k", "size": "9.7 MB"},
+            {"type": "flac", "size": "30MB"},
+        ],
+    }
+    item = map_lxserver_song(raw)
+    assert item["ext"] == "flac"
+    assert item["file_size"] == 30 * 1024 * 1024
+
+    lossy_only = dict(raw, types=[{"type": "128k", "size": "3.9 MB"},
+                                 {"type": "320k", "size": "9.7 MB"}])
+    item_mp3 = map_lxserver_song(lossy_only)
+    assert item_mp3["ext"] == "mp3"
+    assert item_mp3["file_size"] == int(9.7 * 1024 * 1024)
+
+    # types 为 {档位: {size}} 字典形态时同样解析
+    as_dict = dict(raw, types={"flac": {"size": "30MB"}, "320k": {"size": "9.7 MB"}})
+    assert map_lxserver_song(as_dict)["file_size"] == 30 * 1024 * 1024
+
+    # size 无法解析时留 0，不用别的档位顶替
+    unknown = dict(raw, types=[{"type": "flac", "size": "??"}])
+    assert map_lxserver_song(unknown)["file_size"] == 0
 
 
 def test_map_lxserver_song_kuwo():
