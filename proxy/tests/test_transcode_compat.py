@@ -856,11 +856,14 @@ def make_library_db(db_path: str, tracks: list[dict]) -> None:
         DROP TABLE IF EXISTS track_artist; DROP TABLE IF EXISTS album;
         DROP TABLE IF EXISTS audio_file;
         CREATE TABLE track (id INTEGER PRIMARY KEY, guid TEXT, title TEXT,
-                            year INTEGER, album_id INTEGER, audio_file_id INTEGER);
+                            year INTEGER, album_id INTEGER, audio_file_id INTEGER,
+                            is_audio_file_deleted INTEGER DEFAULT 0,
+                            is_admin_deleted INTEGER DEFAULT 0);
         CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE track_artist (track_id INTEGER, artist_id INTEGER);
         CREATE TABLE album (id INTEGER PRIMARY KEY, name TEXT);
-        CREATE TABLE audio_file (id INTEGER PRIMARY KEY, path TEXT);
+        CREATE TABLE audio_file (id INTEGER PRIMARY KEY, path TEXT,
+                                 is_physical_file_deleted INTEGER DEFAULT 0);
     """)
     for t in tracks:
         con.execute("INSERT OR IGNORE INTO artist (id, name) VALUES (?, ?)", (t["artist_id"], t["artist"]))
