@@ -598,7 +598,10 @@ def _load_generated_worker():
     namespace["wait_for_lxserver"] = lambda timeout: True
     namespace["subprocess"] = types.SimpleNamespace(
         Popen=lambda *args, **kwargs: _FakeNodeProcess(),
+        run=lambda *args, **kwargs: types.SimpleNamespace(returncode=0, stdout=b'\0' * 4),
+        TimeoutExpired=subprocess.TimeoutExpired,
         DEVNULL=subprocess.DEVNULL,
+        PIPE=subprocess.PIPE,
     )
     return namespace
 
@@ -630,6 +633,18 @@ def _successful_worker_api(path, data=None, method="GET", timeout=None):
 
 class TestGeneratedWorkerBehavior:
     """直接执行生成 worker 的函数，验证运行时分支而非源码字符串。"""
+
+    def test_decode_prefix_uses_bounded_local_pipe(self):
+        worker = _load_generated_worker()
+        calls = []
+        worker['subprocess'].run = lambda args, **kwargs: calls.append((args, kwargs)) or types.SimpleNamespace(returncode=0, stdout=b'\0' * 4)
+        assert worker['decode_prefix'](b'ID3synthetic') == 'ok'
+        command, kwargs = calls[0]
+        assert command[command.index('-protocol_whitelist') + 1] == 'pipe'
+        assert command[command.index('-i') + 1] == 'pipe:0'
+        assert command[command.index('-t') + 1] == '2'
+        assert kwargs['input'] == b'ID3synthetic'
+        assert 0 < kwargs['timeout'] <= 5
 
     def test_top_level_require_unsafe_true_is_not_accepted(self, monkeypatch):
         worker = _load_generated_worker()
