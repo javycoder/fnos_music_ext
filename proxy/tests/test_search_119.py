@@ -7,9 +7,11 @@ import proxy.app as p
 
 
 @pytest.mark.parametrize("local_count", [0, 49, 50, 99, 100, 120])
-def test_unpaged_default_window(monkeypatch, local_count):
+def test_unpaged_default_window(monkeypatch, tmp_path, local_count):
     p._SEARCH_CACHE.clear()
-    monkeypatch.setattr(p.music_compat, "supports_search_default_100", lambda: True)
+    manifest = tmp_path / "manifest"
+    manifest.write_text('appname="trim.music"\nversion="1.1.19"\n', encoding="utf-8")
+    monkeypatch.setattr(p.music_compat, "MANIFEST", str(manifest))
     monkeypatch.setitem(p.CONF, "musicdl_enabled", True)
     monkeypatch.setitem(p.CONF, "netease_enabled", False)
     monkeypatch.setitem(p.CONF, "lx_enabled", False)
