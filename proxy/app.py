@@ -1748,8 +1748,9 @@ def build_online_track(item: dict, mark_source: bool = False) -> dict:
     except (TypeError, ValueError):
         file_size = 0
     cover = str(item.get("cover_url") or "")
-    # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
-    spec_path = f"online/{src}/{guid}.{play_format}"
+    # 虚拟文件不是曲库目录：保留格式后缀，但不暴露斜杠，避免 1.1.19
+    # 将其父路径误认为可在文件夹视图中定位的真实目录。
+    spec_path = f"{hashlib.sha256(guid.encode('utf-8')).hexdigest()}.{play_format}"
 
     artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
