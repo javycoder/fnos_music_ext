@@ -429,6 +429,23 @@ class TestNodePreloadRealSubprocess:
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'PUBLIC_IPV4_SELECTED' in result.stdout
 
+    @pytest.mark.parametrize("style", ["positional", "options"])
+    def test_server_wildcard_listen_is_constrained_to_loopback(self, preload_file, style):
+        js = """
+        const net = require('net');
+        const s = net.createServer();
+        const done = () => {
+          if (s.address().address !== '127.0.0.1') process.exit(4);
+          console.log('WILDCARD_CLAMPED');
+          s.close(() => process.exit(0));
+        };
+        if (STYLE === 'positional') s.listen(0, '0.0.0.0', done);
+        else s.listen({port: 0, host: '0.0.0.0'}, done);
+        """.replace('STYLE', json.dumps(style))
+        proc = self._run_node(js, preload_file)
+        assert proc.returncode == 0, proc.stderr
+        assert 'WILDCARD_CLAMPED' in proc.stdout
+
     def test_server_listen_127_not_blocked(self, preload_file):
         """容器内 Node 服务端监听 127.0.0.1 不能被拦截。"""
         js = """

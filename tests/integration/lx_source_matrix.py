@@ -281,6 +281,17 @@ const dns = require('dns');
 const http = require('http');
 const https = require('https');
 
+// lxserver 可能硬编码绑定 0.0.0.0；收紧为容器内 loopback，且不放宽出站限制。
+const originalServerListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function(...args) {
+  if (args[0] && typeof args[0] === 'object' && args[0].host === '0.0.0.0') {
+    args[0] = { ...args[0], host: '127.0.0.1' };
+  } else if (args[1] === '0.0.0.0') {
+    args[1] = '127.0.0.1';
+  }
+  return originalServerListen.apply(this, args);
+};
+
 function isDisallowedIP(ip) {
   if (!ip || typeof ip !== 'string') return true;
   if (net.isIP(ip) !== 4) return true;
