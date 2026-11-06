@@ -1953,6 +1953,11 @@ def test_catalog_delivery_returns_none_without_tier_claims(monkeypatch):
     assert _netease_catalog_delivery({"qualities": {}, "maxbr": 0}) is None
 
 
+def test_catalog_delivery_does_not_upshift_above_target():
+    detail = {"qualities": {"lossless": {"ext": "flac", "file_size": 25000000}}, "maxbr": 0}
+    assert _netease_catalog_delivery(detail, target="standard") is None
+
+
 def test_catalog_delivery_downgrades_to_best_declared_tier(monkeypatch):
     """目标档高于曲目声明时按声明里最高的那一档降级交付，不虚报。"""
     monkeypatch.setitem(CONF, "download_quality", "lossless")

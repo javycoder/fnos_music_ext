@@ -3739,9 +3739,8 @@ def _netease_catalog_delivery(detail: dict | None,
     for level in qp.quality_ladder(tier):
         if level in usable:
             return _netease_delivery_of(usable[level])
-    # 目标档及以下都没有可选档：按声明里最高的那一档降级交付
-    best = max(usable, key=lambda lv: qp.QUALITY_LEVELS.index(lv))
-    return _netease_delivery_of(usable[best])
+    # 只有目标档以上的声明时，不能把升档当作降档，也不能借用高档文件大小。
+    return None
 
 
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
