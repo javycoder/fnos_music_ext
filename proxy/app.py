@@ -2406,20 +2406,30 @@ def embed_audio_cover(path: str, data: bytes, mime: str) -> bool:
 
 
 _DETECTED_LIBRARY_DIR = ""
+_LIBRARY_DIR_EXPIRES = 0.0
+_LIBRARY_DIR_GENERATION = 0
+_LIBRARY_DIR_LOCK = threading.Lock()
+_LIBRARY_DIR_TTL = 60.0
+
+
+def invalidate_library_dir() -> None:
+    global _DETECTED_LIBRARY_DIR, _LIBRARY_DIR_EXPIRES, _LIBRARY_DIR_GENERATION
+    with _LIBRARY_DIR_LOCK:
+        _DETECTED_LIBRARY_DIR = ""
+        _LIBRARY_DIR_EXPIRES = 0.0
+        _LIBRARY_DIR_GENERATION += 1
 
 
 def detect_library_dir() -> str:
-    """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。
-
-    探测结果缓存：降权后 music.db 可能不可读，但启动时以 root 探测到的曲库
-    目录仍然有效（边听边存需要写入该目录）。
-    """
-    global _DETECTED_LIBRARY_DIR
+    """尊重显式配置；自动探测采用有限缓存和代数保护。"""
+    global _DETECTED_LIBRARY_DIR, _LIBRARY_DIR_EXPIRES
     explicit = str(CONF.get("library_dir") or "").strip()
     if explicit:
         return explicit
-    if _DETECTED_LIBRARY_DIR:
-        return _DETECTED_LIBRARY_DIR
+    with _LIBRARY_DIR_LOCK:
+        if _DETECTED_LIBRARY_DIR and time.monotonic() < _LIBRARY_DIR_EXPIRES:
+            return _DETECTED_LIBRARY_DIR
+        generation = _LIBRARY_DIR_GENERATION
     db = str(CONF.get("music_db") or "")
     if db:
         try:
@@ -2427,19 +2437,20 @@ def detect_library_dir() -> str:
         except ImportError:
             import musicdb
         try:
-            # 配置热重载时已降权，官方库目录仅 root 可读，探测期间临时恢复。
             with musicdb.privileged_read():
-                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-                try:
+                with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)) as con:
                     rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-                finally:
-                    con.close()
             for (path,) in rows:
                 if path and os.path.isdir(path):
-                    _DETECTED_LIBRARY_DIR = path
-                    return path
+                    with _LIBRARY_DIR_LOCK:
+                        if generation == _LIBRARY_DIR_GENERATION:
+                            _DETECTED_LIBRARY_DIR = path
+                            _LIBRARY_DIR_EXPIRES = time.monotonic() + _LIBRARY_DIR_TTL
+                            return path
+                    # 变更发生在查询期间；不返回也不写回旧结果。
+                    return detect_library_dir()
         except Exception as e:
-            logger.warning("Failed to read shared_library path: %s", e)
+            logger.warning("Failed to read shared_library path: %s", type(e).__name__)
     return CONF["cache_dir"]
 
 
@@ -2608,8 +2619,7 @@ def _reevaluate_privileges():
         except OSError as exc:
             logger.warning('could not re-raise for config change: %s', exc)
             return
-    global _DETECTED_LIBRARY_DIR
-    _DETECTED_LIBRARY_DIR = ""
+    invalidate_library_dir()
     try:
         detect_library_dir()
     except Exception as exc:  # noqa: BLE001
@@ -13316,6 +13326,21 @@ async def play_history_delete(request: Request):
                 logger.warning("Error deleting from online play history for user %s: %s", user_guid, e)
 
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+@app.post("/music/api/v1/shared-library/create")
+@app.post("/music/api/v1/shared-library/edit")
+@app.post("/music/api/v1/shared-library/delete")
+@app.post("/music/api/v1/shared-library/reconnect")
+async def shared_library_change(request: Request):
+    """仅官方明确接受变更后，丢弃自动探测的旧路径。"""
+    envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {})
+    if envelope.get("code") == 0:
+        invalidate_library_dir()
+    return JSONResponse(content=envelope, headers=headers)
 
 
 # 官方端点取证：未拦截路径 -> 转发次数（仅内存，重启清零；用于首见告警与采样）
