@@ -167,6 +167,19 @@ def upstream_posts(calls: list[dict], path_suffix: str) -> list[dict]:
     return [c for c in calls if c["method"] == "POST" and c["path"].endswith(path_suffix)]
 
 
+def _force_explicit_save_intent(monkeypatch):
+    """把歌单意图判定固定为"用户显式保存"，用于验证 legacy 显式保存通路。
+
+    默认判定返回 unknown（issue #120：自动播放列表与显式保存同协议无法
+    区分，add-track 不再触发自动下载/绑定）；显式保存的端到端行为只在
+    判定可证实时启用。
+    """
+    async def explicit_intent(request, user_guid, playlist_guid):
+        return appmod.PLAYLIST_INTENT_EXPLICIT_SAVE
+
+    monkeypatch.setattr(appmod, "_playlist_download_intent", explicit_intent)
+
+
 def test_favorite_full_bind_writes_official_and_removes_local(env, monkeypatch):
     """收藏 → 文件已在库 + 官方库已收录 → 官方收藏写入成功，本地映射删除。"""
     make_official_db(env["db_path"], with_track=True)
@@ -191,7 +204,9 @@ def test_favorite_full_bind_writes_official_and_removes_local(env, monkeypatch):
 
 
 def test_playlist_full_bind_writes_official_and_removes_local(env, monkeypatch):
-    """加入自建歌单 → 文件已在库 + 官方库已收录 → 官方歌单写入成功，本地附加条目删除。"""
+    """（意图判定证实显式保存时）加入自建歌单 → 文件已在库 + 官方库已收录
+    → 官方歌单写入成功，本地附加条目删除。"""
+    _force_explicit_save_intent(monkeypatch)
     make_official_db(env["db_path"], with_track=True)
     monkeypatch.setattr(appmod, "find_cache_file", lambda guid: env["dirs"]["library"] + "/f.mp3")
 
@@ -543,8 +558,65 @@ def test_playlist_detail_route_never_downloads_missing_files(env, monkeypatch):
     assert appmod._full_fetch_tasks == {}
 
 
+def test_playlist_pending_not_restored_nor_bound_for_unknown_intent(env, monkeypatch):
+    """issue #120：意图不可证实的歌单 pending 条目——列表读取不恢复绑定
+    意图，已有文件也不写官方（升级前自动播放列表的存量意图保持休眠）。"""
+    downloads = _no_download_guards(monkeypatch)
+    make_official_db(env["db_path"], with_track=True)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: env["dirs"]["library"] + "/f.mp3")
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot}],
+    })
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": PL_CUSTOM, "page": 1, "size": 50},
+            cookies={"music-token": "t"},
+        )
+        assert resp.status_code == 200
+        time.sleep(0.5)
+
+    assert downloads == []
+    assert upstream_posts(env["upstream_calls"], "/playlist/add-track") == []
+    assert FAKE_KUWO1 not in appmod._bind_pending
+
+
+@pytest.mark.anyio
+async def test_playlist_inflight_bind_write_skipped_for_unknown_intent(env, monkeypatch):
+    """issue #120：写官方前的意图复核——升级前已在途的"收藏+歌单"混合意图
+    任务遇到 unknown 判定时歌单不写官方，收藏部分照常完成。"""
+    make_official_db(env["db_path"], with_track=True)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: env["dirs"]["library"] + "/f.mp3")
+    snapshot = appmod.build_favorite_track_obj(
+        FAKE_KUWO1, {"title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+                     "id": "228908", "source": "kuwo"}, created_at=1,
+    )
+    appmod.save_online_favorites("user-a", [
+        {"guid": FAKE_KUWO1, "createdAt": 1, "bind": "pending", "track": snapshot},
+    ])
+    appmod.save_playlist_tracks("user-a", {
+        PL_CUSTOM: [{"guid": FAKE_KUWO1, "addedAt": 1, "bind": "pending", "track": snapshot}],
+    })
+    appmod._register_bind_intent(FAKE_KUWO1, "user-a", {"cookie": "sid=t"}, None)
+    appmod._register_bind_intent(FAKE_KUWO1, "user-a", {"cookie": "sid=t"}, PL_CUSTOM)
+
+    await appmod._bind_official_task(FAKE_KUWO1, "user-a", None)
+
+    # 收藏照常写官方；歌单写入被意图复核拦截
+    fav_posts = upstream_posts(env["upstream_calls"], "/favorite-track/create")
+    assert fav_posts and fav_posts[0]["json"] == {"trackGUID": OFFICIAL_GUID}
+    assert upstream_posts(env["upstream_calls"], "/playlist/add-track") == []
+
+
 def test_playlist_detail_route_retries_bind_only_for_existing_files(env, monkeypatch):
-    """歌单详情：已有缓存文件的 pending 条目重试官方绑定（不下载），缺失条目不动。"""
+    """（意图判定证实显式保存时）歌单详情：已有缓存文件的 pending 条目重试
+    官方绑定（不下载），缺失条目不动。"""
+    _force_explicit_save_intent(monkeypatch)
     downloads = _no_download_guards(monkeypatch)
     make_official_db(env["db_path"], with_track=True)
     existing = env["dirs"]["library"] + "/f.mp3"

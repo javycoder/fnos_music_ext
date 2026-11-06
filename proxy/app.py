@@ -7824,6 +7824,9 @@ def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
     完成路径（tee 转正 / 后台整轨下载 / 切歌续传）统一调度官方绑定。文件已在
     曲库时无需下载，直接尝试官方绑定（官方可能已扫入库）；命中的只是试听/
     暂存缓存时先转存进曲库（issue #82：官方扫描不进 cache 目录，空等必超时）。
+    带 playlist_guid 的调用方必须先通过 _playlist_download_intent 证实为用户
+    显式保存（issue #120）：官方客户端会把整份搜索结果批量 add-track 进自动
+    创建的播放列表，该形态绝不能触发批量下载。
     """
     if not CONF.get("fav_auto_bind"):
         return
@@ -8441,6 +8444,15 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     for playlist_guid in sorted(set(intent.get("playlists") or ())):
         if not _plt_bind_pending(playlist_guid, guid, user_guid):
             continue
+        # issue #120：写官方前再次确认歌单意图可证实为用户显式保存；不可
+        # 证实的（官方自动播放列表存量意图）保持休眠，等用户显式收藏自愈。
+        if (await _playlist_download_intent(_synth_request(headers), user_guid, playlist_guid)
+                != PLAYLIST_INTENT_EXPLICIT_SAVE):
+            logger.info(
+                "Official playlist bind skip for %s -> %s: save intent not confirmable",
+                guid, playlist_guid,
+            )
+            continue
         ok = await _official_upstream_write(
             "POST", "/music/api/v1/playlist/add-track", headers,
             {"guid": playlist_guid, "trackGUIDs": [official_guid]},
@@ -8638,13 +8650,15 @@ def _lookup_bind_any_user(raw_guid: str) -> "tuple[str, str, dict] | None":
     return None
 
 
-def _maybe_retry_official_binds(request: Request, user_guid: str,
-                                fav_items: "list[dict] | None" = None,
-                                plt_map: "dict[str, list[dict]] | None" = None) -> None:
+async def _maybe_retry_official_binds(request: Request, user_guid: str,
+                                      fav_items: "list[dict] | None" = None,
+                                      plt_map: "dict[str, list[dict]] | None" = None) -> None:
     """列表读取只恢复绑定意图及已有文件的绑定（用户级 60s 节流）。
 
     覆盖代理重启丢内存意图、官方迟扫入库、下载中断等场景；凭证头取当前请求，
-    绝不持久化。
+    绝不持久化。歌单（plt）意图恢复前必须通过 add-track 同款的意图判定
+    （issue #120）：无法证实为用户显式保存的歌单一律不恢复绑定意图，防止
+    升级前自动播放列表的存量 pending 继续触发绑定/转存；收藏意图不受影响。
     """
     if not CONF.get("fav_auto_bind") or not user_guid:
         return
@@ -8667,12 +8681,23 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
         return
     _bind_retry_last[user_guid] = now
     headers = copy_incoming_headers(request)
-    uniq = list(dict.fromkeys(fav_guids + [g for gs in plt_guids.values() for g in gs]))
     for guid in fav_guids[:_BIND_RETRY_BATCH]:
         _register_bind_intent(guid, user_guid, headers, None)
+    restored_playlists: list[str] = []
+    skipped_playlists = 0
     for playlist_guid, guids in plt_guids.items():
+        if (await _playlist_download_intent(request, user_guid, playlist_guid)
+                != PLAYLIST_INTENT_EXPLICIT_SAVE):
+            skipped_playlists += 1
+            continue
+        restored_playlists.append(playlist_guid)
         for guid in guids[:_BIND_RETRY_BATCH]:
             _register_bind_intent(guid, user_guid, headers, playlist_guid)
+    if skipped_playlists:
+        fn_diag(logger, "playlist_bind_retry_skipped", user=str(user_guid)[:40],
+                playlists=skipped_playlists, reason=PLAYLIST_INTENT_UNKNOWN)
+    uniq = list(dict.fromkeys(
+        fav_guids + [g for pl in restored_playlists for g in plt_guids[pl]]))
     for guid in uniq[:_BIND_RETRY_BATCH]:
         cached = find_cache_file(guid)
         if cached and _is_rolling_cache_stem(cached, guid):
@@ -11079,7 +11104,7 @@ async def favorite_track_list(request: Request):
             fav_items = []
 
     # 列表读取只恢复绑定意图；已有文件可重试绑定，缺失文件不补下载。
-    _maybe_retry_official_binds(request, user_guid, fav_items=fav_items)
+    await _maybe_retry_official_binds(request, user_guid, fav_items=fav_items)
 
     # 官方真实条目作为结构模板：App 端解析严格，在线条目字段集需与官方对齐；
     # 旧数据存的快照也统一重建，避免历史遗留形状继续下发。
@@ -11371,6 +11396,34 @@ def _recommend_request_owned(user_guid: str, kind: str, guid: str) -> bool:
 # 分工：在线条目记本地 JSON（按用户分文件，桶键=官方歌单 guid），官方条目
 # 照旧透传官方；读取接口透传官方信封后合并下发。
 
+# === 歌单 add-track 的下载意图判定（issue #120） ===
+# 官方客户端在搜索后点播任意一首，会把整份搜索结果批量 add-track 进它自动
+# 创建的播放列表——该协议与用户显式"保存到歌单"完全同构；收藏自动绑定若照
+# 单全收，就会把没听过的歌全部下载进曲库（本地目录鱼龙混杂）。官方歌单
+# 元数据当前没有任何可取证字段能区分"自动播放列表"与"用户自建歌单"，按
+# fail-safe 处理：add-track 一律不触发收藏自动绑定的后台下载与官方绑定意图；
+# 歌单内容照常保存，显式收藏（favorite-track/create，单曲语义明确）与
+# 边听边存的播放保存链路不受影响。
+
+PLAYLIST_INTENT_EXPLICIT_SAVE = "explicit_save"
+PLAYLIST_INTENT_PLAYBACK_QUEUE = "playback_queue"
+PLAYLIST_INTENT_UNKNOWN = "unknown"
+
+
+async def _playlist_download_intent(request: Request, user_guid: str,
+                                    playlist_guid: str) -> str:
+    """判断一次歌单 add-track 是否可视为用户显式保存意图（issue #120）。
+
+    只接受协议层面可取证的判据（官方字段或显式操作标记）。当前没有任何已
+    确认的标记，一律返回 unknown——调用方必须按"不触发自动下载/绑定"处理，
+    绝不依据歌单名称、曲目数量、与搜索结果的重合度或请求先后时间猜测。
+    未来取得可靠判据时在此扩展：命中自动队列标记返回
+    PLAYLIST_INTENT_PLAYBACK_QUEUE，命中用户歌单标记返回
+    PLAYLIST_INTENT_EXPLICIT_SAVE；判定自身只做只读查询（如需读官方歌单
+    详情必须直连上游），绝不写任何状态。当前实现零 IO，调用方无需节流。
+    """
+    return PLAYLIST_INTENT_UNKNOWN
+
 _PLT_LOCK = asyncio.Lock()
 
 
@@ -11513,6 +11566,15 @@ async def playlist_add_track(request: Request):
 
     saved = False
     autobind = bool(CONF.get("fav_auto_bind"))
+    # issue #120：加入歌单只有被证实为用户显式保存才允许自动下载/绑定；
+    # 判定不可靠（unknown）时只保存歌单内容，绝不批量下载整份列表。
+    autobind_intent = False
+    if autobind:
+        autobind_intent = (await _playlist_download_intent(request, user_guid, playlist_guid)
+                           == PLAYLIST_INTENT_EXPLICIT_SAVE)
+        if not autobind_intent:
+            fn_diag(logger, "playlist_autodl_skipped", playlist=str(playlist_guid)[:40],
+                    tracks=len(online), reason=PLAYLIST_INTENT_UNKNOWN)
     async with _PLT_LOCK:
         try:
             items = load_playlist_tracks(user_guid)
@@ -11524,7 +11586,7 @@ async def playlist_add_track(request: Request):
                     bucket[idx]["track"] = snapshots[g]
                 else:
                     entry = {"guid": g, "addedAt": now, "track": snapshots[g]}
-                    if autobind:
+                    if autobind_intent:
                         entry["bind"] = "pending"
                     bucket.append(entry)
             save_playlist_tracks(user_guid, items)
@@ -11532,7 +11594,7 @@ async def playlist_add_track(request: Request):
         except Exception as e:
             logger.warning("Error updating playlist tracks for user %s: %s", user_guid, e)
 
-    if saved:
+    if saved and autobind_intent:
         for g in online:
             _register_fav_autobind(request, g, user_guid, playlist_guid=playlist_guid)
 
@@ -12014,7 +12076,7 @@ async def playlist_track_list(request: Request):
         if not extras:
             return JSONResponse(content=envelope, headers=headers)
         # 列表读取只对已有文件重试绑定，不补下载。
-        _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
+        await _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
 
         data = envelope.get("data")
         if not isinstance(data, dict):
