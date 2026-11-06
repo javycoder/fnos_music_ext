@@ -36,6 +36,18 @@ def test_success_invalidates_library_cache(library_env, action):
     assert p.detect_library_dir() == str(new)
 
 
+def test_reconnect_check_does_not_invalidate(library_env):
+    db, old, new = library_env
+    assert p.detect_library_dir() == str(old)
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE shared_library SET path = ?", (str(new),))
+    p.app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"code": 0, "data": None})), base_url="http://unix")
+    with TestClient(p.app) as client:
+        assert client.post("/music/api/v1/shared-library/reconnect/check", json={}).json()["code"] == 0
+    assert p.detect_library_dir() == str(old)
+
+
 def test_error_does_not_invalidate(library_env):
     db, old, new = library_env
     assert p.detect_library_dir() == str(old)
