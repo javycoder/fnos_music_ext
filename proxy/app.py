@@ -2423,15 +2423,17 @@ def invalidate_library_dir() -> None:
 def detect_library_dir() -> str:
     """尊重显式配置；自动探测采用有限缓存和代数保护。"""
     global _DETECTED_LIBRARY_DIR, _LIBRARY_DIR_EXPIRES
-    explicit = str(CONF.get("library_dir") or "").strip()
-    if explicit:
-        return explicit
-    with _LIBRARY_DIR_LOCK:
-        if _DETECTED_LIBRARY_DIR and time.monotonic() < _LIBRARY_DIR_EXPIRES:
-            return _DETECTED_LIBRARY_DIR
-        generation = _LIBRARY_DIR_GENERATION
-    db = str(CONF.get("music_db") or "")
-    if db:
+    for _attempt in range(3):
+        explicit = str(CONF.get("library_dir") or "").strip()
+        if explicit:
+            return explicit
+        with _LIBRARY_DIR_LOCK:
+            if _DETECTED_LIBRARY_DIR and time.monotonic() < _LIBRARY_DIR_EXPIRES:
+                return _DETECTED_LIBRARY_DIR
+            generation = _LIBRARY_DIR_GENERATION
+        db = str(CONF.get("music_db") or "")
+        if not db:
+            break
         try:
             from . import musicdb
         except ImportError:
@@ -2440,17 +2442,18 @@ def detect_library_dir() -> str:
             with musicdb.privileged_read():
                 with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)) as con:
                     rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-            for (path,) in rows:
-                if path and os.path.isdir(path):
-                    with _LIBRARY_DIR_LOCK:
-                        if generation == _LIBRARY_DIR_GENERATION:
-                            _DETECTED_LIBRARY_DIR = path
-                            _LIBRARY_DIR_EXPIRES = time.monotonic() + _LIBRARY_DIR_TTL
-                            return path
-                    # 变更发生在查询期间；不返回也不写回旧结果。
-                    return detect_library_dir()
+            path = next((value for (value,) in rows if value and os.path.isdir(value)), None)
+            with _LIBRARY_DIR_LOCK:
+                if generation != _LIBRARY_DIR_GENERATION:
+                    continue
+                if path:
+                    _DETECTED_LIBRARY_DIR = path
+                    _LIBRARY_DIR_EXPIRES = time.monotonic() + _LIBRARY_DIR_TTL
+                    return path
+                break
         except Exception as e:
             logger.warning("Failed to read shared_library path: %s", type(e).__name__)
+            break
     return CONF["cache_dir"]
 
 

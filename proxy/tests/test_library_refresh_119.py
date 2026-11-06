@@ -48,6 +48,27 @@ def test_error_does_not_invalidate(library_env):
     assert p.detect_library_dir() == str(old)
 
 
+def test_repeated_invalidation_has_bounded_retries(library_env, monkeypatch):
+    calls = []
+    real_isdir = p.os.path.isdir
+
+    def invalidate_during_query(path):
+        calls.append(path)
+        p.invalidate_library_dir()
+        return real_isdir(path)
+
+    monkeypatch.setattr(p.os.path, "isdir", invalidate_during_query)
+    assert p.detect_library_dir() == p.CONF["cache_dir"]
+    assert len(calls) == 3
+    assert not p._DETECTED_LIBRARY_DIR
+
+
+def test_explicit_path_takes_precedence(library_env, monkeypatch):
+    _, _, new = library_env
+    monkeypatch.setitem(p.CONF, "library_dir", str(new))
+    assert p.detect_library_dir() == str(new)
+
+
 def test_ttl_detects_external_change(library_env, monkeypatch):
     db, old, new = library_env
     clock = [100.0]
