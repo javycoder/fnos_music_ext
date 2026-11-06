@@ -28,8 +28,12 @@ def installed_version(path: str | None = None) -> tuple[int, int, int] | None:
             with open(path, encoding="utf-8") as manifest:
                 text = manifest.read(65536)
             matches = re.findall(r"(?m)^\s*version\s*=\s*([^\s#]+)\s*(?:#.*)?$", text)
-            if len(matches) == 1 and re.fullmatch(r"\d+\.\d+\.\d+", matches[0]):
-                version = tuple(int(part) for part in matches[0].split("."))
+            if len(matches) == 1:
+                raw = matches[0]
+                if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+                    raw = raw[1:-1]
+                if re.fullmatch(r"\d+\.\d+\.\d+", raw):
+                    version = tuple(int(part) for part in raw.split("."))
         except (OSError, UnicodeError, ValueError):
             pass
         if version is None:
