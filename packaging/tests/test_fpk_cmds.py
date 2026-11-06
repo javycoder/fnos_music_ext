@@ -535,6 +535,14 @@ def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
     repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
     (repo / ".env.bak.20260101000000").write_text("X=0\n", encoding="utf-8")
     sb.add_data(repo)
+    state_dirs = ('playlist_tracks', 'recommend_cache', 'nm_playlists_cache',
+                  'public_playlists_cache', 'cache', 'musicbox-data', 'musicdl_outputs')
+    state_files = ('llm_usage.json', 'album_registry.json', 'bind_registry.json')
+    for name in state_dirs:
+        (repo / name).mkdir()
+        (repo / name / 'state.txt').write_text(name, encoding='utf-8')
+    for name in state_files:
+        (repo / name).write_text(name, encoding='utf-8')
     sb.add_systemctl()
     decoy = tmp_path / "decoy-cwd"
     decoy.mkdir()
@@ -558,6 +566,10 @@ def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
     assert ".env" in listing.splitlines()
     assert any(entry.startswith("sources-data/") for entry in listing.splitlines())
     assert any(entry.startswith("play_history/") for entry in listing.splitlines())
+    for name in state_dirs:
+        assert f'{name}/state.txt' in listing.splitlines()
+    for name in state_files:
+        assert name in listing.splitlines()
 
 
 def test_upgrade_init_tar_failure_aborts_and_cleans(sb):

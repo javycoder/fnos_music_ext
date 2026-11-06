@@ -133,7 +133,10 @@ fnmusic_data_items() {
     # 会按 cwd 展开，把不存在于 repo 的文件名传给 tar 导致备份失败。
     local p f rel items=""
     [ -n "${FNMUSIC_REPO_DIR}" ] || return 0
-    for p in ".env" ".env.bak*" "sources-data" "online_favorites" "online_favorites.json" "play_history"; do
+    for p in ".env" ".env.bak*" "sources-data" "musicbox-data" "musicdl_outputs" \
+             "online_favorites" "online_favorites.json" "play_history" "playlist_tracks" \
+             "recommend_cache" "nm_playlists_cache" "public_playlists_cache" "cache" \
+             "llm_usage.json" "album_registry.json" "bind_registry.json"; do
         # shellcheck disable=SC2086
         for f in "${FNMUSIC_REPO_DIR}"/${p}; do
             [ -e "${f}" ] || continue
