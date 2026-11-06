@@ -551,6 +551,7 @@ class _FakeNodeProcess:
         pass
 
 
+@pytest.mark.skipif(not hasattr(__import__("signal"), "SIGALRM"), reason="requires POSIX interval timers")
 def test_generated_worker_entrypoint_interrupts_blocking_io_at_total_deadline():
     import ast
     import signal
