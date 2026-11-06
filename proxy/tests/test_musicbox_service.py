@@ -632,6 +632,24 @@ def test_song_detail_quality_size_missing_stays_unknown():
     assert row["maxbr"] == 0
 
 
+def test_song_detail_quality_nonfinite_numbers_are_unknown():
+    row = netease_ext._map_song_detail({
+        'id': 1, 'name': 'x',
+        'sq': {'br': float('inf'), 'size': float('inf')},
+        'privilege': {'maxbr': float('inf')},
+    })
+    assert row['qualities']['lossless']['file_size'] == 0
+    assert row['qualities']['lossless']['br'] == 999000
+    assert row['maxbr'] == 0
+    negative = netease_ext._map_song_detail({
+        'id': 2, 'name': 'y', 'sq': {'br': -1, 'size': -2},
+        'privilege': {'maxbr': -1},
+    })
+    assert negative['qualities']['lossless']['file_size'] == 0
+    assert negative['qualities']['lossless']['br'] == 999000
+    assert negative['maxbr'] == 0
+
+
 def test_song_lyric_ok_and_upstream_error(monkeypatch):
     import netease_ext
 

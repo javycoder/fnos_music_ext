@@ -94,10 +94,10 @@ _QUALITY_SLOTS = (
 )
 
 
-def _int_or_zero(value: Any) -> int:
+def _nonnegative_int_or_zero(value: Any) -> int:
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -115,8 +115,8 @@ def map_quality_slots(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
             continue
         out[tier] = {
             "ext": ext,
-            "file_size": _int_or_zero(slot.get("size")),
-            "br": _int_or_zero(slot.get("br")) or nominal_br,
+            "file_size": _nonnegative_int_or_zero(slot.get("size")),
+            "br": _nonnegative_int_or_zero(slot.get("br")) or nominal_br,
         }
     return out
 
@@ -126,7 +126,7 @@ def map_privilege_maxbr(raw: dict[str, Any]) -> int:
     privilege = raw.get("privilege")
     if not isinstance(privilege, dict):
         return 0
-    return _int_or_zero(privilege.get("maxbr"))
+    return _nonnegative_int_or_zero(privilege.get("maxbr"))
 
 
 def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
