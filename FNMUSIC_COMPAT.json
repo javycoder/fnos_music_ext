@@ -1,8 +1,9 @@
 {
-  "extension_version": "2.12.0-8",
+  "extension_version": "2.12.1-0",
   "music_versions": [
-    "1.0.10"
+    "1.0.10",
+    "1.1.19"
   ],
-  "checked_at": "2026-11-05",
-  "notes": "2026-11-05 20:57 本次正式发布准备期间通过已核实的 SSH 主机身份（StrictHostKeyChecking=yes）只读重新检查官方音乐 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10，与既有适配基线一致。未修改官方程序、生产配置或曲库；仅记录适配基线，不控制运行时行为。"
+  "checked_at": "2026-11-07",
+  "notes": "1.0.10 为既有适配基线。2026-11-07 通过已核实的 SSH 主机身份只读核对 NAS 的官方音乐 manifest（trim.music 1.1.19）与数据库结构；候选代码的版本识别、有效曲目路径匹配和自动库目录探测已在该环境只读验证。搜索分页、在线删除及用户状态清理由自动化测试覆盖，未在生产库执行破坏性删除；此记录不控制运行时行为。"
 }
