@@ -13346,6 +13346,8 @@ def _strict_online_items(path: str) -> tuple[object, list]:
         with open(path, "r", encoding="utf-8") as handle:
             document = json.load(handle)
     except FileNotFoundError:
+        if os.path.lexists(path):
+            raise
         return {"items": []}, []
     items = document.get("items") if isinstance(document, dict) else document
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):

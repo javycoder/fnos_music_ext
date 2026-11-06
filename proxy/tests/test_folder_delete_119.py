@@ -88,6 +88,22 @@ def test_corrupt_user_state_prevents_all_deletion(state, corrupt):
     assert [r.url.path for r in calls] == ["/music/api/v1/user/me"]
 
 
+def test_broken_state_symlink_fails_closed(state):
+    from pathlib import Path
+    path = Path(p.user_fav_path("u1"))
+    path.unlink()
+    try:
+        path.symlink_to(path.parent / "missing-target")
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    calls = []
+    with client_for(handler_for(calls)) as client:
+        result = client.post("/music/api/v1/folder-view/delete", json={"folderPaths": [], "trackGUIDs": [state, "official-id"], "isPermanent": False})
+    assert result.json()["code"] != 0
+    assert path.is_symlink()
+    assert len(calls) == 1
+
+
 def test_history_cleanup_keeps_large_history_and_metadata(state):
     import json
     from pathlib import Path
