@@ -112,6 +112,36 @@ async def test_resolver_timeout_cooldown_is_candidate_scoped_and_only_for_full_t
 
 
 @pytest.mark.asyncio
+async def test_timeout_on_one_cross_platform_candidate_tries_next(fake_lx, runtime, monkeypatch, tmp_path):
+    _write_env(tmp_path, monkeypatch, {"FNMUSIC_LX_PLATFORM_PREFERRED": "true"})
+    fake_lx.sources = [_ready("a.js", ["kw", "kg"])]
+    calls = []
+
+    async def candidates(*args, **kwargs):
+        return {"kg": [{"id": "lx:kg:first"}, {"id": "lx:kg:second"}]}
+
+    async def attempt(*args, **kwargs):
+        track_id = kwargs["resolved_track_id"]
+        calls.append(track_id)
+        if kwargs["platform"] == "kw":
+            return lxapp._AttemptResult()
+        if track_id.endswith("first"):
+            return lxapp._AttemptResult(timeout=True, resolve_timeout=True)
+        return lxapp._AttemptResult(data={"url": "https://media.test/good.mp3", "ext": "mp3",
+                                         "resolution_quality": kwargs["quality"]})
+
+    monkeypatch.setattr(lxapp._CANDIDATES, "find_many", candidates)
+    monkeypatch.setattr(lxapp, "_attempt_pinned", attempt)
+    client = _media_client()
+    try:
+        result = await lxapp.resolve_and_probe(client, "kw", _item(), "standard", budget=5.0)
+    finally:
+        await client.aclose()
+    assert result is not None
+    assert calls.index("lx:kg:first") < calls.index("lx:kg:second")
+
+
+@pytest.mark.asyncio
 async def test_media_probe_timeout_is_incomplete_and_not_negative_cached(
     fake_lx, runtime, monkeypatch,
 ):

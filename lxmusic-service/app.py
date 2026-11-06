@@ -1502,7 +1502,8 @@ async def resolve_and_probe(
                     _RESOLVE_TIMEOUT_COOLDOWN[cooldown_key] = (
                         time.monotonic() + _RESOLVE_TIMEOUT_COOLDOWN_S
                     )
-                break
+                # 候选拥有独立预算；有剩余时间时继续尝试同平台的其他候选。
+                continue
             # 明确空链接/无效媒体仅是当前歌曲结果，不计入共享脚本熔断。
 
         if time.monotonic() >= deadline:
