@@ -13340,6 +13340,23 @@ async def play_history_delete(request: Request):
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
+def _strict_online_items(path: str) -> tuple[object, list]:
+    """删除操作不能把损坏或不可读的用户文件当成空集合。"""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except FileNotFoundError:
+        return {"items": []}, []
+    items = document.get("items") if isinstance(document, dict) else document
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("invalid online state")
+    return document, items
+
+
+def _with_online_items(document: object, items: list) -> object:
+    return dict(document, items=items) if isinstance(document, dict) else items
+
+
 @app.post("/music/api/v1/folder-view/delete")
 async def folder_view_delete(request: Request):
     """官方曲库删除与当前用户在线收藏/历史分流；不删除在线音频文件。"""
@@ -13383,29 +13400,34 @@ async def folder_view_delete(request: Request):
         return JSONResponse({"code": -1, "msg": "无法确认管理员身份", "data": None}, status_code=503)
 
     official = [raw for raw, real in resolved if not is_online_guid(real)]
-    if official or folders:
-        forwarded = dict(body, trackGUIDs=official)
+    favorite_path = user_fav_path(user_guid)
+    history_path = os.path.join(dailyrec.play_history_dir(), f"{dailyrec._safe_user_name(user_guid)}.json")
+    # 固定锁顺序：在官方删除前核验两个文件，并防止并发写覆盖预检结果。
+    async with _FAV_LOCK, _HISTORY_LOCK:
         try:
-            upstream = await client.post(str(request.url.path) + ("?" + request.url.query if request.url.query else ""),
-                                         headers=copy_incoming_headers(request), json=forwarded)
-            payload = upstream.json()
-        except Exception:
-            return JSONResponse({"code": -1, "msg": "官方删除结果未知；在线数据未更改", "data": None}, status_code=502)
-        headers = filter_headers(upstream.headers, exclude_keys={"content-length", "content-encoding"})
-        if upstream.status_code != 200 or not isinstance(payload, dict) or payload.get("code") != 0:
-            return Response(content=upstream.content, status_code=upstream.status_code,
-                            headers=headers, media_type=upstream.headers.get("content-type"))
+            favorite_doc, favorites = _strict_online_items(favorite_path)
+            history_doc, history = _strict_online_items(history_path)
+        except (OSError, ValueError, TypeError):
+            return JSONResponse({"code": -1, "msg": "在线收藏或历史不可读，未执行删除", "data": None})
+        if official or folders:
+            forwarded = dict(body, trackGUIDs=official)
+            try:
+                upstream = await client.post(str(request.url.path) + ("?" + request.url.query if request.url.query else ""),
+                                             headers=copy_incoming_headers(request), json=forwarded)
+                payload = upstream.json()
+            except Exception:
+                return JSONResponse({"code": -1, "msg": "官方删除结果未知；在线数据未更改", "data": None}, status_code=502)
+            headers = filter_headers(upstream.headers, exclude_keys={"content-length", "content-encoding"})
+            if upstream.status_code != 200 or not isinstance(payload, dict) or payload.get("code") != 0:
+                return Response(content=upstream.content, status_code=upstream.status_code,
+                                headers=headers, media_type=upstream.headers.get("content-type"))
 
-    # 两个存储各自原子写；失败后明确报告可重试，不声称全量成功。
-    async with _FAV_LOCK:
-        favorites = load_online_favorites(user_guid)
-        kept = [row for row in favorites if not isinstance(row, dict) or row.get("guid") not in online]
-        if len(kept) != len(favorites) and not save_online_favorites(user_guid, kept):
+        # 两个文件各自原子写，不截断历史或丢弃其它文档字段；部分失败明确提示重试。
+        kept = [row for row in favorites if row.get("guid") not in online]
+        if len(kept) != len(favorites) and not dailyrec._atomic_write_json(favorite_path, _with_online_items(favorite_doc, kept)):
             return JSONResponse({"code": -1, "msg": "官方部分可能已删除，在线收藏清理失败；可重试", "data": None})
-    async with _HISTORY_LOCK:
-        history = dailyrec.load_online_play_history(user_guid)
         kept_history = [row for row in history if row.get("guid") not in online]
-        if len(kept_history) != len(history) and not dailyrec.save_online_play_history(user_guid, kept_history):
+        if len(kept_history) != len(history) and not dailyrec._atomic_write_json(history_path, _with_online_items(history_doc, kept_history)):
             return JSONResponse({"code": -1, "msg": "部分内容已删除，在线历史清理失败；可重试", "data": None})
     return JSONResponse({"code": 0, "msg": "", "data": None})
 

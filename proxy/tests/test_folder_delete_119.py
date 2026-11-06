@@ -74,10 +74,38 @@ def test_official_only_request_preserves_official_validation(state):
     assert [r.url.path for r in calls] == ["/music/api/v1/folder-view/delete"]
 
 
+@pytest.mark.parametrize("corrupt", ["favorites", "history"])
+def test_corrupt_user_state_prevents_all_deletion(state, corrupt):
+    from pathlib import Path
+    path = (p.user_fav_path("u1") if corrupt == "favorites" else
+            str(Path(recommend.play_history_dir()) / "u1.json"))
+    Path(path).write_text("{invalid", encoding="utf-8")
+    calls = []
+    with client_for(handler_for(calls)) as client:
+        result = client.post("/music/api/v1/folder-view/delete", json={"folderPaths": [], "trackGUIDs": [state, "official-id"], "isPermanent": False})
+    assert result.json()["code"] != 0
+    assert Path(path).read_text(encoding="utf-8") == "{invalid"
+    assert [r.url.path for r in calls] == ["/music/api/v1/user/me"]
+
+
+def test_history_cleanup_keeps_large_history_and_metadata(state):
+    import json
+    from pathlib import Path
+    path = Path(recommend.play_history_dir()) / "u1.json"
+    items = [{"guid": GUID}] + [{"guid": f"keep-{i}"} for i in range(501)]
+    path.write_text(json.dumps({"items": items, "extra": "preserve"}), encoding="utf-8")
+    with client_for(handler_for([])) as client:
+        result = client.post("/music/api/v1/folder-view/delete", json={"folderPaths": [], "trackGUIDs": [state], "isPermanent": False})
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert result.json()["code"] == 0
+    assert len(data["items"]) == 501
+    assert data["extra"] == "preserve"
+
+
 def test_favorite_write_failure_reports_error(state, monkeypatch):
     calls = []
     with client_for(handler_for(calls)) as client:
-        monkeypatch.setattr(p, "save_online_favorites", lambda *args: False)
+        monkeypatch.setattr(recommend, "_atomic_write_json", lambda *args: False)
         result = client.post("/music/api/v1/folder-view/delete", json={"folderPaths": [], "trackGUIDs": [state], "isPermanent": False})
     assert result.json()["code"] != 0
     assert len(recommend.load_online_play_history("u1")) == 2
