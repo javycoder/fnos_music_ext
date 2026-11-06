@@ -3368,6 +3368,8 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
     params: dict[str, Any] = {"keyword": keyword, "limit": limit, "type": "song"}
     if offset > 0:
         params["offset"] = offset
+    # 整页共用同一个下载目标档：展示格式/大小要与实际下载一致（issue #116）
+    delivery_target = _netease_delivery_target()
     try:
         r = await client.get(
             "/api/v1/search",
@@ -3411,6 +3413,8 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                 "album": album,
                 "duration_s": duration_s,
                 "ext": ext,
+                # /songs/detail 补全后按实际下载档覆盖；无详情时保持 0 表示未知
+                "file_size": 0,
                 # 主接口被风控走 web 兜底时行内自带封面；正常路径仍由 /songs/detail 补全覆盖
                 "cover_url": str(it.get("album_pic_url") or it.get("cover_url") or ""),
                 "lyric": "",
@@ -3442,7 +3446,14 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                                     pic_url = str(d_info.get("album_pic_url") or "")
                                     if pic_url:
                                         item["cover_url"] = pic_url
-                                    if d_info.get("has_sq") or d_info.get("has_hr"):
+                                    # issue #116：展示格式与大小取自「本次会下载的
+                                    # 表示」，而不是曲库里有没有无损——后者在账号
+                                    # 无权益或下载档为有损时与落盘格式矛盾。
+                                    display = _netease_catalog_delivery(d_info, delivery_target)
+                                    if display is not None:
+                                        item["ext"], item["file_size"] = display
+                                    elif d_info.get("has_sq") or d_info.get("has_hr"):
+                                        # 详情没有档位声明（旧服务）：退回原启发式
                                         item["ext"] = "flac"
             except Exception as detail_err:
                 logger.warning("Failed to fetch songs detail for %s: %s", keyword, detail_err)
@@ -3620,6 +3631,101 @@ def _ext_from_netease_media(inner: dict) -> "str | None":
     if level in ("standard", "higher", "exhigh", "mp3"):
         return "mp3"
     return None
+
+
+# issue #116：档位名义码率，只用于按账号 privilege.maxbr 判断该档是否可用；
+# 无损及以上无法从码率区分，统一按「高于 320k」对待。
+_NETEASE_TIER_NOMINAL_BR = {
+    "standard": 128000, "higher": 192000, "exhigh": 320000,
+    "lossless": 999000, "hires": 999000, "jymaster": 999000, "sky": 999000,
+}
+# 与 musicbox_service.netease_ext._QUALITY_SLOTS 同构。/song/{id}/info 返回 weapi
+# 原始对象（字段仍是 l/m/h/sq/hr），不能直接复用已映射的搜索行。
+_NETEASE_RAW_QUALITY_SLOTS = (
+    ("l", "standard", "mp3", 128000),
+    ("m", "higher", "mp3", 192000),
+    ("h", "exhigh", "mp3", 320000),
+    ("sq", "lossless", "flac", 999000),
+    ("hr", "hires", "flac", 999000),
+)
+
+
+def _netease_raw_qualities(raw: dict | None) -> dict[str, dict]:
+    """weapi 原始详情对象 → 与搜索行同构的 qualities。"""
+    out: dict[str, dict] = {}
+    src = raw if isinstance(raw, dict) else {}
+    for field, tier, ext, nominal_br in _NETEASE_RAW_QUALITY_SLOTS:
+        slot = src.get(field)
+        if not isinstance(slot, dict) or not slot:
+            continue
+        try:
+            size = int(slot.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        try:
+            br = int(slot.get("br") or 0)
+        except (TypeError, ValueError):
+            br = 0
+        out[tier] = {"ext": ext, "file_size": max(0, size), "br": br or nominal_br}
+    return out
+
+
+def _netease_delivery_target() -> str:
+    """搜索展示用的网易目标档：与下载任务同一套规则（app 跟随播放档）。"""
+    target = effective_download_quality_conf()
+    if str(target or "").strip().lower() == "app":
+        return effective_play_quality_conf()
+    return qp.normalize_quality(target, default="lossless")
+
+
+def _netease_delivery_of(entry: dict) -> tuple[str, int]:
+    """把某个档位的元数据投影成 (容器, 字节数)；大小缺失记 0（未知）。"""
+    ext = str(entry.get("ext") or "").strip().lower() or "mp3"
+    try:
+        size = int(entry.get("file_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return ext, max(0, size)
+
+
+def _netease_catalog_delivery(detail: dict | None,
+                              target: str | None = None) -> tuple[str, int] | None:
+    """按目标档从曲目各档元数据里挑出「本次会下载的表示」→ (ext, file_size)。
+
+    issue #116：搜索列表此前一律按「曲库有没有 SQ/HR」标 flac，实际下载走
+    下载档，无损无权限时还会降成 mp3，于是列表格式和落盘格式对不上。这里改为
+    「当前下载配置 + 曲目自身声明的档位」推导，详情面板与搜索列表共用同一判据。
+
+    返回 None 表示这份详情没有任何可用档位声明（旧服务/详情缺字段）：调用方
+    必须保留自己原有的启发式，不能凭空把有损曲目标成 flac。搜索阶段不取链，
+    账号权益导致的二次降级只有取链才知道，这里不猜；一个可选档都没有时也不按
+    名义码率估算字节数。
+    """
+    tier = qp.normalize_quality(
+        target if target is not None else _netease_delivery_target(), default="lossless")
+    src = detail if isinstance(detail, dict) else {}
+    qualities = src.get("qualities")
+    qualities = qualities if isinstance(qualities, dict) else {}
+    try:
+        maxbr = int(src.get("maxbr") or 0)
+    except (TypeError, ValueError):
+        maxbr = 0
+    usable: dict[str, dict] = {}
+    for level, entry in qualities.items():
+        if not isinstance(entry, dict) or level not in qp.QUALITY_LEVELS:
+            continue
+        # 账号对该曲的最高码率低于该档名义码率时，取链必然降级，展示也不能按它算
+        if maxbr > 0 and _NETEASE_TIER_NOMINAL_BR.get(level, 0) > maxbr:
+            continue
+        usable[level] = entry
+    if not usable:
+        return None
+    for level in qp.quality_ladder(tier):
+        if level in usable:
+            return _netease_delivery_of(usable[level])
+    # 目标档及以下都没有可选档：按声明里最高的那一档降级交付
+    best = max(usable, key=lambda lv: qp.QUALITY_LEVELS.index(lv))
+    return _netease_delivery_of(usable[best])
 
 
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
@@ -7824,6 +7930,9 @@ def _register_fav_autobind(request: Request, guid: str, user_guid: str = "",
     完成路径（tee 转正 / 后台整轨下载 / 切歌续传）统一调度官方绑定。文件已在
     曲库时无需下载，直接尝试官方绑定（官方可能已扫入库）；命中的只是试听/
     暂存缓存时先转存进曲库（issue #82：官方扫描不进 cache 目录，空等必超时）。
+    带 playlist_guid 的调用方必须先通过 _playlist_download_intent 证实为用户
+    显式保存（issue #120）：官方客户端会把整份搜索结果批量 add-track 进自动
+    创建的播放列表，该形态绝不能触发批量下载。
     """
     if not CONF.get("fav_auto_bind"):
         return
@@ -8194,60 +8303,266 @@ def _register_bind_intent(guid: str, user_guid: str, headers: "dict | None",
         intent["fav"] = True
 
 
-def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "str | None":
-    """只读官方 music.db，按落盘标签匹配曲目的官方 guid（最新一条优先）。
+def _musicdb_privileged_read():
+    """官方曲库只读租约。降权后的运行身份过不了曲库目录 ACL。"""
+    try:
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    return musicdb.privileged_read()
 
-    标签由 write_audio_tags 写入、官方扫描入库时读取，精确匹配即高保真；
-    精确未命中再用大小写不敏感兜底一次（官方扫描器可能做过归一化）。
+
+def _open_music_db(db: str):
+    """在调用方已持有的 root 租约内打开官方库。打不开返回 None。"""
+    try:
+        return sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error as exc:
+        logger.debug("official music db open failed: %s", type(exc).__name__)
+        return None
+
+
+def _path_identity(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(path))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _same_library_path(left: str, right: str) -> bool:
+    """路径字符串、realpath 或同一 inode 视为同一落盘文件。"""
+    if not left or not right:
+        return False
+    keys = {_path_identity(left)}
+    try:
+        keys.add(_path_identity(os.path.realpath(left)))
+    except OSError:
+        pass
+    if _path_identity(right) in keys:
+        return True
+    try:
+        if _path_identity(os.path.realpath(right)) in keys:
+            return True
+    except OSError:
+        pass
+    try:
+        if os.path.isfile(left) and os.path.isfile(right) and os.path.samefile(left, right):
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _glob_ends_with(name: str) -> str:
+    """SQLite GLOB：匹配以该文件名结尾的路径，转义 * ? [。"""
+    parts = ["*"]
+    for char in os.path.basename(name):
+        if char in "*?[":
+            parts.append(f"[{char}]")
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def _saved_file_size(path: str) -> int:
+    try:
+        if os.path.isfile(path):
+            return int(os.path.getsize(path))
+    except OSError:
+        return 0
+    return 0
+
+
+def _guid_by_saved_path(con: sqlite3.Connection, dest: str) -> "tuple[str, str | None]":
+    """按本次落盘文件认官方曲目。
+
+    返回 (hit, guid)、(miss, None)、(ambiguous, None) 或 (unavailable, None)。
+    unavailable 表示库里没有可查询的 audio_file（测试用精简库，或查询失败），
+    调用方可以退回标签匹配；miss/ambiguous 表示路径库可用但还不能唯一认定。
     """
+    sql = (
+        "SELECT t.id, t.guid, af.path, af.size, "
+        "t.is_audio_file_deleted, t.is_admin_deleted, t.is_cue, "
+        "af.is_physical_file_deleted "
+        "FROM track t JOIN audio_file af ON af.id = t.audio_file_id "
+        "WHERE af.path = ? OR af.path = ? OR af.path GLOB ?"
+    )
+    try:
+        real = os.path.realpath(dest)
+    except OSError:
+        real = dest
+    try:
+        rows = con.execute(sql, (dest, real, _glob_ends_with(dest))).fetchall()
+    except sqlite3.Error as exc:
+        logger.debug("official bind path lookup unavailable: %s", type(exc).__name__)
+        return "unavailable", None
+    live = []
+    for row in rows:
+        if any(row[4:]):
+            continue
+        path = str(row[2] or "").strip()
+        guid = str(row[1] or "").strip()
+        if not path or not guid:
+            continue
+        try:
+            stored_size = int(row[3] or 0)
+        except (TypeError, ValueError):
+            stored_size = 0
+        live.append((int(row[0] or 0), guid, path, stored_size))
+    path_hits = [row for row in live if _same_library_path(dest, row[2])]
+    guids = {row[1] for row in path_hits}
+    if len(guids) == 1:
+        return "hit", next(iter(guids))
+    if len(guids) > 1:
+        return "ambiguous", None
+    wanted = _saved_file_size(dest)
+    base = os.path.normcase(os.path.basename(dest))
+    if wanted > 0 and base:
+        sized = []
+        for row in live:
+            size = row[3] if row[3] > 0 else _saved_file_size(row[2])
+            if os.path.normcase(os.path.basename(row[2])) == base and size == wanted:
+                sized.append(row)
+        guids = {row[1] for row in sized}
+        if len(guids) == 1:
+            return "hit", next(iter(guids))
+        if len(guids) > 1:
+            return "ambiguous", None
+    return "miss", None
+
+
+def _guid_by_exact_tags(con: sqlite3.Connection, title: str, artist: str, album: str) -> "str | None":
+    """精确标题+歌手，专辑非空时再收紧；精确失败后做一次大小写不敏感兜底。"""
+    for nocase in (False, True):
+        collate = " COLLATE NOCASE" if nocase else ""
+        sql = (
+            "SELECT t.guid FROM track t "
+            "JOIN track_artist ta ON ta.track_id = t.id "
+            "JOIN artist a ON a.id = ta.artist_id "
+            f"WHERE t.title = ?{collate} AND a.name = ?{collate}"
+        )
+        params: list = [title, artist]
+        if album:
+            sql += (
+                " AND EXISTS (SELECT 1 FROM album al"
+                f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+            )
+            params.append(album)
+        sql += " ORDER BY t.id DESC LIMIT 1"
+        try:
+            row = con.execute(sql, params).fetchone()
+        except sqlite3.Error as exc:
+            logger.debug("official bind tag query failed: %s", type(exc).__name__)
+            return None
+        if row and row[0]:
+            return str(row[0])
+    return None
+
+
+def _guid_by_normalized_tags(con: sqlite3.Connection, title: str, artist: str, album: str) -> "str | None":
+    """没有落盘路径时的兜底：规范化歌名和完整歌手集合，专辑只作优先。
+
+    标题+歌手对应多首且专辑对不上时不猜，避免把另一首同名曲写进歌单。
+    官方库缺 audio_file / 软删除列时返回 None，由精确标签路径负责精简库。
+    """
+    try:
+        from . import localmatch
+    except ImportError:
+        import localmatch
+    needle_title = localmatch.title_key(title)
+    needle_artists = localmatch.split_artist_set(artist)
+    if not needle_title or not needle_artists:
+        return None
+    try:
+        con.create_function("local_title", 1, localmatch.title_key, deterministic=True)
+        rows = con.execute(localmatch._CANDIDATE_SQL, (needle_title,)).fetchall()
+    except sqlite3.Error as exc:
+        logger.debug("official bind normalized lookup unavailable: %s", type(exc).__name__)
+        return None
+    album_norm = localmatch.normalize_text(album)
+    verified = []
+    for row in rows:
+        if localmatch.title_key(row[2] or "") != needle_title:
+            continue
+        if localmatch.split_artist_set(row[8] or "") != needle_artists:
+            continue
+        path = str(row[4] or "")
+        try:
+            if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                continue
+        except OSError:
+            continue
+        verified.append((int(row[0] or 0), str(row[1] or ""), str(row[7] or "")))
+    if not verified:
+        return None
+    same_album = [
+        item for item in verified
+        if album_norm and localmatch.normalize_text(item[2]) == album_norm
+    ]
+    pool = same_album or verified
+    guids = {item[1] for item in pool if item[1]}
+    if not same_album and len(guids) != 1:
+        return None
+    if not guids:
+        return None
+    pool.sort(key=lambda item: item[0])
+    return pool[-1][1] or None
+
+
+def _lookup_official_track_guid(title: str, artist: str, album: str = "",
+                                dest: str = "") -> "tuple[str | None, str]":
+    """只读反查官方 guid。返回 (guid, reason)；命中时 reason 为空。"""
+    db = str(CONF.get("music_db") or "")
+    if not db:
+        return None, "no-db"
     title_s = (title or "").strip()
     artist_s = (artist or "").strip()
     album_s = (album or "").strip()
-    if not title_s or not artist_s:
-        return None
-    db = str(CONF.get("music_db") or "")
-    if not db or not os.path.exists(db):
-        return None
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    except Exception as e:
-        logger.warning("Official bind db open failed: %s", e)
-        return None
-    try:
-        for nocase in (False, True):
-            collate = " COLLATE NOCASE" if nocase else ""
-            sql = (
-                "SELECT t.guid FROM track t "
-                "JOIN track_artist ta ON ta.track_id = t.id "
-                "JOIN artist a ON a.id = ta.artist_id "
-                f"WHERE t.title = ?{collate} AND a.name = ?{collate}"
-            )
-            params: list = [title_s, artist_s]
-            if album_s:
-                sql += (
-                    " AND EXISTS (SELECT 1 FROM album al"
-                    f" WHERE al.id = t.album_id AND al.name = ?{collate})"
-                )
-                params.append(album_s)
-            sql += " ORDER BY t.id DESC LIMIT 1"
-            try:
-                row = con.execute(sql, params).fetchone()
-            except Exception as e:
-                logger.warning("Official bind db query failed: %s", e)
-                return None
-            if row and row[0]:
-                return str(row[0])
-        return None
-    finally:
-        con.close()
+    dest_s = (dest or "").strip()
+    with _musicdb_privileged_read():
+        con = _open_music_db(db)
+        if con is None:
+            return None, "db-open"
+        try:
+            if dest_s:
+                status, guid = _guid_by_saved_path(con, dest_s)
+                if status == "hit":
+                    return guid, ""
+                if status == "ambiguous":
+                    return None, "path-ambiguous"
+                if status == "miss":
+                    return None, "path-not-indexed"
+            if not title_s or not artist_s:
+                return None, "no-metadata"
+            exact = _guid_by_exact_tags(con, title_s, artist_s, album_s)
+            if exact:
+                return exact, ""
+            normalized = _guid_by_normalized_tags(con, title_s, artist_s, album_s)
+            if normalized:
+                return normalized, ""
+            return None, "no-tag-match"
+        finally:
+            con.close()
+
+
+def official_track_guid_by_tags(title: str, artist: str, album: str = "",
+                                dest: str = "") -> "str | None":
+    """只读官方 music.db，解析这次绑定要写入歌单/收藏的官方 guid。
+
+    已知落盘路径时只认这个文件（路径相等、realpath/samefile，或唯一的
+    同名同大小），不拿另一首同名曲凑数。路径列不可用时才退回标签：
+    先精确匹配，再按规范化歌名和歌手集合兜底。整个打开和查询都在 root
+    只读租约内，避免降权后 exists()/直连把权限拒绝当成库不存在。
+    """
+    guid, _reason = _lookup_official_track_guid(title, artist, album, dest)
+    return guid
 
 
 def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | None":
     """按标签在官方 music.db 反查曲库文件路径（audio_file.path，最新优先）。
 
-    find_cache_file 的兜底数据源：与 official_track_guid_by_tags 同款两遍
-    精确/NOCASE 查询，但取 a.path 且逐行校验文件确实存在（官方库里的
-    悬空记录不算命中）。
+    find_cache_file 的兜底数据源：精确/NOCASE 两遍查询，取 a.path 且逐行
+    校验文件确实存在（官方库里的悬空记录不算命中）。打开和查询处于 root
+    只读租约内，不在租约外用 exists() 判断库是否可读。
     """
     title_s = (title or "").strip()
     artist_s = (artist or "").strip()
@@ -8255,43 +8570,43 @@ def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | Non
     if not title_s or not artist_s:
         return None
     db = str(CONF.get("music_db") or "")
-    if not db or not os.path.exists(db):
+    if not db:
         return None
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    except Exception as e:
-        logger.warning("Library tags lookup db open failed: %s", e)
-        return None
-    try:
-        for nocase in (False, True):
-            collate = " COLLATE NOCASE" if nocase else ""
-            sql = (
-                "SELECT a.path FROM track t "
-                "JOIN audio_file a ON a.id = t.audio_file_id "
-                "JOIN track_artist ta ON ta.track_id = t.id "
-                "JOIN artist ar ON ar.id = ta.artist_id "
-                f"WHERE t.title = ?{collate} AND ar.name = ?{collate}"
-            )
-            params: list = [title_s, artist_s]
-            if album_s:
-                sql += (
-                    " AND EXISTS (SELECT 1 FROM album al"
-                    f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+    with _musicdb_privileged_read():
+        con = _open_music_db(db)
+        if con is None:
+            logger.warning("Library tags lookup db open failed")
+            return None
+        try:
+            for nocase in (False, True):
+                collate = " COLLATE NOCASE" if nocase else ""
+                sql = (
+                    "SELECT a.path FROM track t "
+                    "JOIN audio_file a ON a.id = t.audio_file_id "
+                    "JOIN track_artist ta ON ta.track_id = t.id "
+                    "JOIN artist ar ON ar.id = ta.artist_id "
+                    f"WHERE t.title = ?{collate} AND ar.name = ?{collate}"
                 )
-                params.append(album_s)
-            sql += " ORDER BY t.id DESC"
-            try:
-                rows = con.execute(sql, params).fetchall()
-            except Exception as e:
-                logger.warning("Library tags lookup query failed: %s", e)
-                return None
-            for row in rows:
-                path = str(row[0] or "").strip()
-                if path and os.path.isfile(path) and os.path.getsize(path) > 0:
-                    return path
-        return None
-    finally:
-        con.close()
+                params: list = [title_s, artist_s]
+                if album_s:
+                    sql += (
+                        " AND EXISTS (SELECT 1 FROM album al"
+                        f" WHERE al.id = t.album_id AND al.name = ?{collate})"
+                    )
+                    params.append(album_s)
+                sql += " ORDER BY t.id DESC"
+                try:
+                    rows = con.execute(sql, params).fetchall()
+                except sqlite3.Error as exc:
+                    logger.warning("Library tags lookup query failed: %s", type(exc).__name__)
+                    return None
+                for row in rows:
+                    path = str(row[0] or "").strip()
+                    if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                        return path
+            return None
+        finally:
+            con.close()
 
 
 async def _official_upstream_write(method: str, path: str, headers: dict, payload: dict) -> bool:
@@ -8367,6 +8682,17 @@ async def _remove_plt_bound(playlist_guid: str, guid: str, user_guid: str) -> bo
             return False
 
 
+def _bind_file_dest(guid: str, meta: "dict | None") -> str:
+    """本次应绑定的曲库文件。滚动试听缓存不能当成已扫描的曲库文件。"""
+    dest = str((meta or {}).get("dest") or "").strip()
+    if dest and not _is_rolling_cache_stem(dest, guid):
+        return dest
+    cached = find_cache_file(guid)
+    if cached and not _is_rolling_cache_stem(cached, guid):
+        return cached
+    return ""
+
+
 def _dispatch_official_binding(guid: str, headers: "dict | None", meta: "dict | None") -> None:
     """下载落库完成后调度官方绑定：逐用户去重起任务；无意图时零开销。"""
     if not CONF.get("fav_auto_bind"):
@@ -8400,13 +8726,14 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     title = str((meta or {}).get("title") or "")
     artist = str((meta or {}).get("artist") or "")
     album = str((meta or {}).get("album") or "")
+    dest = _bind_file_dest(guid, meta)
     if not (title.strip() and artist.strip()):
         snap = _lookup_online_snapshot(guid)
         snap = _snapshot_to_info(snap) if isinstance(snap, dict) and snap else {}
         title = title.strip() or str(snap.get("title") or "")
         artist = artist.strip() or str(snap.get("artist") or "")
         album = album.strip() or str(snap.get("album") or "")
-    if not (title.strip() and artist.strip()):
+    if not dest and not (title.strip() and artist.strip()):
         logger.info("Official bind skip for %s: no usable metadata", guid)
         return
     # 官方只认曲库内 guid：等待官方把刚落盘文件扫入库（只读轮询，绝不写官方库）
@@ -8416,14 +8743,17 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     except (TypeError, ValueError):
         timeout_s = 120.0
     deadline = time.monotonic() + timeout_s
-    official_guid = await asyncio.to_thread(official_track_guid_by_tags, title, artist, album)
+    official_guid, reason = await asyncio.to_thread(
+        _lookup_official_track_guid, title, artist, album, dest)
     while not official_guid and time.monotonic() < deadline:
         await asyncio.sleep(_BIND_POLL_INTERVAL_S)
-        official_guid = await asyncio.to_thread(official_track_guid_by_tags, title, artist, album)
+        official_guid, reason = await asyncio.to_thread(
+            _lookup_official_track_guid, title, artist, album, dest)
     if not official_guid:
         logger.info(
-            "Official bind wait timeout for %s (%s - %s)：官方曲库尚未收录，保留本地映射待自愈重试",
-            guid, artist, title,
+            "Official bind wait timeout for %s path=%s title=%r artist=%r album=%r reason=%s："
+            "官方曲库尚未收录或未能唯一匹配，保留本地映射待自愈重试",
+            guid, dest, title, artist, album, reason,
         )
         return
     if intent.get("fav") and _fav_bind_pending(guid, user_guid):
@@ -8440,6 +8770,15 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
             )
     for playlist_guid in sorted(set(intent.get("playlists") or ())):
         if not _plt_bind_pending(playlist_guid, guid, user_guid):
+            continue
+        # issue #120：写官方前再次确认歌单意图可证实为用户显式保存；不可
+        # 证实的（官方自动播放列表存量意图）保持休眠，等用户显式收藏自愈。
+        if (await _playlist_download_intent(_synth_request(headers), user_guid, playlist_guid)
+                != PLAYLIST_INTENT_EXPLICIT_SAVE):
+            logger.info(
+                "Official playlist bind skip for %s -> %s: save intent not confirmable",
+                guid, playlist_guid,
+            )
             continue
         ok = await _official_upstream_write(
             "POST", "/music/api/v1/playlist/add-track", headers,
@@ -8638,13 +8977,15 @@ def _lookup_bind_any_user(raw_guid: str) -> "tuple[str, str, dict] | None":
     return None
 
 
-def _maybe_retry_official_binds(request: Request, user_guid: str,
-                                fav_items: "list[dict] | None" = None,
-                                plt_map: "dict[str, list[dict]] | None" = None) -> None:
+async def _maybe_retry_official_binds(request: Request, user_guid: str,
+                                      fav_items: "list[dict] | None" = None,
+                                      plt_map: "dict[str, list[dict]] | None" = None) -> None:
     """列表读取只恢复绑定意图及已有文件的绑定（用户级 60s 节流）。
 
     覆盖代理重启丢内存意图、官方迟扫入库、下载中断等场景；凭证头取当前请求，
-    绝不持久化。
+    绝不持久化。歌单（plt）意图恢复前必须通过 add-track 同款的意图判定
+    （issue #120）：无法证实为用户显式保存的歌单一律不恢复绑定意图，防止
+    升级前自动播放列表的存量 pending 继续触发绑定/转存；收藏意图不受影响。
     """
     if not CONF.get("fav_auto_bind") or not user_guid:
         return
@@ -8667,12 +9008,23 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
         return
     _bind_retry_last[user_guid] = now
     headers = copy_incoming_headers(request)
-    uniq = list(dict.fromkeys(fav_guids + [g for gs in plt_guids.values() for g in gs]))
     for guid in fav_guids[:_BIND_RETRY_BATCH]:
         _register_bind_intent(guid, user_guid, headers, None)
+    restored_playlists: list[str] = []
+    skipped_playlists = 0
     for playlist_guid, guids in plt_guids.items():
+        if (await _playlist_download_intent(request, user_guid, playlist_guid)
+                != PLAYLIST_INTENT_EXPLICIT_SAVE):
+            skipped_playlists += 1
+            continue
+        restored_playlists.append(playlist_guid)
         for guid in guids[:_BIND_RETRY_BATCH]:
             _register_bind_intent(guid, user_guid, headers, playlist_guid)
+    if skipped_playlists:
+        fn_diag(logger, "playlist_bind_retry_skipped", user=str(user_guid)[:40],
+                playlists=skipped_playlists, reason=PLAYLIST_INTENT_UNKNOWN)
+    uniq = list(dict.fromkeys(
+        fav_guids + [g for pl in restored_playlists for g in plt_guids[pl]]))
     for guid in uniq[:_BIND_RETRY_BATCH]:
         cached = find_cache_file(guid)
         if cached and _is_rolling_cache_stem(cached, guid):
@@ -9872,12 +10224,25 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                         cover_url = str(al.get("picUrl") or "") if isinstance(al, dict) else ""
                         dt = data.get("dt") or 0
                         duration_s = float(dt) / 1000.0 if dt else 0.0
-                        sq = data.get("sq")
-                        hr = data.get("hr")
-                        h = data.get("h") or {}
-                        ext = "flac" if (sq or hr) else "mp3"
-                        size_obj = sq or h or {}
-                        file_size = int(size_obj.get("size", 0) or 0) if isinstance(size_obj, dict) else 0
+                        # issue #116：格式与大小必须来自同一份「本次会下载的表示」，
+                        # 此前「有无损就报 flac」却优先取 sq 的字节数，下载档为
+                        # 有损时两者都对不上。
+                        privilege = data.get("privilege")
+                        try:
+                            maxbr = (int((privilege or {}).get("maxbr") or 0)
+                                     if isinstance(privilege, dict) else 0)
+                        except (TypeError, ValueError):
+                            maxbr = 0
+                        delivery = _netease_catalog_delivery({
+                            "qualities": _netease_raw_qualities(data),
+                            "maxbr": maxbr,
+                        })
+                        if delivery is not None:
+                            ext, file_size = delivery
+                        else:
+                            # 详情没有档位对象（旧形态）：退回「有无损即 flac」，大小未知
+                            ext = "flac" if (data.get("sq") or data.get("hr")) else "mp3"
+                            file_size = 0
 
                         lyric_text = ""
                         if include_lyric:
@@ -11079,7 +11444,7 @@ async def favorite_track_list(request: Request):
             fav_items = []
 
     # 列表读取只恢复绑定意图；已有文件可重试绑定，缺失文件不补下载。
-    _maybe_retry_official_binds(request, user_guid, fav_items=fav_items)
+    await _maybe_retry_official_binds(request, user_guid, fav_items=fav_items)
 
     # 官方真实条目作为结构模板：App 端解析严格，在线条目字段集需与官方对齐；
     # 旧数据存的快照也统一重建，避免历史遗留形状继续下发。
@@ -11371,6 +11736,34 @@ def _recommend_request_owned(user_guid: str, kind: str, guid: str) -> bool:
 # 分工：在线条目记本地 JSON（按用户分文件，桶键=官方歌单 guid），官方条目
 # 照旧透传官方；读取接口透传官方信封后合并下发。
 
+# === 歌单 add-track 的下载意图判定（issue #120） ===
+# 官方客户端在搜索后点播任意一首，会把整份搜索结果批量 add-track 进它自动
+# 创建的播放列表——该协议与用户显式"保存到歌单"完全同构；收藏自动绑定若照
+# 单全收，就会把没听过的歌全部下载进曲库（本地目录鱼龙混杂）。官方歌单
+# 元数据当前没有任何可取证字段能区分"自动播放列表"与"用户自建歌单"，按
+# fail-safe 处理：add-track 一律不触发收藏自动绑定的后台下载与官方绑定意图；
+# 歌单内容照常保存，显式收藏（favorite-track/create，单曲语义明确）与
+# 边听边存的播放保存链路不受影响。
+
+PLAYLIST_INTENT_EXPLICIT_SAVE = "explicit_save"
+PLAYLIST_INTENT_PLAYBACK_QUEUE = "playback_queue"
+PLAYLIST_INTENT_UNKNOWN = "unknown"
+
+
+async def _playlist_download_intent(request: Request, user_guid: str,
+                                    playlist_guid: str) -> str:
+    """判断一次歌单 add-track 是否可视为用户显式保存意图（issue #120）。
+
+    只接受协议层面可取证的判据（官方字段或显式操作标记）。当前没有任何已
+    确认的标记，一律返回 unknown——调用方必须按"不触发自动下载/绑定"处理，
+    绝不依据歌单名称、曲目数量、与搜索结果的重合度或请求先后时间猜测。
+    未来取得可靠判据时在此扩展：命中自动队列标记返回
+    PLAYLIST_INTENT_PLAYBACK_QUEUE，命中用户歌单标记返回
+    PLAYLIST_INTENT_EXPLICIT_SAVE；判定自身只做只读查询（如需读官方歌单
+    详情必须直连上游），绝不写任何状态。当前实现零 IO，调用方无需节流。
+    """
+    return PLAYLIST_INTENT_UNKNOWN
+
 _PLT_LOCK = asyncio.Lock()
 
 
@@ -11513,6 +11906,15 @@ async def playlist_add_track(request: Request):
 
     saved = False
     autobind = bool(CONF.get("fav_auto_bind"))
+    # issue #120：加入歌单只有被证实为用户显式保存才允许自动下载/绑定；
+    # 判定不可靠（unknown）时只保存歌单内容，绝不批量下载整份列表。
+    autobind_intent = False
+    if autobind:
+        autobind_intent = (await _playlist_download_intent(request, user_guid, playlist_guid)
+                           == PLAYLIST_INTENT_EXPLICIT_SAVE)
+        if not autobind_intent:
+            fn_diag(logger, "playlist_autodl_skipped", playlist=str(playlist_guid)[:40],
+                    tracks=len(online), reason=PLAYLIST_INTENT_UNKNOWN)
     async with _PLT_LOCK:
         try:
             items = load_playlist_tracks(user_guid)
@@ -11522,9 +11924,13 @@ async def playlist_add_track(request: Request):
                 if idx is not None:
                     bucket[idx]["addedAt"] = now
                     bucket[idx]["track"] = snapshots[g]
+                    # 重新加入视为新的绑定请求，与收藏的幂等更新一致（issue #117）；
+                    # 同样受显式保存意图门控（issue #120）
+                    if autobind_intent:
+                        bucket[idx]["bind"] = "pending"
                 else:
                     entry = {"guid": g, "addedAt": now, "track": snapshots[g]}
-                    if autobind:
+                    if autobind_intent:
                         entry["bind"] = "pending"
                     bucket.append(entry)
             save_playlist_tracks(user_guid, items)
@@ -11532,7 +11938,7 @@ async def playlist_add_track(request: Request):
         except Exception as e:
             logger.warning("Error updating playlist tracks for user %s: %s", user_guid, e)
 
-    if saved:
+    if saved and autobind_intent:
         for g in online:
             _register_fav_autobind(request, g, user_guid, playlist_guid=playlist_guid)
 
@@ -12014,7 +12420,7 @@ async def playlist_track_list(request: Request):
         if not extras:
             return JSONResponse(content=envelope, headers=headers)
         # 列表读取只对已有文件重试绑定，不补下载。
-        _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
+        await _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
 
         data = envelope.get("data")
         if not isinstance(data, dict):

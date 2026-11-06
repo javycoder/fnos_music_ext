@@ -35,15 +35,19 @@ def test_list_retry_never_downloads_across_batches(monkeypatch):
     monkeypatch.setattr(appmod, "_register_background_fetch", lambda *args: downloads.append(args))
     monkeypatch.setattr(appmod, "_dispatch_official_binding", lambda *args: bindings.append(args))
     monkeypatch.setattr(appmod, "find_cache_file", lambda guid: None)
+    import asyncio
+
     for iteration in range(4):
         appmod._bind_retry_last.clear()
-        appmod._maybe_retry_official_binds(request, "user-a", pending, {PL_CUSTOM: pending})
-        appmod._maybe_retry_official_binds(request, "user-b", pending)
+        # issue #120：歌单 pending 意图不可证实为显式保存，不恢复绑定意图
+        asyncio.run(appmod._maybe_retry_official_binds(request, "user-a", pending, {PL_CUSTOM: pending}))
+        asyncio.run(appmod._maybe_retry_official_binds(request, "user-b", pending))
     assert downloads == []
     assert bindings == []
+    # 只有收藏意图照旧恢复/派发（与歌单意图判定互不影响）
     monkeypatch.setattr(appmod, "find_cache_file", lambda guid: "/isolated/existing.mp3")
     appmod._bind_retry_last.clear()
-    appmod._maybe_retry_official_binds(request, "user-a", pending)
+    asyncio.run(appmod._maybe_retry_official_binds(request, "user-a", pending))
     assert len(bindings) == appmod._BIND_RETRY_BATCH
     assert downloads == []
 
@@ -204,7 +208,8 @@ def test_scenario3_fav_autobind_skips_when_cached(monkeypatch):
 
 
 def test_scenario4_playlist_add_track_registered_for_online_only(monkeypatch):
-    """场景 4：playlist/add-track 在线条目同样触发注册（官方/推荐歌单分支不触发）。"""
+    """场景 4：playlist/add-track 在线条目不再注册下载（issue #120：自动播放
+    列表与显式保存同协议无法区分）；推荐/官方分支照旧不触发。"""
     monkeypatch.setitem(CONF, "fav_auto_bind", True)
     recorded = []
 
@@ -214,7 +219,7 @@ def test_scenario4_playlist_add_track_registered_for_online_only(monkeypatch):
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
 
     with TestClient(app) as client:
-        # 分支 a：自建歌单添加在线歌曲 -> 触发注册
+        # 分支 a：自建歌单添加在线歌曲 -> 意图不可证实，不触发下载注册
         fake_guid = fake_official_guid(FAKE_KUWO1)
         resp = client.post(
             "/music/api/v1/playlist/add-track",
@@ -222,7 +227,10 @@ def test_scenario4_playlist_add_track_registered_for_online_only(monkeypatch):
         )
         assert resp.status_code == 200
         assert resp.json() == {"code": 0, "msg": "", "data": None}
-        assert recorded == [FAKE_KUWO1]
+        assert recorded == []
+        # 歌单内容本身照常保存
+        bucket = appmod.load_playlist_tracks("user-a")[PL_CUSTOM]
+        assert [it["guid"] for it in bucket] == [FAKE_KUWO1]
 
         recorded.clear()
 
@@ -299,3 +307,90 @@ def test_fav_autobind_hot_reload(tmp_path, monkeypatch):
     changed = apply_env_hot_reload(env_file)
     assert "fav_auto_bind" in changed
     assert CONF["fav_auto_bind"] is True
+
+
+# === issue #120：官方客户端把整份搜索结果批量 add-track 进自动创建的播放列表 ===
+# 该协议与用户显式"保存到歌单"完全同构且无从取证区分；修复后 add-track
+# 一律不触发自动下载/绑定意图（歌单内容照常保存），显式收藏不受影响。
+
+
+def test_issue120_playlist_batch_add_never_downloads(monkeypatch):
+    """批量 add-track 30 首（自动播放列表形态）→ 零下载注册、零绑定意图；
+    歌单条目照常落盘且不带 bind=pending。"""
+    monkeypatch.setitem(CONF, "fav_auto_bind", True)
+    recorded = []
+
+    async def fake_download(guid, headers):
+        recorded.append(guid)
+
+    monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
+
+    batch = [f"online:kuwo:{228908 + i}" for i in range(30)]
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/playlist/add-track",
+            json={"guid": PL_CUSTOM, "trackGUIDs": [fake_official_guid(g) for g in batch]},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"code": 0, "msg": "", "data": None}
+
+    assert recorded == []
+    assert appmod._full_fetch_tasks == {}
+    assert appmod._bind_pending == {}
+    bucket = appmod.load_playlist_tracks("user-a")[PL_CUSTOM]
+    assert [it["guid"] for it in bucket] == batch
+    assert all("bind" not in it for it in bucket)
+
+
+def test_issue120_explicit_save_intent_still_downloads(monkeypatch):
+    """意图判定证实为用户显式保存（可取证判据出现时的通路）→ 自动下载与
+    bind=pending 登记照旧；该通路只有判定函数返回 explicit_save 才启用。"""
+    monkeypatch.setitem(CONF, "fav_auto_bind", True)
+    recorded = []
+
+    async def fake_download(guid, headers):
+        recorded.append(guid)
+
+    monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
+
+    async def explicit_intent(request, user_guid, playlist_guid):
+        return appmod.PLAYLIST_INTENT_EXPLICIT_SAVE
+
+    monkeypatch.setattr(appmod, "_playlist_download_intent", explicit_intent)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/playlist/add-track",
+            json={"guid": PL_CUSTOM, "trackGUIDs": [fake_official_guid(FAKE_KUWO1)]},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"code": 0, "msg": "", "data": None}
+
+    assert recorded == [FAKE_KUWO1]
+    intent = appmod._bind_pending.get(FAKE_KUWO1, {}).get("user-a")
+    assert intent and PL_CUSTOM in intent["playlists"]
+    bucket = appmod.load_playlist_tracks("user-a")[PL_CUSTOM]
+    assert bucket[0]["bind"] == "pending"
+
+
+def test_issue120_favorite_create_unaffected(monkeypatch):
+    """显式收藏是单曲语义明确的操作：自动下载照旧，不受歌单意图判定影响。"""
+    monkeypatch.setitem(CONF, "fav_auto_bind", True)
+    monkeypatch.setitem(CONF, "tee_save_enabled", False)
+    recorded = []
+
+    async def fake_download(guid, headers):
+        recorded.append(guid)
+
+    monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/favorite-track/create",
+            json={"trackGUID": FAKE_KUWO1},
+            cookies={"music-token": "valid_token"},
+        )
+        assert resp.status_code == 200
+
+    assert recorded == [FAKE_KUWO1]
+    assert appmod._bind_pending.get(FAKE_KUWO1, {}).get("user-a", {}).get("fav") is True

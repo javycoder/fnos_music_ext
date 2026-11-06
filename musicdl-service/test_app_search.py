@@ -142,8 +142,7 @@ def clean_state(monkeypatch):
     monkeypatch.setattr(search_core, "probe_playable_sync", lambda url, headers: True)
     monkeypatch.setitem(app_module.CONF, "search_timeout", 4.0)
     monkeypatch.setitem(app_module.CONF, "adaptive_min_timeout", 1.0)
-    monkeypatch.setitem(app_module.CONF, "slow_grace_s", 1.0)
-    monkeypatch.setitem(app_module.CONF, "fast_return_items", 3)
+    monkeypatch.setitem(app_module.CONF, "concurrency", 3)
     monkeypatch.setitem(app_module.CONF, "slow_degrade_s", 2.0)
     app_module.SOURCE_BREAKER = SourceBreaker(
         failure_threshold=app_module.CONF["breaker_threshold"],
@@ -188,8 +187,12 @@ def test_normalize_startup_sources():
     assert norm([], registered) == ["KuwoMusicClient", "MiguMusicClient"]
 
 
-def test_fast_return_when_enough_results(clean_state, monkeypatch):
-    """快源返回足够结果后立即返回，不被慢源拖到全局超时。"""
+def test_slow_source_is_not_dropped_when_others_answered(clean_state, monkeypatch):
+    """issue #116：任一源先出结果后，其他站点仍按各自预算跑完，结果累加。
+
+    修复前一旦已有结果就把整体截止压到 slow_grace_s（默认 2 秒），而单站一页
+    要约 4 秒，于是勾选多站点只剩最快那一站的约 10 首。
+    """
     calls: dict = {}
     monkeypatch.setattr(
         search_core,
@@ -197,45 +200,46 @@ def test_fast_return_when_enough_results(clean_state, monkeypatch):
         _fake_search_factory(
             calls,
             {
-                "KuwoMusicClient": {"count": 5, "start": 1},
-                "MiguMusicClient": {"count": 5, "start": 100, "sleep": 30},
+                "KuwoMusicClient": {"count": 10, "start": 1},
+                "MiguMusicClient": {"count": 10, "start": 100, "sleep": 1.5},
             },
         ),
     )
 
     with TestClient(app_module.app) as client:
         t0 = time.monotonic()
-        resp = client.get("/search", params={"keyword": "hello", "limit": 5})
+        resp = client.get("/search", params={"keyword": "hello", "limit": 10})
         elapsed = time.monotonic() - t0
 
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is True
-    # kuwo 的 5 条结果都在
-    assert len(data["items"]) == 5
-    assert all(item["id"].startswith("kuwo:") for item in data["items"])
-    # 慢源被跳过并标记错误
-    assert "MiguMusicClient" in data["errors"]
-    assert "fast return" in data["errors"]["MiguMusicClient"]
-    # 远小于慢源 sleep / 全局超时
-    assert elapsed < 10
+    ids = [item["id"] for item in data["items"]]
+    # 两个站点的首屏都要在：按站累加，而不是被提前返回砍成一份
+    assert len(ids) == 20
+    assert sum(1 for i in ids if i.startswith("kuwo:")) == 10
+    assert sum(1 for i in ids if i.startswith("migu:")) == 10
+    assert data["errors"] == {}
+    # 慢源确实跑完了（没有被 fast return / slow grace 提前砍掉）
+    assert elapsed >= 1.5
     assert calls["KuwoMusicClient"] == 1
-    assert len(app_module.SEARCH_CACHE) == 0
+    assert calls["MiguMusicClient"] == 1
 
 
-def test_slow_grace_returns_partial_results(clean_state, monkeypatch):
-    """快源有结果但未达阈值时，慢源最多再等 slow_grace_s 秒。"""
+def test_source_stalled_beyond_deadline_is_skipped_not_failed(clean_state, monkeypatch):
+    """超出整体截止的源只记 skipped：已确认的歌保留，且不计熔断/不压自适应超时。"""
     monkeypatch.setattr(
         search_core,
         "search_one_source",
         _fake_search_factory(
             {},
             {
-                "KuwoMusicClient": {"count": 1, "start": 1},
+                "KuwoMusicClient": {"count": 2, "start": 1},
                 "MiguMusicClient": {"count": 5, "start": 100, "sleep": 30},
             },
         ),
     )
+    monkeypatch.setitem(app_module.CONF, "search_timeout", 1.0)
 
     with TestClient(app_module.app) as client:
         t0 = time.monotonic()
@@ -243,10 +247,16 @@ def test_slow_grace_returns_partial_results(clean_state, monkeypatch):
         elapsed = time.monotonic() - t0
 
     assert resp.status_code == 200
-    items = resp.json()["items"]
-    assert len(items) >= 1
-    # 1 秒宽限期 + 少量开销，远小于全局 4 秒超时或慢源的 30 秒
-    assert elapsed < 3.5
+    data = resp.json()
+    ids = [item["id"] for item in data["items"]]
+    assert sum(1 for i in ids if i.startswith("kuwo:")) == 2
+    assert "MiguMusicClient" in data["errors"]
+    assert "skipped (deadline)" in data["errors"]["MiguMusicClient"]
+    # 整体截止本身不算该源故障
+    assert app_module.SOURCE_BREAKER._failures.get("MiguMusicClient", 0) == 0
+    assert "MiguMusicClient" not in app_module.ADAPTIVE.stats()
+    # 只是等满整体截止（4 秒地板），不是等慢源的 30 秒
+    assert elapsed < 8
 
 
 def test_open_breaker_source_is_skipped(clean_state, monkeypatch):
@@ -274,7 +284,7 @@ def test_open_breaker_source_is_skipped(clean_state, monkeypatch):
 
 
 def test_timeout_shrinks_adaptively_after_failures(clean_state, monkeypatch):
-    """源超时后自适应收紧下一次超时。"""
+    """源自身预算耗尽才收紧自适应超时（整体截止不计为源故障）。"""
     calls: dict = {}
 
     def _always_slow(source: str, keyword: str, limit: int) -> list:
@@ -284,6 +294,8 @@ def test_timeout_shrinks_adaptively_after_failures(clean_state, monkeypatch):
         return []
 
     monkeypatch.setattr(search_core, "search_one_source", _always_slow)
+    # 单源预算 0.5s 远小于整体截止 4s：保证是源自己的超时先触发而不是被整体取消
+    monkeypatch.setattr(app_module, "ADAPTIVE", AdaptiveTimeout(0.5, 0.3))
 
     base = app_module.ADAPTIVE.timeout_for("MiguMusicClient")
     with TestClient(app_module.app) as client:
@@ -291,7 +303,7 @@ def test_timeout_shrinks_adaptively_after_failures(clean_state, monkeypatch):
     assert resp.status_code == 200
     after = app_module.ADAPTIVE.timeout_for("MiguMusicClient")
     assert after < base
-    assert after >= app_module.CONF["adaptive_min_timeout"]
+    assert after >= 0.3
     assert calls["MiguMusicClient"] == 1
 
 
@@ -557,8 +569,8 @@ def test_stalled_probe_hands_off_completed_results_only(clean_state, monkeypatch
     release = threading.Event()
     stalled = threading.Event()
     monkeypatch.setattr(app_module, "ADAPTIVE", AdaptiveTimeout(1 if grace else 0.08, 0.08))
-    monkeypatch.setitem(app_module.CONF, "slow_grace_s", 0.04)
-    monkeypatch.setitem(app_module.CONF, "fast_return_items", 99)
+    # 每个源都完整参与聚合（issue #116 去掉了 fast return / slow grace 提前收口）
+    monkeypatch.setitem(app_module.CONF, "concurrency", 2)
     def search(source, *args):
         if source == "MiguMusicClient":
             assert stalled.wait(1)
@@ -1000,7 +1012,8 @@ def test_refresh_payload_includes_canonical_source_and_parent_cache(clean_state,
     assert entry["download_headers"] == {"X-Test": "value"}
 
 
-def test_grace_skipped_source_is_not_breaker_failure(clean_state, monkeypatch):
+def test_deadline_skipped_source_is_not_breaker_failure(clean_state, monkeypatch):
+    """issue #116：整体截止时没跑完的源只记 skipped，不计熔断、不压自适应超时。"""
     class Boundary:
         async def run(self, source, payload, **kwargs):
             if source == "MiguMusicClient":
@@ -1008,10 +1021,9 @@ def test_grace_skipped_source_is_not_breaker_failure(clean_state, monkeypatch):
             kwargs["on_entry"]([search_core.normalize(_FakeSong(1, source), "keyword"), {}, ""])
             return {"partial": False}
     monkeypatch.setattr(app_module, "SOURCE_WORKERS", Boundary())
-    monkeypatch.setitem(app_module.CONF, "slow_grace_s", .01)
     async def main():
         result = await app_module.search(keyword="grace", limit=1, sources="kuwo,migu")
-        assert "grace" in result["errors"]["MiguMusicClient"]
+        assert "skipped (deadline)" in result["errors"]["MiguMusicClient"]
         assert app_module.SOURCE_BREAKER._failures.get("MiguMusicClient", 0) == 0
         assert "MiguMusicClient" not in app_module.ADAPTIVE.stats()
     asyncio.run(main())

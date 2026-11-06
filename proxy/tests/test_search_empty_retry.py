@@ -306,6 +306,42 @@ async def test_retry_uses_original_deadline(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_musicdl_partial_errors_keep_items_and_skip_retry(monkeypatch):
+    """issue #116：MusicDL 部分站点报错时，已收回的条目必须保留。
+
+    单站失败被隔离后 MusicDL 会带 errors 返回其余站点的结果；代理不能因此把
+    这一轮当成「整轮空结果」而重新搜一遍，更不能丢掉已经有歌的列表。
+    """
+    calls = {"musicdl": 0}
+
+    async def fake_mdl(client, keyword, limit, sources=None):
+        calls["musicdl"] += 1
+        return {
+            "items": [{"id": "kuwo:200", "title": "晴天", "artist": "周杰伦"},
+                      {"id": "migu:201", "title": "晴天", "artist": "周杰伦"}],
+            "errors": {"BilibiliMusicClient": "skipped (deadline)"},
+        }
+
+    async def empty_mb(client, keyword, limit):
+        return []
+
+    async def empty_lx(client, keyword, limit, sources=None):
+        return []
+
+    monkeypatch.setattr("proxy.app.fetch_musicbox_search", empty_mb)
+    monkeypatch.setattr("proxy.app.fetch_musicdl_search", fake_mdl)
+    monkeypatch.setattr("proxy.app.fetch_lx_search", empty_lx)
+
+    entry = {"items": [], "pages": {}, "cursor": 0, "ts": 0}
+    await _aggregate_search(_DummyReq(), "晴天", entry)
+
+    ids = {it["id"] for it in entry["items"]}
+    assert {"kuwo:200", "migu:201"} <= ids
+    assert calls["musicdl"] == 1
+    assert entry["partial"] is True
+
+
+@pytest.mark.anyio
 async def test_musicdl_fetch_does_not_retry_inside_gate():
     import httpx
     import proxy.app as p
