@@ -13337,6 +13337,73 @@ async def play_history_delete(request: Request):
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
+@app.post("/music/api/v1/folder-view/delete")
+async def folder_view_delete(request: Request):
+    """官方曲库删除与当前用户在线收藏/历史分流；不删除在线音频文件。"""
+    client = get_upstream_client(request.app)
+    raw_body = await request.body()
+    if len(raw_body) > 1024 * 1024:
+        return JSONResponse({"code": -1, "msg": "请求过大", "data": None}, status_code=413)
+    try:
+        body = json.loads(raw_body)
+    except (ValueError, UnicodeError):
+        return await forward_to_upstream(request, client)
+    if not isinstance(body, dict):
+        return await forward_to_upstream(request, client)
+    tracks = body.get("trackGUIDs", [])
+    folders = body.get("folderPaths", [])
+    if (not isinstance(tracks, list) or len(tracks) > 1000
+            or any(not isinstance(g, str) or not g.strip() for g in tracks)
+            or not isinstance(folders, list) or len(folders) > 1000
+            or any(not isinstance(path, str) for path in folders)
+            or not isinstance(body.get("isPermanent"), bool)):
+        return JSONResponse({"code": -1, "msg": "删除请求无效", "data": None}, status_code=400)
+    resolved = [(g, resolve_real_guid(g.strip())) for g in tracks]
+    online = {real for _, real in resolved if is_online_guid(real)}
+    if not online:
+        return await forward_to_upstream(request, client)
+
+    # 普通的 _probe_upstream_auth 允许异常降级 shared，不适用于删除。
+    try:
+        probe = await client.get("/music/api/v1/user/me", headers=copy_incoming_headers(request))
+        result = probe.json()
+        data = result.get("data") if isinstance(result, dict) else None
+        if (probe.status_code != 200 or result.get("code") != 0 or not isinstance(data, dict)
+                or data.get("role") != "admin" or not isinstance(data.get("guid"), str)
+                or not data["guid"].strip() or data["guid"].strip() == "shared"):
+            return JSONResponse({"code": -1, "msg": "需要管理员身份才能删除", "data": None}, status_code=403)
+        user_guid = data["guid"].strip()
+    except Exception:
+        return JSONResponse({"code": -1, "msg": "无法确认管理员身份", "data": None}, status_code=503)
+
+    official = [raw for raw, real in resolved if not is_online_guid(real)]
+    if official or folders:
+        forwarded = dict(body, trackGUIDs=official)
+        try:
+            upstream = await client.post(str(request.url.path) + ("?" + request.url.query if request.url.query else ""),
+                                         headers=copy_incoming_headers(request), json=forwarded)
+            payload = upstream.json()
+        except Exception:
+            return JSONResponse({"code": -1, "msg": "官方删除结果未知；在线数据未更改", "data": None}, status_code=502)
+        headers = filter_headers(upstream.headers, exclude_keys={"content-length", "content-encoding"})
+        if upstream.status_code != 200 or not isinstance(payload, dict) or payload.get("code") != 0:
+            return Response(content=upstream.content, status_code=upstream.status_code,
+                            headers=headers, media_type=upstream.headers.get("content-type"))
+
+    # 两个存储各自原子写；失败后明确报告可重试，不声称全量成功。
+    async with _FAV_LOCK:
+        favorites = load_online_favorites(user_guid)
+        kept = [row for row in favorites if not isinstance(row, dict) or row.get("guid") not in online]
+        if len(kept) != len(favorites) and not save_online_favorites(user_guid, kept):
+            return JSONResponse({"code": -1, "msg": "官方部分可能已删除，在线收藏清理失败；可重试", "data": None})
+    async with _HISTORY_LOCK:
+        history = dailyrec.load_online_play_history(user_guid)
+        kept_history = [row for row in history if row.get("guid") not in online]
+        if len(kept_history) != len(history) and not dailyrec.save_online_play_history(user_guid, kept_history):
+            return JSONResponse({"code": -1, "msg": "部分内容已删除，在线历史清理失败；可重试", "data": None})
+    return JSONResponse({"code": 0, "msg": "", "data": None})
+
+
 @app.post("/music/api/v1/shared-library/create")
 @app.post("/music/api/v1/shared-library/edit")
 @app.post("/music/api/v1/shared-library/delete")
