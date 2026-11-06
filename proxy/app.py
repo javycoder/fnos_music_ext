@@ -48,6 +48,7 @@ try:
     from .direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
     from . import localrecommend as localrec
     from . import localmatch
+    from . import music_compat
     from .organize import target_dir as layout_target_dir, safe_part as safe_layout_part
     from .organize import _ensure_target_dir as ensure_layout_dir
     from .media_url import hostname_for_log, validate_media_url
@@ -65,6 +66,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
+    import music_compat  # type: ignore
     from organize import target_dir as layout_target_dir, safe_part as safe_layout_part
     from organize import _ensure_target_dir as ensure_layout_dir
     from media_url import hostname_for_log, validate_media_url  # type: ignore
@@ -5684,8 +5686,12 @@ async def search_track(request: Request):
         page = 1
 
     size_str = request.query_params.get("size")
+    default_size = 50
+    if "page" not in request.query_params and "size" not in request.query_params:
+        if music_compat.supports_search_default_100():
+            default_size = 100
     try:
-        size = int(size_str) if size_str else 50
+        size = int(size_str) if size_str else default_size
     except (TypeError, ValueError):
         size = 50
     if size < 1:
