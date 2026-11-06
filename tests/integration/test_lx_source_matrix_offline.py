@@ -35,6 +35,19 @@ if str(INTEGRATION_DIR) not in sys.path:
 import lx_source_matrix as sm
 
 
+def test_generated_worker_writes_valid_lxserver_config(tmp_path):
+    code = sm.generate_worker_script("ephemeral-token")
+    location = (tmp_path / "lxserver").as_posix()
+    namespace = {"__name__": "isolated_worker_test"}
+    exec(compile(code.replace("/data/lxserver", location), "<worker>", "exec"), namespace)
+    namespace["write_lxserver_config"]()
+    config = (tmp_path / "lxserver" / "config.js").read_text(encoding="utf-8")
+    assert 'module.exports = {' in config
+    assert '"system.allowUnsafeVM": false' in config
+    assert '"frontend.password": "ephemeral-token"' in config
+    assert config.rstrip().endswith('};')
+
+
 # ==============================================================================
 # 1. CLI 参数与默认安全拦截测试
 # ==============================================================================

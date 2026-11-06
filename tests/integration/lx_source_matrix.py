@@ -640,7 +640,7 @@ def write_lxserver_config():
     os.makedirs(f"{{cfg_dir}}/backups", exist_ok=True)
     os.makedirs(f"{{cfg_dir}}/users/source/_open", exist_ok=True)
     cfg_file = f"{{cfg_dir}}/config.js"
-    cfg_code = f"""module.exports = {{
+    cfg_code = f"""module.exports = {{{{
   serverName: "fnmusic-lxserver",
   bindIP: "127.0.0.1",
   port: {{PORT}},
@@ -649,7 +649,7 @@ def write_lxserver_config():
   "subsonic.enable": false,
   "webdav.enable": false,
   "system.allowUnsafeVM": false
-}};
+}}}};
 """
     with open(cfg_file, "w", encoding="utf-8") as f:
         f.write(cfg_code)
