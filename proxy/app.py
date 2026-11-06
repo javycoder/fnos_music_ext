@@ -3368,6 +3368,8 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
     params: dict[str, Any] = {"keyword": keyword, "limit": limit, "type": "song"}
     if offset > 0:
         params["offset"] = offset
+    # 整页共用同一个下载目标档：展示格式/大小要与实际下载一致（issue #116）
+    delivery_target = _netease_delivery_target()
     try:
         r = await client.get(
             "/api/v1/search",
@@ -3411,6 +3413,8 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                 "album": album,
                 "duration_s": duration_s,
                 "ext": ext,
+                # /songs/detail 补全后按实际下载档覆盖；无详情时保持 0 表示未知
+                "file_size": 0,
                 # 主接口被风控走 web 兜底时行内自带封面；正常路径仍由 /songs/detail 补全覆盖
                 "cover_url": str(it.get("album_pic_url") or it.get("cover_url") or ""),
                 "lyric": "",
@@ -3442,7 +3446,14 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                                     pic_url = str(d_info.get("album_pic_url") or "")
                                     if pic_url:
                                         item["cover_url"] = pic_url
-                                    if d_info.get("has_sq") or d_info.get("has_hr"):
+                                    # issue #116：展示格式与大小取自「本次会下载的
+                                    # 表示」，而不是曲库里有没有无损——后者在账号
+                                    # 无权益或下载档为有损时与落盘格式矛盾。
+                                    display = _netease_catalog_delivery(d_info, delivery_target)
+                                    if display is not None:
+                                        item["ext"], item["file_size"] = display
+                                    elif d_info.get("has_sq") or d_info.get("has_hr"):
+                                        # 详情没有档位声明（旧服务）：退回原启发式
                                         item["ext"] = "flac"
             except Exception as detail_err:
                 logger.warning("Failed to fetch songs detail for %s: %s", keyword, detail_err)
@@ -3620,6 +3631,101 @@ def _ext_from_netease_media(inner: dict) -> "str | None":
     if level in ("standard", "higher", "exhigh", "mp3"):
         return "mp3"
     return None
+
+
+# issue #116：档位名义码率，只用于按账号 privilege.maxbr 判断该档是否可用；
+# 无损及以上无法从码率区分，统一按「高于 320k」对待。
+_NETEASE_TIER_NOMINAL_BR = {
+    "standard": 128000, "higher": 192000, "exhigh": 320000,
+    "lossless": 999000, "hires": 999000, "jymaster": 999000, "sky": 999000,
+}
+# 与 musicbox_service.netease_ext._QUALITY_SLOTS 同构。/song/{id}/info 返回 weapi
+# 原始对象（字段仍是 l/m/h/sq/hr），不能直接复用已映射的搜索行。
+_NETEASE_RAW_QUALITY_SLOTS = (
+    ("l", "standard", "mp3", 128000),
+    ("m", "higher", "mp3", 192000),
+    ("h", "exhigh", "mp3", 320000),
+    ("sq", "lossless", "flac", 999000),
+    ("hr", "hires", "flac", 999000),
+)
+
+
+def _netease_raw_qualities(raw: dict | None) -> dict[str, dict]:
+    """weapi 原始详情对象 → 与搜索行同构的 qualities。"""
+    out: dict[str, dict] = {}
+    src = raw if isinstance(raw, dict) else {}
+    for field, tier, ext, nominal_br in _NETEASE_RAW_QUALITY_SLOTS:
+        slot = src.get(field)
+        if not isinstance(slot, dict) or not slot:
+            continue
+        try:
+            size = int(slot.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        try:
+            br = int(slot.get("br") or 0)
+        except (TypeError, ValueError):
+            br = 0
+        out[tier] = {"ext": ext, "file_size": max(0, size), "br": br or nominal_br}
+    return out
+
+
+def _netease_delivery_target() -> str:
+    """搜索展示用的网易目标档：与下载任务同一套规则（app 跟随播放档）。"""
+    target = effective_download_quality_conf()
+    if str(target or "").strip().lower() == "app":
+        return effective_play_quality_conf()
+    return qp.normalize_quality(target, default="lossless")
+
+
+def _netease_delivery_of(entry: dict) -> tuple[str, int]:
+    """把某个档位的元数据投影成 (容器, 字节数)；大小缺失记 0（未知）。"""
+    ext = str(entry.get("ext") or "").strip().lower() or "mp3"
+    try:
+        size = int(entry.get("file_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return ext, max(0, size)
+
+
+def _netease_catalog_delivery(detail: dict | None,
+                              target: str | None = None) -> tuple[str, int] | None:
+    """按目标档从曲目各档元数据里挑出「本次会下载的表示」→ (ext, file_size)。
+
+    issue #116：搜索列表此前一律按「曲库有没有 SQ/HR」标 flac，实际下载走
+    下载档，无损无权限时还会降成 mp3，于是列表格式和落盘格式对不上。这里改为
+    「当前下载配置 + 曲目自身声明的档位」推导，详情面板与搜索列表共用同一判据。
+
+    返回 None 表示这份详情没有任何可用档位声明（旧服务/详情缺字段）：调用方
+    必须保留自己原有的启发式，不能凭空把有损曲目标成 flac。搜索阶段不取链，
+    账号权益导致的二次降级只有取链才知道，这里不猜；一个可选档都没有时也不按
+    名义码率估算字节数。
+    """
+    tier = qp.normalize_quality(
+        target if target is not None else _netease_delivery_target(), default="lossless")
+    src = detail if isinstance(detail, dict) else {}
+    qualities = src.get("qualities")
+    qualities = qualities if isinstance(qualities, dict) else {}
+    try:
+        maxbr = int(src.get("maxbr") or 0)
+    except (TypeError, ValueError):
+        maxbr = 0
+    usable: dict[str, dict] = {}
+    for level, entry in qualities.items():
+        if not isinstance(entry, dict) or level not in qp.QUALITY_LEVELS:
+            continue
+        # 账号对该曲的最高码率低于该档名义码率时，取链必然降级，展示也不能按它算
+        if maxbr > 0 and _NETEASE_TIER_NOMINAL_BR.get(level, 0) > maxbr:
+            continue
+        usable[level] = entry
+    if not usable:
+        return None
+    for level in qp.quality_ladder(tier):
+        if level in usable:
+            return _netease_delivery_of(usable[level])
+    # 目标档及以下都没有可选档：按声明里最高的那一档降级交付
+    best = max(usable, key=lambda lv: qp.QUALITY_LEVELS.index(lv))
+    return _netease_delivery_of(usable[best])
 
 
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, fresh: bool = False,
@@ -10118,12 +10224,25 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                         cover_url = str(al.get("picUrl") or "") if isinstance(al, dict) else ""
                         dt = data.get("dt") or 0
                         duration_s = float(dt) / 1000.0 if dt else 0.0
-                        sq = data.get("sq")
-                        hr = data.get("hr")
-                        h = data.get("h") or {}
-                        ext = "flac" if (sq or hr) else "mp3"
-                        size_obj = sq or h or {}
-                        file_size = int(size_obj.get("size", 0) or 0) if isinstance(size_obj, dict) else 0
+                        # issue #116：格式与大小必须来自同一份「本次会下载的表示」，
+                        # 此前「有无损就报 flac」却优先取 sq 的字节数，下载档为
+                        # 有损时两者都对不上。
+                        privilege = data.get("privilege")
+                        try:
+                            maxbr = (int((privilege or {}).get("maxbr") or 0)
+                                     if isinstance(privilege, dict) else 0)
+                        except (TypeError, ValueError):
+                            maxbr = 0
+                        delivery = _netease_catalog_delivery({
+                            "qualities": _netease_raw_qualities(data),
+                            "maxbr": maxbr,
+                        })
+                        if delivery is not None:
+                            ext, file_size = delivery
+                        else:
+                            # 详情没有档位对象（旧形态）：退回「有无损即 flac」，大小未知
+                            ext = "flac" if (data.get("sq") or data.get("hr")) else "mp3"
+                            file_size = 0
 
                         lyric_text = ""
                         if include_lyric:

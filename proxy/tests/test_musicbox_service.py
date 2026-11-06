@@ -604,6 +604,34 @@ def test_search_web_fallback_row_carries_album_cover(monkeypatch):
     assert rows[0]["album_name"] == "叶惠美"
 
 
+def test_song_detail_carries_quality_sizes_for_search_card():
+    """issue #116：各档真实 size/br 随详情行下发，搜索行才有文件大小可显示。"""
+    row = netease_ext._map_song_detail({
+        "id": 186016, "name": "七里香", "ar": [{"name": "周杰伦"}],
+        "al": {"name": "七里香", "picUrl": "http://img.test/x.jpg"},
+        "dt": 299000, "fee": 1,
+        "h": {"size": 9000000, "br": 320000},
+        "sq": {"size": 25000000, "br": 999000},
+        "privilege": {"maxbr": 320000},
+    })
+    assert row["has_sq"] is True
+    assert row["qualities"]["exhigh"] == {"ext": "mp3", "file_size": 9000000, "br": 320000}
+    assert row["qualities"]["lossless"] == {"ext": "flac", "file_size": 25000000, "br": 999000}
+    # 未提供的档位不凭空造 size
+    assert "standard" not in row["qualities"]
+    assert row["maxbr"] == 320000
+
+
+def test_song_detail_quality_size_missing_stays_unknown():
+    """缺 size 记 0（未知），不按名义码率估算字节数。"""
+    row = netease_ext._map_song_detail({
+        "id": 1, "name": "x", "sq": {"br": 999000}, "privilege": {},
+    })
+    assert row["qualities"]["lossless"]["file_size"] == 0
+    assert row["qualities"]["lossless"]["br"] == 999000
+    assert row["maxbr"] == 0
+
+
 def test_song_lyric_ok_and_upstream_error(monkeypatch):
     import netease_ext
 
