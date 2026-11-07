@@ -238,12 +238,18 @@ def parse_size_bytes(value: Any) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, (int, float)):
-        return max(0, int(value))
+        try:
+            return max(0, int(value))
+        except (ValueError, OverflowError):
+            return 0
     text = str(value or "").strip()
     if not text:
         return 0
     if text.isdigit():
-        return int(text)
+        try:
+            return int(text)
+        except ValueError:
+            return 0
     match = _SIZE_RE.match(text)
     if not match:
         return 0
@@ -252,7 +258,7 @@ def parse_size_bytes(value: Any) -> int:
         return 0
     try:
         return max(0, int(float(match.group(1).replace(",", ".")) * _SIZE_UNITS[unit]))
-    except ValueError:
+    except (ValueError, OverflowError):
         return 0
 
 

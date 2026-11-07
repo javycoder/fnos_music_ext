@@ -125,3 +125,23 @@ def test_favorite_write_failure_reports_error(state, monkeypatch):
         result = client.post("/music/api/v1/folder-view/delete", json={"folderPaths": [], "trackGUIDs": [state], "isPermanent": False})
     assert result.json()["code"] != 0
     assert len(recommend.load_online_play_history("u1")) == 2
+
+
+@pytest.mark.parametrize("corrupt", ["favorites", "history"])
+@pytest.mark.parametrize("bad_guid", [[], {}, None, 123, ""])
+def test_invalid_entry_guid_prevents_official_delete(state, corrupt, bad_guid):
+    import json
+    from pathlib import Path
+
+    path = (Path(p.user_fav_path("u1")) if corrupt == "favorites" else
+            Path(recommend.play_history_dir()) / "u1.json")
+    original = json.dumps({"items": [{"guid": bad_guid}]})
+    path.write_text(original, encoding="utf-8")
+    calls = []
+    with client_for(handler_for(calls)) as client:
+        result = client.post("/music/api/v1/folder-view/delete", json={
+            "folderPaths": [], "trackGUIDs": [state, "official-id"], "isPermanent": False,
+        })
+    assert result.json()["code"] != 0
+    assert path.read_text(encoding="utf-8") == original
+    assert [request.url.path for request in calls] == ["/music/api/v1/user/me"]

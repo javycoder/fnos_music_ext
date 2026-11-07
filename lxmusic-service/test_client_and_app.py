@@ -233,6 +233,19 @@ def test_parse_size_bytes():
     assert parse_size_bytes(True) == 0
 
 
+@pytest.mark.parametrize("value", [
+    float("inf"), float("-inf"), float("nan"), "9" * 400 + " MB", "²", "9" * 5000,
+], ids=["inf", "negative-inf", "nan", "overflow-unit", "unicode-digit", "oversized-integer"])
+def test_parse_size_bytes_ignores_nonfinite_values(value):
+    """单曲的异常大小不能中断整个搜索结果映射。"""
+    raw = {
+        "name": "海阔天空", "singer": "Beyond", "source": "kw", "songmid": "5886682",
+        "types": [{"type": "flac", "size": value}],
+    }
+    assert parse_size_bytes(value) == 0
+    assert map_lxserver_song(raw)["file_size"] == 0
+
+
 def test_map_lxserver_song_file_size_follows_display_container():
     """搜索行按当前展示的容器挑对应档位大小；取不到就是 0，不跨档借用。"""
     raw = {

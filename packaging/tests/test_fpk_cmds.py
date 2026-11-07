@@ -570,6 +570,21 @@ def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
         assert f'{name}/state.txt' in listing.splitlines()
     for name in state_files:
         assert name in listing.splitlines()
+    # 模拟应用中心替换 target 后再恢复，验证备份清单中的数据能真正读回。
+    for name in (*state_dirs, "sources-data", "play_history"):
+        shutil.rmtree(repo / name)
+    for name in (*state_files, ".env", ".env.bak.20260101000000"):
+        (repo / name).unlink()
+    restored = sb.run("upgrade_callback")
+    assert restored.returncode == 0, restored.stderr
+    assert (repo / ".env").read_text(encoding="utf-8") == "FNMUSIC_MUSICDL_ENABLED=true\n"
+    assert (repo / "sources-data" / "keep.txt").read_text(encoding="utf-8") == "data"
+    assert (repo / "play_history" / "u.json").read_text(encoding="utf-8") == "[]"
+    for name in state_dirs:
+        assert (repo / name / "state.txt").read_text(encoding="utf-8") == name
+    for name in state_files:
+        assert (repo / name).read_text(encoding="utf-8") == name
+    assert not backup.exists()
 
 
 def test_upgrade_init_tar_failure_aborts_and_cleans(sb):

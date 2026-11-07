@@ -1963,3 +1963,53 @@ def test_catalog_delivery_downgrades_to_best_declared_tier(monkeypatch):
     monkeypatch.setitem(CONF, "download_quality", "lossless")
     detail = {"qualities": {"exhigh": {"ext": "mp3", "file_size": 9000000}}, "maxbr": 0}
     assert _netease_catalog_delivery(detail) == ("mp3", 9000000)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("target,maxbr", [("standard", 999000), ("lossless", 128000)])
+async def test_search_does_not_restore_ineligible_lossless_metadata(monkeypatch, target, maxbr):
+    """声明存在但不满足目标或权益时，不能重新用 SQ 标记补回 FLAC。"""
+    monkeypatch.setitem(CONF, "download_quality", target)
+    detail = _netease_detail_row(
+        qualities={"lossless": {"ext": "flac", "file_size": 25000000}},
+        maxbr=maxbr,
+    )
+    items = await _search_items(_musicbox_with_detail(detail))
+    assert items[0]["ext"] == ""
+    assert items[0]["file_size"] == 0
+
+
+@pytest.mark.anyio
+async def test_info_does_not_restore_tier_above_download_target(monkeypatch):
+    from proxy.app import _fetch_online_info
+    from starlette.requests import Request
+
+    monkeypatch.setitem(CONF, "download_quality", "standard")
+    handler = lambda request: httpx.Response(200, json={"ok": True, "data": {
+        "name": "七里香", "ar": [{"name": "周杰伦"}],
+        "sq": {"size": 25000000}, "dt": 299000,
+    }})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://musicbox") as client:
+        monkeypatch.setattr(app.state, "musicbox_client", client, raising=False)
+        info = await _fetch_online_info(
+            Request({"type": "http", "app": app}), "online:netease:186016",
+            include_lyric=False,
+        )
+    assert info["ext"] == ""
+    assert info["file_size"] == 0
+
+
+@pytest.mark.parametrize("field", ["size", "br"])
+def test_raw_catalog_ignores_nonfinite_numbers(field):
+    from proxy.app import _netease_raw_qualities
+
+    qualities = _netease_raw_qualities({"sq": {field: float("inf")}})
+    assert qualities["lossless"]["file_size"] == 0
+    assert qualities["lossless"]["br"] == 999000
+
+
+def test_catalog_delivery_ignores_nonfinite_maxbr_and_size():
+    assert _netease_catalog_delivery({
+        "qualities": {"lossless": {"ext": "flac", "file_size": float("inf")}},
+        "maxbr": float("inf"),
+    }, target="lossless") == ("flac", 0)

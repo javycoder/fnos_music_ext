@@ -3468,6 +3468,10 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
                                     display = _netease_catalog_delivery(d_info, delivery_target)
                                     if display is not None:
                                         item["ext"], item["file_size"] = display
+                                    elif d_info.get("qualities"):
+                                        # 已有声明却无可用档位，格式保持未知；SQ 只说明
+                                        # 曲目存在无损版本，不能证明本次目标允许交付。
+                                        item["ext"], item["file_size"] = "", 0
                                     elif d_info.get("has_sq") or d_info.get("has_hr"):
                                         # 详情没有档位声明（旧服务）：退回原启发式
                                         item["ext"] = "flac"
@@ -3676,11 +3680,11 @@ def _netease_raw_qualities(raw: dict | None) -> dict[str, dict]:
             continue
         try:
             size = int(slot.get("size") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             size = 0
         try:
-            br = int(slot.get("br") or 0)
-        except (TypeError, ValueError):
+            br = max(0, int(slot.get("br") or 0))
+        except (TypeError, ValueError, OverflowError):
             br = 0
         out[tier] = {"ext": ext, "file_size": max(0, size), "br": br or nominal_br}
     return out
@@ -3699,7 +3703,7 @@ def _netease_delivery_of(entry: dict) -> tuple[str, int]:
     ext = str(entry.get("ext") or "").strip().lower() or "mp3"
     try:
         size = int(entry.get("file_size") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         size = 0
     return ext, max(0, size)
 
@@ -3724,7 +3728,7 @@ def _netease_catalog_delivery(detail: dict | None,
     qualities = qualities if isinstance(qualities, dict) else {}
     try:
         maxbr = int(src.get("maxbr") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         maxbr = 0
     usable: dict[str, dict] = {}
     for level, entry in qualities.items():
@@ -10255,14 +10259,18 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                         try:
                             maxbr = (int((privilege or {}).get("maxbr") or 0)
                                      if isinstance(privilege, dict) else 0)
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError, OverflowError):
                             maxbr = 0
+                        qualities = _netease_raw_qualities(data)
                         delivery = _netease_catalog_delivery({
-                            "qualities": _netease_raw_qualities(data),
+                            "qualities": qualities,
                             "maxbr": maxbr,
                         })
                         if delivery is not None:
                             ext, file_size = delivery
+                        elif qualities:
+                            # 声明档位均不可用时，不用 SQ/HR 标记重新推断格式。
+                            ext, file_size = "", 0
                         else:
                             # 详情没有档位对象（旧形态）：退回「有无损即 flac」，大小未知
                             ext = "flac" if (data.get("sq") or data.get("hr")) else "mp3"
@@ -13349,7 +13357,12 @@ def _strict_online_items(path: str) -> tuple[object, list]:
             raise
         return {"items": []}, []
     items = document.get("items") if isinstance(document, dict) else document
-    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+    if not isinstance(items, list) or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("guid"), str)
+        or not item["guid"].strip()
+        for item in items
+    ):
         raise ValueError("invalid online state")
     return document, items
 
