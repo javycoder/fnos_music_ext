@@ -500,6 +500,30 @@ async def test_library_scan_debounce_and_ttl(monkeypatch):
         await client.aclose()
 
 
+@pytest.mark.anyio
+async def test_first_library_scan_does_not_wait_for_cooldown_after_boot(monkeypatch):
+    """运行时间不足冷却窗口时，尚未扫描的初始值不能阻塞首次扫描。"""
+    from types import SimpleNamespace
+
+    real_clock = time.monotonic
+    started = real_clock()
+    monkeypatch.setattr(p, "time", SimpleNamespace(monotonic=lambda: 10 + real_clock() - started))
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/shared-library/scan")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 90)
+    posts = []
+
+    def handle(request):
+        posts.append(request.url.path)
+        return httpx.Response(200, json={"code": 0})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://unix") as client:
+        monkeypatch.setattr(p, "get_upstream_client", lambda app: client)
+        p._schedule_library_scan({"cookie": "sid=first"})
+        await asyncio.wait_for(p._scan_task, timeout=0.5)
+    assert posts == ["/music/api/v1/shared-library/scan"]
+
+
 # === issue #52：重复曲目与「未知歌手-未知曲目」 ===
 
 

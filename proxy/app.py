@@ -7009,7 +7009,8 @@ def _schedule_library_scan(headers: dict | None) -> None:
     now = time.monotonic()
 
     # 如果正在运行或处于冷却期中，更新 pending_headers，保证冷却期后重扫最新文件
-    in_cooldown = (now - _scan_last_attempt) < cooldown
+    # 0 表示尚未发起扫描，不能在系统运行时间小于冷却窗口时阻塞首次请求。
+    in_cooldown = _scan_last_attempt > 0 and (now - _scan_last_attempt) < cooldown
     is_running = _scan_task is not None and not _scan_task.done()
 
     if is_running or in_cooldown:
