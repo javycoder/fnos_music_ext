@@ -128,8 +128,9 @@ def test_main_preserves_phase_barriers_and_deduplicates_selection(monkeypatch):
     # Failure must be reported but must not skip remaining suites/phases.
     assert runner.main(["--jobs", "1"]) == 1
     # proxy 被拆成独立分片，但仍先于服务与基础设施阶段，且只调度一次。
-    proxy_phase, *rest = calls
+    proxy_phase, exclusive_phase, *rest = calls
     assert proxy_phase[0] and all(name.startswith("proxy-") for name in proxy_phase[0])
+    assert len(exclusive_phase[0]) == 1 and exclusive_phase[1] == 1
     assert rest == [(["webui", "musicdl", "lxmusic"], 1, False),
                     (["infrastructure"], 1, False)]
     calls.clear()
@@ -165,6 +166,30 @@ record('end')
 print('probe output ' + name)
 sys.exit(3 if name == 'second' else 0)
 """
+
+
+@pytest.mark.parametrize("jobs", [2, 3])
+def test_exclusive_proxy_shard_waits_for_all_parallel_processes(tmp_path, monkeypatch, jobs):
+    """用真实进程观察独占组，不能只检查它在分片清单里排最后。"""
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "proxy_shards", lambda count: [
+        ("proxy/tests/test_shared_a.py",),
+        ("proxy/tests/test_shared_b.py",),
+        ("proxy/tests/test_maintenance.py",),
+    ])
+    probe = PROBE.replace(
+        "time.sleep(.05)", "time.sleep(.3 if name == 'test_shared_b' else .02)",
+    )
+    monkeypatch.setattr(runner, "pytest_command", lambda paths, coverage: [
+        sys.executable, "-c", probe, Path(paths[0]).stem, str(events),
+    ])
+    assert runner.main(["--suite", "proxy", "--jobs", str(jobs)]) == 0
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    starts = {row["name"]: row["at"] for row in rows if row["event"] == "start"}
+    ends = {row["name"]: row["at"] for row in rows if row["event"] == "end"}
+    assert len(starts) == len(ends) == 3
+    assert starts["test_maintenance"] >= max(ends["test_shared_a"], ends["test_shared_b"])
 
 
 @pytest.mark.parametrize("jobs", [1, 2])

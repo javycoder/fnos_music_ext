@@ -274,11 +274,18 @@ def main(argv: list[str] | None = None) -> int:
             for index, phase in enumerate(PHASES):
                 suites = {name: paths for name, paths in phase.items() if name in selected}
                 if index == 0 and "proxy" in suites:
-                    # Separate interpreters, never threads or xdist.
-                    suites = {
-                        f"proxy-{number + 1}": paths
-                        for number, paths in enumerate(shards)
-                    }
+                    parallel = {}
+                    exclusive = {}
+                    for number, paths in enumerate(shards):
+                        target = (exclusive if any(Path(path).name in PROXY_EXCLUSIVE for path in paths)
+                                  else parallel)
+                        target[f"proxy-{number + 1}"] = paths
+                    # 独占组需要执行屏障；只把它排在清单末尾仍可能在其他组
+                    # 未结束时启动，导致宿主资源测试与并行分片相互干扰。
+                    results.update(run_phase(parallel, args.jobs, work, args.coverage))
+                    if exclusive:
+                        results.update(run_phase(exclusive, 1, work, args.coverage))
+                    continue
                 results.update(run_phase(suites, args.jobs, work, args.coverage))
             report_code = coverage_report(work) if args.coverage else 0
     except KeyboardInterrupt:
