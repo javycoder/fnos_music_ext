@@ -450,6 +450,21 @@ def test_search_merge_marks_online_not_local():
     assert titles.count("晴天") == 0
 
 
+def test_script_name_refresh_uses_readonly_source_query():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params.get("read_only"))
+        return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://lx") as client:
+            await refresh_lx_script_map(client)
+
+    asyncio.run(run())
+    assert seen == ["true"], "搜索标签的状态读取不能修改脚本顺序"
+
+
 def test_search_merge_lx_script_platform_and_fallback(monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", False)
     monkeypatch.setitem(CONF, "lx_enabled", True)

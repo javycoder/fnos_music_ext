@@ -125,6 +125,8 @@ def lx_http(monkeypatch, procs):
             url = json.loads(request.content).get("url", "")
             return httpx.Response(200, json={"ok": True, "source_id": "test-source", "data": {
                 "sources": [{"id": "test-source", "url": url, "status": "success"}]}})
+        if path == "/api/v1/source" and request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         return httpx.Response(200, json={"ok": True})
 
     webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -234,7 +236,7 @@ def test_save_aborts_without_writing_when_service_down(env_file, procs, lx_http,
 
 @pytest.mark.parametrize("failure", ["nested", "top_level", "connect", "timeout"])
 def test_service_failure_does_not_disable_active_source(env_file, procs, lx_http, client, failure):
-    """校验期间服务故障：终止保存，顶层分类也不能被 data 中的 message 丢掉。"""
+    """初始状态查询故障中止保存；不能把有效源当作失效。"""
     lx_http["healthy"] = True
 
     def failed_verify(request):
@@ -246,7 +248,7 @@ def test_service_failure_does_not_disable_active_source(env_file, procs, lx_http
         (report["data"] if failure == "nested" else report).update(details)
         return httpx.Response(503, json=report)
 
-    lx_http["business"]["/api/v1/source/verify"] = failed_verify
+    lx_http["business"]["/api/v1/source"] = failed_verify
     before = env_file.read_text(encoding="utf-8")
     r = client.put("/api/config", json={"values": {
         "LX_SOURCE_LIST": json.dumps([
@@ -259,7 +261,7 @@ def test_service_failure_does_not_disable_active_source(env_file, procs, lx_http
     assert env_file.read_text(encoding="utf-8") == before
     assert r.json()["stage"] == ("webui_to_lxmusic" if failure in ("connect", "timeout")
                                   else "lxmusic_to_lxserver")
-    assert lx_http["calls"] == ["/api/v1/source/verify"]
+    assert lx_http["calls"] == ["/api/v1/source"]
 
 
 @pytest.mark.parametrize("failure", ["nested", "top_level", "connect", "timeout"])
@@ -268,6 +270,8 @@ def test_activation_service_failure_preserves_active_source(env_file, procs, lx_
     posted = []
 
     def failed_activate(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         payload = json.loads(request.content)
         posted.append(payload)
         if failure in ("connect", "timeout"):
@@ -286,10 +290,12 @@ def test_activation_service_failure_preserves_active_source(env_file, procs, lx_
     assert r.status_code == 200, r.text
     actions = [a for a in r.json()["actions"] if a["kind"] == "lx_activate"]
     assert len(actions) == 1
-    assert actions[0]["category"] == "service_unavailable"
+    assert actions[0]["category"] == ("result_unknown" if failure in ("connect", "timeout")
+                                      else "service_unavailable")
     assert not actions[0].get("auto_disabled")
     assert r.json()["warnings"]
-    assert posted == [{"url": "https://s/1.js"}]
+    assert len(posted) == 1 and posted[0]["url"] == "https://s/1.js"
+    assert posted[0]["enabled"] is True and 0 < posted[0]["timeout_s"] <= 12
     assert webui._list_active_urls(webui.read_env()) == {"https://s/1.js"}
     assert webui.read_env()["LX_SOURCE_URL"] == "https://s/1.js"
 
@@ -630,7 +636,8 @@ def test_activation_uncertain_keeps_config_and_skips_cleanup(env_file, procs, lx
                                    "internal_stale_failed": "internal", "non_json": "service_unavailable"}.get(kind)
                                   or "initialization_pending")
     assert webui._list_active_urls(webui.read_env()) == {url}
-    assert posted == [{"url": url}]
+    assert len(posted) == 1 and posted[0]["url"] == url
+    assert posted[0]["enabled"] is True and 0 < posted[0]["timeout_s"] <= 12
 
 
 @pytest.mark.parametrize("identity", ["source_id", "unique_file", "ambiguous"])
@@ -652,20 +659,26 @@ def test_local_upload_identity_without_url(env_file, procs, lx_http, client, ide
     action = next(a for a in response.json()["actions"] if a["kind"] == "lx_activate" and a.get("op") == "activate")
     assert action["ok"] is (identity != "ambiguous")
     assert not action.get("auto_disabled")
-    assert webui._list_active_urls(webui.read_env()) == {url}
+    assert webui._list_active_urls(webui.read_env()) == (set() if identity == "ambiguous" else {url})
 
 
 @pytest.mark.parametrize("category,code", [("source_operation_busy", 409), ("initialization_pending", 504)])
-def test_verify_nonterminal_does_not_write_or_disable(env_file, procs, lx_http, client, category, code):
-    lx_http["business"]["/api/v1/source/verify"] = lambda request: httpx.Response(code, json={
-        "ok": False, "data": {"category": category, "message": "try later"}})
-    before = env_file.read_text(encoding="utf-8")
+def test_confirmation_nonterminal_preserves_original_active_flags(env_file, procs, lx_http, client, category, code):
+    def source(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        if json.loads(request.content).get("enabled") is False:
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(code, json={
+            "ok": False, "data": {"category": category, "message": "try later"}})
+    lx_http["business"]["/api/v1/source"] = source
     r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": json.dumps([
         {"url": "https://s/new.js", "active": True}])}})
-    assert r.status_code == code
-    assert r.json()["category"] == category
-    assert env_file.read_text(encoding="utf-8") == before
-    assert lx_http["calls"] == ["/api/v1/source/verify"]
+    assert r.status_code == 200
+    assert r.json()["complete"] is False
+    assert r.json()["warnings"][0]["category"] == category
+    assert not webui._list_active_urls(webui.read_env())
+    assert "/api/v1/source/verify" not in lx_http["calls"]
 
 
 @pytest.mark.parametrize('category,complete,expected', [
@@ -673,7 +686,7 @@ def test_verify_nonterminal_does_not_write_or_disable(env_file, procs, lx_http, 
     ('unsafe_vm_required', False, 'unsafe_vm_required'), ('resolve', False, 'resolve'),
     ('', False, 'incomplete'),
 ])
-def test_verify_unfinished_without_evidence_protects_entire_save(
+def test_incomplete_full_test_does_not_block_quick_save(
         env_file, procs, lx_http, client, category, complete, expected):
     lx_http['business']['/api/v1/source/verify'] = lambda request: httpx.Response(200, json={
         'ok': False, 'data': {'category': category, 'complete': complete,
@@ -681,10 +694,10 @@ def test_verify_unfinished_without_evidence_protects_entire_save(
     before = env_file.read_bytes()
     response = client.put('/api/config', json={'values': {'LX_SOURCE_LIST': json.dumps([
         {'url': 'https://s/new.js', 'active': True}]), 'LX_SOURCES': 'kg'}})
-    assert response.status_code in (409, 503, 504), response.text
-    assert response.json()['category'] == expected
-    assert env_file.read_bytes() == before
-    assert lx_http['calls'] == ['/api/v1/source/verify']
+    assert response.status_code == 200, response.text
+    assert response.json()['complete'] is True
+    assert webui._list_active_urls(webui.read_env()) == {'https://s/new.js'}
+    assert '/api/v1/source/verify' not in lx_http['calls']
 
 
 def test_verify_partial_success_can_still_be_saved(env_file, procs, lx_http, client):

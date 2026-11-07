@@ -1812,7 +1812,13 @@ async def _reconcile_source_targets(urls: list[str]) -> None:
     _CHAIN_HEALTH.clear()
 
 
+_SOURCE_MANUAL_REVISION = 0
+
+
 async def _bootstrap_migration():
+    if _SOURCE_MANUAL_REVISION:
+        return
+    revision = _SOURCE_MANUAL_REVISION
     # 等待 lxserver 就绪不占用管理锁：启动期（lxserver 慢启动最长约 10s）
     # WebUI 的激活请求不应被启动对账挡成 409。
     for _ in range(20):
@@ -1822,7 +1828,8 @@ async def _bootstrap_migration():
         except Exception:
             pass
         await asyncio.sleep(0.5)
-    await _migrate_persisted_sources()
+    if revision == _SOURCE_MANUAL_REVISION:
+        await _migrate_persisted_sources()
 
 
 @serialize_source_operation
@@ -1849,6 +1856,10 @@ async def _migrate_persisted_sources():
         targets = _persisted_source_targets()
         if targets is not None:
             await _reconcile_source_targets(targets)
+            # 启动恢复在管理锁内同步顺序；项目状态查询保持只读，避免迟到查询
+            # 根据旧配置把本次保存刚确认的顺序改回去。
+            sources = await _query_source_list()
+            await _sync_upstream_order(sources, _policy_payload(sources)["source_order"])
             return
         active = await describe_user_source()
         if not active.get("configured"):
@@ -1884,6 +1895,8 @@ async def _migrate_persisted_sources():
                         logger.info("已自动激活历史音源: %s", source_url)
                     except Exception as e:
                         logger.warning("自动激活历史音源失败: %s", e)
+        sources = await _query_source_list()
+        await _sync_upstream_order(sources, _policy_payload(sources)["source_order"])
     except Exception as exc:
         logger.warning("历史数据检查与迁移异常: %s", exc)
 
@@ -2519,22 +2532,26 @@ class SourceBody(BaseModel):
     url: str = ""
     script: str = ""
     enabled: bool = True  # false 表示停用该源（多源叠加语义下的取消激活）
+    timeout_s: float | None = Field(default=None, gt=0, le=55, allow_inf_nan=False)
 
 
 class ReorderBody(BaseModel):
     """排序接口请求体：稳定脚本 ID 数组（只传 WebUI 可见的激活脚本即可）。"""
 
     source_ids: list[str] = Field(default_factory=list)
+    timeout_s: float | None = Field(default=None, gt=0, le=55, allow_inf_nan=False)
+    persist: bool = True  # 配置保存由 WebUI 在同一事务收口，本接口只确认上游顺序。
 
 
 @app.get("/api/v1/source")
-async def source_info():
+async def source_info(read_only: bool = False):
     try:
         sources = await _query_source_list()
         user_src = _describe_source_snapshot(sources)
-        policy_payload = _policy_payload(sources, persist_cleanup=True)
+        policy_payload = _policy_payload(sources, persist_cleanup=not read_only)
         # 运行期排序同步上游：只在管理查询路径做，且同一顺序只发一次。
-        await _sync_upstream_order(sources, policy_payload["source_order"])
+        if not read_only:
+            await _sync_upstream_order(sources, policy_payload["source_order"])
     except Exception as exc:
         return _source_query_response(exc)
     return {
@@ -2570,6 +2587,17 @@ async def _rollback_source_order(previous: list[str]) -> None:
 @app.post("/api/v1/source/reorder")
 @serialize_source_operation
 async def source_reorder(body: ReorderBody):
+    """在调用方预算内确认排序；保存事务可选择由 WebUI 统一写配置。"""
+    try:
+        async with asyncio.timeout(body.timeout_s):
+            return await _source_reorder(body)
+    except TimeoutError:
+        return JSONResponse(status_code=504, content={
+            "ok": False, "category": "result_unknown",
+            "error": "排序确认超时，结果待核实", "result_unknown": True})
+
+
+async def _source_reorder(body: ReorderBody):
     """调整脚本顺序：管理锁串行、上游 sourceIds 持久化、失败回滚。
 
     只改顺序，不改任何脚本的全局启用状态；成功后排空直链/候选缓存并推进
@@ -2630,7 +2658,8 @@ async def source_reorder(body: ReorderBody):
         })
 
     try:
-        _write_source_order_file(after, list(settings.source_order))
+        if body.persist:
+            _write_source_order_file(after, list(settings.source_order))
     except OSError as exc:
         await _rollback_source_order(before)
         return JSONResponse(status_code=500, content={
@@ -2834,6 +2863,21 @@ async def source_upload(body: UploadBody):
 @app.post("/api/v1/source")
 @serialize_source_operation
 async def source_set(body: SourceBody):
+    """串行确认目标源启停；超时释放管理锁并明确返回未知结果。"""
+    global _SOURCE_MANUAL_REVISION
+    if body.timeout_s is not None:
+        # 新保存已接管激活状态；等待健康检查的旧启动任务不能再恢复旧配置。
+        _SOURCE_MANUAL_REVISION += 1
+    try:
+        async with asyncio.timeout(body.timeout_s):
+            return await _source_set(body)
+    except TimeoutError:
+        return JSONResponse(status_code=504, content={
+            "ok": False, "category": "result_unknown", "stage": "source_confirmation",
+            "error": "音源快速确认超时，结果待核实", "result_unknown": True})
+
+
+async def _source_set(body: SourceBody):
     """激活/停用自定义源（多源叠加语义：只改目标源启用态，不动其他源）。
 
     body.enabled=false 表示停用目标源；默认 true 为激活。同一脚本重复添加是正常操作。"""

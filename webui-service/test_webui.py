@@ -882,11 +882,13 @@ def test_musicdl_platform_change_restarts_process(env_file, svctl):
 
 # ------------------------------------------------------------------ lx 换源回路 ---
 
-def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, monkeypatch):
+def test_lx_url_change_confirms_initialization_and_derives_sources(env_file, svctl, monkeypatch):
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": 0, "activate": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         url = str(request.url)
         if url.endswith("/api/v1/source/verify"):
             hits["verify"] += 1
@@ -897,12 +899,13 @@ def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, m
         if request.url.host == "lx.test" and request.method == "POST":
             hits["activate"] += 1
             return httpx.Response(200, json={"ok": True, "source_id": "1.js", "data": {
-                "sources": [{"id": "1.js", "url": "https://s/1.js", "status": "success"}]}})
+                "sources": [{"id": "1.js", "url": "https://s/1.js", "status": "success",
+                             "platforms": ["kw", "kg"]}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
 
-    # 切到 lx 并换 URL：verify → 写 env（含推导 LX_SOURCES）→ 起进程 → 激活
+    # 切到 lx 并换 URL：快速确认初始化 → 写入已确认配置；完整测试独立执行。
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
@@ -910,21 +913,22 @@ def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, m
             "LX_SOURCE_URL": "https://s/1.js",
         }})
         assert r.status_code == 200
-    assert hits["verify"] == 1
+    assert hits["verify"] == 0
     assert hits["activate"] == 1
     text = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='https://s/1.js'" in text
-    assert "LX_SOURCES='kw,kg'" in text  # 来自校验报告的可用平台
+    assert "LX_SOURCES='kw,kg'" in text  # 来自目标脚本的运行期声明
 
 
-def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
+def test_lx_legacy_url_change_blocked_when_initialization_fails(env_file, svctl, monkeypatch):
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).endswith("/api/v1/source/verify"):
-            return httpx.Response(200, json={"ok": False, "data": {
-                "category": "download", "message": "下载失败: 404",
-            }})
+        if request.method == "GET" and request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        if request.method == "POST":
+            return httpx.Response(400, json={"ok": False, "category": "runtime",
+                                          "error": "脚本初始化失败"})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -936,12 +940,12 @@ def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
             "LX_SOURCE_URL": "https://bad/1.js",
         }})
         assert r.status_code == 400
-        assert "校验未通过" in r.json()["error"]
+        assert "初始化未通过" in r.json()["error"]
     assert env_file.read_text(encoding="utf-8") == before  # 校验失败不落盘
 
 
-def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svctl, monkeypatch):
-    """多源同时激活：新源逐个 verify，LX_SOURCES 取并集，逐个 POST 激活（叠加语义）。"""
+def test_lx_multi_source_save_confirms_initialization_and_derives_union(env_file, svctl, monkeypatch):
+    """多源只快速确认初始化，LX_SOURCES 取脚本声明平台并集。"""
     import json as _json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": [], "activate": []}
@@ -958,13 +962,14 @@ def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svc
             hits["verify"].append(body.get("url"))
             platforms = ["kw", "kg"] if body.get("url") == "https://s/a.js" else ["wy"]
             return httpx.Response(200, json={"ok": True, "data": {"platforms": platforms}})
-        if url.endswith("/api/v1/source") and request.method == "GET":
+        if request.url.path == "/api/v1/source" and request.method == "GET":
             # 激活前读取现有启用源平台（此处为空）
             return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
-                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success"}]}})
+                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success",
+                 "platforms": ["kw", "kg"] if body["url"] == "https://s/a.js" else ["wy"]}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -980,7 +985,7 @@ def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svc
         }})
         assert r.status_code == 200
         lx_actions = [a for a in r.json()["actions"] if a.get("kind") == "lx_activate"]
-    assert hits["verify"] == ["https://s/a.js", "https://s/b.js"]  # 新激活源逐个校验
+    assert hits["verify"] == []  # 保存不再执行完整播放测试
     assert len(hits["activate"]) == 2
     assert all(b.get("enabled", True) for b in hits["activate"])
     assert len(lx_actions) == 2 and all(a["ok"] for a in lx_actions)
@@ -1008,10 +1013,10 @@ def test_lx_multi_source_save_blocked_when_no_active(env_file, svctl, monkeypatc
     assert "LX_SOURCE_LIST" not in env_file.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("failure", ["verify", "verify_http", "activate", "runtime_failed"])
+@pytest.mark.parametrize("failure", ["activate", "runtime_failed"])
 @pytest.mark.parametrize("already_active", [False, True])
 def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, monkeypatch, failure, already_active):
-    """失效项自动停用；健康项、其它设置和提示都保留，重新加载不恢复失效项。"""
+    """坏新源保持未激活；已有源失败保留原配置，不阻断其它设置。"""
     import json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     bad, good = "https://s/bad.js", "https://s/good.js"
@@ -1027,6 +1032,7 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         if req.method == "GET":
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
                 {"id": url.rsplit("/", 1)[-1], "url": url,
+                 "status": "failed" if url == bad else "success",
                  "platforms": ["wy" if url == bad else "kw"]}
                 for url, active in enabled.items() if active
             ]}})
@@ -1055,7 +1061,7 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
             return httpx.Response(400, json={"ok": False, "category": "runtime", "error": "脚本初始化失败"})
         enabled[good] = True
         return httpx.Response(200, json={"ok": True, "source_id": "good.js", "data": {
-            "sources": [{"id": "good.js", "url": good, "status": "success"}]}})
+            "sources": [{"id": "good.js", "url": good, "status": "success", "platforms": ["kw"]}]}})
 
     _mock_http(handler)
     with authed_client() as client:
@@ -1070,18 +1076,16 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         assert result["warnings"][0]["source"] == "失效源"
         assert result["warnings"][0]["message"]
         saved = client.get("/api/config").json()["values"]
-        assert [i["active"] for i in json.loads(saved["LX_SOURCE_LIST"])] == [False, True]
-        assert saved["LX_SOURCE_URL"] == good
+        assert [i["active"] for i in json.loads(saved["LX_SOURCE_LIST"])] == [already_active, True]
+        assert saved["LX_SOURCE_URL"] == (bad if already_active else good)
         assert saved["LX_SOURCES"] == "kw"
         assert saved["FNMUSIC_PLAY_QUALITY"] == "exhigh"
         retry = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": saved["LX_SOURCE_LIST"]}})
         assert retry.status_code == 200
-        assert retry.json()["warnings"] == []
-    assert enabled == {bad: False, good: True}
-    if not already_active and failure.startswith("verify"):
-        assert not any(path == "/api/v1/source" and body == {"url": bad} for path, body in calls)
-    else:
-        assert any(a.get("auto_disabled") for a in result["actions"])
+        assert len(retry.json()["warnings"]) == (1 if already_active else 0)
+    assert enabled == {bad: already_active, good: True}
+    assert not any(path.endswith("/verify") for path, body in calls)
+    assert any(a.get("auto_disabled") for a in result["actions"]) is (not already_active)
 
 
 @pytest.mark.parametrize("failure", ["verify", "activate"])
@@ -1119,7 +1123,7 @@ def test_lx_all_failed_sources_save_inactive_and_allow_future_saves(env_file, sv
 
 
 def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
-    """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
+    """取消项优先停用，未变且已就绪的源不重复激活。"""
     import json as _json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": 0, "activate": []}
@@ -1135,9 +1139,10 @@ def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
         if url.endswith("/api/v1/source/verify"):
             hits["verify"] += 1
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
-        if url.endswith("/api/v1/source") and request.method == "GET":
+        if request.url.path == "/api/v1/source" and request.method == "GET":
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
-                {"name": "源A", "platforms": ["kw", "kg"]},
+                {"id": "a.js", "url": "https://s/a.js", "status": "success",
+                 "name": "源A", "platforms": ["kw", "kg"]},
             ]}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
@@ -1166,8 +1171,8 @@ def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
     assert hits["verify"] == 0  # 无新激活源，不触发校验
     deactivate_bodies = [b for b in hits["activate"] if b.get("enabled") is False]
     assert len(deactivate_bodies) == 1 and deactivate_bodies[0]["url"] == "https://s/b.js"
-    assert any(b.get("url") == "https://s/a.js" and b.get("enabled", True) for b in hits["activate"])
-    assert {a["op"] for a in lx_actions} == {"activate", "deactivate"}
+    assert not any(b.get("url") == "https://s/a.js" for b in hits["activate"])
+    assert {a["op"] for a in lx_actions} == {"deactivate"}
     text = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生指针不变
     saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
@@ -1304,6 +1309,8 @@ def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl,
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         url = str(request.url)
         if url.endswith("/api/v1/source/verify"):
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
@@ -1318,7 +1325,7 @@ def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl,
             "FNMUSIC_LX_ENABLED": "true",
             "LX_SOURCE_URL": "https://s/1.js",
         }})
-        assert r.status_code == 200
+        assert r.status_code == 400
         activate = [a for a in r.json()["actions"] if a["kind"] == "lx_activate"]
         assert activate and activate[0]["ok"] is False
         assert "非 JSON" in activate[0]["error"]
@@ -1715,6 +1722,28 @@ def test_resident_enable_starts_musicbox_when_stopped(env_file, svctl, resident_
         assert starts and starts[0]["ok"] is True
     assert ("start", "musicbox") in svctl.calls
     assert webui._resident_state["active"] is True
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_unrelated_save_recovers_stopped_resident_without_rechecking_running_process(
+        env_file, svctl, resident_state, running):
+    _musicdl_env(env_file)
+    webui._resident_state["active"] = True
+    if not running:
+        svctl.status_output["musicbox"] = "musicbox                       STOPPED   Not started"
+    hits = []
+    handler = _resident_http(logged_in=True)
+
+    def tracking(request):
+        hits.append(request.url.path)
+        return handler(request)
+
+    _mock_http(tracking)
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {"FNMUSIC_RECOMMEND_DAILY": False}})
+    assert response.status_code == 200
+    assert (("start", "musicbox") in svctl.calls) is (not running)
+    assert ("/api/v1/auth/status" in hits) is (not running)
 
 
 def test_resident_without_login_reclaims_process(env_file, svctl, resident_state):
@@ -2296,6 +2325,8 @@ def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
 
     def mock_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/source":
+            if request.method == "GET":
+                return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
             activate_calls.append(json.loads(request.content.decode()))
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
                 {"id": "source.js", "url": "http://lx.test/source.js", "status": "success"}]}})
@@ -2318,7 +2349,7 @@ def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
 
 
 def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch):
-    """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
+    """删除已激活项时停用目标，保留源不重复激活。"""
     import json as _json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": 0, "activate": []}
@@ -2334,9 +2365,10 @@ def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch)
         if url.endswith("/api/v1/source/verify"):
             hits["verify"] += 1
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
-        if url.endswith("/api/v1/source") and request.method == "GET":
+        if request.url.path == "/api/v1/source" and request.method == "GET":
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
-                {"name": "源A", "platforms": ["kw", "kg"]},
+                {"id": "a.js", "url": "https://s/a.js", "status": "success",
+                 "name": "源A", "platforms": ["kw", "kg"]},
             ]}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
@@ -2364,8 +2396,8 @@ def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch)
     assert hits["verify"] == 0  # 无新激活源，不触发校验
     deactivate_bodies = [b for b in hits["activate"] if b.get("enabled") is False]
     assert len(deactivate_bodies) == 1 and deactivate_bodies[0]["url"] == "https://s/b.js"
-    assert any(b.get("url") == "https://s/a.js" and b.get("enabled", True) for b in hits["activate"])
-    assert {a["op"] for a in lx_actions} == {"activate", "deactivate"}
+    assert not any(b.get("url") == "https://s/a.js" for b in hits["activate"])
+    assert {a["op"] for a in lx_actions} == {"deactivate"}
     text = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生指针不变
     saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])

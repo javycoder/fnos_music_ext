@@ -70,17 +70,34 @@ let publicDetailRun = null;
 let publicDetailRunUser = "";
 let publicProcessSnapshot = null;
 
-async function api(path, options) {
-  const resp = await fetch(APP_BASE + path, options);
-  let body = {};
-  try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
-  if (!resp.ok) {
-    const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
-    err.status = resp.status;
-    err.body = body;
-    throw err;
+async function api(path, options, timeoutMs = 0) {
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  let timer;
+  const request = async () => {
+    const resp = await fetch(APP_BASE + path, controller ? { ...options, signal: controller.signal } : options);
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok) {
+      const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
+      err.status = resp.status;
+      err.body = body;
+      throw err;
+    }
+    return body;
+  };
+  try {
+    if (!controller) return await request();
+    return await Promise.race([request(), new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("请求超时，结果待核实，请刷新运行状态");
+        error.name = "TimeoutError";
+        reject(error);
+        controller.abort();
+      }, timeoutMs);
+    })]);
+  } finally {
+    clearTimeout(timer);
   }
-  return body;
 }
 
 function updateLlmLikedSettings() {
@@ -501,9 +518,9 @@ function formatVersionLabel(version) {
 }
 
 /* -------------------------------------------------------------- 概览 */
-async function loadStatus() {
+async function loadStatus(timeoutMs = 0) {
   try {
-    const st = await api("/api/status");
+    const st = await api("/api/status", undefined, timeoutMs);
     publicProcessSnapshot = { at: Date.now(), processes: st.processes || {} };
     for (const item of publicSelection) {
       if (item._detail_status === "stopped"
@@ -577,8 +594,8 @@ async function loadStatus() {
 }
 
 /* -------------------------------------------------------------- 配置读写 */
-async function loadConfig() {
-  const cfg = await api("/api/config");
+async function loadConfig(timeoutMs = 0) {
+  const cfg = await api("/api/config", undefined, timeoutMs);
   configValues = cfg.values;
   configPresence = cfg.presence || {};
   configSchema = cfg.schema || {};
@@ -830,68 +847,34 @@ function filterConfigBySchema(values) {
 }
 
 async function saveConfig() {
-  let values;
-  try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
-  // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
-  // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
-  for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
-    const next = values[key] || "";
-    if (next && next !== (configValues[key] || "")) {
-      const res = await fsCheckDir(next);
-      if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
-    }
-  }
   const btn = $("#save-btn");
+  if (btn.disabled) return;
   btn.disabled = true;
-  // 新激活的源保存时要逐个端到端校验（每源可达 1-2 分钟），给出预期提示
-  const pendingNew = lxPendingActivationCount();
-  btn.textContent = pendingNew > 0
-    ? `保存中（校验 ${pendingNew} 个新激活源，可能需要 1-2 分钟）…`
-    : "保存中…";
-  const syncOrderThroughProxy = values.FNMUSIC_LX_ENABLED === true
-    && $("#lx-auto-switch").checked
-    && Boolean(configSchema.FNMUSIC_LX_SOURCE_ORDER);
-  const requestedOrder = lxSourceOrder.slice();
-  if (syncOrderThroughProxy) delete values.FNMUSIC_LX_SOURCE_ORDER;
-  if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
+  const started = performance.now();
+  const deadline = started + 60000;
+  const remaining = () => Math.max(1, deadline - performance.now());
   try {
+    let values;
+    try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
+    // 从点击起计时，目录检查共用三秒，不能在按钮禁用前无限等待。
+    btn.textContent = "保存中（检查目录）…";
+    for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
+      const next = values[key] || "";
+      if (next && next !== (configValues[key] || "")) {
+        const res = await fsCheckDir(next, Math.max(1, started + 3000 - performance.now()));
+        if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
+      }
+    }
+    const pendingNew = lxPendingActivationCount();
+    btn.textContent = pendingNew > 0
+      ? `保存中（快速确认 ${pendingNew} 个新源，一分钟内返回）…`
+      : "保存中（一分钟内返回）…";
+    if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
     const result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ values }),
-    });
-    let orderApplied = false;
-    if (syncOrderThroughProxy) {
-      // 配置保存可能为新激活源补入 lxserver ID；将它们追加到用户排序之后再调用专用代理。
-      const savedConfig = await api("/api/config");
-      let savedOrder = [];
-      try {
-        const parsed = JSON.parse(savedConfig.values.FNMUSIC_LX_SOURCE_ORDER || "[]");
-        if (Array.isArray(parsed)) savedOrder = parsed.filter((id) => typeof id === "string");
-      } catch (_) { /* 共享配置格式错误时保留当前顺序，接口会给出明确校验错误 */ }
-      const finalOrder = requestedOrder.slice();
-      savedOrder.forEach((id) => { if (!finalOrder.includes(id)) finalOrder.push(id); });
-      if (JSON.stringify(finalOrder) !== JSON.stringify(savedOrder)) {
-        try {
-          const reorder = await api("/api/lx/source/reorder", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source_ids: finalOrder }),
-          });
-          orderApplied = Boolean((reorder.changed || []).includes("FNMUSIC_LX_SOURCE_ORDER"));
-          if (orderApplied) result.changed = [...new Set([...(result.changed || []), "FNMUSIC_LX_SOURCE_ORDER"])];
-        } catch (exc) {
-          await loadConfig();
-          await loadStatus();
-          const isBusy = exc.status === 409 || exc.body?.category === "source_operation_busy";
-          const reason = isBusy
-            ? (exc.message && exc.message.includes("忙") ? exc.message : "洛雪源正忙，请稍候重试")
-            : exc.message;
-          toast(`其他配置已保存；洛雪源排序失败，${reason}；已恢复保存顺序`, "fail");
-          return;
-        }
-      }
-    }
+    }, remaining());
     const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
     const warnings = result.warnings || [];
     const parts = [];
@@ -905,31 +888,44 @@ async function saveConfig() {
       if (a.kind === "lx_activate" && !a.auto_disabled) {
         const label = a.source ? `「${a.source}」` : "";
         const op = a.op === "deactivate" ? "取消激活" : "激活";
-        parts.push(`洛雪源${label}${op}${a.ok ? "成功" : "失败"}`);
+        const outcome = a.ok ? "成功" : a.category === "not_executed" ? "未执行"
+          : ["result_unknown", "initialization_pending"].includes(a.category) ? "结果待核实" : "失败";
+        parts.push(`洛雪源${label}${op}${outcome}`);
       }
+      if (a.kind === "lx_reorder") parts.push(`洛雪源排序${a.ok ? "成功" : "未确认，保留原顺序"}`);
     });
     warnings.forEach((w) => {
       if (w.category && !["runtime", "runtime_error"].includes(w.category)) {
-        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌" }[w.category] || "状态暂不可确认";
-        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，激活配置已保留${w.message ? `（${w.message}）` : ""}`);
+        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌",
+          result_unknown: "结果待核实", not_executed: "未执行" }[w.category] || "状态暂不可确认";
+        const state = w.saved_active === false ? "未保存为激活" : "激活配置已保留";
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，${state}${w.message ? `（${w.message}）` : ""}`);
+      } else if (w.auto_disabled === false) {
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」初始化失败，保留原激活配置${w.message ? `（${w.message}）` : ""}`);
       } else {
         parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
       }
     });
-    if (failed.length) {
+    if (failed.length || result.complete === false) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
     } else {
       toast(parts.join("；") || "配置无变化", "ok");
     }
-    clearDirty();
-    await loadConfig();
-    await loadStatus();
+    if (result.values) {
+      configValues = { ...configValues, ...result.values };
+      applyConfigToForm();
+      clearDirty();
+    } else {
+      // 兼容旧后端；配置回读仍使用本次剩余预算。
+      await loadConfig(remaining());
+    }
+    void loadStatus(3000);
     refreshLlmUsage();
   } catch (exc) {
     lxRuntimeSnapshot = null;
     renderLxSourceList();
     toast("保存失败：" + exc.message, "fail");
-    await loadStatus();
+    void loadStatus(3000);
   } finally {
     btn.disabled = false;
     btn.textContent = "保存并生效";
@@ -2629,19 +2625,20 @@ const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试�
 
 /* 目录权限校验：桌面链路由宿主机网关（root，真实落盘视角）拦截应答；
    直连 8774 时 WebUI 返回 501（容器内看不到宿主路径），降级为 skip 放行。 */
-async function fsCheckDir(path) {
+async function fsCheckDir(path, timeoutMs = 0) {
   try {
     const r = await api("/api/fs-check", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
-    });
+    }, timeoutMs);
     if (!r.writable) {
       return { mode: "fail", message: r.exists ? "目录不可写（权限不足或只读挂载）" : "目录无法创建（父目录不可写）" };
     }
     if (!r.exists) return { mode: "warn", message: "目录不存在；父目录可写，保存后自动创建" };
     return { mode: "ok", message: "目录可写 ✓" };
   } catch (exc) {
+    if (exc.name === "TimeoutError") return { mode: "fail", message: "目录检查超时，请重试" };
     return { mode: "skip", message: "目录校验不可用（" + exc.message + "），保存时不校验权限" };
   }
 }

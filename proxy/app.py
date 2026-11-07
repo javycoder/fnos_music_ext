@@ -1587,7 +1587,7 @@ async def refresh_lx_script_map(client: httpx.AsyncClient) -> dict[str, str]:
     by_platform: dict[str, str] = {}
     sources: "list[dict] | None" = None
     try:
-        r = await client.get("/api/v1/source", timeout=5.0)
+        r = await client.get("/api/v1/source?read_only=true", timeout=5.0)
         if r.status_code == 200:
             data = r.json()
             raw = data.get("data") if isinstance(data, dict) else None

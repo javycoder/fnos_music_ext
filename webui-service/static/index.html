@@ -137,7 +137,7 @@
             </div>
             <div class="btn-row">
               <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js 或 file:///data/lxmusic/uploads/xxx.js">
-              <button class="btn" id="lx-test">测试</button>
+              <button class="btn" id="lx-test">完整测试</button>
             </div>
             <div class="btn-row">
               <input type="file" id="lx-file" accept=".js" hidden>
@@ -542,10 +542,11 @@
     <p>按需勾选 musicdl 平台。平台列表来自当前服务注册项，搜索与播放只使用已启用集合；平台不可达时可能返回空结果或播放失败。</p>
   </template>
   <template data-help-id="lx-source-add">
-    <p>可粘贴 http/https 源脚本地址、上传 .js 文件，或在桌面环境从 NAS 选择。可填写自定义名称后点击“添加”，保存时统一校验并加入源列表。</p>
+    <p>可粘贴 http/https 源脚本地址、上传 .js 文件，或在桌面环境从 NAS 选择。可填写自定义名称后点击“添加”，保存时确认目标脚本初始化状态并加入源列表。</p>
   </template>
   <template data-help-id="lx-source-list">
-    <p>支持多个洛雪源同时激活，解析失败时自动接力。新激活的源会先做可用性校验，每个约需 1 分钟；保存并生效后按列表配置热更新。</p>
+    <p>支持多个洛雪源同时激活，解析失败时自动接力。保存仅快速确认启停和初始化，整次等待不超过一分钟；正常且未变化的源不重复激活。完整测试独立执行搜索、解析和音频前缀探活，初始化成功不代表已验证播放。</p>
+    <p>部分失败时保留已确认的修改，并分别提示失败、未执行或结果待核实。超时不会重放写请求；请先刷新运行状态再决定是否重试。</p>
   </template>
   <template data-help-id="lx-timeouts">
     <p>慢源可调大超时。建议总超时至少覆盖一次解析和一次探活；调大后保存即生效，无需重启服务。</p>
