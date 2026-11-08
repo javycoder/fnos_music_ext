@@ -3101,6 +3101,8 @@ test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => 
   assert.strictEqual(els.get("#save-btn").disabled, false);
   assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
   assert.ok(els.get("#toast").textContent.includes("配置已保存生效"));
+});
+
 test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
   const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
   const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");

@@ -54,3 +54,4 @@ packaging/fpk/.build/
 
 .cursor/
 .webui_jobs.db
+openspec/

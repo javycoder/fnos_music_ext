@@ -153,29 +153,43 @@
             <div id="platform-list" class="chip-grid pad"></div>
             <p class="hint" id="platform-note"></p>
             <!-- 批量测试面板 -->
-            <div id="platform-test-panel" class="card" hidden>
-              <div class="card-title"><span>平台批量测试</span></div>
-              <div class="btn-row">
-                <label class="field"><span>测试关键词</span><input class="input" id="platform-test-keyword" value="周杰伦" placeholder="如 周杰伦"></label>
-                <label class="field"><span>并发数</span><input class="input" id="platform-test-concurrency" type="number" min="1" max="8" value="4" style="width:60px"></label>
-                <button class="btn primary" id="platform-test-start">开始测试</button>
-                <button class="btn" id="platform-test-stop" disabled>停止</button>
+            <div id="platform-test-panel" class="pt-panel" hidden>
+              <div class="pt-head">
+                <div class="pt-head-text">
+                  <span class="pt-title">平台批量测试</span>
+                  <span class="pt-desc">用关键词逐个探测已注册音源的可用性，测试完成后可批量启停</span>
+                </div>
+                <div class="pt-stats">
+                  <span class="pt-stat" data-tone="idle">已完成 <b id="platform-test-stat-done">0/0</b></span>
+                  <span class="pt-stat" data-tone="ok">可用 <b id="platform-test-stat-ok">0</b></span>
+                  <span class="pt-stat" data-tone="err">不可用 <b id="platform-test-stat-fail">0</b></span>
+                </div>
               </div>
-              <div class="progress-bar" id="platform-test-progress-wrap" hidden>
-                <div class="progress-fill" id="platform-test-progress" style="width:0%"></div>
-                <span id="platform-test-progress-text">0/0</span>
+              <div class="pt-toolbar">
+                <label class="pt-field"><span>测试关键词</span><input class="input" id="platform-test-keyword" value="周杰伦" placeholder="如 周杰伦"></label>
+                <label class="pt-field pt-field-num"><span>并发数</span><input class="input" id="platform-test-concurrency" type="number" min="1" max="8" value="4"></label>
+                <div class="pt-toolbar-actions">
+                  <button class="btn primary" id="platform-test-start">开始测试</button>
+                  <button class="btn" id="platform-test-stop" disabled>停止</button>
+                </div>
               </div>
-              <div id="platform-test-summary" class="hint"></div>
-              <div class="btn-row" id="platform-test-actions" hidden>
+              <div class="pt-progress" id="platform-test-progress-wrap" hidden>
+                <div class="progress-bar"><div class="progress-fill" id="platform-test-progress" style="width:0%"></div></div>
+                <span class="pt-progress-text" id="platform-test-progress-text">0/0</span>
+              </div>
+              <p class="hint pt-message" id="platform-test-summary"></p>
+              <div class="btn-row pt-actions" id="platform-test-actions" hidden>
                 <button class="btn" id="platform-test-enable-ok">启用成功的 (0)</button>
-                <button class="btn" id="platform-test-disable-fail">关闭无效的 (0)</button>
+                <button class="btn danger" id="platform-test-disable-fail">关闭无效的 (0)</button>
                 <button class="btn" id="platform-test-enable-all">启用全部</button>
                 <button class="btn" id="platform-test-disable-all">停用全部</button>
               </div>
-              <table id="platform-test-table" class="data-table" hidden>
-                <thead><tr><th>平台</th><th>状态</th><th>耗时</th><th>结果数</th><th>示例</th></tr></thead>
-                <tbody id="platform-test-tbody"></tbody>
-              </table>
+              <div class="pt-table-wrap" id="platform-test-table-wrap" hidden>
+                <table id="platform-test-table" class="data-table">
+                  <thead><tr><th>平台</th><th>状态</th><th class="num">耗时</th><th class="num">结果数</th><th>示例</th></tr></thead>
+                  <tbody id="platform-test-tbody"></tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
