@@ -9059,11 +9059,18 @@ async def stream_track(request: Request, subpath: str = ""):
                 )
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
-                if source_from_online_guid(candidate) == "netease":
-                    if isinstance(exc, (TimeoutError, httpx.TimeoutException)) and attempt == 0:
-                        continue
+                source = source_from_online_guid(candidate)
+                if (source != "lx" and attempt == 0
+                        and isinstance(exc, (TimeoutError, httpx.TimeoutException))):
+                    # 冷路径首超时允许再试一次（网易与 musicdl 同等对待）：
+                    # musicdl 首次解析直链 + 无损档解码探针可能超过单次尝试预算
+                    # （_STREAM_ATTEMPT_S=6s），但 musicdl 侧会缓存 URL 与探针结果，
+                    # 第二次尝试即可出流。此前 musicdl 直接 break → 404「搜得到却
+                    # 播不了」，用户必须点两次才响。lx 保持原语义（失败即换候选）。
+                    continue
+                if source == "netease":
                     break
-                if source_from_online_guid(candidate) == "lx":
+                if source == "lx":
                     fresh_lx = isinstance(exc, DeadOnlineMedia)
                     if not fresh_lx:
                         break
