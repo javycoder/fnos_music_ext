@@ -5808,8 +5808,8 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                     ordered = entry["items"] + items
                 entry["items"] = deduplicate_online_items(ordered)[:2000]
             if (not pending and not entry["items"] and failed
-                    and not _user_search_stale(entry, scope)
-                    and retries < max(0, int(CONF.get("search_empty_retry", 2)))):
+                    and not entry.get("abandoned") and not _user_search_stale(entry, scope)
+                    and retries < max(0, min(1, int(CONF.get("search_empty_retry", 1))))):
                 delay = max(0.0, float(CONF.get("search_empty_retry_delay", 1.2)))
                 if deadline - asyncio.get_running_loop().time() > delay:
                     logger.info("搜索首屏空结果触发重试: attempt=%d", retries + 1)
