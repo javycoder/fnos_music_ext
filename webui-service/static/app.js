@@ -1085,19 +1085,46 @@ let platformTestTimer = null;
 let platformTestPolling = false;
 let platformTestResults = [];
 
+function formatPlatformLatency(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 1000) return `${Math.round(n)}ms`;
+  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}s`;
+}
+
+function renderPlatformTestStats(done, total, okCount, failCount) {
+  const setText = (sel, text) => { const el = $(sel); if (el) el.textContent = text; };
+  setText("#platform-test-stat-done", `${done}/${total}`);
+  setText("#platform-test-stat-ok", String(okCount));
+  setText("#platform-test-stat-fail", String(failCount));
+}
+
+function setPlatformTestMessage(text) {
+  const el = $("#platform-test-summary");
+  if (el) el.textContent = text || "";
+}
+
 function renderPlatformTestTable(results) {
   const tbody = $("#platform-test-tbody");
-  const table = $("#platform-test-table");
-  if (!results || !results.length) { table.hidden = true; tbody.innerHTML = ""; return; }
-  table.hidden = false;
+  const wrap = $("#platform-test-table-wrap");
+  if (!results || !results.length) { wrap.hidden = true; tbody.innerHTML = ""; return; }
+  wrap.hidden = false;
   const enabledSet = new Set(platforms.enabled);
   tbody.innerHTML = results.map((r) => {
     const ok = r.status === "ok";
-    const status = ok ? "✓" : "✗";
     const cls = ok ? "ok" : "err";
     const titles = ok ? (r.titles || [r.title]).filter(Boolean).join("、") : (r.error || "");
     const isOn = enabledSet.has(r.platform);
-    return `<tr class="${cls}"><td>${escapeHtml(r.platform)}</td><td>${status} <button class="btn small platform-toggle" data-platform="${escapeHtml(r.platform)}" data-on="${isOn}">${isOn ? "关闭" : "开启"}</button></td><td>${r.latency_ms}ms</td><td>${r.count}</td><td title="${escapeHtml(titles)}">${escapeHtml(titles)}</td></tr>`;
+    const badge = ok ? '<span class="pt-badge ok">✓ 可用</span>' : '<span class="pt-badge err">✗ 不可用</span>';
+    const toggle = `<button class="btn small platform-toggle${isOn ? " on" : ""}" data-platform="${escapeHtml(r.platform)}" data-on="${isOn}">${isOn ? "停用" : "启用"}</button>`;
+    const count = Number.isFinite(Number(r.count)) ? Number(r.count) : 0;
+    return `<tr class="${cls}">`
+      + `<td class="pt-name">${escapeHtml(r.platform)}</td>`
+      + `<td><div class="pt-status">${badge}${toggle}</div></td>`
+      + `<td class="num">${formatPlatformLatency(r.latency_ms)}</td>`
+      + `<td class="num">${count}</td>`
+      + `<td class="pt-sample" title="${escapeHtml(titles)}">${escapeHtml(titles || "—")}</td>`
+      + `</tr>`;
   }).join("");
   tbody.querySelectorAll(".platform-toggle").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1119,7 +1146,7 @@ function updatePlatformTestProgress(done, total) {
   wrap.hidden = false;
   const pct = total ? Math.round((done / total) * 100) : 0;
   fill.style.width = pct + "%";
-  text.textContent = `${done}/${total}`;
+  text.textContent = `${done}/${total} · ${pct}%`;
 }
 
 async function pollPlatformTestJob() {
@@ -1135,20 +1162,22 @@ async function pollPlatformTestJob() {
     updatePlatformTestProgress(platformTestJob.progress.done, platformTestJob.progress.total);
     const okCount = data.ok_count ?? platformTestJob.results.filter((r) => r.status === "ok").length;
     const failCount = (data.fail_count ?? platformTestJob.results.filter((r) => r.status !== "ok").length);
-    $("#platform-test-summary").textContent = `已完成 ${platformTestJob.progress.done}/${platformTestJob.progress.total}，成功 ${okCount}，失败 ${failCount}`;
+    renderPlatformTestStats(platformTestJob.progress.done, platformTestJob.progress.total, okCount, failCount);
     $("#platform-test-enable-ok").textContent = `启用成功的 (${okCount})`;
     $("#platform-test-disable-fail").textContent = `关闭无效的 (${failCount})`;
     if (data.status === "done") {
       $("#platform-test-actions").hidden = false;
       $("#platform-test-start").disabled = false;
       $("#platform-test-stop").disabled = true;
+      setPlatformTestMessage("测试完成，可批量启停平台");
       clearTimeout(platformTestTimer);
       platformTestTimer = null;
     } else {
+      setPlatformTestMessage("测试进行中…");
       platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
     }
   } catch (exc) {
-    $("#platform-test-summary").textContent = `查询失败：${exc.message}`;
+    setPlatformTestMessage(`查询失败：${exc.message}`);
   } finally {
     platformTestPolling = false;
   }
@@ -1160,10 +1189,11 @@ async function startPlatformTest() {
   $("#platform-test-start").disabled = true;
   $("#platform-test-stop").disabled = false;
   $("#platform-test-actions").hidden = true;
-  $("#platform-test-summary").textContent = "正在启动…";
+  setPlatformTestMessage("正在启动…");
+  renderPlatformTestStats(0, 0, 0, 0);
   platformTestResults = [];
   renderPlatformTestTable([]);
-  updatePlatformTestProgress(0, 0);
+  $("#platform-test-progress-wrap").hidden = true;
   try {
     const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) });
     if (!data.ok) throw new Error(data.error || "start failed");
@@ -1171,7 +1201,7 @@ async function startPlatformTest() {
     updatePlatformTestProgress(0, data.total);
     platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
   } catch (exc) {
-    $("#platform-test-summary").textContent = `启动失败：${exc.message}`;
+    setPlatformTestMessage(`启动失败：${exc.message}`);
     $("#platform-test-start").disabled = false;
     $("#platform-test-stop").disabled = true;
   }
@@ -1186,7 +1216,7 @@ function stopPlatformTest() {
   platformTestJob = null;
   $("#platform-test-start").disabled = false;
   $("#platform-test-stop").disabled = true;
-  $("#platform-test-summary").textContent = "已停止";
+  setPlatformTestMessage("已停止");
 }
 
 $("#platform-test-start").addEventListener("click", startPlatformTest);
