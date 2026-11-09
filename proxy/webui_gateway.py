@@ -29,13 +29,21 @@ import sys
 import threading
 import time
 import uuid
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 from pathlib import Path
 
 try:
     import pwd
 except ImportError:  # Development-machine unit tests run on non-Linux hosts.
     pwd = None
+from proxy.self_update import (
+    get_active_job,
+    get_capability,
+    get_job,
+    get_most_recent_job,
+    resolve_target,
+    start_update_job,
+)
 
 UPSTREAM = ("127.0.0.1", 8774)
 SOCK_NAME = "fnmusic-ext.sock"
@@ -61,6 +69,9 @@ MAINTENANCE_MAX_BODY = 4096
 MAINTENANCE_TIMEOUT = 35
 ORGANIZE_PATH = MAINTENANCE_ROOT + "/organize"
 ORGANIZE_LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
+SELF_UPDATE_ROOT = "/api/self-update"
+SELF_UPDATE_MAX_HEADER = 16 * 1024
+SELF_UPDATE_MAX_BODY = 4096
 
 
 def socket_path_for(base: Path) -> Path:
@@ -502,6 +513,26 @@ def _maintenance_target(head_raw: bytes):
     return None
 
 
+def _self_update_target(head_raw: bytes):
+    parts = head_raw.split(b"\r\n", 1)[0].decode("latin-1").split()
+    if len(parts) < 2:
+        return None
+    target = parts[1]
+    prefix = "/app/fnmusic-ext"
+    if target.startswith(prefix + "/"):
+        target = target[len(prefix):]
+    decoded = unquote(target)
+    if decoded.startswith(prefix + "/"):
+        decoded = decoded[len(prefix):]
+    path_only = target.split("?", 1)[0]
+    decoded_path = decoded.split("?", 1)[0]
+    if path_only == SELF_UPDATE_ROOT or path_only.startswith(SELF_UPDATE_ROOT + "/"):
+        return parts[0], target
+    if decoded_path == SELF_UPDATE_ROOT or decoded_path.startswith(SELF_UPDATE_ROOT + "/"):
+        return parts[0], target
+    return None
+
+
 def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, target: str) -> None:
     remote = None
     try:
@@ -602,6 +633,115 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
         client.close()
 
 
+def handle_self_update(client: socket.socket, head_raw: bytes, method: str, target: str) -> None:
+    try:
+        client.settimeout(CONNECT_TIMEOUT)
+        head = head_raw.split(b"\r\n\r\n", 1)[0]
+        if len(head) + 4 > SELF_UPDATE_MAX_HEADER:
+            raise ValueError("请求头过大")
+        lines = head.decode("ascii").split("\r\n")
+        if len(lines[0].split(" ")) != 3 or lines[0].split(" ")[2] not in ("HTTP/1.0", "HTTP/1.1"):
+            raise ValueError("请求行无效")
+        headers = {}
+        for line in lines[1:]:
+            key, value = line.split(":", 1)
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key):
+                raise ValueError("请求头无效")
+            key = key.lower()
+            if key in headers:
+                raise ValueError("重复请求头")
+            headers[key] = value.strip()
+        if headers.get("x-trim-isadmin", "").lower() != "true":
+            client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可执行更新"}))
+            return
+
+        prefix = "/app/fnmusic-ext"
+        clean_target = target
+        if clean_target.startswith(prefix + "/"):
+            clean_target = clean_target[len(prefix):]
+        if "?" in clean_target:
+            path, query = clean_target.split("?", 1)
+        else:
+            path, query = clean_target, ""
+
+        if method == "GET" and path == SELF_UPDATE_ROOT:
+            job = get_active_job() or get_most_recent_job()
+            client.sendall(_json_response(200, {
+                "ok": True,
+                "capability": get_capability(),
+                "job": job.to_dict() if job else None,
+            }))
+            return
+
+        if method == "GET" and path == SELF_UPDATE_ROOT + "/target":
+            params = parse_qs(query)
+            tag = params.get("tag", [""])[0].strip()
+            if not tag or not re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9]+|[a-z])?", tag):
+                client.sendall(_json_response(400, {"ok": False, "error": "缺少 tag 参数或格式不正确"}))
+                return
+            try:
+                snap = resolve_target(tag)
+                client.sendall(_json_response(200, {"ok": True, "target": snap.to_dict()}))
+            except ValueError as e:
+                client.sendall(_json_response(404, {"ok": False, "error": str(e)}))
+            except Exception as e:
+                client.sendall(_json_response(503, {"ok": False, "error": f"解析更新目标失败: {e}"}))
+            return
+
+        if method == "POST" and path == SELF_UPDATE_ROOT:
+            if "transfer-encoding" in headers:
+                raise ValueError("不支持 Transfer-Encoding")
+            length = headers.get("content-length", "0")
+            if not re.fullmatch(r"[0-9]{1,10}", length) or int(length) > SELF_UPDATE_MAX_BODY:
+                raise ValueError("Content-Length 无效")
+            body = head_raw.split(b"\r\n\r\n", 1)[1][:int(length)]
+            deadline = time.monotonic() + CONNECT_TIMEOUT
+            while len(body) < int(length):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("请求体超时")
+                client.settimeout(remaining)
+                chunk = client.recv(int(length) - len(body))
+                if not chunk:
+                    raise ValueError("请求体不完整")
+                body += chunk
+            try:
+                req = json.loads(body)
+            except Exception:
+                raise ValueError("JSON 格式无效")
+            if (not isinstance(req, dict) or
+                    set(req) != {"target_id", "confirm"} or
+                    req.get("confirm") is not True or
+                    not isinstance(req.get("target_id"), str) or
+                    not re.fullmatch(r"[0-9a-fA-F]{32}", req.get("target_id", ""))):
+                client.sendall(_json_response(400, {"ok": False, "error": "请求格式不正确，必须包含 target_id 与 confirm: true"}))
+                return
+            code, resp = start_update_job(req["target_id"])
+            client.sendall(_json_response(code, resp))
+            return
+
+        job_match = re.fullmatch(SELF_UPDATE_ROOT + r"/jobs/([0-9a-fA-F]{32})", path)
+        if method == "GET" and job_match:
+            job_id = job_match.group(1)
+            job = get_job(job_id)
+            if not job:
+                client.sendall(_json_response(404, {"ok": False, "error": "任务不存在"}))
+                return
+            client.sendall(_json_response(200, {"ok": True, "job": job.to_dict()}))
+            return
+
+        client.sendall(_json_response(404, {"ok": False, "error": "未知自更新接口"}))
+    except (ValueError, UnicodeError) as exc:
+        client.sendall(_json_response(400, {"ok": False, "error": str(exc)}))
+    except Exception as exc:
+        try:
+            client.sendall(_json_response(500, {"ok": False, "error": f"自更新网关处理失败: {exc}"}))
+        except OSError:
+            pass
+    finally:
+        client.close()
+
+
 def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     client.settimeout(CONNECT_TIMEOUT)
     head = _read_request_head(client)
@@ -612,6 +752,10 @@ def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     maintenance = _maintenance_target(head_raw)
     if maintenance is not None:
         handle_maintenance(client, head_raw, *maintenance)
+        return
+    self_update = _self_update_target(head_raw)
+    if self_update is not None:
+        handle_self_update(client, head_raw, *self_update)
         return
     client.settimeout(None)
     if _is_host_file_request(head_raw):

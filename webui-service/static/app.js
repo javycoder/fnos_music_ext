@@ -3295,7 +3295,16 @@ async function checkUpdate() {
 // 有新版本则红点常亮（两处"关于"入口 + 关于页 NEW 标记），不因查看而清除
 function renderUpdateBadge() {
   const has = !!(updateInfo && updateInfo.has_update);
-  $$(".nav-dot").forEach((el) => { el.hidden = !has; });
+  $$(".nav-dot").forEach((el) => {
+    el.hidden = !has;
+    if (!el._updateBound) {
+      el._updateBound = true;
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openUpdateModal();
+      });
+    }
+  });
   $("#about-new").hidden = !has;
 }
 
@@ -3303,6 +3312,10 @@ function fmtDate(iso) {
   const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(iso || ""));
   return m ? m[1] : "-";
 }
+
+let updateTargetSnapshot = null;
+let selfUpdateJobId = null;
+let selfUpdatePollTimer = null;
 
 function openUpdateModal() {
   if (!updateInfo || !updateInfo.has_update) return;
@@ -3314,6 +3327,190 @@ function openUpdateModal() {
   // 升级跳转跟随检查源：GitHub 查到跳 GitHub release 页，Gitee 查到跳 Gitee 发行版页
   $("#update-upgrade-btn").href = latest.html_url || "#";
   $("#update-modal").hidden = false;
+
+  // 重置弹窗内动态区域
+  $("#update-modal-prompt").hidden = true;
+  $("#update-modal-error").hidden = true;
+  $("#update-modal-progress").hidden = !selfUpdateJobId;
+  $("#update-install-btn").hidden = true;
+  $("#update-install-btn").disabled = false;
+  $("#update-upgrade-btn").hidden = false;
+
+  if (selfUpdateJobId) {
+    $("#update-upgrade-btn").hidden = true;
+    return;
+  }
+
+  // 异步解析安装目标与架构匹配（若失败或为直连 501 则降级展示手动升级外链）
+  const tagStr = String(latest.tag_name || latest.version || "").trim();
+  if (!tagStr) return;
+  const tag = tagStr.startsWith("v") ? tagStr : `v${tagStr}`;
+  api(`/api/self-update/target?tag=${encodeURIComponent(tag)}`).then((res) => {
+    if (res && res.ok && res.target) {
+      updateTargetSnapshot = res.target;
+      const verText = formatVersionLabel(res.target.tag || res.target.formal_base);
+      const installVer = res.target.install_version || res.target.formal_base;
+      $("#update-modal-prompt").textContent = `是否下载并安装 ${verText}（安装版本 ${installVer}）？`;
+      $("#update-modal-prompt").hidden = false;
+      $("#update-install-btn").hidden = false;
+      $("#update-install-btn").disabled = false;
+      $("#update-upgrade-btn").hidden = true;
+    }
+  }).catch(() => {
+    $("#update-upgrade-btn").hidden = false;
+  });
+}
+
+async function startSelfUpdate() {
+  if (!updateTargetSnapshot || !updateTargetSnapshot.target_id) return;
+  $("#update-install-btn").disabled = true;
+  $("#update-install-btn").hidden = true;
+  $("#update-upgrade-btn").hidden = true;
+  $("#update-modal-prompt").hidden = true;
+  $("#update-modal-error").hidden = true;
+  $("#update-modal-progress").hidden = false;
+  $("#update-progress-phase").textContent = "正在提交更新任务...";
+  $("#update-progress-bar").style.width = "0%";
+  $("#update-progress-detail").textContent = "准备中...";
+
+  try {
+    const res = await api("/api/self-update", {
+      method: "POST",
+      body: JSON.stringify({
+        target_id: updateTargetSnapshot.target_id,
+        confirm: true,
+      }),
+    });
+    if (res && res.ok && res.job) {
+      selfUpdateJobId = res.job.id;
+      try { localStorage.setItem("fnmusic_self_update_job_id", selfUpdateJobId); } catch (_) {}
+      pollSelfUpdate(selfUpdateJobId);
+    } else {
+      throw new Error((res && res.error) || "创建更新任务失败");
+    }
+  } catch (err) {
+    $("#update-modal-progress").hidden = true;
+    $("#update-modal-error").hidden = false;
+    $("#update-error-text").textContent = err.message || "启动更新失败";
+    $("#update-install-btn").disabled = false;
+    $("#update-install-btn").hidden = false;
+  }
+}
+
+function pollSelfUpdate(jobId) {
+  if (selfUpdatePollTimer) clearTimeout(selfUpdatePollTimer);
+
+  const phaseLabels = {
+    downloading: "正在下载更新包",
+    verifying: "正在校验安装包哈希值",
+    backing_up: "正在备份配置与持久数据",
+    staging: "正在暂存安装包到应用中心",
+    installing: "正在执行原生升级，服务可能短暂重启",
+    restarting: "正在等待服务重启恢复",
+  };
+
+  async function step() {
+    try {
+      const res = await api(`/api/self-update/jobs/${jobId}`);
+      if (!res || !res.ok || !res.job) {
+        throw new Error("查询任务失败");
+      }
+      const job = res.job;
+      const phase = job.phase || "";
+      const status = job.status || "";
+
+      let phaseText = phaseLabels[phase] || "处理中...";
+      if (phase === "downloading" && job.source) {
+        phaseText += ` (${job.source === "gitee" ? "Gitee" : "GitHub"})`;
+      }
+      $("#update-progress-phase").textContent = phaseText;
+
+      if (phase === "downloading") {
+        const dl = Number(job.downloaded_bytes || 0);
+        const total = Number(job.total_bytes || 0);
+        if (total > 0) {
+          const pct = Math.min(100, Math.round((dl / total) * 100));
+          $("#update-progress-bar").style.width = pct + "%";
+          $("#update-progress-detail").textContent =
+            `${(dl / 1024 / 1024).toFixed(1)} MB / ${(total / 1024 / 1024).toFixed(1)} MB (${pct}%)`;
+        } else {
+          $("#update-progress-detail").textContent = `${(dl / 1024 / 1024).toFixed(1)} MB`;
+        }
+      } else {
+        $("#update-progress-bar").style.width = "100%";
+        $("#update-progress-detail").textContent = status === "completed" ? "已完成" : "请稍候...";
+      }
+
+      if (status === "completed") {
+        $("#update-progress-phase").textContent = "升级成功，正在刷新页面...";
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        setTimeout(() => { window.location.reload(); }, 3000);
+        return;
+      }
+
+      if (status === "failed") {
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        $("#update-modal-progress").hidden = true;
+        $("#update-modal-error").hidden = false;
+        const msg = job.message || "";
+        if (msg.includes("下载失败") || msg.includes("GitHub 下载最新版本") || msg.includes("所有下载源均失败")) {
+          $("#update-error-text").textContent = "下载失败，请到 GitHub 下载最新版本。";
+          $("#update-error-link").href = "https://github.com/javycoder/fnos_music_ext/releases";
+          $("#update-error-link").hidden = false;
+        } else {
+          $("#update-error-text").textContent = `升级失败: ${msg || "未知错误"}`;
+          $("#update-error-link").href = "https://github.com/javycoder/fnos_music_ext/releases";
+          $("#update-error-link").hidden = false;
+        }
+        $("#update-install-btn").disabled = false;
+        $("#update-install-btn").hidden = false;
+        $("#update-install-btn").textContent = "重试下载并安装";
+        return;
+      }
+
+      if (status === "unknown") {
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        $("#update-modal-progress").hidden = true;
+        $("#update-modal-error").hidden = false;
+        $("#update-error-text").textContent = `安装结果待确认: ${job.message || "请前往飞牛应用中心查看状态"}`;
+        $("#update-error-link").hidden = true;
+        return;
+      }
+
+      const pollInterval = (typeof window !== "undefined" && typeof window.SELF_UPDATE_POLL_INTERVAL === "number")
+        ? window.SELF_UPDATE_POLL_INTERVAL
+        : 1500;
+      selfUpdatePollTimer = setTimeout(step, pollInterval);
+    } catch (_) {
+      const errInterval = (typeof window !== "undefined" && typeof window.SELF_UPDATE_POLL_INTERVAL === "number")
+        ? window.SELF_UPDATE_POLL_INTERVAL
+        : 2000;
+      selfUpdatePollTimer = setTimeout(step, errInterval);
+    }
+  }
+
+  step();
+}
+
+if (typeof window !== "undefined") {
+  window.pollSelfUpdate = pollSelfUpdate;
+  window.startSelfUpdate = startSelfUpdate;
+}
+
+async function checkActiveSelfUpdateJob() {
+  try {
+    const res = await api("/api/self-update");
+    if (res && res.ok && res.job) {
+      if (res.job.status === "queued" || res.job.status === "running") {
+        selfUpdateJobId = res.job.id;
+        openUpdateModal();
+        pollSelfUpdate(selfUpdateJobId);
+      }
+    }
+  } catch (_) {}
 }
 
 function closeUpdateModal() {
@@ -3321,6 +3518,9 @@ function closeUpdateModal() {
 }
 
 $("#about-new").addEventListener("click", openUpdateModal);
+$("#update-install-btn").addEventListener("click", () => {
+  startSelfUpdate().catch(() => {});
+});
 $("#update-cancel-btn").addEventListener("click", closeUpdateModal);
 $("#update-modal").addEventListener("click", (ev) => {
   if (ev.target === ev.currentTarget) closeUpdateModal();  // 点遮罩空白处关闭
@@ -3615,6 +3815,7 @@ $("#organize-modal").addEventListener("click", (ev) => {
   await loadConfig();
   await loadStatus();
   await loadOrganizeStatus();
+  checkActiveSelfUpdateJob().catch(() => {});  // 恢复可能仍在执行的自更新任务
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   void checkActiveConfigJob();

@@ -811,8 +811,28 @@
       <div class="kv"><b>发布日期</b><span id="update-modal-date">-</span></div>
       <div class="modal-section">更新内容</div>
       <div class="update-changelog" id="update-modal-changelog"></div>
+
+      <!-- 确认提示文本 -->
+      <div id="update-modal-prompt" class="update-prompt" hidden></div>
+
+      <!-- 下载与安装进度条 -->
+      <div id="update-modal-progress" class="update-progress-block" hidden>
+        <div class="kv"><b>升级状态</b><span id="update-progress-phase">准备中...</span></div>
+        <div class="progress-bar-wrap">
+          <div id="update-progress-bar" class="progress-bar" style="width: 0%"></div>
+        </div>
+        <div id="update-progress-detail" class="progress-detail">0.0 MB / 0.0 MB (0%)</div>
+      </div>
+
+      <!-- 错误提示 -->
+      <div id="update-modal-error" class="update-error-block" hidden>
+        <p id="update-error-text" class="update-error-text"></p>
+        <div class="btn-row pad"><a id="update-error-link" class="btn" target="_blank" rel="noopener" hidden>前往 GitHub 下载</a></div>
+      </div>
+
       <div class="btn-row modal-actions">
         <button class="btn" id="update-cancel-btn">取消</button>
+        <button class="btn primary" id="update-install-btn" hidden>下载并安装</button>
         <a class="btn primary" id="update-upgrade-btn" target="_blank" rel="noopener">升级</a>
       </div>
     </div>

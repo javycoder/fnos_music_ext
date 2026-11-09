@@ -3169,10 +3169,40 @@ def test_update_check_gitee_null_body_degrades(env_file, update_cache_clean):
     assert rj["has_update"] is False
 
 
+def test_update_check_filters_draft_and_prerelease(env_file, update_cache_clean):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "api.github.com" in str(request.url):
+            # GitHub 是草稿或预发布，应自动回退到 Gitee 的正式版
+            return httpx.Response(200, json=dict(GH_RELEASE, draft=True))
+        return httpx.Response(200, json=GT_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["ok"] is True
+    assert rj["source"] == "gitee"
+    assert rj["has_update"] is True
+    assert len(calls) == 2
+
+
 def test_update_check_requires_admin(env_file, update_cache_clean):
     with TestClient(webui.app) as client:
         r = client.get("/api/update-check")
     assert r.status_code == 403
+
+
+def test_self_update_direct_access_returns_501(env_file):
+    with authed_client() as client:
+        r1 = client.get("/api/self-update")
+        assert r1.status_code == 501
+        assert "当前访问方式不支持自动更新" in r1.json()["error"]
+
+        r2 = client.post("/api/self-update", json={"target_id": "a" * 32, "confirm": True})
+        assert r2.status_code == 501
+        assert "当前访问方式不支持自动更新" in r2.json()["error"]
 
 
 def test_hidden_toggled_elements_not_defeated_by_display():

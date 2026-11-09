@@ -1422,6 +1422,91 @@ test("switchPage('about') 顺带触发检查更新", async () => {
   assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
 });
 
+test("openUpdateModal：解析快照成功展示确认询问与下载安装按钮", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  enqueue("/app/fnmusic-ext/api/self-update/target", {
+    ok: true,
+    target: {
+      target_id: "snap-1",
+      tag: "v2.9.0",
+      formal_base: "2.9.0",
+      install_version: "2.9.0-0",
+      architecture: "amd64",
+      asset_name: "fnmusic-ext-2.9.0-0.x86_64.fpk",
+      source: "gitee",
+    },
+  });
+  await global.checkUpdate();
+  global.openUpdateModal();
+  await new Promise((r) => realSetTimeout(r, 0));
+  assert.strictEqual(els.get("#update-modal-prompt").hidden, false);
+  assert.ok(els.get("#update-modal-prompt").textContent.includes("是否下载并安装 v2.9.0（安装版本 2.9.0-0）？"));
+  assert.strictEqual(els.get("#update-install-btn").hidden, false);
+  assert.strictEqual(els.get("#update-upgrade-btn").hidden, true);
+});
+
+test("startSelfUpdate：点击下载安装提交 POST 并启动进度轮询", async () => {
+  global.window.SELF_UPDATE_POLL_INTERVAL = 10;
+  enqueue("/app/fnmusic-ext/api/self-update", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "running",
+      phase: "downloading",
+      source: "gitee",
+      downloaded_bytes: 5242880,
+      total_bytes: 10485760,
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/self-update/jobs/job-1", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "running",
+      phase: "downloading",
+      source: "gitee",
+      downloaded_bytes: 5242880,
+      total_bytes: 10485760,
+    },
+  });
+  await els.get("#update-install-btn").dispatch("click");
+  await new Promise((r) => realSetTimeout(r, 20));
+  assert.strictEqual(els.get("#update-modal-progress").hidden, false);
+  assert.ok(els.get("#update-progress-phase").textContent.includes("Gitee"));
+  assert.strictEqual(els.get("#update-progress-bar").style.width, "50%");
+});
+
+test("pollSelfUpdate：双源下载失败展示指定文案与 GitHub 链接", async () => {
+  global.window.SELF_UPDATE_POLL_INTERVAL = 10;
+  enqueue("/app/fnmusic-ext/api/self-update/jobs/job-1", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "failed",
+      phase: "downloading",
+      source: "github",
+      message: "所有下载源均失败: 下载失败，请到 GitHub 下载最新版本。",
+    },
+  });
+  await new Promise((r) => realSetTimeout(r, 30));
+  assert.strictEqual(els.get("#update-modal-progress").hidden, true);
+  assert.strictEqual(els.get("#update-modal-error").hidden, false);
+  assert.strictEqual(els.get("#update-error-text").textContent, "下载失败，请到 GitHub 下载最新版本。");
+  assert.strictEqual(els.get("#update-error-link").hidden, false);
+  assert.strictEqual(els.get("#update-install-btn").textContent, "重试下载并安装");
+});
+
+test("nav-dot 点击直接弹出更新弹窗并阻止冒泡", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  const dot = stubEl();
+  qsaRegistry.set(".nav-dot", [dot]);
+  await global.checkUpdate();
+  let stopped = false;
+  await dot.dispatch("click", { stopPropagation: () => { stopped = true; } });
+  assert.strictEqual(stopped, true);
+  assert.strictEqual(els.get("#update-modal").hidden, false);
+});
+
 const CLEANUP_PATH = "/app/fnmusic-ext/api/maintenance/cleanup";
 const cleanupResponse = (status, extra = {}) => ({ ok: true, job: {
   id: "cleanup-1", status, phase: "scan", scanned: 10, removed: 2,

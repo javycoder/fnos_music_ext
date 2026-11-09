@@ -1286,13 +1286,19 @@ async def _fetch_release(request: Request, source: dict) -> "tuple[bool, dict | 
     if not isinstance(data, dict) or not data.get("tag_name"):
         # gitee 对"无发行版"返回 200 + null body（release.yml 实测），不能只看 HTTP 码
         return False, f"{source['name']} 无发行版数据"
+    if data.get("draft") is True:
+        return False, f"{source['name']} 属于草稿发行版"
+    if data.get("prerelease") is True:
+        return False, f"{source['name']} 属于预发布版本"
     return True, {
         "version": str(data["tag_name"]).strip().lstrip("vV"),
+        "tag_name": str(data["tag_name"]).strip(),
         "name": str(data.get("name") or "").strip(),
         "published_at": str(data.get("published_at") or data.get("created_at") or ""),
         "changelog": _strip_release_body(str(data.get("body") or "")),
         # tag 页 URL 缺失时按 tag 名兜底构造（两边仓库发行版页同构 /releases/tag/<tag>）
         "html_url": str(data.get("html_url") or f"{source['page']}/tag/{data['tag_name']}"),
+        "assets": data.get("assets") if isinstance(data.get("assets"), list) else [],
     }
 
 
@@ -2965,6 +2971,15 @@ async def api_update_check(request: Request):
     _update_cache.clear()
     _update_cache.update({"ts": now, "data": result})
     return result
+
+
+@app.api_route("/api/self-update", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/api/self-update/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def api_self_update_fallback(full_path: str = ""):
+    return JSONResponse(
+        status_code=501,
+        content={"ok": False, "error": "当前访问方式不支持自动更新，请通过应用中心或宿主管理网关访问"},
+    )
 
 
 @app.get("/api/logs/export")
