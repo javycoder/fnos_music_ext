@@ -11,6 +11,8 @@
   发来，由宿主侧（本进程，root）代读文件内容。
 - POST /app/fnmusic-ext/api/fs-check——浏览器把储存目录（缓存/下载目录）路径
   发来，由宿主侧按真实落盘视角（root proxy）探测目录存在性与可写性。
+- POST /app/fnmusic-ext/api/logs/export——浏览器把飞牛目录选择器返回的 NAS
+  目录发来，由宿主侧以当前用户身份保存标准 ZIP。
 - /api/maintenance：仅转发已确认的清理/任务查询到固定私有 Unix socket，
   不持有业务状态，也不把未知维护请求交给普通 WebUI。
 """
@@ -22,12 +24,18 @@ import re
 import http.client
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 import uuid
 from urllib.parse import unquote
 from pathlib import Path
+
+try:
+    import pwd
+except ImportError:  # Development-machine unit tests run on non-Linux hosts.
+    pwd = None
 
 UPSTREAM = ("127.0.0.1", 8774)
 SOCK_NAME = "fnmusic-ext.sock"
@@ -42,6 +50,10 @@ HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径
 HOST_FILE_MAX_BYTES = 9_000_000       # 与 lxmusic SCRIPT_MAX_BYTES 对齐
 FS_CHECK_PATHS = ("/app/fnmusic-ext/api/fs-check", "/api/fs-check")
 FS_CHECK_MAX_BODY = 1 << 20           # 同 host-file：只装一个路径字符串
+LOG_EXPORT_PATHS = ("/app/fnmusic-ext/api/logs/export", "/api/logs/export")
+LOG_EXPORT_MAX_BODY = 1 << 20
+LOG_EXPORT_VOLUME = re.compile(r"/vol[1-9][0-9]*(?:/.+)?\Z")
+LOG_EXPORT_FILENAME = re.compile(r"fnmusic-logs-[0-9]{14}-[0-9a-f]{8}\.zip\Z")
 MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
 MAINTENANCE_ROOT = "/api/maintenance"
 MAINTENANCE_MAX_HEADER = 16 * 1024
@@ -265,6 +277,168 @@ def handle_fs_check(client: socket.socket, headers: dict[str, str], head_raw: by
             pass
 
 
+def _valid_log_export_directory(path: str) -> "Path | None":
+    if (not path.startswith("/") or ".." in Path(path).parts or
+            any(char in path for char in "\r\n\x00") or
+            not LOG_EXPORT_VOLUME.fullmatch(path)):
+        return None
+    try:
+        normalized = Path(os.path.normpath(path))
+        if str(normalized) != path.rstrip("/") or normalized.is_symlink():
+            return None
+        status = normalized.lstat()
+        if not os.path.isdir(str(normalized)) or os.path.realpath(normalized) != str(normalized):
+            return None
+        return normalized
+    except (OSError, ValueError):
+        return None
+
+
+def _export_filename(disposition: str) -> "str | None":
+    match = re.search(r'filename="?([^";]+)"?', disposition or "")
+    return match.group(1) if match and LOG_EXPORT_FILENAME.fullmatch(match.group(1)) else None
+
+
+def _run_log_writer(uid: int, target: Path, response: http.client.HTTPResponse,
+                    first_chunk: bytes) -> None:
+    account = pwd.getpwuid(uid)
+    command = [
+        "setpriv", f"--reuid={uid}", f"--regid={account.pw_gid}", "--init-groups",
+        sys.executable, str(Path(__file__).with_name("log_export_writer.py")), str(target),
+    ]
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, close_fds=True,
+    )
+    completed = False
+    try:
+        assert process.stdin is not None
+        if first_chunk:
+            process.stdin.write(first_chunk)
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            process.stdin.write(chunk)
+        process.stdin.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        if process.wait(timeout=RELAY_TIMEOUT) != 0:
+            detail = stderr.decode("utf-8", "replace").strip()
+            raise OSError(detail or f"写入进程失败（exit={process.returncode}）")
+        completed = True
+    finally:
+        if not completed:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=CONNECT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+
+def handle_log_export(client: socket.socket, headers: dict[str, str], head_raw: bytes,
+                      upstream: tuple[str, int]) -> None:
+    """POST /api/logs/export：选中的 NAS 目录内由当前用户身份落盘。"""
+    connection = None
+    try:
+        if headers.get("x-trim-isadmin", "").lower() != "true":
+            client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可保存日志"}))
+            return
+        uid_text = headers.get("x-trim-userid", "").strip()
+        if not re.fullmatch(r"[1-9][0-9]*", uid_text):
+            client.sendall(_json_response(403, {"ok": False, "error": "缺少有效的飞牛用户身份"}))
+            return
+        uid = int(uid_text)
+        if pwd is None:
+            client.sendall(_json_response(503, {
+                "ok": False, "error": "当前系统不支持用户身份写入",
+            }))
+            return
+        try:
+            pwd.getpwuid(uid)
+        except KeyError:
+            client.sendall(_json_response(403, {"ok": False, "error": "飞牛用户不存在"}))
+            return
+        client.settimeout(CONNECT_TIMEOUT)
+        body = _read_full_body(client, headers, head_raw, LOG_EXPORT_MAX_BODY)
+        client.settimeout(None)
+        if body is None:
+            client.sendall(_json_response(400, {"ok": False, "error": "请求体无效"}))
+            return
+        try:
+            request = json.loads(body.decode("utf-8"))
+            directory = request.get("directory") if isinstance(request, dict) else None
+        except Exception:  # noqa: BLE001
+            directory = None
+        target_dir = _valid_log_export_directory(directory) if isinstance(directory, str) else None
+        if target_dir is None:
+            client.sendall(_json_response(400, {
+                "ok": False, "error": "日志保存目录必须是已存在的存储卷目录",
+            }))
+            return
+
+        connection = http.client.HTTPConnection(upstream[0], upstream[1], timeout=CONNECT_TIMEOUT)
+        connection.request("GET", "/app/fnmusic-ext/api/logs/export", headers={
+            "X-Trim-Isadmin": "true",
+            "Connection": "close",
+        })
+        response = connection.getresponse()
+        if response.status != 200:
+            error = response.read(65536).decode("utf-8", "replace")
+            client.sendall(_json_response(502, {
+                "ok": False, "error": f"生成日志包失败（HTTP {response.status}）",
+                "detail": error[:512],
+            }))
+            return
+        filename = _export_filename(response.getheader("Content-Disposition", ""))
+        if filename is None:
+            response.read(1)
+            client.sendall(_json_response(502, {"ok": False, "error": "日志包响应无效"}))
+            return
+        if connection.sock is not None:
+            connection.sock.settimeout(RELAY_TIMEOUT)
+        first_chunk = response.read(65536)
+        if not first_chunk.startswith(b"PK\x03\x04"):
+            client.sendall(_json_response(502, {"ok": False, "error": "日志包不是标准 ZIP"}))
+            return
+        target = target_dir / filename
+        try:
+            _run_log_writer(uid, target, response, first_chunk)
+        except FileNotFoundError as exc:
+            client.sendall(_json_response(503, {
+                "ok": False, "error": "NAS 写入组件不可用", "detail": str(exc)[:256],
+            }))
+            return
+        except OSError as exc:
+            client.sendall(_json_response(400, {
+                "ok": False, "error": f"保存日志失败: {exc}",
+            }))
+            return
+        client.sendall(_json_response(200, {
+            "ok": True,
+            "filename": filename,
+            "path": str(target),
+        }))
+    except OSError:
+        try:
+            client.sendall(_json_response(503, {"ok": False, "error": "日志导出服务不可用"}))
+        except OSError:
+            pass
+    finally:
+        if connection is not None:
+            connection.close()
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
 def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM) -> None:
     sock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -305,6 +479,10 @@ def _is_host_file_request(head_raw: bytes) -> bool:
 
 def _is_fs_check_request(head_raw: bytes) -> bool:
     return _post_request_path(head_raw) in FS_CHECK_PATHS
+
+
+def _is_log_export_request(head_raw: bytes) -> bool:
+    return _post_request_path(head_raw) in LOG_EXPORT_PATHS
 
 
 def _maintenance_target(head_raw: bytes):
@@ -441,6 +619,9 @@ def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
         return
     if _is_fs_check_request(head_raw):
         handle_fs_check(client, headers, head_raw)
+        return
+    if _is_log_export_request(head_raw):
+        handle_log_export(client, headers, head_raw, upstream)
         return
     try:
         remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)

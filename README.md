@@ -350,7 +350,7 @@ FPK 用户从飞牛桌面以管理员身份打开；源码用户确认安装时�
 <details>
 <summary><strong>如何导出日志并反馈问题？</strong></summary>
 
-在管理页「关于 → 导出日志」下载近 3 天 `.logzip`，到 [GitHub Issues](https://github.com/javycoder/fnos_music_ext/issues) 提交：扩展版本、官方音乐版本、Docker / native、主音源、客户端、复现步骤及错误时间。
+在管理页「关于 → 运行日志」点击「下载到本机」下载近 3 天 `.zip`；在飞牛 App / 飞牛桌面内也可点击「保存到 NAS」选择目录直接保存。到 [GitHub Issues](https://github.com/javycoder/fnos_music_ext/issues) 提交：扩展版本、官方音乐版本、Docker / native、主音源、客户端、复现步骤及错误时间。
 
 日志包含脱敏处理，但**分享前仍需自行检查**，不要公开 Cookie、访问令牌、大模型密钥、私人路径或有隐私的歌单信息。安装排障可查看 `/var/log/apps/fnmusic-ext-install.log`；安全问题请参照 [SECURITY.md](SECURITY.md)，仅提交不含密钥、私人路径等敏感信息的影响与复现，不要在公开 Issue 中披露秘密。
 

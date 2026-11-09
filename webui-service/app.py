@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import secrets
 import stat
 import subprocess
 import sys
@@ -2444,7 +2445,8 @@ def _export_log_files(directory: Path):
         for item in sorted(directory.iterdir(), key=lambda p: p.name):
             try:
                 st = item.lstat()
-                if (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and item.suffix != ".logzip"
+                if (stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+                        and item.suffix not in (".logzip", ".zip")
                         and item.name not in ("log_collection.json", "proxy_diagnostics.json",
                                               "export_env_snapshot.txt")
                         and st.st_mtime >= cutoff):
@@ -2670,7 +2672,7 @@ async def api_update_check(request: Request):
 
 @app.get("/api/logs/export")
 async def api_logs_export():
-    """近 3 天日志 + 环境快照；下载名为 <YYYYMMDDHHMMSS>.logzip。
+    """近 3 天日志 + 环境快照；下载名为 fnmusic-logs-<时间>-<随机串>.zip。
 
     每个请求独占系统临时目录（不在日志目录内，避免日志清理影响下载）。
     压缩在线程池执行；仅在本响应发送结束后清理，不保留历史导出包，
@@ -2678,7 +2680,7 @@ async def api_logs_export():
     """
     directory = log_dir()
     proxy_status = await _proxy_diagnostics()
-    filename = f"{time.strftime('%Y%m%d%H%M%S')}.logzip"
+    filename = f"fnmusic-logs-{time.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}.zip"
     temp_dir = None
     try:
         # 不能在 worker 仍写包时取消并删除其目录；等压缩结束再移交给响应。
@@ -2694,7 +2696,7 @@ async def api_logs_export():
                 await run_in_threadpool(append_status)
                 response = _LogExportResponse(
                     target,
-                    media_type="application/octet-stream",
+                    media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'},
                 )
             except BaseException:
@@ -2706,6 +2708,15 @@ async def api_logs_export():
         return JSONResponse(content={"ok": False, "error": f"日志打包失败: {exc}"}, status_code=500)
     logger.info("[diag] log_export file=%s", filename)
     return response
+
+
+@app.post("/api/logs/export")
+async def api_logs_export_to_nas():
+    """NAS 保存只允许宿主网关拦截；直连 WebUI 不接受任意写入路径。"""
+    return JSONResponse(
+        content={"ok": False, "error": "保存到 NAS 需要在飞牛 App 或飞牛桌面内操作"},
+        status_code=501,
+    )
 
 
 # ------------------------------------------------------------------ 静态前端 --

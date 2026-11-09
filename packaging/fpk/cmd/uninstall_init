@@ -26,7 +26,7 @@ if [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/restore.sh" ]; then
     fi
 fi
 
-# 运行日志（logs/，含导出的 .logzip）不属于需备份的用户数据：卸载即删。
+# 运行日志（logs/，含历史导出的 .logzip/.zip）不属于需备份的用户数据：卸载即删。
 # 应用中心随后会删整个应用目录，这里先删一次确保降级/异常路径下也不残留。
 # _common leaves the repo empty when the payload has already disappeared.
 # Require a canonical, non-root repo with its installer marker before cleanup;

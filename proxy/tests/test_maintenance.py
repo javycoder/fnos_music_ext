@@ -342,19 +342,21 @@ def test_log_cleanup_uses_three_day_policy_and_strict_ownership(env, monkeypatch
     old_archive = put(logs / 'proxy.log.20261017.00000001', age=3 * m.DAY + 1)
     new_archive = put(logs / 'proxy.log.20261017.00000002', age=2 * m.DAY)
     old_export = put(logs / '20261017120000.logzip', age=3 * m.DAY + 1)
+    old_zip_export = put(logs / 'fnmusic-logs-20261017120000-aaaaaaaa.zip',
+                         age=3 * m.DAY + 1)
     bad_export = put(logs / 'not-a-timestamp.logzip', age=99 * m.DAY)
     current = put(logs / 'proxy.log', age=99 * m.DAY)
     snapshot = put(logs / 'env_snapshot.txt', age=99 * m.DAY)
     unknown = put(logs / 'keep.log.20261017.00000001', age=99 * m.DAY)
     nested = put(logs / 'nested' / 'proxy.log.20261017.00000001', age=99 * m.DAY)
-    reclaimed = old_archive.stat().st_size + old_export.stat().st_size
+    reclaimed = old_archive.stat().st_size + old_export.stat().st_size + old_zip_export.stat().st_size
     monkeypatch.setenv('FNMUSIC_LOG_DIR', str(logs))
     job = run(env)
-    assert not old_archive.exists() and not old_export.exists()
+    assert not old_archive.exists() and not old_export.exists() and not old_zip_export.exists()
     retained = (new_archive, bad_export, current, snapshot, unknown, nested)
     assert all(path.exists() for path in retained), [str(path) for path in retained if not path.exists()]
-    assert job['categories']['logs']['scanned'] == 3
-    assert job['categories']['logs']['removed'] == 2
+    assert job['categories']['logs']['scanned'] == 4
+    assert job['categories']['logs']['removed'] == 3
     assert job['categories']['logs']['skipped'] == 1
     assert job['categories']['logs']['bytes'] == reclaimed
 

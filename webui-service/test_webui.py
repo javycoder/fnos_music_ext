@@ -2582,8 +2582,9 @@ def test_logs_export_pack_and_cleanup(about_env, export_temp_root):
         assert r1.status_code == 200
         disp = r1.headers.get("content-disposition", "")
         import re as _re
-        m = _re.search(r'filename="(\d{14})\.logzip"', disp)
+        m = _re.search(r'filename="(fnmusic-logs-\d{14}-[0-9a-f]{8}\.zip)"', disp)
         assert m, disp
+        assert r1.headers["content-type"].startswith("application/zip")
         zf = zipfile.ZipFile(io.BytesIO(r1.content))
         names = set(zf.namelist())
         assert "proxy.log" in names and "webui.log" in names
@@ -2592,12 +2593,13 @@ def test_logs_export_pack_and_cleanup(about_env, export_temp_root):
         assert "[env] context=" in zf.read("export_env_snapshot.txt").decode("utf-8")
         # 响应结束就删除其私有包，不把下载产物留在日志目录。
         assert not list(export_temp_root.iterdir())
-        assert not list(logs.glob("*.logzip"))
+        assert not list(logs.glob("*.zip"))
         r2 = client.get("/api/logs/export")
         assert r2.status_code == 200
-        assert _re.search(r'filename="(\d{14})\.logzip"', r2.headers["content-disposition"])
+        assert _re.search(r'filename="fnmusic-logs-\d{14}-[0-9a-f]{8}\.zip"',
+                          r2.headers["content-disposition"])
         assert not list(export_temp_root.iterdir())
-        assert not list(logs.glob("*.logzip"))
+        assert not list(logs.glob("*.zip"))
 
 
 def test_logs_export_concurrent_same_second_before_file_open(about_env, export_temp_root, monkeypatch):
@@ -2609,6 +2611,8 @@ def test_logs_export_concurrent_same_second_before_file_open(about_env, export_t
     log = about_env / "logs" / "proxy.log"
     log.write_bytes(b"first request\n")
     monkeypatch.setattr(webui.time, "strftime", lambda *args: "20261010235959")
+    random_names = iter(("aaaa1111", "bbbb2222"))
+    monkeypatch.setattr(webui.secrets, "token_hex", lambda _: next(random_names))
     original_call = webui._LogExportResponse.__call__
     paths = []
 
@@ -2636,7 +2640,8 @@ def test_logs_export_concurrent_same_second_before_file_open(about_env, export_t
                 second = await asyncio.wait_for(client.get("/api/logs/export"), 5)
                 assert second.status_code == 200
                 assert paths[0] != paths[1]
-                assert paths[0].name == paths[1].name == "20261010235959.logzip"
+                assert paths[0].name == "fnmusic-logs-20261010235959-aaaa1111.zip"
+                assert paths[1].name == "fnmusic-logs-20261010235959-bbbb2222.zip"
                 assert paths[0].exists()  # 第二个请求清理不影响第一个
                 assert not paths[1].parent.exists()
                 listing = await client.get("/api/about")
@@ -2647,12 +2652,15 @@ def test_logs_export_concurrent_same_second_before_file_open(about_env, export_t
             for response, expected in ((first_response, b"first request\n"),
                                        (second, b"second request\n")):
                 assert response.status_code == 200
-                assert response.headers["content-disposition"] == 'attachment; filename="20261010235959.logzip"'
+                assert response.headers["content-disposition"] == (
+                    f'attachment; filename="fnmusic-logs-20261010235959-'
+                    f'{"aaaa1111" if response is first_response else "bbbb2222"}.zip"'
+                )
                 with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                     assert archive.read("proxy.log") == expected
                     assert "export_env_snapshot.txt" in archive.namelist()
             assert not list(export_temp_root.iterdir())
-            assert not list((about_env / "logs").glob("*.logzip"))
+            assert not list((about_env / "logs").glob("*.zip"))
 
     asyncio.run(exercise())
 
@@ -2710,6 +2718,7 @@ def test_logs_export_excludes_symlinks_and_listing_matches(about_env, export_tem
     if hasattr(os, "mkfifo"):
         os.mkfifo(logs / "pipe.log")
     (logs / "old.logzip").write_bytes(b"legacy archive")
+    (logs / "fnmusic-logs-20260101000000-aaaaaaaa.zip").write_bytes(b"current archive")
     old = logs / "old.log"
     old.write_text("expired")
     os.utime(old, (time.time() - 4 * 86400,) * 2)
@@ -2725,6 +2734,7 @@ def test_logs_export_excludes_symlinks_and_listing_matches(about_env, export_tem
     assert secret.read_text() == "must not export"
     # 不扫描删除历史包：它可能是旧版本仍在发送的响应。
     assert (logs / "old.logzip").exists()
+    assert (logs / "fnmusic-logs-20260101000000-aaaaaaaa.zip").exists()
 
 
 def test_logs_export_rejects_symlink_swapped_after_listing(about_env, export_temp_root, monkeypatch):
@@ -2936,6 +2946,13 @@ def test_logs_export_pins_host_directory_before_a_symlink_swap(about_env, monkey
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
         assert archive.read("host/proxy.log") == b"safe-host-log\n"
         assert all(b"must-not-export" not in archive.read(name) for name in archive.namelist())
+
+
+def test_logs_export_post_is_gateway_only(about_env):
+    with authed_client() as client:
+        response = client.post("/api/logs/export", json={"directory": "/vol1/music"})
+    assert response.status_code == 501
+    assert response.json()["error"] == "保存到 NAS 需要在飞牛 App 或飞牛桌面内操作"
 
 
 def test_config_put_logs_cfg_lines(env_file, svctl, caplog):

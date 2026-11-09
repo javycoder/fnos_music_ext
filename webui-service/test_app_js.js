@@ -165,6 +165,17 @@ function reset() {
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
 
+function replaceNavigator(value) {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    value, configurable: true, writable: true,
+    enumerable: descriptor ? descriptor.enumerable : false,
+  });
+  return () => Object.defineProperty(globalThis, "navigator", descriptor || {
+    value: undefined, configurable: true, writable: true,
+  });
+}
+
 /* ------------------------------------------------ 加载 app.js -------------- */
 const src = fs.readFileSync(path.join(__dirname, "static", "app.js"), "utf8");
 vm.runInThisContext(src, { filename: "app.js" });
@@ -1159,7 +1170,7 @@ test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async 
     resp: {
       ok: true, status: 200,
       headers: { get: (n) => (String(n).toLowerCase() === "content-disposition"
-        ? 'attachment; filename="20261010220000.logzip"' : null) },
+        ? 'attachment; filename="fnmusic-logs-20261010220000-aaaaaaaa.zip"' : null) },
       blob: async () => ({ __blob: true }),
     },
   });
@@ -1167,7 +1178,160 @@ test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async 
   assert.ok(fetchCalls.some((c) => c.method === "GET" && c.path === "/app/fnmusic-ext/api/logs/export"));
   assert.strictEqual(createdUrls.length, 1);  // blob → objectURL
   // 下载文件名取自 Content-Disposition 并展示在导出备注
-  assert.ok(global.document.querySelector("#log-export-note").textContent.includes("20261010220000.logzip"));
+  assert.ok(global.document.querySelector("#log-export-note").textContent.includes(
+    "fnmusic-logs-20261010220000-aaaaaaaa.zip"));
+  assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已发起下载"));
+});
+
+test("移动端先准备 ZIP，再通过系统文件分享", async () => {
+  let shared = null;
+  const restoreNavigator = replaceNavigator({
+    canShare: (data) => !!(data && data.files && data.files.length),
+    share: async (data) => { shared = data; },
+  });
+  const originalMatchMedia = global.window.matchMedia;
+  global.window.matchMedia = () => ({ matches: true });
+  try {
+    enqueue("/app/fnmusic-ext/api/logs/export", {
+      __rawResponse: true,
+      resp: {
+        ok: true, status: 200,
+        headers: { get: () => 'attachment; filename="fnmusic-logs-20261010220000-bbbbbbbb.zip"' },
+        blob: async () => ({ __blob: true }),
+      },
+    });
+    await global.exportLogs();
+    assert.strictEqual(global.document.querySelector("#log-share-btn").hidden, false);
+    await global.sharePreparedLogs();
+    assert.strictEqual(shared.files[0].name, "fnmusic-logs-20261010220000-bbbbbbbb.zip");
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("系统分享流程已结束"));
+    assert.strictEqual(global.document.querySelector("#log-export-btn").disabled, false);
+  } finally {
+    restoreNavigator();
+    global.window.matchMedia = originalMatchMedia;
+    global.clearPreparedLogShare(false);
+  }
+});
+
+test("移动端系统分享取消后保留已准备的 ZIP", async () => {
+  const restoreNavigator = replaceNavigator({
+    canShare: (data) => !!(data && data.files && data.files.length),
+    share: async () => {
+      const error = new Error("cancel");
+      error.name = "AbortError";
+      throw error;
+    },
+  });
+  const originalMatchMedia = global.window.matchMedia;
+  global.window.matchMedia = () => ({ matches: true });
+  try {
+    enqueue("/app/fnmusic-ext/api/logs/export", {
+      __rawResponse: true,
+      resp: {
+        ok: true, status: 200,
+        headers: { get: () => 'attachment; filename="fnmusic-logs-20261010220000-dddddddd.zip"' },
+        blob: async () => ({ __blob: true }),
+      },
+    });
+    await global.exportLogs();
+    await global.sharePreparedLogs();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已取消分享"));
+    assert.strictEqual(global.document.querySelector("#log-share-btn").hidden, false);
+  } finally {
+    restoreNavigator();
+    global.window.matchMedia = originalMatchMedia;
+    global.clearPreparedLogShare(false);
+  }
+});
+
+test("NAS 导出选择目录、显示路径并支持复制和定位", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  const picked = [];
+  const restoreNavigator = replaceNavigator({
+    clipboard: { writeText: async (text) => { picked.push(["copy", text]); } },
+  });
+  global.loadTrimSdk = async () => ({
+    pickUserFile: async (options) => {
+      picked.push(options);
+      return { data: ["/vol1/music"] };
+    },
+    openFileManager: async (path) => { picked.push(["open", path]); },
+  });
+  try {
+    enqueue("/app/fnmusic-ext/api/logs/export", {
+      ok: true,
+      filename: "fnmusic-logs-20261010220000-cccccccc.zip",
+      path: "/vol1/music/fnmusic-logs-20261010220000-cccccccc.zip",
+    });
+    await global.exportLogsToNas();
+    assert.strictEqual(picked[0].directory, true);
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已保存"));
+    assert.strictEqual(global.document.querySelector("#log-export-path").textContent,
+      "/vol1/music/fnmusic-logs-20261010220000-cccccccc.zip");
+    assert.strictEqual(global.document.querySelector("#log-export-result").hidden, false);
+    const post = fetchCalls.find((call) => call.method === "POST" && call.path === "/app/fnmusic-ext/api/logs/export");
+    assert.deepStrictEqual(JSON.parse(post.body), { directory: "/vol1/music" });
+    await global.copyLogExportPath();
+    await global.openLogExportFolder();
+    assert.deepStrictEqual(picked.slice(1), [
+      ["copy", "/vol1/music/fnmusic-logs-20261010220000-cccccccc.zip"],
+      ["open", "/vol1/music"],
+    ]);
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+    restoreNavigator();
+  }
+});
+
+test("NAS 选择取消与服务端失败不显示保存成功", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  global.loadTrimSdk = async () => ({
+    pickUserFile: async () => ({ data: [] }),
+  });
+  try {
+    await global.exportLogsToNas();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已取消选择目录"));
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
+  global.loadTrimSdk = async () => ({
+    pickUserFile: async () => ({ data: ["/vol1/music"] }),
+  });
+  enqueue("/app/fnmusic-ext/api/logs/export", new Error("disk full"));
+  try {
+    await global.exportLogsToNas();
+    assert.strictEqual(global.document.querySelector("#log-export-note").textContent, "");
+    assert.strictEqual(global.document.querySelector("#log-export-result").hidden, true);
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
+});
+
+test("SDK 初始化失败时给出明确入口提示", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  global.loadTrimSdk = async () => false;
+  try {
+    await global.exportLogsToNas();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("飞牛 App 或飞牛桌面"));
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
+});
+
+test("独立浏览器引导从飞牛入口保存到 NAS", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  global.loadTrimSdk = async () => ({
+    isStandaloneWeb: true,
+    pickUserFile: async () => {
+      throw new Error("must not pick");
+    },
+  });
+  try {
+    await global.exportLogsToNas();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("请从飞牛 App 或飞牛桌面打开"));
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
 });
 
 test("switchPage('about') 懒加载关于数据", async () => {

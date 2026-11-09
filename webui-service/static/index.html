@@ -489,8 +489,15 @@
             <div class="card-title"><span>运行日志</span><button class="help-btn" type="button" data-help="logs" aria-label="运行日志帮助">?</button></div>
             <div id="about-logs" class="stack"></div>
             <div class="btn-row">
-              <button class="btn" id="log-export-btn">导出日志</button>
+              <button class="btn" id="log-export-btn">下载到本机</button>
+              <button class="btn" id="log-share-btn" hidden>保存或分享 ZIP</button>
+              <button class="btn" id="log-nas-btn" hidden>保存到 NAS</button>
               <span class="muted" id="log-export-note"></span>
+            </div>
+            <div class="log-export-result" id="log-export-result" hidden>
+              <span id="log-export-path"></span>
+              <button class="btn small" id="log-copy-path" type="button">复制路径</button>
+              <button class="btn small" id="log-open-folder" type="button">打开文件夹</button>
             </div>
           </div>
         </div>
@@ -604,7 +611,8 @@
     <p>DeepSeek 等推理模型若正文为空，可在附加请求参数中填写 {"thinking":{"type":"disabled"}} 关闭思考，或调大单次输出上限。猜你喜欢默认间隔 0.5 小时、数量 20，间隔须为有限数字且无上限，数量须为整数且不可留空。启用并保存后后台预生成首批，不必先打开歌单。</p>
   </template>
   <template data-help-id="logs">
-    <p>日志本地滚动保留 3 天，卸载时随应用删除。导出包含近 3 天全部日志与环境快照；密钥会脱敏，但仍建议只在需要排查问题时提供给可信对象。</p>
+    <p>日志本地滚动保留 3 天，卸载时随应用删除。导出为标准 ZIP，包含近 3 天全部日志与环境快照；密钥会脱敏，但仍建议只在需要排查问题时提供给可信对象。</p>
+    <p>电脑可直接下载；手机可先打包再调用系统保存/分享。在飞牛 App 或飞牛桌面内，也可选择 NAS 目录直接保存并定位文件。</p>
   </template>
 
   <div class="modal-mask help-modal" id="help-modal" hidden>

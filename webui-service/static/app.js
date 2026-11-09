@@ -2702,6 +2702,7 @@ DIR_FIELDS.forEach(bindDirField);
   // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
   const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
   if (pathname.startsWith("/app/")) {
+    $("#log-nas-btn").hidden = false;
     const sdk = await loadTrimSdk();
     if (sdk) {
       $("#lx-pick").hidden = false;
@@ -2839,39 +2840,197 @@ async function loadAbout() {
   checkUpdate();
 }
 
+let logShareFile = null;
+
+function isMobileExportDevice() {
+  const coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+  const userAgent = (globalThis.navigator && globalThis.navigator.userAgent) || "";
+  return coarse || /Android|iPhone|iPad|Mobile/i.test(userAgent);
+}
+
+function canShareLogFiles() {
+  const nav = globalThis.navigator;
+  return !!(nav && typeof nav.canShare === "function" && typeof nav.share === "function" &&
+    typeof File === "function");
+}
+
+function setLogExportBusy(busy) {
+  ["#log-export-btn", "#log-share-btn", "#log-nas-btn"].forEach((id) => {
+    $(id).disabled = busy;
+  });
+}
+
+function clearPreparedLogShare(clearNote) {
+  logShareFile = null;
+  $("#log-share-btn").hidden = true;
+  if (clearNote) $("#log-export-note").textContent = "";
+}
+
+function browserDownloadLog(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  $("#log-export-note").textContent =
+    `已发起下载 ${name}，保存位置由浏览器或系统设置决定`;
+}
+
+async function fetchLogArchive() {
+  const resp = await fetch(APP_BASE + "/api/logs/export");
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`;
+    try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
+    throw new Error(msg);
+  }
+  const blob = await resp.blob();
+  const match = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
+  const name = match ? match[1] : `fnmusic-logs-${Date.now()}.zip`;
+  return { blob, name };
+}
+
 async function exportLogs() {
-  const btn = $("#log-export-btn");
-  const note = $("#log-export-note");
-  if (btn.disabled) return;
-  btn.disabled = true;
-  note.textContent = "打包中…";
+  if ($("#log-export-btn").disabled) return;
+  setLogExportBusy(true);
+  $("#log-export-note").textContent = "打包中…";
+  $("#log-export-result").hidden = true;
   try {
-    const resp = await fetch(APP_BASE + "/api/logs/export");
-    if (!resp.ok) {
-      let msg = `HTTP ${resp.status}`;
-      try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
-      throw new Error(msg);
+    const archive = await fetchLogArchive();
+    if (isMobileExportDevice() && canShareLogFiles()) {
+      logShareFile = new File([archive.blob], archive.name, { type: "application/zip" });
+      const supported = globalThis.navigator.canShare({
+        files: [logShareFile], title: "fnmusic-ext 日志",
+      });
+      if (supported) {
+        $("#log-share-btn").hidden = false;
+        $("#log-export-note").textContent =
+          `ZIP 已准备好（${archive.name}），请点击“保存或分享 ZIP”`;
+        return;
+      }
+      logShareFile = null;
     }
-    const blob = await resp.blob();
-    const m = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
-    const name = m ? m[1] : `fnmusic-logs-${Date.now()}.logzip`;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    note.textContent = `已导出 ${name}`;
+    browserDownloadLog(archive.blob, archive.name);
   } catch (exc) {
-    note.textContent = "";
+    $("#log-export-note").textContent = "";
     toast("日志导出失败：" + exc.message, "fail");
+    clearPreparedLogShare(false);
   } finally {
-    btn.disabled = false;
+    setLogExportBusy(false);
   }
 }
 $("#log-export-btn").addEventListener("click", () => { exportLogs().catch(() => {}); });
+
+async function sharePreparedLogs() {
+  if (!logShareFile || $("#log-share-btn").disabled) return;
+  setLogExportBusy(true);
+  try {
+    await globalThis.navigator.share({
+      files: [logShareFile],
+      title: "fnmusic-ext 日志",
+      text: "fnmusic-ext 运行日志",
+    });
+    $("#log-export-note").textContent = "系统分享流程已结束";
+  } catch (exc) {
+    if (exc && exc.name === "AbortError") {
+      $("#log-export-note").textContent = "已取消分享，ZIP 仍保留，可再次保存或分享";
+    } else {
+      browserDownloadLog(logShareFile, logShareFile.name);
+      toast("系统分享不可用，已改为下载 ZIP；也可保存到 NAS", "fail");
+    }
+  } finally {
+    setLogExportBusy(false);
+  }
+}
+$("#log-share-btn").addEventListener("click", () => { sharePreparedLogs().catch(() => {}); });
+
+async function exportLogsToNas() {
+  if ($("#log-nas-btn").disabled) return;
+  setLogExportBusy(true);
+  $("#log-export-result").hidden = true;
+  $("#log-export-note").textContent = "选择 NAS 保存目录…";
+  try {
+    const sdk = await loadTrimSdk();
+    if (!sdk) {
+      $("#log-export-note").textContent = "当前环境不支持 NAS 保存，请在飞牛 App 或飞牛桌面内打开";
+      return;
+    }
+    if (sdk.isStandaloneWeb) {
+      $("#log-export-note").textContent = "请从飞牛 App 或飞牛桌面打开管理台后再保存到 NAS";
+      return;
+    }
+    if (typeof sdk.pickUserFile !== "function") {
+      $("#log-export-note").textContent = "当前飞牛版本不支持目录选择，请升级飞牛 App 或系统";
+      return;
+    }
+    const picked = await sdk.pickUserFile({
+      directory: true,
+      title: "选择日志保存位置",
+      okText: "保存到这里",
+      creatable: true,
+      sidebarGroup: ["myFiles", "otherShare", "external", "remote", "favorites"],
+    });
+    const paths = (picked && picked.data) || [];
+    if (!paths.length) {
+      $("#log-export-note").textContent = "已取消选择目录，未导出日志";
+      return;
+    }
+    const directory = paths[0];
+    $("#log-export-note").textContent = "正在打包并保存到 NAS…";
+    const resp = await fetch(APP_BASE + "/api/logs/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directory }),
+    });
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok || !body.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+    const result = $("#log-export-result");
+    $("#log-export-path").textContent = body.path;
+    $("#log-export-path").dataset.directory = directory;
+    $("#log-export-path").dataset.path = body.path;
+    result.hidden = false;
+    $("#log-export-note").textContent = `已保存 ${body.filename}`;
+    clearPreparedLogShare(false);
+  } catch (exc) {
+    $("#log-export-note").textContent = "";
+    toast("保存到 NAS 失败：" + exc.message, "fail");
+  } finally {
+    setLogExportBusy(false);
+  }
+}
+$("#log-nas-btn").addEventListener("click", () => { exportLogsToNas().catch(() => {}); });
+
+async function copyLogExportPath() {
+  const path = $("#log-export-path").dataset.path || "";
+  if (!path) return;
+  try {
+    await globalThis.navigator.clipboard.writeText(path);
+    toast("路径已复制", "ok");
+  } catch (_) {
+    toast("复制失败，请手动复制显示的路径", "fail");
+  }
+}
+$("#log-copy-path").addEventListener("click", () => { copyLogExportPath().catch(() => {}); });
+
+async function openLogExportFolder() {
+  const directory = $("#log-export-path").dataset.directory || "";
+  if (!directory) return;
+  try {
+    const sdk = await loadTrimSdk();
+    if (!sdk || typeof sdk.openFileManager !== "function") {
+      throw new Error("当前环境不支持打开文件管理器");
+    }
+    await sdk.openFileManager(directory);
+  } catch (exc) {
+    toast("打开文件夹失败：" + exc.message, "fail");
+  }
+}
+$("#log-open-folder").addEventListener("click", () => { openLogExportFolder().catch(() => {}); });
+
+window.addEventListener("pagehide", () => { clearPreparedLogShare(false); });
 
 /* -------------------------------------------------------------- 检查更新 */
 async function checkUpdate() {

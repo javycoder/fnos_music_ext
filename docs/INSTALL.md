@@ -353,7 +353,7 @@ location /music/ {
 - **封面看不到**：封面默认由代理同源直出字节（`FNMUSIC_COVER_MODE=proxy`），无需外链可达；若反代后仍看不到，检查反代是否剥离了 query 参数（`?coverId=`）。
 - **热门推荐重启后不能播、第二天恢复**：先升级到 2.8.3 或更新版本；已修复洛雪 songInfo 只存内存导致重启后推荐曲目被当作“未知曲目”解析失败的问题。封面仍有 1 天客户端缓存，但不要把跨天等待当作处理办法。
 - **入口差异**：自建 nginx/NPM 可按上方配置检查；HTTPS 端口映射保留客户端实际 Host 与端口；fn Connect 没有用户可配置的外层 nginx，遇到失败需结合日志继续定位。
-- **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
+- **仍异常**：WebUI「关于 → 运行日志」下载 `.zip`，或在飞牛 App / 飞牛桌面内「保存到 NAS」；附到 issue 的日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
 
 ### 构建时报 `pass "--allow=network.host"`（issue #71）
 
