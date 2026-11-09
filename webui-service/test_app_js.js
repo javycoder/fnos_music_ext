@@ -3275,6 +3275,59 @@ test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
   assert.ok(css.includes(".progress-bar"), "CSS 必须包含 .progress-bar 样式");
 });
 
+test("平台测试：轮询临时失败后继续查询", async () => {
+  reset();
+  vm.runInThisContext('clearTimeout(platformTestTimer); platformTestJob = {job_id:"retry", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", new Error("temporary outage"));
+  await global.pollPlatformTestJob();
+  assert.ok(els.get("#platform-test-summary").textContent.includes("将重试"));
+  assert.ok(vm.runInThisContext("platformTestTimer !== null"));
+  enqueue("/app/fnmusic-ext/api/platforms/test/status",
+    {ok:true, status:"done", results:[], progress:{done:1,total:1}});
+  await global.pollPlatformTestJob();
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+  assert.strictEqual(vm.runInThisContext("platformTestTimer"), null);
+});
+
+test("平台测试：停止后迟到的轮询不覆盖状态", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"stop", status:"running", results:[], progress:{done:0,total:1}};');
+  let release;
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", {__rawResponse:true, resp:{
+    ok:true, status:200, json:() => new Promise((resolve) => { release = resolve; }),
+  }});
+  const polling = global.pollPlatformTestJob();
+  await tick(0);
+  enqueue("/app/fnmusic-ext/api/platforms/test/stop", {ok:true});
+  await global.stopPlatformTest();
+  release({ok:true, status:"running", results:[], progress:{done:0,total:1}});
+  await polling;
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "cancelled");
+  assert.ok(els.get("#platform-test-summary").textContent.includes("已停止"));
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+});
+
+test("平台测试：停止失败保留任务并允许重试", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"stop-fail", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/stop", new Error("unavailable"));
+  await global.stopPlatformTest();
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "running");
+  assert.strictEqual(els.get("#platform-test-stop").disabled, false);
+  assert.ok(els.get("#platform-test-summary").textContent.includes("停止失败"));
+});
+
+test("平台测试：记录过期恢复开始按钮", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"expired", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", {__rawResponse:true, resp:{
+    ok:false, status:404, json:async () => ({error:"job not found or expired"}),
+  }});
+  await global.pollPlatformTestJob();
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "expired");
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

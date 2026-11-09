@@ -1083,7 +1083,6 @@ $("#platform-test-btn").addEventListener("click", () => {
 let platformTestJob = null;
 let platformTestTimer = null;
 let platformTestPolling = false;
-let platformTestResults = [];
 
 function formatPlatformLatency(ms) {
   const n = Number(ms);
@@ -1150,10 +1149,12 @@ function updatePlatformTestProgress(done, total) {
 }
 
 async function pollPlatformTestJob() {
-  if (platformTestPolling || !platformTestJob || platformTestJob.status === "done") return;
+  if (platformTestPolling || !platformTestJob || platformTestJob.status !== "running") return;
+  const job = platformTestJob;
   platformTestPolling = true;
   try {
-    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(platformTestJob.job_id));
+    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(job.job_id));
+    if (platformTestJob !== job || job.status !== "running") return;
     if (!data.ok) throw new Error(data.error || "status failed");
     platformTestJob.status = data.status;
     platformTestJob.results = data.results || [];
@@ -1165,11 +1166,12 @@ async function pollPlatformTestJob() {
     renderPlatformTestStats(platformTestJob.progress.done, platformTestJob.progress.total, okCount, failCount);
     $("#platform-test-enable-ok").textContent = `启用成功的 (${okCount})`;
     $("#platform-test-disable-fail").textContent = `关闭无效的 (${failCount})`;
-    if (data.status === "done") {
+    if (data.status !== "running") {
       $("#platform-test-actions").hidden = false;
       $("#platform-test-start").disabled = false;
       $("#platform-test-stop").disabled = true;
-      setPlatformTestMessage("测试完成，可批量启停平台");
+      setPlatformTestMessage(data.status === "done" ? "测试完成，可批量启停平台" :
+        data.status === "cancelled" ? "已停止，可操作已完成的结果" : "测试失败，可重新测试");
       clearTimeout(platformTestTimer);
       platformTestTimer = null;
     } else {
@@ -1177,7 +1179,16 @@ async function pollPlatformTestJob() {
       platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
     }
   } catch (exc) {
-    setPlatformTestMessage(`查询失败：${exc.message}`);
+    if (platformTestJob !== job || job.status !== "running") return;
+    if (exc.status === 404) {
+      job.status = "expired";
+      $("#platform-test-start").disabled = false;
+      $("#platform-test-stop").disabled = true;
+      setPlatformTestMessage("测试记录已过期，请重新测试");
+    } else {
+      setPlatformTestMessage(`查询失败，将重试：${exc.message}`);
+      platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+    }
   } finally {
     platformTestPolling = false;
   }
@@ -1187,17 +1198,19 @@ async function startPlatformTest() {
   const keyword = $("#platform-test-keyword").value.trim() || "周杰伦";
   const concurrency = parseInt($("#platform-test-concurrency").value, 10) || 4;
   $("#platform-test-start").disabled = true;
-  $("#platform-test-stop").disabled = false;
+  $("#platform-test-stop").disabled = true;
+  clearTimeout(platformTestTimer);
+  platformTestJob = null;
   $("#platform-test-actions").hidden = true;
   setPlatformTestMessage("正在启动…");
   renderPlatformTestStats(0, 0, 0, 0);
-  platformTestResults = [];
   renderPlatformTestTable([]);
   $("#platform-test-progress-wrap").hidden = true;
   try {
     const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) });
     if (!data.ok) throw new Error(data.error || "start failed");
     platformTestJob = { job_id: data.job_id, status: "running", results: [], progress: { done: 0, total: data.total } };
+    $("#platform-test-stop").disabled = false;
     updatePlatformTestProgress(0, data.total);
     platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
   } catch (exc) {
@@ -1207,16 +1220,25 @@ async function startPlatformTest() {
   }
 }
 
-function stopPlatformTest() {
-  if (platformTestJob) {
-    api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: platformTestJob.job_id }) }).catch(() => {});
-  }
-  clearTimeout(platformTestTimer);
-  platformTestTimer = null;
-  platformTestJob = null;
-  $("#platform-test-start").disabled = false;
+async function stopPlatformTest() {
+  const job = platformTestJob;
+  if (!job || job.status !== "running") return;
   $("#platform-test-stop").disabled = true;
-  setPlatformTestMessage("已停止");
+  try {
+    const data = await api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.job_id }) });
+    if (!data.ok) throw new Error(data.error || "stop failed");
+    if (platformTestJob !== job) return;
+    job.status = "cancelled";
+    clearTimeout(platformTestTimer);
+    platformTestTimer = null;
+    $("#platform-test-start").disabled = false;
+    $("#platform-test-actions").hidden = false;
+    setPlatformTestMessage("已停止，可操作已完成的结果");
+  } catch (exc) {
+    if (platformTestJob !== job) return;
+    $("#platform-test-stop").disabled = job.status !== "running";
+    setPlatformTestMessage(`停止失败：${exc.message}`);
+  }
 }
 
 $("#platform-test-start").addEventListener("click", startPlatformTest);
@@ -1243,11 +1265,13 @@ $("#platform-test-enable-all").addEventListener("click", () => {
   const all = platformTestJob ? platformTestJob.results.map((r) => r.platform) : platforms.registered;
   platforms.enabled = Array.from(new Set(all));
   renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
   markDirty("已启用全部测试平台");
 });
 $("#platform-test-disable-all").addEventListener("click", () => {
   platforms.enabled = [];
   renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
   markDirty("已停用全部平台");
 });
 

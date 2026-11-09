@@ -1161,7 +1161,7 @@ async def _lifespan(_app: FastAPI):
     finally:
         reaper.cancel()
         resident_task.cancel()
-        tasks = list(_config_job_tasks)
+        tasks = list(_config_job_tasks) + list(_platform_test_tasks.values())
         for task in tasks:
             task.cancel()
         if tasks:
@@ -2277,19 +2277,24 @@ async def api_platforms(request: Request):
 
 # 平台批量测试任务存储（进程内，TTL 10 分钟）
 _platform_test_jobs: dict[str, dict] = {}
+_platform_test_tasks: dict[str, asyncio.Task] = {}
 _PLATFORM_TEST_JOB_TTL = 600.0
+_PLATFORM_TEST_MAX_JOBS = 32
 _PLATFORM_TEST_DEFAULT_KEYWORD = "周杰伦"
 _PLATFORM_TEST_DEFAULT_CONCURRENCY = 4
 _PLATFORM_TEST_MAX_CONCURRENCY = 8
 _PLATFORM_TEST_PER_PLATFORM_TIMEOUT = 30.0
-_PLATFORM_TEST_MUSICDL_TIMEOUT = 20.0
 
 
 def _cleanup_platform_test_jobs() -> None:
     now = time.monotonic()
     expired = [jid for jid, j in _platform_test_jobs.items()
-               if now - j.get("updated_at", j.get("created_at", now)) > _PLATFORM_TEST_JOB_TTL]
+               if j["status"] != "running"
+               and now - j.get("updated_at", j.get("created_at", now)) > _PLATFORM_TEST_JOB_TTL]
     for jid in expired:
+        _platform_test_jobs.pop(jid, None)
+    finished = [jid for jid, j in _platform_test_jobs.items() if j["status"] != "running"]
+    for jid in finished[:max(0, len(_platform_test_jobs) - _PLATFORM_TEST_MAX_JOBS + 1)]:
         _platform_test_jobs.pop(jid, None)
 
 
@@ -2328,6 +2333,10 @@ async def _test_one_platform(client: httpx.AsyncClient, platform: str, keyword: 
         else:
             result["error"] = "no results"
         return result
+    except httpx.TimeoutException:
+        result["latency_ms"] = int((time.monotonic() - started) * 1000)
+        result["error"] = "timeout"
+        return result
     except Exception as exc:  # noqa: BLE001
         elapsed = time.monotonic() - started
         result["latency_ms"] = int(elapsed * 1000)
@@ -2340,7 +2349,6 @@ async def _run_platform_test_job(job_id: str, platforms: list[str], keyword: str
     if not job:
         return
     sem = asyncio.Semaphore(concurrency)
-    client = httpx.AsyncClient(timeout=httpx.Timeout(_PLATFORM_TEST_PER_PLATFORM_TIMEOUT, connect=5.0))
 
     async def _one(p: str):
         async with sem:
@@ -2352,14 +2360,24 @@ async def _run_platform_test_job(job_id: str, platforms: list[str], keyword: str
             job["updated_at"] = time.monotonic()
 
     try:
-        await asyncio.gather(*[_one(p) for p in platforms], return_exceptions=True)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_PLATFORM_TEST_PER_PLATFORM_TIMEOUT, connect=5.0)
+        ) as client:
+            await asyncio.gather(*[_one(p) for p in platforms])
+    except asyncio.CancelledError:
+        job["cancelled"] = True
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("平台批量测试任务失败")
+        job["status"] = "error"
     finally:
-        await client.aclose()
-    job["status"] = "done"
-    job["updated_at"] = time.monotonic()
-    ok_count = sum(1 for r in job["results"] if r.get("status") == "ok")
-    job["ok_count"] = ok_count
-    job["fail_count"] = len(job["results"]) - ok_count
+        if job["cancelled"]:
+            job["status"] = "cancelled"
+        elif job["status"] == "running":
+            job["status"] = "done"
+        job["updated_at"] = time.monotonic()
+        job["ok_count"] = sum(1 for r in job["results"] if r.get("status") == "ok")
+        job["fail_count"] = len(job["results"]) - job["ok_count"]
 
 
 @app.post("/api/platforms/test/start")
@@ -2390,6 +2408,9 @@ async def api_platform_test_start(request: Request):
     registered = data.get("registered") or []
     if not registered:
         return JSONResponse(content={"ok": False, "error": "musicdl 未注册任何平台"}, status_code=503)
+    # sources 请求会让出事件循环；在创建任务前检查，避免同时启动多个全平台批次。
+    if any(j["status"] == "running" for j in _platform_test_jobs.values()):
+        return JSONResponse(content={"ok": False, "error": "已有平台测试正在运行"}, status_code=409)
 
     job_id = uuid.uuid4().hex
     job = {
@@ -2405,7 +2426,9 @@ async def api_platform_test_start(request: Request):
         "cancelled": False,
     }
     _platform_test_jobs[job_id] = job
-    asyncio.create_task(_run_platform_test_job(job_id, list(registered), keyword, concurrency))
+    task = asyncio.create_task(_run_platform_test_job(job_id, list(registered), keyword, concurrency))
+    _platform_test_tasks[job_id] = task
+    task.add_done_callback(lambda finished: _platform_test_tasks.pop(job_id, None))
     return {"ok": True, "job_id": job_id, "total": len(registered)}
 
 
@@ -2440,7 +2463,15 @@ async def api_platform_test_stop(request: Request):
     job_id = str(body.get("job_id") or "").strip()
     if not job_id or job_id not in _platform_test_jobs:
         return JSONResponse(content={"ok": False, "error": "job not found or expired"}, status_code=404)
-    _platform_test_jobs[job_id]["cancelled"] = True
+    j = _platform_test_jobs[job_id]
+    if j["status"] == "running":
+        j["cancelled"] = True
+        j["status"] = "cancelled"
+        j["updated_at"] = time.monotonic()
+        task = _platform_test_tasks.get(job_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     return {"ok": True}
 
 

@@ -739,3 +739,12 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .pt-badge.err { background: var(--err-soft); color: var(--err); }
 .pt-sample { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .platform-toggle.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+@media (max-width: 680px) {
+  .pt-field { flex: 1 1 9rem; }
+  .pt-field .input { width: 100%; }
+  .pt-field-num { flex: none; }
+  .pt-toolbar-actions { margin-left: 0; width: 100%; }
+  .pt-toolbar-actions .btn { flex: 1; }
+  .pt-sample { max-width: 200px; }
+}
