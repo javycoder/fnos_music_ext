@@ -261,7 +261,7 @@ def test_favorite_during_active_tee_stream_no_duplicate_download(env, monkeypatc
     make_official_db(env["db_path"], with_track=False)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -436,7 +436,7 @@ async def test_handoff_falls_back_to_full_download_on_no_range(tmp_path, monkeyp
 
     monkeypatch.setattr(appmod, "_open_online_stream", fake_open)
 
-    async def fake_full(guid, headers, force_mp3=False, fresh_url=False):
+    async def fake_full(guid, headers, force_mp3=False, fresh_url=False, **_kwargs):
         calls["full"] = (guid, fresh_url)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_full)

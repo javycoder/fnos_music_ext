@@ -141,7 +141,7 @@ def test_scenario1_fav_autobind_disabled_no_task(monkeypatch):
     monkeypatch.setitem(CONF, "fav_auto_bind", False)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -166,7 +166,7 @@ def test_scenario2_fav_autobind_enabled_registers_task(monkeypatch):
     monkeypatch.setitem(CONF, "tee_save_enabled", False)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -189,7 +189,7 @@ def test_scenario3_fav_autobind_skips_when_cached(monkeypatch):
     monkeypatch.setattr(appmod, "find_cache_file", lambda guid: "/fake/path/music.flac")
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -213,7 +213,7 @@ def test_scenario4_playlist_add_track_registered_for_online_only(monkeypatch):
     monkeypatch.setitem(CONF, "fav_auto_bind", True)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -271,7 +271,7 @@ def test_fav_autobind_cooldown_and_dedup(monkeypatch):
     appmod._full_fetch_failed[FAKE_KUWO1] = now
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -320,7 +320,7 @@ def test_issue120_playlist_batch_add_never_downloads(monkeypatch):
     monkeypatch.setitem(CONF, "fav_auto_bind", True)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -348,7 +348,7 @@ def test_issue120_explicit_save_intent_still_downloads(monkeypatch):
     monkeypatch.setitem(CONF, "fav_auto_bind", True)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)
@@ -379,7 +379,7 @@ def test_issue120_favorite_create_unaffected(monkeypatch):
     monkeypatch.setitem(CONF, "tee_save_enabled", False)
     recorded = []
 
-    async def fake_download(guid, headers):
+    async def fake_download(guid, headers, **_kwargs):
         recorded.append(guid)
 
     monkeypatch.setattr(appmod, "_full_fetch_download", fake_download)

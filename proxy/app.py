@@ -7826,7 +7826,12 @@ def stream_tee_response(
                         _register_tee_handoff(
                             guid, resume_part, written, expected, ext, scan_headers_factory)
                 if retry_corrupt_tee:
-                    _ensure_user_saved(guid, trigger_headers, gate_key="tee_save_enabled")
+                    if CONF.get("tee_save_by_user"):
+                        _ensure_user_saved(guid, trigger_headers, gate_key="tee_save_enabled")
+                    else:
+                        _register_background_fetch(
+                            _synth_request(scan_headers_factory() if scan_headers_factory else {}),
+                            guid, "tee_save_enabled")
             if not eof and delivery_outcome == "complete":
                 delivery_outcome = "client_closed"
             _log_stream_delivery(
