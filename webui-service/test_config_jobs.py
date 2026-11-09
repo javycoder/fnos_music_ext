@@ -111,4 +111,3 @@ def test_api_config_jobs_endpoints(env_file, svctl, tmp_path, monkeypatch):
         assert "revision" in res_cfg.json()
         rev = res_cfg.json()["revision"]
         assert isinstance(rev, str) and len(rev) == 16
-

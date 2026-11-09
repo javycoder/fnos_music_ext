@@ -1153,7 +1153,7 @@ async function pollPlatformTestJob() {
   const job = platformTestJob;
   platformTestPolling = true;
   try {
-    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(job.job_id));
+    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(job.job_id), undefined, 5000);
     if (platformTestJob !== job || job.status !== "running") return;
     if (!data.ok) throw new Error(data.error || "status failed");
     platformTestJob.status = data.status;
@@ -1207,7 +1207,7 @@ async function startPlatformTest() {
   renderPlatformTestTable([]);
   $("#platform-test-progress-wrap").hidden = true;
   try {
-    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) });
+    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) }, 15000);
     if (!data.ok) throw new Error(data.error || "start failed");
     platformTestJob = { job_id: data.job_id, status: "running", results: [], progress: { done: 0, total: data.total } };
     $("#platform-test-stop").disabled = false;
@@ -1225,7 +1225,7 @@ async function stopPlatformTest() {
   if (!job || job.status !== "running") return;
   $("#platform-test-stop").disabled = true;
   try {
-    const data = await api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.job_id }) });
+    const data = await api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.job_id }) }, 10000);
     if (!data.ok) throw new Error(data.error || "stop failed");
     if (platformTestJob !== job) return;
     job.status = "cancelled";

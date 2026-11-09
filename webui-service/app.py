@@ -2354,6 +2354,7 @@ async def _run_platform_test_job(job_id: str, platforms: list[str], keyword: str
         async with sem:
             if job.get("cancelled"):
                 return
+            preview_renew("musicdl")
             r = await _test_one_platform(client, p, keyword)
             job["results"].append(r)
             job["done"] = len(job["results"])
@@ -2439,6 +2440,8 @@ async def api_platform_test_status(request: Request, job: str = ""):
     if not job_id or job_id not in _platform_test_jobs:
         return JSONResponse(content={"ok": False, "error": "job not found or expired"}, status_code=404)
     j = _platform_test_jobs[job_id]
+    if j["status"] == "running":
+        preview_renew("musicdl")
     return {
         "ok": True,
         "job_id": j["id"],

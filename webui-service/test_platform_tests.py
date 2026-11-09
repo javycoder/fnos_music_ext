@@ -115,3 +115,11 @@ def test_completed_job_counts_and_concurrency(monkeypatch):
         assert peak == 2
         assert (j["status"], j["done"], j["ok_count"], j["fail_count"]) == ("done", 3, 2, 1)
     asyncio.run(scenario())
+
+
+def test_running_status_renews_preview(monkeypatch):
+    webui._platform_test_jobs["test"] = {**job(), "keyword": "song", "concurrency": 1}
+    monkeypatch.setattr(webui, "_preview_until", {"musicdl": 1.0})
+    result = asyncio.run(webui.api_platform_test_status(request(), job="test"))
+    assert result["status"] == "running"
+    assert webui._preview_until["musicdl"] > webui.time.monotonic()
