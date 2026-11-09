@@ -386,7 +386,7 @@ def test_release_cleanup_no_previous_release(tmp_path):
     assert _published(calls)[0][:3] == ['release', 'create', 'v2.10.0b']
 
 
-# === Gitee 发行版发布：大文件上传不得整段重发 ===
+# === Gitee 发行版：仅同步说明，安装包回指 GitHub ===
 
 GITEE_STEP = 'Publish release to Gitee'
 
@@ -404,38 +404,11 @@ def _unindent_run(script):
                      for line in script.splitlines())
 
 
-def _upload_function_body(script):
-    """upload_attach 的函数体（到独占一行的右花括号为止）。"""
-    return script.split('upload_attach() {', 1)[1].split('\n}\n', 1)[0]
-
-
 def test_gitee_step_script_is_valid_bash():
     script = _unindent_run(_gitee_step_script())
     path = Path('/tmp/gitee-step.sh')
     path.write_text(script)
     subprocess.run(['bash', '-n', str(path)], check=True)
-
-
-def test_gitee_existing_asset_cleanup_uses_install_revision(tmp_path):
-    """补发只能选择真实 -N 安装包附件，不能从展示 tag 拼裸版本名。"""
-    if not shutil.which('jq'):
-        pytest.skip('release shell sandbox requires jq')
-    assets = tmp_path / 'assets.json'
-    assets.write_text(json.dumps([
-        {'id': 11, 'name': 'fnmusic-ext-2.11.0-4.fpk'},
-        {'id': 12, 'name': 'fnmusic-ext-2.11.0-4.fpk.sha256'},
-        {'id': 21, 'name': 'fnmusic-ext-2.11.0.fpk'},
-        {'id': 22, 'name': 'fnmusic-ext-2.10.2.fpk'},
-        {'id': 23, 'name': 'Source code.zip'},
-    ]))
-    script = _unindent_run(_gitee_step_script())
-    selector = script.split('for attach_id in $(', 1)[1].split('); do', 1)[0]
-    selector = selector.replace('/tmp/gitee-att-list.json', f'"{assets}"')
-    result = subprocess.run(
-        ['bash', '-e', '-o', 'pipefail', '-c', selector],
-        env=dict(os.environ, fpk_file='dist/fnmusic-ext-2.11.0-4.fpk', ver='2.11.0'),
-        capture_output=True, text=True, check=True)
-    assert result.stdout.splitlines() == ['11', '12']
 
 
 def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
@@ -448,47 +421,26 @@ def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
     assert 'pre_flags="--prerelease=false"' in workflow
 
 
-def test_gitee_large_upload_never_uses_body_replaying_retry():
-    """v2.10.0 事故根因：gcurl --retry 会把 28MB 请求体整段重发。
+def test_gitee_never_transfers_or_deletes_attachments():
+    """Gitee 只同步说明；安装包必须保留在 GitHub Release。"""
+    workflow = RELEASE_WORKFLOW.read_text()
+    assert 'actions/upload-artifact@v4' not in workflow
+    assert 'actions/download-artifact@v4' not in workflow
+    assert 'upload_attach' not in workflow
+    assert 'attach_files' not in workflow
+    assert '-F ' not in workflow
+    assert '-X DELETE' not in workflow
+    assert 'mirrored=' not in workflow
 
-    curl 的 --retry 在 --max-time 600 下最坏 6×600s 才以 exit 28 失败，
-    实测单个附件烧掉 65 分钟。上传必须走独立函数，且不得复用带 --retry 的封装。
-    """
+
+def test_gitee_notes_use_install_revision_and_github_links():
+    """说明必须使用真实安装版本号，并固定链接 GitHub 的 FPK 与校验文件。"""
     script = _unindent_run(_gitee_step_script())
-    assert 'upload_attach()' in script
-    upload_body = _upload_function_body(script)
-    assert 'gcurl' not in upload_body, '附件上传不得复用带 --retry 的 gcurl'
-    assert '--retry' not in upload_body
-    # 每次尝试自身仍要有明确上界
-    assert '--max-time' in upload_body
-    # 上传调用点必须走 upload_attach，而不是直接 curl -F
-    assert 'upload_attach "${f}"' in script
-    assert 'attach_files"' in script
-
-
-def test_gitee_step_has_bounded_wall_clock_and_idempotent_recovery():
-    """重试必须能识别"服务端已落盘但响应丢失"，避免重复传输大文件。
-
-    时限按体积分级并设文件级总预算（v2.10.1 实测：28MB fpk 在 3×300s 下全部
-    必然超时；v2.10.2 实测：2×1200s 同样 2400s 零产出）。因此改为文件级
-    总预算 + 停滞检测：大文件 1800s / 小文件 600s，且大文件只要 90s 内低于
-    20KB/s 就断开换连接，不再靠放大单次时限硬扛。
-    """
-    script = _unindent_run(_gitee_step_script())
-    assert 'timeout-minutes:' in RELEASE_WORKFLOW.read_text()
-    upload_body = _upload_function_body(script)
-    # 失败后先查附件列表再决定是否重试（幂等复用）
-    assert 'attach_files?access_token=' in upload_body
-    assert '复用现有附件' in upload_body
-    # 文件级总预算按体积分级
-    assert 'budget=1800; stall=20480' in upload_body
-    assert 'budget=600; stall=0' in upload_body
-    # 总预算必须在循环里被真正约束（剩余预算为底部退出条件）
-    assert 'deadline=$(( $(date +%s) + budget ))' in upload_body
-    assert '[ "${left}" -ge 60 ] || break' in upload_body
-    # 停滞连接必须被主动切断，而不是等满单次上限；小文件不传 0 值给 curl
-    assert 'throttle=(--speed-limit "${stall}" --speed-time 90)' in upload_body
-    assert '"${throttle[@]}"' in upload_body
+    assert 'version="$(tr -d \'[:space:]\' < VERSION)"' in script
+    assert 'fnmusic-ext-${version}.fpk' in script
+    assert 'github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"' in script
+    assert 'echo "- [${fpk_name}](${github_base}/${fpk_name})"' in script
+    assert 'echo "- [${fpk_name}.sha256](${github_base}/${fpk_name}.sha256)"' in script
 
 
 def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():
@@ -504,9 +456,6 @@ def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():
     assert 'needs: [release, update-moo-index]' in workflow
     # 独立 job 后仍需容忍 moo 失败，只在 release 成功时发布镜像
     assert "always() && needs.release.result == 'success'" in workflow
-    # fpk 由 artifact 传递，避免两个 job 各自重打包导致 sha256 不一致
-    assert 'actions/upload-artifact@v4' in workflow
-    assert 'actions/download-artifact@v4' in workflow
-    # 上传失败降级为 warning，不整 job 失败
-    assert 'mirrored=1' in workflow
-    assert '::warning::Gitee 附件' in workflow
+    # Gitee 发行说明在 tag 检出的 CHANGELOG 中生成，并回指 GitHub 资产
+    assert 'notes_file="/tmp/release-notes.md"' in workflow
+    assert 'github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"' in workflow
