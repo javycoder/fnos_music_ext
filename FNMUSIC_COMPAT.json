@@ -1,9 +1,9 @@
 {
-  "extension_version": "2.12.3-0",
+  "extension_version": "2.12.4-0",
   "music_versions": [
     "1.0.10",
     "1.1.19"
   ],
-  "checked_at": "2026-11-07",
-  "notes": "1.0.10 为既有适配基线。1.1.19 的官方 manifest 版本字段已核对，协议适配由项目回归测试覆盖。此记录仅说明版本和协议适配基线，不控制运行时行为。"
+  "checked_at": "2026-11-09",
+  "notes": "1.0.10 为既有适配基线。2026-11-09 通过已核实的 SSH 主机身份只读核对 NAS 的 /var/apps/trim.music/manifest：appname=trim.music，version=1.1.19，与 2026-11-07 基线一致。协议适配由项目回归测试覆盖；此记录仅说明版本和协议适配基线，不控制运行时行为。"
 }
