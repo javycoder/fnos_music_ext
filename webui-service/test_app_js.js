@@ -3103,6 +3103,21 @@ test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => 
   assert.ok(els.get("#toast").textContent.includes("配置已保存生效"));
 });
 
+test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
+  for (const id of ["platform-test-btn", "platform-test-panel", "platform-test-keyword",
+                    "platform-test-concurrency", "platform-test-start", "platform-test-stop",
+                    "platform-test-progress-wrap", "platform-test-progress", "platform-test-progress-text",
+                    "platform-test-summary", "platform-test-actions", "platform-test-enable-ok",
+                    "platform-test-disable-fail", "platform-test-enable-all", "platform-test-disable-all",
+                    "platform-test-table", "platform-test-tbody"]) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 必须包含 id="${id}"`);
+  }
+  assert.ok(css.includes(".data-table"), "CSS 必须包含 .data-table 样式");
+  assert.ok(css.includes(".progress-bar"), "CSS 必须包含 .progress-bar 样式");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

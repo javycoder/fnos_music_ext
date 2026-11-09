@@ -110,23 +110,25 @@ _DIRECT_SELECTIONS: dict[str, dict] = {}
 
 CONF = {
     "sources": _CONF_SOURCES,
-    "search_timeout": float(os.environ.get("MUSICDL_SEARCH_TIMEOUT", "12")),
+    "search_timeout": float(os.environ.get("MUSICDL_SEARCH_TIMEOUT", "20")),
     "limit_per_source": int(os.environ.get("MUSICDL_LIMIT_PER_SOURCE", "10")),
     "url_ttl": int(os.environ.get("MUSICDL_URL_TTL", "1800")),
     "cache_max": int(os.environ.get("MUSICDL_CACHE_MAX", "3000")),
     "work_dir": os.environ.get("MUSICDL_WORK_DIR", "/tmp/musicdl_outputs"),
     "search_cache_ttl": int(os.environ.get("MUSICDL_SEARCH_CACHE_TTL", "300")),
     "search_cache_max": int(os.environ.get("MUSICDL_SEARCH_CACHE_MAX", "200")),
-    "breaker_threshold": int(os.environ.get("MUSICDL_BREAKER_THRESHOLD", "4")),
-    "breaker_cooldown": int(os.environ.get("MUSICDL_BREAKER_COOLDOWN", "120")),
+    "breaker_threshold": int(os.environ.get("MUSICDL_BREAKER_THRESHOLD", "6")),
+    # 一次全源超时不应让搜索停摆两分钟：冷却缩短后下一次搜索即可重新探测。
+    "breaker_cooldown": int(os.environ.get("MUSICDL_BREAKER_COOLDOWN", "30")),
     # Network inactivity timeout is separate from the async response deadline.
     "request_timeout": max(0.1, float(os.environ.get("MUSICDL_REQUEST_TIMEOUT", "5"))),
     "neg_cache_ttl": int(os.environ.get("MUSICDL_NEG_TTL", "30")),
     # 自适应熔断/降级
-    "slow_degrade_s": float(os.environ.get("MUSICDL_SLOW_DEGRADE_S", "8")),
-    # 一页 10 首的上游搜索大约要 4 秒，再留出探活。压到 3 秒时搜索函数还没返回，
-    # 进度里一首都没有，界面就是 0 条，并且会把下一次超时继续压在地板上。
-    "adaptive_min_timeout": float(os.environ.get("MUSICDL_ADAPTIVE_MIN_TIMEOUT", "8")),
+    # 成功但偏慢（例如咪咕 6-11 秒）不应被当成故障，否则会误熔断可用源。
+    "slow_degrade_s": float(os.environ.get("MUSICDL_SLOW_DEGRADE_S", "15")),
+    # 一页 10 首的上游搜索 + 探活要留足预算：压到 8 秒时并发启动的 worker
+    # 光 import 和搜索就耗尽预算，界面永远 0 条，并继续把下一次压在地板上。
+    "adaptive_min_timeout": float(os.environ.get("MUSICDL_ADAPTIVE_MIN_TIMEOUT", "15")),
     "search_page_cap": max(1, int(os.environ.get("MUSICDL_SEARCH_PAGE_CAP", "10"))),
     "probe_timeout": max(0.2, float(os.environ.get("MUSICDL_PROBE_TIMEOUT", "2"))),
     "fast_return_items": int(os.environ.get("MUSICDL_FAST_RETURN_ITEMS", "12")),

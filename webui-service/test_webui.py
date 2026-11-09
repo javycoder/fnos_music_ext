@@ -241,11 +241,25 @@ def test_put_noop_returns_empty_change(env_file):
         assert r.json()["changed"] == []
 
 
+def test_platform_test_start_returns_503_when_musicdl_unreachable(env_file):
+    with authed_client() as client:
+        resp = client.post("/api/platforms/test/start", json={"keyword": "周杰伦", "concurrency": 4})
+        assert resp.status_code == 503
+        assert resp.json().get("ok") is False
+
+
+def test_platform_test_status_unknown_job_returns_404(env_file):
+    with authed_client() as client:
+        resp = client.get("/api/platforms/test/status?job=nonexistent")
+        assert resp.status_code == 404
+        assert resp.json().get("error") == "job not found or expired"
+
+
 def test_search_timeout_defaults_and_saves(env_file):
     with authed_client() as client:
         view = client.get("/api/config")
         assert view.status_code == 200
-        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
+        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "30"
         assert "FNMUSIC_SEARCH_PROBE" not in view.json()["values"]
         assert "FNMUSIC_SEARCH_PROBE" not in view.json()["schema"]
         saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})

@@ -35,6 +35,15 @@ from uuid import uuid4
 
 import httpx
 import anyio
+
+# 预导入后端：安装/升级期间 venv 里的包可能被整目录原子替换，Python 3.11 的
+# FileFinder 只按秒级 mtime 判断目录缓存，替换发生在同一秒内会留下缺子包/坏 .pyc
+# 的旧视图——请求期惰性导入 anyio._backends 时便会 No module named。启动期显式
+# 导入一次，之后运行期不再触发惰性查找（失败也在这里暴露，而非首个请求崩溃）。
+try:
+    import anyio._backends._asyncio  # noqa: F401
+except Exception:  # noqa: BLE001
+    pass
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
@@ -236,7 +245,7 @@ CONF = {
     "lx_resolver_timeout": float(os.environ.get("LX_RESOLVER_TIMEOUT", "8.0")),
     "lx_probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
-    "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "30")),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
     "search_empty_retry_delay": float(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY_DELAY", "1.2")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
@@ -3334,6 +3343,13 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
                     raw_items = data.get("items")
                     if isinstance(raw_items, list):
                         data["items"] = [it for it in raw_items if is_playable_online_track(it)]
+                    errors = data.get("errors")
+                    if isinstance(errors, dict):
+                        # “skipped (fast return/grace elapsed)” 是已经拿到结果后
+                        # 主动不等慢源，不是失败；混进 errors 会让聚合层误判为
+                        # 部分失败而拒绝缓存，并在每次搜索时重复打警告。
+                        data["errors"] = {k: v for k, v in errors.items()
+                                          if not str(v).startswith("skipped ")}
                     return data
         except Exception as e:
             logger.warning("Failed to fetch online search from musicdl: %s", e)
@@ -5305,6 +5321,15 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     global _LX_SCRIPT_MAP_TASK, _LIKED_EPOCH, _LIKED_BUILD_LOCK
+    # 安装/升级期间 venv 里包目录可能被原子替换；Python 3.11 的 FileFinder 仅按秒级
+    # mtime 判断目录缓存是否过期，替换发生在同一秒内会保留缺子包的旧清单（症状：
+    # 首个请求期 "No module named anyio._backends"，重试进程则正常）。服务开始对外
+    # 提供请求前强制失效一次导入缓存，确保首个请求读到当前磁盘状态。
+    try:
+        import importlib
+        importlib.invalidate_caches()
+    except Exception:  # noqa: BLE001
+        pass
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
@@ -9034,11 +9059,18 @@ async def stream_track(request: Request, subpath: str = ""):
                 )
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
-                if source_from_online_guid(candidate) == "netease":
-                    if isinstance(exc, (TimeoutError, httpx.TimeoutException)) and attempt == 0:
-                        continue
+                source = source_from_online_guid(candidate)
+                if (source != "lx" and attempt == 0
+                        and isinstance(exc, (TimeoutError, httpx.TimeoutException))):
+                    # 冷路径首超时允许再试一次（网易与 musicdl 同等对待）：
+                    # musicdl 首次解析直链 + 无损档解码探针可能超过单次尝试预算
+                    # （_STREAM_ATTEMPT_S=6s），但 musicdl 侧会缓存 URL 与探针结果，
+                    # 第二次尝试即可出流。此前 musicdl 直接 break → 404「搜得到却
+                    # 播不了」，用户必须点两次才响。lx 保持原语义（失败即换候选）。
+                    continue
+                if source == "netease":
                     break
-                if source_from_online_guid(candidate) == "lx":
+                if source == "lx":
                     fresh_lx = isinstance(exc, DeadOnlineMedia)
                     if not fresh_lx:
                         break
