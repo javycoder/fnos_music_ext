@@ -76,6 +76,11 @@ from proxy.quality_policy import (  # noqa: E402
     quality_migration,
 )
 from proxy.version import read_release_channel, ui_version
+from proxy.userstorage import (  # noqa: E402
+    merge_user_map,
+    parse_user_map,
+    validate_effective_roots,
+)
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -201,6 +206,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "各用户公共歌单"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
+    "FNMUSIC_TEE_SAVE_BY_USER": {"kind": "bool", "default": "false", "group": "storage", "reload": "hot", "label": "按用户分开保存"},
+    "FNMUSIC_TEE_SAVE_DIR_BY_USER": {"kind": "str", "default": "{}", "group": "storage", "reload": "hot", "label": "各用户下载目录"},
     "FNMUSIC_DOWNLOAD_LAYOUT": {"kind": "enum", "values": ["flat", "artist", "album", "artist_album"], "default": "flat", "group": "storage", "reload": "hot", "label": "存放方式（beta）"},
     "FNMUSIC_TEE_SAVE_MODE": {"kind": "enum", "values": ["auto", "direct", "staged"], "default": "auto", "group": "storage", "reload": "hot", "label": "落盘方式"},
     "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
@@ -211,6 +218,10 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": {"kind": "int", "default": "120", "min": 10, "max": 3600, "group": "tee", "reload": "hot", "label": "官方绑定等待（秒）"},
     "FNMUSIC_TEE_HANDOFF_MAX": {"kind": "int", "default": "3", "min": 0, "max": 20, "group": "tee", "reload": "hot", "label": "切歌续传并行数"},
     "FNMUSIC_LIBRARY_SCAN_PATH": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "曲库重扫接口（选填）"},
+    "FNMUSIC_LIBRARY_SCAN_BY_USER": {"kind": "str", "default": "{}", "group": "tee", "reload": "hot", "label": "各用户曲库扫描"},
+    "FNMUSIC_SCAN_ADMIN_USERNAME": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "扫描管理员用户名"},
+    "FNMUSIC_SCAN_ADMIN_PASSWORD": {"kind": "secret", "default": "", "group": "tee", "reload": "hot", "label": "扫描管理员密码"},
+    "FNMUSIC_SCAN_ADMIN_DEVICE_ID": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "扫描管理员设备 ID"},
     "FNMUSIC_SCAN_DELAY_S": {"kind": "float", "default": "3", "min": 0, "max": 600, "clamp": True, "step": "0.5", "group": "tee", "reload": "hot", "label": "落盘后延迟（秒）"},
     "FNMUSIC_SCAN_COOLDOWN_S": {"kind": "float", "default": "90", "min": 0, "max": 3600, "clamp": True, "step": "0.5", "group": "tee", "reload": "hot", "label": "扫描冷却窗口（秒）"},
     "FNMUSIC_LLM_BASE_URL": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "OpenAI 兼容 Base URL"},
@@ -232,6 +243,15 @@ SCHEMA: dict[str, dict] = {
 }
 
 _PROVIDER_KEYS = set(PROVIDERS.values())
+_USER_MAP_KINDS = {
+    "FNMUSIC_TEE_SAVE_DIR_BY_USER": "下载目录映射",
+    "FNMUSIC_LIBRARY_SCAN_BY_USER": "曲库重扫映射",
+}
+_SCAN_ADMIN_KEYS = {
+    "FNMUSIC_SCAN_ADMIN_USERNAME",
+    "FNMUSIC_SCAN_ADMIN_PASSWORD",
+    "FNMUSIC_SCAN_ADMIN_DEVICE_ID",
+}
 
 
 # ------------------------------------------------------------------ .env 读写 --
@@ -260,7 +280,75 @@ def write_env(updates: dict[str, str]) -> list[str]:
             mapping.update(pubpl.validate_user_selections(updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]))
             updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"] = json.dumps(
                 mapping, ensure_ascii=False, separators=(",", ":"))
+        if updates.keys() & (set(_USER_MAP_KINDS) | {"FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"}):
+            current = read_env()
+            preview = _preview_user_storage(current, updates)
+            for key in _USER_MAP_KINDS:
+                if key in updates:
+                    updates[key] = preview[key]
+            _validate_user_directory_overlap(preview)
         return _write_env_unlocked(updates)
+
+
+def _normalize_user_map_patch(key: str, raw) -> str:
+    """校验增量补丁并保留 null 删除语义，不在此处与磁盘配置合并。"""
+    kind = _USER_MAP_KINDS[key]
+    parsed = parse_user_map(raw, kind=kind, patch=True)
+    if kind == "曲库重扫映射":
+        for guid, value in parsed.items():
+            if value is None:
+                continue
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                raise ValueError(f"用户 {guid} 扫描配置包含控制字符")
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_scan_admin_value(key: str, raw) -> str:
+    if not isinstance(raw, str):
+        raise ValueError(f"{key}: 必须是字符串")
+    text = raw.strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise ValueError(f"{key}: 包含控制字符")
+    limit = 1024 if key == "FNMUSIC_SCAN_ADMIN_PASSWORD" else 256
+    if len(text) > limit:
+        raise ValueError(f"{key}: 长度超出限制")
+    return text
+
+
+def _preview_user_storage(existing: dict[str, str], updates: dict[str, str]) -> dict[str, str]:
+    preview = dict(existing)
+    preview.update(updates)
+    for key, kind in _USER_MAP_KINDS.items():
+        if key not in updates:
+            continue
+        merged = merge_user_map(
+            parse_user_map(existing.get(key, ""), kind=kind),
+            parse_user_map(updates[key], kind=kind, patch=True),
+        )
+        preview[key] = json.dumps(merged, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return preview
+
+
+def _validate_user_directory_overlap(values: dict[str, str]) -> None:
+    directories = parse_user_map(values.get("FNMUSIC_TEE_SAVE_DIR_BY_USER", ""), kind="下载目录映射")
+    scans = parse_user_map(values.get("FNMUSIC_LIBRARY_SCAN_BY_USER", ""), kind="曲库重扫映射")
+    for guid, value in scans.items():
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(f"用户 {guid} 扫描配置包含控制字符")
+    cache = _normalize_dir_path("歌曲缓存目录", values.get("FNMUSIC_CACHE_DIR"))
+    if not cache:
+        host_home = str(values.get("FNMUSIC_HOME") or "").strip()
+        if host_home.startswith("/"):
+            cache = _normalize_dir_path("默认歌曲缓存目录", host_home.rstrip("/") + "/cache")
+    global_root = _normalize_dir_path("下载目录", values.get("FNMUSIC_TEE_SAVE_DIR"))
+    validate_effective_roots({"cache_dir": cache}, directories, global_root)
+
+
+def _validate_scan_admin_pair(values: dict[str, str]) -> None:
+    username = str(values.get("FNMUSIC_SCAN_ADMIN_USERNAME") or "").strip()
+    password = str(values.get("FNMUSIC_SCAN_ADMIN_PASSWORD") or "").strip()
+    if bool(username) != bool(password):
+        raise ValueError("扫描管理员用户名和密码必须同时填写或同时清空")
 
 
 def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
@@ -1043,6 +1131,12 @@ def validate_updates(values: dict) -> dict[str, str]:
             continue
         if key not in SCHEMA:
             raise ValueError(f"不支持的配置键: {key}")
+        if key in _USER_MAP_KINDS:
+            updates[key] = _normalize_user_map_patch(key, raw)
+            continue
+        if key in _SCAN_ADMIN_KEYS:
+            updates[key] = _normalize_scan_admin_value(key, raw)
+            continue
         updates[key] = _normalize_value(key, raw)
     updates.update(legacy_updates)
     if "LX_SOURCE_LIST" in updates:
@@ -1112,6 +1206,12 @@ def validate_updates(values: dict) -> dict[str, str]:
         mapping = pubpl.validate_user_selections(updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])
         updates["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"] = json.dumps(
             mapping, ensure_ascii=False, separators=(",", ":"))
+    if updates.keys() & (set(_USER_MAP_KINDS) | {"FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"}):
+        _validate_user_directory_overlap(_preview_user_storage(existing, updates))
+    if updates.keys() & _SCAN_ADMIN_KEYS:
+        admin_preview = dict(existing)
+        admin_preview.update(updates)
+        _validate_scan_admin_pair(admin_preview)
     return updates
 
 
@@ -1558,6 +1658,8 @@ async def api_config():
     config_values = {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()}
     # GET 只计算旧配置的兼容视图，不写 .env；真正迁移由共享模块和保存流程完成。
     config_values.update(quality_migration(values))
+    password_configured = bool(str(values.get("FNMUSIC_SCAN_ADMIN_PASSWORD") or "").strip())
+    config_values["FNMUSIC_SCAN_ADMIN_PASSWORD"] = ""
     return {
         "ok": True,
         "values": config_values,
@@ -1566,6 +1668,7 @@ async def api_config():
         "webui_build": STATIC_BUILD_ID,
         "env_path": str(ENV_PATH),
         "revision": compute_config_revision(values),
+        "scan_admin_password_configured": password_configured,
     }
 
 
@@ -2666,6 +2769,58 @@ async def api_maintenance_music_users():
     if result is not None:
         return result
     raise HTTPException(status_code=501, detail="直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台")
+
+
+@app.get("/api/maintenance/user-storage")
+async def api_maintenance_user_storage():
+    """读取各用户有效目录和最近扫描状态。"""
+    result = await _try_maintenance_socket("GET", "/api/maintenance/user-storage")
+    if result is not None:
+        return result
+    raise HTTPException(status_code=501, detail="直连模式不支持读取用户目录，请在飞牛桌面内打开管理台")
+
+
+def _scan_user_body(body) -> dict:
+    if (not isinstance(body, dict) or set(body) != {"user_guid"}
+            or not isinstance(body.get("user_guid"), str)):
+        raise ValueError("用户扫描参数无效")
+    user_guid = body["user_guid"].strip()
+    if (not user_guid or user_guid == "shared" or len(user_guid) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in user_guid)):
+        raise ValueError("用户扫描参数无效")
+    return {"user_guid": user_guid}
+
+
+@app.post("/api/maintenance/scan-admin-test")
+async def api_maintenance_scan_admin_test(request: Request):
+    """只用已保存凭据验证管理员登录，不接受请求中的密码。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    if body != {}:
+        raise HTTPException(status_code=400, detail="管理员扫描测试不允许请求参数")
+    result = await _try_maintenance_socket("POST", "/api/maintenance/scan-admin-test", {})
+    if result is not None:
+        return result
+    raise HTTPException(status_code=501, detail="直连模式不支持测试管理员扫描登录，请在飞牛桌面内打开管理台")
+
+
+@app.post("/api/maintenance/scan-user")
+async def api_maintenance_scan_user(request: Request):
+    """按指定用户的有效扫描配置执行一次管理员扫描。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    try:
+        payload = _scan_user_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = await _try_maintenance_socket("POST", "/api/maintenance/scan-user", payload)
+    if result is not None:
+        return result
+    raise HTTPException(status_code=501, detail="直连模式不支持按用户扫描，请在飞牛桌面内打开管理台")
 
 
 @app.get("/api/maintenance/organize")

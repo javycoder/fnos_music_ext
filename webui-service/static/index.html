@@ -481,9 +481,38 @@
           <div class="btn-row">
             <button class="btn" id="organize-open-btn" type="button">按所选方式整理现有曲库</button>
           </div>
+          <label class="field" id="organize-user-field" hidden>
+            <span>整理哪个用户</span>
+            <select class="input" id="organize-user"></select>
+          </label>
           <p class="hint">仅影响后续下载；「整理」会按所选结构移动下载目录内的全部歌曲，包括自行放入的文件。</p>
           <p id="organize-status" role="status" aria-live="polite"></p>
           <pre class="update-changelog" id="organize-details" hidden></pre>
+        </div>
+        <div class="card" id="user-storage-card">
+          <div class="card-title"><span>按用户保存</span></div>
+          <label class="switch-row"><span>每个用户使用独立目录<span class="sub">默认关闭。未自定义的用户保存到下载根目录下按用户标识区分的子目录；关闭时仍使用上面的统一目录。</span></span><input type="checkbox" id="tee-save-by-user"></label>
+          <p class="hint">旧文件不会自动迁移或删除。目录权限以下载服务的实际检查为准。</p>
+          <div id="user-storage-list"></div>
+          <div id="user-storage-stale"></div>
+        </div>
+        <div class="card" id="scan-admin-card">
+          <div class="card-title"><span>管理员扫描</span></div>
+          <label class="field"><span>管理员用户名</span>
+            <input class="input" id="scan-admin-username" autocomplete="off">
+          </label>
+          <label class="field"><span>管理员密码</span>
+            <input class="input" id="scan-admin-password" type="password" autocomplete="new-password">
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="scan-admin-password-clear" type="button">清除已保存密码</button>
+            <button class="btn" id="scan-admin-test" type="button">测试已保存的登录</button>
+          </div>
+          <label class="field"><span>设备 ID（可留空，由本次服务自动生成）</span>
+            <input class="input" id="scan-admin-device-id" autocomplete="off">
+          </label>
+          <p class="hint">密码不会在页面刷新后回显。未修改密码时不会提交，避免普通保存清掉已保存的密码。测试和手动扫描都使用已经保存的凭据。</p>
+          <p id="scan-admin-status" role="status" aria-live="polite"></p>
         </div>
         <div class="card">
           <div class="card-title"><span>临时缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>

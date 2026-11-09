@@ -68,6 +68,9 @@ MAINTENANCE_MAX_HEADER = 16 * 1024
 MAINTENANCE_MAX_BODY = 4096
 MAINTENANCE_TIMEOUT = 35
 ORGANIZE_PATH = MAINTENANCE_ROOT + "/organize"
+USER_STORAGE_PATH = MAINTENANCE_ROOT + "/user-storage"
+SCAN_ADMIN_TEST_PATH = MAINTENANCE_ROOT + "/scan-admin-test"
+SCAN_USER_PATH = MAINTENANCE_ROOT + "/scan-user"
 ORGANIZE_LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
 SELF_UPDATE_ROOT = "/api/self-update"
 SELF_UPDATE_MAX_HEADER = 16 * 1024
@@ -563,7 +566,11 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
                            re.fullmatch(ORGANIZE_PATH + r"/[0-9a-fA-F]{32}", target) is not None)))
         # 音乐用户列表只读，走同一条管理员维护通道（GET，无请求体）
         users_route = method == "GET" and target == MAINTENANCE_ROOT + "/music-users"
-        if not (cleanup_route or organize_route or users_route):
+        user_storage_route = method == "GET" and target == USER_STORAGE_PATH
+        scan_admin_test_route = method == "POST" and target == SCAN_ADMIN_TEST_PATH
+        scan_user_route = method == "POST" and target == SCAN_USER_PATH
+        if not (cleanup_route or organize_route or users_route or user_storage_route
+                or scan_admin_test_route or scan_user_route):
             client.sendall(_json_response(404, {"ok": False, "error": "未知维护接口"}))
             return
         if "transfer-encoding" in headers:
@@ -588,9 +595,25 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
                 if req != {"confirm_beta": True} or type(req.get("confirm_beta")) is not bool:
                     raise ValueError("仅允许 confirm_beta: true 确认字段")
                 body = b'{"confirm_beta":true}'
+            elif target == SCAN_ADMIN_TEST_PATH:
+                if req != {} or not isinstance(req, dict):
+                    raise ValueError("管理员扫描测试不允许请求参数")
+                body = b"{}"
+            elif target == SCAN_USER_PATH:
+                if (not isinstance(req, dict) or set(req) != {"user_guid"}
+                        or not isinstance(req.get("user_guid"), str)):
+                    raise ValueError("用户扫描参数无效")
+                user_guid = req["user_guid"].strip()
+                if (not user_guid or user_guid == "shared" or len(user_guid) > 256
+                        or any(ord(char) < 32 or ord(char) == 127 for char in user_guid)):
+                    raise ValueError("用户扫描参数无效")
+                body = json.dumps({"user_guid": user_guid},
+                                  ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             else:
                 if (not isinstance(req, dict) or
-                        set(req) != {"confirm_beta", "root", "layout"} or
+                        set(req) not in (
+                            {"confirm_beta", "root", "layout"},
+                            {"confirm_beta", "root", "layout", "user_guid"}) or
                         type(req.get("confirm_beta")) is not bool or
                         req.get("confirm_beta") is not True or
                         not isinstance(req.get("layout"), str) or
@@ -601,8 +624,16 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
                 if (not root.startswith("/") or ".." in root.split("/") or
                         any(char in root for char in "\r\n\x00")):
                     raise ValueError("整理目录无效")
-                body = json.dumps({"confirm_beta": True, "root": root,
-                                   "layout": req["layout"]}, separators=(",", ":")).encode("utf-8")
+                payload = {"confirm_beta": True, "root": root, "layout": req["layout"]}
+                if "user_guid" in req:
+                    if not isinstance(req.get("user_guid"), str):
+                        raise ValueError("整理用户无效")
+                    user_guid = req["user_guid"].strip()
+                    if (not user_guid or user_guid == "shared" or len(user_guid) > 256
+                            or any(ord(char) < 32 or ord(char) == 127 for char in user_guid)):
+                        raise ValueError("整理用户无效")
+                    payload["user_guid"] = user_guid
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         elif body:
             raise ValueError("查询不允许请求体")
         remote = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

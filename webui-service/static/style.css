@@ -443,6 +443,15 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .dir-check.fail { color: var(--err); }
 .dir-check.skip { color: var(--muted); }
 
+.user-storage-row, .user-storage-stale-row {
+  display: grid; gap: 8px; margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.user-storage-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.user-storage-head b { font-size: 14px; }
+.user-storage-meta, .user-storage-status { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.user-storage-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
 /* 公共歌单 */
 .public-list {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(228px, 1fr));
@@ -637,6 +646,9 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .adv-fold[hidden], .radio-list[hidden], .lx-item[hidden], .chip[hidden],
 #llm-liked-settings[hidden], .help-modal[hidden],
 .btn-row[hidden], .pt-panel[hidden], .pt-progress[hidden], .pt-table-wrap[hidden],
+.update-prompt[hidden], .update-progress-block[hidden], .update-error-block[hidden] { display: none; }
+#llm-liked-settings[hidden], .help-modal[hidden], .btn-row[hidden], .field[hidden],
+.pt-panel[hidden], .pt-progress[hidden], .pt-table-wrap[hidden],
 .update-prompt[hidden], .update-progress-block[hidden], .update-error-block[hidden] { display: none; }
 
 /* -------------------------------------------------- 移动端 */

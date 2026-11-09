@@ -133,7 +133,8 @@ def _paired(stem):
 
 def _active(runtime):
     return any(bool(getattr(runtime, name, None)) for name in
-               ('_tee_active', '_full_fetch_tasks', '_tee_handoff_active'))
+               ('_tee_active', '_full_fetch_tasks', '_tee_handoff_active',
+                '_ensure_user_save_tasks'))
 
 
 def _sessions(runtime):
@@ -972,7 +973,8 @@ async def run_cleanup(runtime, job):
     try:
         engine.cache = engine.root(runtime.CONF.get('cache_dir', ''))
         engine.home = engine.root(getattr(runtime, '_HOME', ''))
-        for path in runtime.iter_media_dirs():
+        media_dirs = getattr(runtime, 'iter_cleanup_media_dirs', None) or runtime.iter_media_dirs
+        for path in media_dirs():
             root = engine.root(path)
             if root:
                 engine.media.add(root)
