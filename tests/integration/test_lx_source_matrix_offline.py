@@ -35,6 +35,19 @@ if str(INTEGRATION_DIR) not in sys.path:
 import lx_source_matrix as sm
 
 
+def test_generated_worker_writes_valid_lxserver_config(tmp_path):
+    code = sm.generate_worker_script("ephemeral-token")
+    location = (tmp_path / "lxserver").as_posix()
+    namespace = {"__name__": "isolated_worker_test"}
+    exec(compile(code.replace("/data/lxserver", location), "<worker>", "exec"), namespace)
+    namespace["write_lxserver_config"]()
+    config = (tmp_path / "lxserver" / "config.js").read_text(encoding="utf-8")
+    assert 'module.exports = {' in config
+    assert '"system.allowUnsafeVM": false' in config
+    assert '"frontend.password": "ephemeral-token"' in config
+    assert config.rstrip().endswith('};')
+
+
 # ==============================================================================
 # 1. CLI 参数与默认安全拦截测试
 # ==============================================================================
@@ -416,6 +429,23 @@ class TestNodePreloadRealSubprocess:
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'PUBLIC_IPV4_SELECTED' in result.stdout
 
+    @pytest.mark.parametrize("style", ["positional", "options"])
+    def test_server_wildcard_listen_is_constrained_to_loopback(self, preload_file, style):
+        js = """
+        const net = require('net');
+        const s = net.createServer();
+        const done = () => {
+          if (s.address().address !== '127.0.0.1') process.exit(4);
+          console.log('WILDCARD_CLAMPED');
+          s.close(() => process.exit(0));
+        };
+        if (STYLE === 'positional') s.listen(0, '0.0.0.0', done);
+        else s.listen({port: 0, host: '0.0.0.0'}, done);
+        """.replace('STYLE', json.dumps(style))
+        proc = self._run_node(js, preload_file)
+        assert proc.returncode == 0, proc.stderr
+        assert 'WILDCARD_CLAMPED' in proc.stdout
+
     def test_server_listen_127_not_blocked(self, preload_file):
         """容器内 Node 服务端监听 127.0.0.1 不能被拦截。"""
         js = """
@@ -538,6 +568,7 @@ class _FakeNodeProcess:
         pass
 
 
+@pytest.mark.skipif(not hasattr(__import__("signal"), "SIGALRM"), reason="requires POSIX interval timers")
 def test_generated_worker_entrypoint_interrupts_blocking_io_at_total_deadline():
     import ast
     import signal
@@ -567,7 +598,10 @@ def _load_generated_worker():
     namespace["wait_for_lxserver"] = lambda timeout: True
     namespace["subprocess"] = types.SimpleNamespace(
         Popen=lambda *args, **kwargs: _FakeNodeProcess(),
+        run=lambda *args, **kwargs: types.SimpleNamespace(returncode=0, stdout=b'\0' * 4),
+        TimeoutExpired=subprocess.TimeoutExpired,
         DEVNULL=subprocess.DEVNULL,
+        PIPE=subprocess.PIPE,
     )
     return namespace
 
@@ -599,6 +633,18 @@ def _successful_worker_api(path, data=None, method="GET", timeout=None):
 
 class TestGeneratedWorkerBehavior:
     """直接执行生成 worker 的函数，验证运行时分支而非源码字符串。"""
+
+    def test_decode_prefix_uses_bounded_local_pipe(self):
+        worker = _load_generated_worker()
+        calls = []
+        worker['subprocess'].run = lambda args, **kwargs: calls.append((args, kwargs)) or types.SimpleNamespace(returncode=0, stdout=b'\0' * 4)
+        assert worker['decode_prefix'](b'ID3synthetic') == 'ok'
+        command, kwargs = calls[0]
+        assert command[command.index('-protocol_whitelist') + 1] == 'pipe'
+        assert command[command.index('-i') + 1] == 'pipe:0'
+        assert command[command.index('-t') + 1] == '2'
+        assert kwargs['input'] == b'ID3synthetic'
+        assert 0 < kwargs['timeout'] <= 5
 
     def test_top_level_require_unsafe_true_is_not_accepted(self, monkeypatch):
         worker = _load_generated_worker()

@@ -261,11 +261,15 @@ def test_purge_stale_removes_old_files_and_logzip(log_dir):
     old_zip = directory / "20260101000000.logzip"
     old_zip.write_text("x", encoding="utf-8")
     os.utime(old_zip, (now - 4 * 86400, now - 4 * 86400))
+    old_named_zip = directory / "fnmusic-logs-20260101000000-aaaaaaaa.zip"
+    old_named_zip.write_text("x", encoding="utf-8")
+    os.utime(old_named_zip, (now - 4 * 86400, now - 4 * 86400))
     removed = fnlog.purge_stale(days=3, now=now)
     assert fresh.exists()
     assert not old_log.exists()
-    assert not old_zip.exists()
-    assert set(removed) == {"install.log", "20260101000000.logzip"}
+    assert not old_zip.exists() and not old_named_zip.exists()
+    assert set(removed) == {"install.log", "20260101000000.logzip",
+                            "fnmusic-logs-20260101000000-aaaaaaaa.zip"}
 
 
 def test_redact_masks_secret_values():

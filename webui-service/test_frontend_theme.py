@@ -132,8 +132,13 @@ def test_direct_play_hint_warns_about_experimental_playback():
 
 
 def test_about_donate_dom_order_and_ids():
-    """关于页打赏区 DOM 顺序微信在先，ID 兼容与徽章契约。"""
+    """关于页打赏区 DOM 顺序：卡片在免责声明上方（第二张），卡内微信在先。"""
     tags = elements()
+    donate_idx = next(i for i, (tag, attrs) in enumerate(tags)
+                      if tag == "div" and attrs.get("id") == "about-donate")
+    disclaimer_idx = next(i for i, (tag, attrs) in enumerate(tags)
+                          if tag == "div" and attrs.get("id") == "about-disclaimer-card")
+    assert donate_idx < disclaimer_idx, "打赏卡片必须位于免责声明上方（关于页第二张卡片）"
     wechat_idx = next(i for i, (tag, attrs) in enumerate(tags)
                       if tag == "div" and attrs.get("id") == "about-donate-wechat")
     alipay_idx = next(i for i, (tag, attrs) in enumerate(tags)

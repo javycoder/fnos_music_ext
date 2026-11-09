@@ -82,6 +82,53 @@ def reset_api(reason: str = "") -> None:
         logger.info("netease api instance reset: %s", reason)
 
 
+# weapi song/detail 的各档元数据对象 → 展示用档位标签。
+# 每组：原始字段名、档位、容器、该档名义码率。名义码率只在原始对象缺 br 时
+# 兜底，供上层按账号 maxbr 判断哪档可用；绝不拿来估算文件字节数。
+_QUALITY_SLOTS = (
+    ("l", "standard", "mp3", 128000),
+    ("m", "higher", "mp3", 192000),
+    ("h", "exhigh", "mp3", 320000),
+    ("sq", "lossless", "flac", 999000),
+    ("hr", "hires", "flac", 999000),
+)
+
+
+def _nonnegative_int_or_zero(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def map_quality_slots(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """把各档原始对象投影为 {"lossless": {"ext", "file_size", "br"}}。
+
+    只收录真实存在的档位；size 缺失记 0，不按名义码率估算——估算值会被上层
+    当成真实文件大小展示。issue #116：搜索列表要显示文件大小，就必须保留
+    每个档位自己的 size，而不是只留 has_sq/has_hr 布尔位。
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for field, tier, ext, nominal_br in _QUALITY_SLOTS:
+        slot = raw.get(field)
+        if not isinstance(slot, dict) or not slot:
+            continue
+        out[tier] = {
+            "ext": ext,
+            "file_size": _nonnegative_int_or_zero(slot.get("size")),
+            "br": _nonnegative_int_or_zero(slot.get("br")) or nominal_br,
+        }
+    return out
+
+
+def map_privilege_maxbr(raw: dict[str, Any]) -> int:
+    """privilege.maxbr：账号对该曲可用的最高码率；缺失记 0 表示未知（不当限制）。"""
+    privilege = raw.get("privilege")
+    if not isinstance(privilege, dict):
+        return 0
+    return _nonnegative_int_or_zero(privilege.get("maxbr"))
+
+
 def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
     sid = item.get("id") or item.get("song_id")
     song_id = int(sid) if sid is not None else 0
@@ -114,6 +161,10 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": duration_ms,
         "has_sq": bool(item.get("sq")),
         "has_hr": bool(item.get("hr")),
+        # issue #116：各档真实 size/br 随行下发，搜索列表据此显示与下载档一致的
+        # 格式和文件大小；has_sq/has_hr 仍保留给旧调用方。
+        "qualities": map_quality_slots(item),
+        "maxbr": map_privilege_maxbr(item),
         # issue #57：fee 收费类型（0=免费 1=VIP 4=购买专辑 8=非会员免费低音质），
         # 供行级 needs_vip 标记——无 VIP 账号点 VIP 歌只有试听，标记让用户有预期
         "fee": fee,

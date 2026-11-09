@@ -131,8 +131,9 @@ CONF = {
     "adaptive_min_timeout": float(os.environ.get("MUSICDL_ADAPTIVE_MIN_TIMEOUT", "15")),
     "search_page_cap": max(1, int(os.environ.get("MUSICDL_SEARCH_PAGE_CAP", "10"))),
     "probe_timeout": max(0.2, float(os.environ.get("MUSICDL_PROBE_TIMEOUT", "2"))),
-    "fast_return_items": int(os.environ.get("MUSICDL_FAST_RETURN_ITEMS", "12")),
-    "slow_grace_s": float(os.environ.get("MUSICDL_SLOW_GRACE_S", "2")),
+    # issue #116：同时进行的源搜索数。站点勾选多时不能一起把重进程全拉起来
+    # （一台 NAS 上多进程冷启动 + 搜索 + 探活会把整轮拖过预算，最后一首都没有）。
+    "concurrency": max(1, int(os.environ.get("MUSICDL_SEARCH_CONCURRENCY", "3"))),
 }
 
 SEARCH_CACHE = SearchCache(
@@ -727,8 +728,8 @@ async def search(
                 suffix = " (partial results)" if items else ""
                 return source, items, f"timeout after {timeout:.1f}s{suffix}"
             except asyncio.CancelledError:
-                # The aggregate owner collects this closed snapshot on its
-                # global/grace deadline, never the still-running worker.
+                # The aggregate owner collects this closed snapshot on the
+                # global deadline, never the still-running worker.
                 progress.finish()
                 raise
             except Exception as e:  # 单源失败不影响其他源
@@ -737,17 +738,25 @@ async def search(
                 return source, collect(source), f"{type(e).__name__}: {e}"
 
         results: list = []
-        pending = {asyncio.create_task(one(s), name=s): s for s in active_src_list}
+        slots = asyncio.Semaphore(max(1, int(CONF.get("concurrency") or 1)))
+
+        async def limited(source: str):
+            # issue #116：排队时间不计入单源预算——拿到槽位后才开始它自己的超时，
+            # 否则站点一多，后面排队的源必然在起跑线上就超时。
+            async with slots:
+                return await one(source)
+
+        pending = {asyncio.create_task(limited(s), name=s): s for s in active_src_list}
         overall = max(float(CONF["search_timeout"]), 4.0)
         deadline = time.monotonic() + overall
-        skipped_fast_return = False
         try:
-            grace_limited = False
+            # issue #116：只按整体截止收口，不再「凑够 N 条就砍掉其余源」或「有结果
+            # 后再等固定几秒」——那正是勾选多站点却只剩约 10 首的原因。
             while pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                done, still = await asyncio.wait(
+                done, _ = await asyncio.wait(
                     pending.keys(), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in done:
@@ -757,17 +766,6 @@ async def search(
                     except Exception as e:  # noqa: BLE001
                         _STATS["errors"] += 1
                         results.append((task.get_name(), [], f"{type(e).__name__}: {e}"))
-                if not pending:
-                    break
-                total_items = sum(len(items) for _, items, _ in results)
-                # 结果已足够优质：不再等待慢源，立即返回
-                if total_items >= CONF["fast_return_items"]:
-                    skipped_fast_return = True
-                    break
-                # 已有任意源出结果：再给其余源最多 slow_grace_s 秒，避免慢源拖死整页
-                if total_items > 0:
-                    grace_limited = True
-                    deadline = min(deadline, time.monotonic() + CONF["slow_grace_s"])
         finally:
             for task in pending:
                 task.cancel()
@@ -782,15 +780,13 @@ async def search(
                 if interrupted:
                     raise asyncio.CancelledError
         if pending:
-            skip_reason = ("skipped (fast return)" if skipped_fast_return else
-                           "skipped (grace elapsed)" if grace_limited else f"timeout after {overall}s")
-            for task, src in pending.items():
+            # 整体截止时，已确认的歌照常并入；没排到槽位/没跑完的源记 skipped，
+            # 一律不记熔断、不压自适应超时——否则站点选多了会把「还没来得及跑」
+            # 的源逐个打成故障，下次搜索直接空结果（issue #116）。
+            for _task, src in pending.items():
                 items = collect(src)
-                results.append((src, items, skip_reason + (" (partial results)" if items else "")))
-                # 没等到歌才收紧。已经有结果、或因为别的源够了而提前返回，都不是这个源坏了。
-                if not items and not skipped_fast_return and not grace_limited:
-                    ADAPTIVE.record_failure(src)
-                    SOURCE_BREAKER.record_failure(src)
+                results.append((src, items,
+                                "skipped (deadline)" + (" (partial results)" if items else "")))
 
         all_items = []
         seen_ids = set()

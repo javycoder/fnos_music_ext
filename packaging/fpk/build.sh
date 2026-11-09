@@ -104,7 +104,8 @@ rsync -a --delete \
     --exclude='CONTRIBUTING.md' --exclude='AGENTS.md' \
     --exclude='test_*.py' --exclude='test_*.js' --exclude='conftest.py' --exclude='smoke_test.sh' --exclude='run_tests.py' \
     --exclude='.venv*/' --exclude='__pycache__/' --exclude='.pytest_cache/' \
-    --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' --exclude='logs/' --exclude='/logs' \
+    --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' \
+    --exclude='fnmusic-logs-*-????????.zip' --exclude='logs/' --exclude='/logs' \
     --exclude='*.part' --exclude='.DS_Store' \
     --exclude='cache/' --exclude='sources-data/' --exclude='backup/' \
     --exclude='musicbox-data/' --exclude='musicdl_outputs/' \

@@ -232,6 +232,12 @@ h2 > span { min-width: 0; }
   font-size: 12px; font-weight: 500; background: var(--ok-soft); color: var(--ok); white-space: nowrap;
 }
 
+.log-export-result {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 13px; color: var(--muted); overflow-wrap: anywhere;
+}
+.log-export-result[hidden] { display: none; }
+
 .chip-grid { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
@@ -437,6 +443,15 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .dir-check.fail { color: var(--err); }
 .dir-check.skip { color: var(--muted); }
 
+.user-storage-row, .user-storage-stale-row {
+  display: grid; gap: 8px; margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.user-storage-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.user-storage-head b { font-size: 14px; }
+.user-storage-meta, .user-storage-status { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.user-storage-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
 /* 公共歌单 */
 .public-list {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(228px, 1fr));
@@ -533,6 +548,56 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   padding: 12px 14px; font-size: 12.5px; line-height: 1.7; max-height: 40vh; overflow: auto;
 }
 
+.update-prompt {
+  margin: 14px 0 10px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.update-progress-block {
+  margin: 14px 0 10px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.progress-bar-wrap {
+  width: 100%;
+  height: 8px;
+  background: var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 8px 0 6px;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  width: 0%;
+  transition: width 0.2s ease;
+}
+.progress-detail {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
+}
+.update-error-block {
+  margin: 14px 0 10px;
+  padding: 10px 12px;
+  background: rgba(229, 57, 53, 0.08);
+  border: 1px solid rgba(229, 57, 53, 0.3);
+  border-radius: var(--radius-sm);
+}
+.update-error-text {
+  margin: 0;
+  color: #e53935;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 /* 帮助图标：视觉 22px，热区 44px */
 .help-btn {
   position: relative; box-sizing: border-box; width: 22px; height: 22px; margin: 3px;
@@ -579,8 +644,12 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .modal-mask[hidden], .report[hidden], .toast[hidden], .hint[hidden],
 .update-changelog[hidden], .dir-check[hidden], .about-donate-item[hidden],
 .adv-fold[hidden], .radio-list[hidden], .lx-item[hidden], .chip[hidden],
-#llm-liked-settings[hidden], .help-modal[hidden], .btn-row[hidden],
-.pt-panel[hidden], .pt-progress[hidden], .pt-table-wrap[hidden] { display: none; }
+#llm-liked-settings[hidden], .help-modal[hidden],
+.btn-row[hidden], .pt-panel[hidden], .pt-progress[hidden], .pt-table-wrap[hidden],
+.update-prompt[hidden], .update-progress-block[hidden], .update-error-block[hidden] { display: none; }
+#llm-liked-settings[hidden], .help-modal[hidden], .btn-row[hidden], .field[hidden],
+.pt-panel[hidden], .pt-progress[hidden], .pt-table-wrap[hidden],
+.update-prompt[hidden], .update-progress-block[hidden], .update-error-block[hidden] { display: none; }
 
 /* -------------------------------------------------- 移动端 */
 .bottom-nav { display: none; }
@@ -733,3 +802,12 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .pt-badge.err { background: var(--err-soft); color: var(--err); }
 .pt-sample { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .platform-toggle.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+@media (max-width: 680px) {
+  .pt-field { flex: 1 1 9rem; }
+  .pt-field .input { width: 100%; }
+  .pt-field-num { flex: none; }
+  .pt-toolbar-actions { margin-left: 0; width: 100%; }
+  .pt-toolbar-actions .btn { flex: 1; }
+  .pt-sample { max-width: 200px; }
+}

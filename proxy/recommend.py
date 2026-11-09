@@ -471,8 +471,10 @@ def read_local_recent_tracks(db_path: str, user_guid: str, limit: int = SEED_LIM
                al.name AS album
           FROM play_history ph
           JOIN track t ON t.id = ph.track_id
+          JOIN audio_file af ON af.id = t.audio_file_id
           LEFT JOIN album al ON al.id = t.album_id
-         WHERE ph.user_id = ?
+         WHERE ph.user_id = ? AND t.is_audio_file_deleted = 0
+           AND t.is_admin_deleted = 0 AND af.is_physical_file_deleted = 0
          ORDER BY ph.updated_at DESC
          LIMIT ?
     """
@@ -516,8 +518,10 @@ def read_local_favorite_tracks(db_path: str, user_guid: str, limit: int = 200) -
                al.name AS album
           FROM favorite_track ft
           JOIN track t ON t.id = ft.track_id
+          JOIN audio_file af ON af.id = t.audio_file_id
           LEFT JOIN album al ON al.id = t.album_id
-         WHERE ft.user_id = ?
+         WHERE ft.user_id = ? AND t.is_audio_file_deleted = 0
+           AND t.is_admin_deleted = 0 AND af.is_physical_file_deleted = 0
          ORDER BY ft.updated_at DESC
          LIMIT ?
     """

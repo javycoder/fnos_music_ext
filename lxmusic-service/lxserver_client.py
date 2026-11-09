@@ -223,6 +223,45 @@ def parse_interval_to_seconds(interval: str | int | float | None) -> int:
         return 0
 
 
+_SIZE_UNITS = {"": 1, "B": 1, "K": 1024, "KB": 1024,
+               "M": 1024 ** 2, "MB": 1024 ** 2, "G": 1024 ** 3, "GB": 1024 ** 3}
+_SIZE_RE = re.compile(r"^([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{0,2})$")
+
+
+def parse_size_bytes(value: Any) -> int:
+    """把 lx 的 size 解析成字节。
+
+    lxserver 的 types[].size 既有纯数字字节，也有 "4.5 MB" / "30MB" / "4500KB"
+    这类带单位文本（真实脚本两种都出现过）。按 1024 进制换算；解析不了记 0
+    表示未知——绝不按码率估算，估算值会被上层当成真实文件大小展示。
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        try:
+            return max(0, int(value))
+        except (ValueError, OverflowError):
+            return 0
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return 0
+    match = _SIZE_RE.match(text)
+    if not match:
+        return 0
+    unit = match.group(2).upper()
+    if unit not in _SIZE_UNITS:
+        return 0
+    try:
+        return max(0, int(float(match.group(1).replace(",", ".")) * _SIZE_UNITS[unit]))
+    except (ValueError, OverflowError):
+        return 0
+
+
 def extract_track_identifier(song: dict, source: str) -> str:
     """提取平台主键 identifier：保持与现有契约一致。
     kg: hash (或 songmid)
@@ -285,6 +324,24 @@ def map_lxserver_song(song: dict, fallback_source: str = "") -> dict:
     if "flac" in types_list or "flac24bit" in types_list or "hires" in types_list:
         ext = "flac"
 
+    # issue #116：搜索行要显示文件大小。types 的 size 可能是 "4.5 MB" 这类文本，
+    # 按当前展示的容器挑对应档；取不到就留 0（未知），不跨档借用别档位大小。
+    size_by_type: dict[str, int] = {}
+    if isinstance(types_raw, list):
+        for t in types_raw:
+            if isinstance(t, dict) and t.get("type"):
+                size_by_type[str(t["type"]).strip().lower()] = parse_size_bytes(t.get("size"))
+    elif isinstance(types_raw, dict):
+        for key, t in types_raw.items():
+            size_by_type[str(key).strip().lower()] = parse_size_bytes(
+                t.get("size") if isinstance(t, dict) else t)
+    file_size = 0
+    for tier in (("flac24bit", "hires", "flac") if ext == "flac"
+                 else ("320k", "192k", "128k")):
+        if size_by_type.get(tier):
+            file_size = size_by_type[tier]
+            break
+
     item: dict[str, Any] = {
         "id": track_id,
         "lx_source": source,
@@ -293,6 +350,7 @@ def map_lxserver_song(song: dict, fallback_source: str = "") -> dict:
         "album": album,
         "duration_s": duration_s,
         "ext": ext,
+        "file_size": file_size,
         "cover_url": cover_url,
         "types": types_list,
         # 兼容旧搜索器字段

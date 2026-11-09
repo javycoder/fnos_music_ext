@@ -4,15 +4,17 @@
 验证：
   - 自定义歌单 import / detail / enable / delete 全链路；
   - 页面包含 playlist grid / detail panel，且不出现「进入编辑」/custom-list（variant 3 重构后）。
-用法: python3 tests/integration/smoke_playlist_detail.py
+用法: python3 tests/integration/smoke_playlist_detail.py --base-url http://127.0.0.1:18775/app/fnmusic-ext --allow-isolated-writes
+只能指向本次创建的独立实例；禁止使用生产配置、端口或数据。
 """
+import argparse
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8774/app/fnmusic-ext"
+BASE = ""
 HEADERS = {"X-Trim-Isadmin": "true", "Content-Type": "application/json"}
 
 
@@ -36,6 +38,13 @@ def call(path, data=None, method=None):
 
 
 def main():
+    global BASE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True, help="独立测试实例的 WebUI URL")
+    parser.add_argument("--allow-isolated-writes", required=True, action="store_true",
+                        help="确认目标实例使用独立临时数据目录，允许写入测试歌单")
+    args = parser.parse_args()
+    BASE = args.base_url.rstrip("/")
     failures = []
     pid = None
     name = f"smoke-{int(time.time())}"

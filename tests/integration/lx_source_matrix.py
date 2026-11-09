@@ -281,6 +281,17 @@ const dns = require('dns');
 const http = require('http');
 const https = require('https');
 
+// lxserver 可能硬编码绑定 0.0.0.0；收紧为容器内 loopback，且不放宽出站限制。
+const originalServerListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function(...args) {
+  if (args[0] && typeof args[0] === 'object' && args[0].host === '0.0.0.0') {
+    args[0] = { ...args[0], host: '127.0.0.1' };
+  } else if (args[1] === '0.0.0.0') {
+    args[1] = '127.0.0.1';
+  }
+  return originalServerListen.apply(this, args);
+};
+
 function isDisallowedIP(ip) {
   if (!ip || typeof ip !== 'string') return true;
   if (net.isIP(ip) !== 4) return true;
@@ -640,7 +651,7 @@ def write_lxserver_config():
     os.makedirs(f"{{cfg_dir}}/backups", exist_ok=True)
     os.makedirs(f"{{cfg_dir}}/users/source/_open", exist_ok=True)
     cfg_file = f"{{cfg_dir}}/config.js"
-    cfg_code = f"""module.exports = {{
+    cfg_code = f"""module.exports = {{{{
   serverName: "fnmusic-lxserver",
   bindIP: "127.0.0.1",
   port: {{PORT}},
@@ -649,7 +660,7 @@ def write_lxserver_config():
   "subsonic.enable": false,
   "webdav.enable": false,
   "system.allowUnsafeVM": false
-}};
+}}}};
 """
     with open(cfg_file, "w", encoding="utf-8") as f:
         f.write(cfg_code)
@@ -806,6 +817,25 @@ class PinnedHTTPConnection(PinnedConnectionMixin, http.client.HTTPConnection):
 class PinnedHTTPSConnection(PinnedConnectionMixin, http.client.HTTPSConnection):
     pass
 
+def decode_prefix(prefix):
+    """Decode at most two seconds from a bounded in-memory prefix; never open URLs."""
+    if not prefix:
+        return "not_tested"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "pipe", "-i", "pipe:0", "-t", "2", "-ac", "2", "-ar", "44100", "-f", "s16le", "pipe:1"],
+            input=prefix, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=bounded_timeout(5.0),
+        )
+        get_remaining_budget()
+        return "ok" if result.returncode == 0 and len(result.stdout) >= 4 else "failed"
+    except FileNotFoundError:
+        return "unavailable"
+    except subprocess.TimeoutExpired:
+        get_remaining_budget()
+        return "timeout"
+
+
 def probe_stream(url, headers_dict=None):
     """Probe in the container, pin each validated public IPv4, and cap redirects."""
     curr = url
@@ -849,11 +879,11 @@ def probe_stream(url, headers_dict=None):
 
         req_headers = {{
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
-            "Range": "bytes=0-1023"
+            "Range": "bytes=0-131071"
         }}
         if headers_dict:
             for k, v in headers_dict.items():
-                if k.lower() in ("user-agent", "referer", "range"):
+                if k.lower() in ("user-agent", "referer"):
                     req_headers[k] = str(v)
 
         class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -884,7 +914,7 @@ def probe_stream(url, headers_dict=None):
             with opener.open(req, timeout=bounded_timeout(12.0)) as resp:
                 code = resp.getcode()
                 ct = resp.headers.get("Content-Type", "")
-                head = resp.read(1024)
+                head = resp.read(131072)
                 get_remaining_budget()
                 magic = detect_magic(head)
                 ok = (code in (200, 206)) and (magic is not None)
@@ -892,7 +922,8 @@ def probe_stream(url, headers_dict=None):
                     "host": parsed.hostname,
                     "content_type": ct,
                     "size": len(head),
-                    "magic": magic
+                    "magic": magic,
+                    "decode_status": decode_prefix(head) if ok else "not_tested"
                 }}
                 return ok, clean
         except BudgetExceeded:
@@ -1116,6 +1147,9 @@ def main():
 
                             referer = "https://www.kugou.com/" if platform == "kg" else "https://y.qq.com/" if platform == "tx" else "https://music.163.com/"
                             probe_ok, probe_result = probe_stream(media_url, {{"Referer": referer}})
+                            decode_status = probe_result.get("decode_status", "not_tested")
+                            if decode_status == "ok" or (decode_status != "not_tested" and report["decode_status"] == "not_tested"):
+                                report["decode_status"] = decode_status
                             attempt_record = {{
                                 "keyword": keyword,
                                 "quality": quality,

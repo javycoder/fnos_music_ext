@@ -64,7 +64,7 @@ def test_config_job_store_crud(tmp_path):
 def test_api_config_jobs_endpoints(env_file, svctl, tmp_path, monkeypatch):
     import time
     import test_webui
-    from app import app, job_store, compute_config_revision
+    job_store = test_webui.webui.job_store
 
     db_path = tmp_path / "test_api_jobs.db"
     monkeypatch.setattr(job_store, "db_path", db_path)
@@ -111,4 +111,3 @@ def test_api_config_jobs_endpoints(env_file, svctl, tmp_path, monkeypatch):
         assert "revision" in res_cfg.json()
         rev = res_cfg.json()["revision"]
         assert isinstance(rev, str) and len(rev) == 16
-

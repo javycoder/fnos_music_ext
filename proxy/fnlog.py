@@ -4,7 +4,7 @@
 - 本地文件日志，按天午夜或单文件 50MB 滚动；最多保留当前 + 2 个轮转，
   同一天多次大小轮转也不覆盖已有文件，且不会无限积累。
 - purge_stale() 按 mtime 清理超期文件（覆盖 install.log 等无法自轮转的追加文件
-  与历史导出的 .logzip），服务启动时与每日调用。
+  与历史导出的 .logzip/.zip），服务启动时与每日调用。
 - 所有文件 IO 失败一律静默降级为仅 stdout，绝不影响业务。
 - redact() 对 key/token/secret/password/cookie/authorization 的值打码后再入日志。
 - env_snapshot_lines() 采集运行环境（系统/网络/飞牛音乐/扩展配置摘要），

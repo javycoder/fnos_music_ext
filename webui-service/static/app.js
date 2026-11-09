@@ -25,7 +25,15 @@ const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserv
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
 let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
-let currentConfigRevision = ""; // GET /api/config 携带的配置版本哈希，用于 CAS 防并发冲突
+let currentConfigRevision = "";
+let userStorageStatus = null;
+let userStorageReady = false;
+let userStorageError = "";
+let savedUserDirs = {};
+let savedUserScans = {};
+let scanAdminPasswordConfigured = false;
+let scanAdminPasswordDirty = false;
+let scanAdminPasswordClear = false;
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let currentPage = "overview";
@@ -74,17 +82,34 @@ let publicDetailRun = null;
 let publicDetailRunTarget = "";
 let publicProcessSnapshot = null;
 
-async function api(path, options) {
-  const resp = await fetch(APP_BASE + path, options);
-  let body = {};
-  try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
-  if (!resp.ok) {
-    const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
-    err.status = resp.status;
-    err.body = body;
-    throw err;
+async function api(path, options, timeoutMs = 0) {
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  let timer;
+  const request = async () => {
+    const resp = await fetch(APP_BASE + path, controller ? { ...options, signal: controller.signal } : options);
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok) {
+      const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
+      err.status = resp.status;
+      err.body = body;
+      throw err;
+    }
+    return body;
+  };
+  try {
+    if (!controller) return await request();
+    return await Promise.race([request(), new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("请求超时，结果待核实，请刷新运行状态");
+        error.name = "TimeoutError";
+        reject(error);
+        controller.abort();
+      }, timeoutMs);
+    })]);
+  } finally {
+    clearTimeout(timer);
   }
-  return body;
 }
 
 function updateLlmLikedSettings() {
@@ -505,9 +530,9 @@ function formatVersionLabel(version) {
 }
 
 /* -------------------------------------------------------------- 概览 */
-async function loadStatus() {
+async function loadStatus(timeoutMs = 0) {
   try {
-    const st = await api("/api/status");
+    const st = await api("/api/status", undefined, timeoutMs);
     publicProcessSnapshot = { at: Date.now(), processes: st.processes || {} };
     for (const item of publicSelection) {
       if (item._detail_status === "stopped"
@@ -581,12 +606,13 @@ async function loadStatus() {
 }
 
 /* -------------------------------------------------------------- 配置读写 */
-async function loadConfig() {
-  const cfg = await api("/api/config");
+async function loadConfig(timeoutMs = 0) {
+  const cfg = await api("/api/config", undefined, timeoutMs);
   configValues = cfg.values;
   configPresence = cfg.presence || {};
-  configSchema = cfg.schema || {};
   currentConfigRevision = cfg.revision || "";
+  configSchema = cfg.schema || {};
+  scanAdminPasswordConfigured = Boolean(cfg.scan_admin_password_configured);
   const expectedBuild = typeof window !== "undefined" ? window.FNMUSIC_WEBUI_BUILD || "" : "";
   const apiBuild = cfg.webui_build || "";
   const mismatch = Boolean(expectedBuild && apiBuild && expectedBuild !== apiBuild)
@@ -597,6 +623,7 @@ async function loadConfig() {
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
     try { await loadMusicUsers(); } catch (err) { console.warn("加载歌单用户列表异常", err); }
   }
+  try { await loadUserStorage(); } catch (err) { console.warn("加载用户目录异常", err); }
 }
 
 function applyConfigToForm() {
@@ -679,6 +706,20 @@ function applyConfigToForm() {
   updateScanLabels();
   updateTeeCountLabel();
   updateBindTimeoutLabel();
+  if ($("#tee-save-by-user")) {
+    $("#tee-save-by-user").checked = v.FNMUSIC_TEE_SAVE_BY_USER === "true";
+    $("#tee-save-by-user").disabled = !configSchema.FNMUSIC_TEE_SAVE_BY_USER;
+  }
+  savedUserDirs = parseUserMap(v.FNMUSIC_TEE_SAVE_DIR_BY_USER);
+  savedUserScans = parseUserMap(v.FNMUSIC_LIBRARY_SCAN_BY_USER);
+  if ($("#scan-admin-username")) $("#scan-admin-username").value = v.FNMUSIC_SCAN_ADMIN_USERNAME || "";
+  if ($("#scan-admin-device-id")) $("#scan-admin-device-id").value = v.FNMUSIC_SCAN_ADMIN_DEVICE_ID || "";
+  scanAdminPasswordDirty = false;
+  scanAdminPasswordClear = false;
+  if ($("#scan-admin-password")) {
+    $("#scan-admin-password").value = "";
+    $("#scan-admin-password").placeholder = scanAdminPasswordConfigured ? "已保存，留空表示不修改" : "未配置";
+  }
   $("#llm-base").value = v.FNMUSIC_LLM_BASE_URL || "";
   $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
@@ -772,6 +813,13 @@ function collectConfig() {
     FNMUSIC_LIBRARY_SCAN_PATH: $("#scan-path").value.trim(),
     FNMUSIC_SCAN_DELAY_S: parseFloat($("#scan-delay").value) || 0,
     FNMUSIC_SCAN_COOLDOWN_S: parseFloat($("#scan-cooldown").value) || 0,
+    ...(configSchema.FNMUSIC_TEE_SAVE_BY_USER && $("#tee-save-by-user")
+      ? { FNMUSIC_TEE_SAVE_BY_USER: $("#tee-save-by-user").checked } : {}),
+    ...(configSchema.FNMUSIC_SCAN_ADMIN_USERNAME && $("#scan-admin-username")
+      ? { FNMUSIC_SCAN_ADMIN_USERNAME: $("#scan-admin-username").value.trim() } : {}),
+    ...(configSchema.FNMUSIC_SCAN_ADMIN_DEVICE_ID && $("#scan-admin-device-id")
+      ? { FNMUSIC_SCAN_ADMIN_DEVICE_ID: $("#scan-admin-device-id").value.trim() } : {}),
+    ...scanAdminPasswordUpdate(),
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
     FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
@@ -818,6 +866,7 @@ function collectConfig() {
       publicSelectionPayload(publicSelection)
     );
   }
+  Object.assign(values, userStorageConfigPatch());
   const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
   const cacheDir = values.FNMUSIC_CACHE_DIR;
   for (const [label, p] of [["下载目录", dlDir], ["歌曲缓存目录", cacheDir]]) {
@@ -828,6 +877,7 @@ function collectConfig() {
   if (dlDir && cacheDir && (dlDir === cacheDir || dlDir.startsWith(cacheDir + "/") || cacheDir.startsWith(dlDir + "/"))) {
     throw new Error("歌曲缓存目录与下载目录不能相同或互为父子目录");
   }
+  validateUserStoragePatch(values);
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
@@ -855,167 +905,90 @@ function filterConfigBySchema(values) {
   return Object.fromEntries(Object.entries(values).filter(([key]) => supported.has(key)));
 }
 
-async function pollConfigJob(jobId, onProgress) {
-  const startTime = Date.now();
-  const maxWaitMs = 180000;
-  const pollInterval = (typeof globalThis !== "undefined" && typeof globalThis.CONFIG_JOB_POLL_INTERVAL === "number")
-    ? globalThis.CONFIG_JOB_POLL_INTERVAL
-    : (typeof window !== "undefined" && typeof window.CONFIG_JOB_POLL_INTERVAL === "number")
-      ? window.CONFIG_JOB_POLL_INTERVAL
-      : 600;
-  const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
-  while (Date.now() - startTime < maxWaitMs) {
-    let res;
+async function pollConfigJob(jobId, onProgress, timeoutMs = 60000) {
+  const deadline = performance.now() + timeoutMs;
+  const interval = globalThis.CONFIG_JOB_POLL_INTERVAL ?? 600;
+  while (performance.now() < deadline) {
     try {
-      res = await api(`/api/config/jobs/${encodeURIComponent(jobId)}`);
-    } catch (err) {
-      if (err.status === 404) throw err;
-      await sleep(pollInterval);
-      continue;
+      const data = await api(`/api/config/jobs/${encodeURIComponent(jobId)}`, undefined,
+        Math.max(1, deadline - performance.now()));
+      const job = data.job;
+      if (!job) throw new Error("无法获取任务详情");
+      if (onProgress) onProgress(job);
+      if (["success", "partial"].includes(job.status)) return job.result || {};
+      if (["failed", "conflict"].includes(job.status)) throw Object.assign(
+        new Error(job.error || job.message || "保存失败"), {terminal: true});
+    } catch (exc) {
+      if (exc.status === 404 || exc.terminal) throw exc;
     }
-    const job = res && res.job;
-    if (!job) throw new Error("无法获取任务详情");
-    if (typeof onProgress === "function") onProgress(job);
-    if (job.status === "success" || job.status === "partial") {
-      return job.result || { ok: true, actions: [], changed: [] };
-    }
-    if (job.status === "failed") {
-      throw new Error(job.error || job.message || "任务执行失败");
-    }
-    if (job.status === "conflict") {
-      throw new Error(job.error || "配置存在并发修改冲突，请刷新页面重新配置");
-    }
-    await sleep(pollInterval);
+    if (interval > 0) await new Promise((resolve) => setTimeout(resolve, interval));
   }
-  throw new Error("任务执行超时，请稍后刷新页面查看状态");
+  throw new Error("保存已达到时限，请刷新运行状态查看结果");
 }
 
 async function checkActiveConfigJob() {
   try {
-    const res = await api("/api/config/jobs/active");
-    if (res && res.active && res.job) {
-      const job = res.job;
-      const btn = $("#save-btn");
-      btn.disabled = true;
-      btn.textContent = `恢复保存中（${job.progress || 0}%）…`;
-      toast(`检测到未完成的配置保存任务（${job.message || "执行中"}），正在同步…`, "info");
-      try {
-        await pollConfigJob(job.job_id, (j) => {
-          btn.textContent = `保存中（${j.progress || 0}%）…`;
-        });
-        toast("配置已保存生效", "ok");
-        clearDirty();
-        try { await loadConfig(); } catch (_) {}
-        try { await loadStatus(); } catch (_) {}
-      } catch (err) {
-        toast("保存任务失败：" + err.message, "fail");
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "保存并生效";
-      }
+    const data = await api("/api/config/jobs/active", undefined, 3000);
+    if (!data.active || !data.job) return;
+    const btn = $("#save-btn");
+    btn.disabled = true;
+    try {
+      await pollConfigJob(data.job.job_id, (job) => {
+        btn.textContent = `保存中（${job.progress || 0}%）…`;
+      });
+      await loadConfig(3000);
+      clearDirty();
+      toast("配置已保存生效", "ok");
+    } catch (exc) {
+      toast("保存任务失败：" + exc.message, "fail");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "保存并生效";
     }
-  } catch (_) {
-    // 忽略检查活动任务的非阻断异常
-  }
+  } catch (_) { /* 旧后端可无任务接口 */ }
 }
 
 async function saveConfig() {
   const btn = $("#save-btn");
   if (btn.disabled) return;
-  // 即时禁用防抖
   btn.disabled = true;
-  btn.textContent = "准备保存…";
-
-  let values;
+  const started = performance.now();
+  const deadline = started + 60000;
+  const remaining = () => Math.max(1, deadline - performance.now());
   try {
-    values = filterConfigBySchema(collectConfig());
-  } catch (exc) {
-    toast(exc.message, "fail");
-    btn.disabled = false;
-    btn.textContent = "保存并生效";
-    return;
-  }
-
-  // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
-  // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
-  for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
-    const next = values[key] || "";
-    if (next && next !== (configValues[key] || "")) {
-      const res = await fsCheckDir(next);
-      if (res.mode === "fail") {
-        toast(label + "不可用：" + res.message, "fail");
-        btn.disabled = false;
-        btn.textContent = "保存并生效";
-        return;
+    let values;
+    try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
+    // 从点击起计时，目录检查共用三秒，不能在按钮禁用前无限等待。
+    btn.textContent = "保存中（检查目录）…";
+    for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
+      const next = values[key] || "";
+      if (next && next !== (configValues[key] || "")) {
+        const res = await fsCheckDir(next, Math.max(1, started + 3000 - performance.now()));
+        if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
       }
     }
-  }
-
-  // 新激活的源保存时执行轻量快速门禁校验（秒级），给出准确进度指引
-  const pendingNew = lxPendingActivationCount();
-  btn.textContent = pendingNew > 0
-    ? `保存中（快速校验 ${pendingNew} 个新激活源）…`
-    : "保存中…";
-
-  const syncOrderThroughProxy = values.FNMUSIC_LX_ENABLED === true
-    && $("#lx-auto-switch").checked
-    && Boolean(configSchema.FNMUSIC_LX_SOURCE_ORDER);
-  const requestedOrder = lxSourceOrder.slice();
-  if (syncOrderThroughProxy) delete values.FNMUSIC_LX_SOURCE_ORDER;
-  if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
-
-  const idempotencyKey = "cfg_save_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
-  try {
+    const dirPatch = values.FNMUSIC_TEE_SAVE_DIR_BY_USER || {};
+    for (const [guid, path] of Object.entries(dirPatch)) {
+      if (!path || path === (savedUserDirs[guid] || "")) continue;
+      const res = await fsCheckDir(path, Math.max(1, started + 3000 - performance.now()));
+      if (res.mode === "fail") { toast("用户目录不可用：" + res.message, "fail"); return; }
+    }
+    const pendingNew = lxPendingActivationCount();
+    btn.textContent = pendingNew > 0
+      ? `保存中（快速确认 ${pendingNew} 个新源，一分钟内返回）…`
+      : "保存中（一分钟内返回）…";
+    if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
     let result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        values,
-        base_revision: currentConfigRevision || null,
-        idempotency_key: idempotencyKey,
-      }),
-    });
-
-    if (result && result.job_id && (result.status === "pending" || result.status === "running")) {
-      result = await pollConfigJob(result.job_id, (j) => {
-        const pct = typeof j.progress === "number" ? `${j.progress}%` : "";
-        const phaseMsg = j.message || "处理中";
-        btn.textContent = `保存中 ${pct} (${phaseMsg})…`;
-      });
+      body: JSON.stringify({ values, base_revision: currentConfigRevision || null }),
+    }, remaining());
+    if (result.job_id && ["pending", "running"].includes(result.status)) {
+      result = await pollConfigJob(result.job_id, (job) => {
+        btn.textContent = `保存中（${job.progress || 0}%）…`;
+      }, remaining());
     }
-
-    let orderApplied = false;
-    if (syncOrderThroughProxy) {
-      // 配置保存可能为新激活源补入 lxserver ID；将它们追加到用户排序之后再调用专用代理。
-      const savedConfig = await api("/api/config");
-      let savedOrder = [];
-      try {
-        const parsed = JSON.parse(savedConfig.values.FNMUSIC_LX_SOURCE_ORDER || "[]");
-        if (Array.isArray(parsed)) savedOrder = parsed.filter((id) => typeof id === "string");
-      } catch (_) { /* 共享配置格式错误时保留当前顺序，接口会给出明确校验错误 */ }
-      const finalOrder = requestedOrder.slice();
-      savedOrder.forEach((id) => { if (!finalOrder.includes(id)) finalOrder.push(id); });
-      if (JSON.stringify(finalOrder) !== JSON.stringify(savedOrder)) {
-        try {
-          const reorder = await api("/api/lx/source/reorder", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source_ids: finalOrder }),
-          });
-          orderApplied = Boolean((reorder.changed || []).includes("FNMUSIC_LX_SOURCE_ORDER"));
-          if (orderApplied) result.changed = [...new Set([...(result.changed || []), "FNMUSIC_LX_SOURCE_ORDER"])];
-        } catch (exc) {
-          try { await loadConfig(); } catch (_) {}
-          try { await loadStatus(); } catch (_) {}
-          const isBusy = exc.status === 409 || exc.body?.category === "source_operation_busy";
-          const reason = isBusy
-            ? (exc.message && exc.message.includes("忙") ? exc.message : "洛雪源正忙，请稍候重试")
-            : exc.message;
-          toast(`其他配置已保存；洛雪源排序失败，${reason}；已恢复保存顺序`, "fail");
-          return;
-        }
-      }
-    }
+    if (result.new_revision) currentConfigRevision = result.new_revision;
     const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
     const warnings = result.warnings || [];
     const parts = [];
@@ -1029,31 +1002,44 @@ async function saveConfig() {
       if (a.kind === "lx_activate" && !a.auto_disabled) {
         const label = a.source ? `「${a.source}」` : "";
         const op = a.op === "deactivate" ? "取消激活" : "激活";
-        parts.push(`洛雪源${label}${op}${a.ok ? "成功" : "失败"}`);
+        const outcome = a.ok ? "成功" : a.category === "not_executed" ? "未执行"
+          : ["result_unknown", "initialization_pending"].includes(a.category) ? "结果待核实" : "失败";
+        parts.push(`洛雪源${label}${op}${outcome}`);
       }
+      if (a.kind === "lx_reorder") parts.push(`洛雪源排序${a.ok ? "成功" : "未确认，保留原顺序"}`);
     });
     warnings.forEach((w) => {
       if (w.category && !["runtime", "runtime_error"].includes(w.category)) {
-        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌" }[w.category] || "状态暂不可确认";
-        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，激活配置已保留${w.message ? `（${w.message}）` : ""}`);
+        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌",
+          result_unknown: "结果待核实", not_executed: "未执行" }[w.category] || "状态暂不可确认";
+        const state = w.saved_active === false ? "未保存为激活" : "激活配置已保留";
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，${state}${w.message ? `（${w.message}）` : ""}`);
+      } else if (w.auto_disabled === false) {
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」初始化失败，保留原激活配置${w.message ? `（${w.message}）` : ""}`);
       } else {
         parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
       }
     });
-    if (failed.length) {
+    if (failed.length || result.complete === false) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
     } else {
       toast(parts.join("；") || "配置无变化", "ok");
     }
-    clearDirty();
-    try { await loadConfig(); } catch (err) { console.warn("配置加载失败", err); }
-    try { await loadStatus(); } catch (err) { console.warn("状态加载失败", err); }
-    try { refreshLlmUsage(); } catch (err) { console.warn("LLM用量加载失败", err); }
+    if (result.values) {
+      configValues = { ...configValues, ...result.values };
+      applyConfigToForm();
+      clearDirty();
+    } else {
+      // 兼容旧后端；配置回读仍使用本次剩余预算。
+      await loadConfig(remaining());
+    }
+    void loadStatus(3000);
+    refreshLlmUsage();
   } catch (exc) {
     lxRuntimeSnapshot = null;
     renderLxSourceList();
     toast("保存失败：" + exc.message, "fail");
-    await loadStatus();
+    void loadStatus(3000);
   } finally {
     btn.disabled = false;
     btn.textContent = "保存并生效";
@@ -1160,7 +1146,6 @@ $("#platform-test-btn").addEventListener("click", () => {
 let platformTestJob = null;
 let platformTestTimer = null;
 let platformTestPolling = false;
-let platformTestResults = [];
 
 function formatPlatformLatency(ms) {
   const n = Number(ms);
@@ -1227,10 +1212,12 @@ function updatePlatformTestProgress(done, total) {
 }
 
 async function pollPlatformTestJob() {
-  if (platformTestPolling || !platformTestJob || platformTestJob.status === "done") return;
+  if (platformTestPolling || !platformTestJob || platformTestJob.status !== "running") return;
+  const job = platformTestJob;
   platformTestPolling = true;
   try {
-    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(platformTestJob.job_id));
+    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(job.job_id), undefined, 5000);
+    if (platformTestJob !== job || job.status !== "running") return;
     if (!data.ok) throw new Error(data.error || "status failed");
     platformTestJob.status = data.status;
     platformTestJob.results = data.results || [];
@@ -1242,11 +1229,12 @@ async function pollPlatformTestJob() {
     renderPlatformTestStats(platformTestJob.progress.done, platformTestJob.progress.total, okCount, failCount);
     $("#platform-test-enable-ok").textContent = `启用成功的 (${okCount})`;
     $("#platform-test-disable-fail").textContent = `关闭无效的 (${failCount})`;
-    if (data.status === "done") {
+    if (data.status !== "running") {
       $("#platform-test-actions").hidden = false;
       $("#platform-test-start").disabled = false;
       $("#platform-test-stop").disabled = true;
-      setPlatformTestMessage("测试完成，可批量启停平台");
+      setPlatformTestMessage(data.status === "done" ? "测试完成，可批量启停平台" :
+        data.status === "cancelled" ? "已停止，可操作已完成的结果" : "测试失败，可重新测试");
       clearTimeout(platformTestTimer);
       platformTestTimer = null;
     } else {
@@ -1254,7 +1242,16 @@ async function pollPlatformTestJob() {
       platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
     }
   } catch (exc) {
-    setPlatformTestMessage(`查询失败：${exc.message}`);
+    if (platformTestJob !== job || job.status !== "running") return;
+    if (exc.status === 404) {
+      job.status = "expired";
+      $("#platform-test-start").disabled = false;
+      $("#platform-test-stop").disabled = true;
+      setPlatformTestMessage("测试记录已过期，请重新测试");
+    } else {
+      setPlatformTestMessage(`查询失败，将重试：${exc.message}`);
+      platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+    }
   } finally {
     platformTestPolling = false;
   }
@@ -1264,17 +1261,19 @@ async function startPlatformTest() {
   const keyword = $("#platform-test-keyword").value.trim() || "周杰伦";
   const concurrency = parseInt($("#platform-test-concurrency").value, 10) || 4;
   $("#platform-test-start").disabled = true;
-  $("#platform-test-stop").disabled = false;
+  $("#platform-test-stop").disabled = true;
+  clearTimeout(platformTestTimer);
+  platformTestJob = null;
   $("#platform-test-actions").hidden = true;
   setPlatformTestMessage("正在启动…");
   renderPlatformTestStats(0, 0, 0, 0);
-  platformTestResults = [];
   renderPlatformTestTable([]);
   $("#platform-test-progress-wrap").hidden = true;
   try {
-    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) });
+    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) }, 15000);
     if (!data.ok) throw new Error(data.error || "start failed");
     platformTestJob = { job_id: data.job_id, status: "running", results: [], progress: { done: 0, total: data.total } };
+    $("#platform-test-stop").disabled = false;
     updatePlatformTestProgress(0, data.total);
     platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
   } catch (exc) {
@@ -1284,16 +1283,25 @@ async function startPlatformTest() {
   }
 }
 
-function stopPlatformTest() {
-  if (platformTestJob) {
-    api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: platformTestJob.job_id }) }).catch(() => {});
-  }
-  clearTimeout(platformTestTimer);
-  platformTestTimer = null;
-  platformTestJob = null;
-  $("#platform-test-start").disabled = false;
+async function stopPlatformTest() {
+  const job = platformTestJob;
+  if (!job || job.status !== "running") return;
   $("#platform-test-stop").disabled = true;
-  setPlatformTestMessage("已停止");
+  try {
+    const data = await api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.job_id }) }, 10000);
+    if (!data.ok) throw new Error(data.error || "stop failed");
+    if (platformTestJob !== job) return;
+    job.status = "cancelled";
+    clearTimeout(platformTestTimer);
+    platformTestTimer = null;
+    $("#platform-test-start").disabled = false;
+    $("#platform-test-actions").hidden = false;
+    setPlatformTestMessage("已停止，可操作已完成的结果");
+  } catch (exc) {
+    if (platformTestJob !== job) return;
+    $("#platform-test-stop").disabled = job.status !== "running";
+    setPlatformTestMessage(`停止失败：${exc.message}`);
+  }
 }
 
 $("#platform-test-start").addEventListener("click", startPlatformTest);
@@ -1320,11 +1328,13 @@ $("#platform-test-enable-all").addEventListener("click", () => {
   const all = platformTestJob ? platformTestJob.results.map((r) => r.platform) : platforms.registered;
   platforms.enabled = Array.from(new Set(all));
   renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
   markDirty("已启用全部测试平台");
 });
 $("#platform-test-disable-all").addEventListener("click", () => {
   platforms.enabled = [];
   renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
   markDirty("已停用全部平台");
 });
 
@@ -2989,19 +2999,20 @@ const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试�
 
 /* 目录权限校验：桌面链路由宿主机网关（root，真实落盘视角）拦截应答；
    直连 8774 时 WebUI 返回 501（容器内看不到宿主路径），降级为 skip 放行。 */
-async function fsCheckDir(path) {
+async function fsCheckDir(path, timeoutMs = 0) {
   try {
     const r = await api("/api/fs-check", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
-    });
+    }, timeoutMs);
     if (!r.writable) {
       return { mode: "fail", message: r.exists ? "目录不可写（权限不足或只读挂载）" : "目录无法创建（父目录不可写）" };
     }
     if (!r.exists) return { mode: "warn", message: "目录不存在；父目录可写，保存后自动创建" };
     return { mode: "ok", message: "目录可写 ✓" };
   } catch (exc) {
+    if (exc.name === "TimeoutError") return { mode: "fail", message: "目录检查超时，请重试" };
     return { mode: "skip", message: "目录校验不可用（" + exc.message + "），保存时不校验权限" };
   }
 }
@@ -3065,6 +3076,7 @@ DIR_FIELDS.forEach(bindDirField);
   // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
   const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
   if (pathname.startsWith("/app/")) {
+    $("#log-nas-btn").hidden = false;
     const sdk = await loadTrimSdk();
     if (sdk) {
       $("#lx-pick").hidden = false;
@@ -3202,39 +3214,197 @@ async function loadAbout() {
   checkUpdate();
 }
 
+let logShareFile = null;
+
+function isMobileExportDevice() {
+  const coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+  const userAgent = (globalThis.navigator && globalThis.navigator.userAgent) || "";
+  return coarse || /Android|iPhone|iPad|Mobile/i.test(userAgent);
+}
+
+function canShareLogFiles() {
+  const nav = globalThis.navigator;
+  return !!(nav && typeof nav.canShare === "function" && typeof nav.share === "function" &&
+    typeof File === "function");
+}
+
+function setLogExportBusy(busy) {
+  ["#log-export-btn", "#log-share-btn", "#log-nas-btn"].forEach((id) => {
+    $(id).disabled = busy;
+  });
+}
+
+function clearPreparedLogShare(clearNote) {
+  logShareFile = null;
+  $("#log-share-btn").hidden = true;
+  if (clearNote) $("#log-export-note").textContent = "";
+}
+
+function browserDownloadLog(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  $("#log-export-note").textContent =
+    `已发起下载 ${name}，保存位置由浏览器或系统设置决定`;
+}
+
+async function fetchLogArchive() {
+  const resp = await fetch(APP_BASE + "/api/logs/export");
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`;
+    try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
+    throw new Error(msg);
+  }
+  const blob = await resp.blob();
+  const match = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
+  const name = match ? match[1] : `fnmusic-logs-${Date.now()}.zip`;
+  return { blob, name };
+}
+
 async function exportLogs() {
-  const btn = $("#log-export-btn");
-  const note = $("#log-export-note");
-  if (btn.disabled) return;
-  btn.disabled = true;
-  note.textContent = "打包中…";
+  if ($("#log-export-btn").disabled) return;
+  setLogExportBusy(true);
+  $("#log-export-note").textContent = "打包中…";
+  $("#log-export-result").hidden = true;
   try {
-    const resp = await fetch(APP_BASE + "/api/logs/export");
-    if (!resp.ok) {
-      let msg = `HTTP ${resp.status}`;
-      try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
-      throw new Error(msg);
+    const archive = await fetchLogArchive();
+    if (isMobileExportDevice() && canShareLogFiles()) {
+      logShareFile = new File([archive.blob], archive.name, { type: "application/zip" });
+      const supported = globalThis.navigator.canShare({
+        files: [logShareFile], title: "fnmusic-ext 日志",
+      });
+      if (supported) {
+        $("#log-share-btn").hidden = false;
+        $("#log-export-note").textContent =
+          `ZIP 已准备好（${archive.name}），请点击“保存或分享 ZIP”`;
+        return;
+      }
+      logShareFile = null;
     }
-    const blob = await resp.blob();
-    const m = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
-    const name = m ? m[1] : `fnmusic-logs-${Date.now()}.logzip`;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    note.textContent = `已导出 ${name}`;
+    browserDownloadLog(archive.blob, archive.name);
   } catch (exc) {
-    note.textContent = "";
+    $("#log-export-note").textContent = "";
     toast("日志导出失败：" + exc.message, "fail");
+    clearPreparedLogShare(false);
   } finally {
-    btn.disabled = false;
+    setLogExportBusy(false);
   }
 }
 $("#log-export-btn").addEventListener("click", () => { exportLogs().catch(() => {}); });
+
+async function sharePreparedLogs() {
+  if (!logShareFile || $("#log-share-btn").disabled) return;
+  setLogExportBusy(true);
+  try {
+    await globalThis.navigator.share({
+      files: [logShareFile],
+      title: "fnmusic-ext 日志",
+      text: "fnmusic-ext 运行日志",
+    });
+    $("#log-export-note").textContent = "系统分享流程已结束";
+  } catch (exc) {
+    if (exc && exc.name === "AbortError") {
+      $("#log-export-note").textContent = "已取消分享，ZIP 仍保留，可再次保存或分享";
+    } else {
+      browserDownloadLog(logShareFile, logShareFile.name);
+      toast("系统分享不可用，已改为下载 ZIP；也可保存到 NAS", "fail");
+    }
+  } finally {
+    setLogExportBusy(false);
+  }
+}
+$("#log-share-btn").addEventListener("click", () => { sharePreparedLogs().catch(() => {}); });
+
+async function exportLogsToNas() {
+  if ($("#log-nas-btn").disabled) return;
+  setLogExportBusy(true);
+  $("#log-export-result").hidden = true;
+  $("#log-export-note").textContent = "选择 NAS 保存目录…";
+  try {
+    const sdk = await loadTrimSdk();
+    if (!sdk) {
+      $("#log-export-note").textContent = "当前环境不支持 NAS 保存，请在飞牛 App 或飞牛桌面内打开";
+      return;
+    }
+    if (sdk.isStandaloneWeb) {
+      $("#log-export-note").textContent = "请从飞牛 App 或飞牛桌面打开管理台后再保存到 NAS";
+      return;
+    }
+    if (typeof sdk.pickUserFile !== "function") {
+      $("#log-export-note").textContent = "当前飞牛版本不支持目录选择，请升级飞牛 App 或系统";
+      return;
+    }
+    const picked = await sdk.pickUserFile({
+      directory: true,
+      title: "选择日志保存位置",
+      okText: "保存到这里",
+      creatable: true,
+      sidebarGroup: ["myFiles", "otherShare", "external", "remote", "favorites"],
+    });
+    const paths = (picked && picked.data) || [];
+    if (!paths.length) {
+      $("#log-export-note").textContent = "已取消选择目录，未导出日志";
+      return;
+    }
+    const directory = paths[0];
+    $("#log-export-note").textContent = "正在打包并保存到 NAS…";
+    const resp = await fetch(APP_BASE + "/api/logs/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directory }),
+    });
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok || !body.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+    const result = $("#log-export-result");
+    $("#log-export-path").textContent = body.path;
+    $("#log-export-path").dataset.directory = directory;
+    $("#log-export-path").dataset.path = body.path;
+    result.hidden = false;
+    $("#log-export-note").textContent = `已保存 ${body.filename}`;
+    clearPreparedLogShare(false);
+  } catch (exc) {
+    $("#log-export-note").textContent = "";
+    toast("保存到 NAS 失败：" + exc.message, "fail");
+  } finally {
+    setLogExportBusy(false);
+  }
+}
+$("#log-nas-btn").addEventListener("click", () => { exportLogsToNas().catch(() => {}); });
+
+async function copyLogExportPath() {
+  const path = $("#log-export-path").dataset.path || "";
+  if (!path) return;
+  try {
+    await globalThis.navigator.clipboard.writeText(path);
+    toast("路径已复制", "ok");
+  } catch (_) {
+    toast("复制失败，请手动复制显示的路径", "fail");
+  }
+}
+$("#log-copy-path").addEventListener("click", () => { copyLogExportPath().catch(() => {}); });
+
+async function openLogExportFolder() {
+  const directory = $("#log-export-path").dataset.directory || "";
+  if (!directory) return;
+  try {
+    const sdk = await loadTrimSdk();
+    if (!sdk || typeof sdk.openFileManager !== "function") {
+      throw new Error("当前环境不支持打开文件管理器");
+    }
+    await sdk.openFileManager(directory);
+  } catch (exc) {
+    toast("打开文件夹失败：" + exc.message, "fail");
+  }
+}
+$("#log-open-folder").addEventListener("click", () => { openLogExportFolder().catch(() => {}); });
+
+window.addEventListener("pagehide", () => { clearPreparedLogShare(false); });
 
 /* -------------------------------------------------------------- 检查更新 */
 async function checkUpdate() {
@@ -3247,7 +3417,16 @@ async function checkUpdate() {
 // 有新版本则红点常亮（两处"关于"入口 + 关于页 NEW 标记），不因查看而清除
 function renderUpdateBadge() {
   const has = !!(updateInfo && updateInfo.has_update);
-  $$(".nav-dot").forEach((el) => { el.hidden = !has; });
+  $$(".nav-dot").forEach((el) => {
+    el.hidden = !has;
+    if (!el._updateBound) {
+      el._updateBound = true;
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openUpdateModal();
+      });
+    }
+  });
   $("#about-new").hidden = !has;
 }
 
@@ -3255,6 +3434,10 @@ function fmtDate(iso) {
   const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(iso || ""));
   return m ? m[1] : "-";
 }
+
+let updateTargetSnapshot = null;
+let selfUpdateJobId = null;
+let selfUpdatePollTimer = null;
 
 function openUpdateModal() {
   if (!updateInfo || !updateInfo.has_update) return;
@@ -3266,6 +3449,190 @@ function openUpdateModal() {
   // 升级跳转跟随检查源：GitHub 查到跳 GitHub release 页，Gitee 查到跳 Gitee 发行版页
   $("#update-upgrade-btn").href = latest.html_url || "#";
   $("#update-modal").hidden = false;
+
+  // 重置弹窗内动态区域
+  $("#update-modal-prompt").hidden = true;
+  $("#update-modal-error").hidden = true;
+  $("#update-modal-progress").hidden = !selfUpdateJobId;
+  $("#update-install-btn").hidden = true;
+  $("#update-install-btn").disabled = false;
+  $("#update-upgrade-btn").hidden = false;
+
+  if (selfUpdateJobId) {
+    $("#update-upgrade-btn").hidden = true;
+    return;
+  }
+
+  // 异步解析安装目标与架构匹配（若失败或为直连 501 则降级展示手动升级外链）
+  const tagStr = String(latest.tag_name || latest.version || "").trim();
+  if (!tagStr) return;
+  const tag = tagStr.startsWith("v") ? tagStr : `v${tagStr}`;
+  api(`/api/self-update/target?tag=${encodeURIComponent(tag)}`).then((res) => {
+    if (res && res.ok && res.target) {
+      updateTargetSnapshot = res.target;
+      const verText = formatVersionLabel(res.target.tag || res.target.formal_base);
+      const installVer = res.target.install_version || res.target.formal_base;
+      $("#update-modal-prompt").textContent = `是否下载并安装 ${verText}（安装版本 ${installVer}）？`;
+      $("#update-modal-prompt").hidden = false;
+      $("#update-install-btn").hidden = false;
+      $("#update-install-btn").disabled = false;
+      $("#update-upgrade-btn").hidden = true;
+    }
+  }).catch(() => {
+    $("#update-upgrade-btn").hidden = false;
+  });
+}
+
+async function startSelfUpdate() {
+  if (!updateTargetSnapshot || !updateTargetSnapshot.target_id) return;
+  $("#update-install-btn").disabled = true;
+  $("#update-install-btn").hidden = true;
+  $("#update-upgrade-btn").hidden = true;
+  $("#update-modal-prompt").hidden = true;
+  $("#update-modal-error").hidden = true;
+  $("#update-modal-progress").hidden = false;
+  $("#update-progress-phase").textContent = "正在提交更新任务...";
+  $("#update-progress-bar").style.width = "0%";
+  $("#update-progress-detail").textContent = "准备中...";
+
+  try {
+    const res = await api("/api/self-update", {
+      method: "POST",
+      body: JSON.stringify({
+        target_id: updateTargetSnapshot.target_id,
+        confirm: true,
+      }),
+    });
+    if (res && res.ok && res.job) {
+      selfUpdateJobId = res.job.id;
+      try { localStorage.setItem("fnmusic_self_update_job_id", selfUpdateJobId); } catch (_) {}
+      pollSelfUpdate(selfUpdateJobId);
+    } else {
+      throw new Error((res && res.error) || "创建更新任务失败");
+    }
+  } catch (err) {
+    $("#update-modal-progress").hidden = true;
+    $("#update-modal-error").hidden = false;
+    $("#update-error-text").textContent = err.message || "启动更新失败";
+    $("#update-install-btn").disabled = false;
+    $("#update-install-btn").hidden = false;
+  }
+}
+
+function pollSelfUpdate(jobId) {
+  if (selfUpdatePollTimer) clearTimeout(selfUpdatePollTimer);
+
+  const phaseLabels = {
+    downloading: "正在下载更新包",
+    verifying: "正在校验安装包哈希值",
+    backing_up: "正在备份配置与持久数据",
+    staging: "正在暂存安装包到应用中心",
+    installing: "正在执行原生升级，服务可能短暂重启",
+    restarting: "正在等待服务重启恢复",
+  };
+
+  async function step() {
+    try {
+      const res = await api(`/api/self-update/jobs/${jobId}`);
+      if (!res || !res.ok || !res.job) {
+        throw new Error("查询任务失败");
+      }
+      const job = res.job;
+      const phase = job.phase || "";
+      const status = job.status || "";
+
+      let phaseText = phaseLabels[phase] || "处理中...";
+      if (phase === "downloading" && job.source) {
+        phaseText += ` (${job.source === "gitee" ? "Gitee" : "GitHub"})`;
+      }
+      $("#update-progress-phase").textContent = phaseText;
+
+      if (phase === "downloading") {
+        const dl = Number(job.downloaded_bytes || 0);
+        const total = Number(job.total_bytes || 0);
+        if (total > 0) {
+          const pct = Math.min(100, Math.round((dl / total) * 100));
+          $("#update-progress-bar").style.width = pct + "%";
+          $("#update-progress-detail").textContent =
+            `${(dl / 1024 / 1024).toFixed(1)} MB / ${(total / 1024 / 1024).toFixed(1)} MB (${pct}%)`;
+        } else {
+          $("#update-progress-detail").textContent = `${(dl / 1024 / 1024).toFixed(1)} MB`;
+        }
+      } else {
+        $("#update-progress-bar").style.width = "100%";
+        $("#update-progress-detail").textContent = status === "completed" ? "已完成" : "请稍候...";
+      }
+
+      if (status === "completed") {
+        $("#update-progress-phase").textContent = "升级成功，正在刷新页面...";
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        setTimeout(() => { window.location.reload(); }, 3000);
+        return;
+      }
+
+      if (status === "failed") {
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        $("#update-modal-progress").hidden = true;
+        $("#update-modal-error").hidden = false;
+        const msg = job.message || "";
+        if (msg.includes("下载失败") || msg.includes("GitHub 下载最新版本") || msg.includes("所有下载源均失败")) {
+          $("#update-error-text").textContent = "下载失败，请到 GitHub 下载最新版本。";
+          $("#update-error-link").href = "https://github.com/javycoder/fnos_music_ext/releases";
+          $("#update-error-link").hidden = false;
+        } else {
+          $("#update-error-text").textContent = `升级失败: ${msg || "未知错误"}`;
+          $("#update-error-link").href = "https://github.com/javycoder/fnos_music_ext/releases";
+          $("#update-error-link").hidden = false;
+        }
+        $("#update-install-btn").disabled = false;
+        $("#update-install-btn").hidden = false;
+        $("#update-install-btn").textContent = "重试下载并安装";
+        return;
+      }
+
+      if (status === "unknown") {
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        $("#update-modal-progress").hidden = true;
+        $("#update-modal-error").hidden = false;
+        $("#update-error-text").textContent = `安装结果待确认: ${job.message || "请前往飞牛应用中心查看状态"}`;
+        $("#update-error-link").hidden = true;
+        return;
+      }
+
+      const pollInterval = (typeof window !== "undefined" && typeof window.SELF_UPDATE_POLL_INTERVAL === "number")
+        ? window.SELF_UPDATE_POLL_INTERVAL
+        : 1500;
+      selfUpdatePollTimer = setTimeout(step, pollInterval);
+    } catch (_) {
+      const errInterval = (typeof window !== "undefined" && typeof window.SELF_UPDATE_POLL_INTERVAL === "number")
+        ? window.SELF_UPDATE_POLL_INTERVAL
+        : 2000;
+      selfUpdatePollTimer = setTimeout(step, errInterval);
+    }
+  }
+
+  step();
+}
+
+if (typeof window !== "undefined") {
+  window.pollSelfUpdate = pollSelfUpdate;
+  window.startSelfUpdate = startSelfUpdate;
+}
+
+async function checkActiveSelfUpdateJob() {
+  try {
+    const res = await api("/api/self-update");
+    if (res && res.ok && res.job) {
+      if (res.job.status === "queued" || res.job.status === "running") {
+        selfUpdateJobId = res.job.id;
+        openUpdateModal();
+        pollSelfUpdate(selfUpdateJobId);
+      }
+    }
+  } catch (_) {}
 }
 
 function closeUpdateModal() {
@@ -3273,6 +3640,9 @@ function closeUpdateModal() {
 }
 
 $("#about-new").addEventListener("click", openUpdateModal);
+$("#update-install-btn").addEventListener("click", () => {
+  startSelfUpdate().catch(() => {});
+});
 $("#update-cancel-btn").addEventListener("click", closeUpdateModal);
 $("#update-modal").addEventListener("click", (ev) => {
   if (ev.target === ev.currentTarget) closeUpdateModal();  // 点遮罩空白处关闭
@@ -3406,6 +3776,261 @@ window.addEventListener("keydown", (ev) => {
 });
 
 /* ------------------------------------------------------ 下载目录整理 Beta */
+function parseUserMap(raw) {
+  try {
+    const value = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || {});
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function absoluteDirError(label, path) {
+  if (!path) return "";
+  if (!path.startsWith("/") || path.split("/").includes("..") || /[\u0000-\u001f\u007f]/.test(path)) {
+    return label + "必须是以 / 开头的绝对路径，且不能包含 .. 或控制字符";
+  }
+  return "";
+}
+
+function scanAdminPasswordUpdate() {
+  if (!configSchema.FNMUSIC_SCAN_ADMIN_PASSWORD || !$("#scan-admin-password")) return {};
+  if (scanAdminPasswordClear) return { FNMUSIC_SCAN_ADMIN_PASSWORD: "" };
+  if (!scanAdminPasswordDirty) return {};
+  return { FNMUSIC_SCAN_ADMIN_PASSWORD: $("#scan-admin-password").value };
+}
+
+function userDirInput(guid) {
+  return Array.from(document.querySelectorAll("[data-user-dir]")).find((el) => el.dataset.userDir === guid) || null;
+}
+
+function userStorageConfigPatch() {
+  if (!userStorageReady) return {};
+  const directories = {};
+  const scans = {};
+  for (const row of document.querySelectorAll("[data-user-row]")) {
+    const guid = row.dataset.userRow;
+    const dir = (userDirInput(guid) || {}).value || "";
+    directories[guid] = dir.trim() || null;
+    const mode = (row.querySelector("[data-user-scan-mode]") || {}).value || "inherit";
+    if (mode === "disable") scans[guid] = "";
+    else if (mode === "override") scans[guid] = (row.querySelector("[data-user-scan-value]") || {}).value.trim();
+    else scans[guid] = null;
+  }
+  for (const row of document.querySelectorAll("[data-stale-delete]:checked")) {
+    directories[row.dataset.staleDelete] = null;
+    scans[row.dataset.staleDelete] = null;
+  }
+  const patch = {};
+  if (configSchema.FNMUSIC_TEE_SAVE_DIR_BY_USER) patch.FNMUSIC_TEE_SAVE_DIR_BY_USER = directories;
+  if (configSchema.FNMUSIC_LIBRARY_SCAN_BY_USER) patch.FNMUSIC_LIBRARY_SCAN_BY_USER = scans;
+  return patch;
+}
+
+function validateUserStoragePatch(values) {
+  const directories = values.FNMUSIC_TEE_SAVE_DIR_BY_USER || {};
+  const scans = values.FNMUSIC_LIBRARY_SCAN_BY_USER || {};
+  for (const path of Object.values(directories)) {
+    if (path == null) continue;
+    const error = absoluteDirError("用户下载目录", path);
+    if (error) throw new Error(error);
+  }
+  for (const row of document.querySelectorAll("[data-user-row]")) {
+    if ((row.querySelector("[data-user-scan-mode]") || {}).value !== "override") continue;
+    const value = scans[row.dataset.userRow];
+    if (!value) throw new Error("选择单独设置扫描时必须填写扫描配置");
+    if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error("扫描配置包含控制字符");
+  }
+}
+
+function renderUserStorage() {
+  const list = $("#user-storage-list");
+  const staleBox = $("#user-storage-stale");
+  const organizeUser = $("#organize-user");
+  const organizeField = $("#organize-user-field");
+  if (!list || !staleBox) return;
+  const enabled = Boolean($("#tee-save-by-user") && $("#tee-save-by-user").checked);
+  if (organizeField) organizeField.hidden = !enabled;
+  if (!userStorageReady || !userStorageStatus) {
+    list.textContent = enabled
+      ? ("用户目录状态不可用：" + (userStorageError || "未知错误") + "。本次保存不会修改各用户目录和扫描配置。")
+      : "";
+    staleBox.textContent = "";
+    if (organizeUser) organizeUser.innerHTML = "";
+    return;
+  }
+  const users = Array.isArray(userStorageStatus.users) ? userStorageStatus.users : [];
+  if (organizeUser) {
+    const previous = organizeUser.value;
+    organizeUser.innerHTML = users.map((user) =>
+      `<option value="${escapeHtml(user.guid)}">${escapeHtml(user.name || user.guid)}</option>`).join("");
+    if (previous && Array.from(organizeUser.options).some((option) => option.value === previous)) {
+      organizeUser.value = previous;
+    }
+  }
+  if (!enabled) {
+    list.textContent = "";
+    staleBox.textContent = "";
+    return;
+  }
+  list.innerHTML = users.map((user) => {
+    const custom = savedUserDirs[user.guid] || "";
+    const hasScan = Object.prototype.hasOwnProperty.call(savedUserScans, user.guid);
+    const scan = hasScan ? savedUserScans[user.guid] : null;
+    const mode = scan == null ? "inherit" : (String(scan).trim() ? "override" : "disable");
+    const writable = user.root_writable ? "可写" : (user.root_exists ? "存在但不可写" : "目录尚不可用");
+    return `<div class="user-storage-row" data-user-row="${escapeHtml(user.guid)}">
+      <div class="user-storage-head"><b>${escapeHtml(user.name || "未命名用户")}</b><span class="user-storage-meta">${escapeHtml(user.role || "")}</span></div>
+      <div class="user-storage-status">有效目录：${escapeHtml(user.root || "-")} · ${writable}</div>
+      <div class="user-storage-status">最近扫描：${escapeHtml(user.scan_status || "尚无结果")}</div>
+      <label class="field"><span>自定义目录（留空恢复自动目录）</span>
+        <input class="input" data-user-dir="${escapeHtml(user.guid)}" value="${escapeHtml(custom)}" placeholder="留空使用自动目录">
+      </label>
+      <div class="user-storage-actions">
+        <button class="btn" type="button" data-user-dir-pick="${escapeHtml(user.guid)}">从 NAS 选择</button>
+        <button class="btn" type="button" data-user-scan="${escapeHtml(user.guid)}">扫描此用户</button>
+      </div>
+      <label class="field"><span>曲库扫描</span>
+        <select class="input" data-user-scan-mode="${escapeHtml(user.guid)}">
+          <option value="inherit"${mode === "inherit" ? " selected" : ""}>继承全局扫描</option>
+          <option value="disable"${mode === "disable" ? " selected" : ""}>显式禁用</option>
+          <option value="override"${mode === "override" ? " selected" : ""}>单独设置</option>
+        </select>
+      </label>
+      <label class="field"><span>单独扫描配置</span>
+        <input class="input" data-user-scan-value="${escapeHtml(user.guid)}" value="${escapeHtml(mode === "override" ? scan : "")}" placeholder="路径|JSON正文"${mode === "override" ? "" : " hidden"}>
+      </label>
+    </div>`;
+  }).join("") || "没有读取到飞牛音乐用户。";
+  const stale = Array.isArray(userStorageStatus.stale_user_guids) ? userStorageStatus.stale_user_guids : [];
+  staleBox.innerHTML = stale.length
+    ? "以下配置对应的用户已不在飞牛音乐中。勾选后保存才会删除配置，不会删除已保存的歌曲。" +
+      stale.map((guid) => `<label class="user-storage-stale-row"><input type="checkbox" data-stale-delete="${escapeHtml(guid)}">删除失效用户 ${escapeHtml(guid)} 的目录和扫描配置</label>`).join("")
+    : "";
+}
+
+async function loadUserStorage() {
+  if (!configSchema.FNMUSIC_TEE_SAVE_BY_USER || !$("#user-storage-list")) {
+    userStorageReady = false;
+    renderUserStorage();
+    return;
+  }
+  try {
+    const response = await api("/api/maintenance/user-storage");
+    if (!response || response.ok !== true || !Array.isArray(response.users)) {
+      throw new Error((response && response.error) || "用户目录响应无效");
+    }
+    userStorageStatus = response;
+    userStorageReady = true;
+    userStorageError = "";
+  } catch (exc) {
+    userStorageStatus = null;
+    userStorageReady = false;
+    userStorageError = exc.message;
+  }
+  renderUserStorage();
+}
+
+function maintenanceSucceeded(response) {
+  return Boolean(response) && response.ok === true;
+}
+
+async function testScanAdmin() {
+  const status = $("#scan-admin-status");
+  if (!status) return;
+  status.textContent = "正在测试已保存的管理员登录…";
+  try {
+    const response = await api("/api/maintenance/scan-admin-test", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (!maintenanceSucceeded(response)) throw new Error((response && response.error) || "管理员登录测试响应无效");
+    status.textContent = "管理员登录测试成功";
+  } catch (exc) {
+    status.textContent = "管理员登录测试失败：" + exc.message;
+  }
+}
+
+async function scanOneUser(guid) {
+  const status = $("#scan-admin-status");
+  if (status) status.textContent = "正在提交用户扫描…";
+  try {
+    const response = await api("/api/maintenance/scan-user", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_guid: guid }),
+    });
+    if (!maintenanceSucceeded(response)) throw new Error((response && response.error) || "用户扫描响应无效");
+    if (status) status.textContent = "用户扫描已确认";
+    await loadUserStorage();
+  } catch (exc) {
+    if (status) status.textContent = "用户扫描失败：" + exc.message;
+  }
+}
+
+function bindUserStorageControls() {
+  const list = $("#user-storage-list");
+  const staleBox = $("#user-storage-stale");
+  if (list) {
+    list.addEventListener("input", (ev) => {
+      if (ev.target && ev.target.matches && ev.target.matches("[data-user-dir], [data-user-scan-value]")) markDirty();
+    });
+    list.addEventListener("change", (ev) => {
+      const mode = ev.target && ev.target.matches && ev.target.matches("[data-user-scan-mode]") ? ev.target : null;
+      if (!mode) return;
+      const row = mode.closest("[data-user-row]");
+      const input = row && row.querySelector("[data-user-scan-value]");
+      if (input) input.hidden = mode.value !== "override";
+      markDirty();
+    });
+    list.addEventListener("click", async (ev) => {
+      const pick = ev.target && ev.target.closest && ev.target.closest("[data-user-dir-pick]");
+      const scan = ev.target && ev.target.closest && ev.target.closest("[data-user-scan]");
+      if (pick) {
+        const sdk = await loadTrimSdk();
+        if (!sdk) { toast("当前环境不支持 NAS 目录选择（直连 8774 时请直接粘贴路径）", "fail"); return; }
+        try {
+          const result = await sdk.pickUserFile({
+            directory: true, title: "选择用户下载目录", okText: "选择",
+            sidebarGroup: ["myFiles", "otherShare", "favorites"],
+          });
+          const paths = (result && result.data) || [];
+          const input = userDirInput(pick.dataset.userDirPick);
+          if (paths.length && input) {
+            input.value = paths[0];
+            markDirty();
+          }
+        } catch (exc) {
+          toast("NAS 目录选择失败：" + exc.message, "fail");
+        }
+      } else if (scan) {
+        await scanOneUser(scan.dataset.userScan);
+      }
+    });
+  }
+  if (staleBox) staleBox.addEventListener("change", () => markDirty());
+  if ($("#tee-save-by-user")) $("#tee-save-by-user").addEventListener("change", () => {
+    markDirty();
+    renderUserStorage();
+  });
+  if ($("#scan-admin-username")) $("#scan-admin-username").addEventListener("input", () => markDirty());
+  if ($("#scan-admin-device-id")) $("#scan-admin-device-id").addEventListener("input", () => markDirty());
+  if ($("#scan-admin-password")) $("#scan-admin-password").addEventListener("input", () => {
+    scanAdminPasswordDirty = true;
+    scanAdminPasswordClear = false;
+    markDirty();
+  });
+  if ($("#scan-admin-password-clear")) $("#scan-admin-password-clear").addEventListener("click", () => {
+    scanAdminPasswordClear = true;
+    scanAdminPasswordDirty = false;
+    if ($("#scan-admin-password")) {
+      $("#scan-admin-password").value = "";
+      $("#scan-admin-password").placeholder = "保存后清除已保存密码";
+    }
+    markDirty("将清除已保存的扫描管理员密码");
+  });
+  if ($("#scan-admin-test")) $("#scan-admin-test").addEventListener("click", () => { testScanAdmin(); });
+}
+bindUserStorageControls();
+
 let organizeInfo = null;
 let organizeConfirmation = null;
 let organizeJob = null;
@@ -3454,9 +4079,16 @@ function acceptOrganizeJob(response) {
 async function loadOrganizeStatus() {
   try {
     const response = await api(ORGANIZE_PATH);
-    if (!response || response.ok !== true || typeof response.root !== "string" ||
-        !DOWNLOAD_LAYOUT_LABELS[response.layout]) throw new Error("整理状态响应格式无效");
-    organizeInfo = { root: response.root, layout: response.layout };
+    if (!response || response.ok !== true || !DOWNLOAD_LAYOUT_LABELS[response.layout]) {
+      throw new Error("整理状态响应格式无效");
+    }
+    if (response.requires_user === true) {
+      organizeInfo = { root: "", layout: response.layout, requiresUser: true };
+    } else if (typeof response.root !== "string" || !response.root) {
+      throw new Error("整理状态响应格式无效");
+    } else {
+      organizeInfo = { root: response.root, layout: response.layout, requiresUser: false };
+    }
     if (response.job) acceptOrganizeJob(response);
   } catch (exc) {
     organizeInfo = null;
@@ -3488,9 +4120,13 @@ function closeOrganizeModal() {
 function organizeSettingsSaved() {
   const savedLayout = configValues.FNMUSIC_DOWNLOAD_LAYOUT || "flat";
   const savedDir = (configValues.FNMUSIC_TEE_SAVE_DIR || "").trim();
-  return ($("#download-layout").value || "flat") === savedLayout &&
-    $("#dir-download").value.trim() === savedDir &&
-    organizeInfo && organizeInfo.layout === savedLayout;
+  if (($("#download-layout").value || "flat") !== savedLayout) return false;
+  if ($("#dir-download").value.trim() !== savedDir) return false;
+  if (!organizeInfo || organizeInfo.layout !== savedLayout) return false;
+  if (!organizeInfo.requiresUser) return true;
+  const guid = ($("#organize-user") && $("#organize-user").value) || "";
+  const input = userDirInput(guid);
+  return Boolean(guid) && Boolean(input) && input.value.trim() === (savedUserDirs[guid] || "");
 }
 
 async function openOrganizeModal() {
@@ -3503,6 +4139,16 @@ async function openOrganizeModal() {
   await loadOrganizeStatus();
   if (!organizeInfo) return;
   if (organizeJob && organizeJob.status === "running") return;
+  if (organizeInfo.requiresUser) {
+    await loadUserStorage();
+    const guid = ($("#organize-user") && $("#organize-user").value) || "";
+    const user = ((userStorageStatus && userStorageStatus.users) || []).find((item) => item.guid === guid);
+    if (!user || typeof user.root !== "string" || !user.root) {
+      toast("请先选择一个可整理的用户目录", "fail");
+      return;
+    }
+    organizeInfo = { ...organizeInfo, root: user.root, userGuid: guid };
+  }
   if (!organizeSettingsSaved()) {
     toast("请先保存下载目录和存放方式，再执行整理", "fail");
     return;
@@ -3544,6 +4190,7 @@ async function startOrganize() {
         confirm_beta: true,
         root: confirmed.root,
         layout: confirmed.layout,
+      ...(confirmed.userGuid ? { user_guid: confirmed.userGuid } : {}),
       }),
     }));
   } catch (exc) {
@@ -3567,9 +4214,10 @@ $("#organize-modal").addEventListener("click", (ev) => {
   await loadConfig();
   await loadStatus();
   await loadOrganizeStatus();
-  checkActiveConfigJob().catch(() => {});  // 恢复可能仍在执行的配置保存任务
+  checkActiveSelfUpdateJob().catch(() => {});  // 恢复可能仍在执行的自更新任务
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
+  void checkActiveConfigJob();
   if ($("#public-playlists-enabled").checked) await showPublicBrowser();
   setInterval(loadStatus, 15000);
 })();

@@ -694,8 +694,11 @@ def _run_worker(task_line: str):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="worker 协议回归需在 POSIX 上跑")
-def test_worker_search_stage_error_keeps_type_and_stage():
-    """未安装 musicdl 时真实触发 ImportError：错误必须带类型与 search 阶段。"""
+def test_worker_search_stage_error_keeps_type_and_stage(tmp_path, monkeypatch):
+    """隔离缺失 SDK 场景，避免测试环境已装 musicdl 时意外请求真实上游。"""
+    (tmp_path / "musicdl.py").write_text(
+        "raise ModuleNotFoundError('isolated missing musicdl SDK')\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     lines, _ = _run_worker(json.dumps({
         "op": "search", "source": "KuwoMusicClient", "keyword": "晴天",
         "fetch_size": 5, "limit": 1, "song_id": None, "budget_s": 5.0,

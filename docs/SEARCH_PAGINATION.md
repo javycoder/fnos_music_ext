@@ -13,7 +13,7 @@ GET /music/api/v1/search/track?q=<关键词>&page=<页号>&size=<页大小>
 | --- | --- |
 | `q` / `keyword` / `query` | 关键词（三种别名等价，官方前端用 `q`） |
 | `page` | 页号，**1 起始**，默认 1 |
-| `size` | 页大小，默认 **50**；部分列表接口另有约定 `size=-1` = 返回全部 |
+| `size` | 显式提供时遵从请求；飞牛音乐 1.1.19 及以上且 `page`、`size` 均未提供时扩展默认 100，其余默认 50；部分列表接口另有约定 `size=-1` = 返回全部 |
 
 响应信封：
 
@@ -21,7 +21,7 @@ GET /music/api/v1/search/track?q=<关键词>&page=<页号>&size=<页大小>
 {"code": 0, "msg": "OK", "data": {"list": ["<track VO>..."], "total": 123}}
 ```
 
-- **没有 `hasMore` 字段**。官方客户端是否继续翻页完全由 `data.total` 驱动。
+- **没有 `hasMore` 字段**。`data.total` 提供总数，但客户端是否翻页还取决于自身实现：飞牛音乐 1.1.19 网页单曲搜索目前不请求第二页。由于本地结果优先，若本地命中已占满默认 100 条，网页不会显示后面的在线结果；显式分页的客户端不受这一网页限制。
 - track VO 关键字段：`guid`（32-hex）、`title`、`artists[]`、`album{name,...}`、
   `audioSpec{duration(毫秒),format,...}`、`isFavorite`。
 
@@ -46,7 +46,7 @@ GET /music/api/v1/search/track?q=<关键词>&page=<页号>&size=<页大小>
   纯在线 50 条，如此类推。**总量 ≤ size 时第 1 页装下全部，天然不分页。**
 - 在线池（`entry["items"]`）只追加不重排：同一 `(page, size, local_total)` 的
   切片稳定，已返回页的前缀永不移动（跨页零重复的根基）。
-- `data.total = 官方 total + 在线去重条数`，客户端据此继续翻页或停页。
+- `data.total = 官方 total + 在线去重条数`；支持分页的客户端可据此决定继续翻页，实际行为由客户端实现决定。
 - 在线段内部顺序固定为：网易 > musicdl > 洛雪（聚合序）。
 
 ## 3. 在线深分页（v2.7.0）

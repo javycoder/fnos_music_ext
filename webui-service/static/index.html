@@ -203,7 +203,7 @@
             </div>
             <div class="btn-row">
               <input class="input grow" id="lx-url" placeholder="https://example.com/lx-source.js 或 file:///data/lxmusic/uploads/xxx.js">
-              <button class="btn" id="lx-test">测试</button>
+              <button class="btn" id="lx-test">完整测试</button>
             </div>
             <div class="btn-row">
               <input type="file" id="lx-file" accept=".js" hidden>
@@ -482,9 +482,38 @@
           <div class="btn-row">
             <button class="btn" id="organize-open-btn" type="button">按所选方式整理现有曲库</button>
           </div>
+          <label class="field" id="organize-user-field" hidden>
+            <span>整理哪个用户</span>
+            <select class="input" id="organize-user"></select>
+          </label>
           <p class="hint">仅影响后续下载；「整理」会按所选结构移动下载目录内的全部歌曲，包括自行放入的文件。</p>
           <p id="organize-status" role="status" aria-live="polite"></p>
           <pre class="update-changelog" id="organize-details" hidden></pre>
+        </div>
+        <div class="card" id="user-storage-card">
+          <div class="card-title"><span>按用户保存</span></div>
+          <label class="switch-row"><span>每个用户使用独立目录<span class="sub">默认关闭。未自定义的用户保存到下载根目录下按用户标识区分的子目录；关闭时仍使用上面的统一目录。</span></span><input type="checkbox" id="tee-save-by-user"></label>
+          <p class="hint">旧文件不会自动迁移或删除。目录权限以下载服务的实际检查为准。</p>
+          <div id="user-storage-list"></div>
+          <div id="user-storage-stale"></div>
+        </div>
+        <div class="card" id="scan-admin-card">
+          <div class="card-title"><span>管理员扫描</span></div>
+          <label class="field"><span>管理员用户名</span>
+            <input class="input" id="scan-admin-username" autocomplete="off">
+          </label>
+          <label class="field"><span>管理员密码</span>
+            <input class="input" id="scan-admin-password" type="password" autocomplete="new-password">
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="scan-admin-password-clear" type="button">清除已保存密码</button>
+            <button class="btn" id="scan-admin-test" type="button">测试已保存的登录</button>
+          </div>
+          <label class="field"><span>设备 ID（可留空，由本次服务自动生成）</span>
+            <input class="input" id="scan-admin-device-id" autocomplete="off">
+          </label>
+          <p class="hint">密码不会在页面刷新后回显。未修改密码时不会提交，避免普通保存清掉已保存的密码。测试和手动扫描都使用已经保存的凭据。</p>
+          <p id="scan-admin-status" role="status" aria-live="polite"></p>
         </div>
         <div class="card">
           <div class="card-title"><span>临时缓存目录</span><button class="help-btn" type="button" data-help="cache-dir" aria-label="歌曲缓存目录帮助">?</button></div>
@@ -590,18 +619,6 @@
               <a class="about-link" href="https://github.com/javycoder/fnos_music_ext/issues" target="_blank" rel="noopener" id="about-issues">问题反馈</a>
             </div>
           </div>
-          <div class="card" id="about-disclaimer-card">
-            <div class="card-title">免责声明</div>
-            <ul class="about-disclaimer" id="about-disclaimer"></ul>
-          </div>
-          <div class="card">
-            <div class="card-title"><span>运行日志</span><button class="help-btn" type="button" data-help="logs" aria-label="运行日志帮助">?</button></div>
-            <div id="about-logs" class="stack"></div>
-            <div class="btn-row">
-              <button class="btn" id="log-export-btn">导出日志</button>
-              <span class="muted" id="log-export-note"></span>
-            </div>
-          </div>
           <div class="card about-donate" id="about-donate" hidden>
             <div class="card-title">请作者喝杯咖啡</div>
             <p class="hint">本项目用爱发电，全部功能免费开放。如果它对你有帮助，可以请作者喝杯咖啡 ☕</p>
@@ -614,6 +631,25 @@
                 <img class="about-donate-img" id="about-donate-img" alt="支付宝收款码" width="300">
                 <p class="about-donate-note"><span class="about-donate-badge alipay">支付宝</span>打开支付宝扫一扫，请作者喝杯咖啡</p>
               </div>
+            </div>
+          </div>
+          <div class="card" id="about-disclaimer-card">
+            <div class="card-title">免责声明</div>
+            <ul class="about-disclaimer" id="about-disclaimer"></ul>
+          </div>
+          <div class="card">
+            <div class="card-title"><span>运行日志</span><button class="help-btn" type="button" data-help="logs" aria-label="运行日志帮助">?</button></div>
+            <div id="about-logs" class="stack"></div>
+            <div class="btn-row">
+              <button class="btn" id="log-export-btn">下载到本机</button>
+              <button class="btn" id="log-share-btn" hidden>保存或分享 ZIP</button>
+              <button class="btn" id="log-nas-btn" hidden>保存到 NAS</button>
+              <span class="muted" id="log-export-note"></span>
+            </div>
+            <div class="log-export-result" id="log-export-result" hidden>
+              <span id="log-export-path"></span>
+              <button class="btn small" id="log-copy-path" type="button">复制路径</button>
+              <button class="btn small" id="log-open-folder" type="button">打开文件夹</button>
             </div>
           </div>
         </div>
@@ -676,12 +712,11 @@
     <p><b>建议：</b>勾选 3–5 个常用平台即可。勾太多会明显拖慢搜索；个别平台临时维护不可达时会自动跳过。</p>
   </template>
   <template data-help-id="lx-source-add">
-    <p>三种导入方式：<br>1. 粘贴 <code>http://</code> 或 <code>https://</code> 在线脚本地址；<br>2. 点「上传 .js 文件」从本地上传；<br>3. 在飞牛桌面内点「从 NAS 选择」直接选 NAS 上的脚本。</p>
-    <p>填好或上传后点「添加」加入列表，最后点底部「保存并生效」。</p>
+    <p>可粘贴 http/https 源脚本地址、上传 .js 文件，或在桌面环境从 NAS 选择。可填写自定义名称后点击“添加”，保存时确认目标脚本初始化状态并加入源列表。</p>
   </template>
   <template data-help-id="lx-source-list">
-    <p>可同时激活多个洛雪源：排在前面的解析失败时，会自动换下一个接力。</p>
-    <p><b>注意：</b>首次激活新源并保存时会做端到端可用性校验，每个新源约需 30–60 秒，请耐心等待保存完成。</p>
+    <p>支持多个洛雪源同时激活，解析失败时自动接力。保存仅快速确认启停和初始化，整次等待不超过一分钟；正常且未变化的源不重复激活。完整测试独立执行搜索、解析和音频前缀探活，初始化成功不代表已验证播放。</p>
+    <p>部分失败时保留已确认的修改，并分别提示失败、未执行或结果待核实。超时不会重放写请求；请先刷新运行状态再决定是否重试。</p>
   </template>
   <template data-help-id="lx-timeouts">
     <p>控制洛雪解析歌曲链接的等待时间，改完保存即热更新，无需重启：</p>
@@ -733,9 +768,9 @@
     <p><b>封面与歌词：</b>只在歌曲音频成功保存后才下载封面（内嵌到音频文件）与同名 <code>.lrc</code>，不会产生只有素材、没有歌曲的碎片文件。</p>
   </template>
   <template data-help-id="tee-binding">
-    <p><b>点红心/加歌单自动下载到本地：</b>在飞牛音乐里收藏在线歌曲或加入歌单时，后台自动下载并绑定为本地文件；仅浏览列表不会触发下载。默认关闭。</p>
-    <p><b>收录等待上限：</b>歌曲落盘后等待飞牛官方扫描入库并完成写入的最长时间，超时会保留映射并在后台自动重试。</p>
-    <p><b>切歌后台续传：</b>没缓冲完就切歌时，允许后台继续下载的任务数；设为 0 表示切歌即停止下载。</p>
+    <p>显式收藏后，后台下载并绑定本地歌曲；浏览列表不会触发音频下载，已有文件会重试绑定。默认关闭。</p>
+    <p>官方客户端搜索点播后会把整份搜索结果批量加入其自动创建的播放列表，该操作与用户主动保存无法区分，因此加入歌单不会触发自动下载，歌单内容本身照常保存（issue #120）。</p>
+    <p>绑定等待是下载落库后等待官方收录并完成写入的上限，超时保留映射并自动重试。切歌续传让未完成下载转后台；并行数 0 表示关闭续传。重扫接口可用日志取证后填写以加速入库。</p>
   </template>
   <template data-help-id="tee-scan">
     <p><b>自定义曲库扫描接口（选填）：</b>格式为「接口路径|JSON参数」，例如 <code>/music/api/v1/shared-library/scan|{"guid":"你的共享库id"}</code>，guid 可在飞牛音乐网页端手动扫库时按 F12 从请求参数中获取。留空则由官方自动扫描入库。</p>
@@ -762,8 +797,8 @@
     <p><b>推理模型返回为空：</b>可在附加请求参数填 <code>{"thinking":{"type":"disabled"}}</code> 关闭思考，或调大单次最大输出。保存后代理热重载生效；启用后会后台预生成首批，不必先打开歌单。</p>
   </template>
   <template data-help-id="logs">
-    <p>日志在本地滚动保留最近 3 天，卸载应用时会随应用删除。</p>
-    <p>「导出日志」会打包近 3 天日志与运行环境摘要，并自动脱敏 API Key、Cookie 等敏感信息，方便在 GitHub Issues 反馈问题时上传。</p>
+    <p>日志本地滚动保留 3 天，卸载时随应用删除。导出为标准 ZIP，包含近 3 天全部日志与环境快照；密钥会脱敏，但仍建议只在需要排查问题时提供给可信对象。</p>
+    <p>电脑可直接下载；手机可先打包再调用系统保存/分享。在飞牛 App 或飞牛桌面内，也可选择 NAS 目录直接保存并定位文件。</p>
   </template>
 
   <div class="modal-mask help-modal" id="help-modal" hidden>
@@ -806,8 +841,28 @@
       <div class="kv"><b>发布日期</b><span id="update-modal-date">-</span></div>
       <div class="modal-section">更新内容</div>
       <div class="update-changelog" id="update-modal-changelog"></div>
+
+      <!-- 确认提示文本 -->
+      <div id="update-modal-prompt" class="update-prompt" hidden></div>
+
+      <!-- 下载与安装进度条 -->
+      <div id="update-modal-progress" class="update-progress-block" hidden>
+        <div class="kv"><b>升级状态</b><span id="update-progress-phase">准备中...</span></div>
+        <div class="progress-bar-wrap">
+          <div id="update-progress-bar" class="progress-bar" style="width: 0%"></div>
+        </div>
+        <div id="update-progress-detail" class="progress-detail">0.0 MB / 0.0 MB (0%)</div>
+      </div>
+
+      <!-- 错误提示 -->
+      <div id="update-modal-error" class="update-error-block" hidden>
+        <p id="update-error-text" class="update-error-text"></p>
+        <div class="btn-row pad"><a id="update-error-link" class="btn" target="_blank" rel="noopener" hidden>前往 GitHub 下载</a></div>
+      </div>
+
       <div class="btn-row modal-actions">
         <button class="btn" id="update-cancel-btn">取消</button>
+        <button class="btn primary" id="update-install-btn" hidden>下载并安装</button>
         <a class="btn primary" id="update-upgrade-btn" target="_blank" rel="noopener">升级</a>
       </div>
     </div>

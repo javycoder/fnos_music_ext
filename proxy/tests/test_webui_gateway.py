@@ -3,15 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import os
 import socket
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"), reason="desktop gateway requires a Unix socket host")
+
 
 _SPEC = importlib.util.spec_from_file_location(
     "webui_gateway", Path(__file__).resolve().parents[1] / "webui_gateway.py")
@@ -230,6 +236,19 @@ def _post_fs_check(path: str, is_admin: str = "true") -> bytes:
     ).encode() + body
 
 
+def _post_log_export(directory: str, is_admin: str = "true", uid: str = "1000") -> bytes:
+    body = json.dumps({"directory": directory}).encode()
+    return (
+        "POST /app/fnmusic-ext/api/logs/export HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        f"X-Trim-Isadmin: {is_admin}\r\n"
+        f"X-Trim-Userid: {uid}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode() + body
+
+
 def _fs_check(sock_path: Path, path: str, is_admin: str = "true") -> "tuple[bytes, dict]":
     data = _request(sock_path, _post_fs_check(path, is_admin))
     head, _, body = data.partition(b"\r\n\r\n")
@@ -344,6 +363,143 @@ def test_fs_check_only_post_intercepted(tmp_path: Path):
     data = _request(sock_path, b"GET /app/fnmusic-ext/api/fs-check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     upstream.shutdown()
     assert b"/app/fnmusic-ext/api/fs-check" in data
+
+
+class _ZipHandler(BaseHTTPRequestHandler):
+    filename = "fnmusic-logs-20261010235959-aaaaaaaa.zip"
+    valid = True
+    status = 200
+
+    def do_GET(self):  # noqa: N802
+        if not self.valid:
+            payload = b'{"ok":false}'
+            self.send_response(self.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition", f'attachment; filename="{self.filename}"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("proxy.log", "safe\n")
+        payload = buffer.getvalue() if self.filename.endswith(".zip") else b"not-a-zip"
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{self.filename}"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def test_log_export_requires_admin_and_identity(tmp_path: Path):
+    sock = _start_gateway(tmp_path, 1)
+    for headers, expected in (
+        ({"admin": "false", "uid": "1000"}, "仅管理员".encode("utf-8")),
+        ({"admin": "true", "uid": ""}, "有效的飞牛用户身份".encode("utf-8")),
+        ({"admin": "true", "uid": "0"}, "有效的飞牛用户身份".encode("utf-8")),
+        ({"admin": "true", "uid": "abc"}, "有效的飞牛用户身份".encode("utf-8")),
+    ):
+        raw = _post_log_export("/vol1/music", is_admin=headers["admin"], uid=headers["uid"])
+        data = _request(sock, raw)
+        assert data.startswith(b"HTTP/1.1 403"), data
+        assert expected in data
+
+
+def test_log_export_validates_storage_directory(tmp_path: Path):
+    sock = _start_gateway(tmp_path, 1)
+    for directory in ("relative", "/tmp/export", "/vol1/../vol1", "/vol1/missing",
+                      "/vol1/a\nb"):
+        data = _request(sock, _post_log_export(directory))
+        assert data.startswith(b"HTTP/1.1 400"), directory
+        assert "存储卷目录".encode("utf-8") in data
+
+
+def test_log_export_streams_zip_as_gateway_user(tmp_path: Path, monkeypatch):
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _ZipHandler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    export_dir = tmp_path / "nas-export"
+    export_dir.mkdir()
+
+    class Account:
+        pw_gid = 1000
+
+    class Pwd:
+        @staticmethod
+        def getpwuid(uid):
+            assert uid == 1000
+            return Account()
+
+    monkeypatch.setattr(_MOD, "pwd", Pwd)
+    monkeypatch.setattr(_MOD, "_valid_log_export_directory",
+                        lambda path: export_dir if path == "/vol1/music" else None)
+
+    calls = []
+
+    def write_as_user(uid, target, response, first_chunk):
+        calls.append((uid, target, response.read()))
+        payload = first_chunk + calls[0][2]
+        spec = importlib.util.spec_from_file_location(
+            "log_export_writer", Path(__file__).resolve().parents[1] / "log_export_writer.py")
+        writer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(writer)
+        writer.write_archive(io.BytesIO(payload), target)
+
+    monkeypatch.setattr(_MOD, "_run_log_writer", write_as_user)
+    try:
+        data = _request(sock_path, _post_log_export("/vol1/music"), timeout=5)
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200"), data
+    payload = json.loads(body.decode())
+    filename = "fnmusic-logs-20261010235959-aaaaaaaa.zip"
+    assert payload == {"ok": True, "filename": filename, "path": str(export_dir / filename)}
+    assert calls[0][0] == 1000
+    with zipfile.ZipFile(export_dir / filename) as archive:
+        assert archive.read("proxy.log") == b"safe\n"
+
+
+def test_log_export_rejects_invalid_upstream_archive(tmp_path: Path, monkeypatch):
+    export_dir = tmp_path / "nas-export"
+    export_dir.mkdir()
+    monkeypatch.setattr(_MOD, "_valid_log_export_directory", lambda path: export_dir)
+    cases = [
+        ("bad-name.zip", True, 200, "日志包响应无效".encode("utf-8")),
+        ("fnmusic-logs-20261010235959-aaaaaaaa.zip", False, 200, "不是标准 ZIP".encode("utf-8")),
+    ]
+    for case_index, (filename, valid, status, expected) in enumerate(cases):
+        attributes = {"filename": filename, "valid": valid, "status": status}
+        handler = type("DynamicZipHandler", (_ZipHandler,), attributes)
+        upstream = _TestHTTPServer(("127.0.0.1", 0), handler)
+        port = upstream.server_address[1]
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        case_dir = tmp_path / f"invalid-case-{case_index}"
+        case_dir.mkdir()
+        sock_path = _start_gateway(case_dir, port)
+        try:
+            data = _request(sock_path, _post_log_export("/vol1/music"), timeout=5)
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+        assert data.startswith(b"HTTP/1.1 502"), data
+        assert expected in data
+
+
+def test_log_export_only_post_intercepted(tmp_path: Path):
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    data = _request(sock_path, b"GET /app/fnmusic-ext/api/logs/export HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    upstream.shutdown()
+    assert b"/app/fnmusic-ext/api/logs/export" in data
 
 
 def _maintenance_request(method="POST", path="/api/maintenance/cleanup",

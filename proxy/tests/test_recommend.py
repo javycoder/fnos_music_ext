@@ -472,7 +472,10 @@ def test_read_local_recent_tracks(tmp_path):
     con.executescript(
         """
         CREATE TABLE user (id INTEGER PRIMARY KEY, guid TEXT);
-        CREATE TABLE track (id INTEGER PRIMARY KEY, guid TEXT, title TEXT, year INTEGER, album_id INTEGER);
+        CREATE TABLE track (id INTEGER PRIMARY KEY, guid TEXT, title TEXT, year INTEGER, album_id INTEGER,
+                            audio_file_id INTEGER, is_audio_file_deleted INTEGER DEFAULT 0,
+                            is_admin_deleted INTEGER DEFAULT 0);
+        CREATE TABLE audio_file (id INTEGER PRIMARY KEY, is_physical_file_deleted INTEGER DEFAULT 0);
         CREATE TABLE album (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE track_artist (track_id INTEGER, artist_id INTEGER);
@@ -481,7 +484,8 @@ def test_read_local_recent_tracks(tmp_path):
         CREATE TABLE play_history (id INTEGER PRIMARY KEY, user_id INTEGER, track_id INTEGER, play_count INTEGER, updated_at TEXT);
         INSERT INTO user VALUES (1, 'u1');
         INSERT INTO album VALUES (1, '叶惠美');
-        INSERT INTO track VALUES (1, 'tg1', '晴天', 2003, 1);
+        INSERT INTO audio_file VALUES (1, 0);
+        INSERT INTO track VALUES (1, 'tg1', '晴天', 2003, 1, 1, 0, 0);
         INSERT INTO artist VALUES (1, '周杰伦');
         INSERT INTO track_artist VALUES (1, 1);
         INSERT INTO genre VALUES (1, '流行');
@@ -561,6 +565,19 @@ def _make_local_db(path, n_tracks=30, played_by_user=None):
     con.commit()
     con.close()
     return track_ids
+
+
+@pytest.mark.parametrize("column", ["is_audio_file_deleted", "is_admin_deleted", "is_physical_file_deleted"])
+def test_deleted_tracks_excluded_from_favorite_and_history(tmp_path, column):
+    db = tmp_path / "music.db"
+    _make_local_db(db, n_tracks=2, played_by_user={"u1": [("lt1", "2026-01-01"), ("lt2", "2026-01-02")]})
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO favorite_track (user_id, track_id, updated_at) VALUES (1, 1, '2026-01-01')")
+        con.execute("INSERT INTO favorite_track (user_id, track_id, updated_at) VALUES (1, 2, '2026-01-02')")
+        table = "audio_file" if column == "is_physical_file_deleted" else "track"
+        con.execute(f"UPDATE {table} SET {column} = 1 WHERE id = 1")
+    assert [row["guid"] for row in dailyrec.read_local_recent_tracks(str(db), "u1")] == ["lt2"]
+    assert [row["guid"] for row in dailyrec.read_local_favorite_tracks(str(db), "u1")] == ["lt2"]
 
 
 def test_local_random_never_played_first_and_filters_deleted(tmp_path):

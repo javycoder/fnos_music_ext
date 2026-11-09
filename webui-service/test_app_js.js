@@ -180,6 +180,17 @@ function reset() {
 
 const tick = (ms) => new Promise((r) => realSetTimeout(r, ms));
 
+function replaceNavigator(value) {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    value, configurable: true, writable: true,
+    enumerable: descriptor ? descriptor.enumerable : false,
+  });
+  return () => Object.defineProperty(globalThis, "navigator", descriptor || {
+    value: undefined, configurable: true, writable: true,
+  });
+}
+
 /* ------------------------------------------------ 加载 app.js -------------- */
 const src = fs.readFileSync(path.join(__dirname, "static", "app.js"), "utf8");
 vm.runInThisContext(src, { filename: "app.js" });
@@ -665,7 +676,7 @@ test("saveConfig：保存失败后刷新成功或失败均保留草稿和 dirty"
     const qsa = global.document.querySelectorAll;
     global.document.querySelectorAll = (sel) => sel === "input[name=provider]"
       ? [{ value: "lxmusic", checked: true }] : qsa(sel);
-    try { await global.saveConfig(); } finally { global.document.querySelectorAll = qsa; }
+    try { await global.saveConfig(); await tick(0); } finally { global.document.querySelectorAll = qsa; }
     assert.strictEqual(vm.runInThisContext("JSON.stringify([lxSourceList, lxSourceOrder, configValues])"), draft);
     assert.strictEqual(vm.runInThisContext("dirty && lxSourceListDirty"), true);
     assert.ok(els.get("#save-bar").classList.contains("show"));
@@ -1174,7 +1185,7 @@ test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async 
     resp: {
       ok: true, status: 200,
       headers: { get: (n) => (String(n).toLowerCase() === "content-disposition"
-        ? 'attachment; filename="20261010220000.logzip"' : null) },
+        ? 'attachment; filename="fnmusic-logs-20261010220000-aaaaaaaa.zip"' : null) },
       blob: async () => ({ __blob: true }),
     },
   });
@@ -1182,7 +1193,160 @@ test("exportLogs：走 /api/logs/export 并以 a[download] 触发下载", async 
   assert.ok(fetchCalls.some((c) => c.method === "GET" && c.path === "/app/fnmusic-ext/api/logs/export"));
   assert.strictEqual(createdUrls.length, 1);  // blob → objectURL
   // 下载文件名取自 Content-Disposition 并展示在导出备注
-  assert.ok(global.document.querySelector("#log-export-note").textContent.includes("20261010220000.logzip"));
+  assert.ok(global.document.querySelector("#log-export-note").textContent.includes(
+    "fnmusic-logs-20261010220000-aaaaaaaa.zip"));
+  assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已发起下载"));
+});
+
+test("移动端先准备 ZIP，再通过系统文件分享", async () => {
+  let shared = null;
+  const restoreNavigator = replaceNavigator({
+    canShare: (data) => !!(data && data.files && data.files.length),
+    share: async (data) => { shared = data; },
+  });
+  const originalMatchMedia = global.window.matchMedia;
+  global.window.matchMedia = () => ({ matches: true });
+  try {
+    enqueue("/app/fnmusic-ext/api/logs/export", {
+      __rawResponse: true,
+      resp: {
+        ok: true, status: 200,
+        headers: { get: () => 'attachment; filename="fnmusic-logs-20261010220000-bbbbbbbb.zip"' },
+        blob: async () => ({ __blob: true }),
+      },
+    });
+    await global.exportLogs();
+    assert.strictEqual(global.document.querySelector("#log-share-btn").hidden, false);
+    await global.sharePreparedLogs();
+    assert.strictEqual(shared.files[0].name, "fnmusic-logs-20261010220000-bbbbbbbb.zip");
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("系统分享流程已结束"));
+    assert.strictEqual(global.document.querySelector("#log-export-btn").disabled, false);
+  } finally {
+    restoreNavigator();
+    global.window.matchMedia = originalMatchMedia;
+    global.clearPreparedLogShare(false);
+  }
+});
+
+test("移动端系统分享取消后保留已准备的 ZIP", async () => {
+  const restoreNavigator = replaceNavigator({
+    canShare: (data) => !!(data && data.files && data.files.length),
+    share: async () => {
+      const error = new Error("cancel");
+      error.name = "AbortError";
+      throw error;
+    },
+  });
+  const originalMatchMedia = global.window.matchMedia;
+  global.window.matchMedia = () => ({ matches: true });
+  try {
+    enqueue("/app/fnmusic-ext/api/logs/export", {
+      __rawResponse: true,
+      resp: {
+        ok: true, status: 200,
+        headers: { get: () => 'attachment; filename="fnmusic-logs-20261010220000-dddddddd.zip"' },
+        blob: async () => ({ __blob: true }),
+      },
+    });
+    await global.exportLogs();
+    await global.sharePreparedLogs();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已取消分享"));
+    assert.strictEqual(global.document.querySelector("#log-share-btn").hidden, false);
+  } finally {
+    restoreNavigator();
+    global.window.matchMedia = originalMatchMedia;
+    global.clearPreparedLogShare(false);
+  }
+});
+
+test("NAS 导出选择目录、显示路径并支持复制和定位", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  const picked = [];
+  const restoreNavigator = replaceNavigator({
+    clipboard: { writeText: async (text) => { picked.push(["copy", text]); } },
+  });
+  global.loadTrimSdk = async () => ({
+    pickUserFile: async (options) => {
+      picked.push(options);
+      return { data: ["/vol1/music"] };
+    },
+    openFileManager: async (path) => { picked.push(["open", path]); },
+  });
+  try {
+    enqueue("/app/fnmusic-ext/api/logs/export", {
+      ok: true,
+      filename: "fnmusic-logs-20261010220000-cccccccc.zip",
+      path: "/vol1/music/fnmusic-logs-20261010220000-cccccccc.zip",
+    });
+    await global.exportLogsToNas();
+    assert.strictEqual(picked[0].directory, true);
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已保存"));
+    assert.strictEqual(global.document.querySelector("#log-export-path").textContent,
+      "/vol1/music/fnmusic-logs-20261010220000-cccccccc.zip");
+    assert.strictEqual(global.document.querySelector("#log-export-result").hidden, false);
+    const post = fetchCalls.find((call) => call.method === "POST" && call.path === "/app/fnmusic-ext/api/logs/export");
+    assert.deepStrictEqual(JSON.parse(post.body), { directory: "/vol1/music" });
+    await global.copyLogExportPath();
+    await global.openLogExportFolder();
+    assert.deepStrictEqual(picked.slice(1), [
+      ["copy", "/vol1/music/fnmusic-logs-20261010220000-cccccccc.zip"],
+      ["open", "/vol1/music"],
+    ]);
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+    restoreNavigator();
+  }
+});
+
+test("NAS 选择取消与服务端失败不显示保存成功", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  global.loadTrimSdk = async () => ({
+    pickUserFile: async () => ({ data: [] }),
+  });
+  try {
+    await global.exportLogsToNas();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("已取消选择目录"));
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
+  global.loadTrimSdk = async () => ({
+    pickUserFile: async () => ({ data: ["/vol1/music"] }),
+  });
+  enqueue("/app/fnmusic-ext/api/logs/export", new Error("disk full"));
+  try {
+    await global.exportLogsToNas();
+    assert.strictEqual(global.document.querySelector("#log-export-note").textContent, "");
+    assert.strictEqual(global.document.querySelector("#log-export-result").hidden, true);
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
+});
+
+test("SDK 初始化失败时给出明确入口提示", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  global.loadTrimSdk = async () => false;
+  try {
+    await global.exportLogsToNas();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("飞牛 App 或飞牛桌面"));
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
+});
+
+test("独立浏览器引导从飞牛入口保存到 NAS", async () => {
+  const originalLoadTrimSdk = global.loadTrimSdk;
+  global.loadTrimSdk = async () => ({
+    isStandaloneWeb: true,
+    pickUserFile: async () => {
+      throw new Error("must not pick");
+    },
+  });
+  try {
+    await global.exportLogsToNas();
+    assert.ok(global.document.querySelector("#log-export-note").textContent.includes("请从飞牛 App 或飞牛桌面打开"));
+  } finally {
+    global.loadTrimSdk = originalLoadTrimSdk;
+  }
 });
 
 test("switchPage('about') 懒加载关于数据", async () => {
@@ -1271,6 +1435,91 @@ test("switchPage('about') 顺带触发检查更新", async () => {
   await new Promise((r) => realSetTimeout(r, 0));
   assert.ok(fetchCalls.some((c) => c.path === "/app/fnmusic-ext/api/update-check"));
   assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
+});
+
+test("openUpdateModal：解析快照成功展示确认询问与下载安装按钮", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  enqueue("/app/fnmusic-ext/api/self-update/target", {
+    ok: true,
+    target: {
+      target_id: "snap-1",
+      tag: "v2.9.0",
+      formal_base: "2.9.0",
+      install_version: "2.9.0-0",
+      architecture: "amd64",
+      asset_name: "fnmusic-ext-2.9.0-0.x86_64.fpk",
+      source: "gitee",
+    },
+  });
+  await global.checkUpdate();
+  global.openUpdateModal();
+  await new Promise((r) => realSetTimeout(r, 0));
+  assert.strictEqual(els.get("#update-modal-prompt").hidden, false);
+  assert.ok(els.get("#update-modal-prompt").textContent.includes("是否下载并安装 v2.9.0（安装版本 2.9.0-0）？"));
+  assert.strictEqual(els.get("#update-install-btn").hidden, false);
+  assert.strictEqual(els.get("#update-upgrade-btn").hidden, true);
+});
+
+test("startSelfUpdate：点击下载安装提交 POST 并启动进度轮询", async () => {
+  global.window.SELF_UPDATE_POLL_INTERVAL = 10;
+  enqueue("/app/fnmusic-ext/api/self-update", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "running",
+      phase: "downloading",
+      source: "gitee",
+      downloaded_bytes: 5242880,
+      total_bytes: 10485760,
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/self-update/jobs/job-1", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "running",
+      phase: "downloading",
+      source: "gitee",
+      downloaded_bytes: 5242880,
+      total_bytes: 10485760,
+    },
+  });
+  await els.get("#update-install-btn").dispatch("click");
+  await new Promise((r) => realSetTimeout(r, 20));
+  assert.strictEqual(els.get("#update-modal-progress").hidden, false);
+  assert.ok(els.get("#update-progress-phase").textContent.includes("Gitee"));
+  assert.strictEqual(els.get("#update-progress-bar").style.width, "50%");
+});
+
+test("pollSelfUpdate：双源下载失败展示指定文案与 GitHub 链接", async () => {
+  global.window.SELF_UPDATE_POLL_INTERVAL = 10;
+  enqueue("/app/fnmusic-ext/api/self-update/jobs/job-1", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "failed",
+      phase: "downloading",
+      source: "github",
+      message: "所有下载源均失败: 下载失败，请到 GitHub 下载最新版本。",
+    },
+  });
+  await new Promise((r) => realSetTimeout(r, 30));
+  assert.strictEqual(els.get("#update-modal-progress").hidden, true);
+  assert.strictEqual(els.get("#update-modal-error").hidden, false);
+  assert.strictEqual(els.get("#update-error-text").textContent, "下载失败，请到 GitHub 下载最新版本。");
+  assert.strictEqual(els.get("#update-error-link").hidden, false);
+  assert.strictEqual(els.get("#update-install-btn").textContent, "重试下载并安装");
+});
+
+test("nav-dot 点击直接弹出更新弹窗并阻止冒泡", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  const dot = stubEl();
+  qsaRegistry.set(".nav-dot", [dot]);
+  await global.checkUpdate();
+  let stopped = false;
+  await dot.dispatch("click", { stopPropagation: () => { stopped = true; } });
+  assert.strictEqual(stopped, true);
+  assert.strictEqual(els.get("#update-modal").hidden, false);
 });
 
 const CLEANUP_PATH = "/app/fnmusic-ext/api/maintenance/cleanup";
@@ -2987,7 +3236,7 @@ test("洛雪排序：激活源按稳定 ID 单独排序，停用保留、删除�
   assert.deepStrictEqual(global.getLxSourceOrder(), ["source-a"], "删除后清理稳定 ID");
 });
 
-test("高级页保存：排序通过专用接口同步，避免重复提交源管理列表", async () => {
+test("高级页保存：排序并入一次配置提交，避免重复提交源管理列表", async () => {
   reset();
   const sourceList = [
     { id: "source-a", name: "源甲", url: "https://s/a.js", active: true },
@@ -3006,8 +3255,6 @@ test("高级页保存：排序通过专用接口同步，避免重复提交源�
     LX_RESOLVER_TIMEOUT: "8.0", LX_URL_TIMEOUT: "15.0", LX_PROBE_TIMEOUT: "3.0",
   } });
   enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: [], actions: [] });
-  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]' } });
-  enqueue("/app/fnmusic-ext/api/lx/source/reorder", { ok: true, changed: ["FNMUSIC_LX_SOURCE_ORDER"] });
   enqueue("/app/fnmusic-ext/api/config", { schema, values: {
     FNMUSIC_LX_ENABLED: "true", FNMUSIC_NETEASE_ENABLED: "false", FNMUSIC_MUSICDL_ENABLED: "false",
     FNMUSIC_LX_AUTO_SWITCH: "true", FNMUSIC_LX_PLATFORM_PREFERRED: "false",
@@ -3021,9 +3268,9 @@ test("高级页保存：排序通过专用接口同步，避免重复提交源�
   const configPut = fetchCalls.find((call) => call.path.endsWith("/api/config") && call.method === "PUT");
   const configValues = JSON.parse(configPut.body).values;
   assert.ok(!("LX_SOURCE_LIST" in configValues), "高级排序保存不得重做源列表激活");
-  assert.ok(!("FNMUSIC_LX_SOURCE_ORDER" in configValues), "启用洛雪时排序通过专用代理接口保存");
+  assert.strictEqual(configValues.FNMUSIC_LX_SOURCE_ORDER, '["source-b","source-a"]', "排序并入同一次保存");
   const reorderCall = fetchCalls.find((call) => call.path.endsWith("/api/lx/source/reorder"));
-  assert.deepStrictEqual(JSON.parse(reorderCall.body), { source_ids: ["source-b", "source-a"] });
+  assert.strictEqual(reorderCall, undefined, "保存后不能追加排序请求");
 });
 
 test("高级页保存：排序返回 409 忙时 toast 提示洛雪源正忙并恢复保存前顺序", async () => {
@@ -3042,12 +3289,9 @@ test("高级页保存：排序返回 409 忙时 toast 提示洛雪源正忙并�
     FNMUSIC_LX_PLATFORM_PREFERRED: "false",
     FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]', LX_SOURCE_LIST: JSON.stringify(sourceList),
   } });
-  enqueue("/app/fnmusic-ext/api/config", { ok: true, changed: [], actions: [] });
-  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LX_SOURCE_ORDER: '["source-a","source-b"]' } });
-  enqueue("/app/fnmusic-ext/api/lx/source/reorder", {
-    __rawResponse: true,
-    resp: { ok: false, status: 409, json: async () => ({ ok: false, error: "源操作正忙", category: "source_operation_busy" }) },
-  });
+  enqueue("/app/fnmusic-ext/api/config", { ok: true, complete: false, changed: [], actions: [
+    { kind: "lx_reorder", op: "reorder", ok: false, error: "源操作正忙", category: "source_operation_busy" },
+  ] });
   enqueue("/app/fnmusic-ext/api/config", { schema, values: {
     FNMUSIC_LX_ENABLED: "true", FNMUSIC_LX_AUTO_SWITCH: "true",
     FNMUSIC_LX_PLATFORM_PREFERRED: "false",
@@ -3208,54 +3452,52 @@ test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐�
   assert.strictEqual(donateCard.hidden, true);
 });
 
-test("saveConfig 异步任务模式：PUT 返回 202 job_id 后轮询进度至成功", async () => {
+test("有界请求：响应正文卡住也会超时并取消请求", async () => {
+  const original = global.fetch;
+  let signal;
+  global.fetch = async (_, options) => {
+    signal = options.signal;
+    return { ok: true, json: () => new Promise(() => {}) };
+  };
+  try {
+    const waiting = assert.rejects(Promise.race([
+      global.api("/api/config", {}, 20),
+      tick(100).then(() => { throw new Error("未受时限约束"); }),
+    ]), /超时/);
+    await Promise.all([waiting, tick(30)]);
+    assert.strictEqual(signal.aborted, true);
+  } finally {
+    global.fetch = original;
+  }
+});
+
+test("保存：目录检查立即禁用按钮，重复点击不会发起第二次保存", async () => {
   reset();
-  global.CONFIG_JOB_POLL_INTERVAL = 0;
-  const schema = { FNMUSIC_QUALITY_MODE: { kind: "str" } };
-  enqueue("/app/fnmusic-ext/api/config", { schema, values: { FNMUSIC_QUALITY_MODE: "standard" }, revision: "rev_1" });
   await global.loadConfig();
-
-  // 1. PUT 提交返回 job_id
-  enqueue("/app/fnmusic-ext/api/config", {
-    ok: true,
-    job_id: "cfg_job_test_123",
-    status: "pending",
-  });
-  // 2. 第一次轮询：running 50%
-  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_job_test_123", {
-    ok: true,
-    job: {
-      job_id: "cfg_job_test_123",
-      status: "running",
-      progress: 50,
-      message: "正在快速门禁校验...",
-    },
-  });
-  // 3. 第二次轮询：success 100%
-  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_job_test_123", {
-    ok: true,
-    job: {
-      job_id: "cfg_job_test_123",
-      status: "success",
-      progress: 100,
-      message: "保存成功",
-      result: {
-        ok: true,
-        changed: ["FNMUSIC_QUALITY_MODE"],
-        actions: [],
-      },
-    },
-  });
-  // 4. 保存完成后 loadConfig 与 loadStatus
-  enqueue("/app/fnmusic-ext/api/config", { schema, values: { FNMUSIC_QUALITY_MODE: "lossless" }, revision: "rev_2" });
-  enqueue("/app/fnmusic-ext/api/status", { ok: true, current_provider: "none", processes: {} });
-
-  await global.saveConfig();
-
-  const toastText = els.get("#toast").textContent;
-  assert.ok(toastText.includes("已保存 1 项"));
-  assert.strictEqual(els.get("#save-btn").disabled, false);
-  assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
+  qsaRegistry.set("input[name=provider]", [{ value: "musicbox", checked: true }]);
+  els.get("#dir-cache").value = "/test/cache";
+  enqueue("/app/fnmusic-ext/api/fs-check", { ok: true, exists: true, writable: true });
+  const original = global.fetch;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  global.fetch = async (url, options) => {
+    if (String(url).endsWith("/api/fs-check")) {
+      assert.strictEqual(els.get("#save-btn").disabled, true);
+      await pending;
+    }
+    return original(url, options);
+  };
+  try {
+    const first = global.saveConfig();
+    const second = global.saveConfig();
+    release();
+    await Promise.all([first, second]);
+    assert.strictEqual(fetchCalls.filter((c) => c.method === "PUT").length, 1);
+    assert.strictEqual(els.get("#save-btn").disabled, false);
+  } finally {
+    release();
+    global.fetch = original;
+  }
 });
 
 test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => {
@@ -3305,6 +3547,59 @@ test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
   }
   assert.ok(css.includes(".data-table"), "CSS 必须包含 .data-table 样式");
   assert.ok(css.includes(".progress-bar"), "CSS 必须包含 .progress-bar 样式");
+});
+
+test("平台测试：轮询临时失败后继续查询", async () => {
+  reset();
+  vm.runInThisContext('clearTimeout(platformTestTimer); platformTestJob = {job_id:"retry", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", new Error("temporary outage"));
+  await global.pollPlatformTestJob();
+  assert.ok(els.get("#platform-test-summary").textContent.includes("将重试"));
+  assert.ok(vm.runInThisContext("platformTestTimer !== null"));
+  enqueue("/app/fnmusic-ext/api/platforms/test/status",
+    {ok:true, status:"done", results:[], progress:{done:1,total:1}});
+  await global.pollPlatformTestJob();
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+  assert.strictEqual(vm.runInThisContext("platformTestTimer"), null);
+});
+
+test("平台测试：停止后迟到的轮询不覆盖状态", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"stop", status:"running", results:[], progress:{done:0,total:1}};');
+  let release;
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", {__rawResponse:true, resp:{
+    ok:true, status:200, json:() => new Promise((resolve) => { release = resolve; }),
+  }});
+  const polling = global.pollPlatformTestJob();
+  await tick(0);
+  enqueue("/app/fnmusic-ext/api/platforms/test/stop", {ok:true});
+  await global.stopPlatformTest();
+  release({ok:true, status:"running", results:[], progress:{done:0,total:1}});
+  await polling;
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "cancelled");
+  assert.ok(els.get("#platform-test-summary").textContent.includes("已停止"));
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+});
+
+test("平台测试：停止失败保留任务并允许重试", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"stop-fail", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/stop", new Error("unavailable"));
+  await global.stopPlatformTest();
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "running");
+  assert.strictEqual(els.get("#platform-test-stop").disabled, false);
+  assert.ok(els.get("#platform-test-summary").textContent.includes("停止失败"));
+});
+
+test("平台测试：记录过期恢复开始按钮", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"expired", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", {__rawResponse:true, resp:{
+    ok:false, status:404, json:async () => ({error:"job not found or expired"}),
+  }});
+  await global.pollPlatformTestJob();
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "expired");
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

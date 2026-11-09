@@ -160,6 +160,9 @@ def _reload_timeout_settings() -> dict[str, float]:
             if entry.get("data") is None:
                 _URL_CACHE.pop(key, None)
         _CHAIN_HEALTH.clear()
+        cooldown = globals().get("_RESOLVE_TIMEOUT_COOLDOWN")
+        if cooldown is not None:
+            cooldown.clear()
         _URL_CACHE_GEN += 1
     return {key: float(CONF[key]) for key, _, _ in _TIMEOUT_ENV_KEYS}
 
@@ -233,6 +236,9 @@ def _url_cache_reset() -> None:
     候选搜索缓存同样依赖脚本顺序与配置代，必须一起失效，避免排序后仍用旧候选。
     """
     _URL_CACHE.clear()
+    cooldown = globals().get("_RESOLVE_TIMEOUT_COOLDOWN")
+    if cooldown is not None:
+        cooldown.clear()
     global _URL_CACHE_GEN
     _URL_CACHE_GEN += 1
     finder = globals().get("_CANDIDATES")
@@ -661,6 +667,10 @@ def _chain_key(script_id: str, platform: str, generation: int, quality: str) -> 
     return f"policy:{int(generation)}:{script_id}:{platform}:{quality}"
 
 
+class _ResolutionIncomplete(RuntimeError):
+    """解析因超时、预算切片或候选冷却而未能穷尽，不能写失败负缓存。"""
+
+
 @dataclass
 class _AttemptResult:
     """一次固定脚本/平台的解析结果分类。
@@ -711,28 +721,28 @@ _CLOCK_EPSILON = 0.001
 _PROBE_SLOT_FLOOR = 0.5
 
 
-def _attempt_slot(deadline: float, remaining_steps: int, resolver_timeout: float) -> float:
-    """给当前这一次尝试分配的 slot 预算（秒）。
+def _attempt_slot(
+    deadline: float,
+    remaining_steps: int,
+    resolver_timeout: float,
+    probe_timeout: float,
+    *,
+    apply_floor: bool = True,
+) -> float:
+    """给当前质量档的候选分配解析+探活 slot，不让未来降档瓜分首档时间。
 
-    按「剩余总预算 / 剩余尝试数」平均分配，再加一个很低的保底；上限受单次
-    解析超时约束。这样首个慢脚本最多吸收自己那一份，同一档位的后续脚本仍然
-    有预算可用；计划里有多少脚本就算多少份，不设“最多三个脚本”的上限。
+    同一质量档内仍按剩余候选数公平切分；slot 上限同时覆盖一次解析与一次媒体
+    探活。其余质量档只在当前档明确失败后才参与分配，避免单脚本首档预算被
+    尚未发生的降档步骤预切成数份。
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return 0.0
     fair = remaining / max(1, int(remaining_steps))
-    floor = min(_ATTEMPT_SLOT_FLOOR, remaining)
+    floor = min(_ATTEMPT_SLOT_FLOOR, remaining) if apply_floor else 0.0
     slot = max(fair, floor)
-    return max(0.0, min(slot, remaining, max(0.01, float(resolver_timeout))))
-
-
-def _record_step_failures(failed_steps: set[tuple[str, str, str]], generation: int) -> None:
-    """把本轮失败的「脚本+平台+档位」计入熔断；源代已变化时整体丢弃。"""
-    if generation != _URL_CACHE_GEN:
-        return
-    for script_id, platform, step_quality in failed_steps:
-        _chain_record_failure(_chain_key(script_id, platform, generation, step_quality))
+    stage_cap = max(0.01, float(resolver_timeout)) + max(0.01, float(probe_timeout))
+    return max(0.0, min(slot, remaining, stage_cap))
 
 
 def _finish_attempt(
@@ -794,10 +804,21 @@ async def _attempt_pinned(
         return _AttemptResult(timeout=True)
     lx_quality = _tier_to_lx_quality(quality)
     headers = _platform_headers(platform)
-    # slot_deadline 是「now + slot」，重新测量会差几微秒；留 1ms 容差，
-    # 让配置的单次解析超时按原值下发（否则日志/断言会出现 0.0299 这种尾数）。
-    resolve_budget = (resolver_timeout if resolver_timeout - remaining <= _CLOCK_EPSILON
-                      else max(0.01, remaining))
+    # 给媒体探活预留 slot 的一小部分，避免解析刚好耗尽 slot 后没有时间验证
+    # 有效直链。上游解析仍受配置上限与当前总 deadline 双重约束。
+    resolve_allowance = min(remaining, max(0.0, deadline - time.monotonic()))
+    if resolve_allowance <= 0:
+        return _AttemptResult(timeout=True)
+    probe_reserve = min(
+        max(0.01, float(probe_timeout)), _PROBE_SLOT_FLOOR,
+        max(0.01, resolve_allowance * 0.25),
+    )
+    resolve_budget = min(
+        max(0.01, float(resolver_timeout)),
+        max(0.01, resolve_allowance - probe_reserve),
+        resolve_allowance,
+    )
+    full_resolver_budget = resolve_budget + _CLOCK_EPSILON >= float(resolver_timeout)
     resolve_started = time.monotonic()
     try:
         async with asyncio.timeout(resolve_budget):
@@ -808,9 +829,14 @@ async def _attempt_pinned(
                 request_timeout=resolve_budget,
                 auto_switch_api_source=False,
             )
-    except (TimeoutError, httpx.ReadTimeout):
-        # 单次解析超时由外层继续下一个脚本/档位；预算耗尽与取消都不能算脚本失败。
-        return _AttemptResult(timeout=True, resolve_timeout=True)
+    except TimeoutError:
+        # 仅真正用满单次解析上限的超时可设置短暂歌曲候选冷却。
+        return _AttemptResult(timeout=True, resolve_timeout=full_resolver_budget)
+    except httpx.TimeoutException as exc:
+        if is_lxserver_unreachable(exc):
+            logger.warning("lxserver 播放解析内部故障: %s", type(exc).__name__)
+            return _AttemptResult(service_error=True)
+        return _AttemptResult(timeout=True, resolve_timeout=full_resolver_budget)
     except Exception as exc:
         if is_lxserver_unreachable(exc):
             logger.warning("lxserver 播放解析内部故障: %s", exc)
@@ -837,20 +863,20 @@ async def _attempt_pinned(
     raw_url = str(response["url"])
     media_host = _media_host(raw_url)
     remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    slot_remaining = slot_deadline - time.monotonic()
+    probe_allowance = min(remaining, slot_remaining)
+    if probe_allowance <= 0:
         return _AttemptResult(timeout=True)
-    # 探活与搜索、解析共用同一个 slot：先用 slot 剩下的时间，slot 用完了也给
-    # 一个很小的保底，避免“解析快、探活却因为没预算而失败”。
-    slot_remaining = max(0.0, slot_deadline - time.monotonic())
-    probe_allowance = min(remaining, max(slot_remaining, _PROBE_SLOT_FLOOR))
-    probe_budget = (probe_timeout if probe_timeout - probe_allowance <= _CLOCK_EPSILON
-                    else max(0.01, probe_allowance))
+    # 探活严格使用 slot 与全局 deadline 的交集；不因保底预算越过总时限。
+    probe_budget = min(max(0.01, float(probe_timeout)), max(0.01, probe_allowance))
     probe_started = time.monotonic()
     try:
         async with asyncio.timeout(probe_budget):
             ok, final_url, content_type, size = await probe_url(
-                client, raw_url, headers, timeout=probe_budget,
+                client, raw_url, headers, timeout=probe_budget, raise_on_timeout=True,
             )
+    except (TimeoutError, httpx.TimeoutException):
+        return _AttemptResult(timeout=True)
     except Exception:
         ok = False
         final_url, content_type, size = raw_url, "", 0
@@ -996,6 +1022,8 @@ async def probe_url(
     url: str,
     headers: dict | None = None,
     timeout: float | None = None,
+    *,
+    raise_on_timeout: bool = False,
 ) -> tuple[bool, str, str, int]:
     """有界流式前缀探活。返回 (是否有效, 最终URL, MIME/扩展名, 总大小)。"""
     h = {k: v for k, v in (headers or {}).items() if k.lower() not in ("range", "accept-encoding")}
@@ -1053,6 +1081,12 @@ async def probe_url(
                         _content_total_size(r) if ext else 0,
                     )
             return False, curr_url, "", 0
+    except (TimeoutError, httpx.TimeoutException):
+        # 普通探活调用仍保持 bool 返回；播放编排可选择把超时视为未完成。
+        logger.debug("probe_url timeout host=%s", _media_host(url))
+        if raise_on_timeout:
+            raise
+        return False, url, "", 0
     except Exception as exc:
         # 只记媒体主机：直链带签名，完整 URL 不允许进日志。
         logger.debug("probe_url exception host=%s: %s", _media_host(url), exc)
@@ -1065,8 +1099,18 @@ _CHAIN_FAIL_THRESHOLD = 3
 _CHAIN_OPEN_SECONDS = 600
 _CHAIN_RETRY_SECONDS = 30
 _CHAIN_HEALTH: dict[str, dict] = {}
-_RESOLVE_TIMEOUT_COOLDOWN: dict[str, float] = {}
-_RESOLVE_TIMEOUT_COOLDOWN_S = 30.0
+# 解析超时冷却只针对一个实际候选曲目，避免慢歌/版权拒绝连坐同平台其他歌曲。
+_RESOLVE_TIMEOUT_COOLDOWN: dict[tuple[int, str, str, str, str], float] = {}
+_RESOLVE_TIMEOUT_COOLDOWN_S = 3.0
+
+
+def _timeout_cooldown_key(
+    script_id: str, platform: str, generation: int, quality: str, candidate_id: str,
+) -> tuple[int, str, str, str, str]:
+    return (
+        int(generation), str(script_id), normalize_source(platform) or str(platform or ""),
+        str(quality), str(candidate_id),
+    )
 
 
 def _chain_available(name: str) -> bool:
@@ -1275,10 +1319,10 @@ async def resolve_and_probe(
       resolution_quality，实际档位没有实测证据时保持未知；
     - 每次请求用 excludeApiSources 排除其他脚本并关闭上游自动切源，只固定当前
       脚本，不改全局启用态；响应的 sourceId 必须等于该脚本 ID；
-    - 搜索/解析/探活共用同一个 deadline，并按剩余尝试数切分 slot，首慢源不能
-      吃光总预算；
-    - 熔断键是脚本 + 平台 + 音质档 + 配置代；取消、预算耗尽、lxserver 内部故障
-      都不计脚本失败，高档缺失也不会误伤标准档。
+    - 搜索/解析/探活共用总 deadline；预算只在当前质量档的脚本与候选间公平切片，
+      后续降档不预先瓜分首档时间；
+    - 歌曲级空结果只影响该曲目；真实解析超时只短暂冷却同一歌曲候选；预算未耗尽
+      但本轮仍有候选超时/未尝试完时作为“未完成”返回，不能写负缓存。
     """
     src = normalize_source(source)
     if not src:
@@ -1318,19 +1362,20 @@ async def resolve_and_probe(
     stashed: dict[tuple[str, str], dict] = {}
     # 未知档位仅作为最终兼容候选，不抢占后续脚本可证明的目标档。
     unknown_stashed: dict[tuple[str, str], dict] = {}
-    # 记录“脚本+平台+档位”的失败；key 含档位，所以高档缺失不会误伤标准档，
-    # 而整轮都失败的脚本仍会按各自档位累计，进而整体熔断。
-    failed_steps: set[tuple[str, str, str]] = set()
-    budget_exhausted = False
+    # 任一候选超时、冷却跳过或预算用尽都表示本轮未完整验证，不得写确定失败缓存。
+    incomplete = False
 
     for index, step in enumerate(steps):
         if active_generation != _URL_CACHE_GEN:
             return None
         if step.quality not in attempted_tiers:
             attempted_tiers.append(step.quality)
-        slot = _attempt_slot(deadline, len(steps) - index, effective_resolver_timeout)
+        same_tier_steps = sum(1 for pending in steps[index:] if pending.quality == step.quality)
+        slot = _attempt_slot(
+            deadline, same_tier_steps, effective_resolver_timeout, effective_probe_timeout,
+        )
         if slot <= 0:
-            budget_exhausted = True
+            incomplete = True
             break
         step_deadline = min(deadline, time.monotonic() + slot)
         memory_key = (step.script_id, step.platform)
@@ -1341,9 +1386,6 @@ async def resolve_and_probe(
             cached_rank = quality_rank(str(cached.get("resolution_quality") or ""))
             step_rank = quality_rank(step.quality)
             if 0 <= step_rank <= cached_rank:
-                # 暂存交付也须登记此前的真实失败，保持各档位熔断统计一致。
-                # 暂存本身不是新失败，也不把高档失败计入可用的低档。
-                _record_step_failures(failed_steps, active_generation)
                 return _finish_attempt(cached, step_quality=step.quality,
                                        attempted_tiers=attempted_tiers, from_stash=True)
             continue
@@ -1351,12 +1393,6 @@ async def resolve_and_probe(
             continue
 
         chain_key = _chain_key(step.script_id, step.platform, active_generation, step.quality)
-        if _RESOLVE_TIMEOUT_COOLDOWN.get(chain_key, 0) > time.monotonic():
-            fn_diag(logger, "play_attempt", stage="cooldown", script=step.script_id,
-                    platform=step.platform, quality=step.quality, result="timeout_cooldown")
-            continue
-        if not _chain_available(chain_key):
-            continue
 
         if step.platform == src:
             attempts: list[tuple[str, dict]] = [(track_id, original_info)]
@@ -1369,6 +1405,8 @@ async def resolve_and_probe(
                 prefetched[prefetch_key] = await _CANDIDATES.find_many(
                     _search_candidates, item, others, step_deadline, active_generation,
                 )
+                if time.monotonic() >= step_deadline:
+                    incomplete = True
             attempts = []
             for candidate in prefetched[prefetch_key].get(step.platform) or []:
                 candidate_id = str(candidate.get("id") or "")
@@ -1380,14 +1418,35 @@ async def resolve_and_probe(
                     continue
                 attempts.append((candidate_id, _candidate_song_info(candidate)))
         if not attempts:
+            if time.monotonic() >= step_deadline:
+                incomplete = True
             continue
 
         exclude_sources = _exclude_others(step.script_id, catalog)
-        step_failed = False
-        for resolved_id, song_info in attempts:
+        for candidate_index, (resolved_id, song_info) in enumerate(attempts):
             if time.monotonic() >= deadline:
-                budget_exhausted = True
+                incomplete = True
                 break
+            attempt_slot = _attempt_slot(
+                step_deadline, len(attempts) - candidate_index,
+                effective_resolver_timeout, effective_probe_timeout, apply_floor=False,
+            )
+            if attempt_slot <= 0:
+                incomplete = True
+                break
+            attempt_deadline = min(step_deadline, time.monotonic() + attempt_slot)
+            cooldown_key = _timeout_cooldown_key(
+                step.script_id, step.platform, active_generation, step.quality, resolved_id,
+            )
+            now = time.monotonic()
+            for stale_key, expiry in list(_RESOLVE_TIMEOUT_COOLDOWN.items()):
+                if expiry <= now:
+                    _RESOLVE_TIMEOUT_COOLDOWN.pop(stale_key, None)
+            if _RESOLVE_TIMEOUT_COOLDOWN.get(cooldown_key, 0) > now:
+                incomplete = True
+                fn_diag(logger, "play_attempt", stage="cooldown", script=step.script_id,
+                        platform=step.platform, quality=step.quality, result="timeout_cooldown")
+                continue
             attempt_started = time.monotonic()
             attempt = await _attempt_pinned(
                 client,
@@ -1399,7 +1458,7 @@ async def resolve_and_probe(
                 quality=step.quality,
                 requested_quality=target_quality,
                 deadline=deadline,
-                slot_deadline=step_deadline,
+                slot_deadline=attempt_deadline,
                 resolver_timeout=effective_resolver_timeout,
                 probe_timeout=effective_probe_timeout,
                 exclude_sources=exclude_sources,
@@ -1413,13 +1472,13 @@ async def resolve_and_probe(
                     result=("service_error" if attempt.service_error else "timeout" if attempt.timeout
                             else "success" if attempt.data else "no_playable_result"))
             if time.monotonic() >= deadline:
-                budget_exhausted = True
+                incomplete = True
                 break
             if attempt.service_error:
                 # 内部服务故障上浮为 503：不写负缓存、不写脚本熔断，也不继续消耗预算。
                 raise SourceStateQueryError("lxserver 播放解析内部故障")
             if attempt.data:
-                _RESOLVE_TIMEOUT_COOLDOWN.pop(chain_key, None)
+                _RESOLVE_TIMEOUT_COOLDOWN.pop(cooldown_key, None)
                 _chain_record_success(chain_key)
                 # 排序依据是上游解析档回显，不是空的实测档位。
                 resolved_rank = quality_rank(str(attempt.data.get("resolution_quality") or ""))
@@ -1429,37 +1488,29 @@ async def resolve_and_probe(
                     unknown_stashed.setdefault(memory_key, dict(attempt.data))
                     break
                 if resolved_rank >= step_rank:
-                    # 解析档达到本步档位后才交付；未知档位留到全部确定档尝试结束。
-                    # 交付前把本轮已失败的档位记上（例如该脚本没有无损档）。
-                    _record_step_failures(failed_steps, active_generation)
                     return _finish_attempt(attempt.data, step_quality=step.quality,
                                            attempted_tiers=attempted_tiers)
                 # 解析档已知低于本步档位：暂存，先把本档的其他脚本问完。
                 stashed[memory_key] = dict(attempt.data)
                 break
             if attempt.timeout:
-                # 单次超时只是本脚本/本候选慢；预算耗尽时结束整个计划，不记熔断。
-                if deadline - time.monotonic() <= 0:
-                    budget_exhausted = True
-                    break
-                if not attempt.resolve_timeout:
-                    break
-                now = time.monotonic()
-                for key, expiry in list(_RESOLVE_TIMEOUT_COOLDOWN.items()):
-                    if expiry <= now:
-                        _RESOLVE_TIMEOUT_COOLDOWN.pop(key, None)
-                if len(_RESOLVE_TIMEOUT_COOLDOWN) >= 2048:
-                    _RESOLVE_TIMEOUT_COOLDOWN.pop(next(iter(_RESOLVE_TIMEOUT_COOLDOWN)))
-                _RESOLVE_TIMEOUT_COOLDOWN[chain_key] = now + _RESOLVE_TIMEOUT_COOLDOWN_S
-                break
-            step_failed = True
-        if step_failed:
-            failed_steps.add((step.script_id, step.platform, step.quality))
-        if budget_exhausted:
+                # 超时是本轮未完成；只有完整的单次解析超时才冷却同一歌曲候选。
+                incomplete = True
+                if attempt.resolve_timeout:
+                    if len(_RESOLVE_TIMEOUT_COOLDOWN) >= 2048:
+                        _RESOLVE_TIMEOUT_COOLDOWN.pop(next(iter(_RESOLVE_TIMEOUT_COOLDOWN)))
+                    _RESOLVE_TIMEOUT_COOLDOWN[cooldown_key] = (
+                        time.monotonic() + _RESOLVE_TIMEOUT_COOLDOWN_S
+                    )
+                # 候选拥有独立预算；有剩余时间时继续尝试同平台的其他候选。
+                continue
+            # 明确空链接/无效媒体仅是当前歌曲结果，不计入共享脚本熔断。
+
+        if time.monotonic() >= deadline:
+            incomplete = True
             break
 
-    _record_step_failures(failed_steps, active_generation)
-    if (unknown_stashed and not budget_exhausted and time.monotonic() < deadline
+    if (unknown_stashed and time.monotonic() < deadline
             and active_generation == _URL_CACHE_GEN):
         fallback = next(iter(unknown_stashed.values()))
         fallback["fallback_reason"] = (
@@ -1467,6 +1518,10 @@ async def resolve_and_probe(
             "requested tier not confirmed; actual quality unknown"
         )
         return _finish_attempt(fallback, step_quality="", attempted_tiers=attempted_tiers, from_stash=True)
+    if incomplete:
+        raise _ResolutionIncomplete(
+            "playback resolution deadline reached before all candidates completed"
+        )
     return None
 
 
@@ -1757,7 +1812,13 @@ async def _reconcile_source_targets(urls: list[str]) -> None:
     _CHAIN_HEALTH.clear()
 
 
+_SOURCE_MANUAL_REVISION = 0
+
+
 async def _bootstrap_migration():
+    if _SOURCE_MANUAL_REVISION:
+        return
+    revision = _SOURCE_MANUAL_REVISION
     # 等待 lxserver 就绪不占用管理锁：启动期（lxserver 慢启动最长约 10s）
     # WebUI 的激活请求不应被启动对账挡成 409。
     for _ in range(20):
@@ -1767,7 +1828,8 @@ async def _bootstrap_migration():
         except Exception:
             pass
         await asyncio.sleep(0.5)
-    await _migrate_persisted_sources()
+    if revision == _SOURCE_MANUAL_REVISION:
+        await _migrate_persisted_sources()
 
 
 @serialize_source_operation
@@ -1794,6 +1856,10 @@ async def _migrate_persisted_sources():
         targets = _persisted_source_targets()
         if targets is not None:
             await _reconcile_source_targets(targets)
+            # 启动恢复在管理锁内同步顺序；项目状态查询保持只读，避免迟到查询
+            # 根据旧配置把本次保存刚确认的顺序改回去。
+            sources = await _query_source_list()
+            await _sync_upstream_order(sources, _policy_payload(sources)["source_order"])
             return
         active = await describe_user_source()
         if not active.get("configured"):
@@ -1829,6 +1895,8 @@ async def _migrate_persisted_sources():
                         logger.info("已自动激活历史音源: %s", source_url)
                     except Exception as e:
                         logger.warning("自动激活历史音源失败: %s", e)
+        sources = await _query_source_list()
+        await _sync_upstream_order(sources, _policy_payload(sources)["source_order"])
     except Exception as exc:
         logger.warning("历史数据检查与迁移异常: %s", exc)
 
@@ -2335,6 +2403,16 @@ async def track_url(
             client, src, cached, quality,
             budget=timeout_settings["url_timeout"], fresh=bool(fresh), timeout_settings=timeout_settings
         )
+    except _ResolutionIncomplete:
+        # 未穷尽候选不是“曲目无资源”：返回 504 并且不写 60 秒负缓存。
+        _STATS["errors"] += 1
+        fn_diag(logger, "url_resolve", op="incomplete", song=track_id[:60], quality=quality)
+        return JSONResponse(status_code=504, content={
+            "ok": False,
+            "error": "playback resolution deadline exceeded",
+            "category": "resolution_incomplete",
+            "stage": "resolve",
+        })
     except SourceStateQueryError:
         # 内部 lxserver 不可用是服务故障（503），不能伪装成曲目不可播（404/502）。
         raise
@@ -2454,6 +2532,7 @@ class SourceBody(BaseModel):
     url: str = ""
     script: str = ""
     enabled: bool = True  # false 表示停用该源（多源叠加语义下的取消激活）
+    timeout_s: float | None = Field(default=None, gt=0, le=55, allow_inf_nan=False)
     quick: bool = False  # true 表示快速门禁校验（仅语法/平台解析，跳过耗时抽样）
 
 
@@ -2461,16 +2540,19 @@ class ReorderBody(BaseModel):
     """排序接口请求体：稳定脚本 ID 数组（只传 WebUI 可见的激活脚本即可）。"""
 
     source_ids: list[str] = Field(default_factory=list)
+    timeout_s: float | None = Field(default=None, gt=0, le=55, allow_inf_nan=False)
+    persist: bool = True  # 配置保存由 WebUI 在同一事务收口，本接口只确认上游顺序。
 
 
 @app.get("/api/v1/source")
-async def source_info():
+async def source_info(read_only: bool = False):
     try:
         sources = await _query_source_list()
         user_src = _describe_source_snapshot(sources)
-        policy_payload = _policy_payload(sources, persist_cleanup=True)
+        policy_payload = _policy_payload(sources, persist_cleanup=not read_only)
         # 运行期排序同步上游：只在管理查询路径做，且同一顺序只发一次。
-        await _sync_upstream_order(sources, policy_payload["source_order"])
+        if not read_only:
+            await _sync_upstream_order(sources, policy_payload["source_order"])
     except Exception as exc:
         return _source_query_response(exc)
     return {
@@ -2506,6 +2588,17 @@ async def _rollback_source_order(previous: list[str]) -> None:
 @app.post("/api/v1/source/reorder")
 @serialize_source_operation
 async def source_reorder(body: ReorderBody):
+    """在调用方预算内确认排序；保存事务可选择由 WebUI 统一写配置。"""
+    try:
+        async with asyncio.timeout(body.timeout_s):
+            return await _source_reorder(body)
+    except TimeoutError:
+        return JSONResponse(status_code=504, content={
+            "ok": False, "category": "result_unknown",
+            "error": "排序确认超时，结果待核实", "result_unknown": True})
+
+
+async def _source_reorder(body: ReorderBody):
     """调整脚本顺序：管理锁串行、上游 sourceIds 持久化、失败回滚。
 
     只改顺序，不改任何脚本的全局启用状态；成功后排空直链/候选缓存并推进
@@ -2566,7 +2659,8 @@ async def source_reorder(body: ReorderBody):
         })
 
     try:
-        _write_source_order_file(after, list(settings.source_order))
+        if body.persist:
+            _write_source_order_file(after, list(settings.source_order))
     except OSError as exc:
         await _rollback_source_order(before)
         return JSONResponse(status_code=500, content={
@@ -2771,6 +2865,21 @@ async def source_upload(body: UploadBody):
 @app.post("/api/v1/source")
 @serialize_source_operation
 async def source_set(body: SourceBody):
+    """串行确认目标源启停；超时释放管理锁并明确返回未知结果。"""
+    global _SOURCE_MANUAL_REVISION
+    if body.timeout_s is not None:
+        # 新保存已接管激活状态；等待健康检查的旧启动任务不能再恢复旧配置。
+        _SOURCE_MANUAL_REVISION += 1
+    try:
+        async with asyncio.timeout(body.timeout_s):
+            return await _source_set(body)
+    except TimeoutError:
+        return JSONResponse(status_code=504, content={
+            "ok": False, "category": "result_unknown", "stage": "source_confirmation",
+            "error": "音源快速确认超时，结果待核实", "result_unknown": True})
+
+
+async def _source_set(body: SourceBody):
     """激活/停用自定义源（多源叠加语义：只改目标源启用态，不动其他源）。
 
     body.enabled=false 表示停用目标源；默认 true 为激活。同一脚本重复添加是正常操作。"""

@@ -960,11 +960,13 @@ def test_musicdl_platform_change_restarts_process(env_file, svctl):
 
 # ------------------------------------------------------------------ lx 换源回路 ---
 
-def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, monkeypatch):
+def test_lx_url_change_confirms_initialization_and_derives_sources(env_file, svctl, monkeypatch):
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": 0, "activate": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         url = str(request.url)
         if url.endswith("/api/v1/source/verify"):
             hits["verify"] += 1
@@ -975,12 +977,13 @@ def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, m
         if request.url.host == "lx.test" and request.method == "POST":
             hits["activate"] += 1
             return httpx.Response(200, json={"ok": True, "source_id": "1.js", "data": {
-                "sources": [{"id": "1.js", "url": "https://s/1.js", "status": "success"}]}})
+                "sources": [{"id": "1.js", "url": "https://s/1.js", "status": "success",
+                             "platforms": ["kw", "kg"]}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
 
-    # 切到 lx 并换 URL：verify → 写 env（含推导 LX_SOURCES）→ 起进程 → 激活
+    # 切到 lx 并换 URL：快速确认初始化 → 写入已确认配置；完整测试独立执行。
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {
             "FNMUSIC_NETEASE_ENABLED": "false",
@@ -988,21 +991,22 @@ def test_lx_url_change_verifies_activates_and_derives_sources(env_file, svctl, m
             "LX_SOURCE_URL": "https://s/1.js",
         }})
         assert r.status_code == 200
-    assert hits["verify"] == 1
+    assert hits["verify"] == 0
     assert hits["activate"] == 1
     text = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='https://s/1.js'" in text
-    assert "LX_SOURCES='kw,kg'" in text  # 来自校验报告的可用平台
+    assert "LX_SOURCES='kw,kg'" in text  # 来自目标脚本的运行期声明
 
 
-def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
+def test_lx_legacy_url_change_blocked_when_initialization_fails(env_file, svctl, monkeypatch):
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).endswith("/api/v1/source/verify"):
-            return httpx.Response(200, json={"ok": False, "data": {
-                "category": "download", "message": "下载失败: 404",
-            }})
+        if request.method == "GET" and request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        if request.method == "POST":
+            return httpx.Response(400, json={"ok": False, "category": "runtime",
+                                          "error": "脚本初始化失败"})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -1014,12 +1018,12 @@ def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
             "LX_SOURCE_URL": "https://bad/1.js",
         }})
         assert r.status_code == 400
-        assert "校验未通过" in r.json()["error"]
+        assert "初始化未通过" in r.json()["error"]
     assert env_file.read_text(encoding="utf-8") == before  # 校验失败不落盘
 
 
-def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svctl, monkeypatch):
-    """多源同时激活：新源逐个 verify，LX_SOURCES 取并集，逐个 POST 激活（叠加语义）。"""
+def test_lx_multi_source_save_confirms_initialization_and_derives_union(env_file, svctl, monkeypatch):
+    """多源只快速确认初始化，LX_SOURCES 取脚本声明平台并集。"""
     import json as _json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": [], "activate": []}
@@ -1036,13 +1040,14 @@ def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svc
             hits["verify"].append(body.get("url"))
             platforms = ["kw", "kg"] if body.get("url") == "https://s/a.js" else ["wy"]
             return httpx.Response(200, json={"ok": True, "data": {"platforms": platforms}})
-        if url.endswith("/api/v1/source") and request.method == "GET":
+        if request.url.path == "/api/v1/source" and request.method == "GET":
             # 激活前读取现有启用源平台（此处为空）
             return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
-                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success"}]}})
+                {"id": body["url"].rsplit("/", 1)[-1], "url": body["url"], "status": "success",
+                 "platforms": ["kw", "kg"] if body["url"] == "https://s/a.js" else ["wy"]}]}})
         return httpx.Response(200, json={"ok": True})
 
     _mock_http(handler)
@@ -1058,7 +1063,7 @@ def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svc
         }})
         assert r.status_code == 200
         lx_actions = [a for a in r.json()["actions"] if a.get("kind") == "lx_activate"]
-    assert hits["verify"] == ["https://s/a.js", "https://s/b.js"]  # 新激活源逐个校验
+    assert hits["verify"] == []  # 保存不再执行完整播放测试
     assert len(hits["activate"]) == 2
     assert all(b.get("enabled", True) for b in hits["activate"])
     assert len(lx_actions) == 2 and all(a["ok"] for a in lx_actions)
@@ -1086,10 +1091,10 @@ def test_lx_multi_source_save_blocked_when_no_active(env_file, svctl, monkeypatc
     assert "LX_SOURCE_LIST" not in env_file.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("failure", ["verify", "verify_http", "activate", "runtime_failed"])
+@pytest.mark.parametrize("failure", ["activate", "runtime_failed"])
 @pytest.mark.parametrize("already_active", [False, True])
 def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, monkeypatch, failure, already_active):
-    """失效项自动停用；健康项、其它设置和提示都保留，重新加载不恢复失效项。"""
+    """坏新源保持未激活；已有源失败保留原配置，不阻断其它设置。"""
     import json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     bad, good = "https://s/bad.js", "https://s/good.js"
@@ -1105,6 +1110,7 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         if req.method == "GET":
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
                 {"id": url.rsplit("/", 1)[-1], "url": url,
+                 "status": "failed" if url == bad else "success",
                  "platforms": ["wy" if url == bad else "kw"]}
                 for url, active in enabled.items() if active
             ]}})
@@ -1133,7 +1139,7 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
             return httpx.Response(400, json={"ok": False, "category": "runtime", "error": "脚本初始化失败"})
         enabled[good] = True
         return httpx.Response(200, json={"ok": True, "source_id": "good.js", "data": {
-            "sources": [{"id": "good.js", "url": good, "status": "success"}]}})
+            "sources": [{"id": "good.js", "url": good, "status": "success", "platforms": ["kw"]}]}})
 
     _mock_http(handler)
     with authed_client() as client:
@@ -1148,18 +1154,16 @@ def test_lx_failed_source_is_disabled_without_blocking_save(env_file, svctl, mon
         assert result["warnings"][0]["source"] == "失效源"
         assert result["warnings"][0]["message"]
         saved = client.get("/api/config").json()["values"]
-        assert [i["active"] for i in json.loads(saved["LX_SOURCE_LIST"])] == [False, True]
-        assert saved["LX_SOURCE_URL"] == good
+        assert [i["active"] for i in json.loads(saved["LX_SOURCE_LIST"])] == [already_active, True]
+        assert saved["LX_SOURCE_URL"] == (bad if already_active else good)
         assert saved["LX_SOURCES"] == "kw"
         assert saved["FNMUSIC_PLAY_QUALITY"] == "exhigh"
         retry = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": saved["LX_SOURCE_LIST"]}})
         assert retry.status_code == 200
-        assert retry.json()["warnings"] == []
-    assert enabled == {bad: False, good: True}
-    if not already_active and failure.startswith("verify"):
-        assert not any(path == "/api/v1/source" and body == {"url": bad} for path, body in calls)
-    else:
-        assert any(a.get("auto_disabled") for a in result["actions"])
+        assert len(retry.json()["warnings"]) == (1 if already_active else 0)
+    assert enabled == {bad: already_active, good: True}
+    assert not any(path.endswith("/verify") for path, body in calls)
+    assert any(a.get("auto_disabled") for a in result["actions"]) is (not already_active)
 
 
 @pytest.mark.parametrize("failure", ["verify", "activate"])
@@ -1197,7 +1201,7 @@ def test_lx_all_failed_sources_save_inactive_and_allow_future_saves(env_file, sv
 
 
 def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
-    """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
+    """取消项优先停用，未变且已就绪的源不重复激活。"""
     import json as _json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": 0, "activate": []}
@@ -1213,9 +1217,10 @@ def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
         if url.endswith("/api/v1/source/verify"):
             hits["verify"] += 1
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
-        if url.endswith("/api/v1/source") and request.method == "GET":
+        if request.url.path == "/api/v1/source" and request.method == "GET":
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
-                {"name": "源A", "platforms": ["kw", "kg"]},
+                {"id": "a.js", "url": "https://s/a.js", "status": "success",
+                 "name": "源A", "platforms": ["kw", "kg"]},
             ]}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
@@ -1244,8 +1249,8 @@ def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
     assert hits["verify"] == 0  # 无新激活源，不触发校验
     deactivate_bodies = [b for b in hits["activate"] if b.get("enabled") is False]
     assert len(deactivate_bodies) == 1 and deactivate_bodies[0]["url"] == "https://s/b.js"
-    assert any(b.get("url") == "https://s/a.js" and b.get("enabled", True) for b in hits["activate"])
-    assert {a["op"] for a in lx_actions} == {"activate", "deactivate"}
+    assert not any(b.get("url") == "https://s/a.js" for b in hits["activate"])
+    assert {a["op"] for a in lx_actions} == {"deactivate"}
     text = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生指针不变
     saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
@@ -1382,6 +1387,8 @@ def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl,
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/v1/source":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
         url = str(request.url)
         if url.endswith("/api/v1/source/verify"):
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
@@ -1396,7 +1403,7 @@ def test_lx_url_change_save_reports_error_for_non_json_activate(env_file, svctl,
             "FNMUSIC_LX_ENABLED": "true",
             "LX_SOURCE_URL": "https://s/1.js",
         }})
-        assert r.status_code == 200
+        assert r.status_code == 400
         activate = [a for a in r.json()["actions"] if a["kind"] == "lx_activate"]
         assert activate and activate[0]["ok"] is False
         assert "非 JSON" in activate[0]["error"]
@@ -1795,6 +1802,28 @@ def test_resident_enable_starts_musicbox_when_stopped(env_file, svctl, resident_
     assert webui._resident_state["active"] is True
 
 
+@pytest.mark.parametrize("running", [True, False])
+def test_unrelated_save_recovers_stopped_resident_without_rechecking_running_process(
+        env_file, svctl, resident_state, running):
+    _musicdl_env(env_file)
+    webui._resident_state["active"] = True
+    if not running:
+        svctl.status_output["musicbox"] = "musicbox                       STOPPED   Not started"
+    hits = []
+    handler = _resident_http(logged_in=True)
+
+    def tracking(request):
+        hits.append(request.url.path)
+        return handler(request)
+
+    _mock_http(tracking)
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {"FNMUSIC_RECOMMEND_DAILY": False}})
+    assert response.status_code == 200
+    assert (("start", "musicbox") in svctl.calls) is (not running)
+    assert ("/api/v1/auth/status" in hits) is (not running)
+
+
 def test_resident_without_login_reclaims_process(env_file, svctl, resident_state):
     """常驻开启但未登录（需求 2）：拉起校验后回收进程并告警，5 分钟内不再反复拉起。"""
     _musicdl_env(env_file)
@@ -1849,6 +1878,29 @@ def test_public_playlists_allow_anonymous_resident(env_file, svctl, resident_sta
     assert webui._resident_state["active"] is True
     assert webui._resident_start_block["until"] == 0.0
     assert not [a for a in actions if a.get("kind") == "resident" and a.get("op") == "stop"]
+
+
+def test_public_sync_mode_toggle_reconciles_resident_musicbox(env_file, svctl, resident_state):
+    personal = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "200"}]
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+                .replace("FNMUSIC_MUSICDL_ENABLED='false'", "FNMUSIC_MUSICDL_ENABLED='true'")
+        + "FNMUSIC_NETEASE_PLAYLIST_RESIDENT='true'\nFNMUSIC_NETEASE_MY_PLAYLISTS='false'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED='true'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='[]'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{json.dumps({'a': personal})}'\n",
+        encoding="utf-8",
+    )
+    webui._resident_state["active"] = True
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": True,
+        }})
+    assert saved.status_code == 200, saved.text
+    assert ("stop", "musicbox") in svctl.calls
+    assert webui._resident_state["active"] is False
+    assert json.loads(webui.read_env()["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": personal}
 
 
 def test_public_playlist_selection_rejects_invalid_payload(env_file, svctl):
@@ -2375,6 +2427,8 @@ def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
 
     def mock_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/source":
+            if request.method == "GET":
+                return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
             activate_calls.append(json.loads(request.content.decode()))
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
                 {"id": "source.js", "url": "http://lx.test/source.js", "status": "success"}]}})
@@ -2397,7 +2451,7 @@ def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
 
 
 def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch):
-    """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
+    """删除已激活项时停用目标，保留源不重复激活。"""
     import json as _json
     monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
     hits = {"verify": 0, "activate": []}
@@ -2413,9 +2467,10 @@ def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch)
         if url.endswith("/api/v1/source/verify"):
             hits["verify"] += 1
             return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
-        if url.endswith("/api/v1/source") and request.method == "GET":
+        if request.url.path == "/api/v1/source" and request.method == "GET":
             return httpx.Response(200, json={"ok": True, "data": {"sources": [
-                {"name": "源A", "platforms": ["kw", "kg"]},
+                {"id": "a.js", "url": "https://s/a.js", "status": "success",
+                 "name": "源A", "platforms": ["kw", "kg"]},
             ]}})
         if url.endswith("/api/v1/source"):
             hits["activate"].append(body)
@@ -2443,8 +2498,8 @@ def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch)
     assert hits["verify"] == 0  # 无新激活源，不触发校验
     deactivate_bodies = [b for b in hits["activate"] if b.get("enabled") is False]
     assert len(deactivate_bodies) == 1 and deactivate_bodies[0]["url"] == "https://s/b.js"
-    assert any(b.get("url") == "https://s/a.js" and b.get("enabled", True) for b in hits["activate"])
-    assert {a["op"] for a in lx_actions} == {"activate", "deactivate"}
+    assert not any(b.get("url") == "https://s/a.js" for b in hits["activate"])
+    assert {a["op"] for a in lx_actions} == {"deactivate"}
     text = env_file.read_text(encoding="utf-8")
     assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生指针不变
     saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
@@ -2629,8 +2684,9 @@ def test_logs_export_pack_and_cleanup(about_env, export_temp_root):
         assert r1.status_code == 200
         disp = r1.headers.get("content-disposition", "")
         import re as _re
-        m = _re.search(r'filename="(\d{14})\.logzip"', disp)
+        m = _re.search(r'filename="(fnmusic-logs-\d{14}-[0-9a-f]{8}\.zip)"', disp)
         assert m, disp
+        assert r1.headers["content-type"].startswith("application/zip")
         zf = zipfile.ZipFile(io.BytesIO(r1.content))
         names = set(zf.namelist())
         assert "proxy.log" in names and "webui.log" in names
@@ -2639,12 +2695,13 @@ def test_logs_export_pack_and_cleanup(about_env, export_temp_root):
         assert "[env] context=" in zf.read("export_env_snapshot.txt").decode("utf-8")
         # 响应结束就删除其私有包，不把下载产物留在日志目录。
         assert not list(export_temp_root.iterdir())
-        assert not list(logs.glob("*.logzip"))
+        assert not list(logs.glob("*.zip"))
         r2 = client.get("/api/logs/export")
         assert r2.status_code == 200
-        assert _re.search(r'filename="(\d{14})\.logzip"', r2.headers["content-disposition"])
+        assert _re.search(r'filename="fnmusic-logs-\d{14}-[0-9a-f]{8}\.zip"',
+                          r2.headers["content-disposition"])
         assert not list(export_temp_root.iterdir())
-        assert not list(logs.glob("*.logzip"))
+        assert not list(logs.glob("*.zip"))
 
 
 def test_logs_export_concurrent_same_second_before_file_open(about_env, export_temp_root, monkeypatch):
@@ -2656,6 +2713,8 @@ def test_logs_export_concurrent_same_second_before_file_open(about_env, export_t
     log = about_env / "logs" / "proxy.log"
     log.write_bytes(b"first request\n")
     monkeypatch.setattr(webui.time, "strftime", lambda *args: "20261010235959")
+    random_names = iter(("aaaa1111", "bbbb2222"))
+    monkeypatch.setattr(webui.secrets, "token_hex", lambda _: next(random_names))
     original_call = webui._LogExportResponse.__call__
     paths = []
 
@@ -2683,7 +2742,8 @@ def test_logs_export_concurrent_same_second_before_file_open(about_env, export_t
                 second = await asyncio.wait_for(client.get("/api/logs/export"), 5)
                 assert second.status_code == 200
                 assert paths[0] != paths[1]
-                assert paths[0].name == paths[1].name == "20261010235959.logzip"
+                assert paths[0].name == "fnmusic-logs-20261010235959-aaaa1111.zip"
+                assert paths[1].name == "fnmusic-logs-20261010235959-bbbb2222.zip"
                 assert paths[0].exists()  # 第二个请求清理不影响第一个
                 assert not paths[1].parent.exists()
                 listing = await client.get("/api/about")
@@ -2694,12 +2754,15 @@ def test_logs_export_concurrent_same_second_before_file_open(about_env, export_t
             for response, expected in ((first_response, b"first request\n"),
                                        (second, b"second request\n")):
                 assert response.status_code == 200
-                assert response.headers["content-disposition"] == 'attachment; filename="20261010235959.logzip"'
+                assert response.headers["content-disposition"] == (
+                    f'attachment; filename="fnmusic-logs-20261010235959-'
+                    f'{"aaaa1111" if response is first_response else "bbbb2222"}.zip"'
+                )
                 with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                     assert archive.read("proxy.log") == expected
                     assert "export_env_snapshot.txt" in archive.namelist()
             assert not list(export_temp_root.iterdir())
-            assert not list((about_env / "logs").glob("*.logzip"))
+            assert not list((about_env / "logs").glob("*.zip"))
 
     asyncio.run(exercise())
 
@@ -2757,6 +2820,7 @@ def test_logs_export_excludes_symlinks_and_listing_matches(about_env, export_tem
     if hasattr(os, "mkfifo"):
         os.mkfifo(logs / "pipe.log")
     (logs / "old.logzip").write_bytes(b"legacy archive")
+    (logs / "fnmusic-logs-20260101000000-aaaaaaaa.zip").write_bytes(b"current archive")
     old = logs / "old.log"
     old.write_text("expired")
     os.utime(old, (time.time() - 4 * 86400,) * 2)
@@ -2765,12 +2829,14 @@ def test_logs_export_excludes_symlinks_and_listing_matches(about_env, export_tem
         response = client.get("/api/logs/export")
     assert [item["name"] for item in listed] == ["proxy.log"]
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        assert set(archive.namelist()) == {"proxy.log", "export_env_snapshot.txt"}
+        assert set(archive.namelist()) == {
+            "proxy.log", "export_env_snapshot.txt", "log_collection.json", "proxy_diagnostics.json"}
         assert archive.read("proxy.log") == b"safe\n"
     assert not list(export_temp_root.iterdir())
     assert secret.read_text() == "must not export"
     # 不扫描删除历史包：它可能是旧版本仍在发送的响应。
     assert (logs / "old.logzip").exists()
+    assert (logs / "fnmusic-logs-20260101000000-aaaaaaaa.zip").exists()
 
 
 def test_logs_export_rejects_symlink_swapped_after_listing(about_env, export_temp_root, monkeypatch):
@@ -2784,7 +2850,7 @@ def test_logs_export_rejects_symlink_swapped_after_listing(about_env, export_tem
     original_open = webui.os.open
 
     def swap_then_open(path, flags, *args, **kwargs):
-        if Path(path) == log:
+        if Path(path) == log or (Path(path) == Path(log.name) and kwargs.get("dir_fd") is not None):
             log.unlink()
             log.symlink_to(secret)
         return original_open(path, flags, *args, **kwargs)
@@ -2794,7 +2860,8 @@ def test_logs_export_rejects_symlink_swapped_after_listing(about_env, export_tem
         response = client.get("/api/logs/export")
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        assert archive.namelist() == ["export_env_snapshot.txt"]
+        assert set(archive.namelist()) == {
+            "export_env_snapshot.txt", "log_collection.json", "proxy_diagnostics.json"}
     assert not list(export_temp_root.iterdir())
 
 
@@ -2859,6 +2926,135 @@ def test_logs_export_requires_admin(about_env):
     with TestClient(webui.app) as client:
         r = client.get("/api/logs/export")
     assert r.status_code == 403
+
+
+def test_logs_export_includes_separate_host_logs_and_takeover_diagnostics(about_env, monkeypatch):
+    import io
+    import zipfile
+
+    host = about_env / "logs"
+    (host / "proxy.log").write_text("host-proxy token=fixture-host-secret\n", encoding="utf-8")
+    (host / "proxy.log.2026-11-08.00000001").write_bytes(b"rotated-host\n")
+    (host / "install.log").write_text("install-line\n", encoding="utf-8")
+    (host / "env_snapshot.txt").write_text("[env] context=host\n", encoding="utf-8")
+    (host / "unrelated.txt").write_text("must-not-export\n", encoding="utf-8")
+    service = about_env / "sources-data" / "logs"
+    service.mkdir(parents=True)
+    (service / "proxy.log").write_bytes(b"separate-service-log\n")
+    (service / "musicdl.log").write_text("source-line\n", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_LOG_DIR", str(service))
+
+    async def maintenance(method, path, body=None, *, timeout):
+        assert method == "GET" and path == "/api/diagnostics/status"
+        assert timeout <= 3
+        return {"ok": True, "takeover": {"status": "mismatch"}, "upstream": {"status": "ok"}}
+
+    monkeypatch.setattr(webui, "_try_maintenance_socket", maintenance)
+    with authed_client() as client:
+        names = {item["name"] for item in client.get("/api/about").json()["logs"]}
+        response = client.get("/api/logs/export")
+    assert {"proxy.log", "host/proxy.log", "host/env_snapshot.txt"} <= names
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.read("proxy.log") == b"separate-service-log\n"
+        assert b"fixture-host-secret" not in archive.read("host/proxy.log")
+        assert archive.read("host/proxy.log.2026-11-08.00000001") == b"rotated-host\n"
+        assert "host/unrelated.txt" not in archive.namelist()
+        manifest = json.loads(archive.read("log_collection.json"))
+        assert manifest["sources"][1]["status"] == "ok"
+        report = json.loads(archive.read("proxy_diagnostics.json"))
+        assert report["status"] == "reachable" and report["takeover"]["status"] == "mismatch"
+
+
+@pytest.mark.parametrize("host_state", ["missing", "unreadable", "unsafe_directory"])
+def test_logs_export_reports_host_log_collection_failure(about_env, monkeypatch, host_state):
+    import io
+    import zipfile
+
+    service = about_env / "service-logs"
+    service.mkdir()
+    monkeypatch.setenv("FNMUSIC_LOG_DIR", str(service))
+    host = about_env / "logs"
+    if host_state == "missing":
+        host.rmdir()
+    elif host_state == "unreadable":
+        original = Path.iterdir
+
+        def inaccessible(path):
+            if path == host:
+                raise PermissionError("fixture")
+            return original(path)
+        monkeypatch.setattr(Path, "iterdir", inaccessible)
+    else:
+        host.rmdir()
+        host.symlink_to(service, target_is_directory=True)
+    monkeypatch.setattr(webui, "MAINTENANCE_SOCKET", str(about_env / "absent.sock"))
+    with authed_client() as client:
+        response = client.get("/api/logs/export")
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("log_collection.json"))
+        assert manifest["sources"][1]["status"] == host_state
+        assert json.loads(archive.read("proxy_diagnostics.json"))["status"] == "unavailable"
+
+
+def test_logs_export_excludes_hardlinks_and_duplicate_metadata(about_env):
+    import io
+    import os
+    import zipfile
+
+    logs = about_env / "logs"
+    secret = about_env / "secret"
+    secret.write_text("must-not-export", encoding="utf-8")
+    os.link(secret, logs / "proxy.log")
+    for name in ("log_collection.json", "proxy_diagnostics.json", "export_env_snapshot.txt"):
+        (logs / name).write_text("stale-metadata", encoding="utf-8")
+    with authed_client() as client:
+        response = client.get("/api/logs/export")
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert "proxy.log" not in archive.namelist()
+        assert len(archive.namelist()) == len(set(archive.namelist()))
+        assert all(b"stale-metadata" not in archive.read(name) for name in archive.namelist())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux directory descriptors")
+def test_logs_export_pins_host_directory_before_a_symlink_swap(about_env, monkeypatch):
+    import io
+    import zipfile
+
+    host = about_env / "logs"
+    (host / "proxy.log").write_bytes(b"safe-host-log\n")
+    secret = about_env / "other-data"
+    secret.mkdir()
+    (secret / "proxy.log").write_bytes(b"must-not-export\n")
+    service = about_env / "service-logs"
+    service.mkdir()
+    monkeypatch.setenv("FNMUSIC_LOG_DIR", str(service))
+    original = webui._export_log_files
+    swapped = False
+
+    def swap_after_listing(directory):
+        nonlocal swapped
+        for item, info in original(directory):
+            if directory == host and not swapped:
+                host.rename(about_env / "original-logs")
+                host.symlink_to(secret, target_is_directory=True)
+                swapped = True
+            yield item, info
+
+    monkeypatch.setattr(webui, "_export_log_files", swap_after_listing)
+    with authed_client() as client:
+        response = client.get("/api/logs/export")
+    assert response.status_code == 200 and swapped
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.read("host/proxy.log") == b"safe-host-log\n"
+        assert all(b"must-not-export" not in archive.read(name) for name in archive.namelist())
+
+
+def test_logs_export_post_is_gateway_only(about_env):
+    with authed_client() as client:
+        response = client.post("/api/logs/export", json={"directory": "/vol1/music"})
+    assert response.status_code == 501
+    assert response.json()["error"] == "保存到 NAS 需要在飞牛 App 或飞牛桌面内操作"
 
 
 def test_config_put_logs_cfg_lines(env_file, svctl, caplog):
@@ -3061,10 +3257,40 @@ def test_update_check_gitee_null_body_degrades(env_file, update_cache_clean):
     assert rj["has_update"] is False
 
 
+def test_update_check_filters_draft_and_prerelease(env_file, update_cache_clean):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "api.github.com" in str(request.url):
+            # GitHub 是草稿或预发布，应自动回退到 Gitee 的正式版
+            return httpx.Response(200, json=dict(GH_RELEASE, draft=True))
+        return httpx.Response(200, json=GT_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["ok"] is True
+    assert rj["source"] == "gitee"
+    assert rj["has_update"] is True
+    assert len(calls) == 2
+
+
 def test_update_check_requires_admin(env_file, update_cache_clean):
     with TestClient(webui.app) as client:
         r = client.get("/api/update-check")
     assert r.status_code == 403
+
+
+def test_self_update_direct_access_returns_501(env_file):
+    with authed_client() as client:
+        r1 = client.get("/api/self-update")
+        assert r1.status_code == 501
+        assert "当前访问方式不支持自动更新" in r1.json()["error"]
+
+        r2 = client.post("/api/self-update", json={"target_id": "a" * 32, "confirm": True})
+        assert r2.status_code == 501
+        assert "当前访问方式不支持自动更新" in r2.json()["error"]
 
 
 def test_hidden_toggled_elements_not_defeated_by_display():

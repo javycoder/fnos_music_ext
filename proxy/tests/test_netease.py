@@ -28,6 +28,7 @@ from proxy.app import (
     _netease_url_pin_store,
     _ext_from_netease_media,
     _sniff_audio_ext,
+    _netease_catalog_delivery,
 )
 
 
@@ -1859,3 +1860,157 @@ async def test_tee_buffered_close_failure_cleans_every_resource(tmp_path, monkey
     assert parts and all(not os.path.exists(path) for path in parts)
     finalize.assert_not_called()
     handoff.assert_not_called()
+
+
+# =========================================================================
+# issue #116：搜索行的格式与文件大小必须跟随「本次会下载的表示」
+# =========================================================================
+def _netease_detail_row(**overrides):
+    row = {
+        "song_id": 186016,
+        "name": "七里香",
+        "artist": "周杰伦",
+        "album_name": "七里香",
+        "album_pic_url": "https://img.test/qlx.jpg",
+        "duration_ms": 299000,
+        "has_sq": True,
+        "has_hr": False,
+        "qualities": {
+            "exhigh": {"ext": "mp3", "file_size": 9000000, "br": 320000},
+            "lossless": {"ext": "flac", "file_size": 25000000, "br": 999000},
+        },
+        "maxbr": 999000,
+    }
+    row.update(overrides)
+    return row
+
+
+def _musicbox_with_detail(detail_row, detail_status=200):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(200, json={"ok": True, "data": [{
+                "song_id": "186016", "song_name": "七里香", "artist": "周杰伦",
+                "album_name": "七里香", "duration": 299, "quality": "SQ",
+            }]})
+        if request.url.path == "/api/v1/songs/detail":
+            return httpx.Response(detail_status, json={"ok": True, "data": [detail_row]})
+        return httpx.Response(404)
+    return handler
+
+
+async def _search_items(handler):
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8770")
+    try:
+        return await fetch_musicbox_search(client, "七里香", 10)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_search_file_size_follows_lossless_download_tier():
+    """下载档为无损：展示 flac，大小取无损档自己的 size（不与 sq/h 混用）。"""
+    items = await _search_items(_musicbox_with_detail(_netease_detail_row()))
+    assert items[0]["ext"] == "flac"
+    assert items[0]["file_size"] == 25000000
+
+
+@pytest.mark.anyio
+async def test_search_format_follows_lossy_download_tier(monkeypatch):
+    """下载档为极高(320k)：即便曲库有 SQ，展示也必须是 mp3 + 该档大小。"""
+    monkeypatch.setitem(CONF, "download_quality", "exhigh")
+    items = await _search_items(_musicbox_with_detail(_netease_detail_row()))
+    assert items[0]["ext"] == "mp3"
+    assert items[0]["file_size"] == 9000000
+
+
+@pytest.mark.anyio
+async def test_search_skips_tier_above_privilege_maxbr(monkeypatch):
+    """账号 maxbr 只到 320k：无损档取链必然降级，展示不能仍标 flac 和无损大小。"""
+    monkeypatch.setitem(CONF, "download_quality", "lossless")
+    items = await _search_items(_musicbox_with_detail(_netease_detail_row(maxbr=320000)))
+    assert items[0]["ext"] == "mp3"
+    assert items[0]["file_size"] == 9000000
+
+
+@pytest.mark.anyio
+async def test_search_detail_failure_keeps_heuristic_without_fake_size():
+    """详情接口失败时退回质量字符串启发式，但绝不编造文件大小。"""
+    items = await _search_items(
+        _musicbox_with_detail(_netease_detail_row(), detail_status=500))
+    assert items[0]["ext"] == "flac"   # 搜索行的 quality="SQ"
+    assert items[0]["file_size"] == 0
+
+
+def test_catalog_delivery_returns_none_without_tier_claims(monkeypatch):
+    """曲目没有任何档位声明时返回 None，由调用方保留自己的启发式。
+
+    这里绝不能凭下载档「猜」成 flac：那会把只有有损档的曲目标错，也正是
+    issue #116 第 2 点的症状来源。
+    """
+    monkeypatch.setitem(CONF, "download_quality", "exhigh")
+    assert _netease_catalog_delivery({"qualities": {}, "maxbr": 0}) is None
+    monkeypatch.setitem(CONF, "download_quality", "lossless")
+    assert _netease_catalog_delivery({"qualities": {}, "maxbr": 0}) is None
+
+
+def test_catalog_delivery_does_not_upshift_above_target():
+    detail = {"qualities": {"lossless": {"ext": "flac", "file_size": 25000000}}, "maxbr": 0}
+    assert _netease_catalog_delivery(detail, target="standard") is None
+
+
+def test_catalog_delivery_downgrades_to_best_declared_tier(monkeypatch):
+    """目标档高于曲目声明时按声明里最高的那一档降级交付，不虚报。"""
+    monkeypatch.setitem(CONF, "download_quality", "lossless")
+    detail = {"qualities": {"exhigh": {"ext": "mp3", "file_size": 9000000}}, "maxbr": 0}
+    assert _netease_catalog_delivery(detail) == ("mp3", 9000000)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("target,maxbr", [("standard", 999000), ("lossless", 128000)])
+async def test_search_does_not_restore_ineligible_lossless_metadata(monkeypatch, target, maxbr):
+    """声明存在但不满足目标或权益时，不能重新用 SQ 标记补回 FLAC。"""
+    monkeypatch.setitem(CONF, "download_quality", target)
+    detail = _netease_detail_row(
+        qualities={"lossless": {"ext": "flac", "file_size": 25000000}},
+        maxbr=maxbr,
+    )
+    items = await _search_items(_musicbox_with_detail(detail))
+    assert items[0]["ext"] == ""
+    assert items[0]["file_size"] == 0
+
+
+@pytest.mark.anyio
+async def test_info_does_not_restore_tier_above_download_target(monkeypatch):
+    from proxy.app import _fetch_online_info
+    from starlette.requests import Request
+
+    monkeypatch.setitem(CONF, "download_quality", "standard")
+    handler = lambda request: httpx.Response(200, json={"ok": True, "data": {
+        "name": "七里香", "ar": [{"name": "周杰伦"}],
+        "sq": {"size": 25000000}, "dt": 299000,
+    }})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://musicbox") as client:
+        monkeypatch.setattr(app.state, "musicbox_client", client, raising=False)
+        info = await _fetch_online_info(
+            Request({"type": "http", "app": app}), "online:netease:186016",
+            include_lyric=False,
+        )
+    assert info["ext"] == ""
+    assert info["file_size"] == 0
+
+
+@pytest.mark.parametrize("field", ["size", "br"])
+def test_raw_catalog_ignores_nonfinite_numbers(field):
+    from proxy.app import _netease_raw_qualities
+
+    qualities = _netease_raw_qualities({"sq": {field: float("inf")}})
+    assert qualities["lossless"]["file_size"] == 0
+    assert qualities["lossless"]["br"] == 999000
+
+
+def test_catalog_delivery_ignores_nonfinite_maxbr_and_size():
+    assert _netease_catalog_delivery({
+        "qualities": {"lossless": {"ext": "flac", "file_size": float("inf")}},
+        "maxbr": float("inf"),
+    }, target="lossless") == ("flac", 0)

@@ -207,6 +207,7 @@ class TestPayload:
             "logs/proxy.log", "logs/proxy.log.2026-10-09",
             "logs/env_snapshot.txt", "logs/exports/support.logzip",
             "logs/other/nested.bin", "export.logzip", "support/export.logzip",
+            "fnmusic-logs-20260101000000-aaaaaaaa.zip",
             "proxy/debug.log", "keep.py", ".env.example",
         )
         for rel in paths:
@@ -224,6 +225,7 @@ class TestPayload:
                        env={**os.environ, "REPO_ROOT": str(source), "STAGE": str(stage)})
         assert not (target / "logs").exists()
         assert not list(target.rglob("*.logzip"))
+        assert not list(target.rglob("fnmusic-logs-*-????????.zip"))
         assert not list(target.rglob("*.log"))
         assert (target / "keep.py").is_file()
         assert (target / ".env.example").is_file()
@@ -317,6 +319,7 @@ class TestPayload:
         assert not list(repo.rglob("logs"))
         assert not list(repo.rglob("*.log"))
         assert not list(repo.rglob("*.logzip"))
+        assert not list(repo.rglob("fnmusic-logs-*.zip"))
         assert not list(repo.rglob("env_snapshot.txt"))
 
     def test_no_pycache_or_venv(self, stage: Path):

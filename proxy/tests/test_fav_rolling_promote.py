@@ -154,7 +154,7 @@ async def test_list_self_heal_promotes_rolling_cache(monkeypatch):
     await listen(guid, title="歌一")
     _save_favorite_snapshot("user-a", guid, "歌一")
     calls = _record_dispatch(monkeypatch)
-    p._maybe_retry_official_binds(
+    await p._maybe_retry_official_binds(
         _fake_request(), "user-a", [{"guid": guid, "bind": "pending"}], None)
     dest = os.path.join(p.CONF["library_dir"], "周杰伦 - 歌一.flac")
     await _wait_until(lambda: os.path.isfile(dest))

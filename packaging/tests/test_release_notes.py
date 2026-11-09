@@ -386,7 +386,7 @@ def test_release_cleanup_no_previous_release(tmp_path):
     assert _published(calls)[0][:3] == ['release', 'create', 'v2.10.0b']
 
 
-# === Gitee 只发布说明与 GitHub 下载链接，不传输附件 ===
+# === Gitee 发行版：仅同步说明，安装包回指 GitHub ===
 
 GITEE_STEP = 'Publish release to Gitee'
 
@@ -404,23 +404,11 @@ def _unindent_run(script):
                      for line in script.splitlines())
 
 
-def test_gitee_step_script_is_valid_bash(tmp_path):
+def test_gitee_step_script_is_valid_bash():
     script = _unindent_run(_gitee_step_script())
-    path = tmp_path / 'gitee-step.sh'
+    path = Path('/tmp/gitee-step.sh')
     path.write_text(script)
     subprocess.run(['bash', '-n', str(path)], check=True)
-
-
-def test_gitee_preserves_existing_assets_and_only_transfers_notes():
-    workflow = RELEASE_WORKFLOW.read_text()
-    script = _unindent_run(_gitee_step_script())
-    assert 'attach_files' not in script
-    assert 'upload_attach' not in script
-    assert '-F ' not in script and '--form' not in script and '-X DELETE' not in script
-    assert 'install_version: ${{ steps.release-kind.outputs.version }}' in workflow
-    assert 'FPK_NAME: fnmusic-ext-${{ needs.release.outputs.install_version }}.fpk' in workflow
-    assert 'path: dist/release-notes.md' in workflow
-    assert 'release-dist' not in workflow
 
 
 def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
@@ -433,79 +421,26 @@ def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
     assert 'pre_flags="--prerelease=false"' in workflow
 
 
-@pytest.mark.parametrize('exists', [False, True])
-@pytest.mark.parametrize('patch_status', [200, 500])
-def test_gitee_metadata_only_publish(tmp_path, exists, patch_status):
-    """执行真实 Bash 编排：新建、补发都只写说明，且下载名保留数字修订号。"""
-    if os.name == 'nt':
-        pytest.skip('release shell sandbox requires POSIX executables')
-    tools = tmp_path / 'bin'
-    tools.mkdir()
-    helper = textwrap.dedent('''\
-        #!/usr/bin/env python3
-        import json, os, sys
-        from pathlib import Path
-        name = Path(sys.argv[0]).name
-        args = sys.argv[1:]
-        if name == 'git':
-            print('abc refs/tags/v2.12.0')
-        elif name == 'jq':
-            value = json.loads(Path(args[-1]).read_text())
-            print(value.get('id', '') if isinstance(value, dict) else '')
-        else:
-            assert not any('attach_files' in a for a in args), args
-            assert '-F' not in args and '--form' not in args, args
-            url = next(a for a in args if a.startswith('https://'))
-            method = args[args.index('-X') + 1] if '-X' in args else (
-                'POST' if '-d' in args else 'GET')
-            assert method != 'DELETE'
-            with Path(os.environ['API_CALLS']).open('a') as stream:
-                stream.write(json.dumps([method, url]) + '\\n')
-            out = Path(args[args.index('-o') + 1])
-            if method == 'GET':
-                out.write_text(json.dumps({'id': 99} if os.environ['EXISTS'] == '1' else None))
-                print('200')
-            elif method == 'POST':
-                out.write_text('{"id":99}')
-                print('201')
-            else:
-                body = next(a[5:] for a in args if a.startswith('body@'))
-                Path(os.environ['CAPTURED_BODY']).write_text(Path(body).read_text())
-                out.write_text('{}')
-                print(os.environ['PATCH_STATUS'])
-    ''')
-    for name in ('git', 'jq', 'curl'):
-        path = tools / name
-        path.write_text(helper, encoding='utf-8')
-        path.chmod(0o755)
-    (tmp_path / 'dist').mkdir()
-    (tmp_path / 'dist/release-notes.md').write_text('Cumulative release notes.\n')
-    script = _unindent_run(_gitee_step_script())
-    script = script.replace('/tmp/gitee-', str(tmp_path / 'gitee-'))
-    env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
-               TAG='v2.12.0', FPK_NAME='fnmusic-ext-2.12.0-8.fpk',
-               GITEE_REPO='example/music', GITEE_TOKEN='test-token',
-               GITHUB_REPOSITORY='example/music', EXISTS='1' if exists else '0',
-               PATCH_STATUS=str(patch_status), API_CALLS=str(tmp_path / 'calls.jsonl'),
-               CAPTURED_BODY=str(tmp_path / 'body.md'))
-    result = subprocess.run(['bash', '-c', script], cwd=tmp_path, env=env,
-                            capture_output=True, text=True)
-    assert (result.returncode == 0) == (patch_status == 200), result.stderr
-    calls = [json.loads(s) for s in (tmp_path / 'calls.jsonl').read_text().splitlines()]
-    assert [c[0] for c in calls] == (['GET', 'PATCH'] if exists else ['GET', 'POST', 'PATCH'])
-    body = (tmp_path / 'body.md').read_text()
-    assert body.startswith('Cumulative release notes.')
-    url = 'https://github.com/example/music/releases/download/v2.12.0/fnmusic-ext-2.12.0-8.fpk'
-    assert f']({url})' in body and f']({url}.sha256)' in body
-    assert 'fnmusic-ext-2.12.0.fpk' not in body
-    assert not list(tmp_path.rglob('*.fpk'))
+def test_gitee_never_transfers_or_deletes_attachments():
+    """Gitee 只同步说明；安装包必须保留在 GitHub Release。"""
+    workflow = RELEASE_WORKFLOW.read_text()
+    assert 'actions/upload-artifact@v4' not in workflow
+    assert 'actions/download-artifact@v4' not in workflow
+    assert 'upload_attach' not in workflow
+    assert 'attach_files' not in workflow
+    assert '-F ' not in workflow
+    assert '-X DELETE' not in workflow
+    assert 'mirrored=' not in workflow
 
 
-def test_gitee_metadata_requests_have_bounded_time():
+def test_gitee_notes_use_install_revision_and_github_links():
+    """说明必须使用真实安装版本号，并固定链接 GitHub 的 FPK 与校验文件。"""
     script = _unindent_run(_gitee_step_script())
-    assert 'timeout-minutes: 20' in RELEASE_WORKFLOW.read_text()
-    assert '--max-time 30' in script and '--retry 2' in script
-    assert 'budget=1800' not in script
+    assert 'version="$(tr -d \'[:space:]\' < VERSION)"' in script
+    assert 'fnmusic-ext-${version}.fpk' in script
+    assert 'github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"' in script
+    assert 'echo "- [${fpk_name}](${github_base}/${fpk_name})"' in script
+    assert 'echo "- [${fpk_name}.sha256](${github_base}/${fpk_name}.sha256)"' in script
 
 
 def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():
@@ -521,8 +456,6 @@ def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():
     assert 'needs: [release, update-moo-index]' in workflow
     # 独立 job 后仍需容忍 moo 失败，只在 release 成功时发布镜像
     assert "always() && needs.release.result == 'success'" in workflow
-    # 只传递说明文件，Gitee 不再下载或上传完整 FPK。
-    assert 'actions/upload-artifact@v4' in workflow
-    assert 'actions/download-artifact@v4' in workflow
-    assert 'path: dist/release-notes.md' in workflow
-    assert 'upload_attach' not in workflow
+    # Gitee 发行说明在 tag 检出的 CHANGELOG 中生成，并回指 GitHub 资产
+    assert 'notes_file="/tmp/release-notes.md"' in workflow
+    assert 'github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"' in workflow

@@ -17,7 +17,11 @@ REQUEST_TIMEOUT = 5
 CALLBACK_TIMEOUT = 30
 CLEANUP_PATH = "/api/maintenance/cleanup"
 ORGANIZE_PATH = "/api/maintenance/organize"
+USER_STORAGE_PATH = "/api/maintenance/user-storage"
+SCAN_ADMIN_TEST_PATH = "/api/maintenance/scan-admin-test"
+SCAN_USER_PATH = "/api/maintenance/scan-user"
 FS_CHECK_PATH = "/api/fs-check"
+DIAGNOSTICS_PATH = "/api/diagnostics/status"
 LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
 
 
@@ -42,7 +46,11 @@ def _parent(path: Path) -> None:
 
 def _route(method: str, path: str) -> bool:
     return ((method == "POST" and path == CLEANUP_PATH)
+            or (method == "GET" and path == DIAGNOSTICS_PATH)
             or (method == "GET" and path == "/api/maintenance/music-users")
+            or (method == "GET" and path == USER_STORAGE_PATH)
+            or (method == "POST" and path == SCAN_ADMIN_TEST_PATH)
+            or (method == "POST" and path == SCAN_USER_PATH)
             or (method == "GET" and re.fullmatch(CLEANUP_PATH + r"/[0-9a-fA-F]{32}", path) is not None)
             or (method == "POST" and path == ORGANIZE_PATH)
             or (method == "GET" and (path == ORGANIZE_PATH or
@@ -66,7 +74,22 @@ def _validate_body(method: str, path: str, body):
                 any(char in target for char in "\r\n\x00")):
             raise ValueError("Invalid fs-check path")
         return {"path": target}
-    if (not isinstance(body, dict) or set(body) != {"confirm_beta", "root", "layout"} or
+    if path == SCAN_ADMIN_TEST_PATH:
+        if body != {}:
+            raise ValueError("Scan admin test body must be empty")
+        return {}
+    if path == SCAN_USER_PATH:
+        if (not isinstance(body, dict) or set(body) != {"user_guid"}
+                or not isinstance(body.get("user_guid"), str)):
+            raise ValueError("Invalid scan user")
+        user_guid = body["user_guid"].strip()
+        if (not user_guid or user_guid == "shared" or len(user_guid) > 256
+                or any(ord(char) < 32 or ord(char) == 127 for char in user_guid)):
+            raise ValueError("Invalid scan user")
+        return {"user_guid": user_guid}
+    if (not isinstance(body, dict) or set(body) not in (
+            {"confirm_beta", "root", "layout"},
+            {"confirm_beta", "root", "layout", "user_guid"}) or
             type(body.get("confirm_beta")) is not bool or body.get("confirm_beta") is not True or
             not isinstance(body.get("layout"), str) or
             body.get("layout") not in LAYOUTS or
@@ -76,7 +99,16 @@ def _validate_body(method: str, path: str, body):
     if (not root.startswith("/") or ".." in root.split("/") or
             any(char in root for char in "\r\n\x00")):
         raise ValueError("Invalid organize root")
-    return {"confirm_beta": True, "root": root, "layout": body["layout"]}
+    result = {"confirm_beta": True, "root": root, "layout": body["layout"]}
+    if "user_guid" in body:
+        if not isinstance(body.get("user_guid"), str):
+            raise ValueError("Invalid organize user")
+        user_guid = body["user_guid"].strip()
+        if (not user_guid or user_guid == "shared" or len(user_guid) > 256
+                or any(ord(char) < 32 or ord(char) == 127 for char in user_guid)):
+            raise ValueError("Invalid organize user")
+        result["user_guid"] = user_guid
+    return result
 
 
 def _recover_stale_socket(path: Path) -> None:

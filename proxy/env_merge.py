@@ -22,6 +22,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -30,9 +31,22 @@ _ENV_LOCK = threading.RLock()
 
 
 @contextmanager
-def env_file_lock(path: str | Path):
+def _thread_env_lock(deadline: float | None):
+    acquired = (_ENV_LOCK.acquire() if deadline is None else
+                _ENV_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())))
+    if not acquired:
+        raise TimeoutError("配置文件正忙，未写入配置")
+    try:
+        yield
+    finally:
+        _ENV_LOCK.release()
+
+
+@contextmanager
+def env_file_lock(path: str | Path, *, timeout: float | None = None):
     """Serialize read/merge/replace across the host proxy and WebUI."""
-    with _ENV_LOCK:
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    with _thread_env_lock(deadline):
         lock_path = Path(str(Path(path).resolve()) + ".lock")
 
         def _open_lock():
@@ -74,7 +88,18 @@ def env_file_lock(path: str | Path):
                     # root-created lock file; the mode was already set correctly
                     # by the creator, so just continue.
                     pass
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                if deadline is None:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                else:
+                    while True:
+                        try:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("配置文件正忙，未写入配置")
+                            time.sleep(min(0.01, remaining))
             else:
                 import msvcrt
                 lock.seek(0)
@@ -82,7 +107,18 @@ def env_file_lock(path: str | Path):
                     lock.write(b"\0")
                     lock.flush()
                 lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                if deadline is None:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    while True:
+                        try:
+                            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("配置文件正忙，未写入配置")
+                            time.sleep(min(0.01, remaining))
             try:
                 yield
             finally:

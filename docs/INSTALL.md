@@ -171,6 +171,22 @@ ls sources-native/                           # supervisor 套接字与各程序�
 
 ## 3. 启用、切换与还原
 
+遇到「管理页正常，但飞牛音乐搜不到在线歌曲」时，先在官方音乐顶栏搜索一次，
+记录关键词和时间，再从扩展管理页「关于」导出日志。Docker 部署的日志包同时
+包含音源日志和 `host/` 下的宿主 `proxy.log`、安装日志及环境快照；原生部署
+共用一个日志目录，不重复打包。只收集最近 3 天的日志，导出前统一脱敏。
+
+包中的 `log_collection.json` 会标明宿主日志缺失、无权读取或收集不完整；
+`proxy_diagnostics.json` 通过私有维护通道核对官方 Socket 是否由当前代理接管，
+并检查官方上游是否可达。维护通道不可达时标记 `unavailable`，不据此断言代理
+未运行。导出诊断不会调用在线音源搜索，也不会使用用户登录态。
+
+搜索诊断使用同一次请求的 `id` 串联 `search_received`、`search_source` 和
+`search_finished`，记录音源结果数、耗时、合并后的在线条数、缓存及取消状态。
+`upstream_http` / `upstream_rejected` 表示官方接口未放行，
+`abandoned` 表示本次搜索未等到结果，`online_pool` 大于零而 `online_page` 为零
+可用于排查分页显示。诊断不记录关键词正文、Token、Cookie 或完整音源错误正文。
+
 ```bash
 # 启用扩展接管（含全链路验收，失败自动回滚）
 ./extend.sh
@@ -355,7 +371,7 @@ location /music/ {
 - **封面看不到**：封面默认由代理同源直出字节（`FNMUSIC_COVER_MODE=proxy`），无需外链可达；若反代后仍看不到，检查反代是否剥离了 query 参数（`?coverId=`）。
 - **热门推荐重启后不能播、第二天恢复**：先升级到 2.8.3 或更新版本；已修复洛雪 songInfo 只存内存导致重启后推荐曲目被当作“未知曲目”解析失败的问题。封面仍有 1 天客户端缓存，但不要把跨天等待当作处理办法。
 - **入口差异**：自建 nginx/NPM 可按上方配置检查；HTTPS 端口映射保留客户端实际 Host 与端口；fn Connect 没有用户可配置的外层 nginx，遇到失败需结合日志继续定位。
-- **仍异常**：WebUI「关于 → 导出日志」下载 `.logzip` 附到 issue，日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
+- **仍异常**：WebUI「关于 → 运行日志」下载 `.zip`，或在飞牛 App / 飞牛桌面内「保存到 NAS」；附到 issue 的日志中 `stream_unresolved` / `stream_delivery` / `stream_abort_detail` / `cover_id_unresolved` 诊断标记可定位环节。
 
 ### 构建时报 `pass "--allow=network.host"`（issue #71）
 

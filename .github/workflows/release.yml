@@ -25,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       formal: ${{ steps.release-kind.outputs.formal }}
-      install_version: ${{ steps.release-kind.outputs.version }}
     env:
       # 打赏二维码文本（可选）：两个渠道独立生成，不把文本或图片提交到仓库
       ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
@@ -175,17 +174,6 @@ jobs:
               "$fpk_file" "$fpk_file.sha256"
           fi
 
-      # Gitee 只同步发行说明和 GitHub 下载链接，不传递或上传安装包。
-      - name: Stage release artifacts
-        run: cp /tmp/release-notes.md dist/release-notes.md
-
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-notes
-          path: dist/release-notes.md
-          retention-days: 1
-
   # issue #36：moo 商店协议源索引自动回填。从 GitHub Release API 取真实资产
   # （download_url/size/sha256 digest）与发行说明，生成/更新仓库根 moo.json 并
   # 提交到 main；迭代预发布（2.9.0a 等字母尾巴）不改写索引——索引始终指向最新
@@ -229,8 +217,8 @@ jobs:
           git commit -m "chore(ci): 自动更新 moo 商店协议源索引 [skip ci]"
           git push
 
-  # Gitee 仅发布说明及 GitHub 的 FPK / SHA256 下载链接，不自动上传附件。
-  # 既有 Gitee 附件保留；未配置 GITEE_TOKEN 时跳过说明发布。
+  # Gitee 镜像只同步分支/标签/提交、moo 索引和发行说明。按 2026-11-05 的
+  # 发布策略，FPK 与 SHA256 始终链接 GitHub Release，不传安装包给 Gitee job。
   #
   # 严格排在 update-moo-index 之后：索引提交推到 main 后，Gitee 侧的仓库镜像
   # 才会连带同步到最新 moo.json；若两者并行，Gitee 可能停在旧索引上，用户
@@ -245,23 +233,17 @@ jobs:
       GITEE_REPO: javycoder/fnos_music_ext
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
       TAG: ${{ inputs.tag || github.ref_name }}
-      FPK_NAME: fnmusic-ext-${{ needs.release.outputs.install_version }}.fpk
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-notes
-          path: dist
-
-      # v2.7.0 实测：runner→gitee.com TLS 间歇失败（curl exit 35），故所有
-      # 小请求 API 调用必须带重试。
+      # v2.7.0 实测：runner→gitee.com TLS 间歇失败（curl exit 35），故小
+      # 请求 API 调用必须带重试。这里没有大文件上传路径。
       - name: Publish release to Gitee
         if: env.GITEE_TOKEN != ''
-        # tag 轮询最多 10 分钟，其余仅有有界的元数据小请求。
-        timeout-minutes: 20
+        # tag 轮询 ≤10min，查询/创建/PATCH 均为小请求并有单次上界。
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           tag="${TAG}"
@@ -272,14 +254,24 @@ jobs:
               exit 0
               ;;
           esac
-          notes_file="dist/release-notes.md"
-          fpk_name="${FPK_NAME:?缺少数字安装版本对应的 FPK 文件名}"
+          ver="${tag#v}"
+          version="$(tr -d '[:space:]' < VERSION)"
+          notes_file="/tmp/release-notes.md"
+          awk -v ver="${ver}" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "${notes_file}"
+          if [ ! -s "${notes_file}" ]; then
+            echo "CHANGELOG.md 中未找到 ## [${ver}] 段落" >&2
+            exit 1
+          fi
           api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
 
           gcurl() {
-            # 只用于发行说明的查询、创建与更新，不发送附件。
-            curl -sS --connect-timeout 15 --max-time 30 \
-              --retry 2 --retry-all-errors --retry-delay 4 "$@"
+            # 仅用于查询/创建/PATCH 等小请求。
+            curl -sS --connect-timeout 15 --max-time 120 \
+              --retry 3 --retry-all-errors --retry-delay 4 "$@"
           }
 
           # 镜像同步有延迟，轮询等 tag 出现在 Gitee（公开仓库 ls-remote 无需认证）
@@ -308,8 +300,10 @@ jobs:
             cat /tmp/gitee-release.json >&2 || true
             exit 1
           fi
-          ver="${tag#v}"
-          if [ -z "${release_id}" ]; then
+          if [ -n "${release_id}" ]; then
+            # 重跑只更新说明；历史附件由 Gitee 页面人工管理，本管线不再处理。
+            :
+          else
             # 创建：gitee 要求 target_commitish 必传（tag 已存在时仅作落点声明）
             create_http="$(gcurl -o /tmp/gitee-create.json -w '%{http_code}' "${api}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
@@ -325,17 +319,17 @@ jobs:
             release_id="$(jq -r '.id' /tmp/gitee-create.json)"
           fi
 
-          # 下载链接使用数字安装版本（保留 -N），不从展示 tag 拼安装包名。
-          download_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
-          # 更新说明 = changelog + GitHub 下载链接；不删除已有 Gitee 附件。
+          # 固定回指 GitHub Release。此 job 不上传、不删除 Gitee 附件。
+          github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          fpk_name="fnmusic-ext-${version}.fpk"
+
+          # 更新说明 = changelog + 附件下载链接；PATCH 必须重传 tag_name 与 name
           {
             cat "${notes_file}"
             echo
-            echo "> **下载说明**：安装包及校验文件统一由 GitHub Release 提供，Gitee 不自动上传附件。"
-            echo
-            echo "### 下载"
-            printf -- '- [%s](%s/%s)\n' "${fpk_name}" "${download_base}" "${fpk_name}"
-            printf -- '- [%s.sha256](%s/%s.sha256)\n' "${fpk_name}" "${download_base}" "${fpk_name}"
+            echo "### 附件"
+            echo "- [${fpk_name}](${github_base}/${fpk_name})"
+            echo "- [${fpk_name}.sha256](${github_base}/${fpk_name}.sha256)"
           } > /tmp/gitee-body.md
           patch_http="$(gcurl -o /tmp/gitee-patch.json -w '%{http_code}' -X PATCH \
             "${api}/releases/${release_id}?access_token=${GITEE_TOKEN}" \
@@ -347,4 +341,4 @@ jobs:
             cat /tmp/gitee-patch.json >&2 || true
             exit 1
           fi
-          echo "[gitee] 发行说明已更新，下载链接指向 GitHub；不上传 FPK 或校验附件"
+          echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
