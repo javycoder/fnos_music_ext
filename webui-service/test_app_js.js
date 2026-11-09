@@ -3226,6 +3226,55 @@ test("保存：目录检查立即禁用按钮，重复点击不会发起第二�
   }
 });
 
+test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => {
+  reset();
+  global.CONFIG_JOB_POLL_INTERVAL = 0;
+  // 1. 查询活动任务：发现进行中任务
+  enqueue("/app/fnmusic-ext/api/config/jobs/active", {
+    ok: true,
+    active: true,
+    job: {
+      job_id: "cfg_active_999",
+      status: "running",
+      progress: 80,
+      message: "正在激活洛雪音源...",
+    },
+  });
+  // 2. 轮询至完成
+  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_active_999", {
+    ok: true,
+    job: {
+      job_id: "cfg_active_999",
+      status: "success",
+      progress: 100,
+      result: { ok: true, changed: [], actions: [] },
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  enqueue("/app/fnmusic-ext/api/status", { ok: true, current_provider: "none", processes: {} });
+
+  await global.checkActiveConfigJob();
+
+  assert.strictEqual(els.get("#save-btn").disabled, false);
+  assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
+  assert.ok(els.get("#toast").textContent.includes("配置已保存生效"));
+});
+
+test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
+  for (const id of ["platform-test-btn", "platform-test-panel", "platform-test-keyword",
+                    "platform-test-concurrency", "platform-test-start", "platform-test-stop",
+                    "platform-test-progress-wrap", "platform-test-progress", "platform-test-progress-text",
+                    "platform-test-summary", "platform-test-actions", "platform-test-enable-ok",
+                    "platform-test-disable-fail", "platform-test-enable-all", "platform-test-disable-all",
+                    "platform-test-table", "platform-test-tbody"]) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 必须包含 id="${id}"`);
+  }
+  assert.ok(css.includes(".data-table"), "CSS 必须包含 .data-table 样式");
+  assert.ok(css.includes(".progress-bar"), "CSS 必须包含 .progress-bar 样式");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

@@ -534,7 +534,7 @@ class AdaptiveTimeout:
     def __init__(
         self,
         base_timeout: float = 12.0,
-        min_timeout: float = 3.0,
+        min_timeout: float = 5.0,
         shrink_factor: float = 0.6,
         recover_factor: float = 1.25,
         slow_latency: float = 8.0,
