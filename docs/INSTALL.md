@@ -160,6 +160,22 @@ ls sources-native/                           # supervisor 套接字与各程序�
 
 ## 3. 启用、切换与还原
 
+遇到「管理页正常，但飞牛音乐搜不到在线歌曲」时，先在官方音乐顶栏搜索一次，
+记录关键词和时间，再从扩展管理页「关于」导出日志。Docker 部署的日志包同时
+包含音源日志和 `host/` 下的宿主 `proxy.log`、安装日志及环境快照；原生部署
+共用一个日志目录，不重复打包。只收集最近 3 天的日志，导出前统一脱敏。
+
+包中的 `log_collection.json` 会标明宿主日志缺失、无权读取或收集不完整；
+`proxy_diagnostics.json` 通过私有维护通道核对官方 Socket 是否由当前代理接管，
+并检查官方上游是否可达。维护通道不可达时标记 `unavailable`，不据此断言代理
+未运行。导出诊断不会调用在线音源搜索，也不会使用用户登录态。
+
+搜索诊断使用同一次请求的 `id` 串联 `search_received`、`search_source` 和
+`search_finished`，记录音源结果数、耗时、合并后的在线条数、缓存及取消状态。
+`upstream_http` / `upstream_rejected` 表示官方接口未放行，
+`abandoned` 表示本次搜索未等到结果，`online_pool` 大于零而 `online_page` 为零
+可用于排查分页显示。诊断不记录关键词正文、Token、Cookie 或完整音源错误正文。
+
 ```bash
 # 启用扩展接管（含全链路验收，失败自动回滚）
 ./extend.sh

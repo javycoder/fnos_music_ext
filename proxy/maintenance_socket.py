@@ -18,6 +18,7 @@ CALLBACK_TIMEOUT = 30
 CLEANUP_PATH = "/api/maintenance/cleanup"
 ORGANIZE_PATH = "/api/maintenance/organize"
 FS_CHECK_PATH = "/api/fs-check"
+DIAGNOSTICS_PATH = "/api/diagnostics/status"
 LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
 
 
@@ -42,6 +43,7 @@ def _parent(path: Path) -> None:
 
 def _route(method: str, path: str) -> bool:
     return ((method == "POST" and path == CLEANUP_PATH)
+            or (method == "GET" and path == DIAGNOSTICS_PATH)
             or (method == "GET" and path == "/api/maintenance/music-users")
             or (method == "GET" and re.fullmatch(CLEANUP_PATH + r"/[0-9a-fA-F]{32}", path) is not None)
             or (method == "POST" and path == ORGANIZE_PATH)

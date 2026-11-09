@@ -81,6 +81,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
+_SEARCH_DIAG_ID: ContextVar[str] = ContextVar("search_diagnostic_id", default="-")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 # httpx INFO 包含完整签名 URL；播放诊断仅记录歌曲、耗时和状态。
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -3349,8 +3350,11 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
                     if isinstance(raw_items, list):
                         data["items"] = [it for it in raw_items if is_playable_online_track(it)]
                     return data
+            fn_diag(logger, "search_transport", id=_SEARCH_DIAG_ID.get(),
+                    source="musicdl", http_status=r.status_code)
         except Exception as e:
-            logger.warning("Failed to fetch online search from musicdl: %s", e)
+            fn_diag(logger, "search_transport", id=_SEARCH_DIAG_ID.get(),
+                    source="musicdl", error=type(e).__name__)
         return None
 
     async def _query():
@@ -3363,7 +3367,10 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
         # 取消/换词后不重试）；这里不再内嵌第二轮，避免两层重试叠加拖穿预算。
         data = await _fetch_once(params, timeout)
         if isinstance(data, dict) and data.get("errors"):
-            logger.warning("musicdl search partial errors: %s", data.get("errors"))
+            # 第三方错误正文可能包含签名 URL、Cookie 或查询词，只记数量。
+            errors = data["errors"]
+            fn_diag(logger, "search_partial", id=_SEARCH_DIAG_ID.get(),
+                    source="musicdl", errors=len(errors) if isinstance(errors, (dict, list)) else 1)
         return data
 
     return await _MUSICDL_SEARCH_GATE.run(scope, keyword, _query)
@@ -5308,6 +5315,8 @@ def _fs_check_target(path: str) -> tuple[bool, bool]:
 async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int, dict]:
     global _maintenance_task, _organize_task, _last_organize_job
     if method == "GET":
+        if path == "/api/diagnostics/status":
+            return 200, await _proxy_diagnostic_status()
         if path == "/api/maintenance/music-users":
             try:
                 users = await asyncio.to_thread(list_music_users)
@@ -5600,6 +5609,42 @@ async def lifespan(fastapi_app: FastAPI):
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
 
 
+async def _proxy_diagnostic_status() -> dict:
+    """只通过私有维护 socket 提供；核对实际官方入口，而非仅看进程存活。"""
+    async def target():
+        try:
+            transport = httpx.AsyncHTTPTransport(uds="/var/run/trim_music.socket")
+            async with httpx.AsyncClient(transport=transport, base_url="http://unix",
+                                         timeout=1.0) as client:
+                resp = await client.get("/_ext/livez")
+                data = resp.json() if resp.status_code == 200 else {}
+                owned = (isinstance(data, dict) and data.get("service") == "fnmusic-ext"
+                         and data.get("pid") == os.getpid())
+                return {"status": "ok" if owned else "mismatch", "http_status": resp.status_code}
+        except Exception as exc:
+            return {"status": "unreachable", "error": type(exc).__name__}
+
+    async def upstream():
+        try:
+            resp = await get_upstream_client(app).get(
+                "/music/api/v1/search/track?keyword=healthz_probe", timeout=1.0)
+            return {"status": "ok" if resp.status_code < 500 else "fail",
+                    "http_status": resp.status_code}
+        except Exception as exc:
+            return {"status": "unreachable", "error": type(exc).__name__}
+
+    # 总预算也覆盖响应正文读取与清理；不进行音源搜索、不使用用户登录态。
+    try:
+        takeover, official = await asyncio.wait_for(asyncio.gather(target(), upstream()), 2.0)
+    except TimeoutError:
+        takeover = official = {"status": "unknown", "error": "TimeoutError"}
+    return {"ok": True, "pid": os.getpid(), "version": get_version(),
+            "checked_at": int(time.time()), "takeover": takeover, "upstream": official,
+            "providers": [name for name, key in (("musicdl", "musicdl_enabled"),
+                          ("musicbox", "netease_enabled"), ("lxmusic", "lx_enabled")) if CONF.get(key)],
+            "search_timeout_s": CONF["search_timeout"]}
+
+
 @app.middleware("http")
 async def log_client_requests(request: Request, call_next):
     """记录 /music/ 请求的方法/路径/状态/UA/耗时/Host/XFF，供 App 端兼容问题远程定位。
@@ -5608,7 +5653,31 @@ async def log_client_requests(request: Request, call_next):
     （issue #49 外网反代后不能播/无封面），格式与 takeover 日志白名单对齐。
     """
     started = time.monotonic()
-    response = await call_next(request)
+    search = (request.url.path == "/music/api/v1/search/track"
+              or request.url.path.startswith("/music/api/v1/search/track/"))
+    diagnostic = {"id": uuid4().hex[:12], "outcome": "unclassified"} if search else None
+    token = None
+    if diagnostic is not None:
+        request.state.search_diagnostic = diagnostic
+        token = _SEARCH_DIAG_ID.set(diagnostic["id"])
+        fn_diag(logger, "search_received", id=diagnostic["id"], pid=os.getpid(),
+                query_chars=len(extract_keyword(request)),
+                musicdl=bool(CONF.get("musicdl_enabled")),
+                musicbox=bool(CONF.get("netease_enabled")), lx=bool(CONF.get("lx_enabled")))
+    try:
+        response = await call_next(request)
+    except BaseException as exc:
+        if diagnostic is not None:
+            fn_diag(logger, "search_finished", id=diagnostic["id"],
+                    outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                    error=type(exc).__name__, ms=int((time.monotonic() - started) * 1000))
+        raise
+    finally:
+        if token is not None:
+            _SEARCH_DIAG_ID.reset(token)
+    if diagnostic is not None:
+        fn_diag(logger, "search_finished", **diagnostic, status=response.status_code,
+                ms=int((time.monotonic() - started) * 1000))
     if request.url.path.startswith("/music/"):
         ua = re.sub(r"\s+", " ", request.headers.get("user-agent") or "-")[:100]
         host = re.sub(r"\s+", " ", request.headers.get("host") or "-")[:80]
@@ -5687,6 +5756,7 @@ async def ext_healthz(request: Request):
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):
+    diagnostic = getattr(request.state, "search_diagnostic", {})
     upstream_client = get_upstream_client(request.app)
     musicdl_client = get_musicdl_client(request.app)
     musicbox_client = get_musicbox_client(request.app)
@@ -5725,6 +5795,7 @@ async def search_track(request: Request):
     resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
 
     if upstream_resp.status_code != 200:
+        diagnostic["outcome"] = "upstream_http"
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -5735,6 +5806,7 @@ async def search_track(request: Request):
     try:
         upstream_json = upstream_resp.json()
     except Exception:
+        diagnostic["outcome"] = "upstream_invalid_json"
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -5743,13 +5815,16 @@ async def search_track(request: Request):
         )
 
     if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+        diagnostic["outcome"] = "upstream_rejected"
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     if not keyword:
+        diagnostic["outcome"] = "no_keyword"
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     scope = _credential_scope(request)
     if _USER_SEARCH_WORD.get(scope) != keyword:
+        diagnostic["outcome"] = "superseded"
         return JSONResponse(content=disguise_client_json(upstream_json), status_code=upstream_resp.status_code, headers=resp_headers)
 
     key = _search_scope(request) + ":" + keyword
@@ -5776,6 +5851,7 @@ async def search_track(request: Request):
     entry["superseded"] = False
     entry["accessed"] = time.time()
     task = entry.get("task")
+    diagnostic["cache"] = bool(task and task.done() and entry.get("ts"))
     if (not task or task.done()) and time.time() - entry["ts"] >= _search_ttl(entry):
         # 走到这里的一定是刚换上的新轮（ts=0 必然过期）或首次创建：启动聚合
         task = asyncio.create_task(_aggregate_search(request, keyword, entry))
@@ -5837,7 +5913,12 @@ async def search_track(request: Request):
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
     # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
     selected = _online_window(entry, page, size, original_total)
+    diagnostic.update(outcome="abandoned" if entry.get("abandoned") else
+                      "superseded" if entry.get("superseded") else "merged",
+                      local=len(local_list), online_pool=total_online,
+                      partial=bool(entry.get("partial")), page=page, size=size)
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
+    diagnostic["online_page"] = max(0, len(ensure_search_list(merged)) - diagnostic["local"])
     merged["data"]["total"] = original_total + total_online
     # 预取下一页的在线段：源未取尽且池未填满时后台先取一轮，连续翻页零等待
     if CONF.get("search_deep_page"):
@@ -5865,14 +5946,19 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
         return
     token = _FETCH_SCOPE.set(scope)
     factories = []
+    factory_names = {}
     if CONF.get("netease_enabled"):
         factories.append(lambda: fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
+        factory_names[factories[-1]] = "musicbox"
     if CONF.get("musicdl_enabled"):
         factories.append(lambda: fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
+        factory_names[factories[-1]] = "musicdl"
     if CONF.get("lx_enabled"):
         factories.append(lambda: fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
+        factory_names[factories[-1]] = "lxmusic"
     tasks = [asyncio.create_task(factory()) for factory in factories]
     task_factory = dict(zip(tasks, factories))
+    task_started = {task: time.monotonic() for task in tasks}
     pending = set(tasks)
     partial = False
     retries = 0
@@ -5903,6 +5989,10 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                 if hard_failure:
                     failed.append(task_factory[task])
                 items = data.get("items", []) if isinstance(data, dict) else (data or [])
+                fn_diag(logger, "search_source", id=_SEARCH_DIAG_ID.get(),
+                        source=factory_names[task_factory[task]], count=len(items),
+                        partial=hard_failure, retry=retries,
+                        ms=int((time.monotonic() - task_started[task]) * 1000))
                 results[task] = items
                 if not entry["items"]:
                     ordered = [item for source_task in tasks for item in results.get(source_task, [])]
@@ -5920,6 +6010,7 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                         break
                     new_tasks = [asyncio.create_task(factory()) for factory in failed]
                     task_factory.update(zip(new_tasks, failed))
+                    task_started.update((task, time.monotonic()) for task in new_tasks)
                     tasks.extend(new_tasks)
                     pending = set(new_tasks)
                     failed = []

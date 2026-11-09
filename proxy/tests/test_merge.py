@@ -126,7 +126,7 @@ def test_write_audio_tags_id3(tmp_path):
     assert tagged["album"] == ["叶惠美"]
 
 
-def test_search_track_merge_success():
+def test_search_track_merge_success(caplog):
     """用例 a: 上游 code 0 + 列表 → 合并追加 online 条目、guid 前缀正确。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         data = {
@@ -200,6 +200,14 @@ def test_search_track_merge_success():
         assert items[1]["is_online"] is True
         assert items[1]["artists"][0]["name"] == "周杰伦"
         assert res_json["data"]["total"] == 2
+    messages = [record.getMessage() for record in caplog.records if "[diag] search_" in record.getMessage()]
+    received = next(line for line in messages if "search_received" in line)
+    request_id = received.split("id=", 1)[1].split()[0]
+    assert all("id=" + request_id in line for line in messages)
+    finished = next(line for line in messages if "search_finished" in line)
+    assert "outcome=merged" in finished and "local=1" in finished and "online_page=1" in finished
+    assert any("search_source" in line and "source=musicbox" in line and "count=1" in line for line in messages)
+    assert all("夜曲" not in line and "周杰伦" not in line for line in messages)
 
 
 def test_search_track_merge_with_q_param():
@@ -436,7 +444,7 @@ def test_search_track_upstream_unauthorized():
         assert res_json["data"] is None
 
 
-def test_search_track_upstream_http_401_fast_path():
+def test_search_track_upstream_http_401_fast_path(caplog):
     """上游 HTTP 401 非 200 响应 → 快速路径原样透传，不调用 musicdl。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"code": 99999, "msg": "UNAUTHORIZED"})
@@ -455,6 +463,8 @@ def test_search_track_upstream_http_401_fast_path():
         resp = client.get("/music/api/v1/search/track?keyword=test")
         assert resp.status_code == 401
         assert resp.json()["code"] == 99999
+    assert any("search_finished" in record.getMessage() and "outcome=upstream_http" in record.getMessage()
+               and "status=401" in record.getMessage() for record in caplog.records)
 
 
 def test_search_suggest_upstream_unauthorized_fast_path(monkeypatch):
@@ -480,7 +490,7 @@ def test_search_suggest_upstream_unauthorized_fast_path(monkeypatch):
         assert resp.json()["code"] == 99999
 
 
-def test_search_track_deduplication():
+def test_search_track_deduplication(caplog):
     """用例 c: title+artist 与上游重复时去重。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         data = {
@@ -545,6 +555,8 @@ def test_search_track_deduplication():
         assert items[0]["guid"] == "local:101"
         assert items[1]["guid"] == fake_official_guid("online:netease:228909")
         assert items[1]["title"] == "[music box] 晴天 (Live)"
+    assert any("search_finished" in record.getMessage() and "online_page=1" in record.getMessage()
+               for record in caplog.records)
 
 
 def test_stream_online_guid_range_and_tee_cache(monkeypatch):
