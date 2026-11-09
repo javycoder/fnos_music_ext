@@ -3364,9 +3364,11 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
                     if isinstance(errors, dict):
                         # “skipped (fast return/grace elapsed)” 是已经拿到结果后
                         # 主动不等慢源，不是失败；混进 errors 会让聚合层误判为
-                        # 部分失败而拒绝缓存，并在每次搜索时重复打警告。
+                        # 部分失败而拒绝缓存。总预算耗尽的 skipped (deadline)
+                        # 必须保留，否则尚未完成的源会被误当成完整搜索并缓存。
                         data["errors"] = {k: v for k, v in errors.items()
-                                          if not str(v).startswith("skipped ")}
+                                          if not str(v).startswith((
+                                              "skipped (fast return)", "skipped (grace elapsed)"))}
                     return data
             fn_diag(logger, "search_transport", id=_SEARCH_DIAG_ID.get(),
                     source="musicdl", http_status=r.status_code)
