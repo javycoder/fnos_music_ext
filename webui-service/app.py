@@ -196,6 +196,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
+    "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "同步全部用户"},
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "各用户公共歌单"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
@@ -625,11 +626,21 @@ def _resident_active(values: dict[str, str]) -> bool:
 
 
 def _public_selection_rows(values: dict[str, str]) -> list:
+    sync_all = str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL") or "").strip().lower() in (
+        "true", "1", "yes")
+    if sync_all:
+        try:
+            selection = json.loads(str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION") or "[]"))
+        except Exception:
+            return []
+        return selection if isinstance(selection, list) else []
     if str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
         return [
             entry for selection in pubpl.parse_user_selections(
                 values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]).values() for entry in selection
         ]
+    if "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL" in values:
+        return []
     if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" not in values:
         return [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
     try:

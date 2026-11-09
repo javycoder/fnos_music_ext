@@ -275,6 +275,7 @@ CONF = {
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     "public_playlists_enabled": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "public_playlists_sync_all": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL", "false").lower() in ("true", "1", "yes"),
     "public_playlists_selection": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""),
     "public_playlists_by_user": os.environ.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", ""),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
@@ -635,6 +636,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": ("public_playlists_enabled", "bool"),
+    "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": ("public_playlists_sync_all", "bool"),
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
@@ -5114,9 +5116,12 @@ def migrate_public_playlist_users(users: list[dict] | None = None) -> None:
         if str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER") or "").strip():
             pubpl.validate_user_selections(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"])
             return
-        users = list_music_users() if users is None else users
-        selection = pubpl.parse_selection(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""))
-        mapping = {user["guid"]: selection for user in users}
+        if "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL" in values:
+            mapping = {}
+        else:
+            users = list_music_users() if users is None else users
+            selection = pubpl.parse_selection(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", ""))
+            mapping = {user["guid"]: selection for user in users}
         raw = json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
         updated = [(key, value) for key, value in existing if key != "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]
         updated.append(("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", raw))

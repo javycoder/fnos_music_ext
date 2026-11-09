@@ -159,7 +159,22 @@ function reset() {
   global.helpTemplates = [];
   localStore.clear();
   try {
-    vm.runInThisContext("if (typeof abortActivePublicDetailRequests !== 'undefined') { publicSelectionDetailSeq++; abortActivePublicDetailRequests(); publicProcessSnapshot = null; }");
+    vm.runInThisContext(`if (typeof abortActivePublicDetailRequests !== 'undefined') {
+      publicSelectionDetailSeq++;
+      abortActivePublicDetailRequests();
+      publicSelection = [];
+      publicSelectionMap = {};
+      publicUserChanges.clear();
+      publicUserGuid = "";
+      publicUsers = [];
+      publicUsersReady = false;
+      publicSyncAll = false;
+      publicSharedSelection = [];
+      publicSharedChanged = false;
+      publicDetailRunTarget = "";
+      publicProcessSnapshot = null;
+      $("#public-playlists-enabled").checked = true;
+    }`);
   } catch (_) {}
 }
 
@@ -2438,6 +2453,7 @@ test("公共歌单用户：查询失败禁用配置，重试恢复", async () =>
 test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   vm.runInThisContext(`
     configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = {};
+    $("#public-playlists-enabled").checked = true;
     publicUsersReady = true; publicUsers = [{guid:"a"},{guid:"b"}];
     publicUserGuid = "a"; publicSelectionMap = {a:[
       {provider:"musicbox",source:"netease",kind:"playlist",id:"7108"}
@@ -2458,6 +2474,179 @@ test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   assert.ok(!els.get("#public-selected").innerHTML.includes("旧用户详情"));
   enqueue("/app/fnmusic-ext/api/config", {values:{}});
   await global.loadConfig();
+});
+
+test("公共歌单：全部用户与个人配置独立记忆并同时提交", async () => {
+  reset();
+  const shared = [{ provider: "musicbox", source: "netease", kind: "chart", id: "all-1" }];
+  const userA = [{ provider: "musicbox", source: "netease", kind: "chart", id: "a-1" }];
+  const userB = [{ provider: "lx", source: "kg", kind: "playlist", id: "b-1" }];
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    presence: { FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: true },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "false",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify(shared),
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({ a: userA, b: userB }),
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true,
+    users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }],
+    public_playlists_by_user: { a: userA, b: userB },
+  });
+  await global.loadConfig();
+  await global.selectPublicUser("a");
+  vm.runInThisContext(`publicSelection.push(
+    {provider:"musicbox",source:"netease",kind:"chart",id:"a-2"}
+  ); stashPublicUser(true);`);
+  global.movePublicSelection(1, -1);
+  vm.runInThisContext(`
+    publicSelection.splice(1, 1);
+    stashPublicUser(true);
+  `);
+  await global.selectPublicUser("b");
+  vm.runInThisContext(`publicSelection.push(
+    {provider:"lx",source:"kg",kind:"playlist",id:"b-2"}
+  ); stashPublicUser(true);`);
+  await global.selectPublicUser("a");
+
+  els.get("#public-playlists-sync-all").checked = true;
+  await els.get("#public-playlists-sync-all").dispatch("change");
+  assert.strictEqual(vm.runInThisContext("publicSyncAll"), true);
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["all-1"]);
+  vm.runInThisContext(`publicSelection.push(
+    {provider:"musicbox",source:"netease",kind:"chart",id:"all-2"}
+  ); stashPublicUser(true);`);
+  global.movePublicSelection(1, -1);
+  vm.runInThisContext(`
+    publicSelection.splice(1, 1);
+    stashPublicUser(true);
+  `);
+
+  els.get("#public-playlists-sync-all").checked = false;
+  await els.get("#public-playlists-sync-all").dispatch("change");
+  assert.strictEqual(vm.runInThisContext("publicSyncAll"), false);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a-2"]);
+  let values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL, false);
+  assert.deepStrictEqual(
+    JSON.parse(values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION).map(({id}) => id),
+    ["all-2"],
+  );
+  const changes = JSON.parse(values.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER);
+  assert.deepStrictEqual(changes.a.map(({id}) => id), ["a-2"]);
+  assert.deepStrictEqual(changes.b.map(({id}) => id), ["b-1", "b-2"]);
+
+  // 保存后的完整回填恢复两套草稿；随后共享列表显式清空也必须持久化为 []。
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    presence: { FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: true },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "false",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify([{ ...shared[0], id: "all-2" }]),
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({
+        a: [{ ...userA[0], id: "a-2" }],
+        b: [{ ...userB[0], id: "b-1" }, { ...userB[0], id: "b-2" }],
+      }),
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true,
+    users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }],
+    public_playlists_by_user: {
+      a: [{ ...userA[0], id: "a-2" }],
+      b: [{ ...userB[0], id: "b-1" }, { ...userB[0], id: "b-2" }],
+    },
+  });
+  await global.loadConfig();
+  await global.selectPublicUser("a");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a-2"]);
+  els.get("#public-playlists-sync-all").checked = true;
+  await els.get("#public-playlists-sync-all").dispatch("change");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["all-2"]);
+  vm.runInThisContext(`
+    publicSelection.splice(0, 1);
+    stashPublicUser(true);
+  `);
+  values = global.collectConfig();
+  assert.deepStrictEqual(JSON.parse(values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION), []);
+
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    presence: { FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: true },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: "[]",
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({ a: [], b: [] }),
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true,
+    users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }],
+    public_playlists_by_user: { a: [], b: [] },
+  });
+  await global.loadConfig();
+  assert.strictEqual(vm.runInThisContext("publicSyncAll"), true);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+});
+
+test("公共歌单：共享模式用户查询失败仍可编辑全部列表", async () => {
+  reset();
+  const shared = [{ provider: "musicbox", source: "netease", kind: "chart", id: "all" }];
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify(shared),
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: "{}",
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", new Error("数据库不可读"));
+  await global.loadConfig();
+  assert.strictEqual(vm.runInThisContext("publicSelectionEditable()"), true);
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  assert.strictEqual(els.get("#public-playlists-browser").hidden, false);
+  assert.ok(els.get("#public-users-note").textContent.includes("共享"));
+  assert.strictEqual(global.setPublicSelection({
+    provider: "lx", source: "kg", kind: "playlist", id: "new", name: "新歌单",
+  }, true), true);
+});
+
+test("公共歌单：旧后端缺少全用户开关时禁用且不提交未知字段", async () => {
+  reset();
+  vm.runInThisContext(`
+    configSchema = { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} };
+    configValues = {
+      FNMUSIC_NETEASE_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: "{}",
+    };
+    configPresence = {};
+    applyConfigToForm();
+  `);
+  assert.strictEqual(els.get("#public-playlists-sync-all").disabled, true);
+  assert.strictEqual(
+    global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL,
+    undefined,
+  );
 });
 
 test("洛雪超时设置：loadConfig 回填默认与已存参数 + 输入标脏", async () => {

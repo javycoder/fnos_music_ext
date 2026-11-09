@@ -153,10 +153,15 @@ try:
     if os.path.isfile(sys.argv[1]):
         values.update(dict(parse_env_file(sys.argv[1], strict=True)[0]))
     raw = values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION", "")
+    sync_all = str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL", "")).strip().lower() in ("true", "1", "yes")
     per_user = values.get("FNMUSIC_PUBLIC_PLAYLISTS_BY_USER", "").strip()
-    if per_user:
+    if sync_all:
+        rows = json.loads(raw) if raw.strip() else []
+    elif per_user:
         mapping = json.loads(per_user)
         rows = [item for selection in mapping.values() if isinstance(selection, list) for item in selection] if isinstance(mapping, dict) else []
+    elif "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL" in values:
+        rows = []
     else:
         rows = json.loads(raw) if raw.strip() else [{"provider": "musicbox", "id": "3778678"}]
     needed = isinstance(rows, list) and any(isinstance(x, dict) and x.get("provider") == "musicbox" and x.get("id") for x in rows)

@@ -51,6 +51,9 @@ let publicUsersSeq = 0;
 let publicUserGuid = "";
 let publicSelectionMap = {};
 const publicUserChanges = new Set();
+let publicSyncAll = false;
+let publicSharedSelection = [];
+let publicSharedChanged = false;
 let publicCapabilities = null;
 let publicState = {
   provider: "musicbox", channel: "charts", source: "netease", category: "", sort: "",
@@ -68,7 +71,7 @@ const MAX_PUBLIC_DETAIL_CONCURRENCY = 2;
 const publicDetailAbortControllers = new Set();
 const publicDetailInflight = new Map();
 let publicDetailRun = null;
-let publicDetailRunUser = "";
+let publicDetailRunTarget = "";
 let publicProcessSnapshot = null;
 
 async function api(path, options) {
@@ -628,17 +631,29 @@ function applyConfigToForm() {
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
+  const supportsSyncAll = Boolean(configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL);
+  const syncAllEl = $("#public-playlists-sync-all");
+  syncAllEl.disabled = !supportsSyncAll || !$("#public-playlists-enabled").checked;
+  publicSyncAll = supportsSyncAll && v.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL === "true";
+  syncAllEl.checked = publicSyncAll;
   publicSelectionDetailSeq++;
+  abortActivePublicDetailRequests();
   publicUserChanges.clear();
+  publicSharedChanged = false;
+  try {
+    const sharedSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
+    publicSharedSelection = Array.isArray(sharedSelection) ? sharedSelection : [];
+  } catch (_) { publicSharedSelection = []; }
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
     try {
       const mapping = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || "{}");
       publicSelectionMap = mapping && typeof mapping === "object" && !Array.isArray(mapping) ? mapping : {};
     } catch (_) { publicSelectionMap = {}; }
-    publicSelection = Array.isArray(publicSelectionMap[publicUserGuid]) ? publicSelectionMap[publicUserGuid] : [];
+    publicSelection = publicSyncAll
+      ? publicSharedSelection
+      : (Array.isArray(publicSelectionMap[publicUserGuid]) ? publicSelectionMap[publicUserGuid] : []);
   } else try {
-    publicSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
-    if (!Array.isArray(publicSelection)) publicSelection = [];
+    publicSelection = publicSharedSelection;
   } catch (_) { publicSelection = []; }
   $("#public-playlists-browser").hidden = !$("#public-playlists-enabled").checked;
   renderMusicUsers();
@@ -741,6 +756,8 @@ function collectConfig() {
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
     FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: $("#public-playlists-enabled").checked,
+    ...(configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL
+      ? { FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: publicSyncAll } : {}),
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
@@ -783,17 +800,22 @@ function collectConfig() {
   }
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
     stashPublicUser();
-    if (publicUsersReady && publicUserChanges.size) {
+    if (publicUserChanges.size) {
       const changes = {};
       for (const user of publicUserChanges) {
-        changes[user] = (publicSelectionMap[user] || []).map(({ provider, source, kind, id }) =>
-          ({ provider, source, kind, id }));
+        changes[user] = publicSelectionPayload(publicSelectionMap[user] || []);
       }
       values.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = JSON.stringify(changes);
     }
+    if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL
+        && (publicSharedChanged || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION)) {
+      values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
+        publicSelectionPayload(publicSharedSelection)
+      );
+    }
   } else if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
     values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
-      publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))
+      publicSelectionPayload(publicSelection)
     );
   }
   const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
@@ -1313,7 +1335,30 @@ const PUBLIC_PROVIDER_OPTIONS = [
 ];
 const PUBLIC_SOURCE_LABEL = { netease: "网易", wy: "网易", kw: "酷我", kg: "酷狗", tx: "QQ", mg: "咪咕" };
 
+function publicSelectionPayload(selection) {
+  return (selection || []).map(({ provider, source, kind, id }) =>
+    ({ provider, source, kind, id }));
+}
+
+function publicSelectionTarget() {
+  return publicSyncAll ? "all" : `user:${publicUserGuid}`;
+}
+
+function publicSelectionEditable() {
+  if (!$("#public-playlists-enabled").checked) return false;
+  if (publicSyncAll) return true;
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    return publicUsersReady && Boolean(publicUserGuid);
+  }
+  return true;
+}
+
 function stashPublicUser(changed = false) {
+  if (publicSyncAll) {
+    publicSharedSelection = publicSelection;
+    if (changed) publicSharedChanged = true;
+    return;
+  }
   if (!configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || !publicUserGuid) return;
   publicSelectionMap[publicUserGuid] = publicSelection;
   if (changed) publicUserChanges.add(publicUserGuid);
@@ -1326,11 +1371,22 @@ function renderMusicUsers() {
   panel.hidden = !perUser || !$("#public-playlists-enabled").checked;
   if (!perUser) return;
   const selector = $("#public-user");
+  const syncAllEl = $("#public-playlists-sync-all");
+  syncAllEl.disabled = !configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL
+    || !$("#public-playlists-enabled").checked;
+  syncAllEl.checked = publicSyncAll;
   selector.innerHTML = '<option value="">请先选择飞牛音乐用户</option>' + publicUsers.map((user) =>
     `<option value="${escapeHtml(user.guid)}">${escapeHtml(user.name || user.guid)}${user.role === "admin" ? "（管理员）" : ""}</option>`).join("");
   selector.value = publicUserGuid;
-  selector.disabled = !publicUsersReady || !publicUsers.length;
-  $("#public-playlists-browser").hidden = panel.hidden || !publicUsersReady || !publicUserGuid;
+  selector.disabled = publicSyncAll || !publicUsersReady || !publicUsers.length;
+  $("#public-playlists-browser").hidden = !publicSelectionEditable();
+  $("#public-users-note").textContent = publicSyncAll
+    ? "正在配置所有用户共享的歌单；个人配置已保留。"
+    : (publicUsersReady
+      ? (publicUsers.length
+        ? `共 ${publicUsers.length} 位有效用户。先选择用户，再配置歌单；新用户默认没有公共歌单。`
+        : "飞牛音乐中还没有有效用户。请先登录飞牛音乐，再刷新用户。")
+      : $("#public-users-note").textContent);
 }
 
 async function loadMusicUsers() {
@@ -1347,16 +1403,15 @@ async function loadMusicUsers() {
       publicSelectionMap = data.public_playlists_by_user;
     }
     if (!publicUsers.some((user) => user.guid === publicUserGuid)) publicUserGuid = "";
-    publicSelection = publicSelectionMap[publicUserGuid] || [];
-    $("#public-users-note").textContent = publicUsers.length
-      ? `共 ${publicUsers.length} 位有效用户。先选择用户，再配置歌单；新用户默认没有公共歌单。`
-      : "飞牛音乐中还没有有效用户。请先登录飞牛音乐，再刷新用户。";
+    if (!publicSyncAll) publicSelection = publicSelectionMap[publicUserGuid] || [];
   } catch (exc) {
     if (seq !== publicUsersSeq) return;
     publicUsersReady = false;
-    invalidatePublicBrowse();
-    publicSelectionDetailSeq++;
-    abortActivePublicDetailRequests();
+    if (!publicSyncAll) {
+      invalidatePublicBrowse();
+      publicSelectionDetailSeq++;
+      abortActivePublicDetailRequests();
+    }
     const isDirectRestricted = (exc && (exc.status === 403 || exc.status === 501))
       || String(exc && exc.message || "").includes("403")
       || String(exc && exc.message || "").includes("501")
@@ -1373,7 +1428,7 @@ async function loadMusicUsers() {
       $("#public-users-retry").disabled = false;
       renderMusicUsers();
       renderPublicSelected();
-      if (publicUsersReady) void ensurePublicSelectionDetails();
+      if (publicSelectionEditable()) void ensurePublicSelectionDetails();
       updateResidentAvailability();
     }
   }
@@ -1381,6 +1436,10 @@ async function loadMusicUsers() {
 
 async function selectPublicUser(guid) {
   stashPublicUser();
+  if (publicSyncAll) {
+    renderMusicUsers();
+    return;
+  }
   invalidatePublicBrowse();
   publicSelectionDetailSeq++;
   abortActivePublicDetailRequests();
@@ -1395,13 +1454,14 @@ async function selectPublicUser(guid) {
 $("#public-user").addEventListener("change", () => selectPublicUser($("#public-user").value));
 $("#public-users-retry").addEventListener("click", async () => {
   await loadMusicUsers();
-  if (publicUsersReady && publicUserGuid) await showPublicBrowser();
+  if (publicSelectionEditable()) await showPublicBrowser();
 });
 
 function anyPublicMusicboxSelection() {
   stashPublicUser();
-  const selections = configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER
-    ? Object.values(publicSelectionMap) : [publicSelection];
+  const selections = publicSyncAll
+    ? [publicSharedSelection]
+    : (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER ? Object.values(publicSelectionMap) : [publicSelection]);
   return selections.some((selection) => Array.isArray(selection) && selection.some((item) => item.provider === "musicbox"));
 }
 
@@ -1414,7 +1474,7 @@ function selectedPublicEntry(item) {
 }
 
 function setPublicSelection(item, selected) {
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) return false;
+  if (!publicSelectionEditable()) return false;
   if (selected) {
     if (selectedPublicEntry(item)) return true;
     if (publicSelection.length >= 50) {
@@ -1694,14 +1754,15 @@ function abortActivePublicDetailRequests() {
 }
 
 async function ensurePublicSelectionDetails() {
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) return;
+  if (!publicSelectionEditable()) return;
   // Removing entries cancels only their own work. Browsing never cancels names.
   const keys = new Set(publicSelection.map(publicEntryKey));
   for (const ctrl of publicDetailAbortControllers) {
     if (!keys.has(ctrl.publicKey)) ctrl.abort();
   }
-  if (publicDetailRun && publicDetailRunUser === publicUserGuid) return publicDetailRun;
-  publicDetailRunUser = publicUserGuid;
+  const target = publicSelectionTarget();
+  if (publicDetailRun && publicDetailRunTarget === target) return publicDetailRun;
+  publicDetailRunTarget = target;
   const run = runPublicSelectionDetails();
   publicDetailRun = run;
   try {
@@ -1720,7 +1781,7 @@ async function ensurePublicSelectionDetails() {
 
 async function runPublicSelectionDetails() {
   const seq = ++publicSelectionDetailSeq;
-  const currentUserGuid = publicUserGuid;
+  const currentTarget = publicSelectionTarget();
 
   for (const item of publicSelection) {
     if (item._name) {
@@ -1750,7 +1811,7 @@ async function runPublicSelectionDetails() {
 
   return new Promise((resolve) => {
     function scheduleNext() {
-      if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) {
+      if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget) {
         resolve();
         return;
       }
@@ -1759,7 +1820,7 @@ async function runPublicSelectionDetails() {
         return;
       }
       while (activeWorkers < MAX_PUBLIC_DETAIL_CONCURRENCY && queueIndex < toFetch.length) {
-        if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) {
+        if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget) {
           resolve();
           return;
         }
@@ -1773,7 +1834,7 @@ async function runPublicSelectionDetails() {
           renderPublicSelected();
           publicDetailInflight.get(key).then(() => {
             activeWorkers--;
-            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+            if (seq === publicSelectionDetailSeq && publicSelectionTarget() === currentTarget) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
@@ -1782,7 +1843,7 @@ async function runPublicSelectionDetails() {
             scheduleNext();
           }).catch(() => {
             activeWorkers--;
-            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+            if (seq === publicSelectionDetailSeq && publicSelectionTarget() === currentTarget) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
@@ -1809,7 +1870,7 @@ async function runPublicSelectionDetails() {
         const fetchPromise = (async () => {
           try {
             const detail = await fetchPublicItemDetail(item, controller.signal);
-            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid
+            if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget
                 || !publicSelection.includes(item)) return;
             setPublicDetailCache(key, {
               name: detail.name || "",
@@ -1817,7 +1878,7 @@ async function runPublicSelectionDetails() {
               track_count: detail.track_count || 0,
             }, true);
           } catch (exc) {
-            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) return;
+            if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget) return;
             if (!publicSelection.includes(item)) return;
             setPublicDetailCache(key, { failed: true, failedAt: Date.now() });
             unavailable = exc.status === 503 && /未运行|not.running|not.started/i.test(exc.message);
@@ -1826,7 +1887,7 @@ async function runPublicSelectionDetails() {
             publicDetailAbortControllers.delete(controller);
             if (publicDetailInflight.get(key) === fetchPromise) publicDetailInflight.delete(key);
             activeWorkers--;
-            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+            if (seq === publicSelectionDetailSeq && publicSelectionTarget() === currentTarget) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
@@ -2229,7 +2290,7 @@ async function initPublicDefaults() {
 }
 
 async function showPublicBrowser() {
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) {
+  if (!publicSelectionEditable()) {
     renderMusicUsers();
     return;
   }
@@ -2239,6 +2300,26 @@ async function showPublicBrowser() {
   const seq = await reloadPublicBrowser(true);
   if (seq === publicState.seq && saved === "musicdl") $("#public-note").textContent = "当前音源是 musicdl：它没有统一推荐歌单接口；可浏览网易/洛雪，保存后按常驻规则展示网易公共歌单。";
 }
+
+$("#public-playlists-sync-all").addEventListener("change", async () => {
+  const nextSyncAll = $("#public-playlists-sync-all").checked;
+  stashPublicUser();
+  invalidatePublicBrowse();
+  publicSelectionDetailSeq++;
+  abortActivePublicDetailRequests();
+  publicSyncAll = nextSyncAll;
+  $("#public-playlists-sync-all").checked = publicSyncAll;
+  publicSelection = publicSyncAll
+    ? publicSharedSelection
+    : (publicSelectionMap[publicUserGuid] || []);
+  renderMusicUsers();
+  renderPublicSelected();
+  updateResidentAvailability();
+  markDirty(publicSyncAll ? "公共歌单已切换为全部用户共享" : "公共歌单已切换为按用户配置");
+  if (!$("#public-playlists-enabled").checked) return;
+  if (!publicSyncAll && !publicUsersReady) await loadMusicUsers();
+  if (publicSelectionEditable()) await showPublicBrowser();
+});
 
 $("#public-playlists-enabled").addEventListener("change", async () => {
   const enabled = $("#public-playlists-enabled").checked;
@@ -2254,7 +2335,7 @@ $("#public-playlists-enabled").addEventListener("change", async () => {
     return;
   }
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
-    if (!publicUsersReady) await loadMusicUsers();
+    if (!publicSyncAll && !publicUsersReady) await loadMusicUsers();
   } else if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
   await showPublicBrowser();
 });

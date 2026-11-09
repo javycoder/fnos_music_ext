@@ -37,9 +37,9 @@
 | **三类音源** | 在 musicdl、网易云 musicbox、洛雪 lxmusic 中选择主音源 |
 | **在线搜索与播放** | 本地结果优先，在线结果随后展示，适配歌词、封面与客户端播放 |
 | **独立音质设置** | 在线播放与 App 下载分别选音质，支持七档偏好及缺档降级 |
-| **推荐与歌单** | 每日推荐、热门推荐、猜你喜欢，以及按用户选择的公共歌单 |
+| **推荐与歌单** | 每日推荐、热门推荐、猜你喜欢，以及按用户或全部用户共享的公共歌单 |
 | **在线转本地** | 边听边存、封面内嵌、可选歌词落盘与收藏自动绑定本地 |
-| **家庭多用户** | 在线收藏隔离，公共歌单按用户配置；网易账号歌单可跨主音源常驻 |
+| **家庭多用户** | 在线收藏隔离，公共歌单支持个人配置或全部用户同步；网易账号歌单可跨主音源常驻 |
 | **集中管理** | 音源配置、主题、日志导出、更新检查与存储维护，一个入口完成 |
 
 **先了解三点：** 主音源三选一，并非同时聚合全部提供者；项目不附送可用的洛雪脚本；安装扩展不等于获得第三方平台的会员或付费内容权限。
@@ -140,7 +140,7 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 | **网易歌单常驻** | 开启后，切换到 musicdl 或洛雪仍可显示和播放网易歌单；账号歌单需登录，公共歌单可匿名使用 |
 | **在线收藏** | 家庭用户彼此隔离；可选在收藏或加入歌单后自动下载，待官方收录再绑定本地歌曲 |
 
-网易歌单常驻会额外保留网易服务，**不代表搜索变为多个提供者混合搜索**。公共歌单按用户保存在配置中，新用户默认没有所选歌单。
+网易歌单常驻会额外保留网易服务，**不代表搜索变为多个提供者混合搜索**。公共歌单默认按用户分别保存，个人模式下的新用户没有所选歌单；勾选“同步全部用户”后，所有登录用户共用共享列表，个人配置仍独立保留，切换并保存后生效。
 
 <details>
 <summary><strong>可选：大模型推荐</strong></summary>
@@ -240,7 +240,7 @@ native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行
 | 目录布局 / 文件名 | `FNMUSIC_DOWNLOAD_LAYOUT` / `FNMUSIC_LIBRARY_NAME_PATTERN` | `flat` / `{artist} - {title}` |
 | 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 分别为 `true` / `false` |
 | 每日 / 热门推荐 | `FNMUSIC_RECOMMEND_DAILY` / `FNMUSIC_RECOMMEND_HOT` | 均为 `true` |
-| 公共 / 网易账号 / 网易常驻歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` / `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 均为 `false` |
+| 公共 / 全用户同步 / 网易账号 / 网易常驻歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` / `FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL` / `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 均为 `false` |
 | 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | `false` |
 | 大模型连接 | `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL` | 只填连接不会启用用途 |
 | 大模型用途 | `FNMUSIC_LLM_DAILY_ENABLED` / `FNMUSIC_LLM_LIKED_ENABLED` | 均为 `false`，独立开启 |

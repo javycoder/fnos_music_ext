@@ -183,20 +183,33 @@ def parse_user_selections(raw: object) -> dict[str, list[dict]]:
 
 
 def user_selections(conf: dict) -> dict[str, list[dict]]:
+    if conf.get("public_playlists_sync_all"):
+        return {"__shared__": shared_selection(conf)}
     mapping = parse_user_selections(conf.get("public_playlists_by_user"))
     if str(conf.get("public_playlists_by_user") or "").strip():
         return mapping
-    legacy = configured_selection(conf)
-    return {"__legacy__": legacy} if legacy else {}
+    return {}
+
+
+def shared_selection(conf: dict) -> list[dict]:
+    raw = str(conf.get("public_playlists_selection") or "").strip()
+    return parse_selection(raw or "[]", conf)
 
 
 def configured_selection(conf: dict, user_guid: str | None = None) -> list[dict]:
     if not conf.get("public_playlists_enabled"):
         return []
-    if user_guid is None:
-        return parse_selection(conf.get("public_playlists_selection"), conf)
-    mapping = parse_user_selections(conf.get("public_playlists_by_user"))
-    return mapping.get(str(user_guid), [])
+    if user_guid is not None:
+        guid = str(user_guid).strip()
+        if not guid or guid == "shared":
+            return []
+        if conf.get("public_playlists_sync_all"):
+            return shared_selection(conf)
+        mapping = parse_user_selections(conf.get("public_playlists_by_user"))
+        return mapping.get(guid, [])
+    if conf.get("public_playlists_sync_all"):
+        return shared_selection(conf)
+    return parse_selection(conf.get("public_playlists_selection"), conf)
 
 
 def all_configured_selections(conf: dict) -> list[dict]:

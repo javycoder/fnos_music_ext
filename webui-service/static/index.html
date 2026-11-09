@@ -277,6 +277,7 @@
           <label class="switch-row"><span>显示「每日推荐」<span class="sub">每日更新，可由网易原生、AI 或本地曲库生成</span></span><input type="checkbox" id="recommend-daily"></label>
           <label class="switch-row"><span>启用「精选公共歌单」<span class="sub">订阅各平台官方榜单与分类歌单，可按飞牛音乐用户分别配置</span></span><input type="checkbox" id="public-playlists-enabled"></label>
           <div id="public-users-panel" class="stack" hidden>
+            <label class="switch-row"><span>同步全部用户<span class="sub">勾选后所有用户共用同一份歌单，个人配置会独立保留</span></span><input type="checkbox" id="public-playlists-sync-all" disabled></label>
             <div class="btn-row">
               <select class="input grow" id="public-user" aria-label="配置公共歌单的飞牛音乐用户" disabled>
                 <option value="">请先选择飞牛音乐用户</option>
@@ -721,7 +722,7 @@
   </template>
   <template data-help-id="recommend">
     <p>热门榜单与每日推荐是两个独立歌单，可分别开关。</p>
-    <p><b>精选公共歌单</b>开启后，可按飞牛音乐用户分别勾选网易/洛雪的官方榜单与分类歌单，作为只读歌单展示（单个歌单最多载入前 1,000 首）。musicdl 没有统一的歌单发现接口。</p>
+    <p><b>精选公共歌单</b>开启后，可按飞牛音乐用户分别勾选网易/洛雪的官方榜单与分类歌单，作为只读歌单展示（单个歌单最多载入前 1,000 首）。勾选“同步全部用户”后，所有用户共用“全部用户”歌单；取消后恢复各用户自己的历史配置。两套配置独立保存，切换后需保存生效。musicdl 没有统一的歌单发现接口。</p>
   </template>
   <template data-help-id="search">
     <p><b>自动深分页：</b>首屏有效结果不够填满列表时，自动向后翻页补齐。本地曲库歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>

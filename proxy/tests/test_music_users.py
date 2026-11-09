@@ -61,6 +61,53 @@ def test_migration_retry_idempotence_and_new_user_empty(tmp_path, monkeypatch):
     assert not public.selection_allows(conf, "", SELECTION[0])
 
 
+def test_sync_all_uses_shared_selection_for_every_authenticated_user():
+    shared = [
+        {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"},
+        {"provider": "lx", "source": "kg", "kind": "playlist", "id": "200"},
+    ]
+    personal = [SELECTION[0]]
+    conf = {
+        "public_playlists_enabled": True,
+        "public_playlists_sync_all": True,
+        "public_playlists_selection": json.dumps(shared),
+        "public_playlists_by_user": json.dumps({"a": personal}),
+    }
+    assert public.configured_selection(conf, "a") == shared
+    assert public.configured_selection(conf, "new") == shared
+    assert public.configured_selection(conf) == shared
+    assert public.user_selections(conf) == {"__shared__": shared}
+    assert public.selection_allows(conf, "new", shared[0])
+    assert not public.selection_allows(conf, "", shared[0])
+    assert not public.selection_allows(conf, "shared", shared[0])
+
+
+def test_personal_mode_does_not_fall_back_to_shared_selection():
+    personal = [SELECTION[0]]
+    conf = {
+        "public_playlists_enabled": True,
+        "public_playlists_sync_all": False,
+        "public_playlists_selection": json.dumps([{**SELECTION[0], "id": "shared"}]),
+        "public_playlists_by_user": json.dumps({"a": personal}),
+    }
+    assert public.configured_selection(conf, "a") == personal
+    assert public.configured_selection(conf, "new") == []
+    assert public.user_selections(conf) == {"a": personal}
+    assert not public.selection_allows(conf, "new", SELECTION[0])
+
+
+def test_shared_mode_missing_or_explicit_empty_selection_stays_empty():
+    conf = {
+        "public_playlists_enabled": True,
+        "public_playlists_sync_all": True,
+        "public_playlists_selection": "",
+        "public_playlists_by_user": json.dumps({"a": SELECTION}),
+    }
+    assert public.configured_selection(conf, "a") == []
+    conf["public_playlists_selection"] = "[]"
+    assert public.configured_selection(conf, "a") == []
+
+
 def test_private_guid_uses_whole_identity_and_rejects_foreign():
     a, b = "same-prefix-123456-A", "same-prefix-123456-B"
     for kind in ("daily", "liked"):
@@ -84,6 +131,27 @@ def test_failed_migration_write_keeps_legacy_for_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(music, "write_env_atomic", writer)
     music.migrate_public_playlist_users([{"guid": "a"}])
     assert json.loads(dict(parse_env_file(path)[0])["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": []}
+
+
+def test_sync_all_key_prevents_legacy_copy_without_user_database(tmp_path, monkeypatch):
+    path = tmp_path / ".env"
+    path.write_text(
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='" + json.dumps(SELECTION) + "'\n"
+        "CUSTOM='keep'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(music, "_env_watch_path", lambda: str(path))
+    monkeypatch.setattr(
+        music,
+        "list_music_users",
+        lambda: (_ for _ in ()).throw(AssertionError("new mode must not query users")),
+    )
+    music.migrate_public_playlist_users()
+    values = dict(parse_env_file(path)[0])
+    assert values["CUSTOM"] == "keep"
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] == json.dumps(SELECTION)
+    assert json.loads(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {}
 
 
 def test_legacy_short_identity_cache_is_rebuilt(tmp_path, monkeypatch):

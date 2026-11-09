@@ -276,6 +276,31 @@ def test_entrypoint_public_resident_considers_every_user(entrypoint_env, mapping
     assert entrypoint_env(env_text) == ["start musicdl"] + (["start musicbox"] if needs_musicbox else [])
 
 
+@pytest.mark.parametrize("sync_all,selection,personal,needs_musicbox", [
+    (True, [{"provider": "musicbox", "source": "netease",
+             "kind": "chart", "id": "100"}], [], True),
+    (True, [], [{"provider": "musicbox", "source": "netease",
+                 "kind": "chart", "id": "200"}], False),
+    (False, [{"provider": "musicbox", "source": "netease",
+              "kind": "chart", "id": "100"}],
+     [{"provider": "musicbox", "source": "netease",
+       "kind": "chart", "id": "200"}], True),
+    (False, [{"provider": "musicbox", "source": "netease",
+              "kind": "chart", "id": "100"}], [], False),
+])
+def test_entrypoint_public_resident_follows_active_mode(
+        entrypoint_env, sync_all, selection, personal, needs_musicbox):
+    import json
+    by_user = json.dumps({"a": personal})
+    env_text = ("FNMUSIC_MUSICDL_ENABLED=true\n"
+                "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
+                "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED=true\n"
+                f"FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL={'true' if sync_all else 'false'}\n"
+                f"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='{json.dumps(selection)}'\n"
+                f"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{by_user}'\n")
+    assert entrypoint_env(env_text) == ["start musicdl"] + (["start musicbox"] if needs_musicbox else [])
+
+
 def test_entrypoint_resident_requires_my_playlists_flag(entrypoint_env, tmp_path):
     """常驻为账号歌单供数：账号歌单开关未开时不空跑 musicbox。"""
     _seed_musicbox_cookie(tmp_path)

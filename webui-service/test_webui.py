@@ -73,6 +73,70 @@ def test_invalid_public_user_mapping(value):
         webui.validate_updates({"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": value})
 
 
+def test_public_selection_rows_only_use_active_mode(env_file):
+    shared = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"}]
+    personal = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "200"}]
+    by_user = json.dumps({"a": personal})
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "true",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": by_user,
+    }) == shared
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "false",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": by_user,
+    }) == personal
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "false",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+    }) == []
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": "[]",
+    }) == []
+
+
+def test_public_sync_all_and_personal_lists_save_atomically(env_file):
+    env_file.write_text(
+        BASE_ENV
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{}'\n",
+        encoding="utf-8",
+    )
+    shared = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"}]
+    personal = [{"provider": "lx", "source": "kg", "kind": "playlist", "id": "200"}]
+    webui.write_env({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "true",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": json.dumps({"a": personal}),
+    })
+    values = webui.read_env()
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL"] == "true"
+    assert json.loads(values["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"]) == shared
+    assert json.loads(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": personal}
+
+
+def test_public_sync_toggle_does_not_rewrite_either_list(env_file):
+    shared = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"}]
+    personal = [{"provider": "lx", "source": "kg", "kind": "playlist", "id": "200"}]
+    shared_raw = json.dumps(shared, ensure_ascii=False)
+    personal_raw = json.dumps({"a": personal}, ensure_ascii=False)
+    env_file.write_text(
+        BASE_ENV
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='{shared_raw}'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{personal_raw}'\n",
+        encoding="utf-8",
+    )
+
+    webui.write_env({"FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "true"})
+
+    values = webui.read_env()
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL"] == "true"
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] == shared_raw
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"] == personal_raw
+
+
 @pytest.fixture(autouse=True)
 def lx_ready_mock(monkeypatch):
     """业务测试仅 mock 就绪；真实恢复行为由 test_lx_ready.py 覆盖。"""
@@ -1800,7 +1864,8 @@ def test_public_playlist_selection_rejects_invalid_payload(env_file, svctl):
 def test_public_playlist_save_contract_strips_display_only_fields():
     """管理页内部可保留展示字段，但写入配置必须只保存稳定身份四字段。"""
     js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
-    needle = "publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))"
+    needle = "publicSelectionPayload(publicSelection)"
+    assert "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL" in js
     assert needle in js
     assert "_name: item.name" in js and "_cover_url: item.cover_url" in js
 
