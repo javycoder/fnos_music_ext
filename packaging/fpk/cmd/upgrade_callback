@@ -18,11 +18,11 @@ fi
 # 升级流程已完整恢复历史 .env 与 sources-data 数据；
 # 无需传递推导的 --sources 与单值 --lx-source-url，由 install.sh 自动从 .env
 # 继承音源与完整多源列表；仅在洛雪源时透传 --lx-skip-verify 防止源临时故障卡死升级。
-SOURCES="$(fnmusic_saved_source)"
-
 ARGS=(--non-interactive --webui --extend --adopt)
-if [ "${SOURCES}" = "lxmusic" ]; then
+if fnmusic_env_source FNMUSIC_LX_ENABLED; then
     ARGS+=(--lx-skip-verify)
+elif [ "$?" -ne 1 ]; then
+    fnmusic_fail "读取现有配置失败，无法确定原音乐源（数据备份保留在 ${BACKUP_DIR}）"
 fi
 
 cd "${FNMUSIC_REPO_DIR}"

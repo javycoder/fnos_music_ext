@@ -17,6 +17,7 @@ systemctl/docker/tar/readlink）用 PATH 桩替代，验证各钩子的可观测
 """
 
 import os
+import json
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CMD_SRC = REPO_ROOT / "packaging" / "fpk" / "cmd"
 BASH = shutil.which("bash")
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from proxy.env_merge import parse_env_file, render_env
 
 # 沙箱 PATH 需要的真实工具白名单（cmd 脚本内部使用；docker/systemctl/readlink
 # 按测试意图用桩覆盖，tar 在需要验证备份内容时用真 tar、需要故障注入时用桩覆盖）
@@ -114,11 +119,19 @@ esac
 
     # ---- 布局辅助 -------------------------------------------------------
     def make_repo(self, env_text: str | None = None, stub: str = INSTALLER_STUB,
-                  with_restore: bool = False, with_compose: bool = False) -> Path:
+                  with_restore: bool = False, with_compose: bool = False,
+                  with_env_merge: bool = True) -> Path:
         repo = self.appdest / "repo"
         repo.mkdir(parents=True, exist_ok=True)
         (repo / "install.sh").write_text(stub, encoding="utf-8")
         (repo / "install.sh").chmod(0o755)
+        if with_env_merge:
+            proxy_dir = repo / "proxy"
+            proxy_dir.mkdir(exist_ok=True)
+            for rel in ("__init__.py", "env_merge.py"):
+                src = REPO_ROOT / "proxy" / rel
+                if src.is_file():
+                    shutil.copy2(src, proxy_dir / rel)
         if env_text is not None:
             (repo / ".env").write_text(env_text, encoding="utf-8")
         if with_restore:
@@ -250,6 +263,114 @@ def test_common_saved_lx_url(sb):
     out = sb.bash(script)
     assert out.returncode == 0, out.stderr
     assert out.stdout == "http://quoted/z.js"
+
+
+def test_common_saved_source_quotes_and_formats(sb, tmp_path):
+    """覆盖真实 .env 引号、空白、export、重复键、大小写真值与非真值，且绝不执行命令替换。"""
+    marker = tmp_path / "cmd-subst-ran"
+    cases = [
+        (render_env([("FNMUSIC_NETEASE_ENABLED", "true")], "test"), "musicbox"),
+        (render_env([("FNMUSIC_LX_ENABLED", "true")], "test"), "lxmusic"),
+        (render_env([("FNMUSIC_MUSICDL_ENABLED", "true")], "test"), "musicdl"),
+        ('FNMUSIC_LX_ENABLED="TRUE"\n', "lxmusic"),
+        ("FNMUSIC_NETEASE_ENABLED=true\n", "musicbox"),
+        ("  export  FNMUSIC_LX_ENABLED =  ' Yes '  \n", "lxmusic"),
+        ("FNMUSIC_MUSICDL_ENABLED='1'\n", "musicdl"),
+        ('FNMUSIC_LX_ENABLED="on"\n', "lxmusic"),
+        # 重复键以最后一次赋值为准
+        (
+            "FNMUSIC_LX_ENABLED='true'\n"
+            "FNMUSIC_LX_ENABLED='false'\n"
+            "FNMUSIC_MUSICDL_ENABLED='true'\n",
+            "musicdl",
+        ),
+        # 非真值与恶意文本不得误判为启用或被执行
+        ("FNMUSIC_LX_ENABLED='true-invalid'\n", ""),
+        ("FNMUSIC_LX_ENABLED='false'\nFNMUSIC_NETEASE_ENABLED='0'\nFNMUSIC_MUSICDL_ENABLED='off'\n", ""),
+        ("FNMUSIC_LX_ENABLED='no'\n", ""),
+        ("FNMUSIC_LX_ENABLED=''\n", ""),
+        (f"FNMUSIC_LX_ENABLED='$(touch {marker})'\n", ""),
+    ]
+    script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
+              'printf \'%s\' "$(fnmusic_saved_source)"\n')
+    for env_text, expected in cases:
+        sb.make_repo(env_text=env_text)
+        out = sb.bash(script)
+        assert out.returncode == 0, (env_text, out.stderr)
+        assert out.stdout == expected, (env_text, out.stdout)
+        shutil.rmtree(sb.appdest / "repo")
+    assert not marker.exists()
+
+
+def test_common_saved_lx_url_quotes_query_and_safety(sb, tmp_path):
+    """LX_SOURCE_URL 支持单双引号/export/查询参数/空值，且不得执行命令替换。"""
+    marker = tmp_path / "url-subst-ran"
+    special_url = f"https://example.com/lx.js?q=$(touch {marker})&name=a'b#sec"
+    cases = [
+        (render_env([("LX_SOURCE_URL", "https://example.com/lx.js?token=a&v=1#frag")], "test"),
+         "https://example.com/lx.js?token=a&v=1#frag"),
+        ('LX_SOURCE_URL="https://example.com/a.js"\n', "https://example.com/a.js"),
+        ("  export  LX_SOURCE_URL = 'https://example.com/b.js' \n", "https://example.com/b.js"),
+        ("LX_SOURCE_URL='https://old/a.js'\nLX_SOURCE_URL='https://new/b.js'\n", "https://new/b.js"),
+        ("LX_SOURCE_URL=''\n", ""),
+        (render_env([("LX_SOURCE_URL", special_url)], "test"), special_url),
+    ]
+    script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
+              'printf \'%s\' "$(fnmusic_saved_lx_url)"\n')
+    for env_text, expected in cases:
+        sb.make_repo(env_text=env_text)
+        out = sb.bash(script)
+        assert out.returncode == 0, (env_text, out.stderr)
+        assert out.stdout == expected, (env_text, out.stdout)
+        shutil.rmtree(sb.appdest / "repo")
+    assert not marker.exists()
+
+
+def test_common_env_value_missing_vs_read_errors(sb):
+    """区分缺失 .env（正常空值）与已存在 .env 读取/解码/解析器异常（非零且不泄露正文）。"""
+    src_script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
+                  'fnmusic_saved_source\n')
+    url_script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
+                  'fnmusic_saved_lx_url\n')
+
+    # 1) .env 不存在 → 返回 0 且为空
+    repo = sb.make_repo(env_text=None)
+    out = sb.bash(src_script)
+    assert out.returncode == 0 and out.stdout == ""
+    out = sb.bash(url_script)
+    assert out.returncode == 0 and out.stdout == ""
+
+    # 2) 非法 UTF-8 → 必须失败，且不泄露敏感配置内容
+    (repo / ".env").write_bytes(
+        b"FNMUSIC_LX_ENABLED='true'\nFNMUSIC_INTERNAL_TOKEN='secret-do-not-leak'\n\xff\xfe\n"
+    )
+    for cmd_body in (src_script, url_script):
+        out = sb.bash(cmd_body)
+        assert out.returncode != 0
+        assert "secret-do-not-leak" not in out.stdout + out.stderr
+
+    # 3) 缺少 proxy/env_merge.py（即使从 REPO_ROOT 调用也不得误用工作目录模块）
+    shutil.rmtree(repo / "proxy")
+    (repo / ".env").write_text("FNMUSIC_LX_ENABLED='true'\n", encoding="utf-8")
+    out = subprocess.run([BASH, "-c", src_script], env=sb.env(), cwd=REPO_ROOT,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode != 0
+
+    # 4) .env 为目录 / 不可读 → 必须失败
+    shutil.rmtree(sb.appdest / "repo")
+    repo = sb.make_repo(env_text=None)
+    (repo / ".env").mkdir()
+    out = sb.bash(src_script)
+    assert out.returncode != 0
+    (repo / ".env").rmdir()
+    if os.geteuid() != 0:
+        (repo / ".env").write_text("FNMUSIC_LX_ENABLED='true'\n", encoding="utf-8")
+        (repo / ".env").chmod(0o000)
+        try:
+            out = sb.bash(src_script)
+            assert out.returncode != 0
+        finally:
+            (repo / ".env").chmod(0o600)
 
 
 def test_common_data_items_only_existing(sb, tmp_path):
@@ -748,6 +869,169 @@ def test_upgrade_callback_defaults_to_musicdl_when_env_silent(sb):
     result = sb.run("upgrade_callback")
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == ["--non-interactive --webui --extend --adopt"]
+
+
+@pytest.mark.parametrize("provider", ["lxmusic", "musicbox", "musicdl"])
+def test_upgrade_callback_preserves_provider_from_render_env(sb, provider):
+    """issue #129：真实 render_env 写出的单引号配置升级后必须保留原音源与洛雪 URL。"""
+    repo = sb.make_repo(env_text=render_env([("FNMUSIC_MUSICDL_ENABLED", "true")], "stale"))
+    pairs = [
+        ("FNMUSIC_MUSICDL_ENABLED", "true" if provider == "musicdl" else "false"),
+        ("FNMUSIC_NETEASE_ENABLED", "true" if provider == "musicbox" else "false"),
+        ("FNMUSIC_LX_ENABLED", "true" if provider == "lxmusic" else "false"),
+    ]
+    if provider == "lxmusic":
+        pairs.append(("LX_SOURCE_URL", "https://example.com/lx.js?v=2"))
+    _make_backup(sb, repo, render_env(pairs, "saved"))
+    # 模拟升级替换文件后目标目录初始为空配置
+    (repo / ".env").unlink()
+
+    result = sb.run("upgrade_callback")
+    assert result.returncode == 0, result.stderr
+    expected = "--non-interactive --webui --extend --adopt"
+    if provider == "lxmusic":
+        expected += " --lx-skip-verify"
+    assert sb.install_args() == [expected]
+    assert dict(parse_env_file(repo / ".env")[0]) == dict(pairs)
+    assert not (sb.pkgvar / "upgrade-backup").exists()
+
+
+def test_upgrade_callback_lx_url_single_arg_and_no_shell_exec(sb, tmp_path):
+    """洛雪 URL 保存在 .env 而不透传，不得触发 shell 执行。"""
+    marker = tmp_path / "argv-subst-ran"
+    lx_url = f"https://example.com/lx.js?k=1&x=$(touch {marker})"
+    argv_stub = """#!/bin/bash
+python3 -c 'import json, os, sys; open(os.environ["STUB_INSTALL_LOG"], "a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")' "$@"
+"""
+    repo = sb.make_repo(stub=argv_stub)
+    env_text = render_env([
+        ("FNMUSIC_LX_ENABLED", "true"),
+        ("LX_SOURCE_URL", lx_url),
+    ], "saved")
+    _make_backup(sb, repo, env_text)
+    (repo / ".env").unlink()
+
+    result = sb.run("upgrade_callback")
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert [json.loads(line) for line in sb.install_args()] == [[
+        "--non-interactive", "--webui", "--extend", "--adopt", "--lx-skip-verify",
+    ]]
+    assert dict(parse_env_file(repo / ".env")[0])["LX_SOURCE_URL"] == lx_url
+
+
+def test_upgrade_callback_lx_empty_url_skips_url_arg(sb):
+    """FNMUSIC_LX_ENABLED='true' 且 LX_SOURCE_URL='' 时继续升级，不传空 --lx-source-url。"""
+    repo = sb.make_repo()
+    _make_backup(sb, repo, render_env([("FNMUSIC_LX_ENABLED", "true"), ("LX_SOURCE_URL", "")], "saved"))
+    (repo / ".env").unlink()
+
+    result = sb.run("upgrade_callback")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == ["--non-interactive --webui --extend --adopt --lx-skip-verify"]
+
+
+def test_upgrade_callback_aborts_and_keeps_backup_on_env_read_errors(sb):
+    """已存在 .env 读取/解码失败或缺少解析器时必须中止升级、保留备份且不泄露正文。"""
+    repo = sb.make_repo()
+    backup = sb.pkgvar / "upgrade-backup"
+
+    # 1) 非法 UTF-8 .env
+    (repo / ".env").write_bytes(
+        b"FNMUSIC_LX_ENABLED='true'\nFNMUSIC_INTERNAL_TOKEN='secret-token-value'\n\xff\xfe\n"
+    )
+    backup.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["tar", "-czf", str(backup / "data.tar.gz"), "-C", str(repo), ".env"], check=True)
+    (repo / ".env").unlink()
+
+    result = sb.run("upgrade_callback")
+    assert result.returncode == 1
+    assert (backup / "data.tar.gz").is_file()
+    assert sb.install_args() == []
+    popup = (sb.tmp / "trim-log.txt").read_text(encoding="utf-8")
+    assert "读取现有配置失败" in popup
+    assert "secret-token-value" not in result.stderr + popup
+
+    # 2) 缺少解析模块 proxy/env_merge.py（从 REPO_ROOT 启动亦不得误用工作目录模块）
+    shutil.rmtree(backup)
+    _make_backup(sb, repo, render_env([("FNMUSIC_LX_ENABLED", "true")], "saved"))
+    shutil.rmtree(repo / "proxy")
+    result = subprocess.run([str(sb.cmd / "upgrade_callback")], env=sb.env(), cwd=REPO_ROOT,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert (backup / "data.tar.gz").is_file()
+    assert sb.install_args() == []
+
+    # 3) 不可读 .env（非 root 校验 chmod 000）
+    if os.geteuid() != 0:
+        shutil.rmtree(sb.appdest / "repo")
+        shutil.rmtree(backup)
+        repo = sb.make_repo()
+        sb.add_data(repo)
+        backup.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["tar", "-czf", str(backup / "data.tar.gz"), "-C", str(repo), "sources-data"], check=True)
+        (repo / ".env").write_text(render_env([("FNMUSIC_LX_ENABLED", "true")], "saved"), encoding="utf-8")
+        (repo / ".env").chmod(0o000)
+        try:
+            result = subprocess.run([str(sb.cmd / "upgrade_callback")], env=sb.env(),
+                                    capture_output=True, text=True, timeout=60)
+            assert result.returncode == 1
+            assert (backup / "data.tar.gz").is_file()
+            assert sb.install_args() == []
+        finally:
+            (repo / ".env").chmod(0o600)
+
+
+def test_upgrade_roundtrip_preserves_lx_source_across_consecutive_upgrades(sb):
+    """连续两次完整 upgrade_init → 替换目录 → upgrade_callback，均保留洛雪源、URL 与脚本数据。"""
+    install_stub = """#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "${STUB_INSTALL_LOG}"
+python3 - "$@" <<'PY'
+import os, pathlib, sys
+sys.path.insert(0, os.getcwd())
+from proxy.env_merge import parse_env_file, render_env
+assert "--sources" not in sys.argv[1:] and "--lx-source-url" not in sys.argv[1:]
+pairs, _ = parse_env_file(".env")
+pathlib.Path(".env").write_text(render_env(pairs, "stub"), encoding="utf-8")
+PY
+"""
+    repo = sb.make_repo(
+        env_text=render_env([
+            ("FNMUSIC_MUSICDL_ENABLED", "false"),
+            ("FNMUSIC_NETEASE_ENABLED", "true"),
+            ("FNMUSIC_LX_ENABLED", "true"),
+            ("LX_SOURCE_URL", "https://example.com/my-lx.js?v=1"),
+            ("FNMUSIC_INTERNAL_TOKEN", "tok123"),
+        ], "user-choice"),
+        stub=install_stub,
+    )
+    script_file = repo / "sources-data" / "lxmusic" / "uploads" / "custom.js"
+    script_file.parent.mkdir(parents=True)
+    script_file.write_text("// custom lx script", encoding="utf-8")
+    sb.add_systemctl()
+
+    for round_idx in (1, 2):
+        init_res = sb.run("upgrade_init")
+        assert init_res.returncode == 0, (round_idx, init_res.stderr)
+        assert (sb.pkgvar / "upgrade-backup" / "data.tar.gz").is_file()
+
+        # 模拟应用中心升级替换 target/repo：清掉用户数据再重建全新代码负载
+        shutil.rmtree(repo)
+        repo = sb.make_repo(env_text=None, stub=install_stub)
+
+        cb_res = sb.run("upgrade_callback")
+        assert cb_res.returncode == 0, (round_idx, cb_res.stderr)
+        assert not (sb.pkgvar / "upgrade-backup").exists()
+        assert script_file.read_text(encoding="utf-8") == "// custom lx script"
+        saved_env = (repo / ".env").read_text(encoding="utf-8")
+        assert "FNMUSIC_LX_ENABLED='true'" in saved_env
+        assert "FNMUSIC_NETEASE_ENABLED='true'" in saved_env
+        assert "FNMUSIC_MUSICDL_ENABLED='false'" in saved_env
+        assert "LX_SOURCE_URL='https://example.com/my-lx.js?v=1'" in saved_env
+
+    expected_cmd = "--non-interactive --webui --extend --adopt --lx-skip-verify"
+    assert sb.install_args() == [expected_cmd, expected_cmd]
 
 
 # ---------------------------------------------------------- uninstall_init ---

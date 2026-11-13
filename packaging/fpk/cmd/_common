@@ -114,13 +114,49 @@ fnmusic_cleanup_sources_container() {
     docker rm -f fnmusic-sources >/dev/null 2>&1 || true
 }
 
+fnmusic_env_value() {
+    # Read a single key from ${FNMUSIC_REPO_DIR}/.env using proxy/env_merge.py
+    # without sourcing or evaluating .env contents.
+    # Returns 0 when .env is absent or parsed cleanly; non-zero on read/parse error.
+    local key="${1:-}" env_file
+    [ -n "${key}" ] || return 1
+    [ -n "${FNMUSIC_REPO_DIR:-}" ] || return 0
+    env_file="${FNMUSIC_REPO_DIR}/.env"
+    if [ ! -e "${env_file}" ] && [ ! -L "${env_file}" ]; then
+        return 0
+    fi
+    python3 - "${FNMUSIC_REPO_DIR}" "${key}" <<'PY'
+import pathlib
+import sys
+
+repo_dir, target_key = sys.argv[1], sys.argv[2]
+expected = (pathlib.Path(repo_dir) / "proxy" / "env_merge.py").resolve()
+if not expected.is_file():
+    sys.exit(1)
+
+# 剔除调用方工作目录 ""，防止仓库解析模块缺失时误加载外部副本
+sys.path[:] = [repo_dir] + [p for p in sys.path if p != ""]
+try:
+    import proxy.env_merge as env_merge
+    if pathlib.Path(env_merge.__file__).resolve() != expected:
+        sys.exit(1)
+    pairs, _ = env_merge.parse_env_file(pathlib.Path(repo_dir) / ".env", strict=True)
+except Exception:
+    sys.exit(1)
+
+value = dict(pairs).get(target_key, "")
+sys.stdout.buffer.write(value.encode("utf-8"))
+PY
+}
+
 fnmusic_env_source() {
-    # 0 when the selected audio source recorded in .env matches $1.
-    [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
-    local key="$1" val
-    val="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null \
-        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" \
-        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//" | tr '[:upper:]' '[:lower:]')"
+    # 0 when the selected audio source recorded in .env matches $1;
+    # 1 when missing/disabled; 2 when an existing .env cannot be read or parsed.
+    local key="${1:-}" val rc
+    val="$(fnmusic_env_value "${key}")"
+    rc=$?
+    [ "${rc}" -eq 0 ] || return 2
+    val="$(printf '%s' "${val}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
     case "${val}" in
         true|1|yes|on) return 0 ;;
         *) return 1 ;;
@@ -129,17 +165,28 @@ fnmusic_env_source() {
 
 fnmusic_saved_source() {
     # Map the flags written by install.sh back to a --sources value.
-    if fnmusic_env_source FNMUSIC_NETEASE_ENABLED; then echo musicbox
-    elif fnmusic_env_source FNMUSIC_LX_ENABLED; then echo lxmusic
-    elif fnmusic_env_source FNMUSIC_MUSICDL_ENABLED; then echo musicdl
-    else echo ""; fi
+    # Returns non-zero if an existing .env cannot be read or parsed.
+    local rc
+    fnmusic_env_source FNMUSIC_NETEASE_ENABLED
+    rc=$?
+    if [ "${rc}" -eq 0 ]; then echo musicbox; return 0; fi
+    [ "${rc}" -eq 1 ] || return "${rc}"
+
+    fnmusic_env_source FNMUSIC_LX_ENABLED
+    rc=$?
+    if [ "${rc}" -eq 0 ]; then echo lxmusic; return 0; fi
+    [ "${rc}" -eq 1 ] || return "${rc}"
+
+    fnmusic_env_source FNMUSIC_MUSICDL_ENABLED
+    rc=$?
+    if [ "${rc}" -eq 0 ]; then echo musicdl; return 0; fi
+    [ "${rc}" -eq 1 ] || return "${rc}"
+
+    return 0
 }
 
 fnmusic_saved_lx_url() {
-    [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
-    grep -E "^[[:space:]]*(export[[:space:]]+)?LX_SOURCE_URL[[:space:]]*=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null \
-        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?LX_SOURCE_URL[[:space:]]*=[[:space:]]*//" \
-        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//"
+    fnmusic_env_value "LX_SOURCE_URL"
 }
 
 fnmusic_data_items() {
