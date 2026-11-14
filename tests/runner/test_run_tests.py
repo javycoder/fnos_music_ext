@@ -73,6 +73,12 @@ def test_new_proxy_file_is_scheduled_by_default(tmp_path, monkeypatch):
 
 def test_shard_children_get_isolated_state_dirs(tmp_path, monkeypatch, capsys):
     captured = {}
+    monkeypatch.setenv("HOME", "/production/home")
+    monkeypatch.setenv("XDG_DATA_HOME", "/production/data")
+    monkeypatch.setenv("WEBUI_REPO_DIR", "/production/repo")
+    monkeypatch.setenv("SOURCES_DATA_DIR", "/production/sources")
+    monkeypatch.setenv("NETEASE_SESSION_FILE", "/production/session.json")
+    monkeypatch.setenv("NETEASE_COOKIE", "do-not-inherit")
 
     class FakeProcess:
         pid = 0
@@ -91,9 +97,15 @@ def test_shard_children_get_isolated_state_dirs(tmp_path, monkeypatch, capsys):
     assert runner.run_phase({"proxy-1": ("proxy/tests",)}, 1, work, False) == {"proxy-1": 0}
     env = captured["env"]
     # 每个分片独占应用状态，避免并发写同一份注册表/缓存。
-    for key in ("FNMUSIC_HOME", "FNMUSIC_LOG_DIR", "FNMUSIC_ALBUM_REGISTRY",
+    for key in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                "XDG_RUNTIME_DIR", "WEBUI_REPO_DIR", "SOURCES_DATA_DIR", "NETEASE_SESSION_FILE",
+                "FNMUSIC_HOME", "FNMUSIC_LOG_DIR", "FNMUSIC_ALBUM_REGISTRY",
                 "FNMUSIC_CACHE_DIR", "FNMUSIC_LIBRARY_DIR", "FNMUSIC_FAV_DIR"):
         assert env[key].startswith(str(work / "proxy-1")), key
+        if key in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                   "XDG_RUNTIME_DIR", "WEBUI_REPO_DIR", "SOURCES_DATA_DIR"):
+            assert Path(env[key]).is_dir()
+    assert "NETEASE_COOKIE" not in env
     assert any(arg.startswith("--basetemp=") for arg in captured["command"])
     capsys.readouterr()
 
@@ -370,6 +382,14 @@ def test_ci_uses_runner_and_retains_unique_image_checks():
     jobs = ci["jobs"]
     commands = [step.get("run", "") for step in jobs["test"]["steps"]]
     assert "python scripts/run_tests.py --jobs 2 --shards 2 --coverage" in commands
+    install = "npm ci --prefix netease-service --omit=dev --ignore-scripts"
+    assert commands.index(install) < commands.index(
+        "python scripts/run_tests.py --jobs 2 --shards 2 --coverage"
+    )
+    node_checks = next(step["run"] for step in jobs["test"]["steps"]
+                       if step.get("name") == "Node syntax check")
+    assert "node --check netease-service/app.js" in node_checks.splitlines()
+    assert "node --check netease-service/service.js" in node_checks.splitlines()
     assert not any("python -m pytest" in command for command in commands)
     assert "images" not in jobs
     images = jobs["images-multiarch"]

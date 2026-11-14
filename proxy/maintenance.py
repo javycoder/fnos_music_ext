@@ -42,7 +42,7 @@ RECOMMEND = re.compile(r'(daily|hot)-(\d{8})(\.fallback)?\.json\Z')
 PUBLIC = re.compile(r'(summary|tracks)-[0-9a-f]{24}\.json\Z')
 LOG_EXPORT = re.compile(
     r'(?:[0-9]{14}\.logzip|fnmusic-logs-[0-9]{14}-[0-9a-f]{8}\.zip)\Z')
-LOG_ARCHIVE = re.compile(r'(?:proxy|webui|lxmusic|musicbox)\.log\.[0-9]{8}(?:\.[0-9]{8})?\Z')
+LOG_ARCHIVE = re.compile(r'(?:proxy|webui|lxmusic|musicbox|netease)\.log\.[0-9]{8}(?:\.[0-9]{8})?\Z')
 
 
 def _absolute(path):

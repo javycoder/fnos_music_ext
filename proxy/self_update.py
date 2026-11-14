@@ -9,6 +9,7 @@ import dataclasses
 import hashlib
 import http.client
 import json
+import logging
 import os
 import platform
 import re
@@ -16,8 +17,10 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +42,7 @@ DEFAULT_GITEE_REPO = "javycoder/fnos_music_ext"
 DAEMON_SOCKET = "/var/run/com.trim.app.center.sock"
 FALLBACK_FAIL_MESSAGE = "下载失败，请到 GitHub 下载最新版本。"
 GITHUB_RELEASE_PAGE = "https://github.com/javycoder/fnos_music_ext/releases"
+logger = logging.getLogger(__name__)
 
 DATA_BACKUP_ITEMS = (
     ".env",
@@ -58,6 +62,7 @@ DATA_BACKUP_ITEMS = (
 _TARGET_CACHE: dict[str, TargetSnapshot] = {}
 _ACTIVE_JOB: UpdateJob | None = None
 _JOB_HISTORY: list[dict[str, Any]] = []
+_UPDATE_LOCK = threading.Lock()
 
 
 @dataclasses.dataclass
@@ -230,16 +235,20 @@ def resolve_target(
     github_asset = select_release_assets(github_norm, target_arch) if github_norm else None
 
     candidates: list[dict[str, Any]] = []
-    if gitee_asset:
+    if gitee_asset and gitee_asset["formal_base"] == base:
         candidates.append(gitee_asset)
-    if github_asset:
+    if github_asset and github_asset["formal_base"] == base:
         candidates.append(github_asset)
 
     if not candidates:
         return None
 
-    # Verify candidate consistency (same install_version and architecture)
     primary = candidates[0]
+    candidates = [
+        candidate for candidate in candidates
+        if candidate["install_version"] == primary["install_version"]
+        and candidate["asset_name"] == primary["asset_name"]
+    ]
     install_ver = primary["install_version"]
     asset_name = primary["asset_name"]
 
@@ -327,10 +336,10 @@ def _download_and_verify(
             part_path.unlink()
         return False, f"下载网络异常: {exc}"
 
-    if expected_size and downloaded != expected_size:
+    if (expected_size and downloaded != expected_size) or (total_size and downloaded != total_size):
         if part_path.exists():
             part_path.unlink()
-        return False, f"文件大小不符（期望 {expected_size}，实际 {downloaded}）"
+        return False, f"文件大小不符（期望 {expected_size or total_size}，实际 {downloaded}）"
 
     computed_sha = hasher.hexdigest().lower()
 
@@ -351,7 +360,11 @@ def _download_and_verify(
         except Exception:
             pass
 
-    if expected_sha256 and computed_sha != expected_sha256.lower():
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256 or ""):
+        if part_path.exists():
+            part_path.unlink()
+        return False, "缺少有效的 SHA256 校验和"
+    if computed_sha != expected_sha256.lower():
         if part_path.exists():
             part_path.unlink()
         return False, f"SHA256 校验和不匹配（计算值 {computed_sha}）"
@@ -374,10 +387,8 @@ def create_data_backup(dest_tar: Path, repo_dir: Path | None = None) -> bool:
                         try:
                             tar.add(str(path), arcname=str(rel))
                         except Exception as e:
-                            # Critical config (.env) failure must abort backup
-                            if path.name == ".env" or path.name.startswith(".env.bak"):
-                                logger.error("Failed to backup critical config %s: %s", path, e)
-                                return False
+                            logger.error("Failed to backup %s: %s", path, e)
+                            return False
     except Exception as e:
         logger.error("Failed to create data backup archive %s: %s", dest_tar, e)
         return False
@@ -507,7 +518,7 @@ class NativeAppCenterClient:
         for app in apps:
             if isinstance(app, dict) and app.get("appName") == app_name:
                 cur_ver = str(app.get("version") or "")
-                if cur_ver == expected_version or cur_ver.split("-")[0] == expected_version.split("-")[0]:
+                if cur_ver == expected_version:
                     return True, cur_ver
                 return False, f"版本不一致（当前 {cur_ver}，期望 {expected_version}）"
         return False, f"已安装列表中未找到 {app_name}"
@@ -575,13 +586,13 @@ def execute_job(job_dir: Path) -> int:
         _save_job_state(job_dir, job)
         return 3
 
-    # If daemon socket is missing (e.g. offline test environment), complete up to download/verification
     if not os.path.exists(DAEMON_SOCKET):
-        job.status = "completed"
-        job.phase = "done"
-        job.message = "FPK 已下载并校验成功（非宿主环境，未提交原生安装）"
+        job.status = "failed"
+        job.phase = "installing"
+        job.error_code = "DAEMON_UNAVAILABLE"
+        job.message = "FPK 已下载并校验，但应用中心不可用，未安装更新"
         _save_job_state(job_dir, job)
-        return 0
+        return 5
 
     client = NativeAppCenterClient(DAEMON_SOCKET)
     try:
@@ -592,6 +603,8 @@ def execute_job(job_dir: Path) -> int:
         staged_ver = staged.get("version")
         if staged_app != "fnmusic-ext":
             raise RuntimeError(f"安装包应用名不匹配: {staged_app}")
+        if staged_ver != snap.install_version:
+            raise RuntimeError(f"安装包版本不匹配: {staged_ver}（期望 {snap.install_version}）")
 
         job.phase = "installing"
         _save_job_state(job_dir, job)
@@ -635,14 +648,20 @@ def execute_job(job_dir: Path) -> int:
 
 def start_update_job(target_id: str) -> tuple[int, dict[str, Any]]:
     """Create and start a new background update job from a valid target snapshot."""
+    with _UPDATE_LOCK:
+        return _start_update_job_locked(target_id)
+
+
+def _start_update_job_locked(target_id: str) -> tuple[int, dict[str, Any]]:
     global _ACTIVE_JOB
     snap = get_target_snapshot(target_id)
     if not snap:
         return 409, {"ok": False, "error": "目标版本快照不存在或已过期，请重新检查更新"}
 
-    if _ACTIVE_JOB and _ACTIVE_JOB.status in ("queued", "running"):
-        if _ACTIVE_JOB.target_id == target_id:
-            return 202, {"ok": True, "job": _ACTIVE_JOB.to_dict()}
+    active_job = get_active_job()
+    if active_job and active_job.status in ("queued", "running"):
+        if active_job.target_id == target_id:
+            return 202, {"ok": True, "job": active_job.to_dict()}
         return 409, {"ok": False, "error": "已有其他更新任务正在执行中"}
 
     job_id = secrets.token_hex(16)
@@ -667,7 +686,7 @@ def start_update_job(target_id: str) -> tuple[int, dict[str, Any]]:
 
     base_dir = get_job_base_dir()
     job_dir = base_dir / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     (job_dir / "target.json").write_text(json.dumps(snap.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     _save_job_state(job_dir, job)
@@ -675,7 +694,7 @@ def start_update_job(target_id: str) -> tuple[int, dict[str, Any]]:
 
     # Launch worker
     worker_cmd = [
-        "python3",
+        sys.executable,
         "-c",
         "import sys; from proxy.self_update import execute_job; from pathlib import Path; sys.exit(execute_job(Path(sys.argv[1])))",
         str(job_dir),
@@ -684,11 +703,21 @@ def start_update_job(target_id: str) -> tuple[int, dict[str, Any]]:
     # On Linux with systemd, use systemd-run for independence from main unit lifecycle
     if shutil.which("systemd-run") and os.name != "nt" and os.getuid() == 0:
         unit_name = f"fnmusic-ext-update-{job_id[:8]}"
-        cmd = ["systemd-run", f"--unit={unit_name}", "--description=fnmusic-ext-update-worker", "--"] + worker_cmd
+        work_dir = str(Path(__file__).resolve().parent.parent)
+        cmd = [
+            "systemd-run", f"--unit={unit_name}", "--description=fnmusic-ext-update-worker",
+            f"--working-directory={work_dir}", "--",
+        ] + worker_cmd
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return 202, {"ok": True, "job": job.to_dict()}
-        except Exception:
+            started = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            if started.returncode == 0:
+                return 202, {"ok": True, "job": job.to_dict()}
+        except subprocess.TimeoutExpired:
+            return 503, {
+                "ok": False,
+                "error": "启动升级工作进程超时；为避免重复安装，请先核对任务和应用中心状态",
+            }
+        except OSError:
             pass
 
     # Detached subprocess fallback
@@ -698,6 +727,8 @@ def start_update_job(target_id: str) -> tuple[int, dict[str, Any]]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=(os.name != "nt"),
+            cwd=str(Path(__file__).resolve().parent.parent),
+            start_new_session=(os.name == "posix"),
         )
     except Exception as exc:
         job.status = "failed"

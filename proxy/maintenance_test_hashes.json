@@ -162,7 +162,8 @@
     "f51e8a5630436f2ac04873695f4a5d67dd237a163a06ac7c89c401e2e53f86a0"
   ],
   "proxy/tests/test_issue56.py": [
-    "2b9b89fedba1c30cbc130a6e4203241bfd49f3f74c1f8e0c3fa50c8099bbb3aa"
+    "2b9b89fedba1c30cbc130a6e4203241bfd49f3f74c1f8e0c3fa50c8099bbb3aa",
+    "7131f72e3a060723c228e21dd84b9bd0f37ecacbe15526b83a577cb902d38680"
   ],
   "proxy/tests/test_local_cover.py": [
     "2477965da010fecaf804668af25b4200c6ccc3085eaec4adc0ae21e770f9dd5f"
@@ -193,6 +194,7 @@
     "d326184acdf96820af042ca1be98b918b10d64bab90cc7c2bb617d1c0d5202fc"
   ],
   "proxy/tests/test_merge.py": [
+    "cfd42b01ce5ea7aca0d0af982455c6de9ae706570c26595568d0fe6538d02cc4",
     "08c1e11e73d820ba54fb2bdc3b3e10b26ab46f3f35b125b98ebad963209bc8a1",
     "182b735ce34f48150b44d143a229ade81f745a8de77e2ae8b485c6350399e3fc",
     "2971c2764baee29b20748aa4e5e6ddd36c4791b9086e4f08848b331c93cdbc12",
@@ -205,15 +207,6 @@
   "proxy/tests/test_multidir_guard.py": [
     "323056a0df8b6e6be443fe77fe8aeef369592f5f1ea7f25e517be6fde2dcef0d",
     "76edb4adccaf33604818fadd762a23affcf86a44d2f056d0c1bcc07d48fadf33"
-  ],
-  "proxy/tests/test_musicbox_service.py": [
-    "340aabf07a7a10bab22799fa5e327dff09c94e47ff6d4ef4aad74adb556cbe08",
-    "4a93f91bfdf518ca830eb76c4d246eac2607f7ee9a321f704d85d5d5a71cf954",
-    "83d2a2ecec464bd077428af31afeba462169ce9a79e2de7b02576f3d34e29f39",
-    "a6e3f3d961121ea705dc64adeb4d9e0253fd5398d90fd85feb29e8a0a505349e",
-    "ab6bb5243d64a866e06a8b8985f8ae5067bf88b7ecd1d14960ae24c01b5cc99a",
-    "aee08a5039cfaebd1ac5f65aa2fd5e11e79d1ce274eae094b49dbef4a53f79ec",
-    "c411ce81d81e34424fa1246b81e35b79c5085ad2e58d8c5c720cb2a68fc718db"
   ],
   "proxy/tests/test_native_deploy.py": [
     "423dc12197a50f8df0c51c6f7f527c3afe3a1c8510ddb68515307dddcd9463bb",

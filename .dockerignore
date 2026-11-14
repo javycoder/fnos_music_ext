@@ -1,7 +1,8 @@
 # 统一镜像构建上下文：只送四个服务目录 + container/，仓库其余内容（数据/缓存/密钥）不进镜像
 *
 !musicdl-service/
-!musicbox-service/
+!netease-service/
+netease-service/node_modules/
 !lxmusic-service/
 !webui-service/
 !container/
@@ -14,6 +15,7 @@ proxy/*
 !proxy/direct_play.py
 !proxy/env_merge.py
 !proxy/fnlog.py
+!proxy/netease_legacy.py
 !proxy/publicplaylists.py
 !proxy/version.py
 !proxy/llm_usage.py

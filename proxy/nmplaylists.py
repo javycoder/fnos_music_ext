@@ -383,7 +383,7 @@ async def _fetch_tracks(client: httpx.AsyncClient, playlist_id: int, build_track
     for row in data.get("data") or []:
         if not isinstance(row, dict):
             continue
-        candidate = dailyrec._musicbox_recommend_item(row)
+        candidate = dailyrec._netease_recommend_item(row)
         if not candidate.get("id"):
             continue
         try:

@@ -2,7 +2,7 @@
 
 覆盖：
 1. Python 探测优先级（显式配置 → fnOS python312 → 系统 Python），最低 3.11，检查 venv/ensurepip/ssl/sqlite3
-2. Node 探测优先级（显式配置 → fnOS nodejs_v22 → 系统 Node），最低 20
+2. Node 探测优先级（显式配置 → fnOS nodejs_v22 → 系统 Node），最低 22.13.0
 3. ffmpeg/ffprobe 探测与 trim 核心组件识别
 4. 原生配置 @SOURCES_PATH@ 完整渲染与精简 PATH 运行
 5. 依赖指纹状态文件校验（deps_state_valid / deps_write_state），未变跳过，变化/缺失/强制刷新触发重装
@@ -116,7 +116,7 @@ def test_node_explicit_override_valid(tmp_path):
     stub_node = tmp_path / "custom-node"
     stub_node.write_text("""#!/bin/sh
 if [ "$1" = "-p" ]; then
-    echo "22"
+    echo "22.18.0"
     exit 0
 fi
 echo "v22.18.0"
@@ -136,14 +136,14 @@ exit 0
     assert "SOURCE=explicit" in res.stdout
 
 
-def test_node_explicit_override_below_20_rejected(tmp_path):
+def test_node_explicit_override_below_22_13_rejected(tmp_path):
     old_node = tmp_path / "old-node"
     old_node.write_text("""#!/bin/sh
 if [ "$1" = "-p" ]; then
-    echo "18"
+    echo "22.12.0"
     exit 0
 fi
-echo "v18.0.0"
+echo "v22.12.0"
 exit 0
 """)
     old_node.chmod(0o755)
@@ -161,7 +161,7 @@ def test_node_fnos_candidate_preferred(tmp_path):
     fake_node_dir.mkdir(parents=True)
     fake_node = fake_node_dir / "node"
     fake_node.write_text("""#!/bin/sh
-if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+if [ "$1" = "-p" ]; then echo "22.18.0"; exit 0; fi
 echo "v22.18.0"; exit 0
 """)
     fake_node.chmod(0o755)
@@ -216,7 +216,7 @@ def test_native_config_sources_path_rendering(tmp_path):
     node_bin = tmp_path / "opt/node/bin/node"
     node_bin.parent.mkdir(parents=True)
     node_bin.write_text("""#!/bin/sh
-if [ "$1" = "-p" ]; then echo 20; exit 0; fi
+if [ "$1" = "-p" ]; then echo 22.18.0; exit 0; fi
 exit 0
 """)
     node_bin.chmod(0o755)

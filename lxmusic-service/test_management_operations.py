@@ -1,11 +1,10 @@
-"""Issue #96 管理互斥与校验恢复回归；仅模拟 HTTP，不执行源脚本。"""
+"""Issue #96 管理互斥与校验恢复回归；仅模拟源进程，不执行源脚本。"""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
 import json
-import sys
 from types import SimpleNamespace
 
 import httpx
@@ -254,246 +253,181 @@ def test_source_list_invalid_success_payload_is_not_empty_config(payload):
 
 
 @pytest.fixture
-def verification(monkeypatch, tmp_path):
-    """全链路使用真实客户端 + 内存 HTTP transport，脚本内容绝不执行。"""
+def verification(monkeypatch, fake_lx, source_runtime_stub):
+    """真实 verify_url + 替身元数据客户端、替身独立运行时。"""
+    import app as lx_app
     import verify_source
 
-    state = SimpleNamespace(
-        reused=False, enabled=False, toggle_failure=False, cleanup_failure=False,
-        cleanup_hangs=False, close_hangs=False, calls=[], sources=[],
-        search_entered=None, search_release=None, cleanup_entered=None,
-        cleanup_release=None, client=None, closed=False,
-    )
-
-    async def handler(request):
-        path = request.url.path
-        body = json.loads(request.content) if request.content else {}
-        state.calls.append((path, body))
-        if path.endswith("/upload"):
-            if state.reused:
-                return httpx.Response(500, json={"error": '源 "X" 已存在'})
-            return httpx.Response(200, json={"success": True, "id": "created"})
-        if path.endswith("/list"):
-            target_id = "existing" if state.reused else "created"
-            # 故意把同名其他源放在前面，上传成功只能按创建 ID 选中。
-            state.sources = [
-                {"id": "other", "name": "X", "enabled": True, "supportedSources": ["kg"]},
-                {"id": target_id, "name": "X", "enabled": state.enabled,
-                 "supportedSources": ["kw"]},
-            ] if not state.reused else [
-                {"id": target_id, "name": "X", "enabled": state.enabled,
-                 "supportedSources": ["kw"]},
-                {"id": "other", "name": "Other", "enabled": True},
-            ]
-            return httpx.Response(200, json=state.sources)
-        if path.endswith("/toggle"):
-            if body["enabled"] and state.toggle_failure:
-                return httpx.Response(500, json={"error": "enable failed"})
-            if not body["enabled"] and state.cleanup_failure:
-                raise httpx.ConnectError("restore offline", request=request)
-            if not body["enabled"] and state.cleanup_hangs:
-                state.cleanup_entered.set()
-                await state.cleanup_release.wait()
-            return httpx.Response(200, json={"success": True})
-        if path.endswith("/delete"):
-            if state.cleanup_failure:
-                raise httpx.ConnectError("delete offline", request=request)
-            if state.cleanup_hangs:
-                state.cleanup_entered.set()
-                await state.cleanup_release.wait()
-            return httpx.Response(200, json={"success": True})
-        if path == "/api/music/search":
-            if state.search_entered is not None:
-                state.search_entered.set()
-                await state.search_release.wait()
-            return httpx.Response(200, json=[])
-        raise AssertionError(path)
-
-    def factory(**kwargs):
-        client = LxServerClient(**kwargs)
-        client._client = httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), base_url=client.base_url,
-        )
-        original_close = client.close
-
-        async def close():
-            state.closed = True
-            if state.close_hangs:
-                await asyncio.Event().wait()
-            await original_close()
-
-        client.close = close
-        state.client = client
-        return client
-
-    async def download(url):
+    async def download(_url):
         return "/*! @name X */ /* inert fixture: never executed */"
 
-    async def no_wait(*args):
-        pass
+    async def probe(_client, url, *_args, **_kwargs):
+        return True, url, "audio/mpeg", 1024
 
-    monkeypatch.setattr(verify_source, "_new_temp_client", factory)
+    monkeypatch.setattr(verify_source, "_new_temp_client", lambda **_kwargs: fake_lx)
+    monkeypatch.setattr(
+        verify_source, "_new_temp_manager", lambda *_args, **_kwargs: source_runtime_stub
+    )
     monkeypatch.setattr(verify_source, "download_script", download)
-    monkeypatch.setattr(verify_source.asyncio, "sleep", no_wait)
-    # 已有源复用必须以实际存储内容为证据，不能只凭同名列表项。
-    root = tmp_path / "users" / "source" / "_open"
-    root.mkdir(parents=True)
-    (root / "existing").write_text("/*! @name X */ /* inert fixture: never executed */", encoding="utf-8")
-    # verify 只会在解析成功后使用探活客户端；当前 fixture 在搜索即返回空列表。
-    monkeypatch.setitem(sys.modules, "app", SimpleNamespace(
-        app=object(), get_http=lambda app: None, LXSERVER_DATA_DIR=str(tmp_path)))
-    return verify_source, state
+    monkeypatch.setattr(lx_app, "probe_url", probe)
+    return verify_source, fake_lx, source_runtime_stub
 
 
-def test_verify_created_id_only_is_deleted_and_same_name_is_not_reused(verification):
-    module, state = verification
-    report = asyncio.run(module.verify_url("https://example.test/inert.js", keywords=["test"]))
+def test_verify_uses_dedicated_manager_and_closes_it(verification):
+    module, metadata, manager = verification
+    report = asyncio.run(
+        module.verify_url("https://example.test/inert.js", keywords=["test"])
+    )
+    assert report["ok"] is True
     assert report["declared_platforms"] == ["kw"]
-    assert state.closed
-    assert [(path, body) for path, body in state.calls if path.endswith("/delete")] == [
-        ("/api/custom-source/delete", {"id": "created"}),
-    ]
-    assert [body for path, body in state.calls if path.endswith("/toggle")] == [
-        {"id": "created", "enabled": True},
-    ]
+    assert len(manager.upload_calls) == 1
+    assert manager.toggle_calls == [("temp.js", True)]
+    assert manager.close_calls == 1
+    assert metadata.upload_calls == []
+    assert metadata.toggle_calls == []
+    assert metadata.deleted_ids == []
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_verify_reused_source_only_restores_its_own_state(verification, enabled):
-    module, state = verification
-    state.reused, state.enabled = True, enabled
-    asyncio.run(module.verify_url("https://example.test/inert.js", keywords=["test"]))
-    assert not [path for path, body in state.calls if path.endswith("/delete")]
-    assert [body for path, body in state.calls if path.endswith("/toggle")] == ([] if enabled else [
-        {"id": "existing", "enabled": True},
-        {"id": "existing", "enabled": False},
-    ])
-    assert state.closed
+def test_verify_url_quick_gate_skips_sampling(verification, monkeypatch):
+    module, _metadata, manager = verification
+
+    async def fail_sampling(*_args, **_kwargs):
+        raise AssertionError("quick=True should not run sampling")
+
+    monkeypatch.setattr(module, "_verification_samples", fail_sampling)
+    result = asyncio.run(
+        module.verify_url("https://example.test/inert.js", quick=True)
+    )
+    assert result["ok"] is True
+    assert result["category"] == "quick_gate"
+    assert result["complete"] is True
+    assert "kw" in result["platforms"]
+    assert manager.toggle_calls == []
+    assert manager.close_calls == 1
 
 
-def test_verify_reused_failed_enable_is_not_reverted_as_if_changed(verification):
-    module, state = verification
-    state.reused, state.toggle_failure = True, True
-    with pytest.raises(RuntimeError, match="enable failed"):
-        asyncio.run(module.verify_url("https://example.test/inert.js", keywords=["test"]))
-    assert [body for path, body in state.calls if path.endswith("/toggle")] == [
-        {"id": "existing", "enabled": True},
-    ]
-    assert not [path for path, body in state.calls if path.endswith("/delete")]
-    assert state.closed
+@pytest.mark.parametrize("mode", ["cancel", "timeout"])
+def test_verify_cancel_or_timeout_still_closes_temp_runtime(verification, monkeypatch, mode):
+    module, metadata, manager = verification
+    entered, release = asyncio.Event(), asyncio.Event()
 
+    async def stalled(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return []
 
-@pytest.mark.parametrize("reused", [False, True])
-@pytest.mark.parametrize("timeout", [False, True])
-def test_verify_cancel_and_timeout_restore_before_releasing_lock(verification, reused, timeout):
-    module, state = verification
-    state.reused = reused
+    monkeypatch.setattr(metadata, "search", stalled)
 
     async def run():
-        state.search_entered, state.search_release = asyncio.Event(), asyncio.Event()
-
         async def verify():
-            if timeout:
+            if mode == "timeout":
                 async with asyncio.timeout(0.02):
-                    return await module.verify_url("https://example.test/inert.js", keywords=["test"])
-            return await module.verify_url("https://example.test/inert.js", keywords=["test"])
+                    return await module.verify_url(
+                        "https://example.test/inert.js", keywords=["test"]
+                    )
+            return await module.verify_url(
+                "https://example.test/inert.js", keywords=["test"]
+            )
 
         task = asyncio.create_task(verify())
-        await state.search_entered.wait()
-        # 同一 base URL 的其他临时客户端也必须看到占锁，不能中途修改。
-        async def mutate():
-            async with management_operation():
-                pass
-        if not timeout:
+        await entered.wait()
+        if mode == "cancel":
             with pytest.raises(SourceOperationBusy):
-                await mutate()
+                async with management_operation():
+                    pass
             task.cancel()
-        with pytest.raises(TimeoutError if timeout else asyncio.CancelledError):
+        with pytest.raises(TimeoutError if mode == "timeout" else asyncio.CancelledError):
             await task
-        assert state.closed
+        release.set()
+        assert manager.close_calls == 1
         async with management_operation():
             pass
 
     asyncio.run(run())
-    cleanup = [(path, body) for path, body in state.calls
-               if path.endswith("/delete") or (path.endswith("/toggle") and not body["enabled"])]
-    assert cleanup == ([("/api/custom-source/toggle", {"id": "existing", "enabled": False})]
-                       if reused else [("/api/custom-source/delete", {"id": "created"})])
 
 
-@pytest.mark.parametrize("reused", [False, True])
-def test_verify_cleanup_failure_is_logged_and_client_closed(verification, caplog, reused):
-    module, state = verification
-    state.reused, state.cleanup_failure = reused, True
+def test_verify_cleanup_failure_is_logged_and_manager_closed(verification, caplog):
+    module, _metadata, manager = verification
+    manager.failures["close"] = RuntimeError("cleanup broken")
     asyncio.run(module.verify_url("https://example.test/inert.js", keywords=["test"]))
-    assert state.closed
-    assert "verify_source cleanup failed" in caplog.text
-    assert ("existing" if reused else "created") in caplog.text
+    assert manager.close_calls == 1
+    assert "verify_source runtime cleanup failed: RuntimeError" in caplog.text
 
 
-@pytest.mark.parametrize("reused", [False, True])
-def test_verify_cancel_cleanup_timeout_is_bounded_and_logged(verification, monkeypatch, caplog, reused):
-    module, state = verification
-    state.reused, state.cleanup_hangs = reused, True
+def test_verify_cancel_cleanup_timeout_is_bounded_and_logged(
+    verification, monkeypatch, caplog
+):
+    module, metadata, manager = verification
+    entered, release = asyncio.Event(), asyncio.Event()
+    manager.close_entered, manager.close_gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(module, "_CLEANUP_TIMEOUT_S", 0.02)
 
+    async def stalled(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(metadata, "search", stalled)
+
     async def run():
-        state.search_entered, state.search_release = asyncio.Event(), asyncio.Event()
-        state.cleanup_entered, state.cleanup_release = asyncio.Event(), asyncio.Event()
-        task = asyncio.create_task(module.verify_url("https://example.test/inert.js", keywords=["test"]))
-        await state.search_entered.wait()
+        task = asyncio.create_task(
+            module.verify_url("https://example.test/inert.js", keywords=["test"])
+        )
+        await entered.wait()
         started = asyncio.get_running_loop().time()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert asyncio.get_running_loop().time() - started < 0.3
-        assert state.cleanup_entered.is_set()
-        assert state.closed
+        assert manager.close_entered.is_set()
+        assert manager.closed is True
         async with management_operation():
             pass
 
     asyncio.run(run())
-    assert "verify_source cleanup failed" in caplog.text
+    assert "verify_source runtime cleanup failed" in caplog.text
     assert "TimeoutError" in caplog.text
 
 
 def test_verify_lock_covers_download_too(verification, monkeypatch):
-    module, state = verification
+    module, _metadata, manager = verification
 
     async def run():
         entered, release = asyncio.Event(), asyncio.Event()
 
-        async def download(url):
+        async def download(_url):
             entered.set()
             await release.wait()
             return "/*! @name X */"
 
         monkeypatch.setattr(module, "download_script", download)
-        task = asyncio.create_task(module.verify_url("https://example.test/inert.js", keywords=["test"]))
+        task = asyncio.create_task(
+            module.verify_url("https://example.test/inert.js", keywords=["test"])
+        )
         await entered.wait()
         with pytest.raises(SourceOperationBusy):
             async with management_operation():
                 pass
         release.set()
         await task
-        assert state.closed
+        assert manager.close_calls == 1
 
     asyncio.run(run())
 
 
-def test_verify_cleanup_lock_held_until_restore_finishes(verification, monkeypatch):
-    module, state = verification
-    state.cleanup_hangs = True
-    monkeypatch.setattr(module, "_CLEANUP_TIMEOUT_S", 1.0)
+def test_verify_cleanup_lock_held_until_close_finishes(verification):
+    module, _metadata, manager = verification
+    manager.close_entered, manager.close_gate = asyncio.Event(), asyncio.Event()
 
     async def run():
-        state.cleanup_entered, state.cleanup_release = asyncio.Event(), asyncio.Event()
-        task = asyncio.create_task(module.verify_url("https://example.test/inert.js", keywords=["test"]))
-        await state.cleanup_entered.wait()
+        task = asyncio.create_task(
+            module.verify_url("https://example.test/inert.js", keywords=["test"])
+        )
+        await manager.close_entered.wait()
         with pytest.raises(SourceOperationBusy):
             async with management_operation():
                 pass
-        state.cleanup_release.set()
+        manager.close_gate.set()
         await task
         async with management_operation():
             pass
@@ -501,18 +435,25 @@ def test_verify_cleanup_lock_held_until_restore_finishes(verification, monkeypat
     asyncio.run(run())
 
 
-def test_verify_client_close_timeout_is_bounded_and_logged(verification, monkeypatch, caplog):
-    module, state = verification
-    state.close_hangs = True
+def test_verify_metadata_close_timeout_is_bounded_and_logged(
+    verification, monkeypatch, caplog
+):
+    module, metadata, manager = verification
+    closed = []
     monkeypatch.setattr(module, "_CLOSE_TIMEOUT_S", 0.02)
+
+    async def hanging_close():
+        closed.append(True)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(metadata, "close", hanging_close)
 
     async def run():
         started = asyncio.get_running_loop().time()
         await module.verify_url("https://example.test/inert.js", keywords=["test"])
         assert asyncio.get_running_loop().time() - started < 0.3
-        assert state.closed
-        # fixture 故意阻塞 close，补关 mock transport，避免测试本身遗留资源。
-        await LxServerClient.close(state.client)
+        assert closed == [True]
+        assert manager.close_calls == 1
         async with management_operation():
             pass
 
@@ -552,25 +493,7 @@ def test_describe_source_snapshot_derives_file_url_and_ignores_non_dict_entries(
     assert snap["sources"][0]["initialized"] is True
     assert snap["sources"][1]["url"] == "https://example.test/remote.js"
     assert snap["sources"][1]["initialized"] is False
-    caps = lx_app._source_capabilities_snapshot([None, "bad", {"id": "a.js", "enabled": True, "status": "success"}])
+    caps = lx_app._source_capabilities_snapshot(
+        [None, "bad", {"id": "a.js", "enabled": True, "status": "success"}]
+    )
     assert caps["kw"]["playback_available"] is True
-
-
-def test_verify_url_quick_gate_skips_sampling(verification, monkeypatch):
-    module, state = verification
-
-    async def fail_sampling(*args, **kwargs):
-        raise AssertionError("quick=True should not run sampling")
-
-    monkeypatch.setattr(module, "_verification_samples", fail_sampling)
-
-    async def run():
-        res = await module.verify_url("https://example.test/inert.js", quick=True)
-        assert res["ok"] is True
-        assert res["category"] == "quick_gate"
-        assert res["complete"] is True
-        assert "kw" in res["platforms"]
-        assert state.closed
-
-    asyncio.run(run())
-

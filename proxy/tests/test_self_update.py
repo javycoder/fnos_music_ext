@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tarfile
 import time
 from pathlib import Path
@@ -170,6 +171,15 @@ def test_download_and_verify_success_and_sha_mismatch(tmp_path):
     assert "不匹配" in err
     assert not dest_bad.exists()
 
+    no_digest = dict(candidate, sha256="")
+    target.sha256 = ""
+    dest_unknown = tmp_path / "unknown.fpk"
+    with patch("urllib.request.urlopen", return_value=MockResp()):
+        ok, err = _download_and_verify(no_digest, target, dest_unknown)
+    assert ok is False
+    assert "SHA256" in err
+    assert not dest_unknown.exists()
+
 
 def test_create_data_backup(tmp_path):
     repo = tmp_path / "repo"
@@ -189,6 +199,11 @@ def test_create_data_backup(tmp_path):
         assert ".env" in names
         assert any("sub.conf" in n for n in names)
         assert any("pl1.json" in n for n in names)
+
+
+def test_create_data_backup_returns_failure_when_archive_cannot_be_created(tmp_path):
+    with patch("tarfile.open", side_effect=OSError("disk unavailable")):
+        assert create_data_backup(tmp_path / "backup.tar.gz", repo_dir=tmp_path) is False
 
 
 def test_native_app_center_client_flow():
@@ -247,6 +262,9 @@ def test_native_app_center_client_flow():
         ok, ver = client.verify_installed("fnmusic-ext", "2.12.4-0")
         assert ok is True
         assert ver == "2.12.4-0"
+        ok, ver = client.verify_installed("fnmusic-ext", "2.12.4-1")
+        assert ok is False
+        assert "版本不一致" in ver
 
 
 def test_job_lifecycle_and_deduplication(tmp_path, monkeypatch):
@@ -280,7 +298,7 @@ def test_job_lifecycle_and_deduplication(tmp_path, monkeypatch):
     su._TARGET_CACHE["snap-1"] = snap
 
     # Mock subprocess.Popen so worker doesn't run asynchronously in test
-    with patch("subprocess.Popen") as mock_popen:
+    with patch("shutil.which", return_value=None), patch("subprocess.Popen") as mock_popen:
         status, resp = start_update_job("snap-1")
         assert status == 202
         assert resp["ok"] is True
@@ -315,8 +333,154 @@ def test_job_lifecycle_and_deduplication(tmp_path, monkeypatch):
         assert status3 == 409
         assert "已有其他更新任务" in resp3["error"]
 
+        finished = su._read_job_state(tmp_path / "jobs" / job_id)
+        finished.status = "completed"
+        su._save_job_state(tmp_path / "jobs" / job_id, finished)
+        status4, resp4 = start_update_job("snap-2")
+        assert status4 == 202
+        assert resp4["job"]["id"] != job_id
+        job_id = resp4["job"]["id"]
+
     # Retrieve job from disk
     su._ACTIVE_JOB = None
     recovered = su.get_active_job()
     assert recovered is not None
     assert recovered.id == job_id
+
+
+def test_start_update_recovers_disk_job_and_falls_back_when_systemd_rejects(tmp_path, monkeypatch):
+    import proxy.self_update as su
+
+    jobs_dir = tmp_path / "jobs"
+    monkeypatch.setattr(su, "get_job_base_dir", lambda: jobs_dir)
+    monkeypatch.setattr(su, "_ACTIVE_JOB", None)
+    monkeypatch.setattr(su, "_TARGET_CACHE", {})
+    monkeypatch.setattr(su.os, "getuid", lambda: 0)
+    snap = TargetSnapshot(
+        target_id="snap", tag="v2.12.4", formal_base="2.12.4",
+        install_version="2.12.4-0", architecture="amd64",
+        asset_name="fnmusic-ext-2.12.4-0.fpk", download_url="https://example.com/fpk",
+        size=100, sha256="", sha256_url="", source="github", candidates=[],
+        created_at=time.time(), expires_at=time.time() + 600,
+    )
+    su._TARGET_CACHE[snap.target_id] = snap
+    with patch("shutil.which", return_value="/usr/bin/systemd-run"), \
+         patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as systemd, \
+         patch("subprocess.Popen") as detached:
+        status, response = start_update_job(snap.target_id)
+        assert status == 202
+        assert systemd.call_count == 1
+        assert any(arg.startswith("--working-directory=") for arg in systemd.call_args.args[0])
+        assert detached.call_count == 1
+        assert detached.call_args.kwargs["start_new_session"] is True
+        job_id = response["job"]["id"]
+        su._ACTIVE_JOB = None
+        status, response = start_update_job(snap.target_id)
+        assert status == 202
+        assert response["job"]["id"] == job_id
+        assert detached.call_count == 1
+
+
+@pytest.mark.parametrize("worker_started", [False, True])
+def test_systemd_timeout_does_not_overwrite_or_duplicate_job(tmp_path, monkeypatch, worker_started):
+    import proxy.self_update as su
+
+    jobs_dir = tmp_path / "jobs"
+    monkeypatch.setattr(su, "get_job_base_dir", lambda: jobs_dir)
+    monkeypatch.setattr(su, "_ACTIVE_JOB", None)
+    monkeypatch.setattr(su, "_TARGET_CACHE", {})
+    monkeypatch.setattr(su.os, "getuid", lambda: 0)
+    snap = TargetSnapshot(
+        target_id="snap", tag="v2.12.4", formal_base="2.12.4",
+        install_version="2.12.4-0", architecture="amd64",
+        asset_name="fnmusic-ext-2.12.4-0.fpk", download_url="https://example.com/fpk",
+        size=100, sha256="", sha256_url="", source="github", candidates=[],
+        created_at=time.time(), expires_at=time.time() + 600,
+    )
+    su._TARGET_CACHE[snap.target_id] = snap
+
+    def timeout(*args, **kwargs):
+        if worker_started:
+            job_dir = next(jobs_dir.iterdir())
+            job = su._read_job_state(job_dir)
+            job.status = "running"
+            su._save_job_state(job_dir, job)
+        raise subprocess.TimeoutExpired(args[0], 15)
+
+    with patch("shutil.which", return_value="/usr/bin/systemd-run"), \
+         patch("subprocess.run", side_effect=timeout) as systemd, \
+         patch("subprocess.Popen") as detached:
+        status, response = start_update_job(snap.target_id)
+        assert status == 503
+        assert "超时" in response["error"]
+        su._ACTIVE_JOB = None
+        active = su.get_active_job()
+        assert active is not None
+        assert active.status == ("running" if worker_started else "queued")
+        status, response = start_update_job(snap.target_id)
+        assert status == 202
+        assert response["job"]["id"] == active.id
+        assert systemd.call_count == 1
+        detached.assert_not_called()
+
+
+def test_execute_job_does_not_report_install_success_without_daemon(tmp_path, monkeypatch):
+    import proxy.self_update as su
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    monkeypatch.setattr(su, "DAEMON_SOCKET", str(tmp_path / "missing.sock"))
+    snap = TargetSnapshot(
+        target_id="snap", tag="v2.12.4", formal_base="2.12.4",
+        install_version="2.12.4-0", architecture="amd64",
+        asset_name="fnmusic-ext-2.12.4-0.fpk", download_url="https://example.com/fpk",
+        size=100, sha256="", sha256_url="", source="github", candidates=[{}],
+        created_at=time.time(), expires_at=time.time() + 600,
+    )
+    job = UpdateJob(
+        id="job", target_id="snap", tag=snap.tag, install_version=snap.install_version,
+        architecture="amd64", status="queued", phase="downloading", source="",
+        downloaded_bytes=0, total_bytes=0, daemon_task_id="", error_code="", message="",
+        created_at=time.time(), updated_at=time.time(),
+    )
+    su._save_job_state(job_dir, job)
+    monkeypatch.setattr(su, "get_target_snapshot", lambda target_id: snap)
+    monkeypatch.setattr(su, "_download_and_verify", lambda *args, **kwargs: (True, ""))
+    monkeypatch.setattr(su, "create_data_backup", lambda *args: True)
+    assert su.execute_job(job_dir) != 0
+    result = su._read_job_state(job_dir)
+    assert result.status == "failed"
+    assert "未" in result.message and "安装" in result.message
+
+
+def test_execute_job_rejects_mismatched_staged_revision(tmp_path, monkeypatch):
+    import proxy.self_update as su
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    daemon = tmp_path / "daemon.sock"
+    daemon.touch()
+    monkeypatch.setattr(su, "DAEMON_SOCKET", str(daemon))
+    snap = TargetSnapshot(
+        target_id="snap", tag="v2.12.4", formal_base="2.12.4",
+        install_version="2.12.4-1", architecture="amd64",
+        asset_name="fnmusic-ext-2.12.4-1.fpk", download_url="https://example.com/fpk",
+        size=100, sha256="", sha256_url="", source="github", candidates=[{}],
+        created_at=time.time(), expires_at=time.time() + 600,
+    )
+    job = UpdateJob(
+        id="job", target_id="snap", tag=snap.tag, install_version=snap.install_version,
+        architecture="amd64", status="queued", phase="downloading", source="",
+        downloaded_bytes=0, total_bytes=0, daemon_task_id="", error_code="", message="",
+        created_at=time.time(), updated_at=time.time(),
+    )
+    su._save_job_state(job_dir, job)
+    monkeypatch.setattr(su, "get_target_snapshot", lambda target_id: snap)
+    monkeypatch.setattr(su, "_download_and_verify", lambda *args, **kwargs: (True, ""))
+    monkeypatch.setattr(su, "create_data_backup", lambda *args: True)
+    client = MagicMock()
+    client.stage_fpk.return_value = {"appName": "fnmusic-ext", "version": "2.12.4-0"}
+    monkeypatch.setattr(su, "NativeAppCenterClient", lambda socket_path: client)
+    assert su.execute_job(job_dir) == 5
+    client.get_update_info.assert_not_called()
+    assert "版本不匹配" in su._read_job_state(job_dir).message

@@ -41,10 +41,10 @@ _cover_urls: dict[str, str] = {}
 _prefetch_tasks: set[asyncio.Task] = set()
 
 _DEFAULT_NETEASE = [
-    {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"},
-    {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3779629"},
-    {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "19723756"},
-    {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "2884035"},
+    {"provider": "netease", "source": "netease", "kind": "chart", "id": "3778678"},
+    {"provider": "netease", "source": "netease", "kind": "chart", "id": "3779629"},
+    {"provider": "netease", "source": "netease", "kind": "chart", "id": "19723756"},
+    {"provider": "netease", "source": "netease", "kind": "chart", "id": "2884035"},
 ]
 def home_dir() -> str:
     env = (os.environ.get("FNMUSIC_HOME") or "").strip()
@@ -85,7 +85,8 @@ def _load_json(path: str) -> dict | None:
 
 
 def _entry_key(entry: dict) -> str:
-    return "|".join(str(entry.get(k) or "") for k in ("provider", "source", "kind", "id"))
+    prov = "netease" if entry.get("provider") in ("netease", "musicbox") else str(entry.get("provider") or "")
+    return "|".join([prov, str(entry.get("source") or ""), str(entry.get("kind") or ""), str(entry.get("id") or "")])
 
 
 def playlist_guid(entry: dict) -> str:
@@ -147,11 +148,11 @@ def parse_selection(raw: object, conf: dict | None = None, default_provider: str
             "kind": str(row.get("kind") or "playlist").strip(),
             "id": str(row.get("id") or "").strip(),
         }
-        if entry["provider"] not in ("musicbox", "lx"):
+        if entry["provider"] not in ("netease", "musicbox", "lx"):
             continue
         if entry["kind"] not in ("playlist", "chart") or not entry["source"] or not entry["id"]:
             continue
-        key = _entry_key({**entry, "kind": "playlist"}) if entry["provider"] == "musicbox" else _entry_key(entry)
+        key = _entry_key({**entry, "kind": "playlist"}) if entry["provider"] in ("netease", "musicbox") else _entry_key(entry)
         if key in seen:
             continue
         seen.add(key)
@@ -248,7 +249,7 @@ def validate_user_selections(raw: object) -> dict[str, list[dict]]:
         if not isinstance(selection, list) or len(selection) > _MAX_SELECTION:
             raise ValueError("每位用户的公共歌单必须是数组且最多选择 50 份")
         for entry in selection:
-            if (not isinstance(entry, dict) or entry.get("provider") not in ("musicbox", "lx")
+            if (not isinstance(entry, dict) or entry.get("provider") not in ("netease", "musicbox", "lx")
                     or entry.get("kind") not in ("playlist", "chart")
                     or not str(entry.get("source") or "").strip()
                     or not str(entry.get("id") or "").strip()):
@@ -257,7 +258,7 @@ def validate_user_selections(raw: object) -> dict[str, list[dict]]:
 
 
 def _selection_runtime_usable(entry: dict, conf: dict) -> bool:
-    if entry["provider"] == "musicbox":
+    if entry["provider"] in ("netease", "musicbox"):
         return bool(conf.get("netease_enabled") or conf.get("netease_playlist_resident"))
     if not conf.get("lx_enabled"):
         return False
@@ -266,10 +267,12 @@ def _selection_runtime_usable(entry: dict, conf: dict) -> bool:
 
 
 def _provider_client(app_state, entry: dict) -> httpx.AsyncClient:
-    if entry["provider"] == "musicbox":
-        client = getattr(app_state, "musicbox_client", None)
+    if entry["provider"] in ("netease", "musicbox"):
+        client = getattr(app_state, "musicbox_client", None) or getattr(app_state, "netease_client", None)
         if client is None:
-            client = httpx.AsyncClient(base_url=os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"), timeout=20.0)
+            url = os.environ.get("FNMUSIC_NETEASE_URL") or os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770")
+            client = httpx.AsyncClient(base_url=url, timeout=20.0)
+            app_state.netease_client = client
             app_state.musicbox_client = client
         return client
     client = getattr(app_state, "lx_client", None)
@@ -422,7 +425,7 @@ def cover_url_for(guid: str) -> str:
     return _cover_urls.get(guid, "") if disk else ""
 
 
-def _musicbox_item(row: dict) -> dict:
+def _netease_item(row: dict) -> dict:
     return {
         "id": f"netease:{row.get('song_id') or row.get('id')}",
         "source": "netease",
@@ -434,6 +437,9 @@ def _musicbox_item(row: dict) -> dict:
         "has_sq": row.get("has_sq"),
         "needs_vip": row.get("needs_vip"),
     }
+
+
+_musicbox_item = _netease_item
 
 
 def _tracks_disk_path(guid: str) -> str:
@@ -467,7 +473,7 @@ async def _fetch_tracks(app_state, entry: dict, build_track) -> list:
     for row in payload["data"][:_MAX_TRACKS]:
         if not isinstance(row, dict):
             continue
-        item = _musicbox_item(row) if entry["provider"] == "musicbox" else row
+        item = _netease_item(row) if entry["provider"] in ("netease", "musicbox") else row
         track = build_track(item)
         if isinstance(track, dict) and track.get("guid"):
             tracks.append(track)

@@ -594,6 +594,7 @@ def generate_worker_script(admin_token: str, sample_budget_s: float = 90.0) -> s
     - 在沙箱内发起媒体流探活（Probe），脱敏后输出 JSON 报告。
     """
     return f'''import json
+import asyncio
 import os
 import subprocess
 import sys
@@ -614,7 +615,15 @@ PORT = 8005
 BASE_URL = f"http://127.0.0.1:{{PORT}}"
 SAMPLE_BUDGET_S = {sample_budget_s}
 MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
+PROJECT_RUNTIME_DIR = "/srv/lxmusic-service"
 START_TIME = time.monotonic()
+
+try:
+    if PROJECT_RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, PROJECT_RUNTIME_DIR)
+    import source_runtime as _source_runtime
+except Exception:
+    _source_runtime = None
 
 class BudgetExceeded(TimeoutError):
     """Raised when the single per-sample deadline has expired."""
@@ -656,6 +665,7 @@ def write_lxserver_config():
   bindIP: "127.0.0.1",
   port: {{PORT}},
   "frontend.password": "{{ADMIN_TOKEN}}",
+  "admin.password": "{{ADMIN_TOKEN}}",
   "player.enableAuth": false,
   "subsonic.enable": false,
   "webdav.enable": false,
@@ -945,6 +955,92 @@ def probe_stream(url, headers_dict=None):
             return False, {{"error_type": type(e).__name__}}
     return False, {{"error_type": "TooManyRedirects"}}
 
+class ProjectSourceChain:
+    """Project single-source runtime used beside the native lxserver comparison."""
+
+    def __init__(self):
+        self.loop = None
+        self.manager = None
+        self.source_id = ""
+        self.error = ""
+
+    def start(self, script_text):
+        if _source_runtime is None:
+            self.error = "project_runtime_missing"
+            return False
+        try:
+            # The project worker is a separate Node process; give it the same
+            # network preload as the native lxserver under test.
+            os.environ["NODE_OPTIONS"] = "--require /data/preload.js"
+            manager = _source_runtime.SourceRuntimeManager(
+                source_root="/data/project-sources",
+                lxserver_dir="/srv/lxserver",
+                node_bin="node",
+                init_timeout_s=15,
+                stop_budget_s=5,
+            )
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(manager.start())
+            remaining = get_remaining_budget()
+            record = loop.run_until_complete(manager.upload_source(
+                "target_source.js", script_text,
+                deadline=time.monotonic() + max(1.0, remaining - 25.0),
+            ))
+            loop.run_until_complete(manager.set_enabled(
+                record["id"], True,
+                deadline=time.monotonic() + max(1.0, get_remaining_budget() - 20.0),
+            ))
+            self.loop, self.manager, self.source_id = loop, manager, record["id"]
+            return True
+        except Exception as exc:
+            self.error = type(exc).__name__
+            self.close()
+            return False
+
+    def resolve(self, song_info, quality):
+        if self.manager is None or self.loop is None:
+            return {{"status": "not_tested", "reason": self.error or "project_runtime_unavailable"}}
+        try:
+            remaining = get_remaining_budget()
+            if remaining <= 2.0:
+                return {{"status": "not_tested", "reason": "budget_insufficient"}}
+            data = self.loop.run_until_complete(self.manager.resolve(
+                self.source_id,
+                song_info,
+                quality,
+                deadline=time.monotonic() + max(1.0, remaining - 1.0),
+            ))
+            source_id_matched = str(data.get("sourceId") or "") == str(self.source_id)
+            media_url = str(data.get("url") or "")
+            if not source_id_matched:
+                return {{"status": "source_id_mismatch", "source_id_matched": False}}
+            if not media_url:
+                return {{"status": "empty_url", "source_id_matched": True}}
+            ok, probe = probe_stream(media_url, {{}})
+            return {{
+                "status": "ok" if ok else "probe_failed",
+                "source_id_matched": True,
+                "probe": probe,
+            }}
+        except Exception as exc:
+            return {{"status": "failed", "error_type": type(exc).__name__}}
+
+    def close(self):
+        loop, manager = self.loop, self.manager
+        self.loop = None
+        self.manager = None
+        if loop is None:
+            return
+        try:
+            if manager is not None:
+                loop.run_until_complete(manager.close())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
 def main():
     script_text = sys.stdin.read()
     report = {{
@@ -953,9 +1049,13 @@ def main():
         "requireUnsafe": False,
         "platforms": {{}},
         "quality_capability": "unknown",
-        "validation_scope": "native_url_and_prefix",
+        "validation_scope": "native_url_prefix_and_project_single_source",
         "decode_status": "not_tested",
         "adapter_status": "not_tested",
+        "project_chain_status": "not_tested",
+        "project_error_type": "",
+        "project_attempts": 0,
+        "project_successes": 0,
         "playback_verified": False,
         "coverage": "not_tested",
         "attempts": [],
@@ -982,6 +1082,7 @@ def main():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
+    project = ProjectSourceChain()
 
     try:
         if not wait_for_lxserver(15.0):
@@ -1033,6 +1134,15 @@ def main():
 
         http_json("/api/custom-source/reorder", {{"sourceIds": [target_id]}}, method="POST")
         report["stages"]["activate"] = "ok"
+
+        # 3b. 同一脚本再导入项目单源运行时；原生侧仍使用共享 lxserver。
+        if project.start(script_text):
+            report["project_chain_status"] = "ok"
+        else:
+            report["project_chain_status"] = (
+                "needs_unsafe" if project.error == "SourceUnsafeVmRequired" else "failed"
+            )
+            report["project_error_type"] = project.error
 
         # 4. 读取运行时可验证的平台元数据；列表未公开档位时保持 unknown。
         _, sources = http_json("/api/custom-source/list")
@@ -1088,8 +1198,9 @@ def main():
                     get_remaining_budget()
                     keyword_report = platform_report["keywords"][keyword]
                     query = urllib.parse.urlencode({{"source": platform, "name": keyword, "text": keyword, "page": 1, "limit": 3}})
-                    search_code, songs = http_json(f"/api/music/search?{{query}}")
+                    search_code, search_result = http_json(f"/api/music/search?{{query}}")
                     get_remaining_budget()
+                    songs = search_result.get("list") if isinstance(search_result, dict) else search_result
                     if search_code != 200 or not isinstance(songs, list) or not songs:
                         search_status = "no_songs" if search_code == 200 else "search_failed"
                         keyword_report["search_status"] = search_status
@@ -1114,6 +1225,16 @@ def main():
                             get_remaining_budget()
                             attempted += 1
                             quality_report["attempt_count"] = attempted
+                            if project.manager is not None:
+                                project_result = project.resolve(song, quality)
+                                report["project_attempts"] += 1
+                                if project_result.get("status") == "ok":
+                                    report["project_successes"] += 1
+                            else:
+                                project_result = {{
+                                    "status": "not_tested",
+                                    "reason": project.error or "project_runtime_unavailable",
+                                }}
                             url_body = {{
                                 "songInfo": song,
                                 "quality": quality,
@@ -1125,7 +1246,8 @@ def main():
                             if resolve_code != 200 or not isinstance(resolve_result, dict):
                                 platform_report["attempts"].append({{
                                     "keyword": keyword, "quality": quality, "exploratory": is_exploratory,
-                                    "result": "resolve_http_error"
+                                    "result": "resolve_http_error",
+                                    "project": project_result,
                                 }})
                                 continue
 
@@ -1133,7 +1255,8 @@ def main():
                             if returned_id != str(target_id):
                                 platform_report["attempts"].append({{
                                     "keyword": keyword, "quality": quality, "exploratory": is_exploratory,
-                                    "result": "resolved_by_other_source" if returned_id else "resolved_source_id_missing"
+                                    "result": "resolved_by_other_source" if returned_id else "resolved_source_id_missing",
+                                    "project": project_result,
                                 }})
                                 continue
 
@@ -1141,7 +1264,8 @@ def main():
                             if not media_url:
                                 platform_report["attempts"].append({{
                                     "keyword": keyword, "quality": quality, "exploratory": is_exploratory,
-                                    "result": "resolve_empty"
+                                    "result": "resolve_empty",
+                                    "project": project_result,
                                 }})
                                 continue
 
@@ -1156,6 +1280,7 @@ def main():
                                 "exploratory": is_exploratory,
                                 "probe_ok": probe_ok,
                                 "probe": probe_result,
+                                "project": project_result,
                             }}
                             platform_report["attempts"].append(attempt_record)
                             if probe_ok:
@@ -1194,6 +1319,14 @@ def main():
                 if all(platform_report["coverage"] == "complete" for platform_report in report["platforms"].values())
                 else "partial"
             )
+            if report["project_attempts"] == 0:
+                report["project_chain_status"] = "not_tested"
+            elif report["project_successes"] == 0:
+                report["project_chain_status"] = "failed"
+            elif report["project_successes"] < report["project_attempts"]:
+                report["project_chain_status"] = "partial"
+            else:
+                report["project_chain_status"] = "ok"
             if any_success and all_success:
                 report["overall_status"] = "ok"
             elif any_success or any(
@@ -1207,6 +1340,14 @@ def main():
             report["stages"]["budget"] = "expired"
             report["coverage"] = "partial"
             report["overall_status"] = "partial"
+            if report["project_attempts"] == 0:
+                report["project_chain_status"] = "not_tested"
+            elif report["project_successes"] == 0:
+                report["project_chain_status"] = "failed"
+            elif report["project_successes"] < report["project_attempts"]:
+                report["project_chain_status"] = "partial"
+            else:
+                report["project_chain_status"] = "ok"
             for stage in ("init", "upload", "activate"):
                 report["stages"].setdefault(stage, "not_tested_budget")
             for platform_report in report["platforms"].values():
@@ -1236,6 +1377,7 @@ def main():
 
         print(json.dumps(report))
     finally:
+        project.close()
         node_proc.terminate()
         try:
             node_proc.wait(timeout=3.0)

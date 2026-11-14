@@ -30,6 +30,10 @@ def test_user_map_patch_merge_and_ref_name_are_stable():
         parse_user_map({"user-a": "  "}, kind="下载目录映射")
     with pytest.raises(ValueError):
         parse_user_map({"shared": "/vol1/music/a"}, kind="下载目录映射")
+    with pytest.raises(ValueError):
+        parse_user_map({"user-a": "relative/music"}, kind="下载目录映射")
+    with pytest.raises(ValueError):
+        parse_user_map({"user-a": "/vol1/music/../other"}, kind="下载目录映射")
     name = user_ref_name("user-a", "song")
     assert name.startswith("u_") and name.endswith("__song.ref")
     assert user_storage_key("user-a") == user_storage_key("user-a")
@@ -84,6 +88,23 @@ def test_user_save_does_not_reuse_another_users_file(tmp_path, monkeypatch):
         runtime.tee_save_dir(user_guid="shared")
     monkeypatch.setitem(runtime.CONF, "tee_save_by_user", False)
     assert runtime.tee_save_dir(user_guid="user-b") == str(library)
+
+
+def test_user_save_rejects_overlapping_mappings_before_creating_directories(tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    cache = tmp_path / "cache"
+    library.mkdir()
+    cache.mkdir()
+    shared = tmp_path / "shared"
+    monkeypatch.setitem(runtime.CONF, "tee_save_by_user", True)
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", str(library))
+    monkeypatch.setitem(runtime.CONF, "cache_dir", str(cache))
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir_by_user", {
+        "user-a": str(shared), "user-b": str(shared / "nested"),
+    })
+    with pytest.raises(runtime.UserStorageError):
+        runtime.tee_save_dir(user_guid="user-a")
+    assert not shared.exists()
 
 
 def test_organize_selects_one_user_root_and_cleanup_skips_public_parent(tmp_path, monkeypatch):

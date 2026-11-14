@@ -19,8 +19,8 @@ const APP_BASE = "/app/fnmusic-ext";
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", lxmusic: "洛雪自定义源", none: "未配置" };
-const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
+const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", netease: "网易云音乐", musicbox: "网易云音乐", lxmusic: "洛雪自定义源", none: "未配置" };
+const PROC_LABEL = { musicdl: "musicdl", netease: "netease", musicbox: "musicbox", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
@@ -49,6 +49,10 @@ let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校�
 let lxSourceList = [];    // 本地待保存配置；运行状态轮询不可覆盖 active
 let lxSourceOrder = [];   // 洛雪稳定源 ID 顺序；停用时保留历史位置
 let lxRuntimeSnapshot = null; // /api/status 的只读运行快照
+// CPU 异常按稳定源 ID 缓存：刷新失败时保留已知红标，只把当前读数降为未知。
+let lxCpuAlerts = new Map();
+let lxRuntimeStatusUnknown = false;
+let lxCpuHelpSourceId = "";
 const LX_STATE_LABEL = { unconfigured: "未配置", loading: "初始化中", ready: "可用", degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" };
 const LX_SOURCE_STATUS_LABEL = { success: "运行就绪", failed: "运行失败", loading: "初始化中", unknown: "运行状态未知" };
 let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
@@ -263,6 +267,7 @@ function closeHelp() {
   helpBackgroundState = [];
   if (helpReturnFocus && typeof helpReturnFocus.focus === "function") helpReturnFocus.focus();
   helpReturnFocus = null;
+  lxCpuHelpSourceId = "";
 }
 
 $$("[data-help]").forEach((btn) => btn.addEventListener("click", () => openHelp(btn.dataset.help, btn)));
@@ -562,6 +567,8 @@ async function loadStatus(timeoutMs = 0) {
       return `<span class="state-line"><span class="dot ok"></span>${escapeHtml(PROC_LABEL[name])}：正常</span>`;
     }).join("");
     lxRuntimeSnapshot = st.lx_source || null;
+    lxRuntimeStatusUnknown = false;
+    syncLxCpuAlerts((lxRuntimeSnapshot || {}).sources);
     syncLxSourceOrder();
     renderLxSourceList(); // 只同步运行徽标，不重载配置或丢弃尚未保存的编辑。
     renderLxSourceOrder();
@@ -597,6 +604,7 @@ async function loadStatus(timeoutMs = 0) {
   } catch (exc) {
     // 旧快照不能无限期显示绿色“运行就绪”；保留用户尚未保存的编辑。
     lxRuntimeSnapshot = null;
+    lxRuntimeStatusUnknown = true;
     renderLxSourceList();
     $("#ov-provider-body").textContent = "状态加载失败：" + exc.message;
     $("#ov-processes").innerHTML = '<span class="chip"><span class="dot"></span>进程状态未知（获取失败）</span>';
@@ -1025,6 +1033,8 @@ async function saveConfig() {
     } else {
       toast(parts.join("；") || "配置无变化", "ok");
     }
+    // 只按本次已确认成功的停用操作清标；部分失败或超时不能凭本地表单状态清除。
+    clearLxCpuAlertsAfterSavedConfig(result);
     if (result.values) {
       configValues = { ...configValues, ...result.values };
       applyConfigToForm();
@@ -1472,11 +1482,12 @@ function anyPublicMusicboxSelection() {
   const selections = publicSyncAll
     ? [publicSharedSelection]
     : (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER ? Object.values(publicSelectionMap) : [publicSelection]);
-  return selections.some((selection) => Array.isArray(selection) && selection.some((item) => item.provider === "musicbox"));
+  return selections.some((selection) => Array.isArray(selection) && selection.some((item) => item.provider === "netease" || item.provider === "musicbox"));
 }
 
 function publicEntryKey(item) {
-  return [item.provider, item.source, item.provider === "musicbox" ? "playlist" : item.kind, item.id].join("|");
+  const isNetease = item.provider === "netease" || item.provider === "musicbox";
+  return [isNetease ? "netease" : item.provider, item.source, isNetease ? "playlist" : item.kind, item.id].join("|");
 }
 
 function selectedPublicEntry(item) {
@@ -1994,7 +2005,8 @@ function renderPublicControls() {
     `<option value="${item.value}">${item.label}</option>`).join("");
   providerSelect.value = publicState.provider;
 
-  const channels = publicState.provider === "musicbox" ? [
+  const isNetease = publicState.provider === "netease" || publicState.provider === "musicbox";
+  const channels = isNetease ? [
     { id: "charts", name: "排行榜" }, { id: "recommend", name: "推荐歌单" },
     { id: "top", name: "热门与分类" }, { id: "highquality", name: "精品歌单" },
     { id: "account_recommend", name: "账号推荐歌单" },
@@ -2004,7 +2016,7 @@ function renderPublicControls() {
     item.id !== "account_recommend" || logged).map((item) =>
     `<option value="${item.id}">${item.name}</option>`).join("");
   if (![...channelSelect.options].some((opt) => opt.value === publicState.channel)) {
-    publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
+    publicState.channel = isNetease ? "charts" : "top";
   }
   channelSelect.value = publicState.channel;
 
@@ -2044,7 +2056,7 @@ async function loadPublicCategories(seq = publicState.seq) {
     return;
   }
   try {
-    const highquality = provider === "musicbox" && channel === "highquality";
+    const highquality = (provider === "netease" || provider === "musicbox") && channel === "highquality";
     const data = await publicApi("categories", {
       source, kind: channel === "charts" ? "chart" : "playlist",
     }, true, provider);
@@ -2554,8 +2566,144 @@ function lxPendingActivationCount() {
   return lxSourceList.filter((i) => i.active && !saved.has(i.url)).length;
 }
 
+function lxCpuAlertFromSource(source) {
+  if (!source || typeof source !== "object") return null;
+  const usage = source.resource_usage;
+  if (!usage || typeof usage !== "object" || usage.abnormal !== true) return null;
+  const sourceId = String(source.id || "").trim();
+  if (!sourceId) return null;
+  const finite = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+  return {
+    sourceId,
+    name: String(source.name || sourceId),
+    runtimeId: String(usage.runtime_id || source.runtime_id || ""),
+    cpuPercent: finite(usage.cpu_percent),
+    thresholdPercent: finite(usage.threshold_percent) ?? 50,
+    requiredDurationS: finite(usage.required_duration_s) ?? 180,
+    highDurationS: finite(usage.high_duration_s),
+    monitoringStatus: String(usage.monitoring_status || "unknown"),
+    detectedAt: String(usage.detected_at || ""),
+    processState: String(source.process_state || ""),
+  };
+}
+
+function syncLxCpuAlerts(sources) {
+  if (!Array.isArray(sources)) return; // 状态不可读时不能据空列表清除历史告警。
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const sourceId = String(source.id || "").trim();
+    if (!sourceId) continue;
+    const alert = lxCpuAlertFromSource(source);
+    if (alert) {
+      lxCpuAlerts.set(sourceId, alert);
+      continue;
+    }
+    const cached = lxCpuAlerts.get(sourceId);
+    if (!cached) continue;
+    const usage = source.resource_usage;
+    const runtimeId = String((usage && usage.runtime_id) || source.runtime_id || "");
+    if (String((usage && usage.monitoring_status) || "") === "stopped"
+        || ["stopped", "disabled"].includes(String(source.process_state || ""))) {
+      lxCpuAlerts.delete(sourceId);
+      continue;
+    }
+    // 进程实例变化即重新计时；同一实例只认后端锁定状态，不能因短暂低载清除。
+    if (cached.runtimeId && runtimeId && runtimeId !== cached.runtimeId) {
+      lxCpuAlerts.delete(sourceId);
+    }
+  }
+  // 当前快照缺少某源时不能确认是停用还是状态接口暂时不完整；保留红标，
+  // 等成功停用操作、显式 stopped 状态或新 runtime_id 再清除。
+}
+
+function findLxCpuAlert(item) {
+  const sourceId = lxStableSourceId(item);
+  return sourceId ? (lxCpuAlerts.get(sourceId) || null) : null;
+}
+
+function lxCpuReadingText(alert) {
+  if (!alert) return "未知";
+  if (lxRuntimeStatusUnknown || alert.cpuPercent == null
+      || alert.monitoringStatus === "unknown") return "未知（当前读数不可用）";
+  return `${alert.cpuPercent.toFixed(1)}%（单核口径）`;
+}
+
+function lxCpuAlertHtml(item) {
+  const alert = findLxCpuAlert(item);
+  if (!alert) return "";
+  const name = escapeHtml(item.name || lxDefaultName(item.url));
+  return `<button class="lx-cpu-alert" type="button" data-cpu-source-id="${escapeHtml(alert.sourceId)}"
+      aria-label="资源异常占用：${name}，查看判定说明" title="资源异常占用">!</button>
+    <span class="lx-cpu-alert-label">资源异常占用</span>`;
+}
+
+function clearLxCpuAlertsAfterSavedConfig(result) {
+  const actions = Array.isArray(result && result.actions) ? result.actions : [];
+  if (!actions.length || !lxCpuAlerts.size) return;
+  const runtimeSources = Array.isArray(lxRuntimeSnapshot && lxRuntimeSnapshot.sources)
+    ? lxRuntimeSnapshot.sources : [];
+  const idForUrl = (url) => {
+    const raw = String(url || "");
+    if (!raw) return "";
+    const local = lxSourceList.find((item) => item && String(item.url || "") === raw);
+    const localId = local ? lxStableSourceId(local) : "";
+    if (localId) return localId;
+    const matches = runtimeSources.filter((source) => source && source.id
+      && String(source.url || "") === raw);
+    return matches.length === 1 ? String(matches[0].id) : "";
+  };
+  for (const action of actions) {
+    if (!action || action.kind !== "lx_activate" || action.op !== "deactivate" || action.ok !== true) continue;
+    const sourceId = String(action.source_id || action.id || "").trim() || idForUrl(action.url);
+    if (sourceId) lxCpuAlerts.delete(sourceId);
+  }
+  renderLxSourceList();
+}
+
+function lxCpuDetectedText(value) {
+  const text = String(value || "");
+  if (!text) return "未知";
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? text : date.toLocaleString();
+}
+
+function fillLxCpuHelp(alert) {
+  const body = $("#help-body");
+  if (!body || !alert || typeof body.querySelectorAll !== "function") return;
+  const values = {
+    source: alert.name,
+    reading: lxCpuReadingText(alert),
+    threshold: `${alert.thresholdPercent}%`,
+    required: `${alert.requiredDurationS} 秒（5 秒统计窗口）`,
+    high: alert.highDurationS == null ? "未知" : `${alert.highDurationS} 秒`,
+    detected: lxCpuDetectedText(alert.detectedAt),
+    runtime: alert.runtimeId || "未知",
+    process: alert.processState || "未知",
+  };
+  body.querySelectorAll("[data-cpu-help]").forEach((node) => {
+    const key = node.getAttribute("data-cpu-help");
+    if (key && Object.prototype.hasOwnProperty.call(values, key)) {
+      node.textContent = String(values[key]);
+    }
+  });
+}
+
+function openLxCpuHelp(item, trigger) {
+  const alert = findLxCpuAlert(item);
+  if (!alert) return;
+  openHelp("lx-source-cpu", trigger);
+  lxCpuHelpSourceId = alert.sourceId;
+  $("#help-title").textContent = "资源异常占用";
+  fillLxCpuHelp(alert);
+}
+
 function findLxRuntimeSource(item, sources) {
   const list = Array.isArray(sources) ? sources : [];
+  const itemId = String((item && (item.id || item.source_id)) || "").trim();
+  if (itemId) {
+    const byId = list.find((s) => s && String(s.id || "") === itemId);
+    if (byId) return byId;
+  }
   const itemUrl = (item && item.url) || "";
   if (itemUrl) {
     const exact = list.find((s) => s && s.url && s.url === itemUrl);
@@ -2774,6 +2922,7 @@ function renderLxSourceList() {
         <div class="lx-item-main">
           <div class="lx-item-header">
             <span class="lx-item-name">${displayName}</span>
+            ${lxCpuAlertHtml(item)}
             ${isActive || wasActive ? `<span class="lx-badge">${configLabel}</span>` : `<span class="muted">${configLabel}</span>`}
             <span class="chip"><span class="dot ${runtime && status === "success" ? "ok" : runtime && status === "failed" ? "err" : ""}"></span>${escapeHtml(runtimeLabel)}</span>
           </div>
@@ -2793,6 +2942,21 @@ function renderLxSourceList() {
   container.querySelectorAll(".lx-btn-del").forEach((btn) => {
     btn.addEventListener("click", () => deleteLxSource(parseInt(btn.dataset.idx, 10)));
   });
+  container.querySelectorAll(".lx-cpu-alert").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const sourceId = String(btn.dataset.cpuSourceId || "");
+      const item = lxSourceList.find((entry) => lxStableSourceId(entry) === sourceId);
+      if (item) openLxCpuHelp(item, btn);
+    });
+  });
+  // 轮询重绘会替换按钮节点；弹窗仍开着时把返回焦点改绑到新节点。
+  if (lxCpuHelpSourceId && !$("#help-modal").hidden) {
+    const replacement = Array.from(container.querySelectorAll(".lx-cpu-alert"))
+      .find((btn) => String(btn.dataset.cpuSourceId || "") === lxCpuHelpSourceId);
+    helpReturnFocus = replacement || container;
+    const alert = lxCpuAlerts.get(lxCpuHelpSourceId);
+    if (alert) fillLxCpuHelp(alert);
+  }
 }
 
 function activateLxSource(idx) {

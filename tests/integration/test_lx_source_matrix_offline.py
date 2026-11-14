@@ -45,6 +45,7 @@ def test_generated_worker_writes_valid_lxserver_config(tmp_path):
     assert 'module.exports = {' in config
     assert '"system.allowUnsafeVM": false' in config
     assert '"frontend.password": "ephemeral-token"' in config
+    assert '"admin.password": "ephemeral-token"' in config
     assert config.rstrip().endswith('};')
 
 
@@ -539,6 +540,7 @@ class TestDockerAndWorkerContracts:
         assert 'PORT = 8005' in worker_code
         assert 'port: {PORT}' in worker_code
         assert '"frontend.password": "{ADMIN_TOKEN}"' in worker_code
+        assert '"admin.password": "{ADMIN_TOKEN}"' in worker_code
 
         # 上传 allowUnsafeVM: false 与 requireUnsafe 单列
         assert '"allowUnsafeVM": False' in worker_code
@@ -727,7 +729,12 @@ class TestGeneratedWorkerBehavior:
         assert platform["status"] == "ok"
         assert report["quality_capability"] == "unknown"
         assert all(item["exploratory"] is True for item in platform["attempts"])
-        assert report["validation_scope"] == "native_url_and_prefix"
+        assert report["validation_scope"] == "native_url_prefix_and_project_single_source"
+        assert report["project_chain_status"] == "not_tested"
+        assert all(
+            item.get("project", {}).get("status") == "not_tested"
+            for item in platform["attempts"]
+        )
         assert report["decode_status"] == "not_tested"
         assert report["adapter_status"] == "not_tested"
         assert report["playback_verified"] is False

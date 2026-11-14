@@ -34,7 +34,7 @@
 | 能力 | 你可以做什么 |
 | :--- | :--- |
 | **原生入口** | 继续使用官方飞牛音乐 Web / App，无需换一套播放器 |
-| **三类音源** | 在 musicdl、网易云 musicbox、洛雪 lxmusic 中选择主音源 |
+| **三类音源** | 在 musicdl、网易云 netease、洛雪 lxmusic 中选择主音源 |
 | **在线搜索与播放** | 本地结果优先，在线结果随后展示，适配歌词、封面与客户端播放 |
 | **独立音质设置** | 在线播放与 App 下载分别选音质，支持七档偏好及缺档降级 |
 | **推荐与歌单** | 每日推荐、热门推荐、猜你喜欢，以及按用户或全部用户共享的公共歌单 |
@@ -62,7 +62,7 @@
 | 选择的主音源 | 首次配置 |
 | :--- | :--- |
 | **musicdl** | 勾选需要的平台，建议先少量启用，确认搜索与播放正常后再扩展 |
-| **网易云 musicbox** | 按需扫码登录，以使用账号歌单及相应账号权益 |
+| **网易云 netease** | 按需扫码登录，以使用账号歌单及相应账号权益 |
 | **洛雪 lxmusic** | 自行导入可信 `.js` 音源脚本，测试、激活并保存；仅安装服务不代表已具备播放解析能力 |
 
 ### 3. 开始听歌
@@ -86,7 +86,7 @@
 | 主音源 | 适合场景 | 能力与边界 |
 | :--- | :--- | :--- |
 | **musicdl** | 按需选择多个平台搜索 | 当前登记 57 个 SDK 平台类；登记不等于每个平台都可播放，部分资源受登录、DRM 或交付格式限制 |
-| **网易云 musicbox** | 网易搜索、账号歌单与推荐 | 支持扫码登录；会员、付费及试听限制仍由平台和账号决定 |
+| **网易云 netease** | 网易搜索、账号歌单与推荐 | 支持扫码登录；会员、付费及试听限制仍由平台和账号决定 |
 | **洛雪 lxmusic** | 使用自己信任的自定义源脚本 | 搜索、歌词与榜单由内置平台接口提供，播放解析交给用户脚本；不提供或保证可用脚本 |
 
 musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。洛雪兼容层基于 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)，不保证所有第三方脚本兼容或长期有效。
@@ -132,6 +132,8 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 - **自动切源开启：** 先按目标音质遍历脚本，再降低音质；开启平台优选后，只在当前脚本声明的平台范围内寻找可信同曲。
 - **自动切源关闭：** 只在原平台首个就绪且兼容的脚本内降档，不跨脚本或平台。
 - **脚本排序：** 使用稳定脚本 ID；停用保留历史位置，新激活项追加，删除时清理对应项。非洛雪主音源时保存设置不意味着启动洛雪服务。
+
+每个已激活脚本由独立的 Node 子进程运行，搜索与元数据仍复用共享的 lxserver。若某个脚本进程连续三分钟占用超过单个 CPU 核心的 50%，源列表会显示红色感叹号和「资源异常占用」；点击可查看当前读数、阈值和排查建议。该标记只归属对应脚本进程，不表示本项目主服务 CPU 异常，也不会自动停用脚本或结束进程。标记保留到该源成功停用或进程重新启动，之后 CPU 降低不会自动清除。
 
 > **脚本是可执行代码，不是普通配置。** 请只导入可信来源，不能把 Node.js 运行环境当成完整安全沙箱。Docker 模式在容器内执行，native 模式在宿主机执行；新导入脚本不会自动获得不安全 VM 授权。
 
@@ -215,16 +217,16 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./install.sh --non-interactive --sources musicdl-kuwo,musicdl-migu --webui --extend
 
 # Docker：网易云 + 管理页，安装后扫码登录
-./install.sh --non-interactive --sources musicbox --webui --extend
+./install.sh --non-interactive --sources netease --webui --extend
 
 # Docker：洛雪 + 管理页，安装后自行导入脚本
 ./install.sh --non-interactive --sources lxmusic --webui --extend
 
 # native：无 Docker，网易云 + 管理页
-./install.sh --deploy native --non-interactive --sources musicbox --webui --extend
+./install.sh --deploy native --non-interactive --sources netease --webui --extend
 ```
 
-native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行为见安装指南。切换部署形态、跨目录接管（`--adopt`）和旧版本迁移应先阅读指南，**不要从多个目录同时接管同一个官方 Socket**。
+native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；洛雪 v2.2.0 要求 **Node.js 22.13.0 或更高版本**，低于该版本会拒绝启动源进程。补装及降级行为见安装指南。切换部署形态、跨目录接管（`--adopt`）和旧版本迁移应先阅读指南，**不要从多个目录同时接管同一个官方 Socket**。
 
 </details>
 
@@ -282,7 +284,7 @@ fnmusic-ext 代理（宿主机 systemd）
         ├── 缓存、转码、下载落库 ──► 本地曲库
         └── 按需调用音源服务
                 ├── musicdl   127.0.0.1:8768
-                ├── musicbox  127.0.0.1:8770
+                ├── netease   127.0.0.1:8770
                 └── lxmusic   127.0.0.1:8772
 
 飞牛桌面 / 管理员网关
@@ -301,7 +303,7 @@ fnmusic-ext 代理（宿主机 systemd）
 | 音源与管理服务 | 单个 `fnmusic-sources` 容器，supervisor 按需启停 | 宿主机 systemd + supervisord |
 | 配置与持久数据 | `.env`、`sources-data/` 等持久路径 | 共用相同配置与持久路径 |
 
-服务仅监听本机回环地址。通常只启用当前主音源及可选 WebUI；洛雪自身还包含解析服务，开启网易歌单常驻时可额外保留 musicbox。**切源不是把所有提供者一起启动搜索。**
+服务仅监听本机回环地址。通常只启用当前主音源及可选 WebUI；洛雪自身还包含解析服务，开启网易歌单常驻时可额外保留 netease。**切源不是把所有提供者一起启动搜索。**
 
 ## 常见问题
 
@@ -375,7 +377,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | [贡献指南](CONTRIBUTING.md) | 开发约定、提交与验证要求 |
 | [安全反馈](SECURITY.md) | 安全边界及漏洞报告方式 |
 
-核心代码：`proxy/` 负责代理与业务适配；`musicbox-service/`、`musicdl-service/`、`lxmusic-service/` 提供音源；`webui-service/` 提供管理页；`container/` 管理服务编排；`packaging/fpk/` 构建应用包。
+核心代码：`proxy/` 负责代理与业务适配；`netease-service/`、`musicdl-service/`、`lxmusic-service/` 提供音源；`webui-service/` 提供管理页；`container/` 管理服务编排；`packaging/fpk/` 构建应用包。
 
 ```bash
 # 离线测试统一入口；需先按贡献指南与 CI 准备各服务依赖
@@ -407,7 +409,7 @@ python3 scripts/run_tests.py
 感谢以下开源项目、社区及所有贡献者，让这份扩展成为可能：
 
 - [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl) — 多平台音乐能力。
-- [darknessomi/musicbox](https://github.com/darknessomi/musicbox) — 网易云音乐相关能力。
+- [@neteasecloudmusicapienhanced/api](https://github.com/neteasecloudmusicapienhanced/api) — 网易云音乐增强 API 服务。感谢 darknessomi/musicbox 的早期探索与贡献。
 - [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver) 与洛雪音乐社区 — 自定义源兼容基础。
 - 每一位提交代码、报告问题、完善文档和帮助验证的使用者。
 

@@ -139,7 +139,7 @@ def test_webui_supervisorctl_default_single_word_unchanged(monkeypatch, tmp_path
 
 def test_native_supervisor_template_programs_and_ports():
     text = (BASE / "container" / "supervisord-native.conf.in").read_text(encoding="utf-8")
-    for program in ("musicdl", "musicbox", "lxserver", "lxmusic", "webui"):
+    for program in ("musicdl", "netease", "lxserver", "lxmusic", "webui"):
         assert f"[program:{program}]" in text
     # 与容器发布端口一致（proxy 契约不变）；lxserver 保持回环 8005
     for port in ("8768", "8770", "8772", "8774", "8005"):
@@ -149,6 +149,11 @@ def test_native_supervisor_template_programs_and_ports():
     assert "WEBUI_SUPERVISORCTL=" in text
     for placeholder in ("@REPO@", "@VENV@", "@DATA@", "@RUN@"):
         assert placeholder in text
+    assert 'DATA_PATH="@DATA@/lxserver-meta"' in text
+    assert 'CONFIG_PATH="@DATA@/lxserver/config.js"' in text
+    assert 'LXSERVER_DATA_DIR="@DATA@/lxserver"' in text
+    assert 'LXSERVER_DIR="@REPO@/.lxserver"' in text
+    assert 'FNMUSIC_NODE_BIN="@NODE@"' in text
 
 
 def test_native_unit_template_shape():
@@ -158,6 +163,7 @@ def test_native_unit_template_shape():
     assert 'Environment="SUPERVISOR_CONF=@RUN@/supervisord.conf"' in text
     assert 'Environment="FNMUSIC_ENV_FILE=@REPO@/.env"' in text
     assert 'Environment="DATA_PATH=@DATA@/lxserver"' in text
+    assert 'Environment="LXSERVER_META_DATA_DIR=@DATA@/lxserver-meta"' in text
 
 
 # ------------------------------------------------- install.sh 形态解析/迁移 ---
@@ -277,6 +283,100 @@ def _write_stub(bindir: Path, name: str, body: str) -> None:
     p.chmod(0o755)
 
 
+def test_ensure_netease_deps_installs_and_reuses_matching_lock(tmp_path):
+    repo = tmp_path / "repo"
+    service = repo / "netease-service"
+    service.mkdir(parents=True)
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy(BASE / "netease-service" / name, service / name)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _write_stub(bindir, "node", "exit 0\n")
+    npm_log = tmp_path / "npm.log"
+    _write_stub(bindir, "npm", f'mkdir -p "{service}/node_modules"\necho "$*" >> "{npm_log}"\n')
+    text = (BASE / "ensure_sources_native.sh").read_text(encoding="utf-8")
+    body = (
+        'log_info() { :; }\nlog_err() { echo "$*" >&2; }\n'
+        + function(text, "ensure_netease_deps")
+        + '\nensure_netease_deps\n'
+    )
+    env = {
+        "BASE_DIR": str(repo),
+        "NODE_BIN": str(bindir / "node"),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+    }
+    first = run_bash(body, env=env)
+    assert first.returncode == 0, first.stderr
+    assert (service / "node_modules" / ".fnmusic-lock-sha256").is_file()
+    second = run_bash(body, env=env)
+    assert second.returncode == 0, second.stderr
+    assert len(npm_log.read_text().splitlines()) == 1
+    assert "ci --omit=dev --ignore-scripts" in npm_log.read_text()
+    with (service / "package-lock.json").open("a", encoding="utf-8") as lock_file:
+        lock_file.write("\n")
+    third = run_bash(body, env=env)
+    assert third.returncode == 0, third.stderr
+    assert len(npm_log.read_text().splitlines()) == 2
+
+
+def test_ensure_netease_deps_reports_install_failure(tmp_path):
+    repo = tmp_path / "repo"
+    service = repo / "netease-service"
+    service.mkdir(parents=True)
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy(BASE / "netease-service" / name, service / name)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _write_stub(bindir, "node", "exit 0\n")
+    _write_stub(bindir, "npm", "exit 42\n")
+    text = (BASE / "ensure_sources_native.sh").read_text(encoding="utf-8")
+    body = (
+        'log_info() { :; }\nlog_err() { echo "$*" >&2; }\n'
+        + function(text, "ensure_netease_deps")
+        + '\nensure_netease_deps\n'
+    )
+    result = run_bash(body, env={
+        "BASE_DIR": str(repo),
+        "NODE_BIN": str(bindir / "node"),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+    })
+    assert result.returncode != 0
+    assert "安装或校验失败" in result.stderr
+    assert not (service / "node_modules" / ".fnmusic-lock-sha256").exists()
+
+
+@pytest.mark.skipif(not os.environ.get("FNMUSIC_TEST_NPM_CACHE"), reason="no explicit offline npm cache")
+def test_ensure_netease_deps_with_real_npm_offline(tmp_path):
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    if not node or not npm:
+        pytest.skip("node and npm are required")
+    repo = tmp_path / "repo"
+    service = repo / "netease-service"
+    service.mkdir(parents=True)
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy(BASE / "netease-service" / name, service / name)
+    text = (BASE / "ensure_sources_native.sh").read_text(encoding="utf-8")
+    body = (
+        'log_info() { echo "$*"; }\nlog_err() { echo "$*" >&2; }\n'
+        + function(text, "ensure_netease_deps")
+        + '\nensure_netease_deps\n'
+    )
+    env = {
+        "BASE_DIR": str(repo),
+        "NODE_BIN": node,
+        "npm_config_cache": os.environ["FNMUSIC_TEST_NPM_CACHE"],
+        "npm_config_offline": "true",
+        "npm_config_audit": "false",
+        "npm_config_fund": "false",
+    }
+    first = run_bash(body, env=env)
+    assert first.returncode == 0, first.stderr
+    second = run_bash(body, env=env)
+    assert second.returncode == 0, second.stderr
+    assert "跳过联网安装" in second.stdout
+
+
 def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     repo = tmp_path / "repo"
     (repo / "container" / "lxserver-artifact").mkdir(parents=True)
@@ -284,23 +384,25 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     shutil.copy(BASE / "ensure_sources_native.sh", repo / "ensure_sources_native.sh")
     shutil.copy(BASE / "container/ensure_lxserver_native.sh",
                 repo / "container/ensure_lxserver_native.sh")
-    shutil.copy(BASE / "container/lxserver_compat.py", repo / "container/lxserver_compat.py")
-    compat = _load_module("container/lxserver_compat.py", "native_provision_compat_test")
-    upstream_api = "\n".join((compat.ANCHOR_BTOA, compat.ANCHOR_CALL_OLD, compat.ANCHOR_AES_OLD,
-                              compat.ANCHOR_RETRIES))
-    for req in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
+    upstream_api = (
+        "module.exports = {\n"
+        "  loadUserApi() { return {}; },\n"
+        "  extractMetadata() { return {name: 'fixture'}; },\n"
+        "};\n"
+    )
+    for req in ("musicdl-service", "lxmusic-service", "webui-service"):
         (repo / req).mkdir()
         (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
-    # 预置包：zip 布局对齐真实 v2.1.2（根级 index.js 为运行入口；
-    # server/server.js 存在时应打 getLyric Promise 补丁）
-    original_line = 'const result = await musicSdk[source].getLyric(songInfo);'
+    (repo / "netease-service").mkdir()
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy(BASE / "netease-service" / name, repo / "netease-service" / name)
+    # 预置包：zip 布局对齐真实 v2.2.0（根级 index.js 为运行入口，源执行模块
+    # 位于 server/server/sources/userApi.js）。
     artifact = repo / "container" / "lxserver-artifact" / "lx-test-server.zip"
     with zipfile.ZipFile(artifact, "w") as zf:
         zf.writestr("lx-music-sync-server/index.js", "#!/usr/bin/env node\nrequire('./server/server');\n")
-        zf.writestr("lx-music-sync-server/server/server.js", f"#!/usr/bin/env node\n{original_line}\n")
-        zf.writestr("lx-music-sync-server/server/server/userApi.js", upstream_api)
-        zf.writestr("lx-music-sync-server/server/server/customSourceHandlers.js",
-                    compat.ANCHOR_CAPABILITIES)
+        zf.writestr("lx-music-sync-server/server/server.js", "#!/usr/bin/env node\n")
+        zf.writestr("lx-music-sync-server/server/server/sources/userApi.js", upstream_api)
     sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
     native_tarball = repo / "container/lxserver-artifact/music-tag-native-linux-arm64-gnu-0.2.5.tgz"
     package_dir = tmp_path / "native-package" / "package"
@@ -328,8 +430,20 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
         (venv / "bin" / f).chmod(0o755)
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
-    _write_stub(stub_bin, "node", 'case "$1" in -p) echo 20 ;; *) echo "v20.0.0" ;; esac\n')
+    _write_stub(stub_bin, "node", '''case "$1" in
+  -p) echo "22.14.0" ;;
+  -e)
+    case "$2" in
+      *loadUserApi*) grep -q "loadUserApi" "$3" && grep -q "extractMetadata" "$3" || exit 1 ;;
+    esac
+    ;;
+  --version|-v) echo "v22.14.0" ;;
+esac
+exit 0
+''')
     _write_stub(stub_bin, "ffmpeg", 'echo "ffmpeg version 6.0" ; exit 0\n')
+    npm_log = tmp_path / "npm.log"
+    _write_stub(stub_bin, "npm", f'mkdir -p "{repo}/netease-service/node_modules"\necho run >> "{npm_log}"\n')
     env = {
         "BASE_DIR": str(repo),
         "FNMUSIC_PYTHON_BIN": sys.executable,
@@ -340,34 +454,30 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
     r = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env=env)
     assert r.returncode == 0, r.stderr
     server_js = repo / ".lxserver" / "server" / "server.js"
-    assert server_js.is_file()
+    api = repo / ".lxserver/server/server/sources/userApi.js"
     assert (repo / ".lxserver" / "index.js").is_file()
-    patched = server_js.read_text(encoding="utf-8")
-    assert "const result = await (_res && _res.promise ? _res.promise : _res);" in patched
+    assert api.is_file()
+    assert api.read_text(encoding="utf-8") == upstream_api
     assert (repo / ".lxserver" / ".provisioned-version").read_text().strip() == "vtest"
-    api = repo / ".lxserver/server/server/userApi.js"
-    patched_api = api.read_text()
-    for patch in (compat.PATCH_GLOBALS, compat.ANCHOR_CALL_NEW, compat.ANCHOR_AES_NEW):
-        assert patch in patched_api
-    # 同版本旧安装也必须补齐沙箱补丁，且不得重新解压覆盖其他在位文件。
-    api.write_text(upstream_api)
     # 真实包允许主脚本嵌套；幂等判定必须使用根入口而非 server/server.js。
     server_js.unlink()
     r2 = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env=env)
     assert r2.returncode == 0, r2.stderr
     assert "已就位" in r2.stdout
     assert not server_js.exists()
-    assert api.read_text() == patched_api
+    assert api.read_text(encoding="utf-8") == upstream_api
     r3 = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env=env)
     assert r3.returncode == 0, r3.stderr
-    assert api.read_text() == patched_api
+    assert api.read_text(encoding="utf-8") == upstream_api
+    assert not (repo / "container" / "lxserver_compat.py").exists()
+    assert npm_log.read_text().splitlines() == ["run"]
 
 
 def test_ensure_sources_native_rejects_bad_sha256(tmp_path):
     repo = tmp_path / "repo"
     (repo / "container" / "lxserver-artifact").mkdir(parents=True)
     shutil.copy(BASE / "ensure_sources_native.sh", repo / "ensure_sources_native.sh")
-    for req in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
+    for req in ("musicdl-service", "lxmusic-service", "webui-service"):
         (repo / req).mkdir()
         (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
     artifact = repo / "container" / "lxserver-artifact" / "lx-test-server.zip"
@@ -386,7 +496,7 @@ def test_ensure_sources_native_rejects_bad_sha256(tmp_path):
         (venv / "bin" / f).chmod(0o755)
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
-    _write_stub(stub_bin, "node", 'case "$1" in -p) echo 20 ;; *) echo v20 ;; esac\n')
+    _write_stub(stub_bin, "node", 'case "$1" in -p) echo 22.14.0 ;; --version|-v) echo v22.14.0 ;; esac\nexit 0\n')
     _write_stub(stub_bin, "ffmpeg", "exit 0\n")
     r = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env={
         "BASE_DIR": str(repo),
@@ -396,6 +506,50 @@ def test_ensure_sources_native_rejects_bad_sha256(tmp_path):
     assert r.returncode != 0
     assert "校验和不符" in (r.stderr + r.stdout)
     assert not (repo / ".lxserver").exists()
+
+
+def test_ensure_sources_native_rejects_wrong_user_api_exports(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "container" / "lxserver-artifact").mkdir(parents=True)
+    shutil.copy(BASE / "ensure_sources_native.sh", repo / "ensure_sources_native.sh")
+    shutil.copy(BASE / "container/ensure_lxserver_native.sh",
+                repo / "container/ensure_lxserver_native.sh")
+    for req in ("musicdl-service", "lxmusic-service", "webui-service"):
+        (repo / req).mkdir()
+        (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    artifact = repo / "container" / "lxserver-artifact" / "lx-test-server.zip"
+    with zipfile.ZipFile(artifact, "w") as zf:
+        zf.writestr("lx-music-sync-server/index.js", "#!/usr/bin/env node\n")
+        zf.writestr("lx-music-sync-server/server/server/sources/userApi.js",
+                    "module.exports = { onlyOneExport: true };\n")
+    sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    (repo / "container" / "lxserver.version").write_text(
+        f"LXSERVER_TAG=vtest\nLXSERVER_ZIP_NAME=lx-test-server.zip\nLXSERVER_SHA256={sha}\n",
+        encoding="utf-8",
+    )
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (venv / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    for name in ("python", "pip"):
+        (venv / "bin" / name).chmod(0o755)
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    _write_stub(stub_bin, "node", '''case "$1" in
+  -p) echo "22.14.0" ;;
+  -e) grep -q "loadUserApi" "$3" && grep -q "extractMetadata" "$3" || exit 1 ;;
+  --version|-v) echo "v22.14.0" ;;
+esac
+exit 0
+''')
+    _write_stub(stub_bin, "ffmpeg", "exit 0\n")
+    r = run_bash(f'bash "{repo}/ensure_sources_native.sh"', env={
+        "BASE_DIR": str(repo),
+        "FNMUSIC_VENV_SOURCES_DIR": str(venv),
+        "PATH": f"{stub_bin}:{os.environ['PATH']}",
+    })
+    assert r.returncode != 0
+    assert "导出不符合约定" in (r.stderr + r.stdout)
 
 
 def test_migrate_lx_url_native_to_docker_checks_host_file(tmp_path):

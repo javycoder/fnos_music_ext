@@ -14,7 +14,11 @@ export_source_env
 # 确保 lxserver 数据目录与初始配置就绪
 init_lxserver_config() {
     _lx_data="${DATA_PATH:-/data/lxserver}"
+    _lx_meta="${LXSERVER_META_DATA_DIR:-${_lx_data}-meta}"
     mkdir -p "${_lx_data}/backups" "${_lx_data}/users/source/_open"
+    # 共享 lxserver 只跑搜索/歌词等元数据接口，不加载用户源目录；独立
+    # DATA_PATH 仍保留空 users/source/_open，兼容上游启动时自检。
+    mkdir -p "${_lx_meta}/backups" "${_lx_meta}/users/source/_open"
     _cfg_file="${_lx_data}/config.js"
     if [ ! -f "${_cfg_file}" ] || (grep -q "frontend:" "${_cfg_file}" 2>/dev/null && ! grep -q "frontend.password" "${_cfg_file}" 2>/dev/null); then
         # 默认密码从环境变量获取，或缺省为 123456
@@ -118,7 +122,7 @@ wait_ready() {
 if [ "$(env_flag FNMUSIC_MUSICDL_ENABLED)" = "true" ]; then
     start_prog musicdl
 elif [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" = "true" ]; then
-    start_prog musicbox
+    start_prog netease
 elif [ "$(env_flag FNMUSIC_LX_ENABLED)" = "true" ]; then
     start_prog lxserver
     start_prog lxmusic
@@ -132,8 +136,9 @@ fi
 # 账号歌单（盘上有 cookie，登录启发）或网易公共歌单选择时，拉起 musicbox。
 # 权威校验由 webui 开机对账完成。原生形态 entrypoint 无 XDG 环境变量，可能
 # 找不到 cookie 而跳过——由 webui 开机对账兜底拉起。
-musicbox_cookie_present() {
-    for _f in "${XDG_DATA_HOME:-/nonexistent}/netease-musicbox/cookie.txt" \
+netease_cookie_present() {
+    for _f in "${XDG_DATA_HOME:-/nonexistent}/netease/session.json" \
+              "${XDG_DATA_HOME:-/nonexistent}/netease-musicbox/cookie.txt" \
               "${HOME:-/root}/.netease-musicbox/cookie.txt" \
               "${XDG_CONFIG_HOME:-/nonexistent}/netease-musicbox/cookie.txt"; do
         if [ -s "$_f" ]; then
@@ -143,7 +148,7 @@ musicbox_cookie_present() {
     return 1
 }
 
-public_musicbox_selected() {
+public_netease_selected() {
     [ "$(env_flag FNMUSIC_PUBLIC_PLAYLISTS_ENABLED)" = "true" ] || return 1
     python3 -c 'import json, os, sys
 sys.path[:0] = [sys.argv[2], "/srv"]
@@ -163,8 +168,8 @@ try:
     elif "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL" in values:
         rows = []
     else:
-        rows = json.loads(raw) if raw.strip() else [{"provider": "musicbox", "id": "3778678"}]
-    needed = isinstance(rows, list) and any(isinstance(x, dict) and x.get("provider") == "musicbox" and x.get("id") for x in rows)
+        rows = json.loads(raw) if raw.strip() else [{"provider": "netease", "id": "3778678"}]
+    needed = isinstance(rows, list) and any(isinstance(x, dict) and x.get("provider") in ("netease", "musicbox") and x.get("id") for x in rows)
 except (ValueError, TypeError, OSError):
     needed = False
 sys.exit(0 if needed else 1)' "$ENV_FILE" "$(dirname "$0")/.."
@@ -172,9 +177,9 @@ sys.exit(0 if needed else 1)' "$ENV_FILE" "$(dirname "$0")/.."
 
 if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_PLAYLIST_RESIDENT)" = "true" ] \
-   && { public_musicbox_selected \
-        || { [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ] && musicbox_cookie_present; }; }; then
-    start_prog musicbox
+   && { public_netease_selected \
+        || { [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ] && netease_cookie_present; }; }; then
+    start_prog netease
 fi
 
 # WebUI 默认随容器启动（--no-webui 安装会写 FNMUSIC_WEBUI_ENABLED=false）

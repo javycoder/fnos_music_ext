@@ -571,14 +571,14 @@ native_code_or_env_newer() {
     local epoch_start target
     epoch_start="$(native_unit_started_epoch)" || return 1
     for target in "${BASE_DIR}/.env" \
-                  "${BASE_DIR}/musicdl-service" "${BASE_DIR}/musicbox-service" \
+                  "${BASE_DIR}/musicdl-service" "${BASE_DIR}/netease-service" \
                   "${BASE_DIR}/lxmusic-service" "${BASE_DIR}/webui-service" \
                   "${BASE_DIR}/.lxserver"; do
         [ -e "${target}" ] || continue
         if [ -f "${target}" ]; then
             [ "$(stat -c %Y "${target}")" -gt "${epoch_start}" ] && return 0
         else
-            find "${target}" -type f \( -name '*.py' -o -name '*.js' -o -name '*.json' \
+            find "${target}" -type f \( -name '*.py' -o -name '*.js' -o -name '*.cjs' -o -name '*.json' \
                 -o -name '*.html' -o -name '*.css' -o -name '*.txt' \) \
                 -not -path '*/__pycache__/*' -newermt "@${epoch_start}" \
                 -print -quit 2>/dev/null | grep -q . && return 0

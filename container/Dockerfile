@@ -5,6 +5,8 @@ FROM ${BASE_IMAGE}
 
 ARG PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/
 ARG APT_MIRROR="https://mirrors.tencent.com"
+ARG NODE_VERSION=v22.14.0
+ARG NODE_DIST_MIRROR="https://nodejs.org/dist"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -19,7 +21,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
-# nodejs（洛雪自定义源 Node 沙箱，trixie 自带 20.x）/ ffmpeg（musicdl 转封装）/ supervisor
+# lxserver v2.2.0 要求 Node >=22.13.0；Debian trixie 自带的 20.x 不够，
+# 因此从官方发行包安装固定版本，并在同层立即校验完整版本号。
+# ffmpeg（musicdl 转封装）/ supervisor 仍走发行版包。
 # apt 源默认国内镜像（与 pip 同策略，APT_MIRROR 可覆盖），仅在本构建层内临时替换。
 # 构建容器无法复用"指向本机"的宿主 DNS（Docker 会剔除 127.x 并回退 8.8.8.8，国内不可达），
 # 因此不探测、始终把国内可达的公共 DNS 写到最前（写入失败不中断）；apt-get update
@@ -62,15 +66,36 @@ RUN set -eu; \
         echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
         exit 1; \
     fi; \
-    apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates unzip curl; \
+    apt-get install -y --no-install-recommends ffmpeg supervisor ca-certificates unzip curl xz-utils; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
+
+# Node 发行包同时校验官方 SHASUMS256；镜像仅改变下载源，不改变被校验的文件名。
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) node_arch="x64" ;; \
+        arm64) node_arch="arm64" ;; \
+        *) echo "ERROR: 不支持的 Node 架构 $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    node_file="node-${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    for mirror in "${NODE_DIST_MIRROR}" "https://npmmirror.com/mirrors/node"; do \
+        base="${mirror%/}/${NODE_VERSION}"; \
+        if curl -fSL --connect-timeout 15 --max-time 300 "${base}/${node_file}" -o "/tmp/${node_file}" \
+            && curl -fSL --connect-timeout 15 --max-time 60 "${base}/SHASUMS256.txt" -o /tmp/SHASUMS256.txt; then \
+            break; \
+        fi; \
+    done; \
+    test -s "/tmp/${node_file}" && test -s /tmp/SHASUMS256.txt; \
+    (cd /tmp && grep "  ${node_file}\$" SHASUMS256.txt | sha256sum -c -); \
+    tar -xJf "/tmp/${node_file}" -C /usr/local --strip-components=1; \
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a < 22 || (a === 22 && b < 13)) { console.error(`Node ${process.versions.node} < 22.13.0`); process.exit(1); }'; \
+    node --version; \
+    npm --version
 
 # 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装）
 # 构建容器 DNS 失败自愈同 apt 步骤（resolv.conf 改写不跨 RUN 层持久，需每步自带）；
 # 镜像源安装失败自动回退官方 PyPI 重试
 COPY musicdl-service/requirements.txt /srv/req.musicdl
-COPY musicbox-service/requirements.txt /srv/req.musicbox
 COPY lxmusic-service/requirements.txt /srv/req.lxmusic
 COPY webui-service/requirements.txt /srv/req.webui
 RUN set -eu; \
@@ -82,22 +107,21 @@ RUN set -eu; \
         cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     fix_dns; \
-    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui \
+    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.lxmusic -r /srv/req.webui \
     || { echo "[WARN] pip 镜像源（${PIP_INDEX_URL}）安装失败，回退官方 PyPI 重试..." >&2; \
          pip install --no-cache-dir -i https://pypi.org/simple \
-            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
+            -r /srv/req.musicdl -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
 RUN groupadd -g 1000 appuser \
     && useradd -m -u 1000 -g 1000 appuser \
-    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/logs \
+    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/lxserver-meta /data/logs \
     && chown -R appuser:appuser /data
 
 # lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
 ARG LXSERVER_MIRROR="https://ghfast.top"
 COPY container/lxserver.version /srv/lxserver.version
 COPY container/lxserver-artifact/ /srv/lxserver-artifact/
-COPY container/lxserver_compat.py /srv/lxserver_compat.py
 COPY container/ensure_lxserver_native.sh /usr/local/bin/ensure-lxserver-native
 RUN set -eu; \
     . /srv/lxserver.version; \
@@ -138,37 +162,50 @@ RUN set -eu; \
     else \
         cp -a /srv/lxserver-tmp/. /srv/lxserver/; \
     fi; \
-    if [ -f /srv/lxserver/server/server.js ]; then \
-        sed -i 's/const result = await musicSdk\[source\]\.getLyric(songInfo);/const _res = musicSdk[source].getLyric(songInfo); const result = await (_res \&\& _res.promise ? _res.promise : _res);/g' /srv/lxserver/server/server.js; \
-    fi; \
-    if [ -f /srv/lxserver/server/server/userApi.js ]; then \
-        python3 /srv/lxserver_compat.py /srv/lxserver/server/server/userApi.js; \
-    fi; \
+    test -f /srv/lxserver/server/server/sources/userApi.js; \
+    node -e 'const u=require("/srv/lxserver/server/server/sources/userApi.js"); if (typeof u.loadUserApi !== "function" || typeof u.extractMetadata !== "function") process.exit(1)'; \
     chmod 0755 /usr/local/bin/ensure-lxserver-native; \
     /usr/local/bin/ensure-lxserver-native \
         --artifact-dir /srv/lxserver-artifact \
         --lxserver-dir /srv/lxserver \
         --version-file /srv/lxserver.version; \
-    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact /srv/lxserver_compat.py; \
+    rm -rf /srv/lxserver-tmp /srv/lxserver-artifact; \
     chown -R appuser:appuser /srv/lxserver
+
+# netease-service npm 依赖
+COPY --chown=appuser:appuser netease-service/package.json netease-service/package-lock.json /srv/netease-service/
+RUN set -eu; \
+    cd /srv/netease-service; \
+    npm ci --omit=dev --ignore-scripts; \
+    chown -R appuser:appuser /srv/netease-service
+COPY --chown=appuser:appuser netease-service/service.js netease-service/app.js /srv/netease-service/
 
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
 COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/worker.py /srv/musicdl-service/
-COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py /srv/musicbox-service/
 # 音质 + 播放编排新模块随本轮一并分发：
 #   proxy/quality_policy.py        —— A 组（主智能体）共享七档音质策略
 #   lxmusic-service/playback_policy.py —— B 组（洛雪）播放编排
 # 两个文件属其他并行分支，本轮合入前文件可能尚不存在：那时 COPY 会失败，
 # 这是刻意保留的硬失败——不能删掉 COPY 行绕过，否则容器里缺少模块会在
 # 运行期才报 ModuleNotFoundError。集成时请先确认两个文件已落盘。
-COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py lxmusic-service/playback_policy.py /srv/lxmusic-service/
+COPY --chown=appuser:appuser \
+    lxmusic-service/app.py \
+    lxmusic-service/lxserver_client.py \
+    lxmusic-service/managed_client.py \
+    lxmusic-service/playback_policy.py \
+    lxmusic-service/source_cpu.py \
+    lxmusic-service/source_runtime.py \
+    lxmusic-service/verify_source.py \
+    lxmusic-service/source_worker.cjs \
+    lxmusic-service/lx_vm_bridge.cjs \
+    /srv/lxmusic-service/
 COPY --chown=appuser:appuser webui-service/app.py webui-service/config_jobs.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui/lxmusic/musicbox 复用 proxy 模块（.env 安全合并 + 统一日志 fnlog），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/publicplaylists.py proxy/quality_policy.py proxy/userstorage.py proxy/version.py /srv/proxy/
+COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/netease_legacy.py proxy/publicplaylists.py proxy/quality_policy.py proxy/userstorage.py proxy/version.py /srv/proxy/
 COPY --chown=appuser:appuser VERSION RELEASE_CHANNEL /srv/
 RUN chmod 0644 /srv/VERSION /srv/RELEASE_CHANNEL \
-    && find /srv -name "*.py" -exec chmod 0644 {} + \
+    && find /srv -type f \( -name "*.py" -o -name "*.cjs" \) -exec chmod 0644 {} + \
     && mkdir -p /repo \
     && chmod 0755 /repo /data
 

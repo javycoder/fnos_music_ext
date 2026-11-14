@@ -16,11 +16,14 @@ def _guid(value: object, label: str = "用户 GUID") -> str:
 
 
 def _absolute_path(value: str, label: str) -> str:
-    path = os.path.realpath(os.path.abspath(str(value or "").strip()))
-    if not os.path.isabs(path) or path == os.sep:
+    raw_path = str(value or "").strip()
+    if not os.path.isabs(raw_path):
         raise ValueError(f"{label}必须是绝对目录")
-    if ".." in path.split(os.sep) or any(ord(char) < 32 for char in path):
+    if ".." in raw_path.split(os.sep) or any(ord(char) < 32 or ord(char) == 127 for char in raw_path):
         raise ValueError(f"{label}包含非法字符")
+    path = os.path.realpath(raw_path)
+    if path == os.sep:
+        raise ValueError(f"{label}必须是绝对目录")
     return path
 
 

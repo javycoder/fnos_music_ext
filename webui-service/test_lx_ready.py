@@ -742,3 +742,53 @@ def test_status_source_query_failure_preserves_last_error(env_file, procs, lx_ht
     assert result["state"] == "unavailable"
     assert result["last_error"] == "upstream detail"
     assert result["error"] == "query failed"
+
+
+def test_status_preserves_source_cpu_usage_and_runtime_identity(env_file, procs, lx_http, client):
+    snapshot = {
+        "state": "degraded",
+        "sources": [{
+            "id": "a.js",
+            "name": "源A",
+            "url": "file:///data/lxserver/users/source/_open/a.js",
+            "status": "success",
+            "runtime_id": "r1",
+            "process_state": "running",
+            "resource_usage": {
+                "monitoring_status": "ok",
+                "cpu_basis": "single_core",
+                "cpu_percent": 78.4,
+                "threshold_percent": 50.0,
+                "required_duration_s": 180,
+                "high_duration_s": 185.0,
+                "abnormal": True,
+                "reason": "sustained_source_cpu",
+                "detected_at": "2026-01-01T00:00:00+00:00",
+                "runtime_id": "r1",
+            },
+        }],
+    }
+
+    def health(request):
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"ok": True, "user_source": snapshot})
+        pytest.fail("healthz 已含源快照，不应再次查询 source")
+
+    webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(health))
+    result = client.get("/api/status").json()["lx_source"]
+    source = result["sources"][0]
+    assert source["runtime_id"] == "r1"
+    assert source["process_state"] == "running"
+    assert source["resource_usage"]["abnormal"] is True
+    assert source["resource_usage"]["cpu_percent"] == 78.4
+    assert source["resource_usage"]["runtime_id"] == "r1"
+
+
+def test_lx_cpu_help_copy_and_template_are_shipped():
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'data-help-id="lx-source-cpu"' in html
+    assert "该 LX 音源脚本进程曾连续三分钟占用超过单个 CPU 核心 50% 的计算资源。" in html
+    assert "此标记针对独立运行的第三方音源脚本进程，不表示本项目主服务进程出现 CPU 异常。" in html
+    assert "标记会保留至该源停用或进程重新启动。当前 CPU 降低不会自动清除标记。" in html
+    assert 'data-cpu-help="reading"' in html
+    assert 'data-cpu-help="runtime"' in html

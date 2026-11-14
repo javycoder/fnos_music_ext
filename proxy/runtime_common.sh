@@ -85,12 +85,24 @@ runtime_node_ok() {
         resolved="$(command -v "${bin}" 2>/dev/null || true)"
         [ -n "${resolved}" ] && [ -x "${resolved}" ] || return 1
     fi
-    local major
-    major="$("${resolved}" -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
-    case "${major}" in
-        ''|*[!0-9]*) return 1 ;;
+    local version major minor
+    version="$("${resolved}" -p 'process.versions.node' 2>/dev/null || true)"
+    IFS=. read -r major minor _ <<<"${version}"
+    case "${major}:${minor}" in
+        ''|:*|*:|*[!0-9:]*) return 1 ;;
     esac
-    [ "${major}" -ge 20 ]
+    [ "${major}" -gt 22 ] || { [ "${major}" -eq 22 ] && [ "${minor}" -ge 13 ]; }
+}
+
+runtime_node_version() {
+    local bin="$1"
+    local resolved
+    if [[ "${bin}" == */* ]]; then
+        resolved="${bin}"
+    else
+        resolved="$(command -v "${bin}" 2>/dev/null || true)"
+    fi
+    [ -n "${resolved}" ] && "${resolved}" -p 'process.versions.node' 2>/dev/null || echo unknown
 }
 
 choose_node_bin() {

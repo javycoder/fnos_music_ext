@@ -568,12 +568,14 @@ async def _live_lx_sources(client, permitted: list[str] | None) -> list[str]:
 
 
 async def _fetch_new_candidates(musicbox_client, netease_enabled: bool,
-                                lx_client, lx_enabled: bool, lx_sources: list[str] | None) -> list[dict]:
+                                lx_client, lx_enabled: bool, lx_sources: list[str] | None,
+                                netease_client=None) -> list[dict]:
+    active_netease = netease_client if netease_client is not None else musicbox_client
     candidates = []
-    if netease_enabled and musicbox_client is not None:
+    if netease_enabled and active_netease is not None:
         try:
-            candidates.extend(await rec.fetch_musicbox_recommend(
-                musicbox_client, "/api/v1/toplist", {"index": 1, "limit": 100}))
+            candidates.extend(await rec.fetch_netease_recommend(
+                active_netease, "/api/v1/toplist", {"index": 1, "limit": 100}))
         except Exception as error:
             logger.warning("liked netease new-song fetch failed: %s", error)
     if lx_enabled and lx_client is not None:
@@ -648,7 +650,9 @@ async def build_llm_bundle(
     source_fingerprint: str | None = None, *, publication_guard=None,
     get_source_fingerprint=None, source_enabled=None, verify_playable=None,
     online_favorites=None, online_history: list[dict] | None = None,
+    netease_client=None,
 ) -> dict:
+    active_netease = netease_client if netease_client is not None else musicbox_client
     """Build privately, then publish under the account lock without an intervening await.
 
     publication_guard() synchronously checks the app's captured generation epoch/task.
@@ -726,7 +730,7 @@ async def build_llm_bundle(
     excluded_ids, favorite_keys = rec.collect_exclude_sets(favorites)
     excluded_keys.update(favorite_keys)
     try:
-        items = await _fetch_new_candidates(musicbox_client, netease_enabled, lx_client, lx_enabled, lx_sources)
+        items = await _fetch_new_candidates(active_netease, netease_enabled, lx_client, lx_enabled, lx_sources)
     except Exception as error:
         logger.warning("liked new candidates unavailable: %s", error)
         items = []
@@ -736,7 +740,7 @@ async def build_llm_bundle(
         if guid.startswith("online:netease:"):
             enabled = (bool(guid[len("online:netease:"):]) and netease_enabled
                        and track.get("source", "netease") == "netease"
-                       and (musicbox_client is not None or verify_playable is not None))
+                       and (active_netease is not None or verify_playable is not None))
         elif guid.startswith("online:lx:"):
             parts = guid.split(":")
             platform = parts[2] if len(parts) >= 4 and parts[3] else ""
@@ -768,7 +772,7 @@ async def build_llm_bundle(
                     or built_key in online_keys or not allowed(track)):
                 continue
             playable = (await _await_value(verify_playable(track)) if verify_playable is not None
-                        else await rec.verify_track_playable(track, None, musicbox_client, lx_client))
+                        else await rec.verify_track_playable(track, None, active_netease, lx_client))
             if not playable:
                 continue
             online_ids.add(identifier)

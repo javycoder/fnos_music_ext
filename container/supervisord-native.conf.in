@@ -15,7 +15,7 @@ logfile_maxbytes=0
 pidfile=@RUN@/supervisord.pid
 ; 全部子进程的公共环境：PATH 前置 venv（uvicorn/supervisorctl/musicbox CLI）、
 ; 数据目录对齐容器卷映射（sources-data = 容器 /data，仓库 = 容器 /repo）
-environment=PATH="@SOURCES_PATH@",PYTHONUNBUFFERED="1",FNMUSIC_ENV_FILE="@REPO@/.env",XDG_DATA_HOME="@DATA@",XDG_CACHE_HOME="@DATA@/cache",XDG_CONFIG_HOME="@DATA@/config",LX_DATA_DIR="@DATA@/lxmusic",LXSERVER_DATA_DIR="@DATA@/lxserver",FNMUSIC_FFMPEG_BIN="@FFMPEG@",FNMUSIC_FFPROBE_BIN="@FFPROBE@"
+environment=PATH="@SOURCES_PATH@",PYTHONUNBUFFERED="1",FNMUSIC_ENV_FILE="@REPO@/.env",XDG_DATA_HOME="@DATA@",XDG_CACHE_HOME="@DATA@/cache",XDG_CONFIG_HOME="@DATA@/config",LX_DATA_DIR="@DATA@/lxmusic",LXSERVER_DATA_DIR="@DATA@/lxserver",LXSERVER_META_DATA_DIR="@DATA@/lxserver-meta",FNMUSIC_FFMPEG_BIN="@FFMPEG@",FNMUSIC_FFPROBE_BIN="@FFPROBE@"
 
 [unix_http_server]
 file=@RUN@/supervisor.sock
@@ -40,16 +40,17 @@ stdout_logfile=@RUN@/musicdl.log
 stdout_logfile_maxbytes=0
 redirect_stderr=true
 
-[program:musicbox]
-directory=@REPO@/musicbox-service
-command="@VENV@/bin/uvicorn" app:app --host 127.0.0.1 --port 8770
+[program:netease]
+directory=@REPO@/netease-service
+command="@NODE@" app.js
+environment=HOST="127.0.0.1",PORT="8770",SOURCES_DATA_DIR="@DATA@"
 autostart=false
 autorestart=true
 startretries=5
 stopsignal=TERM
 stopasgroup=true
 killasgroup=true
-stdout_logfile=@RUN@/musicbox.log
+stdout_logfile=@RUN@/netease.log
 stdout_logfile_maxbytes=0
 redirect_stderr=true
 
@@ -71,11 +72,14 @@ stdout_logfile=@REPO@/logs/lxserver.log
 stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=3
 redirect_stderr=true
-environment=DATA_PATH="@DATA@/lxserver",CONFIG_PATH="@DATA@/lxserver/config.js",PORT="8005",BIND_IP="127.0.0.1"
+; 共享元数据服务使用独立 DATA_PATH；用户源仍由 lxmusic 进程的
+; LXSERVER_DATA_DIR=@DATA@/lxserver 接管，避免上游扫描用户脚本目录。
+environment=DATA_PATH="@DATA@/lxserver-meta",CONFIG_PATH="@DATA@/lxserver/config.js",PORT="8005",BIND_IP="127.0.0.1"
 
 [program:lxmusic]
 directory=@REPO@/lxmusic-service
 command="@VENV@/bin/uvicorn" app:app --host 127.0.0.1 --port 8772
+environment=LXSERVER_DATA_DIR="@DATA@/lxserver",LXSERVER_DIR="@REPO@/.lxserver",FNMUSIC_NODE_BIN="@NODE@"
 autostart=false
 autorestart=true
 startretries=5

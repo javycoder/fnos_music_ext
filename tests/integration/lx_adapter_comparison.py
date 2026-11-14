@@ -169,6 +169,7 @@ class CandidateComparisonRequest:
     resolver: Callable[[str, int], Sequence[str]] | None = None  # 仅测试注入
     dial: Callable[[tuple[str, int], float], socket.socket] | None = None  # 仅测试注入
     ssl_context: ssl.SSLContext | None = None             # 仅测试注入自签 CA
+    project_client: Any | None = None                     # 可选：已启动的项目单源托管客户端
 
 
 # --------------------------------------------------------- URL 与地址校验 --
@@ -835,7 +836,10 @@ _SNAPSHOT_MARKERS = (
     "async def _attempt_pinned(",
     "async def probe_url(",
     "def _media_signature(",
+)
+_SNAPSHOT_LXSERVER_MARKERS = (
     "LXSERVER = LxServerClient(",
+    "LXSERVER = ManagedLxServerClient(",
 )
 _SNAPSHOT_SIBLINGS = (
     ("lxserver_client.py", "class LxServerClient"),
@@ -863,6 +867,8 @@ def _validate_snapshot(path: Path) -> None:
     for marker in _SNAPSHOT_MARKERS:
         if marker not in text:
             raise ComparisonConfigError("快照缺少真实 app 入口")
+    if not any(marker in text for marker in _SNAPSHOT_LXSERVER_MARKERS):
+        raise ComparisonConfigError("快照缺少真实 app 入口")
     for filename, marker in _SNAPSHOT_SIBLINGS:
         sibling = path.parent / filename
         if not sibling.is_file():
@@ -1004,6 +1010,9 @@ class _RecordingNativeClient:
         self.error_type = ""
 
     async def get_music_url(self, *args, **kwargs):
+        # 原生对照只能走 lxserver 的普通解析入口；source_id 是项目单源托管
+        # 客户端的扩展参数，不能透传给不认识它的 LxServerClient。
+        kwargs.pop("source_id", None)
         try:
             response = await self._client.get_music_url(*args, **kwargs)
         except Exception as exc:
@@ -1221,7 +1230,7 @@ async def compare_candidate(request: CandidateComparisonRequest) -> dict:
     capture = _StageCapture()
     app_logger.addHandler(capture)
     old_lxserver = module.LXSERVER
-    module.LXSERVER = recorder
+    module.LXSERVER = request.project_client if request.project_client is not None else recorder
     attempt = None
     native_url = ""
     try:
@@ -1230,6 +1239,24 @@ async def compare_candidate(request: CandidateComparisonRequest) -> dict:
             report["deadline_exhausted"] = True
             report["stages"]["deadline"] = "exhausted"
             return report
+        if request.project_client is not None:
+            # 项目侧使用托管单源客户端时，原生侧仍需单独取证；两次调用共享同一
+            # 剩余预算，且这里不传 source_id，避免把项目结果记成原生结果。
+            try:
+                native_response = await native_client.get_music_url(
+                    request.song_info,
+                    lx_quality,
+                    exclude_api_sources=None,
+                    request_timeout=max(0.01, min(left, 2.0)),
+                    auto_switch_api_source=False,
+                )
+                recorder.last_response = (
+                    dict(native_response) if isinstance(native_response, dict) else None
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 只留受控类型
+                recorder.error_type = type(exc).__name__
         track_id = str(
             request.song_info.get("id")
             or f"lx:{platform}:{request.song_info.get('songmid') or ''}"

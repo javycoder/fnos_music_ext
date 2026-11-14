@@ -37,7 +37,7 @@ PHASES = (
 )
 SUITES = {name: paths for phase in PHASES for name, paths in phase.items()}
 COVERAGE_TARGETS = (
-    "proxy", "lxmusic-service", "musicdl-service", "musicbox-service", "webui-service",
+    "proxy", "lxmusic-service", "musicdl-service", "webui-service",
 )
 PROXY_ROOT = "proxy/tests"
 # Files whose tests bind host-level resources (shell scripts, sockets, nginx,
@@ -53,7 +53,6 @@ PROXY_EXCLUSIVE = (
     "test_maintenance.py",
     "test_maintenance_jobs.py",
     "test_maintenance_socket.py",
-    "test_musicbox_service.py",
     "test_musicdl_distribution.py",
     "test_native_deploy.py",
     "test_netease_sky_quality.py",
@@ -185,9 +184,18 @@ def run_phase(
                 # Shards share one checkout, so give each interpreter its own app
                 # home, registry and caches; no two processes write the same file.
                 isolated = work / name
-                for sub in ("home", "logs", "cache", "library", "fav", "tmp"):
+                for sub in ("home", "logs", "cache", "config", "data", "library", "fav", "tmp"):
                     (isolated / sub).mkdir(parents=True, exist_ok=True)
+                env.pop("NETEASE_COOKIE", None)
                 env.update({
+                    "HOME": str(isolated / "home"),
+                    "XDG_CACHE_HOME": str(isolated / "cache"),
+                    "XDG_CONFIG_HOME": str(isolated / "config"),
+                    "XDG_DATA_HOME": str(isolated / "data"),
+                    "XDG_RUNTIME_DIR": str(isolated / "tmp"),
+                    "WEBUI_REPO_DIR": str(isolated / "home"),
+                    "SOURCES_DATA_DIR": str(isolated / "data"),
+                    "NETEASE_SESSION_FILE": str(isolated / "data" / "netease" / "session.json"),
                     "FNMUSIC_HOME": str(isolated / "home"),
                     "FNMUSIC_LOG_DIR": str(isolated / "logs"),
                     "FNMUSIC_ALBUM_REGISTRY": str(isolated / "home" / "album_registry.json"),

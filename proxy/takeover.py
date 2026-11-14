@@ -460,7 +460,7 @@ def wait_ready(state, seconds):
             body, peer = request(state.target, '/_ext/healthz', min(4, max(0.01, deadline-time.monotonic())))
             if body.get('ok') is True and body.get('upstream') == 'ok' and peer == current['process']:
                 return
-            keys = ('upstream', 'musicdl', 'musicbox', 'lxmusic')
+            keys = ('upstream', 'musicdl', 'netease', 'musicbox', 'lxmusic')
             allowed = ('ok', 'error', 'disabled', 'timeout', 'unavailable')
             reason = 'dependencies: ' + ','.join(k+'='+ (str(body.get(k)) if body.get(k) in allowed else 'not-ready') for k in keys)
         except (OSError, ValueError, Unsafe) as exc:
@@ -517,7 +517,7 @@ _SAFE_OUTCOME = re.compile(
     r'Tee handoff resume rejected for [!-~]{1,120}|'
     r'Background full fetch (?:failed|finalize rejected) for [!-~]{1,120}(?:: [A-Za-z_]{1,40})?|'
     r'Failed to fetch online search from (?:musicdl|lxmusic)|'
-    r'Failed to fetch musicbox search|musicdl search partial errors|'
+    r'Failed to fetch (?:netease|musicbox) search|musicdl search partial errors|'
     r'Suggest musicdl error|Stream startup failed|'
     r'Stream aborted mid-way for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'
     r'tee disk write failed for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'
@@ -527,7 +527,7 @@ _SAFE_OUTCOME = re.compile(
     r'album detail not synthesizable: source=[!-~]{1,40}|'
     r'forward-unhandled (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,140}(?: \(\#[0-9]+\))?|'
     r'Upstream auth probe failed|'
-    r'(?:musicbox|lxmusic|musicdl)(?: /info| lyric fetch(?: in _online_info)?)? failed|'
+    r'(?:netease|musicbox|lxmusic|musicdl)(?: /info| lyric fetch(?: in _online_info)?)? failed|'
     r'lyric sidecar fetch failed|resolve_(?:lx|netease)_url error|'
     r'llm call failed|daily recommend (?:peek|list inject|llm branch|fallback branch) failed|'
     r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge)|'

@@ -1,12 +1,9 @@
 """lxmusic-service/verify_source.py
-洛雪自定义源可用性端到端校验 (基于 lxserver 后端)。
+洛雪自定义源可用性端到端校验。
 
-校验链路：
-1. 下载 / 读取脚本文本并校验头部元数据；
-2. 作为临时源导入 lxserver 沙箱；
-3. 读取声明的平台与音质；
-4. 抽取标准关键词 (晴天、江南等) 发起搜索并调用解析 + Range 媒体探活；
-5. 清理临时源并输出结构化校验报告。
+每次校验使用独立的临时数据目录和独立 SourceRuntimeManager。脚本只会在本次
+校验创建的临时 Node 进程中执行，不会上传、启停或复用正在播放的同名源。
+搜索仍复用共享 lxserver 的元数据接口，解析固定在本次测试源实例上。
 """
 
 from __future__ import annotations
@@ -17,7 +14,9 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
+import tempfile
 import time
 from typing import Sequence
 import urllib.parse
@@ -30,28 +29,52 @@ from lxserver_client import (
     DEFAULT_ADMIN_PASSWORD,
     DEFAULT_LXSERVER_URL,
     LxServerClient,
-    UnsafeVmRequired,
     SUPPORTED_PLATFORMS,
+    UnsafeVmRequired,
     is_lxserver_unreachable,
     normalize_source,
     serialize_source_operation,
+)
+from source_runtime import (
+    SourceInitializationFailed,
+    SourceProcessBusy,
+    SourceProcessUnavailable,
+    SourceResolveTimeout,
+    SourceRuntimeError,
+    SourceRuntimeManager,
+    SourceUnsafeVmRequired,
+    parse_script_metadata,
 )
 
 from proxy.quality_policy import QUALITY_LEVELS, to_lx_quality
 
 VERIFY_KEYWORDS = ("晴天", "江南", "十年", "倔强")
 _LX_QUALITY_ORDER = tuple(to_lx_quality(q) for q in reversed(QUALITY_LEVELS))
-_PROBE_TIMEOUT = 12.0
 _SAMPLE_BUDGET_S = 90.0
-_VERIFY_BUDGET_S = 110.0  # 外层 120s 之前预留 cleanup/close 的 4s 及调度余量。
-_CLEANUP_TIMEOUT_S = 3.0
+_VERIFY_BUDGET_S = 110.0
+_RESOLVE_ATTEMPT_BUDGET_S = 20.0
+_CLEANUP_TIMEOUT_S = 4.0
 _CLOSE_TIMEOUT_S = 1.0
+_MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 logger = logging.getLogger("lxmusic_service")
 
 
 def _new_temp_client(**kwargs) -> LxServerClient:
-    """创建校验用临时 lxserver 客户端。"""
+    """临时元数据/搜索客户端；不承担源管理或解析。"""
+
     return LxServerClient(**kwargs)
+
+
+def _new_temp_manager(source_root: str | Path, **kwargs) -> SourceRuntimeManager:
+    """每次校验独立的管理器；调用方随后必须 close。"""
+
+    return SourceRuntimeManager(
+        source_root=source_root,
+        init_timeout_s=min(20.0, _VERIFY_BUDGET_S),
+        stop_budget_s=2.0,
+        **kwargs,
+    )
+
 
 _NET_DEAD_MARKERS = (
     "ECONNREFUSED",
@@ -93,7 +116,8 @@ def _looks_like_json_source(script: str) -> bool:
 
 
 async def download_script(url: str, timeout: float = 20.0) -> str:
-    """下载或读取脚本内容。支持 http(s):// 与 file://"""
+    """下载或读取脚本内容。支持 http(s):// 与 file://。"""
+
     url = url.strip()
     if url.startswith("file://"):
         raw = urllib.parse.unquote(url[len("file://"):])
@@ -105,53 +129,44 @@ async def download_script(url: str, timeout: float = 20.0) -> str:
         path = raw
         if not os.path.isfile(path):
             raise ValueError(f"本地文件不存在: {path}")
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        if os.path.getsize(path) > _MAX_SCRIPT_BYTES:
+            raise ValueError("本地脚本超过 2 MiB 上限")
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            raise ValueError(f"下载失败 (HTTP {resp.status_code})")
-        return resp.text
+        async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+            if response.status_code != 200:
+                raise ValueError(f"下载失败 (HTTP {response.status_code})")
+            chunks = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(chunks) + len(chunk) > _MAX_SCRIPT_BYTES:
+                    raise ValueError("脚本超过 2 MiB 上限")
+                chunks.extend(chunk)
+    return chunks.decode("utf-8", errors="replace")
 
 
 def parse_script_meta(script: str) -> dict:
-    meta = {"name": "", "description": "", "version": "1.0.0", "author": ""}
-    # 与 lxserver extractMetadata 同契约：优先解析 /*! 或 /** 块注释
-    block = re.search(r"/\*[*!]([\s\S]*?)\*/", script)
-    lines = block.group(1).splitlines() if block else script.splitlines()[:50]
-    for line in lines:
-        line = line.strip()
-        m = re.search(r"@(\w+)\s+(.+)", line)
-        if m:
-            key = m.group(1).lower()
-            val = m.group(2).strip()
-            if key in meta:
-                meta[key] = val
-    if not meta["name"]:
-        # 从内容猜测
-        meta["name"] = "custom_source"
-    return meta
+    parsed = parse_script_metadata(script, "custom_source")
+    return {
+        "name": parsed.name,
+        "description": parsed.description,
+        "version": parsed.version,
+        "author": parsed.author,
+        "homepage": parsed.homepage,
+    }
 
 
-async def _cleanup_verification_client(
-    client: LxServerClient, created_id: str | None, changed_reused_id: str | None,
+async def _cleanup_verification_runtime(
+    manager: SourceRuntimeManager,
+    client: LxServerClient,
+    temp_root: str | Path,
 ) -> None:
-    """在持锁的原 Task 内有界恢复；不能用 wait_for/shield 派生新锁 owner。"""
     try:
         async with asyncio.timeout(_CLEANUP_TIMEOUT_S):
-            if created_id:
-                if await client.delete_custom_source(created_id) is False:
-                    raise RuntimeError("delete returned false")
-            elif changed_reused_id:
-                if await client.toggle_custom_source(changed_reused_id, False) is False:
-                    raise RuntimeError("toggle returned false")
+            await manager.close()
     except (Exception, asyncio.CancelledError) as exc:
-        logger.warning(
-            "verify_source cleanup failed (%s source %s): %s",
-            "delete created" if created_id else "restore reused",
-            created_id or changed_reused_id or "none", type(exc).__name__,
-        )
+        logger.warning("verify_source runtime cleanup failed: %s", type(exc).__name__)
         if isinstance(exc, asyncio.CancelledError):
             raise
     finally:
@@ -162,22 +177,41 @@ async def _cleanup_verification_client(
             logger.warning("verify_source client close failed: %s", type(exc).__name__)
             if isinstance(exc, asyncio.CancelledError):
                 raise
+        finally:
+            shutil.rmtree(str(temp_root), ignore_errors=True)
 
 
 def _declared_qualities(source: dict, platform: str) -> list[str]:
     """只报告运行时显式声明档位；缺失元数据不等于支持全档。"""
-    raw = source.get("sources") or source.get("platforms") or {}
-    spec = raw.get(platform, {}) if isinstance(raw, dict) else {}
-    values = spec.get("qualitys", spec.get("qualities", [])) if isinstance(spec, dict) else []
-    if not values and isinstance(source.get("qualitys"), dict):
-        values = source["qualitys"].get(platform, [])
+
+    values: object = []
+    raw_quality = source.get("qualitys")
+    if isinstance(raw_quality, dict):
+        values = raw_quality.get(platform, [])
+    if not values:
+        raw = source.get("sources") or source.get("platforms") or {}
+        spec = raw.get(platform, {}) if isinstance(raw, dict) else {}
+        values = spec.get("qualitys", spec.get("qualities", [])) if isinstance(spec, dict) else []
     if not isinstance(values, (list, tuple)):
         return []
     return [q for q in _LX_QUALITY_ORDER if q in values]
 
 
+def _declared_platforms(source: dict) -> list[str]:
+    raw = source.get("supportedSources") or source.get("sources") or source.get("platforms") or []
+    if isinstance(raw, dict):
+        raw = list(raw.keys())
+    result: list[str] = []
+    for item in raw if isinstance(raw, (list, tuple, set)) else []:
+        code = normalize_source(str(item))
+        if code and code in SUPPORTED_PLATFORMS and code not in result:
+            result.append(code)
+    return result
+
+
 def _verification_headers(lx_app, platform: str, resolved: dict) -> dict:
     """保持正式播放相同 UA/平台 Referer；不透传客户端认证或 Host。"""
+
     headers = {"User-Agent": lx_app.UA_PC}
     referer = {"kg": "https://www.kugou.com/", "tx": "https://y.qq.com/"}.get(platform)
     if referer:
@@ -191,31 +225,25 @@ def _verification_headers(lx_app, platform: str, resolved: dict) -> dict:
     return headers
 
 
-def _stored_script_matches(lx_app, source: dict, script: str) -> bool:
-    """只信 lxserver _open 实际存储内容；名称、版本和 sourceUrl 不是身份凭据。"""
-    source_id = str(source.get("id") or "")
-    if not source_id or source_id in (".", "..") or re.search(r"[\\/:]", source_id):
-        return False
-    root = Path(getattr(lx_app, "LXSERVER_DATA_DIR", os.environ.get("LXSERVER_DATA_DIR", "/data/lxserver")))
-    try:
-        root = (root / "users" / "source" / "_open").resolve()
-        path = (root / source_id).resolve()
-        return path.parent == root and path.read_text(encoding="utf-8") == script
-    except (OSError, UnicodeError, ValueError):
-        return False
-
-
-async def _verification_samples(lx_app, temp_client, sources, target_src, report, keywords):
+async def _verification_samples(
+    lx_app,
+    metadata_client,
+    manager: SourceRuntimeManager,
+    target_id: str,
+    report,
+    keywords,
+    deadline: float,
+):
     """顺序抽样且受调用方总超时约束；一项成功不会跳过其他平台。"""
+
     client = lx_app.get_http(lx_app.app)
-    target_id = str(target_src.get("id") or "")
-    excluded = [str(s["id"]) for s in sources if s.get("id") and str(s["id"]) != target_id]
+    target_id = str(target_id or "")
     report["quality_results"] = {p: {} for p in report["platforms"]}
     for keyword in keywords[:4]:
         for platform in report["platforms"]:
             base = {"keyword": keyword, "platform": platform, "result": "", "error": ""}
             try:
-                songs = await temp_client.search(keyword, source=platform, page=1, limit=3)
+                songs = await metadata_client.search(keyword, source=platform, page=1, limit=3)
             except httpx.ReadTimeout:
                 report["complete"] = False
                 report["attempts"].append(dict(base, result="timeout", stage="search", error="ReadTimeout"))
@@ -229,25 +257,52 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
                 report["attempts"].append(dict(base, result="no_items"))
                 continue
             declared = report["qualitys"][platform]
-            # 真实上游list不一定公开品质声明；未知时探索代表高低档，
-            # 但capability_known仍为false，不能把请求成功宣称为脚本全档能力。
             qualities = list(dict.fromkeys((declared[0], declared[-1]))) if declared else ["flac", "128k"]
             for quality in qualities:
                 for song in songs[:3]:
                     attempt = dict(base, quality=quality, song_id=str(song.get("id") or ""),
                                    capability_known=bool(declared))
-                    sinfo = temp_client.get_cached_song_info(song["id"]) or temp_client.synthesize_song_info(song["id"], song)
+                    song_info = (
+                        metadata_client.get_cached_song_info(song["id"])
+                        or metadata_client.synthesize_song_info(song["id"], song)
+                    )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        report["complete"] = False
+                        report["attempts"].append(dict(attempt, result="timeout", stage="resolve",
+                                                       error="budget_exhausted"))
+                        return
                     try:
-                        resolved = await temp_client.get_music_url(
-                            sinfo, quality, exclude_api_sources=excluded, auto_switch_api_source=False)
+                        resolved = await manager.resolve(
+                            target_id,
+                            song_info,
+                            quality,
+                            deadline=min(deadline, time.monotonic() + _RESOLVE_ATTEMPT_BUDGET_S),
+                        )
+                    except (SourceResolveTimeout, TimeoutError):
+                        report["complete"] = False
+                        report["attempts"].append(dict(attempt, result="timeout", stage="resolve",
+                                                       error="TimeoutError"))
+                        continue
+                    except SourceProcessBusy:
+                        report["complete"] = False
+                        report["attempts"].append(dict(attempt, result="timeout", stage="resolve",
+                                                       error="source_process_busy"))
+                        continue
+                    except (SourceProcessUnavailable, SourceRuntimeError) as exc:
+                        report["attempts"].append(dict(attempt, result="resolve_failed",
+                                                       error=getattr(exc, "code", type(exc).__name__)))
+                        continue
                     except httpx.ReadTimeout:
                         report["complete"] = False
-                        report["attempts"].append(dict(attempt, result="timeout", stage="resolve", error="ReadTimeout"))
+                        report["attempts"].append(dict(attempt, result="timeout", stage="resolve",
+                                                       error="ReadTimeout"))
                         continue
                     except Exception as exc:
                         if is_lxserver_unreachable(exc):
                             raise
-                        report["attempts"].append(dict(attempt, result="resolve_failed", error=type(exc).__name__))
+                        report["attempts"].append(dict(attempt, result="resolve_failed",
+                                                       error=type(exc).__name__))
                         continue
                     if not resolved or not resolved.get("url"):
                         report["attempts"].append(dict(attempt, result="resolve_empty"))
@@ -257,17 +312,31 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
                         report["attempts"].append(dict(attempt, result="resolved_by_other_source"))
                         continue
                     headers = _verification_headers(lx_app, platform, resolved)
-                    ok, final_url, content_type, size = await lx_app.probe_url(client, resolved["url"], headers)
-                    report["attempts"].append(dict(attempt, result="ok" if ok else "probe_failed"))
+                    try:
+                        ok, final_url, content_type, size = await lx_app.probe_url(
+                            client, resolved["url"], headers
+                        )
+                    except Exception as exc:
+                        ok, final_url, content_type, size = False, resolved["url"], "", 0
+                        report["attempts"].append(dict(attempt, result="probe_failed",
+                                                       error=type(exc).__name__))
+                    else:
+                        report["attempts"].append(dict(attempt, result="ok" if ok else "probe_failed"))
                     previous = report["quality_results"][platform].get(quality)
-                    report["quality_results"][platform][quality] = "ok" if ok or previous == "ok" else "failed"
+                    report["quality_results"][platform][quality] = (
+                        "ok" if ok or previous == "ok" else "failed"
+                    )
                     if ok:
                         report["platform_results"][platform] = "ok"
                         report["ok"] = True
-                        # 管理报告不发布完整临时签名链接，只保留媒体主机与格式。
-                        report["probe"] = {"platform": platform, "song": song.get("title", ""),
-                                           "host": urllib.parse.urlsplit(final_url).hostname or "",
-                                           "ct": content_type, "size": size, "quality": quality}
+                        report["probe"] = {
+                            "platform": platform,
+                            "song": song.get("title", ""),
+                            "host": urllib.parse.urlsplit(final_url).hostname or "",
+                            "ct": content_type,
+                            "size": size,
+                            "quality": quality,
+                        }
                         break
                     if report["platform_results"][platform] != "ok":
                         report["platform_results"][platform] = "failed"
@@ -277,13 +346,14 @@ async def _verification_samples(lx_app, temp_client, sources, target_src, report
 async def verify_url(url: str, *, keywords: Sequence[str] | None = None, quick: bool = False) -> dict:
     """端到端校验一个源 URL 并返回结构化报告。
 
-    quick=True 时仅执行下载、格式、语法、依赖沙箱及声明平台检查（秒级快速门禁），
-    跳过耗时的多平台歌曲搜索与探活抽样，适用于配置保存前的轻量校验。
+    quick=True 只执行下载、格式、初始化、声明平台检查，跳过搜索与媒体抽样。
     """
+
     deadline = time.monotonic() + _VERIFY_BUDGET_S
-    import app as lx_app  # 延迟导入
+    import app as lx_app
 
     keywords = list(keywords) if keywords else list(VERIFY_KEYWORDS)
+    stage = "download"
     report: dict = {
         "ok": False,
         "url": url,
@@ -297,6 +367,8 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None, quick: 
         "probe": None,
         "keywords": keywords,
         "attempts": [],
+        "source_id": "",
+        "complete": False,
     }
 
     try:
@@ -315,108 +387,76 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None, quick: 
         )
         return report
 
-    meta = parse_script_meta(script)
-    report["meta"] = meta
-
-    temp_client = _new_temp_client(
+    report["meta"] = parse_script_meta(script)
+    temp_root = Path(tempfile.mkdtemp(prefix="fnmusic-lx-verify-"))
+    metadata_client = _new_temp_client(
         base_url=os.environ.get("LXSERVER_URL", DEFAULT_LXSERVER_URL),
         admin_password=os.environ.get("LXSERVER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
         timeout=15.0,
     )
-
-    temp_filename = f"verify_tmp_{int(time.time())}.js"
-    # lxserver 以 @name 生成 id；同名冲突必须比对实际存储内容后才能复用。
-    temp_source_id: str | None = None
-    changed_reused_id: str | None = None
-    management_stage = "upload"
+    manager: SourceRuntimeManager | None = None
     try:
-        # 上传为临时源
-        try:
-            upload_res = await temp_client.upload_custom_source(temp_filename, script)
-            temp_source_id = str(upload_res.get("id") or "") or None
-        except UnsafeVmRequired:
-            report.update(category="unsafe_vm_required", requires_unsafe_vm=True, complete=False,
-                          message="脚本需要不安全VM运行环境；本项目未自动授权，本次未验证")
-            return report
-        except Exception as upload_exc:
-            # 通信故障（尤其写入结果未知）不能按错误文案转入复用或重放。
-            if is_lxserver_unreachable(upload_exc):
-                raise
-            if "已存在" not in str(upload_exc):
-                report.update(category="internal", message=f"临时源上传失败: {upload_exc}")
-                return report
-        management_stage = "list"
-        # 等待源在沙箱初始化并查询平台
-        await asyncio.sleep(1.0)
-        sources = await temp_client.list_custom_sources()
-        candidates = [s for s in sources
-                      if (s.get("id") == temp_source_id if temp_source_id else s.get("name") == meta["name"])]
-        target_src = candidates[0] if len(candidates) == 1 else None
-        if temp_source_id is None and (
-            target_src is None or not _stored_script_matches(lx_app, target_src, script)
-        ):
-            report.update(category="identity_conflict", complete=False,
-                          message="同名源已存在，但无法确认其实际脚本内容与本次一致；本次未验证，未改动既有源")
-            return report
-        if target_src is None:
-            report.update(category="internal", message="临时源上传后未在 lxserver 列表中找到")
-            return report
-
-        # lxserver 解析只走 enabled 的源（isSourceSupported 跳过禁用源）：
-        # 新上传的临时源默认禁用，须临时启用；复用既有源时记住原状态，测毕还原
-        management_stage = "toggle"
-        if temp_source_id is None:
-            if not target_src.get("enabled"):
-                reused_id = str(target_src.get("id") or "")
-                if not reused_id:
-                    report.update(category="internal", message="复用源缺少 ID，无法临时启用")
-                    return report
-                if await temp_client.toggle_custom_source(reused_id, True) is False:
-                    report.update(category="internal", message="复用源临时启用失败")
-                    return report
-                changed_reused_id = reused_id
-        else:
-            await temp_client.toggle_custom_source(temp_source_id, True)
-
-        management_stage = "samples"
-        declared = []
-        # lxserver 列表项的平台字段是 supportedSources（数组）
-        raw_platforms = target_src.get("supportedSources") or target_src.get("sources") or []
-        if isinstance(raw_platforms, dict):
-            raw_platforms = list(raw_platforms.keys())
-        for p in raw_platforms:
-            code = normalize_source(str(p))
-            if code and code not in declared:
-                declared.append(code)
-        if not declared:
-            declared = list(SUPPORTED_PLATFORMS)
-
-        declared = [p for p in declared if p in SUPPORTED_PLATFORMS]
+        manager = _new_temp_manager(temp_root / "_open")
+        stage = "start"
+        await manager.start()
+        filename = Path(urllib.parse.urlsplit(url).path).name or "verify_source.js"
+        stage = "upload"
+        record = await manager.upload_source(
+            filename,
+            script,
+            deadline=min(deadline, time.monotonic() + 20.0),
+        )
+        target_id = str(record.get("id") or "")
+        report["source_id"] = target_id
+        report["meta"] = {
+            "name": str(record.get("name") or report["meta"].get("name") or "custom_source"),
+            "description": str(record.get("description") or ""),
+            "version": str(record.get("version") or "1.0.0"),
+            "author": str(record.get("author") or ""),
+            "homepage": str(record.get("homepage") or ""),
+        }
+        declared = _declared_platforms(record)
         report["declared_platforms"] = declared
-        report["qualitys"] = {p: _declared_qualities(target_src, p) for p in declared}
+        report["qualitys"] = {p: _declared_qualities(record, p) for p in declared}
         usable = declared
         report["platforms"] = usable
         report["platform_results"] = {p: "untested" for p in usable}
-
         if not usable:
             report.update(category="no_platform", message="源未声明任何支持的音乐平台")
             return report
-
-        # 快速门禁模式：脚本已成功在 lxserver 沙箱中加载并解析出有效平台，无需进一步抽样探活
         if quick:
-            report["ok"] = True
-            report["complete"] = True
-            report["category"] = "quick_gate"
-            report["message"] = f"快速门禁校验通过，声明支持平台：{', '.join(usable)}"
+            report.update(
+                ok=True,
+                complete=True,
+                category="quick_gate",
+                message=f"快速门禁校验通过，声明支持平台：{', '.join(usable)}",
+            )
             return report
 
-        # 深度检测模式：验证所有平台；单项读超时和总预算耗尽都保留已经取得的成功证据。
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            report.update(category="timeout", complete=False,
+                          message="校验总预算在初始化后已耗尽；未执行搜索/解析")
+            return report
+        stage = "enable"
+        await manager.set_enabled(
+            target_id, True, deadline=min(deadline, time.monotonic() + 20.0)
+        )
+        stage = "sample"
         sample_budget = min(_SAMPLE_BUDGET_S, deadline - time.monotonic())
         report["complete"] = sample_budget > 0
         if sample_budget > 0:
             try:
                 async with asyncio.timeout(sample_budget):
-                    await _verification_samples(lx_app, temp_client, sources, target_src, report, keywords)
+                    await _verification_samples(
+                        lx_app,
+                        metadata_client,
+                        manager,
+                        target_id,
+                        report,
+                        keywords,
+                        deadline,
+                    )
             except TimeoutError:
                 report["complete"] = False
         if not report["complete"]:
@@ -428,23 +468,38 @@ async def verify_url(url: str, *, keywords: Sequence[str] | None = None, quick: 
         else:
             report.update(category="resolve", message="当前样本未获得可播放媒体；请区分搜索、解析和探活阶段")
         return report
-
+    except SourceUnsafeVmRequired:
+        report.update(category="unsafe_vm_required", requires_unsafe_vm=True, complete=False,
+                      message="脚本需要不安全VM运行环境；本项目未自动授权，本次未验证")
+        return report
+    except SourceInitializationFailed as exc:
+        report.update(category="initialization", complete=False,
+                      message=f"临时源初始化失败: {exc.code}")
+        return report
+    except SourceRuntimeError as exc:
+        report.update(category="runtime", complete=False,
+                      message=f"临时源运行时错误: {exc.stage}: {exc.code}")
+        return report
     except Exception as exc:
-        if isinstance(exc, httpx.ReadTimeout) and management_stage in ("upload", "toggle"):
-            report.update(ok=False, category="timeout", complete=False, result_unknown=True,
-                          stage=management_stage,
-                          message="源管理写请求超时，结果未知；未重放请求，请先核对源状态")
+        if isinstance(exc, httpx.ReadTimeout):
+            report.update(ok=False, category="timeout", stage=stage, complete=False,
+                          message="临时源校验读超时；结果未知，未重放")
+            if getattr(exc, "result_unknown", False):
+                report["result_unknown"] = True
             return report
         if not is_lxserver_unreachable(exc):
             raise
         report.update(
-            ok=False, category="service_unavailable", stage="lxmusic_to_lxserver", complete=False,
+            ok=False, category="service_unavailable", stage="lxmusic_to_lxserver",
+            complete=False,
             message="洛雪脚本服务 lxserver 不可连接，请查看 lxserver 运行日志",
         )
         if getattr(exc, "result_unknown", False):
             report["result_unknown"] = True
         return report
     finally:
-        # 只删除上传返回的本次创建 ID；既有源只恢复本次成功切换的状态。
-        # timeout/cancel 仍在原 task/共享锁内完成有界清理，然后再向调用方传播。
-        await _cleanup_verification_client(temp_client, temp_source_id, changed_reused_id)
+        if manager is not None:
+            await _cleanup_verification_runtime(manager, metadata_client, temp_root)
+        else:
+            await metadata_client.close()
+            shutil.rmtree(str(temp_root), ignore_errors=True)

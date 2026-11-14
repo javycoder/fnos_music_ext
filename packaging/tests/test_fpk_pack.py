@@ -38,6 +38,8 @@ def _png_size(path: Path) -> tuple[int, int]:
 
 @pytest.fixture(scope="module")
 def stage(tmp_path_factory) -> Path:
+    if not shutil.which("rsync"):
+        pytest.skip("rsync 不在 PATH（本地构建 stage 需 rsync）")
     out = tmp_path_factory.mktemp("fpk-stage")
     subprocess.run(
         ["bash", str(FPK_DIR / "build.sh"), "--stage-only", str(out)],
@@ -199,6 +201,8 @@ class TestCmdScripts:
 
 class TestPayload:
     def test_logs_and_exports_excluded_by_real_rsync(self, tmp_path):
+        if not shutil.which("rsync"):
+            pytest.skip("rsync 不在 PATH（执行实际 rsync 需 rsync）")
         # Execute the exact production rsync stanza against a miniature checkout,
         # without adding fixture secrets/logs to the actual working tree.
         source = tmp_path / "source"
@@ -237,6 +241,8 @@ class TestPayload:
         assert not (target / "logs").is_symlink()
 
     def test_dev_files_and_runtime_maps_excluded_by_real_rsync(self, tmp_path):
+        if not shutil.which("rsync"):
+            pytest.skip("rsync 不在 PATH（执行实际 rsync 需 rsync）")
         source = tmp_path / "source"
         stage = tmp_path / "stage"
         target = stage / "app/repo"
@@ -256,7 +262,9 @@ class TestPayload:
             "recommend_cache/user.json", "public_playlists_cache/list.json",
         )
         retained = (
-            "lxmusic-service/verify_source.py", "container/lxserver_compat.py",
+            "lxmusic-service/verify_source.py", "lxmusic-service/source_runtime.py",
+            "lxmusic-service/managed_client.py", "lxmusic-service/source_worker.cjs",
+            "lxmusic-service/lx_vm_bridge.cjs", "container/lxserver.version",
             "proxy/app.py", "webui-service/static/app.js", ".env.example",
             "webui-service/static/wechat.png", "webui-service/static/alipay.png",
             "container/config.json",
@@ -290,7 +298,13 @@ class TestPayload:
             "docker-compose.yml", ".env.example", ".dockerignore",
             "fnmusic-ext.service", "VERSION",
             "proxy/app.py", "container/Dockerfile", "webui-service/app.py",
-            "lxmusic-service/verify_source.py", "container/lxserver_compat.py",
+            "netease-service/app.js", "netease-service/service.js",
+            "netease-service/package.json", "netease-service/package-lock.json",
+            "lxmusic-service/app.py", "lxmusic-service/lxserver_client.py",
+            "lxmusic-service/managed_client.py", "lxmusic-service/playback_policy.py",
+            "lxmusic-service/source_cpu.py", "lxmusic-service/source_runtime.py",
+            "lxmusic-service/verify_source.py", "lxmusic-service/source_worker.cjs",
+            "lxmusic-service/lx_vm_bridge.cjs",
         ):
             assert (repo / rel).is_file(), f"payload 缺少运行所需文件 {rel}"
 
@@ -310,6 +324,9 @@ class TestPayload:
         repo = stage / "app" / "repo"
         for rel in (".env", ".git", ".github", "tests", "docs", "packaging", "dist"):
             assert not (repo / rel).exists(), f"payload 不应包含 {rel}"
+        assert not (repo / "musicbox-service").exists(), "payload 不应包含已退役的 musicbox-service"
+        assert not list(repo.rglob("node_modules")), "payload 不应包含开发机 node_modules"
+        assert not list(repo.rglob("session.json")), "payload 不应包含本地 session.json"
         # .env.* 排除但 .env.example 保留
         env_files = [p.name for p in repo.glob(".env*")]
         assert env_files == [".env.example"], f"payload 只应保留 .env.example，实际: {env_files}"

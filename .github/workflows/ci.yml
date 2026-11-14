@@ -29,6 +29,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install NetEase test dependencies
+        run: npm ci --prefix netease-service --omit=dev --ignore-scripts
+
       - name: Install audio and proxy test tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg nginx
 
@@ -47,10 +50,15 @@ jobs:
       - name: Python compile check
         run: >
           python -m py_compile proxy/app.py proxy/recommend.py proxy/publicplaylists.py proxy/env_merge.py proxy/version.py
+          proxy/netease_legacy.py
           lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py
           musicdl-service/app.py musicdl-service/hardening.py
-          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py
           webui-service/app.py
+
+      - name: Node syntax check
+        run: |
+          node --check netease-service/app.js
+          node --check netease-service/service.js
 
       - name: Verify official music compatibility record
         run: python scripts/check_music_compat.py
@@ -143,7 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [musicdl, musicbox, lxmusic]
+        service: [musicdl, lxmusic]
         python: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
@@ -154,6 +162,21 @@ jobs:
         run: python -m pip install -r '${{ matrix.service }}-service/requirements.txt'
       - name: Offline dependency and CLI contract
         run: python tests/integration/production_contract.py '${{ matrix.service }}' --app-dir '${{ matrix.service }}-service'
+
+  production-netease:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install real production dependencies
+        run: npm ci --prefix netease-service --omit=dev --ignore-scripts
+      - name: Offline dependency and contract
+        run: python tests/integration/production_contract.py netease --app-dir netease-service
 
   # amd64 镜像只在下方矩阵构建一次，复用它验证 musicdl 与洛雪。
   # 不再另起 images job 重建相同 Dockerfile/参数及重复跑非 root 契约。
@@ -198,7 +221,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=fnmusic-images-${{ matrix.arch }}
       - name: Verify non-root contract for each bundled service
         run: |
-          for svc in musicdl musicbox lxmusic; do
+          for svc in musicdl netease lxmusic; do
             docker run --rm --platform '${{ matrix.platform }}' --network none --user 1000 --entrypoint python \
               -v "$PWD/tests/integration/production_contract.py:/tmp/production_contract.py:ro" \
               fnmusic-sources:ci /tmp/production_contract.py \

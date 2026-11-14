@@ -1685,35 +1685,21 @@ async def test_netease_inflight_cancellation_keeps_application_client(cancel_lea
 @pytest.mark.anyio
 async def test_netease_negative_cache_and_pin_expiry_refresh(monkeypatch):
     """普通冷失败保留负缓存；TTL过期、dead pin与显式refresh仍旁路。"""
-    import importlib.util
-    import sys
-    import types
-    from pathlib import Path
     import importlib
     p = importlib.import_module("proxy.app")
-    path = Path(__file__).resolve().parents[2] / "musicbox-service" / "netease_ext.py"
-    spec = importlib.util.spec_from_file_location("netease_negative_cache_test", path)
-    ne = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ne)
     calls, params = [], []
+    cache = {}
 
-    class Config:
-        config = {"music_quality": {"value": "standard"}}
-        def get(self, key):
-            return self.config[key]["value"]
-
-    class Api:
-        def songs_url(self, ids):
-            calls.append(Config().get("music_quality"))
-            return [{"id": ids[0], "code": 404, "url": None}]
-
-    monkeypatch.setitem(sys.modules, "NEMbox.config", types.SimpleNamespace(Config=Config))
-    monkeypatch.setattr(ne, "_get_api_locked", lambda: Api())
+    def ne_get_song_url(song_id, quality, fresh=False):
+        if fresh or quality not in cache:
+            calls.append(quality)
+            cache[quality] = {"id": song_id, "code": 404, "url": None}
+        return cache[quality]
 
     def handler(request):
         q = dict(request.url.params)
         params.append(q)
-        data = ne.get_song_url(123, q["quality"], fresh=q.get("fresh") == "1")
+        data = ne_get_song_url(123, q["quality"], fresh=q.get("fresh") == "1")
         return httpx.Response(200, json={"ok": True, "data": data})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://mb.test") as client:

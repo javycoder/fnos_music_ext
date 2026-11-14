@@ -93,8 +93,11 @@ def test_selection_guid_and_default_initialization():
     entry = pubpl.parse_selection("", {"netease_enabled": True, "lx_enabled": False})
     assert [item["id"] for item in entry] == ["3778678", "3779629", "19723756", "2884035"]
     guid = pubpl.playlist_guid(entry[0])
-    assert guid == "online:playlist:public:musicbox:netease:chart:3778678"
+    assert guid == "online:playlist:public:netease:netease:chart:3778678"
     assert pubpl.entry_from_guid(guid)["id"] == "3778678"
+    legacy_guid = "online:playlist:public:musicbox:netease:chart:3778678"
+    legacy_entry = pubpl.entry_from_guid(legacy_guid)
+    assert legacy_entry["provider"] == "musicbox"
 
 
 def test_explicit_empty_selection_does_not_restore_defaults():

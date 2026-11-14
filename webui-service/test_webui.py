@@ -1453,7 +1453,7 @@ def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
         assert r.status_code == 200
         rj = r.json()
         assert rj["version"] == "v2.0.0"
-        assert rj["current_provider"] == "musicbox"
+        assert rj["current_provider"] in ("netease", "musicbox")
         assert rj["processes"]["musicbox"]["state"] == "RUNNING"
         # lxserver 与 lxmusic 并列出现在进程概览，便于定位洛雪链路哪一环故障
         assert rj["processes"]["lxserver"]["state"] == "STOPPED"

@@ -41,6 +41,8 @@ class ConfigJob:
 
 class ConfigJobStore:
     def __init__(self, db_path: str | Path | None = None):
+        self._memory_uri: str | None = None
+        self._memory_anchor: sqlite3.Connection | None = None
         if db_path is None:
             # 优先使用持久数据卷 /data/webui_jobs.db
             data_dir = os.environ.get("XDG_DATA_HOME", "/data")
@@ -56,8 +58,16 @@ class ConfigJobStore:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path), timeout=15.0)
+        if self.db_path == Path(":memory:"):
+            if self._memory_uri is None:
+                self._memory_uri = f"file:config_jobs_{uuid.uuid4().hex}?mode=memory&cache=shared"
+                self._memory_anchor = sqlite3.connect(
+                    self._memory_uri, uri=True, check_same_thread=False,
+                )
+            conn = sqlite3.connect(self._memory_uri, timeout=15.0, uri=True)
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -108,6 +118,12 @@ class ConfigJobStore:
                         result_json TEXT,
                         error TEXT
                     );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_jobs_idempotency ON config_jobs(idempotency_key);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_jobs_status ON config_jobs(status);
                 """)
                 conn.commit()
 

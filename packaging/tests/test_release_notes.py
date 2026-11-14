@@ -242,8 +242,6 @@ def _run_release_sandbox(tmp_path, releases, *, tag='v2.10.0b', fail='', current
                     assert any(r['id'] == rid for r in state['releases'])
                     state['releases'] = [r for r in state['releases'] if r['id'] != rid]
                     finish()
-                if endpoint.startswith(root + 'git/refs/tags/'):
-                    finish()
             if args[:1] == ['api'] and len(args) == 2 and endpoint.startswith(root + 'releases/'):
                 rid = int(endpoint.rsplit('/', 1)[1])
                 release = next(r for r in state['releases'] if r['id'] == rid)
@@ -288,18 +286,18 @@ def test_release_cleanup_workflow_contract():
     assert 'GH_TOKEN: ${{ github.token }}' in cleanup
     assert 'GH_REPO: ${{ github.repository }}' in cleanup
     assert 'contents: write' in workflow
+    assert '/git/refs/tags/' not in _release_step(CLEANUP_STEP)
     for name in (CLEANUP_STEP, PUBLISH_STEP):
         subprocess.run(['bash', '-n'], input=_release_step(name), text=True, check=True)
 
 
-def test_release_cleanup_deletes_release_then_tag_before_publish(tmp_path):
+def test_release_cleanup_deletes_releases_but_preserves_tags(tmp_path):
     # Includes a second page and an old version outside the target's minor series.
     result, calls = _run_release_sandbox(tmp_path, [
         _release('v2.10.0a', 1), _release('v2.9.0a', 2)])
     assert result.returncode == 0, result.stderr
     assert _deletions(calls) == [
-        'repos/example/music/releases/1', 'repos/example/music/git/refs/tags/v2.10.0a',
-        'repos/example/music/releases/2', 'repos/example/music/git/refs/tags/v2.9.0a']
+        'repos/example/music/releases/1', 'repos/example/music/releases/2']
     last_delete = max(i for i, c in enumerate(calls) if c[:3] == ['api', '--method', 'DELETE'])
     assert last_delete < calls.index(_published(calls)[0])
     assert sum('--paginate' in c for c in calls) == 2
@@ -312,8 +310,7 @@ def test_release_cleanup_protects_formal_draft_and_retry_target(tmp_path):
         _release('v2.8.0a', 3, draft=True),
         _release('v2.10.0b', 4), _release('v2.7.0a', 5)])
     assert result.returncode == 0, result.stderr
-    assert _deletions(calls) == [
-        'repos/example/music/releases/5', 'repos/example/music/git/refs/tags/v2.7.0a']
+    assert _deletions(calls) == ['repos/example/music/releases/5']
     assert _published(calls)[0][:3] == ['release', 'edit', 'v2.10.0b']
 
 
@@ -346,9 +343,7 @@ def test_release_cleanup_blocks_unrecognized_prerelease_without_deleting(tmp_pat
     ('repos/example/music/releases?per_page=100', []),
     ('repos/example/music/releases/1', []),
     ('DELETE:repos/example/music/releases/1', ['releases/1']),
-    ('DELETE:repos/example/music/git/refs/tags/v2.10.0a',
-     ['releases/1', 'git/refs/tags/v2.10.0a']),
-    ('final-list', ['releases/1', 'git/refs/tags/v2.10.0a']),
+    ('final-list', ['releases/1']),
 ])
 def test_release_cleanup_api_failure_stops_publication(tmp_path, fail, attempted):
     result, calls = _run_release_sandbox(tmp_path, [_release('v2.10.0a')], fail=fail)
@@ -441,6 +436,16 @@ def test_gitee_notes_use_install_revision_and_github_links():
     assert 'github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"' in script
     assert 'echo "- [${fpk_name}](${github_base}/${fpk_name})"' in script
     assert 'echo "- [${fpk_name}.sha256](${github_base}/${fpk_name}.sha256)"' in script
+
+
+def test_gitee_links_use_the_actual_built_fpk_name():
+    workflow = RELEASE_WORKFLOW.read_text()
+    script = _unindent_run(_gitee_step_script())
+    assert 'fpk_name: ${{ steps.release-fpk.outputs.name }}' in workflow
+    assert 'FPK_NAME: ${{ needs.release.outputs.fpk_name }}' in workflow
+    assert 'fpk_name="${FPK_NAME:-}"' in script
+    for suffix in ("", "-amd64", "-arm64"):
+        assert f'"fnmusic-ext-${{version}}{suffix}.fpk"' in script
 
 
 def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():

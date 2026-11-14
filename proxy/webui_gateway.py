@@ -712,6 +712,9 @@ def handle_self_update(client: socket.socket, head_raw: bytes, method: str, targ
                 return
             try:
                 snap = resolve_target(tag)
+                if snap is None:
+                    client.sendall(_json_response(404, {"ok": False, "error": "未找到可用的正式版安装包"}))
+                    return
                 client.sendall(_json_response(200, {"ok": True, "target": snap.to_dict()}))
             except ValueError as e:
                 client.sendall(_json_response(404, {"ok": False, "error": str(e)}))

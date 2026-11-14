@@ -1,21 +1,12 @@
 """Cold playback, protocol, and cancellation regressions for issue #56."""
 import asyncio
 import importlib
-import json
-import sys
-import threading
 import time
-import types
-from pathlib import Path
-from urllib.parse import parse_qs
 
 import httpx
 import pytest
 from starlette.requests import Request
 from starlette.responses import Response
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "musicbox-service"))
-import playback
 
 proxy = importlib.import_module("proxy.app")
 
@@ -27,9 +18,6 @@ def anyio_backend():
 
 @pytest.fixture(autouse=True)
 def isolate(monkeypatch, tmp_path):
-    monkeypatch.setattr(playback, "_tasks", {})
-    monkeypatch.setattr(playback, "_cache", {})
-    monkeypatch.setattr(playback, "_api", None)
     monkeypatch.setattr(proxy, "_NETEASE_URL_INFLIGHT", {})
     monkeypatch.setattr(proxy, "_NETEASE_PREFETCH", set())
     monkeypatch.setattr(proxy, "_NETEASE_PREHEATED_PINS", {})
@@ -39,132 +27,6 @@ def isolate(monkeypatch, tmp_path):
     monkeypatch.setitem(proxy.CONF, "quality_mode", "high")
     monkeypatch.setitem(proxy.CONF, "netease_enabled", True)
     monkeypatch.setitem(proxy.CONF, "cache_dir", str(tmp_path))
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("fresh", [False, True])
-async def test_service_shared_resolution_survives_caller_cancel(monkeypatch, fresh):
-    entered, release = asyncio.Event(), asyncio.Event()
-    calls = []
-
-    async def request(song_id, quality, generation):
-        calls.append((song_id, quality))
-        entered.set()
-        await release.wait()
-        return {"code": 200, "url": "https://cdn.test/original.flac", "expi": 100}
-
-    monkeypatch.setattr(playback, "_request", request)
-    first = asyncio.create_task(playback.get_song_url_async(56, "lossless", fresh=fresh))
-    await entered.wait()
-    second = asyncio.create_task(playback.get_song_url_async(56, "lossless", fresh=fresh))
-    await asyncio.sleep(0)
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    release.set()
-    assert (await second)["url"].endswith("original.flac")
-    assert calls == [(56, "lossless")]
-    assert not playback._tasks
-
-
-@pytest.mark.anyio
-async def test_service_reset_rejects_old_result(monkeypatch):
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    async def request(*args):
-        entered.set()
-        await release.wait()
-        return {"code": 200, "url": "https://cdn.test/old.flac"}
-
-    monkeypatch.setattr(playback, "_request", request)
-    task = asyncio.create_task(playback.get_song_url_async(56, "lossless"))
-    await entered.wait()
-    playback.reset()
-    release.set()
-    with pytest.raises(playback.UpstreamError, match="login state"):
-        await task
-    assert not playback._cache
-
-
-def test_old_login_generation_cannot_merge_response_cookies(monkeypatch):
-    class Jar:
-        def load(self):
-            raise AssertionError("旧登录态不得读取或写入 cookie")
-
-    monkeypatch.setattr(playback, "_api", types.SimpleNamespace(cookie_jar=Jar()))
-    playback._merge_cookies(playback._generation - 1, httpx.Cookies({"MUSIC_U": "fixture"}))
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("failure", ["timeout", "network", "payload"])
-async def test_service_errors_are_not_negative_cached(monkeypatch, failure):
-    async def request(*args):
-        if failure == "timeout":
-            raise httpx.ReadTimeout("slow")
-        if failure == "network":
-            raise httpx.ConnectError("offline")
-        raise ValueError("malformed")
-
-    monkeypatch.setattr(playback, "_request", request)
-    expected = playback.ResolutionTimeout if failure == "timeout" else playback.UpstreamError
-    with pytest.raises(expected):
-        await playback.get_song_url_async(56, "lossless")
-    assert not playback._cache
-
-
-@pytest.mark.anyio
-async def test_service_budget_cancels_work(monkeypatch):
-    cancelled = asyncio.Event()
-
-    async def request(*args):
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    monkeypatch.setattr(playback, "BUDGET_S", 0.03)
-    monkeypatch.setattr(playback, "_request", request)
-    with pytest.raises(playback.ResolutionTimeout):
-        await playback.get_song_url_async(56, "lossless")
-    assert cancelled.is_set() and not playback._tasks
-
-
-@pytest.mark.anyio
-async def test_service_wire_encoding_and_global_lock_independence(monkeypatch):
-    import netease_ext
-    module = types.ModuleType("NEMbox.api")
-    payloads, requests = [], []
-    module.BASE_URL = "https://music.163.com"
-    module.EAPI_BASE_URL = "https://interface.music.163.com"
-
-    def encode(path, payload):
-        payloads.append(payload)
-        return {"params": "encrypted+payload"}
-
-    module.eapi_encrypt = encode
-    module.encrypted_request = lambda params: {"params": "fallback", "encSecKey": "rsa"}
-    module.eapi_response_decrypt = lambda value: {"code": 200, "data": []}
-    module.music_quality_to_level = lambda quality: quality
-    module.level_to_encode_type = lambda quality: "flac"
-    monkeypatch.setitem(sys.modules, "NEMbox.api", module)
-    monkeypatch.setattr(playback, "_snapshot", lambda generation: ({"__csrf": "fixture"}, {}, []))
-    client_type = httpx.AsyncClient
-
-    async def handler(request):
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(200, json={"code": 200, "data": []})
-        return httpx.Response(200, json={"code": 200, "data": [{"code": 200, "url": "https://cdn.test/a.flac"}]})
-
-    monkeypatch.setattr(playback.httpx, "AsyncClient", lambda **kwargs: client_type(
-        transport=httpx.MockTransport(handler), **kwargs))
-    with netease_ext._api_lock:
-        result = await asyncio.wait_for(playback.get_song_url_async(56, "lossless"), 1)
-    assert result["url"].endswith(".flac")
-    assert payloads[0]["level"] == "lossless"
-    assert payloads[0]["ids"] == "[56]"
-    assert parse_qs(requests[0].content.decode()) == {"params": ["encrypted+payload"]}
-    assert parse_qs(requests[1].content.decode()) == {"params": ["fallback"], "encSecKey": ["rsa"]}
 
 
 @pytest.mark.anyio
@@ -298,54 +160,6 @@ async def test_proxy_total_budget_cancels_endpoint_without_downgrade(monkeypatch
 
 
 @pytest.mark.anyio
-async def test_service_cli_only_for_unavailable_protocol(monkeypatch):
-    calls = []
-
-    async def request(*args):
-        raise playback.CapabilityError()
-
-    async def cli(song_id, quality):
-        calls.append((song_id, quality))
-        return {"code": 200, "url": "https://cdn.test/fallback.flac"}
-
-    monkeypatch.setattr(playback, "_request", request)
-    monkeypatch.setattr(playback, "_cli", cli)
-    await playback.get_song_url_async(56, "lossless")
-    assert calls == [(56, "lossless")]
-
-    async def timeout(*args):
-        raise httpx.ReadTimeout("slow")
-
-    monkeypatch.setattr(playback, "_request", timeout)
-    with pytest.raises(playback.ResolutionTimeout):
-        await playback.get_song_url_async(57, "lossless")
-    assert len(calls) == 1
-
-
-@pytest.mark.anyio
-async def test_service_fresh_inflight_takes_precedence_over_cached_success(monkeypatch):
-    entered, release = asyncio.Event(), asyncio.Event()
-    calls = []
-
-    async def request(*args):
-        calls.append(True)
-        if len(calls) > 1:
-            entered.set()
-            await release.wait()
-        return {"code": 200, "url": f"https://cdn.test/{len(calls)}.flac"}
-
-    monkeypatch.setattr(playback, "_request", request)
-    await playback.get_song_url_async(56, "lossless")
-    fresh = asyncio.create_task(playback.get_song_url_async(56, "lossless", fresh=True))
-    await entered.wait()
-    ordinary = asyncio.create_task(playback.get_song_url_async(56, "lossless"))
-    await asyncio.sleep(0)
-    release.set()
-    assert (await fresh)["url"] == (await ordinary)["url"] == "https://cdn.test/2.flac"
-    assert len(calls) == 2
-
-
-@pytest.mark.anyio
 async def test_metadata_returns_retained_info_without_lyrics_and_preheats(monkeypatch):
     calls = []
 
@@ -405,52 +219,6 @@ async def test_get_second_wait_reuses_first_resolution_without_fresh(monkeypatch
         assert response.status_code == 200
     assert refreshes == [False, False]
     assert calls == [{"quality": "lossless"}]
-
-
-@pytest.mark.anyio
-async def test_service_distinct_qualities_resolve_concurrently(monkeypatch):
-    entered, release = asyncio.Event(), asyncio.Event()
-    calls = []
-
-    async def request(song_id, quality, generation):
-        calls.append((song_id, quality))
-        if len(calls) == 2:
-            entered.set()
-        await release.wait()
-        return {"code": 200, "url": f"https://cdn.test/{song_id}-{quality}.flac"}
-
-    monkeypatch.setattr(playback, "_request", request)
-    tasks = [asyncio.create_task(playback.get_song_url_async(56, quality))
-             for quality in ("lossless", "exhigh")]
-    await asyncio.wait_for(entered.wait(), 1)
-    release.set()
-    results = await asyncio.gather(*tasks)
-    assert [item["url"] for item in results] == [
-        "https://cdn.test/56-lossless.flac", "https://cdn.test/56-exhigh.flac"]
-
-
-@pytest.mark.anyio
-async def test_service_success_expiry_and_negative_cache_separate(monkeypatch):
-    now = [100.0]
-    calls = []
-
-    async def request(song_id, quality, generation):
-        calls.append(song_id)
-        if song_id == 57:
-            return {"code": 404, "url": None}
-        return {"code": 200, "url": f"https://cdn.test/{len(calls)}.flac", "expi": 100}
-
-    # Patch only playback's clock, not the event loop's clock.
-    monkeypatch.setattr(playback, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
-    monkeypatch.setattr(playback, "_request", request)
-    assert (await playback.get_song_url_async(56, "lossless"))["url"].endswith("1.flac")
-    now[0] = 139
-    assert (await playback.get_song_url_async(56, "lossless"))["url"].endswith("1.flac")
-    now[0] = 141
-    assert (await playback.get_song_url_async(56, "lossless"))["url"].endswith("2.flac")
-    await playback.get_song_url_async(57, "lossless")
-    await playback.get_song_url_async(57, "lossless")
-    assert calls == [56, 56, 57]
 
 
 @pytest.mark.anyio

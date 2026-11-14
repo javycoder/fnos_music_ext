@@ -206,7 +206,7 @@ def test_search_track_merge_success(caplog):
     assert all("id=" + request_id in line for line in messages)
     finished = next(line for line in messages if "search_finished" in line)
     assert "outcome=merged" in finished and "local=1" in finished and "online_page=1" in finished
-    assert any("search_source" in line and "source=musicbox" in line and "count=1" in line for line in messages)
+    assert any("search_source" in line and ("source=netease" in line or "source=musicbox" in line) and "count=1" in line for line in messages)
     assert all("夜曲" not in line and "周杰伦" not in line for line in messages)
 
 

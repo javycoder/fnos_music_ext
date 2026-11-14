@@ -170,7 +170,8 @@ def _safe_scan_number(raw: str, default: float, lo: float, hi: float):
 
 CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
-    "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
+    "netease_url": os.environ.get("FNMUSIC_NETEASE_URL") or os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
+    "musicbox_url": os.environ.get("FNMUSIC_NETEASE_URL") or os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
@@ -576,7 +577,8 @@ def reset_source_search_gates() -> None:
 
 _LX_SEARCH_GATE = SourceSearchGate(cancellable=True)
 _MUSICDL_SEARCH_GATE = SourceSearchGate(cancellable=False)
-_MUSICBOX_SEARCH_GATE = SourceSearchGate(cancellable=False)
+_NETEASE_SEARCH_GATE = SourceSearchGate(cancellable=False)
+_MUSICBOX_SEARCH_GATE = _NETEASE_SEARCH_GATE
 
 
 def _search_ttl(entry: dict) -> float:
@@ -1097,6 +1099,7 @@ async def _run_liked_build(
                 db_path=str(CONF.get("music_db") or dailyrec.music_db_path()),
                 llm_http=get_llm_client(fastapi_app),
                 build_track=build_online_track,
+                netease_client=get_netease_client(fastapi_app) if CONF["netease_enabled"] else None,
                 musicbox_client=get_musicbox_client(fastapi_app) if CONF["netease_enabled"] else None,
                 netease_enabled=CONF["netease_enabled"],
                 lx_client=get_lx_client(fastapi_app) if CONF.get("lx_enabled") else None,
@@ -2564,11 +2567,13 @@ def tee_save_dir(*, user_guid: str = "") -> str:
     if user_guid == "shared":
         raise UserStorageError("cannot save isolated file for shared user")
     try:
+        directory_map = parse_user_map(CONF.get("tee_save_dir_by_user"), kind="下载目录映射")
+        validate_effective_roots(CONF, directory_map, root)
         target = effective_user_root(CONF, user_guid, root)
+        validate_effective_roots(CONF, {**directory_map, user_guid: target})
         os.makedirs(target, exist_ok=True)
         if not os.path.isdir(target) or not os.access(target, os.W_OK):
             raise OSError("user download directory is not writable")
-        validate_effective_roots(CONF, {user_guid: target})
         return target
     except UserStorageError:
         raise
@@ -3135,11 +3140,11 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
         return ""
     src = source_from_online_guid(guid)
     if src == "netease":
-        musicbox_client = get_musicbox_client(request.app)
+        netease_client = get_netease_client(request.app)
         raw_song_id = song_id_from_online_guid(guid)
         song_id = raw_song_id.split(":")[-1]
         try:
-            r = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
+            r = await netease_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
             if r.status_code == 200:
                 res_data = r.json()
                 if isinstance(res_data, dict) and res_data.get("ok") is not False:
@@ -3156,7 +3161,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                             )
                             return lyric_text
         except Exception as e:
-            logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
+            logger.warning("netease lyric fetch failed for %s: %s", guid, e)
         return ""
 
     data = await _online_info(request, guid)
@@ -3360,12 +3365,22 @@ def get_musicdl_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
-def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
-    client = getattr(fastapi_app.state, "musicbox_client", None)
-    if client is None:
-        client = httpx.AsyncClient(base_url=CONF["musicbox_url"], timeout=20.0)
-        fastapi_app.state.musicbox_client = client
+def get_netease_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    fn = globals().get("get_musicbox_client")
+    if fn is not None and fn is not get_netease_client:
+        return fn(fastapi_app)
+    mb_client = getattr(fastapi_app.state, "musicbox_client", None)
+    ne_client = getattr(fastapi_app.state, "netease_client", None)
+    client = mb_client if mb_client is not None else ne_client
+    if client is None or client.is_closed:
+        base_url = CONF.get("netease_url") or CONF.get("musicbox_url", "http://127.0.0.1:8770")
+        client = httpx.AsyncClient(base_url=base_url, timeout=20.0)
+    fastapi_app.state.netease_client = client
+    fastapi_app.state.musicbox_client = client
     return client
+
+
+get_musicbox_client = get_netease_client
 
 
 def get_lx_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
@@ -3527,18 +3542,33 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
     return await _MUSICDL_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+async def fetch_netease_search(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+    fn = globals().get("fetch_musicbox_search")
+    if fn is not None and fn is not fetch_netease_search:
+        try:
+            return await fn(client, keyword, limit, offset=offset)
+        except TypeError:
+            return await fn(client, keyword, limit)
     if not keyword:
         return None
     scope = _FETCH_SCOPE.get()
 
     async def _query():
-        return await _musicbox_search_request(client, keyword, limit, offset)
+        return await _netease_search_request(client, keyword, limit, offset)
 
-    return await _MUSICBOX_SEARCH_GATE.run(scope, keyword, _query)
+    return await _NETEASE_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+fetch_musicbox_search = fetch_netease_search
+
+
+async def _netease_search_request(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+    fn = globals().get("_musicbox_search_request")
+    if fn is not None and fn is not _netease_search_request:
+        try:
+            return await fn(client, keyword, limit, offset=offset)
+        except TypeError:
+            return await fn(client, keyword, limit)
     params: dict[str, Any] = {"keyword": keyword, "limit": limit, "type": "song"}
     if offset > 0:
         params["offset"] = offset
@@ -3638,8 +3668,11 @@ async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limi
 
         return [it for it in items if is_playable_online_track(it)]
     except Exception as e:
-        logger.warning("Failed to fetch musicbox search: %s", e)
+        logger.warning("Failed to fetch netease search: %s", e)
         return None
+
+
+_musicbox_search_request = _netease_search_request
 
 
 class _SearchItems(list):
@@ -4582,7 +4615,7 @@ def _prefetch_netease(request: Request, guid: str) -> None:
         # 调度后可能有实际播放抢先登记，启动前再核对登记上限。
         if len(_NETEASE_URL_INFLIGHT) >= 16:
             return
-        await resolve_netease_url(get_musicbox_client(request.app), song_id, prefetch=True)
+        await resolve_netease_url(get_netease_client(request.app), song_id, prefetch=True)
 
     task = asyncio.create_task(warm())
     _NETEASE_PREFETCH.add(task)
@@ -5775,11 +5808,20 @@ async def lifespan(fastapi_app: FastAPI):
         )
         created_musicdl = True
 
-    if getattr(fastapi_app.state, "musicbox_client", None) is None:
-        fastapi_app.state.musicbox_client = httpx.AsyncClient(
-            base_url=CONF["musicbox_url"],
+    mb_client = getattr(fastapi_app.state, "musicbox_client", None)
+    ne_client = getattr(fastapi_app.state, "netease_client", None)
+    if mb_client is not None:
+        fastapi_app.state.netease_client = mb_client
+    elif ne_client is not None:
+        fastapi_app.state.musicbox_client = ne_client
+    else:
+        base_url = CONF.get("netease_url") or CONF.get("musicbox_url", "http://127.0.0.1:8770")
+        client = httpx.AsyncClient(
+            base_url=base_url,
             timeout=20.0,
         )
+        fastapi_app.state.netease_client = client
+        fastapi_app.state.musicbox_client = client
         created_musicbox = True
 
     if getattr(fastapi_app.state, "lx_client", None) is None:
@@ -5906,8 +5948,11 @@ async def lifespan(fastapi_app: FastAPI):
         if created_musicdl and getattr(fastapi_app.state, "musicdl_client", None):
             await fastapi_app.state.musicdl_client.aclose()
             fastapi_app.state.musicdl_client = None
-        if created_musicbox and getattr(fastapi_app.state, "musicbox_client", None):
-            await fastapi_app.state.musicbox_client.aclose()
+        if created_musicbox:
+            c = getattr(fastapi_app.state, "netease_client", None) or getattr(fastapi_app.state, "musicbox_client", None)
+            if c:
+                await c.aclose()
+            fastapi_app.state.netease_client = None
             fastapi_app.state.musicbox_client = None
         if created_lx and getattr(fastapi_app.state, "lx_client", None):
             await fastapi_app.state.lx_client.aclose()
@@ -5952,7 +5997,7 @@ async def _proxy_diagnostic_status() -> dict:
     return {"ok": True, "pid": os.getpid(), "version": get_version(),
             "checked_at": int(time.time()), "takeover": takeover, "upstream": official,
             "providers": [name for name, key in (("musicdl", "musicdl_enabled"),
-                          ("musicbox", "netease_enabled"), ("lxmusic", "lx_enabled")) if CONF.get(key)],
+                          ("netease", "netease_enabled"), ("musicbox", "netease_enabled"), ("lxmusic", "lx_enabled")) if CONF.get(key)],
             "search_timeout_s": CONF["search_timeout"]}
 
 
@@ -5974,6 +6019,7 @@ async def log_client_requests(request: Request, call_next):
         fn_diag(logger, "search_received", id=diagnostic["id"], pid=os.getpid(),
                 query_chars=len(extract_keyword(request)),
                 musicdl=bool(CONF.get("musicdl_enabled")),
+                netease=bool(CONF.get("netease_enabled")),
                 musicbox=bool(CONF.get("netease_enabled")), lx=bool(CONF.get("lx_enabled")))
     try:
         response = await call_next(request)
@@ -6036,16 +6082,19 @@ async def ext_healthz(request: Request):
 
     checks = [("upstream", True, get_upstream_client, "/music/api/v1/search/track?keyword=healthz_probe"),
               ("musicdl", CONF.get("musicdl_enabled"), get_musicdl_client, "/healthz"),
-              # 网易云歌单常驻：musicbox 非当前音源时仍是健康检查的一部分（issue #38）
-              ("musicbox", _netease_runtime_usable(), get_musicbox_client, "/healthz"),
+              # 网易云歌单常驻：netease 非当前音源时仍是健康检查的一部分（issue #38）
+              ("netease", _netease_runtime_usable(), get_netease_client, "/healthz"),
               ("lxmusic", CONF.get("lx_enabled"), get_lx_client, "/healthz")]
     enabled = [(name, getter, path) for name, on, getter, path in checks if on]
     results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
     details = {name: {"status": "disabled"} for name, on, _, _ in checks if not on}
     details.update({name: result for (name, _, _), result in zip(enabled, results)})
     statuses = {name: value["status"] for name, value in details.items()}
-    failed = [name for name, status in statuses.items() if status == "fail"]
-    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "lxmusic"))
+    if "netease" in statuses:
+        statuses["musicbox"] = statuses["netease"]
+        details["musicbox"] = details["netease"]
+    failed = [name for name, status in statuses.items() if status == "fail" and name != "musicbox"]
+    source_ok = any(statuses[name] == "ok" for name in ("musicdl", "netease", "lxmusic"))
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
             "recommend": {
@@ -6070,7 +6119,8 @@ async def search_track(request: Request):
     diagnostic = getattr(request.state, "search_diagnostic", {})
     upstream_client = get_upstream_client(request.app)
     musicdl_client = get_musicdl_client(request.app)
-    musicbox_client = get_musicbox_client(request.app)
+    netease_client = get_netease_client(request.app)
+    musicbox_client = netease_client
     keyword = extract_keyword(request)
     if keyword:
         _note_user_keyword(_credential_scope(request), keyword)
@@ -6259,8 +6309,8 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
     factories = []
     factory_names = {}
     if CONF.get("netease_enabled"):
-        factories.append(lambda: fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
-        factory_names[factories[-1]] = "musicbox"
+        factories.append(lambda: fetch_netease_search(get_netease_client(request.app), keyword, CONF["netease_search_limit"]))
+        factory_names[factories[-1]] = "netease"
     if CONF.get("musicdl_enabled"):
         factories.append(lambda: fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
         factory_names[factories[-1]] = "musicdl"
@@ -6409,8 +6459,8 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
         if CONF.get("netease_enabled") and "netease" not in exhausted:
             limit = int(CONF["netease_search_limit"])
             n_cursor = cursors.get("netease", 1)
-            fetches.append(("netease", _musicbox_search_request(
-                get_musicbox_client(request.app), keyword, limit, offset=n_cursor * limit)))
+            fetches.append(("netease", _netease_search_request(
+                get_netease_client(request.app), keyword, limit, offset=n_cursor * limit)))
         if CONF.get("lx_enabled") and "lx" not in exhausted:
             lx_cursor = cursors.get("lx", 1)
             fetches.append(("lx", _lx_search_request(
@@ -7908,7 +7958,7 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
     token = _FETCH_SCOPE.set(_credential_scope(request) + ":play")
     try:
         if source == "netease":
-            coro = fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
+            coro = fetch_netease_search(get_netease_client(request.app), keyword, CONF["netease_search_limit"])
         elif source == "lx":
             # 按目标 GUID 的平台精确重搜（GUID 第 3 段），对齐 musicdl 分支按引擎重搜的行为
             parts = guid.split(":")
@@ -7975,7 +8025,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                         netease_download_generation = (
                             _DL_CONFIG_GENERATION if generation is None else int(generation))
                         selected = await _resolve_netease_download_media(
-                            get_musicbox_client(request.app), song_id,
+                            get_netease_client(request.app), song_id,
                             netease_download_quality,
                             purpose=purpose, generation=netease_download_generation,
                         )
@@ -7987,7 +8037,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     else:
                         if max_q:
                             fn_diag(logger, "lossless_downgrade", guid=guid, path="stream_open", tier="mp3")
-                        url = await resolve_netease_url(get_musicbox_client(request.app), song_id,
+                        url = await resolve_netease_url(get_netease_client(request.app), song_id,
                                                         refresh=refresh or bool(max_q), max_quality=max_q)
                     if not url:
                         return None
@@ -8364,7 +8414,7 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
         except ImportError:
             from netease_direct import upgrade_netease_media_url  # type: ignore
         song_id = song_id_from_online_guid(guid).split(":")[-1]
-        url = await resolve_netease_url(get_musicbox_client(request.app), song_id)
+        url = await resolve_netease_url(get_netease_client(request.app), song_id)
         if not url:
             raise RuntimeError("resolve_failed")
         url = await upgrade_netease_media_url(url)
@@ -10296,7 +10346,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
         if source == "netease":
             max_q = "exhigh" if _lossless_is_blacklisted(guid) else None
             url = await resolve_netease_url(
-                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1],
+                get_netease_client(request.app), song_id_from_online_guid(guid).split(":")[-1],
                 max_quality=max_q)
             if not url:
                 return None, None
@@ -11037,11 +11087,12 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True) 
 async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
     src = source_from_online_guid(guid)
     if src == "netease":
-        musicbox_client = get_musicbox_client(request.app)
+        netease_client = get_netease_client(request.app)
+        musicbox_client = netease_client
         raw_song_id = song_id_from_online_guid(guid)
         song_id = raw_song_id.split(":")[-1]
         try:
-            r = await musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
+            r = await netease_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
             if r.status_code == 200:
                 res_data = r.json()
                 if isinstance(res_data, dict) and res_data.get("ok") is not False:
@@ -11089,7 +11140,7 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                         lyric_text = ""
                         if include_lyric:
                             try:
-                                lr = await musicbox_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
+                                lr = await netease_client.get(f"/api/v1/song/{song_id}/lyric", timeout=10.0)
                                 if lr.status_code == 200:
                                     l_res = lr.json()
                                     if isinstance(l_res, dict) and l_res.get("ok") is not False:
@@ -11097,7 +11148,7 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
                                         if isinstance(l_data, dict):
                                             lyric_text = str(l_data.get("lyric") or "").strip()
                             except Exception as l_err:
-                                logger.warning("musicbox lyric fetch in _online_info failed for %s: %s", guid, l_err)
+                                logger.warning("netease lyric fetch in _online_info failed for %s: %s", guid, l_err)
 
                         return {
                             "id": f"netease:{song_id}",
@@ -11265,7 +11316,7 @@ async def track_metadata(request: Request, subpath: str = ""):
             if source_from_online_guid(guid) == "netease":
                 song_id = song_id_from_online_guid(guid).split(":")[-1]
                 max_q = "exhigh" if _lossless_is_blacklisted(guid) else None
-                url = await resolve_netease_url(get_musicbox_client(request.app), song_id, max_quality=max_q)
+                url = await resolve_netease_url(get_netease_client(request.app), song_id, max_quality=max_q)
                 return _netease_pin_media(song_id) if url else None
             max_q = "high" if _lossless_is_blacklisted(guid) else None
             return await resolve_lx_url_shared(get_lx_client(request.app),
@@ -11397,11 +11448,12 @@ async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> 
     cached = _cover_cache_get(key)
     if cached:
         return cached
-    musicbox_client = get_musicbox_client(request.app)
+    netease_client = get_netease_client(request.app)
+    musicbox_client = netease_client
     keyword = " ".join(x for x in (artist, title) if x)
     target = ""
     try:
-        r = await musicbox_client.get(
+        r = await netease_client.get(
             "/api/v1/search",
             params={"keyword": keyword, "limit": 5, "type": "song"},
             timeout=8.0,
@@ -11426,7 +11478,7 @@ async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> 
             sid = str(it.get("song_id") or it.get("id") or "")
             if not sid:
                 continue
-            d = await musicbox_client.get("/api/v1/songs/detail", params={"ids": sid}, timeout=8.0)
+            d = await netease_client.get("/api/v1/songs/detail", params={"ids": sid}, timeout=8.0)
             if d.status_code == 200:
                 dj = d.json()
                 dl = dj.get("data") if isinstance(dj, dict) else None
@@ -12450,6 +12502,7 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
         dailyrec.get_or_build_daily(
             user_guid=user_guid,
             musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled") else None,
+            netease_client=get_netease_client(request.app) if CONF["netease_enabled"] else None,
             musicbox_client=get_musicbox_client(request.app) if CONF["netease_enabled"] else None,
             llm_http=get_llm_client(request.app) if dailyrec.llm_enabled() else None,
             build_track=build_online_track,
@@ -12970,7 +13023,7 @@ async def playlist_list(request: Request):
     nm_cards: list[dict] = []
     if nm_on:
         try:
-            nm_cards = await nmpl.peek_summaries(get_musicbox_client(request.app))
+            nm_cards = await nmpl.peek_summaries(get_netease_client(request.app))
             for card in nm_cards:
                 g = str(card.get("guid") or "")
                 if is_online_guid(g):
@@ -12980,13 +13033,13 @@ async def playlist_list(request: Request):
             logger.warning("netease my-playlists inject failed: %s", e)
             nm_cards = []
         if nm_cards:
-            nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
+            nmpl.schedule_prefetch(get_netease_client(request.app), build_online_track, nm_cards)
     if nm_cards:
         nm_ids = {str(nmpl.nm_playlist_id_from_guid(card.get("guid"))) for card in nm_cards}
         nm_ids.discard("0")
         public_cards = [
             card for card in public_cards
-            if (pubpl.entry_from_guid(card.get("guid")) or {}).get("provider") != "musicbox"
+            if (pubpl.entry_from_guid(card.get("guid")) or {}).get("provider") not in ("netease", "musicbox")
             or str((pubpl.entry_from_guid(card.get("guid")) or {}).get("id")) not in nm_ids
         ]
     official = [
@@ -13219,7 +13272,7 @@ async def playlist_track_list(request: Request):
         if not is_authed and auth_resp is not None:
             return auth_resp
         tracks = dailyrec.stamp_playlist_tracks(
-            await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
+            await nmpl.load_tracks(get_netease_client(request.app), nm_pl_id, build_online_track)
         )
         register_online_meta(tracks)
         try:
@@ -13412,7 +13465,8 @@ async def _netease_album_detail_payload(request: Request, entry: dict) -> dict |
     # 专辑详情若仍只看 netease_enabled，常驻用户点网易曲目专辑页必然打不开。
     if not _netease_runtime_usable():
         return None
-    musicbox_client = get_musicbox_client(request.app)
+    netease_client = get_netease_client(request.app)
+    musicbox_client = netease_client
     track_guid = str(entry.get("track_guid") or "")
     album_id = str(entry.get("album_id") or "")
     album_name = str(entry.get("album") or "")
@@ -13420,7 +13474,7 @@ async def _netease_album_detail_payload(request: Request, entry: dict) -> dict |
     if not album_id:
         song_id = song_id_from_online_guid(track_guid).rsplit(":", 1)[-1]
         try:
-            r = await musicbox_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
+            r = await netease_client.get(f"/api/v1/song/{song_id}/info", timeout=10.0)
             if r.status_code == 200:
                 body = r.json()
                 if isinstance(body, dict) and body.get("ok") is not False:
@@ -13713,7 +13767,7 @@ def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str] | None
 async def _netease_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
     if not CONF.get("netease_enabled"):
         return []
-    client = get_musicbox_client(request.app)
+    client = get_netease_client(request.app)
     try:
         r = await client.get(
             "/api/v1/search",

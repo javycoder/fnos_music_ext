@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       formal: ${{ steps.release-kind.outputs.formal }}
+      fpk_name: ${{ steps.release-fpk.outputs.name }}
     env:
       # 打赏二维码文本（可选）：两个渠道独立生成，不把文本或图片提交到仓库
       ALIPAY_QRCODE: ${{ secrets.ALIPAY_QRCODE }}
@@ -87,9 +88,17 @@ jobs:
           test -s webui-service/static/wechat.png
 
       - name: Build fpk package
+        id: release-fpk
         run: |
           ./packaging/fpk/build.sh
           ls -la dist/
+          shopt -s nullglob
+          packages=(dist/fnmusic-ext-*.fpk)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one FPK, got ${#packages[@]}" >&2
+            exit 1
+          fi
+          echo "name=$(basename "${packages[0]}")" >> "$GITHUB_OUTPUT"
 
       - name: Verify donation assets in fpk
         run: |
@@ -136,9 +145,8 @@ jobs:
               and .prerelease == true and .draft == false
               and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+[a-z]$"))
             ' <<< "$current" >/dev/null
-            # 必须先删 Release 再删远端 tag；任何 API 失败均阻止创建新 Release。
+            # 只清理 Release，保留已有 tag；任何 API 失败均阻止创建新 Release。
             gh api --method DELETE "repos/${GH_REPO}/releases/${release_id}"
-            gh api --method DELETE "repos/${GH_REPO}/git/refs/tags/${old_tag}"
           done <<< "$candidates"
           # 重新分页复核；非约定格式的预发布不自动删除，也不能与新版本并存。
           remaining="$(gh api --paginate --slurp "repos/${GH_REPO}/releases?per_page=100")"
@@ -233,6 +241,7 @@ jobs:
       GITEE_REPO: javycoder/fnos_music_ext
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
       TAG: ${{ inputs.tag || github.ref_name }}
+      FPK_NAME: ${{ needs.release.outputs.fpk_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -321,7 +330,11 @@ jobs:
 
           # 固定回指 GitHub Release。此 job 不上传、不删除 Gitee 附件。
           github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
-          fpk_name="fnmusic-ext-${version}.fpk"
+          fpk_name="${FPK_NAME:-}"
+          case "${fpk_name}" in
+            "fnmusic-ext-${version}.fpk"|"fnmusic-ext-${version}-amd64.fpk"|"fnmusic-ext-${version}-arm64.fpk") ;;
+            *) echo "ERROR: GitHub Release FPK 名称与 VERSION 不匹配" >&2; exit 1 ;;
+          esac
 
           # 更新说明 = changelog + 附件下载链接；PATCH 必须重传 tag_name 与 name
           {

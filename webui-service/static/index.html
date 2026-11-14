@@ -718,6 +718,16 @@
     <p>支持多个洛雪源同时激活，解析失败时自动接力。保存仅快速确认启停和初始化，整次等待不超过一分钟；正常且未变化的源不重复激活。完整测试独立执行搜索、解析和音频前缀探活，初始化成功不代表已验证播放。</p>
     <p>部分失败时保留已确认的修改，并分别提示失败、未执行或结果待核实。超时不会重放写请求；请先刷新运行状态再决定是否重试。</p>
   </template>
+  <template data-help-id="lx-source-cpu">
+    <p><b>源名称：</b><span data-cpu-help="source">未知</span><br>
+      <b>当前读数：</b><span data-cpu-help="reading">未知</span><br>
+      <b>触发阈值：</b><span data-cpu-help="threshold">50%</span>，持续 <span data-cpu-help="required">180 秒</span><br>
+      <b>已连续高占用：</b><span data-cpu-help="high">未知</span><br>
+      <b>触发时间：</b><span data-cpu-help="detected">未知</span><br>
+      <b>进程状态：</b><span data-cpu-help="process">未知</span> · 运行实例 <span data-cpu-help="runtime">未知</span></p>
+    <p>该 LX 音源脚本进程曾连续三分钟占用超过单个 CPU 核心 50% 的计算资源。此标记针对独立运行的第三方音源脚本进程，不表示本项目主服务进程出现 CPU 异常。请优先检查、更新或更换 LX 音乐源脚本，也可联系脚本作者排查。</p>
+    <p>标记会保留至该源停用或进程重新启动。当前 CPU 降低不会自动清除标记。</p>
+  </template>
   <template data-help-id="lx-timeouts">
     <p>控制洛雪解析歌曲链接的等待时间，改完保存即热更新，无需重启：</p>
     <p>· <b>单次取链超时</b>：单次调用某个源脚本解析链接的最长等待（默认 8 秒）。<br>· <b>播放取链总限时</b>：含缓存续期、多源重试与音质降档的总预算（默认 15 秒）。<br>· <b>音频链接探活超时</b>：拿到直链后验证能否连通的超时（默认 3 秒）。</p>

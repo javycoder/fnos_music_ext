@@ -824,6 +824,33 @@ class TestAdapterComparison:
     def _run(self, request):
         return asyncio.run(lac.compare_candidate(request))
 
+    def test_project_single_source_client_keeps_native_evidence_separate(self, backend):
+        """注入项目单源客户端时，适配链路走精确 source_id，原生侧另取证据。"""
+        class _ProjectClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get_music_url(self, song_info, quality, **kwargs):
+                self.calls.append((song_info, quality, kwargs))
+                return {
+                    "url": backend.media_url("/stream.wav"),
+                    "type": "128k",
+                    "sourceId": "fakesource",
+                    "sourceName": "project-source",
+                }
+
+        project = _ProjectClient()
+        report = self._run(_request(backend, project_client=project))
+        assert report["adapter"]["status"] == "ok"
+        assert report["native_resolve"]["status"] == "url_present"
+        assert report["native_resolve"]["source_id_matched"] is True
+        assert len(project.calls) == 1
+        _song, quality, kwargs = project.calls[0]
+        assert quality == "128k"
+        assert kwargs["source_id"] == "fakesource"
+        assert kwargs["auto_switch_api_source"] is False
+        assert report["candidate_disposition"] == "adapter_ok"
+
     def test_success_flow_uses_real_app_parse_and_probe(self, backend):
         """成功用例：真实 app 解析 + 真实探活 + 受限 transport + 候选级结论。"""
         report = self._run(_request(backend))

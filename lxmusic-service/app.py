@@ -14,7 +14,7 @@ fnmusic-ext 洛雪音源适配服务 (基于 lxserver 后端)。
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 import math
 import json
@@ -46,6 +46,14 @@ from lxserver_client import (
     parse_interval_to_seconds,
     SourceOperationBusy,
     serialize_source_operation,
+)
+from managed_client import ManagedLxServerClient
+from source_runtime import (
+    SourceProcessBusy,
+    SourceProcessUnavailable,
+    SourceResolveTimeout,
+    SourceRuntimeError,
+    SourceRuntimeManager,
 )
 from playback_policy import (
     CandidateFinder,
@@ -166,11 +174,13 @@ def _reload_timeout_settings() -> dict[str, float]:
         _URL_CACHE_GEN += 1
     return {key: float(CONF[key]) for key, _, _ in _TIMEOUT_ENV_KEYS}
 
-# 全局客户端实例
-LXSERVER = LxServerClient(
+# 共享 lxserver 负责搜索/歌词/榜单；源生命周期与解析由独立进程管理器接管。
+SOURCE_RUNTIME = SourceRuntimeManager()
+LXSERVER = ManagedLxServerClient(
     base_url=os.environ.get("LXSERVER_URL", DEFAULT_LXSERVER_URL),
     admin_password=os.environ.get("LXSERVER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
     timeout=CONF["resolver_timeout"],
+    manager=SOURCE_RUNTIME,
     # songInfo 磁盘持久化（issue #49）：重启后榜单/搜索反查缓存不丢，
     # 关键词型源脚本冷启动仍能按真实歌名歌手取链
     store_path=os.path.join(CONF["data_dir"], "songinfo_store.json"),
@@ -828,6 +838,7 @@ async def _attempt_pinned(
                 exclude_api_sources=exclude_sources,
                 request_timeout=resolve_budget,
                 auto_switch_api_source=False,
+                source_id=script.id,
             )
     except TimeoutError:
         # 仅真正用满单次解析上限的超时可设置短暂歌曲候选冷却。
@@ -837,6 +848,16 @@ async def _attempt_pinned(
             logger.warning("lxserver 播放解析内部故障: %s", type(exc).__name__)
             return _AttemptResult(service_error=True)
         return _AttemptResult(timeout=True, resolve_timeout=full_resolver_budget)
+    except (SourceResolveTimeout, SourceProcessBusy):
+        return _AttemptResult(timeout=True, resolve_timeout=full_resolver_budget)
+    except SourceProcessUnavailable as exc:
+        logger.warning("洛雪源进程不可用 script=%s platform=%s code=%s",
+                       script.id, platform, exc.code)
+        return _AttemptResult(failure=True)
+    except SourceRuntimeError as exc:
+        logger.warning("洛雪源运行时错误 script=%s platform=%s stage=%s code=%s",
+                       script.id, platform, exc.stage, exc.code)
+        return _AttemptResult(failure=True)
     except Exception as exc:
         if is_lxserver_unreachable(exc):
             logger.warning("lxserver 播放解析内部故障: %s", exc)
@@ -1552,6 +1573,12 @@ def _describe_source_snapshot(sources: list[dict]) -> dict:
             "error": redact(str(s.get("error") or "")),
             "initialized": status == "success",
             "platforms": _source_supported_platforms(s),
+            "runtime_id": str(s.get("runtime_id") or ""),
+            "process_state": str(s.get("process_state") or ""),
+            "resource_usage": (
+                dict(s.get("resource_usage"))
+                if isinstance(s.get("resource_usage"), dict) else None
+            ),
         })
     ready = sum(s["initialized"] for s in active_sources)
     failed = sum(s["status"] == "failed" for s in active_sources)
@@ -1905,11 +1932,17 @@ async def _migrate_persisted_sources():
 async def lifespan(app: FastAPI):
     # 共享一个全局 AsyncClient 用于探活和下载
     app.state.client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+    await SOURCE_RUNTIME.start()
     migration_task = asyncio.create_task(_bootstrap_migration())
-    yield
-    migration_task.cancel()
-    await app.state.client.aclose()
-    await LXSERVER.close()
+    try:
+        yield
+    finally:
+        migration_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await migration_task
+        await SOURCE_RUNTIME.close()
+        await app.state.client.aclose()
+        await LXSERVER.close()
 
 
 app = FastAPI(title="fnmusic-lxmusic", version=SERVICE_VERSION, lifespan=lifespan)
@@ -1960,18 +1993,33 @@ def _err(msg: str, code: int = 404) -> JSONResponse:
 async def healthz():
     # 两个底层请求并发且有总预算；状态与能力复用同一份源列表。
     error = ""
+    source_error = ""
     sources: list[dict] = []
     try:
         async with asyncio.timeout(HEALTH_SNAPSHOT_TIMEOUT):
-            alive, sources = await asyncio.gather(LXSERVER.is_alive(), LXSERVER.list_custom_sources())
-        if not alive:
-            error = "lxserver unreachable"
+            alive = await LXSERVER.is_alive()
     except Exception as exc:
+        alive = False
         error = _source_query_error(exc)
-    if error:
-        user_src = {"state": "unavailable", "initialized": False, "last_error": error}
+    try:
+        async with asyncio.timeout(HEALTH_SNAPSHOT_TIMEOUT):
+            sources = await LXSERVER.list_custom_sources()
+    except Exception as exc:
+        source_error = _source_query_error(exc)
+        if not error:
+            error = source_error
+    if not alive:
+        error = error or "lxserver unreachable"
+    if source_error and not sources:
+        user_src = {"state": "unavailable", "initialized": False, "last_error": source_error}
     else:
         user_src = _describe_source_snapshot(sources)
+        if error:
+            user_src["metadata_error"] = error
+            prior = str(user_src.get("last_error") or "").strip()
+            user_src["last_error"] = "; ".join(
+                part for part in (prior, error) if part
+            )
     result = {
         "ok": not bool(error),
         "service": "fnmusic-lxmusic",

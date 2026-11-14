@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import pytest
 from config_jobs import ConfigJobStore
 from test_webui import env_file, svctl, lx_ready_mock
@@ -58,6 +59,23 @@ def test_config_job_store_crud(tmp_path):
     assert completed.result == {"changed": ["FNMUSIC_LX_ENABLED"]}
 
     # 完成后无活动任务
+    assert store.get_active_job() is None
+
+
+@pytest.mark.parametrize("fallback", [True, False])
+def test_config_job_store_memory_survives_new_connections(tmp_path, fallback):
+    if fallback:
+        blocker = tmp_path / "not-a-directory"
+        blocker.touch()
+        store = ConfigJobStore(blocker / "jobs.db")
+    else:
+        store = ConfigJobStore(":memory:")
+
+    assert store.db_path == Path(":memory:")
+    job = store.create_job({"FNMUSIC_LX_ENABLED": "true"}, idempotency_key="memory")
+    assert store.get_active_job().job_id == job.job_id
+    assert store.find_by_idempotency_key("memory").job_id == job.job_id
+    store.update_job(job.job_id, status="success")
     assert store.get_active_job() is None
 
 

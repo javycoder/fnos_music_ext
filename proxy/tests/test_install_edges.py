@@ -821,7 +821,7 @@ def test_base_image_write_preserves_existing_env(tmp_path):
 
 # ----------------------------------------------------------- netease_login.sh ---
 
-NETEASE_TOOLS = ("dirname", "grep", "cut", "tr", "date", "cat", "jq", "printf")
+NETEASE_TOOLS = ("dirname", "grep", "cut", "tr", "tail", "date", "cat", "jq", "printf")
 
 
 def netease_curl_stub(bindir: Path) -> str:
@@ -876,6 +876,30 @@ def run_netease(tmp_path: Path, **env: str) -> subprocess.CompletedProcess:
     full_env = {**os.environ, "PATH": str(bindir), "FNMUSIC_MUSICBOX_URL": "http://mb.test", **env}
     return subprocess.run([BASH, str(sandbox / "netease_login.sh")],
                           env=full_env, capture_output=True, text=True, timeout=60)
+
+
+def test_netease_login_prefers_new_url_from_environment_and_config(tmp_path):
+    env_dir = tmp_path / "environment"
+    env_dir.mkdir()
+    result = run_netease(env_dir, NETEASE_HEALTHZ_OK="0",
+                         FNMUSIC_NETEASE_URL="http://new.test",
+                         FNMUSIC_MUSICBOX_URL="http://old.test")
+    assert result.returncode == 0
+    log = (env_dir / "nbin" / "netease-curl.log").read_text(encoding="utf-8")
+    assert "http://new.test/healthz" in log
+    config_dir = tmp_path / "config"
+    sandbox = config_dir / "nsandbox"
+    sandbox.mkdir(parents=True)
+    (sandbox / ".env").write_text(
+        "FNMUSIC_MUSICBOX_URL=http://old-config.test\n"
+        "FNMUSIC_NETEASE_URL=http://new-config.test\n",
+        encoding="utf-8",
+    )
+    result = run_netease(config_dir, NETEASE_HEALTHZ_OK="0",
+                         FNMUSIC_NETEASE_URL="", FNMUSIC_MUSICBOX_URL="")
+    assert result.returncode == 0
+    log = (config_dir / "nbin" / "netease-curl.log").read_text(encoding="utf-8")
+    assert "http://new-config.test/healthz" in log
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="需要 jq")

@@ -1,9 +1,16 @@
 {
   "purpose": "Pinned public script metadata only; no scripts executed or embedded.",
   "repositories": {
-    "pdone/lx-music-source": "000578ddca4a676012cf735abdc3489efdc67c74",
+    "pdone/lx-music-source": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
     "guoyue2010/lxmusic-": "4b6ddafad26fed0b6cbe029a3cc8dcd7fd7e8cd7",
     "Macrohard0001/lx-ikun-music-sources": "d96e1df6738bc067abaee97bcc5d81b4a7bcf0ad"
+  },
+  "aggregators": {
+    "deerwan/lxhub": {
+      "commit": "488238ee8c1eeb5fc54e6a7906f73458c22431d4",
+      "fixed_scripts": 0,
+      "note": "Link aggregator; no fixed .js sources. Not counted as tested sources."
+    }
   },
   "source_location_count": 57,
   "unique_blob_count": 40,
@@ -12,7 +19,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "changqing/latest.js"
         }
       ],
@@ -26,7 +33,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "fish/latest.js"
         }
       ],
@@ -40,7 +47,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "flower/latest.js"
         }
       ],
@@ -54,7 +61,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "grass/latest.js"
         }
       ],
@@ -68,7 +75,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "helloworld/latest.js"
         }
       ],
@@ -82,7 +89,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "huanyin/latest.js"
         },
         {
@@ -101,7 +108,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "huibq/latest.js"
         }
       ],
@@ -115,7 +122,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "hyw/latest.js"
         }
       ],
@@ -129,7 +136,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "ikun/latest.js"
         }
       ],
@@ -143,7 +150,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "jiexiang/latest.js"
         }
       ],
@@ -157,7 +164,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "juhe/latest.js"
         }
       ],
@@ -171,7 +178,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "lx/latest.js"
         }
       ],
@@ -185,7 +192,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "qdy/latest.js"
         }
       ],
@@ -199,7 +206,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "sixyin/latest.js"
         }
       ],
@@ -213,13 +220,13 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "xinghai/latest.js"
         }
       ],
-      "git_blob_sha": "25db1d81b31570e545a7e84af6a1726973ee0fb1",
-      "sha256": "807d6157e4fd7cdd05b8727efd73778b54a3b05a0b5e4c6bb28dedc0668e94e9",
-      "bytes": 38858,
+      "git_blob_sha": "3eb0ce8c233ba5e1b2f0f1b4d70856e6accb3be5",
+      "sha256": "d2f72c5c0dde51fbaa32c9ca5c634a1ae43eafa952abc1e5a83dab4f578487ab",
+      "bytes": 21572,
       "fetch": "verified",
       "runtime_test": "pending_isolated_instance"
     },
@@ -227,7 +234,7 @@
       "locations": [
         {
           "repository": "pdone/lx-music-source",
-          "commit": "000578ddca4a676012cf735abdc3489efdc67c74",
+          "commit": "ed8328dbd1a77aee3ee0116d835eb9d907eeaad2",
           "path": "yuningxi/latest.js"
         },
         {

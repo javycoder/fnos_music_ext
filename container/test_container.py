@@ -27,7 +27,7 @@ def supervisord_conf():
 def test_supervisord_programs_all_autostart_false(supervisord_conf):
     programs = sorted(s for s in supervisord_conf.sections() if s.startswith("program:"))
     assert programs == [
-        "program:lxmusic", "program:lxserver", "program:musicbox", "program:musicdl", "program:webui",
+        "program:lxmusic", "program:lxserver", "program:musicdl", "program:netease", "program:webui",
     ]
     for section in programs:
         assert supervisord_conf.get(section, "autostart") == "false"
@@ -49,7 +49,6 @@ def test_supervisord_programs_all_autostart_false(supervisord_conf):
 def test_supervisord_ports_and_directories(supervisord_conf):
     expected = {
         "musicdl": ("8001", "/srv/musicdl-service"),
-        "musicbox": ("8002", "/srv/musicbox-service"),
         "lxmusic": ("8003", "/srv/lxmusic-service"),
         "webui": ("8004", "/srv/webui-service"),
     }
@@ -59,11 +58,22 @@ def test_supervisord_ports_and_directories(supervisord_conf):
         assert f"--port {port}" in command
         assert supervisord_conf.get(section, "directory") == directory
 
+    netease_sec = "program:netease"
+    assert supervisord_conf.get(netease_sec, "directory") == "/srv/netease-service"
+    assert "node app.js" in supervisord_conf.get(netease_sec, "command")
+    assert 'PORT="8002"' in supervisord_conf.get(netease_sec, "environment")
+
     # lxserver 独立 node 进程，通过环境变量注入端口与路径
     lxserver_sec = "program:lxserver"
     assert supervisord_conf.get(lxserver_sec, "directory") == "/srv/lxserver"
     assert "node index.js" in supervisord_conf.get(lxserver_sec, "command")
     assert 'PORT="8005"' in supervisord_conf.get(lxserver_sec, "environment")
+    assert 'DATA_PATH="/data/lxserver-meta"' in supervisord_conf.get(lxserver_sec, "environment")
+    assert 'CONFIG_PATH="/data/lxserver/config.js"' in supervisord_conf.get(lxserver_sec, "environment")
+    lxmusic_env = supervisord_conf.get("program:lxmusic", "environment")
+    assert 'LXSERVER_DATA_DIR="/data/lxserver"' in lxmusic_env
+    assert 'LXSERVER_DIR="/srv/lxserver"' in lxmusic_env
+    assert 'FNMUSIC_NODE_BIN="/usr/local/bin/node"' in lxmusic_env
 
 
 def test_supervisord_daemon_section(supervisord_conf):
@@ -221,7 +231,7 @@ def entrypoint_env(tmp_path):
 @pytest.mark.parametrize("env_text,expected", [
     # 单源：只启动所选音源
     ("FNMUSIC_MUSICDL_ENABLED=true\n", ["start musicdl"]),
-    ("FNMUSIC_NETEASE_ENABLED=true\n", ["start musicbox"]),
+    ("FNMUSIC_NETEASE_ENABLED=true\n", ["start netease"]),
     ("FNMUSIC_LX_ENABLED=true\n", ["start lxserver", "start lxmusic"]),
     # WebUI 独立开关
     ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\n", ["start lxserver", "start lxmusic", "start webui"]),
@@ -250,7 +260,7 @@ def test_entrypoint_resident_starts_musicbox_with_cookie(entrypoint_env, tmp_pat
     env_text = ("FNMUSIC_MUSICDL_ENABLED=true\n"
                 "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
                 "FNMUSIC_NETEASE_MY_PLAYLISTS=true\n")
-    assert entrypoint_env(env_text) == ["start musicdl", "start musicbox"]
+    assert entrypoint_env(env_text) == ["start musicdl", "start netease"]
 
 
 def test_entrypoint_resident_skips_without_cookie(entrypoint_env, tmp_path):
@@ -273,7 +283,7 @@ def test_entrypoint_public_resident_considers_every_user(entrypoint_env, mapping
                 "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
                 "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED=true\n"
                 "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='" + json.dumps(mapping) + "'\n")
-    assert entrypoint_env(env_text) == ["start musicdl"] + (["start musicbox"] if needs_musicbox else [])
+    assert entrypoint_env(env_text) == ["start musicdl"] + (["start netease"] if needs_musicbox else [])
 
 
 @pytest.mark.parametrize("sync_all,selection,personal,needs_musicbox", [
@@ -298,7 +308,7 @@ def test_entrypoint_public_resident_follows_active_mode(
                 f"FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL={'true' if sync_all else 'false'}\n"
                 f"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='{json.dumps(selection)}'\n"
                 f"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{by_user}'\n")
-    assert entrypoint_env(env_text) == ["start musicdl"] + (["start musicbox"] if needs_musicbox else [])
+    assert entrypoint_env(env_text) == ["start musicdl"] + (["start netease"] if needs_musicbox else [])
 
 
 def test_entrypoint_resident_requires_my_playlists_flag(entrypoint_env, tmp_path):
@@ -314,7 +324,7 @@ def test_entrypoint_musicbox_provider_not_duplicated_by_resident(entrypoint_env,
     env_text = ("FNMUSIC_NETEASE_ENABLED=true\n"
                 "FNMUSIC_NETEASE_PLAYLIST_RESIDENT=true\n"
                 "FNMUSIC_NETEASE_MY_PLAYLISTS=true\n")
-    assert entrypoint_env(env_text) == ["start musicbox"]
+    assert entrypoint_env(env_text) == ["start netease"]
 
 
 # ---------------------------------------------------------------- compose / Dockerfile
@@ -357,13 +367,18 @@ def test_dockerfile_assembly():
     # 单镜像运行时：python + node(lx 沙箱) + ffmpeg(musicdl 试听) + supervisor
     for pkg in ("nodejs", "ffmpeg", "supervisor"):
         assert pkg in text
-    for req in ("musicdl-service/requirements.txt", "musicbox-service/requirements.txt",
+    for req in ("musicdl-service/requirements.txt",
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
+    assert "netease-service/package.json" in text
     assert "container/lxserver.version" in text
     assert "container/ensure_lxserver_native.sh" in text
     assert "ensure-lxserver-native" in text
     assert "lxmusic-service/lxserver_client.py" in text
+    for module in ("managed_client.py", "source_runtime.py", "source_cpu.py",
+                   "source_worker.cjs", "lx_vm_bridge.cjs"):
+        assert f"lxmusic-service/{module}" in text
+    assert "lxserver_compat" not in text
     assert "lxmusic-service/js/bridge.js" not in text
     assert text.count("HEALTHCHECK") >= 1
     assert 'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' in text
@@ -406,7 +421,7 @@ def test_dockerfile_network_fallback_resilience():
     DNS/NSS，缺失或失败还可能被 set -e 打死，因此改为不探测、始终注入。
     """
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
-    apt_step = text.split("# nodejs（洛雪自定义源")[1].split("# 四个服务的")[0]
+    apt_step = text.split("# 四个服务的 Python 依赖并集")[0]
     # DNS 自愈：始终注入备用公共 DNS（仅本构建层内生效），不依赖 getent
     assert "getent hosts" not in apt_step
     assert "223.5.5.5" in apt_step and "119.29.29.29" in apt_step
@@ -424,7 +439,7 @@ def test_dockerfile_network_fallback_resilience():
     # 双源失败时必须报告备用 DNS 注入是否真正生效，区分「注入失败」与「源不可达」
     assert "注入未生效" in apt_step
     # pip 步骤：同样自带 DNS 自愈（resolv.conf 改写不跨 RUN 层）+ 官方 PyPI 回退
-    pip_step = text.split("# 四个服务的")[1]
+    pip_step = text.split("# 四个服务的 Python 依赖并集")[1]
     assert "getent hosts" not in pip_step
     assert "223.5.5.5" in pip_step
     assert "https://pypi.org/simple" in pip_step
@@ -435,7 +450,7 @@ def test_dockerignore_whitelist_build_context():
     code_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     # 白名单模式：先忽略一切，再放行四个服务目录与 container/
     assert code_lines[0] == "*"
-    for keep in ("!musicdl-service/", "!musicbox-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
+    for keep in ("!musicdl-service/", "!netease-service/", "!lxmusic-service/", "!webui-service/", "!container/"):
         assert keep in code_lines
 
 
@@ -475,7 +490,7 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
     # proxy/app.py 按部署形态动态导入公共歌单模块；正则扫描静态 import 不容易覆盖。
     required = {"publicplaylists"} | set(re.findall(r"\bproxy/([A-Za-z_]\w*)\.py\b", copied))
     origins: dict[str, str] = {"publicplaylists": "动态导入（proxy/app.py）"}
-    for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
+    for service_dir in ("musicdl-service", "lxmusic-service", "webui-service"):
         for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
             # 测试文件（test_*/conftest）不进镜像、不随服务运行：其跨目录 import
             # （如 lxmusic 测试比对 proxy 的 UA 常量）不构成镜像依赖
@@ -526,6 +541,7 @@ def test_entrypoint_creates_log_root_before_supervisord(tmp_path):
         "FNMUSIC_LOG_DIR": str(log_root),
         # 重定向数据目录：宿主 macOS 上 /data 只读，容器外测试必须指到临时目录
         "DATA_PATH": str(tmp_path / "data" / "lxserver"),
+        "LXSERVER_META_DATA_DIR": str(tmp_path / "data" / "lxserver-meta"),
         "LX_DATA_DIR": str(tmp_path / "data" / "lxmusic"),
         "XDG_DATA_HOME": str(tmp_path / "data"),
     }
@@ -535,6 +551,10 @@ def test_entrypoint_creates_log_root_before_supervisord(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert log_root.is_dir(), "entrypoint 应在 supervisord 启动前创建日志根目录"
+    meta_root = tmp_path / "data" / "lxserver-meta"
+    assert (meta_root / "users" / "source" / "_open").is_dir(), (
+        "共享元数据 lxserver 应使用独立 DATA_PATH，不扫描用户源目录"
+    )
 
 
 def _install_function(name):

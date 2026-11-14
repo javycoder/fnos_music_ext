@@ -404,6 +404,7 @@ def test_pinned_attempt_sends_auto_switch_false(test_app_client, fake_lx, runtim
         lxapp.app.state.client = restore
     assert response.status_code == 200, response.text
     assert fake_lx.url_auto_switch == [False]
+    assert fake_lx.url_source_ids == ["a.js"]
 
 
 @pytest.mark.parametrize("source_id", ["kw", "other.js", ""])
@@ -461,7 +462,7 @@ async def test_song_high_tier_failure_does_not_quarantine_standard(fake_lx, runt
     fake_lx.sources = [_ready("a.js", ["kw"])]
 
     async def without_flac(song_info, quality="128k", exclude_api_sources=None,
-                           request_timeout=None, auto_switch_api_source=True):
+                           request_timeout=None, auto_switch_api_source=True, source_id=None):
         fake_lx.url_calls.append((str(song_info.get("songmid") or ""), quality))
         # 该脚本没有无损档：要 flac 时拿不到链接；320k 及以下给真实的 mp3 直链
         # （降档后拿到 FLAC 媒体属于越界表示，会被拒绝，不是这里的测试对象）
@@ -520,7 +521,7 @@ async def test_cancellation_and_budget_exhaustion_do_not_record_failure(
     started = asyncio.Event()
 
     async def slow(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None, auto_switch_api_source=True):
+                   request_timeout=None, auto_switch_api_source=True, source_id=None):
         started.set()
         await asyncio.sleep(5)
         return None
@@ -562,7 +563,7 @@ async def test_song_failure_then_budget_exhaustion_does_not_open_global_circuit(
     calls: list[str] = []
 
     async def fail_then_hang(song_info, quality="128k", exclude_api_sources=None,
-                             request_timeout=None, auto_switch_api_source=True):
+                             request_timeout=None, auto_switch_api_source=True, source_id=None):
         pinned = "a.js" if exclude_api_sources == ["b.js"] else "b.js"
         calls.append(pinned)
         # a.js 真失败（脚本明确拿不出直链），b.js 慢到单次超时
@@ -700,19 +701,19 @@ async def test_first_slow_script_does_not_eat_total_budget(fake_lx, runtime, mon
     fake_lx.sources = [_ready("a.js", ["kw"]), _ready("b.js", ["kw"])]
 
     async def slow(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None, auto_switch_api_source=True):
+                   request_timeout=None, auto_switch_api_source=True, source_id=None):
         await asyncio.sleep(1.0)
         # 标准档请求要真实的有损媒体：低档却回 FLAC 会被判越界拒绝
         return {"url": "https://media.test/a.mp3", "type": "128k", "sourceId": "a.js"}
 
     async def fast(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None, auto_switch_api_source=True):
+                   request_timeout=None, auto_switch_api_source=True, source_id=None):
         return {"url": "https://media.test/b.mp3", "type": "128k", "sourceId": "b.js"}
 
     calls: list[str] = []
 
     async def by_pin(song_info, quality="128k", exclude_api_sources=None,
-                     request_timeout=None, auto_switch_api_source=True):
+                     request_timeout=None, auto_switch_api_source=True, source_id=None):
         pinned = "a.js" if exclude_api_sources == ["b.js"] else "b.js"
         calls.append(pinned)
         fake_lx.url_timeouts.append(request_timeout)
@@ -850,7 +851,7 @@ def _constant_flac_script(fake_lx, monkeypatch, *, url="https://media.test/const
     """
 
     async def constant(song_info, quality="128k", exclude_api_sources=None,
-                       request_timeout=None, auto_switch_api_source=True):
+                       request_timeout=None, auto_switch_api_source=True, source_id=None):
         fake_lx.url_calls.append((str(song_info.get("songmid") or ""), quality))
         fake_lx.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         fake_lx.url_auto_switch.append(bool(auto_switch_api_source))

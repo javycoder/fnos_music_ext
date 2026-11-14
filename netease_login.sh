@@ -18,9 +18,12 @@ handle_interrupt() {
 trap handle_interrupt INT TERM
 
 # 优先取环境变量，其次从 .env 读取，默认 127.0.0.1:8770
-MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-}"
+MUSICBOX_URL="${FNMUSIC_NETEASE_URL:-${FNMUSIC_MUSICBOX_URL:-}}"
 if [ -z "${MUSICBOX_URL}" ] && [ -f "${BASE_DIR}/.env" ]; then
-    MUSICBOX_URL="$(grep -E '^FNMUSIC_MUSICBOX_URL=' "${BASE_DIR}/.env" 2>/dev/null | cut -d= -f2- | tr -d "'\"\r " || true)"
+    MUSICBOX_URL="$(grep -E '^FNMUSIC_NETEASE_URL=' "${BASE_DIR}/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "'\"\r " || true)"
+    if [ -z "${MUSICBOX_URL}" ]; then
+        MUSICBOX_URL="$(grep -E '^FNMUSIC_MUSICBOX_URL=' "${BASE_DIR}/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "'\"\r " || true)"
+    fi
 fi
 MUSICBOX_URL="${MUSICBOX_URL:-http://127.0.0.1:8770}"
 

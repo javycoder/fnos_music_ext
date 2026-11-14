@@ -12,88 +12,59 @@ import sys
 import tempfile
 
 
-def check_musicbox():
-    from NEMbox import cli
+def check_netease(app_dir: Path):
+    verify_script = """
+    const assert = require('assert');
+    const { createService } = require('./service');
+    const sdk = require('@neteasecloudmusicapienhanced/api');
 
-    parser = cli._build_parser()
-    commands = [
-        ["search", "fixture", "--type", "song", "--json"],
-        ["song", "url", "123", "--quality", "lossless", "--json"],
-        ["song", "info", "123", "--json"],
-        ["artist", "123", "--limit", "5", "--json"],
-        ["album", "123", "--json"],
-        ["playlist", "show", "123", "--json"],
-        ["auth", "login", "--no-wait", "--json"],
-    ]
-    for command in commands:
-        assert getattr(parser.parse_args(command), "handler", None), command
+    const requiredExports = [
+      'cloudsearch', 'song_detail', 'song_url_v1', 'lyric_new',
+      'artists', 'album', 'playlist_detail', 'login_status',
+      'user_playlist', 'recommend_songs', 'toplist', 'playlist_catlist',
+      'playlist_highquality_tags', 'personalized', 'top_playlist',
+      'top_playlist_highquality', 'login_qr_key', 'login_qr_create',
+      'login_qr_check', 'recommend_resource'
+    ];
+    for (const exp of requiredExports) {
+      assert.strictEqual(typeof sdk[exp], 'function', 'Missing export: ' + exp);
+    }
 
-    class Api:
-        def songs_url(self, ids):
-            assert ids == [123]
-            return [{"id": 123, "code": 200, "url": "https://audio.invalid/fixture.flac"}]
-
-    # Update notices are not part of the offline response contract.
-    cli._update_notice = lambda: None
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        status = cli.dispatch(Api(), parser.parse_args(commands[1]))
-    payload = json.loads(output.getvalue())
-    assert status == 0 and payload["ok"] is True
-    assert payload["data"]["code"] == 200
-    assert payload["data"]["url"].endswith(".flac")
-    executable = Path(sys.executable).parent / "musicbox"
-    result = subprocess.run([str(executable), "song", "url", "--help"], capture_output=True, timeout=15)
-    assert result.returncode == 0, result.stderr.decode(errors="replace")
-    assert b"--quality" in result.stdout
-    import playback
-    import netease_ext
-    import httpx
-    from urllib.parse import parse_qs
-    from NEMbox.encrypt import AES, EAPI_KEY
-
-    client_type = httpx.AsyncClient
-    captured = []
-
-    def handler(request):
-        form = parse_qs(request.content.decode())
-        if request.url.path.endswith("/url/v1"):
-            decoded = AES.new(EAPI_KEY, AES.MODE_ECB).decrypt(bytes.fromhex(form["params"][0]))
-            decoded = decoded[:-decoded[-1]].decode().split("-36cd479b6b5-")
-            body = json.loads(decoded[1])
-            assert decoded[0] == "/api/song/enhance/player/url/v1"
-            assert body["ids"] == "[123]" and body["level"] == "lossless"
-            assert body["encodeType"] == "flac" and body["header"]["deviceId"]
-            captured.append("eapi")
-            plain = json.dumps({"code": 200, "data": []}).encode()
-            padding = 16 - len(plain) % 16
-            encrypted = AES.new(EAPI_KEY, AES.MODE_ECB).encrypt(plain + bytes([padding]) * padding)
-            return httpx.Response(200, content=encrypted)
-        assert "params" in form and "encSecKey" in form
-        assert request.headers["host"] == request.url.host
-        captured.append("weapi")
-        return httpx.Response(200, json={"code": 200, "data": [{
-            "id": 123, "code": 200, "url": "https://audio.invalid/fixture.flac",
-        }]})
-
-    async def verify():
-        original_client = playback.httpx.AsyncClient
-        playback.httpx.AsyncClient = lambda **kwargs: client_type(transport=httpx.MockTransport(handler), **kwargs)
-        try:
-            playback.reset()
-            with netease_ext._api_lock:
-                item = await asyncio.wait_for(playback.get_song_url_async(123, "lossless"), 5)
-            assert item["url"].endswith(".flac") and captured == ["eapi", "weapi"]
-            await playback.shutdown()
-        finally:
-            playback.httpx.AsyncClient = original_client
-
-    asyncio.run(verify())
+    const { app } = createService();
+    const server = app.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      const http = require('http');
+      http.get('http://127.0.0.1:' + port + '/healthz', (res) => {
+        assert.strictEqual(res.statusCode, 200);
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          const body = JSON.parse(data);
+          assert.strictEqual(body.status, 'ok');
+          assert.strictEqual(body.provider, 'netease');
+          assert.strictEqual(body.upstream, '@neteasecloudmusicapienhanced/api');
+          assert.strictEqual(body.version, '4.41.1');
+          server.close(() => process.exit(0));
+        });
+      }).on('error', (err) => {
+        console.error(err);
+        process.exit(1);
+      });
+    });
+    """
+    proc = subprocess.run(
+        ["node", "-e", verify_script],
+        cwd=str(app_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"NetEase production contract failed: {proc.stdout}\n{proc.stderr}"
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("service", choices=["musicdl", "musicbox", "lxmusic"])
+    parser.add_argument("service", choices=["musicdl", "netease", "lxmusic", "musicbox"])
     parser.add_argument("--app-dir", type=Path, required=True)
     parser.add_argument("--require-non-root", action="store_true")
     args = parser.parse_args()
@@ -104,25 +75,26 @@ def main():
                           XDG_CONFIG_HOME=home + "/config", XDG_RUNTIME_DIR=home + "/run")
         for name in ("cache", "data", "config", "run"):
             Path(home, name).mkdir()
-        sys.path.insert(0, str(args.app_dir.resolve()))
-        module = importlib.import_module("app")
-        assert module.app is not None
-        if args.service == "musicbox":
-            check_musicbox()
-        elif args.service == "musicdl":
-            from musicdl import musicdl
-            import curl_cffi
-            assert callable(musicdl.MusicClient)
-            assert curl_cffi.requests.Session
+        if args.service in ("netease", "musicbox"):
+            check_netease(args.app_dir)
         else:
-            from lxserver_client import SUPPORTED_PLATFORMS
-            from verify_source import parse_script_meta
-            assert "kw" in SUPPORTED_PLATFORMS
-            meta = parse_script_meta(
-                "/*\n * @name ci-src\n * @version 1.0.0\n * @author ci\n"
-                " * @description contract\n */\n"
-            )
-            assert meta["name"] == "ci-src"
+            sys.path.insert(0, str(args.app_dir.resolve()))
+            module = importlib.import_module("app")
+            assert module.app is not None
+            if args.service == "musicdl":
+                from musicdl import musicdl
+                import curl_cffi
+                assert callable(musicdl.MusicClient)
+                assert curl_cffi.requests.Session
+            else:
+                from lxserver_client import SUPPORTED_PLATFORMS
+                from verify_source import parse_script_meta
+                assert "kw" in SUPPORTED_PLATFORMS
+                meta = parse_script_meta(
+                    "/*\n * @name ci-src\n * @version 1.0.0\n * @author ci\n"
+                    " * @description contract\n */\n"
+                )
+                assert meta["name"] == "ci-src"
         print(json.dumps({"service": args.service, "production_import": "pass", "offline_contract": "pass"}))
 
 

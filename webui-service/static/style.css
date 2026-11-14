@@ -420,6 +420,16 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .lx-item-main { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .lx-item-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .lx-item-name { font-weight: 600; font-size: 13.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lx-cpu-alert {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
+  background: var(--err); color: var(--on-accent);
+  font-family: inherit; font-weight: 700; font-size: 12px; line-height: 1;
+  cursor: pointer; touch-action: manipulation;
+}
+.lx-cpu-alert:hover { filter: brightness(1.08); }
+.lx-cpu-alert:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.lx-cpu-alert-label { color: var(--err); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .lx-item-url { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lx-item-btns { display: flex; align-items: center; gap: 8px; flex: none; }
 #lx-source-order-card.is-disabled .lx-order-item { pointer-events: none; touch-action: none; opacity: .7; }

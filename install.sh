@@ -432,8 +432,8 @@ print_featured_source_menu() {
         [ -z "${id}" ] && continue
         [ "${star}" = "1" ] || continue
         case "${provider}" in
-            musicbox)
-                echo "  ${id}) ${label} (musicbox) [端口 8770] — 高品质/无损/歌词封面"
+            netease|musicbox)
+                echo "  ${id}) ${label} (netease) [端口 8770] — 高品质/无损/歌词封面"
                 ;;
             musicdl)
                 echo "  ${id}) mdl-${short} ${label}"
@@ -521,8 +521,8 @@ parse_sources() {
         part="${part%"${part##*[![:space:]]}"}"
         [ -z "${part}" ] && continue
         case "${part}" in
-            musicbox|netease|netease-musicbox)
-                ENABLE_MUSICBOX=1; picked+=("musicbox") ;;
+            netease|musicbox|netease-musicbox)
+                ENABLE_MUSICBOX=1; picked+=("netease") ;;
             musicdl|mdl)
                 ENABLE_MUSICDL=1; picked+=("musicdl") ;;
             lx|lxmusic)
@@ -570,7 +570,7 @@ parse_sources() {
                 }
                 [ "${provider}" != "lx" ] || picked+=("lxmusic")
                 [ "${provider}" != "musicdl" ] || picked+=("musicdl")
-                [ "${provider}" != "musicbox" ] || picked+=("musicbox")
+                [ "${provider}" != "musicbox" ] && [ "${provider}" != "netease" ] || picked+=("netease")
                 ;;
         esac
     done
@@ -791,7 +791,7 @@ precheck_environment() {
             log_info "原生模式 Python 已选定: ${FNMUSIC_SELECTED_PYTHON} ($(runtime_python_version "${FNMUSIC_SELECTED_PYTHON}"))。"
         fi
         if ! choose_node_bin; then
-            log_warn "未检测到 Node 20+（lxserver 需要）：安装阶段将尝试自动探测或 sudo apt-get 补装。"
+            log_warn "未检测到 Node >=22.13.0（lxserver v2.2.0 需要）：安装阶段将尝试自动探测或 sudo apt-get 补装。"
         else
             log_info "原生模式 Node 已选定: ${FNMUSIC_SELECTED_NODE} (${FNMUSIC_NODE_SOURCE})。"
         fi
@@ -1159,7 +1159,7 @@ LX_SUMMARY=""
 [ -n "${LX_PLATFORMS}" ] && LX_SUMMARY="(${LX_PLATFORMS})"
 
 SELECTED=""
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} musicbox[8770]"
+[ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} netease[8770]"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]${MDL_SUMMARY}"
 [ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]${LX_SUMMARY}"
 
@@ -1239,11 +1239,11 @@ find "${SOURCES_DATA_DIR}" -type f -exec chmod 0600 {} + 2>/dev/null || true
 # 归一化服务源码权限：umask 077 环境检出的文件为 600，会导致镜像内 appuser 读不到 app.py
 chmod 0644 \
     "${BASE_DIR}/musicdl-service/app.py" "${BASE_DIR}/musicdl-service/hardening.py" \
-    "${BASE_DIR}/musicbox-service/app.py" "${BASE_DIR}/musicbox-service/runner.py" \
-    "${BASE_DIR}/musicbox-service/netease_ext.py" \
-    "${BASE_DIR}/musicbox-service/playback.py" \
-    "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
-    "${BASE_DIR}/lxmusic-service/verify_source.py" "${BASE_DIR}/lxmusic-service/js/bridge.js" \
+    "${BASE_DIR}/netease-service/app.js" "${BASE_DIR}/netease-service/service.js" \
+    "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/lxserver_client.py" \
+    "${BASE_DIR}/lxmusic-service/managed_client.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
+    "${BASE_DIR}/lxmusic-service/source_cpu.py" "${BASE_DIR}/lxmusic-service/verify_source.py" \
+    "${BASE_DIR}/lxmusic-service/source_worker.cjs" "${BASE_DIR}/lxmusic-service/lx_vm_bridge.cjs" \
     "${BASE_DIR}/webui-service/app.py" "${BASE_DIR}/webui-service/static/index.html" \
     "${BASE_DIR}/webui-service/static/app.js" "${BASE_DIR}/webui-service/static/style.css" \
     2>/dev/null || true
@@ -1593,9 +1593,9 @@ install_sources_container() {
     if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
         waited=1
         if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
-            log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
+            log_info "netease 已就绪 http://127.0.0.1:8770/healthz"
         else
-            log_err "等待 musicbox healthz 超时"
+            log_err "等待 netease healthz 超时"
             diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
@@ -1759,9 +1759,9 @@ install_sources_native() {
     if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
         waited=1
         if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
-            log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
+            log_info "netease 已就绪 http://127.0.0.1:8770/healthz"
         else
-            log_err "等待 musicbox healthz 超时"
+            log_err "等待 netease healthz 超时"
             diagnose_native
             return 1
         fi
@@ -1936,8 +1936,7 @@ log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
 log_info "已启用音源（${MODE_LABEL}）:${SELECTED}"
 log_install "done version=${FNMUSIC_VERSION} deploy=${DEPLOY_MODE} sources=${SELECTED} webui=${WEBUI_FLAG}"
 log_info "------------------------------------------------------------"
-log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
+[ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • netease   [8770] 网易云音源     http://127.0.0.1:8770/healthz"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源${MDL_SUMMARY:+ 平台${MDL_SUMMARY}}   http://127.0.0.1:8768/healthz"
 [ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪自定义源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
 if [ "${WEBUI_FLAG}" = "true" ]; then
@@ -1978,7 +1977,7 @@ log_info "============================================================"
 
 if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info ""
-    log_info "==> 检测到已启用网易云音源 (musicbox)，即将进入扫码登录流程..."
+    log_info "==> 检测到已启用网易云音源 (netease)，即将进入扫码登录流程..."
     bash "${BASE_DIR}/netease_login.sh" || true
 fi
 

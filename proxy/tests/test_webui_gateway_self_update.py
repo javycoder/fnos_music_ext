@@ -79,6 +79,10 @@ def test_handle_self_update_get_target_valid_and_invalid():
         assert status == 200
         assert body["ok"] is True
         assert body["target"]["target_id"] == "0123456789abcdef0123456789abcdef"
+    with patch("proxy.webui_gateway.resolve_target", return_value=None):
+        status, body = _call_gateway_handler(head_valid, "GET", "/api/self-update/target?tag=v2.12.0")
+        assert status == 404
+        assert body["ok"] is False
 
 
 def test_handle_self_update_post_validation_and_dispatch():

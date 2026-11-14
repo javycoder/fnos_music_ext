@@ -687,7 +687,7 @@ def test_track_url_platform_preferred_resolves_trusted_other_platform(
     })
 
     async def by_platform(song_info, quality="128k", exclude_api_sources=None,
-                          request_timeout=None, auto_switch_api_source=True):
+                          request_timeout=None, auto_switch_api_source=True, source_id=None):
         fake_lx.url_song_sources.append(str(song_info.get("source") or ""))
         fake_lx.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         if song_info.get("source") == "wy":
@@ -723,7 +723,7 @@ def test_track_url_platform_preferred_resolves_trusted_other_platform(
 @pytest.mark.asyncio
 async def test_resolver_timeout_does_not_trip_script_circuit(fake_lx, policy_runtime, monkeypatch):
     async def slow(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None, auto_switch_api_source=True):
+                   request_timeout=None, auto_switch_api_source=True, source_id=None):
         await asyncio.sleep(0.05)
         return {"url": "https://media.test/song.flac", "type": "flac",
                 "sourceId": "source1"}
@@ -747,7 +747,7 @@ async def test_internal_service_failure_does_not_trip_script_circuit(
     fake_lx, policy_runtime, monkeypatch,
 ):
     async def dead(song_info, quality="128k", exclude_api_sources=None,
-                   request_timeout=None, auto_switch_api_source=True):
+                   request_timeout=None, auto_switch_api_source=True, source_id=None):
         raise httpx.ConnectError("lxserver down")
 
     monkeypatch.setattr(fake_lx, "get_music_url", dead)

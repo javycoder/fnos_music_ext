@@ -3602,6 +3602,157 @@ test("平台测试：记录过期恢复开始按钮", async () => {
   assert.strictEqual(els.get("#platform-test-start").disabled, false);
 });
 
+test("洛雪源 CPU 异常：按稳定 ID 显示红标，同名源不串告警", async () => {
+  vm.runInThisContext(`
+    lxSourceList = [
+      {id: "a.js", name: "同名源", url: "file:///data/lxserver/users/source/_open/a.js", active: true},
+      {id: "b.js", name: "同名源", url: "file:///data/lxserver/users/source/_open/b.js", active: true},
+    ];
+    lxSourceOrder = [];
+    lxRuntimeSnapshot = {state: "ready", sources: [
+      {id: "a.js", name: "同名源", status: "success", runtime_id: "r1", resource_usage: {
+        abnormal: true, cpu_percent: 78.4, threshold_percent: 50, required_duration_s: 180,
+        high_duration_s: 185, monitoring_status: "ok", runtime_id: "r1",
+        detected_at: "2026-01-01T00:00:00Z", reason: "sustained_source_cpu"}},
+      {id: "b.js", name: "同名源", status: "success", runtime_id: "r2", resource_usage: {
+        abnormal: false, cpu_percent: 2.1, threshold_percent: 50, required_duration_s: 180,
+        high_duration_s: 0, monitoring_status: "ok", runtime_id: "r2", detected_at: ""}},
+    ]};
+    lxCpuAlerts.clear();
+    lxRuntimeStatusUnknown = false;
+    syncLxCpuAlerts(lxRuntimeSnapshot.sources);
+    syncLxSourceOrder();
+    renderLxSourceList();
+  `);
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.strictEqual((html.match(/class="lx-cpu-alert"/g) || []).length, 1);
+  assert.ok(html.includes('data-cpu-source-id="a.js"'));
+  assert.ok(html.includes("资源异常占用"));
+  assert.ok(html.includes('aria-label="资源异常占用：同名源，查看判定说明"'));
+  assert.ok(!html.includes('data-cpu-source-id="b.js"'));
+});
+
+test("洛雪源 CPU 异常：刷新失败保留红标，新运行实例才清除", async () => {
+  reset();
+  const ready = (runtimeId, abnormal) => ({
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: {state: "ready", sources: [{
+      id: "a.js", name: "源A", status: "success", runtime_id: runtimeId,
+      resource_usage: {abnormal, cpu_percent: abnormal ? 70 : 1,
+        threshold_percent: 50, required_duration_s: 180, high_duration_s: abnormal ? 181 : 0,
+        monitoring_status: "ok", runtime_id: runtimeId, detected_at: abnormal ? "2026-01-01T00:00:00Z" : ""},
+    }]},
+  });
+  vm.runInThisContext(`lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: true}];
+    lxSourceOrder = []; lxCpuAlerts.clear(); lxRuntimeStatusUnknown = false;`);
+  enqueue("/app/fnmusic-ext/api/status", ready("r1", true));
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'));
+  enqueue("/app/fnmusic-ext/api/status", new Error("状态接口超时"));
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "刷新失败不能清除已确认的告警");
+  enqueue("/app/fnmusic-ext/api/status", ready("r1", false));
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "同一运行实例的低载读数不能自动解除告警");
+  enqueue("/app/fnmusic-ext/api/status", ready("r2", false));
+  await global.loadStatus();
+  assert.ok(!els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "新运行实例应清除旧告警");
+});
+
+test("洛雪源 CPU 异常：快照暂时缺源不清标，显式停止才清除", async () => {
+  reset();
+  vm.runInThisContext(`lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: true}];
+    lxSourceOrder = []; lxCpuAlerts.clear();
+    lxCpuAlerts.set("a.js", {sourceId: "a.js", name: "源A", runtimeId: "r1", cpuPercent: 70});
+    lxRuntimeStatusUnknown = false;
+    renderLxSourceList();`);
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: {state: "ready", sources: []},
+  });
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "快照暂时缺源不能当作已停用");
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: {state: "ready", sources: [{
+      id: "a.js", name: "源A", status: "stopped", process_state: "stopped", runtime_id: "",
+      resource_usage: {abnormal: false, monitoring_status: "stopped", runtime_id: ""},
+    }]},
+  });
+  await global.loadStatus();
+  assert.ok(!els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "显式 stopped 状态应清除红标");
+});
+
+test("洛雪源 CPU 异常：只有确认成功的停用才清除红标", async () => {
+  vm.runInThisContext(`
+    lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: false}];
+    lxRuntimeSnapshot = {state: "ready", sources: [
+      {id: "a.js", name: "源A", url: "file:///a.js", status: "success"},
+      {id: "b.js", name: "源A", url: "file:///b.js", status: "success"},
+    ]};
+    lxCpuAlerts.clear();
+    lxCpuAlerts.set("a.js", {sourceId: "a.js", name: "源A", runtimeId: "r1", cpuPercent: 70});
+    lxCpuAlerts.set("b.js", {sourceId: "b.js", name: "源A", runtimeId: "r2", cpuPercent: 60});
+  `);
+  global.clearLxCpuAlertsAfterSavedConfig({
+    complete: false,
+    actions: [
+      {kind: "lx_activate", op: "deactivate", ok: false, url: "file:///a.js", source: "源A"},
+      {kind: "lx_activate", op: "deactivate", ok: true, url: "file:///b.js", source: "源A"},
+    ],
+  });
+  assert.strictEqual(vm.runInThisContext('lxCpuAlerts.has("a.js")'), true,
+    "停用结果未确认时不能清除告警");
+  assert.strictEqual(vm.runInThisContext('lxCpuAlerts.has("b.js")'), false,
+    "同名源只清除确认停用的稳定 ID");
+  global.clearLxCpuAlertsAfterSavedConfig({
+    complete: true,
+    actions: [{kind: "lx_activate", op: "deactivate", ok: true, url: "file:///a.js", source: "源A"}],
+  });
+  assert.strictEqual(vm.runInThisContext('lxCpuAlerts.has("a.js")'), false,
+    "确认停用后清除告警");
+});
+
+test("洛雪源 CPU 异常：帮助弹窗复用焦点往返并在重绘后改绑按钮", async () => {
+  const template = stubEl();
+  template.dataset.helpId = "lx-source-cpu";
+  global.helpTemplates = [template];
+  els.get("#help-modal").hidden = true;
+  vm.runInThisContext(`
+    lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: true}];
+    lxSourceOrder = [];
+    lxRuntimeSnapshot = {state: "ready", sources: [{id: "a.js", name: "源A", status: "success",
+      resource_usage: {abnormal: true, cpu_percent: 80, threshold_percent: 50,
+        required_duration_s: 180, high_duration_s: 181, monitoring_status: "ok",
+        runtime_id: "r1", detected_at: "2026-01-01T00:00:00Z"}}]};
+    lxCpuAlerts.clear();
+    syncLxCpuAlerts(lxRuntimeSnapshot.sources);
+  `);
+  const trigger = stubEl();
+  trigger.getAttribute = () => "查看资源异常占用";
+  const item = vm.runInThisContext("lxSourceList[0]");
+  global.openLxCpuHelp(item, trigger);
+  assert.strictEqual(els.get("#help-modal").hidden, false);
+  assert.strictEqual(els.get("#help-title").textContent, "资源异常占用");
+  assert.strictEqual(vm.runInThisContext("lxCpuHelpSourceId"), "a.js");
+  global.closeHelp();
+  assert.strictEqual(document.activeElement, trigger);
+
+  const replacement = stubEl();
+  replacement.dataset.cpuSourceId = "a.js";
+  const list = els.get("#lx-source-list");
+  list.querySelectorAll = (selector) => selector === ".lx-cpu-alert" ? [replacement] : [];
+  vm.runInThisContext(`$("#help-modal").hidden = false; lxCpuHelpSourceId = "a.js"; helpReturnFocus = null;
+    renderLxSourceList();`);
+  assert.strictEqual(vm.runInThisContext("helpReturnFocus"), replacement);
+  vm.runInThisContext(`$("#help-modal").hidden = true; lxCpuHelpSourceId = "";`);
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;
