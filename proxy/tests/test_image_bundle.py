@@ -161,6 +161,9 @@ def test_ensure_rejects_identity_drift_after_load(tmp_path, monkeypatch):
                         lambda docker, ref: {**matching_local(), "id": "sha256:" + "d" * 64}
                         if "latest" in str(ref) else None)
     monkeypatch.setattr(ib, "load_archive", lambda *_a: None)
+    # 经典存储语义：Id 漂移时也须 re-export 复核，返回同样不符即拒绝
+    monkeypatch.setattr(ib, "reexport_config_digest",
+                        lambda *_a: {"image_id": "sha256:" + "d" * 64, "arch": "amd64"})
     with pytest.raises(ib.BundleError, match="身份与清单不符"):
         ib.ensure(bundle, docker_cmd="docker")
 
@@ -182,15 +185,84 @@ def test_ensure_accepts_inspect_without_diff_ids(tmp_path, monkeypatch):
     ib.ensure(bundle, docker_cmd="docker")
 
 
-def test_ensure_rejects_diff_ids_drift_when_inspect_provides(tmp_path, monkeypatch):
-    """inspect 提供了 diff_ids 且与清单不一致（同 id 不同层描述）仍须拒绝。"""
+def test_ensure_containerd_manifest_digest_accepted_via_reexport(tmp_path, monkeypatch):
+    """containerd image store：load 后 inspect Id 是 manifest 摘要而非 config 摘要。
+
+    必须以 re-export 提取的 config 摘要裁决身份，通过后记录 marker；不能因
+    Id 不等就误判导入失败（GH Actions containerd runner 上的真实回归）。
+    """
     bundle = write_bundle(tmp_path)
     monkeypatch.setattr(ib, "host_arch", lambda: "amd64")
-    monkeypatch.setattr(ib, "inspect_image", lambda docker, ref: {
-        **matching_local(), "diff_ids": ["sha256:" + "e" * 64]})
+    manifest_digest = "sha256:" + "f" * 64
+    state = {"n": 0}
+
+    def fake_inspect(docker, ref):
+        state["n"] += 1
+        if state["n"] >= 3:  # load 之后的 inspect：Id 是 manifest 摘要
+            return {**matching_local(), "id": manifest_digest, "diff_ids": []}
+        return None
+
+    monkeypatch.setattr(ib, "inspect_image", fake_inspect)
     monkeypatch.setattr(ib, "load_archive", lambda *_a: None)
+    monkeypatch.setattr(ib, "reexport_config_digest",
+                        lambda docker, ref, bd: {
+                            "image_id": "sha256:" + "a" * 64,
+                            "arch": "amd64"})
+    reexport_refs = []
+
+    def tracking_reexport(docker, ref, bd):
+        reexport_refs.append(ref)
+        return {"image_id": "sha256:" + "a" * 64, "arch": "amd64"}
+    monkeypatch.setattr(ib, "reexport_config_digest", tracking_reexport)
+    ib.ensure(bundle, docker_cmd="docker")
+    assert reexport_refs == ["fnmusic-sources:latest"]
+    marker = json.loads((bundle / ".loaded-id.json").read_text())
+    assert marker["image_id"] == "sha256:" + "a" * 64
+    assert marker["loaded_id"] == manifest_digest
+
+    # 第二次 ensure：镜像仍在（同 manifest 摘要），按 marker 幂等复用，不再导入
+    monkeypatch.setattr(ib, "load_archive",
+                        lambda *_a: (_ for _ in ()).throw(AssertionError("不得重复导入")))
+    monkeypatch.setattr(ib, "reexport_config_digest",
+                        lambda *_a: (_ for _ in ()).throw(AssertionError("marker 命中时无需 re-export")))
+    state["n"] = 3  # 首次 inspect 即返回已加载形态
+    ib.ensure(bundle, docker_cmd="docker")
+
+
+def test_ensure_containerd_reexport_mismatch_rejected(tmp_path, monkeypatch):
+    """re-export 出的 config 摘要与清单不符（同名 tag 被其他镜像冒用）必须拒绝。"""
+    bundle = write_bundle(tmp_path)
+    monkeypatch.setattr(ib, "host_arch", lambda: "amd64")
+    state = {"n": 0}
+
+    def fake_inspect(docker, ref):
+        state["n"] += 1
+        if state["n"] >= 3:
+            return {"id": "sha256:" + "f" * 64, "diff_ids": [],
+                    "os": "linux", "arch": "amd64"}
+        return None
+
+    monkeypatch.setattr(ib, "inspect_image", fake_inspect)
+    monkeypatch.setattr(ib, "load_archive", lambda *_a: None)
+    monkeypatch.setattr(ib, "reexport_config_digest",
+                        lambda *_a: {"image_id": "sha256:" + "9" * 64, "arch": "amd64"})
     with pytest.raises(ib.BundleError, match="身份与清单不符"):
         ib.ensure(bundle, docker_cmd="docker")
+
+
+def test_ensure_rejects_diff_ids_drift_when_inspect_provides(tmp_path, monkeypatch):
+    """inspect 提供了 diff_ids 且与清单不一致（同 id 不同层描述）时不得按已就绪放行。"""
+    bundle = write_bundle(tmp_path)
+    monkeypatch.setattr(ib, "host_arch", lambda: "amd64")
+    loads = []
+    monkeypatch.setattr(ib, "inspect_image", lambda docker, ref: {
+        **matching_local(), "diff_ids": ["sha256:" + "e" * 64]})
+    monkeypatch.setattr(ib, "load_archive", lambda *_a: loads.append(1))
+    monkeypatch.setattr(ib, "reexport_config_digest",
+                        lambda *_a: (_ for _ in ()).throw(ib.BundleError("re-export 不可用")))
+    with pytest.raises(ib.BundleError):
+        ib.ensure(bundle, docker_cmd="docker")
+    assert loads == [1]  # 未走"已就绪跳过"，而是重新导入并交由 re-export 裁决
 
 
 def test_ensure_arch_mismatch_guarded(tmp_path, monkeypatch):

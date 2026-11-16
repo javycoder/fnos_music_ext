@@ -339,13 +339,22 @@ jobs:
           wheel_manifest = json.loads(wheels.read_text())
           assert wheel_manifest["arch"] == "amd64"
           assert wheel_manifest["python_versions"] == ["3.11", "3.12", "3.13"]
+          # ensure 已做严格身份裁决：经典存储 Id == config 摘要；containerd 存储
+          # Id 是 load 生成的 manifest 摘要，以 ensure 写下的 .loaded-id.json 快照为准。
+          marker = bundle / ".loaded-id.json"
+          if marker.is_file():
+              snapshot = json.loads(marker.read_text())
+              assert snapshot["image_id"] == manifest["image_id"], "marker 与清单版本不符"
+              want_id = snapshot["loaded_id"]
+          else:
+              want_id = manifest["image_id"]
           out = subprocess.run(["docker", "image", "inspect", "fnmusic-sources:latest",
                                 "--format", "{{.Id}} {{.Architecture}}"],
                                capture_output=True, text=True, check=True).stdout.split()
           image_id, arch = out[0], out[1]
-          assert image_id == manifest["image_id"], f"{image_id} != {manifest['image_id']}"
+          assert image_id == want_id, f"{image_id} != {want_id}"
           assert arch == manifest["arch"], f"{arch} != {manifest['arch']}"
-          print(f"bundle reload verified: {image_id[:19]} linux/{arch}")
+          print(f"bundle reload verified: {image_id[:19]} linux/{arch} (config {manifest['image_id'][:19]})")
           PY
       - name: Smoke musicdl from the loaded image
         run: |

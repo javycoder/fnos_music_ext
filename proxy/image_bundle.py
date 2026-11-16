@@ -14,12 +14,15 @@ unless the operator forced bundle mode.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -39,6 +42,33 @@ class BundleError(Exception):
 
 def info(msg: str) -> None:
     print(f"[image-bundle] {msg}")
+
+
+def _marker_path(bundle_dir: Path) -> Path:
+    """containerd 存储下的已验证身份标记（load 后实际 Id ≠ config 摘要时的快照）。"""
+    return bundle_dir / ".loaded-id.json"
+
+
+def _read_marker(bundle_dir: Path) -> dict:
+    try:
+        marker = json.loads(_marker_path(bundle_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return marker if isinstance(marker, dict) else {}
+
+
+def _write_marker(bundle_dir: Path, manifest: dict, loaded_id: str) -> None:
+    payload = {
+        "schema": 1,
+        "image_id": manifest["image_id"],
+        "loaded_id": loaded_id,
+        "arch": manifest["arch"],
+    }
+    try:
+        _marker_path(bundle_dir).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        info(f"身份标记写入失败（不影响本次校验）: {exc}")
 
 
 def host_arch() -> str:
@@ -115,9 +145,23 @@ def inspect_image(docker: list[str], ref: str) -> dict | None:
 
 
 def image_matches(local: dict | None, manifest: dict) -> bool:
+    return _identity_matches(local, manifest, expected_id=manifest["image_id"])
+
+
+def marker_matches(local: dict | None, manifest: dict, bundle_dir: Path) -> bool:
+    """containerd image store：inspect 的 Id 是 load 时生成的 manifest 摘要，
+    不等于清单的 config 摘要且不可预计算。以首次 load 后严格校验（re-export
+    提取 config 摘要）写下的标记为凭，后续按 loaded_id 幂等复用。"""
+    marker = _read_marker(bundle_dir)
+    if not marker or marker.get("image_id") != manifest["image_id"]:
+        return False
+    return _identity_matches(local, manifest, expected_id=str(marker.get("loaded_id") or ""))
+
+
+def _identity_matches(local: dict | None, manifest: dict, *, expected_id: str) -> bool:
     if not local or not local.get("id"):
         return False
-    if local["id"] != manifest["image_id"]:
+    if local["id"] != expected_id:
         return False
     # image_id 是 config 摘要，相等即蕴含 rootfs 描述一致；diff_ids 仅在
     # inspect 提供（经典 docker 存储）时作加强校验——containerd image store
@@ -142,6 +186,57 @@ def load_archive(docker: list[str], archive: Path) -> None:
     if decompressor.returncode != 0 or loader.returncode != 0:
         detail = (loader.stdout or "") + (decompressor.stderr.read() if decompressor.stderr else "")
         raise BundleError(f"docker load 失败: {detail.strip().splitlines()[-1:] or '未知错误'}")
+
+
+def reexport_config_digest(docker: list[str], ref: str, bundle_dir: Path) -> dict:
+    """docker save <ref> 到临时 gzip 归档并提取 config 摘要与架构。
+
+    containerd image store 下 inspect 的 Id 是 load 时生成的 manifest 摘要，
+    与清单的 config 摘要不可比；镜像真实身份（config 摘要）只能从 save
+    归档提取。归档 sha256 已由 check() 锁定交付内容，这里校验的是"本地
+    实际生效的镜像"与交付产物一致，防止同名 tag 被其他镜像冒用。
+    """
+    tmp = bundle_dir / f".verify-save-{os.getpid()}.tar.gz"
+    # stderr 直连 DEVNULL：docker save 几乎不写 stderr，PIPE 又无人读会在写满
+    # 管道缓冲时死锁；失败语义从 returncode 与归档完整性判定。
+    try:
+        saver = subprocess.Popen(docker + ["save", ref], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        raise BundleError(f"无法启动 docker save: {exc}") from exc
+    assert saver.stdout is not None
+    try:
+        try:
+            with gzip.open(tmp, "wb", compresslevel=1) as packed:
+                shutil.copyfileobj(saver.stdout, packed, length=4 * 1024 * 1024)
+        except OSError as exc:
+            raise BundleError(f"docker save 读取失败: {exc}") from exc
+        if saver.wait() != 0:
+            raise BundleError(f"docker save 失败 (rc={saver.returncode})")
+        try:
+            with tarfile.open(tmp, "r:gz") as tar:
+                member = tar.extractfile("manifest.json")
+                if member is None:
+                    raise BundleError("re-export 归档缺少 manifest.json")
+                saved = json.load(member)
+                if not (isinstance(saved, list) and len(saved) == 1 and saved[0].get("Config")):
+                    raise BundleError(f"re-export 归档应恰好含一个镜像条目: {saved!r}")
+                config_bytes = tar.extractfile(saved[0]["Config"]).read()
+        except (tarfile.TarError, OSError) as exc:
+            raise BundleError(f"re-export 归档解析失败: {exc}") from exc
+        config = json.loads(config_bytes)
+        return {
+            "image_id": "sha256:" + hashlib.sha256(config_bytes).hexdigest(),
+            "arch": config.get("architecture"),
+        }
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        if saver.poll() is None:
+            saver.kill()
+            saver.wait()
 
 
 def check(bundle_dir: Path, *, expect_arch: str | None = None) -> tuple[dict, Path]:
@@ -169,7 +264,7 @@ def ensure(bundle_dir: Path, *, docker_cmd: str, tag: str | None = None,
     docker = shlex.split(docker_cmd)
 
     local = inspect_image(docker, want_tag)
-    if image_matches(local, manifest):
+    if image_matches(local, manifest) or marker_matches(local, manifest, bundle_dir):
         info(f"应用镜像已就绪：{want_tag} ({manifest['image_id'][:19]})，跳过导入。")
         return manifest
 
@@ -185,10 +280,24 @@ def ensure(bundle_dir: Path, *, docker_cmd: str, tag: str | None = None,
     started = time.monotonic()
     load_archive(docker, archive)
     loaded = inspect_image(docker, want_tag)
-    if not image_matches(loaded, manifest):
+    if loaded is None:
+        raise BundleError("导入后镜像不可见（inspect 失败）")
+    if loaded.get("os") != "linux" or loaded.get("arch") != manifest["arch"]:
         raise BundleError(
-            "导入后的镜像身份与清单不符"
-            f"（got {loaded.get('id') if loaded else None}, want {manifest['image_id']}）")
+            f"导入后的镜像平台不符（{loaded.get('os')}/{loaded.get('arch')},"
+            f" want linux/{manifest['arch']}）")
+    if not image_matches(loaded, manifest):
+        # containerd image store：inspect Id 是 load 生成的 manifest 摘要，与
+        # 清单的 config 摘要天然不等。以 re-export 提取的 config 摘要做最终
+        # 裁决，通过后记录 loaded_id 快照，后续按 marker 幂等复用。
+        reexported = reexport_config_digest(docker, want_tag, bundle_dir)
+        if reexported["image_id"] != manifest["image_id"]:
+            raise BundleError(
+                "导入后的镜像身份与清单不符"
+                f"（re-export {reexported['image_id']}, want {manifest['image_id']}）")
+        _write_marker(bundle_dir, manifest, str(loaded.get("id") or ""))
+        info(f"containerd 存储身份快照已记录：{str(loaded.get('id'))[:19]}"
+             f" → config {manifest['image_id'][:19]}")
     info(f"镜像导入并校验完成，耗时 {time.monotonic() - started:.1f}s。")
     return manifest
 

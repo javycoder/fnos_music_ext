@@ -202,8 +202,6 @@ def _run_release_sandbox(tmp_path, releases, *, tag='v2.10.0b', fail='', current
     if not shutil.which('jq'):
         pytest.skip('release shell sandbox requires jq')
     state = tmp_path / 'state.json'
-    state.write_text(json.dumps(dict(releases=releases, fail=fail, current=current,
-                                    appeared=appeared, lists=0, calls=[])))
     gh = tmp_path / 'gh'
     # Only this executable handles gh; unexpected commands fail closed, no network.
     gh.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
@@ -292,6 +290,9 @@ def _run_release_sandbox(tmp_path, releases, *, tag='v2.10.0b', fail='', current
     for release in releases:
         if release.get('tag_name') == tag and not release.get('draft'):
             release['assets'] = [{'name': package.name, 'digest': f'sha256:{digest}'}]
+    # 初始状态最后落盘：assets 预填必须先于沙箱 gh 读到 state.json。
+    state.write_text(json.dumps(dict(releases=releases, fail=fail, current=current,
+                                    appeared=appeared, lists=0, calls=[])))
     # Run both actual workflow scripts in one fail-fast shell, as Actions does.
     script = _release_step(CLEANUP_STEP) + '\n' + _release_step(PUBLISH_STEP)
     env = dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}', TAG=tag,
