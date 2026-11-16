@@ -274,6 +274,60 @@ def test_detail_batch_and_track_list_flow():
         assert len(resp.json()["data"]["list"]) == 2
 
 
+def test_tracks_paging_fetches_full_playlist_beyond_single_batch_cap():
+    """issue #133：歌单超单批上限时分页拉全量，total/offset 协议驱动翻页。"""
+    TOTAL = 2500  # 三页：1000 + 1000 + 500
+    calls: list[dict] = []
+
+    def paged_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/user/playlists":
+            return httpx.Response(200, json={
+                "ok": True, "logged_in": True, "account_uid": OWN_UID, "data": PLAYLIST_ROWS,
+            })
+        if path.startswith("/api/v1/user/playlists/") and path.endswith("/tracks"):
+            offset = int(request.url.params.get("offset") or 0)
+            limit = int(request.url.params.get("limit") or 0)
+            calls.append({"offset": offset, "limit": limit})
+            assert limit == 1000
+            page_rows = [
+                {"song_id": 1000 + offset + i, "name": f"歌{offset + i}",
+                 "artist": "歌手", "album_name": "专辑", "album_pic_url": "",
+                 "duration_ms": 200000, "has_sq": False}
+                for i in range(min(limit, TOTAL - offset))
+            ]
+            return httpx.Response(200, json={
+                "ok": True, "data": page_rows, "total": TOTAL,
+                "offset": offset, "limit": limit,
+            })
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(paged_handler),
+                               base_url="http://127.0.0.1:8770")
+    built: list = []
+
+    async def run():
+        def build_track(candidate):
+            built.append(candidate)
+            return {"guid": f"online:netease:{candidate['id']}", "title": candidate["title"]}
+
+        return await nmpl.load_tracks(client, 111, build_track)
+
+    tracks = _run_async(run())
+    assert [c["offset"] for c in calls] == [0, 1000, 2000]
+    assert len(tracks) == TOTAL
+    assert tracks[0]["title"] == "歌0"
+    assert tracks[-1]["title"] == f"歌{TOTAL - 1}"
+    # 全量驻留内存缓存：下发端点 total 即真实曲量
+    cached = nmpl.cached_tracks(111)
+    assert cached is not None and len(cached) == TOTAL
+
+
+def _run_async(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
 def test_track_list_favorite_state_is_user_scoped_and_refreshes(monkeypatch):
     """网易账号歌单按当前用户和实时收藏状态回填红心，不污染共享缓存。"""
     current_user = {"guid": "user-a"}

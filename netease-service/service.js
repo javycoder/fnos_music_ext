@@ -819,6 +819,10 @@ function createService(options = {}) {
   });
 
   // 11. User playlist tracks
+  // Supports offset/limit paging so playlists larger than the single-batch cap
+  // (e.g. ~4000-track "My Favorite Music") can be fetched in full by the proxy.
+  // The legacy single-call shape ({ok, data:[...]}) is preserved; total/offset/
+  // limit are additive metadata for paging clients.
   app.get('/api/v1/user/playlists/:playlist_id/tracks', async (req, res, next) => {
     try {
       const playlistId = nonnegativeIntOrZero(req.params.playlist_id);
@@ -827,6 +831,11 @@ function createService(options = {}) {
       if (!login.loggedIn) {
         return res.json({ ok: false, error: 'not_logged_in', logged_in: false });
       }
+      const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+      // Song details are fetched from netease in batches of 100; a page cap of
+      // 1000 keeps one request within the netease "no more than 1000 songs per
+      // song/detail call" contract while remaining backward compatible.
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 1000, 1), 1000);
       const cookie = getCookieString();
       const resp = await sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs });
       const playlist = resp && resp.body && resp.body.playlist ? resp.body.playlist : null;
@@ -834,10 +843,16 @@ function createService(options = {}) {
         return res.json({ ok: false, error: 'playlist not found or inaccessible', logged_in: true });
       }
       const trackIds = playlist.trackIds.map(t => (typeof t === 'object' ? t.id : t)).map(nonnegativeIntOrZero).filter(x => x > 0);
-      const slicedIds = trackIds.slice(0, 1000);
+      const slicedIds = trackIds.slice(offset, offset + limit);
       const detailed = await batchSongDetails(slicedIds);
       const marked = await markNeedsVip(detailed);
-      return res.json({ ok: true, data: marked });
+      return res.json({
+        ok: true,
+        data: marked,
+        total: trackIds.length,
+        offset,
+        limit
+      });
     } catch (err) {
       next(err);
     }

@@ -551,6 +551,21 @@ test('User playlists, recommend songs, and public playlist tracks', async () => 
   assert.strictEqual(track501.needs_vip, true);
   assert.strictEqual(track502.needs_vip, undefined);
 
+  // Paging metadata (issue #133): total is the full trackIds length, offset slices
+  const page1 = await makeRequest(service.app, 'GET', '/api/v1/user/playlists/901/tracks?offset=0&limit=1');
+  assert.strictEqual(page1.status, 200);
+  assert.strictEqual(page1.body.ok, true);
+  assert.strictEqual(page1.body.total, 2);
+  assert.strictEqual(page1.body.offset, 0);
+  assert.strictEqual(page1.body.data.length, 1);
+  assert.strictEqual(page1.body.data[0].song_id, 501);
+  const page2 = await makeRequest(service.app, 'GET', '/api/v1/user/playlists/901/tracks?offset=1&limit=1');
+  assert.strictEqual(page2.body.data.length, 1);
+  assert.strictEqual(page2.body.data[0].song_id, 502);
+  const beyond = await makeRequest(service.app, 'GET', '/api/v1/user/playlists/901/tracks?offset=5&limit=100');
+  assert.strictEqual(beyond.body.data.length, 0);
+  assert.strictEqual(beyond.body.total, 2);
+
   // Recommend songs
   const recRes = await makeRequest(service.app, 'GET', '/api/v1/recommend/songs');
   assert.strictEqual(recRes.status, 200);
