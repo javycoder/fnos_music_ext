@@ -117,8 +117,14 @@ fnmusic_cleanup_sources_container() {
 fnmusic_env_source() {
     # 0 when the selected audio source recorded in .env matches $1.
     [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
-    local key="$1"
-    grep -q "^${key}=true" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
+    local key="$1" val
+    val="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null \
+        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" \
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//" | tr '[:upper:]' '[:lower:]')"
+    case "${val}" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 fnmusic_saved_source() {
@@ -130,8 +136,10 @@ fnmusic_saved_source() {
 }
 
 fnmusic_saved_lx_url() {
-    [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
-    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+    [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
+    grep -E "^[[:space:]]*(export[[:space:]]+)?LX_SOURCE_URL[[:space:]]*=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null \
+        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?LX_SOURCE_URL[[:space:]]*=[[:space:]]*//" \
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//"
 }
 
 fnmusic_data_items() {

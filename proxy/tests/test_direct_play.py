@@ -83,7 +83,7 @@ def configure_direct(monkeypatch):
         lambda _request, _guid, _source: _async_result(direct_target()))
     monkeypatch.setattr(
         proxy_app, "validate_media_url",
-        lambda _url: MediaURLDecision(True, host="cdn.example"))
+        lambda _url, **_kwargs: MediaURLDecision(True, host="cdn.example"))
     monkeypatch.setattr(proxy_app, "_register_background_fetch", lambda *_args, **_kwargs: False)
 
 
@@ -121,6 +121,31 @@ async def test_nonzero_range_reuses_bound_target(monkeypatch):
     assert second.status_code == 302
     assert calls == []
 
+
+@pytest.mark.asyncio
+async def test_public_http_target_redirects_and_range_reuses_it(monkeypatch):
+    configure_direct(monkeypatch)
+    selected = direct_target()
+    selected.url = "http://cdn.example/a.flac"
+    selected.protocol = "http"
+    validations = []
+
+    def validate(url, *, require_https=True):
+        validations.append((url, require_https))
+        return MediaURLDecision(True, host="cdn.example")
+
+    monkeypatch.setattr(proxy_app, "validate_media_url", validate)
+
+    async def resolve(*_args):
+        return selected
+
+    monkeypatch.setattr(proxy_app, "_resolve_direct_target", resolve)
+    first = await proxy_app._direct_redirect_response(make_request("GET"), "online:lx:kg:1")
+    second = await proxy_app._direct_redirect_response(
+        make_request("GET", headers={"Range": "bytes=100-200"}), "online:lx:kg:1")
+    assert first.status_code == 302 and first.headers["location"] == selected.url
+    assert second.status_code == 302 and second.headers["location"] == selected.url
+    assert validations == [(selected.url, False), (selected.url, False)]
 
 @pytest.mark.asyncio
 async def test_nonzero_range_without_identity_is_rejected(monkeypatch):
@@ -316,7 +341,7 @@ async def test_unsafe_public_target_rejects_redirect(monkeypatch):
     configure_direct(monkeypatch)
     monkeypatch.setattr(
         proxy_app, "validate_media_url",
-        lambda _url: MediaURLDecision(False, "host_not_public", "127.0.0.1"))
+        lambda _url, **_kwargs: MediaURLDecision(False, "host_not_public", "127.0.0.1"))
     response = await proxy_app._direct_redirect_response(make_request("GET"), "online:lx:kg:1")
     assert response.status_code == 502
 

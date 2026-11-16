@@ -366,7 +366,7 @@
           <div class="card-title"><span>播放直连（302 重定向 · Beta）</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></div>
           <div class="direct-list">
             <div class="direct-option">
-              <label for="direct-netease">网易云音乐<span class="sub">登录与取链仍由 NAS 完成，只把媒体地址交给客户端</span></label>
+              <label for="direct-netease">网易云音乐<span class="sub">优先 HTTPS，升级不可用时回退合规 HTTP</span></label>
               <input type="checkbox" id="direct-netease">
               <button class="help-btn" type="button" data-help="direct-netease" aria-label="网易云音乐盒子播放直连帮助">?</button>
             </div>
@@ -376,12 +376,12 @@
               <button class="help-btn" type="button" data-help="direct-musicdl" aria-label="musicdl 播放直连帮助">?</button>
             </div>
             <div class="direct-option">
-              <label for="direct-lx">洛雪自定义源<span class="sub">兼容性取决于脚本与目标 CDN，换脚本后需重新验证</span></label>
+              <label for="direct-lx">洛雪自定义源<span class="sub">支持合规 HTTP，兼容性取决于脚本与 CDN</span></label>
               <input type="checkbox" id="direct-lx">
               <button class="help-btn" type="button" data-help="direct-lx" aria-label="洛雪播放直连帮助">?</button>
             </div>
           </div>
-          <p class="hint">测试功能，如遇播放异常可以尝试关闭</p>
+          <p class="hint">测试功能；HTTP 音频为明文传输，如遇播放异常可以关闭</p>
         </div>
       </section>
 
@@ -746,7 +746,7 @@
     <p><b>是什么：</b>默认在线歌曲由 NAS 代理下载再转发给播放器。开启直连后，本地与缓存都未命中时，NAS 用 <code>302</code> 把音乐平台的原始音频地址直接交给播放器，减轻 NAS 带宽与 CPU。</p>
     <p><b>哪些仍走 NAS：</b>本地/已缓存歌曲、标准音质 HLS、App 下载、收藏与歌单协议。开启边听边存时，客户端直连的同时 NAS 仍会在后台下载保存。</p>
     <p><b>为什么会失败：</b>部分平台会校验 UA/Referer 或限制跨网络 IP。点歌不响或报错时，关掉对应音源开关并重新起播即可恢复。</p>
-    <p><b>隐私提醒：</b>客户端 IP 与播放请求会直接暴露给音乐源，NAS 仍承担搜索、鉴权、取链与有限探活。</p>
+    <p><b>隐私提醒：</b>客户端 IP 与播放请求会直接暴露给音乐源，NAS 仍承担搜索、鉴权、取链与有限探活。目标为 HTTP 时不提供传输加密和防篡改保护，路径上的观察者可能看到临时链接或篡改音频。</p>
   </template>
   <template data-help-id="direct-netease">
     <p>登录、会员鉴权与取链仍由 NAS 上的网易服务完成，302 只交付解析后的媒体地址。链接有效期、跨出口可用性取决于网易 CDN；外网播不动就关掉此项。</p>
