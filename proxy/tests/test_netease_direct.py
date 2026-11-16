@@ -252,6 +252,37 @@ async def test_upgrade_connection_refused_is_availability_failure():
 
 
 @pytest.mark.asyncio
+async def test_upgrade_all_addresses_failed_is_availability_failure():
+    """多地址 CDN 全部连接失败（httpx 聚合文案 + 底层 errno）按暂时不可用回退 HTTP。"""
+    import errno as _errno
+
+    raw = "http://m7.music.126.net/track.mp3"
+
+    # 形态一：聚合文案（无 __cause__）
+    def handler_aggregated(_req):
+        raise httpx.ConnectError("All connection attempts failed")
+
+    with pytest.raises(NeteaseDirectUpgradeUnavailable, match="probe_exception:ConnectError"):
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(handler_aggregated),
+        )
+
+    # 形态二：本地化系统错误消息 + 底层 OSError errno=ECONNREFUSED
+    def handler_errno(_req):
+        cause = OSError(_errno.ECONNREFUSED, "连接被拒绝(本地化消息)")
+        raise httpx.ConnectError("[Errno 111] 连接被拒绝") from cause
+
+    with pytest.raises(NeteaseDirectUpgradeUnavailable, match="probe_exception:ConnectError"):
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(handler_errno),
+        )
+
+
+@pytest.mark.asyncio
 async def test_upgrade_ssl_error_remains_security_failure():
     raw = "http://m7.music.126.net/track.mp3"
 

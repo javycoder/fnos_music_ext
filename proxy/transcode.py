@@ -172,7 +172,15 @@ def _usable_cache(directory: str, expected_bitrate: str | None = None) -> dict |
         return None
     if expected_bitrate is not None and str(state.get("bitrate") or "").strip() != str(expected_bitrate).strip():
         return None
-    if read_output_playlist(directory) is None:
+    segments = read_output_playlist(directory)
+    if segments is None:
+        return None
+    # issue #50 修复前转正的历史毒缓存：源站断连时 ffmpeg rc=0 自然退出并写
+    # 出自洽 ENDLIST 清单，但实际分片少于 state 记录的 declared_count——按
+    # 新写入语义（finalize 时 declared_count == produced）必然一致，不一致
+    # 即历史半成品，拒用并触发重转自愈。
+    declared = state.get("declared_count")
+    if isinstance(declared, int) and declared > 0 and declared != len(segments):
         return None
     return state
 

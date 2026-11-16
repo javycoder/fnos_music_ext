@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import re
 import socket
 import ssl
@@ -45,7 +46,15 @@ UPGRADE_UNAVAILABLE_CONNECT_REASONS = (
     "connection refused",
     "network is unreachable",
     "no route to host",
+    # httpx 在主机解析出多个地址且全部连接失败时的聚合文案（网易 CDN 常见
+    # 多 A 记录/双栈），底层 errno 藏在 __cause__ 链之外的消息里
+    "all connection attempts failed",
 )
+UPGRADE_UNAVAILABLE_CONNECT_ERRNOS = frozenset({
+    errno.ECONNREFUSED,
+    errno.ENETUNREACH,
+    errno.EHOSTUNREACH,
+})
 
 
 def _has_ssl_error(exc: BaseException) -> bool:
@@ -68,7 +77,20 @@ def _is_upgrade_unavailable(exc: BaseException) -> bool:
             return True
         if isinstance(current, httpx.ConnectError) and not _has_ssl_error(current):
             reason = str(current).lower()
-            return any(marker in reason for marker in UPGRADE_UNAVAILABLE_CONNECT_REASONS)
+            if any(marker in reason for marker in UPGRADE_UNAVAILABLE_CONNECT_REASONS):
+                return True
+            # 多地址失败时 httpx 聚合为 ConnectError("All connection attempts
+            # failed")，真实原因在各地址的 OSError errno 上；中文/本地化系统
+            # 错误消息匹配不到英文短语，按 errno 判定。
+            if isinstance(current.__cause__, OSError):
+                cause_errno = getattr(current.__cause__, "errno", None)
+                if cause_errno in UPGRADE_UNAVAILABLE_CONNECT_ERRNOS:
+                    return True
+        # httpcore 的 ConnectError 在 __cause__ 下还有各地址的底层 OSError
+        if isinstance(current, OSError) and not isinstance(current, httpx.ConnectError):
+            if (getattr(current, "errno", None) in UPGRADE_UNAVAILABLE_CONNECT_ERRNOS
+                    and not _has_ssl_error(current)):
+                return True
         current = current.__cause__
     return False
 

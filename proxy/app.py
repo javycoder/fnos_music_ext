@@ -7701,7 +7701,13 @@ def _schedule_library_scan(headers: dict | None, user_guid: str = "") -> None:
 
 
 def _stream_cache_eligibility(resp: httpx.Response) -> tuple[bool, int | None]:
-    """判定上游单次响应是否为完整整轨资源（完整 200 或覆盖 0..N-1 的完整 206），并返回预期字节数。"""
+    """判定上游单次响应是否为完整整轨资源（完整 200 或覆盖 0..N-1 的完整 206），并返回预期字节数。
+
+    resp 可能为 None（复用既有解析、不重建流的重试路径不携带新响应）：
+    视为非整轨，交给后台整轨下载兜底，不得在此解引用崩溃。
+    """
+    if resp is None:
+        return False, None
     length = resp.headers.get("content-length", "")
     expected = int(length) if length.isdigit() else None
     if resp.status_code == 200:

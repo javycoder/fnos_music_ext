@@ -539,6 +539,14 @@ def test_usable_cache_rejects_short_segment_dir(tmp_path):
     for i in range(3):
         with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
             f.write(b"moofseg")
+    # 历史毒缓存形态：断流时 ffmpeg 自然退出写出的"自洽"ENDLIST 清单
+    # （编号 0..2 连续非空），但 state 的 declared_count=26 远大于实际分片。
+    with open(os.path.join(directory, tc.PLAYLIST_NAME), "w") as f:
+        f.write("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n"
+                "#EXT-X-MAP:URI=\"init.mp4\"\n")
+        for i in range(3):
+            f.write(f"#EXTINF:10.0,\n{i:05d}.m4s\n")
+        f.write("#EXT-X-ENDLIST\n")
     with open(os.path.join(directory, tc.STATE_NAME), "w") as f:
         json.dump({"guid": FAKE_KUWO, "status": "done", "duration_s": 269,
                    "hls_time": 10, "declared_count": 26, "bitrate": "128k",
