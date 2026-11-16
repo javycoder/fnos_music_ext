@@ -10,22 +10,18 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/upgrade-backup"
 if [ -f "${BACKUP_DIR}/data.tar.gz" ]; then
-    if ! tar -xzf "${BACKUP_DIR}/data.tar.gz" -C "${FNMUSIC_REPO_DIR}" >> "${FNMUSIC_LOG}" 2>&1; then
+    if ! ( cd "${BACKUP_DIR}" && tar -xzf data.tar.gz -C "${FNMUSIC_REPO_DIR}" ) >> "${FNMUSIC_LOG}" 2>&1; then
         fnmusic_fail "恢复用户数据失败：备份保留在 ${BACKUP_DIR}/data.tar.gz"
     fi
 fi
 
+# 升级流程已完整恢复历史 .env 与 sources-data 数据；
+# 无需传递推导的 --sources 与单值 --lx-source-url，由 install.sh 自动从 .env
+# 继承音源与完整多源列表；仅在洛雪源时透传 --lx-skip-verify 防止源临时故障卡死升级。
 SOURCES="$(fnmusic_saved_source)"
-[ -n "${SOURCES}" ] || SOURCES="musicdl"
 
-ARGS=(--non-interactive --sources "${SOURCES}" --webui --extend --adopt)
+ARGS=(--non-interactive --webui --extend --adopt)
 if [ "${SOURCES}" = "lxmusic" ]; then
-    LX_URL="$(fnmusic_saved_lx_url)"
-    # 洛雪源 URL 可能为空（v2.2.7+ 支持无源安装、装后在管理页配置）：
-    # 有值才透传；无值不阻塞升级，升级后照旧到管理页配置。
-    [ -n "${LX_URL}" ] && ARGS+=(--lx-source-url "${LX_URL}")
-    # 源是用户装机时已确认过的：升级不得因源服务器临时故障（校验不过）而卡死，
-    # 跳过可用性校验，只做激活；源状态装好后在管理页 WebUI 查看
     ARGS+=(--lx-skip-verify)
 fi
 
