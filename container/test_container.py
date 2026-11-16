@@ -374,6 +374,13 @@ def test_dockerfile_assembly():
     assert "container/lxserver.version" in text
     assert "container/ensure_lxserver_native.sh" in text
     assert "ensure-lxserver-native" in text
+    assert "FROM runtime-base AS lx-prepare" in text
+    assert "COPY --from=lx-prepare --chown=appuser:appuser /srv/lxserver /srv/lxserver" in text
+    assert text.rfind("\nFROM runtime-base\n") > text.rfind("FROM runtime-base AS lx-prepare")
+    assert "npm cache clean --force" in text
+    assert "/usr/local/include/node" in text
+    assert "/usr/local/include " not in text
+    assert "/usr/local/include\n" not in text
     assert "lxmusic-service/lxserver_client.py" in text
     for module in ("managed_client.py", "source_runtime.py", "source_cpu.py",
                    "source_worker.cjs", "lx_vm_bridge.cjs"):

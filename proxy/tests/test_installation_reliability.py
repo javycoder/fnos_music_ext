@@ -1388,3 +1388,74 @@ def test_ensure_proxy_deps_reports_guidance_when_all_indexes_fail(tmp_path):
     assert result.returncode != 0
     assert '排查建议' in result.stderr
     assert 'PIP_INDEX=' in result.stderr
+
+
+def _matching_wheelhouse(deploy, arch: str):
+    from proxy.wheelhouse import write_manifest
+    wheel_dir = deploy / 'assets' / 'proxy-wheels'
+    wheel_dir.mkdir(parents=True)
+    (wheel_dir / 'demo-1.0.0-py3-none-any.whl').write_bytes(b'not-a-real-wheel')
+    write_manifest(wheel_dir, arch, deploy / 'proxy' / 'requirements.txt')
+    return wheel_dir
+
+
+def _host_machine() -> str:
+    return subprocess.check_output(['bash', '-lc', 'uname -m'], text=True).strip()
+
+
+def test_ensure_proxy_deps_uses_matching_wheelhouse_without_upgrading_pip(tmp_path):
+    deploy, venv, calls = _deploy_helper_with_stub_pip(tmp_path, [])
+    shutil.copy2(BASE / 'proxy' / 'wheelhouse.py', deploy / 'proxy' / 'wheelhouse.py')
+    (venv / 'bin' / 'python').write_text(
+        '#!/bin/sh\nif [ "$1" = "-c" ]; then printf \'3.12\\n\'; fi\nexit 0\n',
+        encoding='utf-8')
+    (venv / 'bin' / 'python').chmod(0o755)
+    arch = _host_machine()
+    _matching_wheelhouse(deploy, arch)
+    env = os.environ.copy()
+    env.update(FNMUSIC_VENV_DIR=str(venv), FNMUSIC_PYTHON_BIN=sys.executable)
+    result = subprocess.run(['bash', str(deploy / 'ensure_proxy_deps.sh')], env=env,
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    tried = calls.read_text(encoding='utf-8')
+    assert '--no-index' in tried
+    assert '-U pip' not in tried
+    assert '离线安装' in result.stdout
+
+
+def test_ensure_proxy_deps_rejects_corrupt_wheelhouse_without_network(tmp_path):
+    deploy, venv, calls = _deploy_helper_with_stub_pip(tmp_path, [])
+    shutil.copy2(BASE / 'proxy' / 'wheelhouse.py', deploy / 'proxy' / 'wheelhouse.py')
+    arch = _host_machine()
+    wheel_dir = _matching_wheelhouse(deploy, arch)
+    manifest = json.loads((wheel_dir / 'manifest.json').read_text(encoding='utf-8'))
+    manifest['wheels'][0]['sha256'] = '0' * 64
+    (wheel_dir / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+    env = os.environ.copy()
+    env.update(FNMUSIC_VENV_DIR=str(venv), FNMUSIC_PYTHON_BIN=sys.executable)
+    result = subprocess.run(['bash', str(deploy / 'ensure_proxy_deps.sh')], env=env,
+                            text=True, capture_output=True)
+    assert result.returncode != 0
+    assert '校验失败' in result.stderr or '清单损坏' in result.stderr
+    assert not calls.exists()
+
+
+def test_ensure_proxy_deps_falls_back_when_wheelhouse_target_mismatches(tmp_path):
+    deploy, venv, calls = _deploy_helper_with_stub_pip(tmp_path, [])
+    shutil.copy2(BASE / 'proxy' / 'wheelhouse.py', deploy / 'proxy' / 'wheelhouse.py')
+    (venv / 'bin' / 'python').write_text(
+        '#!/bin/sh\nif [ "$1" = "-c" ]; then printf \'3.12\\n\'; fi\nexit 0\n',
+        encoding='utf-8')
+    (venv / 'bin' / 'python').chmod(0o755)
+    host = _host_machine().lower()
+    other_arch = 'amd64' if host in {'aarch64', 'arm64'} else 'arm64'
+    _matching_wheelhouse(deploy, other_arch)
+    env = os.environ.copy()
+    env.update(FNMUSIC_VENV_DIR=str(venv), FNMUSIC_PYTHON_BIN=sys.executable)
+    result = subprocess.run(['bash', str(deploy / 'ensure_proxy_deps.sh')], env=env,
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    tried = calls.read_text(encoding='utf-8')
+    assert '--no-index' not in tried
+    assert '-U pip' in tried
+    assert '不匹配' in result.stdout + result.stderr

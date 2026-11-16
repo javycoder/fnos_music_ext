@@ -9,6 +9,9 @@
 版本必须取自实际 FPK 文件名并保留数字修订号（fnmusic-ext-2.11.0-4.fpk →
 2.11.0-4），绝不降成 tag 的 2.11.0——否则应用中心会认为版本没变而跳过升级。
 历史发行仍可能使用 fnmusic-ext-2.10.2.fpk 这类无修订附件，继续兼容。
+3.0.0 之后的新发布是三个同版本包：通用包、prebuilt-amd64、prebuilt-arm64。
+商店索引的 x86/arm 都指向通用包；只有历史 ``-amd64``/``-arm64`` 双包发行才按
+架构分别指向。预构建包不完整、或通用包与旧架构包混发时，整条发行拒绝。
 
 发布工作流在 Release 上传后自动调用（.github/workflows/release.yml 的
 update-moo-index job），也可本地手动执行：
@@ -28,6 +31,17 @@ import re
 import sys
 import urllib.request
 from datetime import datetime, timezone, timedelta
+
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from proxy.update_release import (  # noqa: E402
+    classify_fpk_assets,
+    package_arch,
+    package_version,
+    parse_install_package,
+)
 
 DEFAULT_REPO = "javycoder/fnos_music_ext"
 APP_KEY = "fnmusic-ext"
@@ -51,12 +65,6 @@ _REVISION_PATTERN = r"(?:0|[1-9][0-9]*)"
 _INSTALL_VERSION_RE = re.compile(rf"^{_BASE_PATTERN}(?:-{_REVISION_PATTERN})?$")
 # 正式 tag 只有 vx.y.z：数字修订号属于安装包，字母尾巴属于预发布迭代号。
 _FORMAL_TAG_RE = re.compile(rf"^v?({_BASE_PATTERN})$")
-# 实际 FPK 文件名：fnmusic-ext-<安装版本>[-<架构>].fpk（版本含 -N，历史发行可
-# 无 -N；3.0.0 起 FPK 内嵌按架构预构建的镜像归档，双架构产物以 -amd64/-arm64
-# 区分，同一发行允许两种架构各一个、共用同一安装版本）
-_ARCH_PATTERN = r"(?:amd64|arm64)"
-_FPK_NAME_RE = re.compile(
-    rf"^fnmusic-ext-({_BASE_PATTERN}(?:-{_REVISION_PATTERN})?)(?:-({_ARCH_PATTERN}))?\.fpk$")
 # moo 索引平台键 → FPK 架构后缀（x86 生态沿用 amd64 产物）
 _PLATFORM_ARCH = {"x86": "amd64", "arm": "arm64"}
 
@@ -65,18 +73,6 @@ def formal_version(tag: str) -> "str | None":
     """正式 tag 的三段 base（v2.11.0 → 2.11.0）；字母尾巴与杂形返回 None。"""
     match = _FORMAL_TAG_RE.fullmatch(str(tag or "").strip())
     return match.group(1) if match else None
-
-
-def package_version(asset_name: str) -> "str | None":
-    """从 FPK 文件名提取实际安装版本（保留数字修订号，忽略架构后缀）；畸形返回 None。"""
-    match = _FPK_NAME_RE.fullmatch(str(asset_name or "").strip())
-    return match.group(1) if match else None
-
-
-def package_arch(asset_name: str) -> "str | None":
-    """从 FPK 文件名提取架构后缀（amd64/arm64）；无后缀或畸形返回 None。"""
-    match = _FPK_NAME_RE.fullmatch(str(asset_name or "").strip())
-    return match.group(2) if match else None
 
 
 def _require_install_version(version: str) -> str:
@@ -119,8 +115,8 @@ def _release_fpk(rel: dict) -> "tuple[str, str, dict, dict | None] | None":
     返回 (tag_base, 安装版本, 主资产, 按平台资产映射)；非正式 tag、畸形包名、
     错 base、同发行多个安装版本等一律返回 None（宁可漏收也不把错误版本写进
     索引）。带架构后缀的发行必须 amd64/arm64 双架构齐全且不与无后缀包混发，
-    映射为 {"x86": amd64 资产, "arm": arm64 资产}；无后缀（历史/通用包）则
-    映射为 None，沿用两平台同一资产。
+    映射为 {"x86": amd64 资产, "arm": arm64 资产}。通用包，以及通用包加两个
+    预构建包的新发布，都映射为 None，两平台沿用同一个通用资产。
     """
     tag_base = formal_version(str(rel.get("tag_name") or ""))
     if tag_base is None:
@@ -128,31 +124,17 @@ def _release_fpk(rel: dict) -> "tuple[str, str, dict, dict | None] | None":
     assets = rel.get("assets")
     if not isinstance(assets, list):
         return None
-    candidates: dict[str, dict[str, dict]] = {}
-    for asset in assets:
-        if not isinstance(asset, dict):
-            continue
-        name = str(asset.get("name") or "")
-        if not (name.startswith("fnmusic-ext-") and name.endswith(".fpk")):
-            continue
-        version = package_version(name)
-        if version is None:
-            return None  # 形似 FPK 但版本畸形：整条发行拒绝
-        arch = package_arch(name) or ""
-        per = candidates.setdefault(version, {})
-        if arch in per:
-            return None  # 同版本同架构出现多个资产：歧义，整条拒绝
-        per[arch] = asset
-    if len(candidates) != 1:
+    classified = classify_fpk_assets(assets)
+    if classified is None:
         return None
-    version, per = next(iter(candidates.items()))
+    version = str(classified["version"])
     if package_base(version) != tag_base:
         return None
-    if set(per) - {""}:
-        if set(per) != {"amd64", "arm64"}:
-            return None  # 架构不全或与无后缀包混发：失败关闭
-        return tag_base, version, per["amd64"], {"x86": per["amd64"], "arm": per["arm64"]}
-    fpk = per.get("")
+    legacy = classified["legacy"]
+    if legacy:
+        return (tag_base, version, legacy["amd64"],
+                {"x86": legacy["amd64"], "arm": legacy["arm64"]})
+    fpk = classified["generic"]
     if not isinstance(fpk, dict):
         return None
     return tag_base, version, fpk, None
@@ -236,7 +218,7 @@ def build_release_entry(rel: dict, updated_at: str) -> dict:
     version = _require_install_version(rel.get("version"))
     by_platform = rel.get("fpk_by_platform")
     if isinstance(by_platform, dict) and by_platform:
-        # 3.0.0 起双架构分包：x86→amd64、arm→arm64，各指向各自资产
+        # 只有历史 -amd64/-arm64 双包才按平台分开。三包发布不进入这里。
         packages = {}
         for platform, arch in _PLATFORM_ARCH.items():
             asset = by_platform.get(platform)
@@ -245,9 +227,11 @@ def build_release_entry(rel: dict, updated_at: str) -> dict:
             url = str(asset.get("browser_download_url") or "")
             url_name = url.rsplit("/", 1)[-1]
             name = str(asset.get("name") or "") or url_name
-            if package_version(name) != version or package_arch(name) != arch:
+            parsed = parse_install_package(name)
+            if (parsed is None or package_version(name) != version
+                    or package_arch(name) != arch or parsed[2] != "legacy"):
                 raise ValueError(
-                    f"{platform} 架构资产必须是 fnmusic-ext-{version}-{arch}.fpk: {name!r}")
+                    f"{platform} 架构资产必须是历史包 fnmusic-ext-{version}-{arch}.fpk: {name!r}")
             if url_name != name:
                 raise ValueError(f"download_url 与资产文件名不一致: {url}")
             packages[platform] = _pkg(asset)
@@ -389,14 +373,23 @@ def validate_index(index: dict) -> None:
             name_arm = str(pkgs["arm"].get("download_url") or "").rsplit("/", 1)[-1]
             if name_x86 == name_arm:
                 # 单 FPK 通用包（历史口径）：两平台必须同一资产
+                parsed = parse_install_package(name_x86)
+                assert parsed is not None and parsed[2] == "generic", \
+                    f"{ver} 的 x86/arm 指向同一文件时必须是通用包: {name_x86!r}"
                 assert pkgs["arm"].get("sha256") == pkgs["x86"].get("sha256"), \
                     f"{ver} 的 x86/arm 指向同一 FPK，sha256 必须一致"
                 assert int(pkgs["arm"].get("size") or 0) == int(pkgs["x86"].get("size") or 0), \
                     f"{ver} 的 x86/arm 指向同一 FPK，size 必须一致"
             else:
-                # 双架构分包：平台键与架构后缀必须严格对应
-                assert package_arch(name_x86) == "amd64" and package_arch(name_arm) == "arm64", \
-                    f"{ver} 的双架构包必须 x86→amd64、arm→arm64: {name_x86!r}/{name_arm!r}"
+                # 只有历史 -amd64/-arm64 双包才按平台分开；预构建包不进商店索引。
+                parsed_x86 = parse_install_package(name_x86)
+                parsed_arm = parse_install_package(name_arm)
+                assert (parsed_x86 is not None and parsed_x86[2] == "legacy"
+                        and parsed_x86[1] == "amd64"), \
+                    f"{ver} 的 x86 包必须是历史 amd64 FPK: {name_x86!r}"
+                assert (parsed_arm is not None and parsed_arm[2] == "legacy"
+                        and parsed_arm[1] == "arm64"), \
+                    f"{ver} 的 arm 包必须是历史 arm64 FPK: {name_arm!r}"
 
 
 def main(argv: "list[str] | None" = None) -> int:

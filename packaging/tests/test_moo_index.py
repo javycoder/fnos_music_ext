@@ -264,6 +264,63 @@ def test_update_index_rejects_swapped_platform_arch_mapping():
         mod.update_index({}, [rel], "t")
 
 
+def _prebuilt_asset(version: str, arch: str, sha: str, tag: "str | None" = None) -> dict:
+    name = f"fnmusic-ext-{version}-prebuilt-{arch}.fpk"
+    tag = tag or f"v{version.partition('-')[0]}"
+    return {
+        "name": name,
+        "browser_download_url": f"https://github.com/x/y/releases/download/{tag}/{name}",
+        "size": 34567,
+        "digest": f"sha256:{sha}",
+    }
+
+
+def _three_package_release(tag: str, version: str) -> dict:
+    generic = _asset(version, _SHA_C, tag)
+    return {
+        "tag_name": tag,
+        "draft": False,
+        "prerelease": False,
+        "body": f"{tag} 三个安装包",
+        "published_at": "2026-11-16T12:00:00Z",
+        "assets": [
+            generic,
+            _prebuilt_asset(version, "amd64", _SHA_A, tag),
+            _prebuilt_asset(version, "arm64", _SHA_B, tag),
+        ],
+    }
+
+
+def test_three_package_release_indexes_the_generic_fpk_for_both_platforms():
+    entry = mod.select_formal_release(_three_package_release("v3.0.0", "3.0.0-0"))
+    assert entry is not None
+    assert "fpk_by_platform" not in entry
+    assert entry["fpk"]["name"] == "fnmusic-ext-3.0.0-0.fpk"
+    index: dict = {}
+    mod.update_index(index, [entry], "t")
+    mod.validate_index(index)
+    app = index["apps"]["fnmusic-ext"]
+    assert app["download_url"].endswith("/v3.0.0/fnmusic-ext-3.0.0-0.fpk")
+    entry_packages = app["releases"]["3.0.0-0"]["packages"]
+    assert entry_packages["x86"]["download_url"] == entry_packages["arm"]["download_url"]
+    assert entry_packages["x86"]["download_url"].endswith("fnmusic-ext-3.0.0-0.fpk")
+    assert "prebuilt" not in entry_packages["x86"]["download_url"]
+
+
+@pytest.mark.parametrize("assets", [
+    [_prebuilt_asset("3.0.0-0", "amd64", _SHA_A), _prebuilt_asset("3.0.0-0", "arm64", _SHA_B)],
+    [_asset("3.0.0-0", _SHA_C), _prebuilt_asset("3.0.0-0", "amd64", _SHA_A)],
+    [_asset("3.0.0-0", _SHA_C), _arch_asset("3.0.0-0", "amd64", _SHA_A),
+     _arch_asset("3.0.0-0", "arm64", _SHA_B)],
+    [_asset("3.0.0-0", _SHA_C), _prebuilt_asset("3.0.0-0", "amd64", _SHA_A),
+     _prebuilt_asset("3.0.0-0", "amd64", _SHA_B)],
+])
+def test_three_package_release_rejects_incomplete_or_mixed_sets(assets):
+    rel = _three_package_release("v3.0.0", "3.0.0-0")
+    rel["assets"] = assets
+    assert mod.select_formal_release(rel) is None
+
+
 def test_build_release_entry_rejects_version_downgrade():
     # 本次修复的核心事故：v2.11.0 tag 不能把安装版本降成 2.11.0
     rel = _rel("2.11.0-4", _SHA_A, "2026-10-29T12:00:00Z")
@@ -485,13 +542,16 @@ def test_packaging_uses_install_version_in_fpk_name_and_manifest():
     build = (root / "packaging/fpk/build.sh").read_text(encoding="utf-8")
     manifest = (root / "packaging/fpk/manifest.in").read_text(encoding="utf-8")
     assert 'VERSION="$(python3 "${REPO_ROOT}/proxy/version.py" --format version)"' in build
-    # 3.0.0 起镜像归档 FPK 按架构后缀命名（无资产时后缀为空，保持历史口径）
     assert 'FINAL="${OUT_DIR}/fnmusic-ext-${VERSION}${ASSET_ARCH_SUFFIX}.fpk"' in build
-    assert 'sed "s/@VERSION@/${VERSION}/"' in build
+    assert 'ASSET_ARCH_SUFFIX="-prebuilt-${IMAGE_ARCH}"' in build
+    assert 'sed -e "s/@VERSION@/${VERSION}/g" -e "s/@PLATFORM@/${MANIFEST_PLATFORM}/g"' in build
     assert "version               = @VERSION@" in manifest
+    assert "platform              = @PLATFORM@" in manifest
 
     version = (root / "VERSION").read_text(encoding="utf-8").strip()
     assert mod.package_version(f"fnmusic-ext-{version}.fpk") == version
+    assert mod.package_version(f"fnmusic-ext-{version}-prebuilt-amd64.fpk") == version
+    assert mod.package_arch(f"fnmusic-ext-{version}-prebuilt-arm64.fpk") == "arm64"
 
 
 def test_repo_moo_json_if_present():

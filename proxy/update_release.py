@@ -14,8 +14,11 @@ _REVISION_PATTERN = r"(?:0|[1-9][0-9]*)"
 _INSTALL_VERSION_RE = re.compile(rf"^{_BASE_PATTERN}(?:-{_REVISION_PATTERN})?$")
 _FORMAL_TAG_RE = re.compile(rf"^v?({_BASE_PATTERN})$")
 _ARCH_PATTERN = r"(?:amd64|arm64)"
-_FPK_NAME_RE = re.compile(
-    rf"^fnmusic-ext-({_BASE_PATTERN}(?:-{_REVISION_PATTERN})?)(?:-({_ARCH_PATTERN}))?\.fpk$"
+_VERSION_PATTERN = rf"{_BASE_PATTERN}(?:-{_REVISION_PATTERN})?"
+_GENERIC_FPK_RE = re.compile(rf"^fnmusic-ext-({_VERSION_PATTERN})\.fpk$")
+_LEGACY_FPK_RE = re.compile(rf"^fnmusic-ext-({_VERSION_PATTERN})-({_ARCH_PATTERN})\.fpk$")
+_PREBUILT_FPK_RE = re.compile(
+    rf"^fnmusic-ext-({_VERSION_PATTERN})-prebuilt-({_ARCH_PATTERN})\.fpk$"
 )
 
 
@@ -28,15 +31,43 @@ def formal_version(tag: str) -> str | None:
     return match.group(1) if match else None
 
 
+def parse_install_package(name: str) -> tuple[str, str | None, str] | None:
+    """Parse an FPK name into (install_version, arch, kind).
+
+    ``kind`` is ``generic``, ``legacy`` (``-amd64``/``-arm64``), or
+    ``prebuilt``. Malformed names return None. Current updaters recognize
+    prebuilt names but still prefer a generic package when one is present.
+    """
+    text = str(name or "").strip()
+    prebuilt = _PREBUILT_FPK_RE.fullmatch(text)
+    if prebuilt:
+        return prebuilt.group(1), prebuilt.group(2), "prebuilt"
+    legacy = _LEGACY_FPK_RE.fullmatch(text)
+    if legacy:
+        return legacy.group(1), legacy.group(2), "legacy"
+    generic = _GENERIC_FPK_RE.fullmatch(text)
+    if generic:
+        return generic.group(1), None, "generic"
+    return None
+
+
 def parse_install_asset(name: str) -> tuple[str, str | None] | None:
     """Parse an FPK asset name into (install_version, arch).
 
     Returns None if the asset name is not a valid fnmusic-ext FPK.
+    Prebuilt packages report their CPU arch here; callers that need to
+    distinguish them use ``parse_install_package``.
     """
-    match = _FPK_NAME_RE.fullmatch(str(name or "").strip())
-    if not match:
+    parsed = parse_install_package(name)
+    if parsed is None:
         return None
-    return match.group(1), match.group(2)
+    version, arch, _kind = parsed
+    return version, arch
+
+
+def package_kind(asset_name: str) -> str | None:
+    parsed = parse_install_package(asset_name)
+    return parsed[2] if parsed else None
 
 
 def package_version(asset_name: str) -> str | None:
@@ -64,6 +95,59 @@ def normalize_arch(arch: str | None = None) -> str:
     if raw in ("aarch64", "arm64", "armv8", "armv8l"):
         return "arm64"
     return raw
+
+
+def classify_fpk_assets(assets: list[Any]) -> dict[str, Any] | None:
+    """Classify one release's FPK set, or return None when it is unsafe.
+
+    Accepted sets:
+    - one generic package (historical universal installer);
+    - legacy ``-amd64`` and ``-arm64`` together, with no generic package;
+    - generic plus both ``-prebuilt-amd64`` and ``-prebuilt-arm64``.
+
+    Mixing generic with legacy names, a partial prebuilt pair, duplicate
+    identities, or more than one install version all fail closed.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    saw_fpk = False
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "").strip()
+        if not (name.startswith("fnmusic-ext-") and name.endswith(".fpk")):
+            continue
+        saw_fpk = True
+        parsed = parse_install_package(name)
+        if parsed is None:
+            return None
+        version, arch, kind = parsed
+        bucket = grouped.setdefault(version, {"generic": None, "legacy": {}, "prebuilt": {}})
+        if kind == "generic":
+            if bucket["generic"] is not None:
+                return None
+            bucket["generic"] = asset
+            continue
+        slot = bucket[kind]
+        if arch in slot:
+            return None
+        slot[arch] = asset
+    if not saw_fpk or len(grouped) != 1:
+        return None
+    version, bucket = next(iter(grouped.items()))
+    generic = bucket["generic"]
+    legacy = bucket["legacy"]
+    prebuilt = bucket["prebuilt"]
+    if legacy and (generic is not None or prebuilt):
+        return None
+    if prebuilt:
+        if generic is None or set(prebuilt) != {"amd64", "arm64"}:
+            return None
+    elif legacy:
+        if set(legacy) != {"amd64", "arm64"}:
+            return None
+    elif generic is None:
+        return None
+    return {"version": version, "generic": generic, "legacy": legacy, "prebuilt": prebuilt}
 
 
 def normalize_release(data: dict[str, Any], source: str) -> dict[str, Any] | None:
@@ -118,7 +202,9 @@ def normalize_release(data: dict[str, Any], source: str) -> dict[str, Any] | Non
 def select_release_assets(release_dict: dict[str, Any], arch: str | None = None) -> dict[str, Any] | None:
     """Select the appropriate FPK and sha256 asset for target architecture.
 
-    Refuses ambiguous releases (conflicting versions, mismatched bases).
+    A generic package wins whenever it is present, including the three-package
+    release that also carries prebuilt archives. Legacy dual-arch releases keep
+    their architecture mapping. Incomplete or mixed sets return None.
     """
     target_arch = normalize_arch(arch)
     base = release_dict.get("formal_base") or formal_version(str(release_dict.get("tag_name") or ""))
@@ -129,8 +215,8 @@ def select_release_assets(release_dict: dict[str, Any], arch: str | None = None)
     if not isinstance(assets, list):
         return None
 
-    fpk_candidates: dict[str, dict[str, dict[str, Any]]] = {}
     sha256_files: dict[str, str] = {}  # asset_name -> url
+    fpk_assets: list[dict[str, Any]] = []
 
     for a in assets:
         if not isinstance(a, dict):
@@ -140,25 +226,18 @@ def select_release_assets(release_dict: dict[str, Any], arch: str | None = None)
             base_name = name[:-7]
             sha256_files[base_name] = str(a.get("browser_download_url") or "")
             continue
-        parsed = parse_install_asset(name)
-        if not parsed:
-            continue
-        version, pkg_arch = parsed
-        if package_base(version) != base:
-            return None  # Mismatched base, reject release
-        arch_key = pkg_arch or "all"
-        fpk_candidates.setdefault(version, {})[arch_key] = a
-
-    if len(fpk_candidates) != 1:
-        return None  # Missing FPK or multiple competing versions in same release
-
-    version, arch_map = next(iter(fpk_candidates.items()))
-    chosen_asset: dict[str, Any] | None = None
-    if target_arch in arch_map:
-        chosen_asset = arch_map[target_arch]
-    elif "all" in arch_map:
-        chosen_asset = arch_map["all"]
-
+        if name.startswith("fnmusic-ext-") and name.endswith(".fpk"):
+            fpk_assets.append(a)
+    classified = classify_fpk_assets(fpk_assets)
+    if classified is None:
+        return None
+    version = str(classified["version"])
+    if package_base(version) != base:
+        return None
+    if classified["generic"] is not None and not classified["legacy"]:
+        chosen_asset = classified["generic"]
+    else:
+        chosen_asset = classified["legacy"].get(target_arch)
     if not chosen_asset:
         return None
 

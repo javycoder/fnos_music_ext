@@ -354,7 +354,7 @@ log_err() { printf '%s\n' "$*" >&2; }
 def test_native_forwards_selected_node_to_module_validator(tmp_path):
     text = (BASE / "ensure_sources_native.sh").read_text()
     start = text.index('bash "${BASE_DIR}/container/ensure_lxserver_native.sh"')
-    end = text.index('\n\nlog_info "原生音源运行时就绪。"', start)
+    end = text.index("\nensure_netease_deps() {", start)
     selected = str(tmp_path / "Node Runtime/bin/node")
     script = r'''
 set -euo pipefail

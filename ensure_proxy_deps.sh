@@ -138,22 +138,60 @@ if [ "${FNMUSIC_REFRESH_DEPS:-0}" != "1" ] \
 fi
 rm -f "${VENV_DIR}/.fnmusic-deps"
 
+offline_ok=0
+ok_index=""
+WHEEL_MANIFEST="${BASE_DIR}/assets/proxy-wheels/manifest.json"
+WHEEL_TOOL="${BASE_DIR}/proxy/wheelhouse.py"
+if [ -f "${WHEEL_MANIFEST}" ]; then
+    if [ ! -f "${WHEEL_TOOL}" ]; then
+        log_err "预置了宿主依赖清单，但缺少 proxy/wheelhouse.py，拒绝联网回退。"
+        exit 1
+    fi
+    py_ver="$("${VENV_PYTHON}" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+    host_arch="$(uname -m 2>/dev/null || true)"
+    set +e
+    "${PYTHON_BIN}" "${WHEEL_TOOL}" check \
+        --manifest "${WHEEL_MANIFEST}" \
+        --requirements "${REQ_FILE}" \
+        --python-version "${py_ver}" \
+        --arch "${host_arch}"
+    wheel_status=$?
+    set -e
+    if [ "${wheel_status}" -eq 0 ]; then
+        log_info "使用预置宿主 wheel 离线安装代理依赖（不升级 pip）。"
+        if ! PIP_DISABLE_PIP_VERSION_CHECK=1 "${PIP_BIN}" install -q \
+            --no-index --find-links "${BASE_DIR}/assets/proxy-wheels" \
+            -r "${REQ_FILE}" --retries 0 --timeout 30; then
+            log_err "预置 wheel 与当前环境匹配，但离线安装失败。"
+            exit 1
+        fi
+        offline_ok=1
+        ok_index="offline-wheelhouse"
+    elif [ "${wheel_status}" -eq 2 ]; then
+        log_warn "预置 wheel 与当前 Python/架构不匹配，回退联网安装。"
+    else
+        log_err "预置 wheel 清单损坏、校验失败或声明的 wheel 缺失，已中止安装。"
+        exit 1
+    fi
+fi
+
 # 候选源去重：用户自定义 PIP_INDEX 永远第一位
 candidates="${PIP_INDEX}"
 for idx in ${FALLBACK_INDEXES}; do
     [ "${idx}" = "${PIP_INDEX}" ] || candidates="${candidates} ${idx}"
 done
 
-ok_index=""
-for idx in ${candidates}; do
-    log_info "尝试 pip 源: ${idx}"
-    if "${PIP_BIN}" install -q -U pip --retries 2 --timeout 30 -i "${idx}" \
-       && "${PIP_BIN}" install -q -r "${REQ_FILE}" --retries 2 --timeout 30 -i "${idx}"; then
-        ok_index="${idx}"
-        break
-    fi
-    log_warn "pip 源不可用: ${idx}，切换下一候选源重试..."
-done
+if [ "${offline_ok}" -ne 1 ]; then
+    for idx in ${candidates}; do
+        log_info "尝试 pip 源: ${idx}"
+        if "${PIP_BIN}" install -q -U pip --retries 2 --timeout 30 -i "${idx}" \
+           && "${PIP_BIN}" install -q -r "${REQ_FILE}" --retries 2 --timeout 30 -i "${idx}"; then
+            ok_index="${idx}"
+            break
+        fi
+        log_warn "pip 源不可用: ${idx}，切换下一候选源重试..."
+    done
+fi
 
 if [ -z "${ok_index}" ]; then
     log_err "所有 pip 源均安装失败（尝试了: ${candidates}）。"

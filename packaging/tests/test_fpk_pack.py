@@ -351,6 +351,8 @@ class TestPayload:
         repo = stage / "app" / "repo"
         assert not (repo / "assets" / "image").exists(), \
             "stage-only 不应携带镜像资产（FPK_IMAGE_ASSETS 未显式设置时）"
+        assert not (repo / "assets" / "proxy-wheels").exists(), \
+            "stage-only 不应携带宿主 wheelhouse"
 
     def test_image_bundle_installer_files_shipped(self, stage: Path):
         """安装端离线镜像路径依赖的文件必须随包分发。"""

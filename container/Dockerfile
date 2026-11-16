@@ -1,7 +1,7 @@
 # fnmusic-sources 统一镜像：musicdl + musicbox + lxmusic + webui 四进程（supervisor 管理，按需启动）
 # 基础镜像引用可由 build args 覆盖（默认官方源；国内网络自动回退见根目录 ensure_base_image.sh）
 ARG BASE_IMAGE=python:3.13-slim
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS runtime-base
 
 ARG PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/
 ARG APT_MIRROR="https://mirrors.tencent.com"
@@ -90,7 +90,12 @@ RUN set -eu; \
     tar -xJf "/tmp/${node_file}" -C /usr/local --strip-components=1; \
     node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a < 22 || (a === 22 && b < 13)) { console.error(`Node ${process.versions.node} < 22.13.0`); process.exit(1); }'; \
     node --version; \
-    npm --version
+    npm --version; \
+    rm -rf "/tmp/${node_file}" /tmp/SHASUMS256.txt /root/.npm \
+        /usr/local/include/node /usr/local/share/doc/node \
+        /usr/local/share/man/man1/node.1 \
+        /usr/local/CHANGELOG.md /usr/local/README.md; \
+    npm cache clean --force
 
 # 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装）
 # 构建容器 DNS 失败自愈同 apt 步骤（resolv.conf 改写不跨 RUN 层持久，需每步自带）；
@@ -118,7 +123,11 @@ RUN groupadd -g 1000 appuser \
     && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/lxserver-meta /data/logs \
     && chown -R appuser:appuser /data
 
-# lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
+# 洛雪发行包只留在准备阶段。最终镜像只复制解压后的运行目录，
+# 避免 ZIP 和原生模块压缩包留在镜像层里。
+FROM runtime-base AS lx-prepare
+
+# 构建上下文优先（预置离线 zip）+ 多镜像加速回退链
 ARG LXSERVER_MIRROR="https://ghfast.top"
 COPY container/lxserver.version /srv/lxserver.version
 COPY container/lxserver-artifact/ /srv/lxserver-artifact/
@@ -172,11 +181,17 @@ RUN set -eu; \
     rm -rf /srv/lxserver-tmp /srv/lxserver-artifact; \
     chown -R appuser:appuser /srv/lxserver
 
+FROM runtime-base
+
+COPY --from=lx-prepare --chown=appuser:appuser /srv/lxserver /srv/lxserver
+
 # netease-service npm 依赖
 COPY --chown=appuser:appuser netease-service/package.json netease-service/package-lock.json /srv/netease-service/
 RUN set -eu; \
     cd /srv/netease-service; \
     npm ci --omit=dev --ignore-scripts; \
+    npm cache clean --force; \
+    rm -rf /root/.npm /tmp/npm-* /home/appuser/.npm; \
     chown -R appuser:appuser /srv/netease-service
 COPY --chown=appuser:appuser netease-service/service.js netease-service/app.js /srv/netease-service/
 

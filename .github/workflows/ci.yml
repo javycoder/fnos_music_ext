@@ -300,7 +300,7 @@ jobs:
   # build.sh 从最终 staging 构建 amd64 镜像并 docker save 归档 → 组装 FPK →
   # 用 image_bundle.py ensure 把归档重新 load 回 docker 并核对镜像身份，
   # 确认 NAS 侧离线导入路径（免 apt/pip 现场构建）在 CI 上真实可走。
-  # arm64 归档由 release 侧按同一 build.sh 流程产出（QEMU 交叉构建，耗时较长）。
+  # arm64 预构建包由 release 矩阵在 ARM runner 上按同一 build.sh 流程产出。
   fpk-image-bundle:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -317,8 +317,9 @@ jobs:
           FPK_IMAGE_ARCH: amd64
         run: |
           ./packaging/fpk/build.sh --fnpack /tmp/fnpack --out dist
-          test -s dist/fnmusic-ext-*-amd64.fpk
-          test -s dist/fnmusic-ext-*-amd64.fpk.sha256
+          test -s dist/fnmusic-ext-*-prebuilt-amd64.fpk
+          test -s dist/fnmusic-ext-*-prebuilt-amd64.fpk.sha256
+          test -s packaging/fpk/.build/fpk/app/repo/assets/proxy-wheels/manifest.json
       - name: Reload staged archive and verify image identity
         run: |
           staging="$(ls -d packaging/fpk/.build/fpk)"
@@ -334,6 +335,10 @@ jobs:
           import json, pathlib, subprocess, sys
           bundle = pathlib.Path("packaging/fpk/.build/fpk/app/repo/assets/image")
           manifest = json.loads((bundle / "manifest.json").read_text())
+          wheels = pathlib.Path("packaging/fpk/.build/fpk/app/repo/assets/proxy-wheels/manifest.json")
+          wheel_manifest = json.loads(wheels.read_text())
+          assert wheel_manifest["arch"] == "amd64"
+          assert wheel_manifest["python_versions"] == ["3.11", "3.12", "3.13"]
           out = subprocess.run(["docker", "image", "inspect", "fnmusic-sources:latest",
                                 "--format", "{{.Id}} {{.Architecture}}"],
                                capture_output=True, text=True, check=True).stdout.split()

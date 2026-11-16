@@ -91,7 +91,7 @@ def main():
                 from verify_source import parse_script_meta
                 assert "kw" in SUPPORTED_PLATFORMS
                 meta = parse_script_meta(
-                    "/*\n * @name ci-src\n * @version 1.0.0\n * @author ci\n"
+                    "/*!\n * @name ci-src\n * @version 1.0.0\n * @author ci\n"
                     " * @description contract\n */\n"
                 )
                 assert meta["name"] == "ci-src"

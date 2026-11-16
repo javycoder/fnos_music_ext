@@ -10,9 +10,13 @@ set -euo pipefail
 #   packaging/fpk/build.sh --stage-only DIR    # 只组装不打包（结构测试用）
 #   packaging/fpk/build.sh --fnpack /path/fnpack --out dist
 # 环境变量: FNPACK_VERSION（默认 1.2.3）
-#           FPK_IMAGE_ASSETS=require|auto|skip（默认 auto；CI 用 require 强制内嵌
-#           预构建应用镜像归档，见下方 1.5 节）与 FPK_IMAGE_ARCH / FPK_IMAGE_BASE /
-#           FPK_IMAGE_PIP_INDEX / FPK_IMAGE_APT_MIRROR / FPK_IMAGE_GZIP_LEVEL
+#           FPK_IMAGE_ASSETS=require|auto|skip（默认 auto）
+#           skip：通用包，platform=all，不含镜像和宿主 wheel，安装时现场构建
+#           require：必须同时生成对应架构镜像和宿主 wheelhouse，文件名带
+#           -prebuilt-amd64/-prebuilt-arm64，manifest platform 为 x86 或 arm
+#           auto：本机 Docker 可用时按 require，否则按 skip
+#           另有 FPK_IMAGE_ARCH / FPK_IMAGE_BASE / FPK_IMAGE_PIP_INDEX /
+#           FPK_IMAGE_APT_MIRROR / FPK_IMAGE_GZIP_LEVEL
 # ==============================================================================
 
 FPK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -114,6 +118,7 @@ rsync -a --delete \
     --exclude='llm_usage.json' --exclude='llm_usage.json.*' \
     --exclude='playlist_tracks/' --exclude='album_registry.json' --exclude='bind_registry.json' \
     --exclude='*.fpk' \
+    --exclude='assets/image/' --exclude='assets/proxy-wheels/' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
 
 # 注入预编译包至打包 staging 目录，实现 fpk 离线内嵌而不污染源码树
@@ -155,6 +160,7 @@ else
     IMAGE_ASSET_MODE="${FPK_IMAGE_ASSETS:-auto}"
 fi
 ASSET_ARCH_SUFFIX=""
+MANIFEST_PLATFORM="all"
 if [ "${IMAGE_ASSET_MODE}" != "skip" ]; then
     case "$(uname -m)" in
         x86_64) _HOST_ARCH=amd64 ;;
@@ -237,8 +243,24 @@ print(f"[fpk] 镜像身份: {image_id} ({len(diff_ids)} 层, {config.get('archit
 PY
         IMAGE_ID="$(python3 -c "import json,pathlib; print(json.loads(pathlib.Path('${BUNDLE_DIR}/manifest.json').read_text(encoding='utf-8'))['image_id'])")"
         echo "[fpk] 镜像资产就绪: ${IMAGE_ID#sha256:} 归档 $(du -m "${ARCHIVE}" | cut -f1)MB"
-        # 内嵌镜像的 FPK 按架构命名，避免双架构产物同名混淆（manifest 内版本号不变）
-        ASSET_ARCH_SUFFIX="-${IMAGE_ARCH}"
+        case "${IMAGE_ARCH}" in
+            amd64) MANIFEST_PLATFORM="x86" ;;
+            arm64) MANIFEST_PLATFORM="arm" ;;
+            *)
+                echo "ERROR: 预构建包不支持架构 ${IMAGE_ARCH}" >&2
+                exit 1
+                ;;
+        esac
+        echo "[fpk] 构建宿主 wheelhouse (${IMAGE_ARCH}, CPython 3.11/3.12/3.13)..."
+        if ! bash "${REPO_ROOT}/packaging/proxy-wheels/build.sh" \
+            "${IMAGE_ARCH}" \
+            "${STAGE}/app/repo/assets/proxy-wheels" \
+            "${STAGE}/app/repo/proxy/requirements.txt"; then
+            echo "ERROR: 预构建包必须同时包含镜像归档和宿主 wheelhouse" >&2
+            exit 1
+        fi
+        # 预构建包带架构名；通用在线包保持历史的无后缀文件名。
+        ASSET_ARCH_SUFFIX="-prebuilt-${IMAGE_ARCH}"
     elif [ "${IMAGE_ASSET_MODE}" = "require" ]; then
         echo "ERROR: FPK_IMAGE_ASSETS=require，但 Docker 不可用或无法识别架构" >&2
         exit 1
@@ -248,7 +270,8 @@ PY
 fi
 
 # 正式和预发布的 manifest、包内 VERSION、文件名均保留数字 -N；通道另存 RELEASE_CHANNEL。
-sed "s/@VERSION@/${VERSION}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+sed -e "s/@VERSION@/${VERSION}/g" -e "s/@PLATFORM@/${MANIFEST_PLATFORM}/g" \
+    "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/"
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"
