@@ -127,7 +127,7 @@ def test_theme_preference_key_matches_boot_and_app(filename):
 
 
 def test_direct_play_hint_warns_about_experimental_playback():
-    assert '<p class="hint">测试功能，如遇播放异常可以尝试关闭</p>' in HTML
+    assert '<p class="hint">测试功能；HTTP 音频为明文传输，如遇播放异常可以关闭</p>' in HTML
     assert "默认关闭；开启后保存生效。三个音源互不联动。" not in HTML
 
 

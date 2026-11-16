@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager, closing
 from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any, AsyncGenerator, Callable, Coroutine
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -8410,14 +8410,18 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
     now = time.time()
     if source == "netease":
         try:
-            from .netease_direct import upgrade_netease_media_url
+            from .netease_direct import NeteaseDirectUpgradeUnavailable, upgrade_netease_media_url
         except ImportError:
-            from netease_direct import upgrade_netease_media_url  # type: ignore
+            from netease_direct import NeteaseDirectUpgradeUnavailable, upgrade_netease_media_url  # type: ignore
         song_id = song_id_from_online_guid(guid).split(":")[-1]
         url = await resolve_netease_url(get_netease_client(request.app), song_id)
         if not url:
             raise RuntimeError("resolve_failed")
-        url = await upgrade_netease_media_url(url)
+        try:
+            url = await upgrade_netease_media_url(url)
+        except NeteaseDirectUpgradeUnavailable:
+            if urlsplit(str(url)).scheme.lower() != "http":
+                raise
         pin = _NETEASE_URL_PIN.get(song_id)
         info = _online_meta_for_request(request, guid) or {}
         # issue IKS5FW：直连保存的扩展名同样以取链结果（钉链 meta）为准，
@@ -8426,6 +8430,7 @@ async def _resolve_direct_target(request: Request, guid: str, source: str) -> Di
         return DirectMediaTarget(
             provider=provider, platform="netease", canonical_id=song_id, url=str(url),
             server_headers={"User-Agent": _MEDIA_UA_PC}, ext=ext,
+            protocol=urlsplit(str(url)).scheme.lower() or "https",
             resolved_at=now, reuse_deadline=_pin_deadline(pin[1] if pin else None),
             expiry_source="policy", source_generation=generation,
             representation_key=_representation_key(url, "netease", ext),
@@ -8566,7 +8571,7 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
         if binding is None:
             fn_diag(logger, "direct_rejected", guid=guid, reason="range_identity_unavailable")
             return _direct_error(409, "range_identity_unavailable")
-        decision = await asyncio.to_thread(validate_media_url, binding.target.url)
+        decision = await asyncio.to_thread(validate_media_url, binding.target.url, require_https=False)
         if not decision.ok:
             return _direct_error(502, decision.reason)
     elif binding is None:
@@ -8585,7 +8590,7 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
             return _direct_error(502, "target_expired")
         if target.ext.lower() in ("m3u8", "m3u") or target.protocol.lower() in ("hls", "m3u8"):
             return _direct_error(502, "original_file_required")
-        decision = await asyncio.to_thread(validate_media_url, target.url)
+        decision = await asyncio.to_thread(validate_media_url, target.url, require_https=False)
         if not decision.ok:
             fn_diag(logger, "direct_rejected", guid=guid, reason=decision.reason, host=decision.host)
             return _direct_error(502, decision.reason)
@@ -8598,7 +8603,7 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
         )
         _DIRECT_FILE_BINDINGS.forget(scope, guid)
     else:
-        decision = await asyncio.to_thread(validate_media_url, binding.target.url)
+        decision = await asyncio.to_thread(validate_media_url, binding.target.url, require_https=False)
         if not decision.ok:
             fn_diag(logger, "direct_rejected", guid=guid, reason=decision.reason, host=decision.host)
             return _direct_error(502, decision.reason)

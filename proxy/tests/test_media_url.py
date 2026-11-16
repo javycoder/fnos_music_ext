@@ -62,6 +62,25 @@ def test_accepts_https_public_dns_answers():
     assert decision.host == "media.example.com"
 
 
+def test_accepts_public_http_when_caller_explicitly_allows_it():
+    decision = validate_media_url(
+        "http://media.example.com/a.flac?sig=x",
+        require_https=False,
+        resolver=lambda *_: resolver("93.184.216.34"),
+    )
+    assert decision.ok
+    assert decision.host == "media.example.com"
+
+
+def test_http_policy_change_still_rejects_private_targets():
+    decision = validate_media_url(
+        "http://10.0.0.8/a.flac",
+        require_https=False,
+        resolver=lambda *_: resolver("10.0.0.8"),
+    )
+    assert decision.reason == "host_not_public"
+
+
 def test_accepts_public_ipv6_literal_with_port():
     # 验证公网 IPv6 字面量地址配合自定义 HTTPS 端口能够正确通过校验
     decision = validate_media_url(

@@ -36,6 +36,43 @@ class NeteaseDirectProbeError(RuntimeError):
     """Raised when probing an upgraded NetEase HTTPS target fails."""
 
 
+class NeteaseDirectUpgradeUnavailable(NeteaseDirectProbeError):
+    """Raised when an upgraded NetEase HTTPS target is only temporarily unusable."""
+
+
+UPGRADE_UNAVAILABLE_HTTP_STATUSES = frozenset({404, 405, 410, 500, 501, 502, 503, 504})
+UPGRADE_UNAVAILABLE_CONNECT_REASONS = (
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+)
+
+
+def _has_ssl_error(exc: BaseException) -> bool:
+    current = exc
+    while current is not None:
+        if isinstance(current, ssl.SSLError):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _is_upgrade_unavailable(exc: BaseException) -> bool:
+    message = str(exc)
+    status_match = re.fullmatch(r"http_status_(\d{3})", message)
+    if status_match and int(status_match.group(1)) in UPGRADE_UNAVAILABLE_HTTP_STATUSES:
+        return True
+    current = exc
+    while current is not None:
+        if isinstance(current, (httpx.ConnectTimeout, httpx.ReadTimeout)):
+            return True
+        if isinstance(current, httpx.ConnectError) and not _has_ssl_error(current):
+            reason = str(current).lower()
+            return any(marker in reason for marker in UPGRADE_UNAVAILABLE_CONNECT_REASONS)
+        current = current.__cause__
+    return False
+
+
 def is_allowed_netease_cdn_host(
     host: str,
     extra_allowed_hosts: Container[str] | None = None,
@@ -285,8 +322,12 @@ async def upgrade_netease_media_url(
     try:
         return await asyncio.wait_for(_do_probe(), timeout=timeout)
     except asyncio.TimeoutError:
-        raise NeteaseDirectProbeError("probe_timeout")
-    except NeteaseDirectProbeError:
+        raise NeteaseDirectUpgradeUnavailable("probe_timeout")
+    except NeteaseDirectProbeError as exc:
+        if _is_upgrade_unavailable(exc):
+            raise NeteaseDirectUpgradeUnavailable(str(exc)) from exc
         raise
     except Exception as exc:
+        if _is_upgrade_unavailable(exc):
+            raise NeteaseDirectUpgradeUnavailable(f"probe_exception:{type(exc).__name__}") from exc
         raise NeteaseDirectProbeError(f"probe_exception:{type(exc).__name__}") from exc
