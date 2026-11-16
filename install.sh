@@ -1061,9 +1061,8 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         echo "  1) musicbox — 网易云音乐盒子（高品质/无损/歌词封面；推荐安装后扫码登录）"
         echo "  2) musicdl  — 聚合音源（多平台可选：酷我/咪咕/酷狗/QQ/B站等）"
         echo "  3) lxmusic  — 洛雪音乐自定义源（解析播放只走用户源；源脚本装后在管理页配置：URL / 上传 .js / NAS 选择）"
-        local def_choice="2"
+        def_choice="2"
         if [ -f "${BASE_DIR}/.env" ]; then
-            local prev_mdl prev_box prev_lx
             prev_mdl="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
             prev_box="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
             prev_lx="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
@@ -1071,18 +1070,22 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             case "${prev_lx}" in true|1|yes|on) def_choice="3" ;; esac
             case "${prev_mdl}" in true|1|yes|on) def_choice="2" ;; esac
         fi
-        local_choice="$(prompt "请选择音源 (输入 1/2/3)" "${def_choice}")"
+        # 直接读原始输入（不经 prompt 归并默认值）：键入任何选项都算显式选择，
+        # 不被存量 .env 的音源继承逻辑覆盖；回车才沿用推导出的默认值。
+        local_choice=""
+        read -r -p "请选择音源 (输入 1/2/3) [${def_choice}]: " local_choice || true
+        [ -n "${local_choice}" ] && SOURCES_EXPLICIT=1
+        local_choice="${local_choice:-${def_choice}}"
         case "${local_choice}" in
             1) SOURCES_RAW="musicbox" ;;
             3) SOURCES_RAW="lxmusic" ;;
             *) SOURCES_RAW="musicdl" ;;
         esac
         if [ "${SOURCES_RAW}" = "musicdl" ]; then
-            echo "【musicdl 平台多选】输入平台编号（逗号分隔），直接回车用默认精选（酷我+咪咕）"
+            echo "【musicdl 平台多选】输入平台编号（逗号分隔），直接回车沿用提示所示默认值"
             print_featured_mdl_menu
-            local def_mdl_choice="2,4"
+            def_mdl_choice="2,4"
             if [ -f "${BASE_DIR}/.env" ]; then
-                local prev_mdl_plat
                 prev_mdl_plat="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_ONLINE_SOURCES" | tr -d '[:space:]')"
                 [ -n "${prev_mdl_plat}" ] && def_mdl_choice="all"
             fi
