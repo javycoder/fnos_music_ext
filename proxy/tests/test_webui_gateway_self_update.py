@@ -117,3 +117,32 @@ def test_handle_self_update_job_status_and_unknown_path():
     status, body = _call_gateway_handler(head_unknown, "GET", "/api/self-update/not-exist")
     assert status == 404
     assert body["error"] == "未知自更新接口"
+
+
+def test_gateway_bootstraps_repo_root_in_script_mode(tmp_path):
+    """systemd 以脚本方式拉起 webui_gateway.py（fnmusic-ext.service
+    ExecStartPost：python3 .../proxy/webui_gateway.py），sys.path[0] 是
+    proxy/ 自身、不含仓库根。回归：顶层 ``from proxy.self_update import``
+    必须自举仓库根，否则首次安装后服务启动即 ModuleNotFoundError
+    （2026-11-16 NAS 实机安装 3.0.0-1 实测崩溃路径）。"""
+    import runpy
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    gateway = Path(__file__).resolve().parent.parent / "webui_gateway.py"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy, sys; runpy.run_path(sys.argv[1], run_name='bootstrap_check')",
+            str(gateway),
+        ],
+        cwd=str(gateway.parent),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"脚本方式加载 webui_gateway.py 失败（sys.path 无仓库根）:\n{proc.stderr}"
+    )

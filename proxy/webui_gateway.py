@@ -36,6 +36,13 @@ try:
     import pwd
 except ImportError:  # Development-machine unit tests run on non-Linux hosts.
     pwd = None
+
+# 本文件由 systemd 以脚本方式拉起（fnmusic-ext.service ExecStartPost：
+# python3 .../proxy/webui_gateway.py），sys.path[0] 是 proxy/ 自身而非仓库根，
+# 必须先把仓库根补进 sys.path 才能导入 proxy.self_update，否则服务启动即崩。
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from proxy.self_update import (
     get_active_job,
     get_capability,
