@@ -624,6 +624,11 @@ class LxServerClient:
             logger.warning("lxserver search error %s for %s (%s)", resp.status_code, keyword, src)
             return []
         data = resp.json()
+        if isinstance(data, dict):
+            # lxserver v2.2.0 起搜索响应是分页对象 {list, total, allPage, ...}；
+            # 直接按数组断言会把真实结果静默丢成空列表（2026-11-16 NAS 实机
+            # 3.0.0-1 验证发现）。旧版本/兼容实现直接返回数组，两种形态都接受。
+            data = data.get("list") or []
         if not isinstance(data, list):
             return []
 

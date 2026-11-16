@@ -2496,3 +2496,32 @@ def test_track_url_endpoint_uses_hot_reloaded_timeouts(test_app_client, fake_lx,
         assert fake_lx.url_timeouts[-1] == 11.5
     finally:
         restore()
+
+
+def test_search_accepts_lxserver_v2_paged_payload():
+    """lxserver v2.2.0 起搜索响应是分页对象 {list, total, ...} 而非裸数组。
+
+    回归：按数组断言时真实 dict 响应被静默丢成空列表，LX 搜索永远 0 结果
+    （2026-11-16 NAS 实机 3.0.0-1 验证发现）。两种形态都必须返回歌曲。"""
+    song = {"name": "晴天", "singer": "周杰伦", "source": "kw", "songmid": "228908"}
+    payloads = [
+        {"list": [song], "total": 1, "allPage": 1, "pageSize": 20, "fetchedPages": 1},
+        [song],  # 旧版本/兼容实现仍直接返回数组
+    ]
+    for payload in payloads:
+        client = LxServerClient(base_url="http://test", timeout=5.0)
+
+        def handler(request, payload=payload):
+            return httpx.Response(200, json=payload)
+
+        async def run():
+            client._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), base_url="http://test")
+            try:
+                return await client.search("晴天", source="kw", limit=5)
+            finally:
+                await client.close()
+
+        items = asyncio.run(run())
+        assert len(items) == 1, f"payload form {type(payload).__name__} lost results"
+        assert items[0]["id"] == "lx:kw:228908"
