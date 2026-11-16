@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 from uuid import uuid4
 
-from . import publicplaylists as pubpl
+try:
+    from . import publicplaylists as pubpl
+except ImportError:  # uvicorn --app-dir proxy
+    import publicplaylists as pubpl  # type: ignore
 
 logger = logging.getLogger("proxy.playlistsearch")
 
