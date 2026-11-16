@@ -68,6 +68,7 @@ try:
     from .media_url import hostname_for_log, validate_media_url
     from . import nmplaylists as nmpl
     from . import publicplaylists as pubpl
+    from . import playlistsearch
     from . import transcode as tc
     from . import quality_policy as qp
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
@@ -91,6 +92,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from media_url import hostname_for_log, validate_media_url  # type: ignore
     import nmplaylists as nmpl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
+    import playlistsearch  # type: ignore
     import transcode as tc  # type: ignore
     import quality_policy as qp  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
@@ -1307,9 +1309,9 @@ def _search_scope(request: Request) -> str:
 def _netease_runtime_usable() -> bool:
     """网易盒子歌单/播放运行期链路可用性：当前音源是网易盒子，或网易云歌单常驻生效。
 
-    只覆盖歌单注入与已登记网易曲目（播放/歌词/取链等）的放行口径；
-    搜索聚合（_aggregate_search/深分页/专辑搜索）仍只看 netease_enabled——
-    常驻模式下搜索结果不聚合网易（issue #38 需求 1）。
+    只覆盖歌单注入、已登记网易曲目，以及客户端歌单搜索；
+    歌曲搜索聚合（_aggregate_search/深分页/专辑搜索）仍只看 netease_enabled。
+    常驻模式不把网易混进歌曲搜索（issue #38 需求 1）。
     """
     return bool(CONF.get("netease_enabled")) or bool(CONF.get("netease_playlist_resident"))
 
@@ -5149,6 +5151,10 @@ def ensure_registry_warm() -> None:
         _load_album_registry_persisted()
     except Exception as e:
         logger.debug("album registry restore failed: %s", type(e).__name__)
+    try:
+        playlistsearch.restore_discovered(fake_official_guid)
+    except Exception as e:
+        logger.debug("playlist discovery restore failed: %s", type(e).__name__)
 
 
 def resolve_real_guid(candidate: str) -> str:
@@ -5901,6 +5907,7 @@ async def lifespan(fastapi_app: FastAPI):
         _scan_state_by_user.clear()
         await _scan_admin_session.close()
         await pubpl.shutdown()
+        await playlistsearch.shutdown()
         lx_tasks = _cancel_lx_resolutions()
         if lx_tasks:
             await asyncio.gather(*lx_tasks, return_exceptions=True)
@@ -11709,6 +11716,15 @@ async def _playlist_cover_response(request: Request, guid: str, tracks: list,
     return _placeholder_cover_response(guid)
 
 
+def _public_playlist_allowed(user_guid: str, entry: dict | None) -> bool:
+    """已订阅歌单保持原口径；搜索发现的歌单只对当前用户、且来源仍启用时放行。"""
+    if not entry:
+        return False
+    if pubpl.selection_allows(CONF, user_guid, entry):
+        return True
+    return playlistsearch.discovery_allows(user_guid, entry, CONF)
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
@@ -11748,7 +11764,8 @@ async def static_cover(request: Request, subpath: str = ""):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        if not pubpl.selection_allows(CONF, user_guid, pubpl.entry_from_guid(guid)):
+        entry = pubpl.entry_from_guid(guid)
+        if not _public_playlist_allowed(user_guid, entry):
             return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
         response = await _playlist_cover_response(
             request, guid, pubpl.cached_tracks(guid) or [], pubpl.cover_url_for(guid))
@@ -13074,7 +13091,7 @@ async def playlist_detail(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
         if not is_authed:
             return auth_resp or JSONResponse(content={"code": -1, "msg": "unauthorized", "data": None}, status_code=401)
-        if not pubpl.selection_allows(CONF, user_guid, public_entry):
+        if not _public_playlist_allowed(user_guid, public_entry):
             return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             card = await pubpl.load_summary(request.app.state, public_entry)
@@ -13209,7 +13226,7 @@ async def playlist_batch_detail(request: Request):
             recs.append(card)
     for g in public_ids:
         entry = pubpl.entry_from_guid(g)
-        if entry is None or not pubpl.selection_allows(CONF, user_guid, entry):
+        if entry is None or not _public_playlist_allowed(user_guid, entry):
             continue
         try:
             card = await pubpl.load_summary(request.app.state, entry)
@@ -13242,7 +13259,7 @@ async def playlist_track_list(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        if not pubpl.selection_allows(CONF, user_guid, public_entry):
+        if not _public_playlist_allowed(user_guid, public_entry):
             return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             tracks = dailyrec.stamp_playlist_tracks(
@@ -13901,6 +13918,101 @@ async def _online_album_search(request: Request, keyword: str, limit: int) -> li
             seen.add(name_key)
             out.append(obj)
     return out[:limit]
+
+
+def _playlist_search_total(data: dict, page: int, size: int, official: list) -> int:
+    total = data.get("total")
+    if isinstance(total, int) and total >= 0:
+        return total
+    if len(official) < size:
+        return (page - 1) * size + len(official)
+    return page * size
+
+
+@app.api_route("/music/api/v1/search/playlist", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/search/playlist/{subpath:path}", methods=["GET", "HEAD"])
+async def search_playlist(request: Request, subpath: str = ""):
+    """客户端歌单搜索：官方结果在前，已启用音源的公开歌单按页补在后面。"""
+    deadline = time.monotonic() + playlistsearch.TOTAL_BUDGET_S
+    upstream_client = get_upstream_client(request.app)
+    try:
+        envelope = await asyncio.wait_for(
+            fetch_upstream_envelope(request, upstream_client),
+            timeout=max(0.05, deadline - time.monotonic()),
+        )
+    except TimeoutError:
+        return JSONResponse(content={"code": -1, "msg": "upstream timeout", "data": None})
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {}) or {}
+    if envelope.get("code") != 0:
+        return JSONResponse(content=envelope, headers=headers)
+
+    keyword = extract_keyword(request)
+    page = playlistsearch.parse_positive_int(request.query_params.get("page"), 1, 10000)
+    size = playlistsearch.parse_positive_int(request.query_params.get("size"), 24, 100)
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        data = {"list": [], "total": 0}
+        envelope["data"] = data
+    raw_list = data.get("list") if isinstance(data.get("list"), list) else []
+    official = [row for row in raw_list if isinstance(row, dict)]
+    official_total = _playlist_search_total(data, page, size, official)
+    official_page = official[:size]
+    data["list"] = official_page
+    data["total"] = official_total
+    if not keyword or not playlistsearch.sources_configured(CONF):
+        return JSONResponse(content=disguise_client_json(envelope), headers=headers)
+
+    user_guid = ""
+    remaining = deadline - time.monotonic()
+    if remaining > 0.05:
+        try:
+            is_authed, user_guid, _auth_resp = await asyncio.wait_for(
+                _probe_upstream_auth(request, upstream_client),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            is_authed, user_guid = False, ""
+        if not is_authed:
+            user_guid = ""
+    if not user_guid or user_guid == "shared":
+        return JSONResponse(content=disguise_client_json(envelope), headers=headers)
+
+    async def resolve_platforms(timeout: float):
+        if not CONF.get("lx_enabled"):
+            return [], True
+        return await playlistsearch.fetch_lx_platforms(
+            get_lx_client(request.app), list(CONF.get("lx_sources") or []), timeout,
+        )
+
+    async def fetch_page(target, query: str, provider_page: int, timeout: float):
+        client = get_netease_client(request.app) if target.provider == "netease" else get_lx_client(request.app)
+        return await playlistsearch.fetch_http(client, target, query, provider_page, timeout)
+
+    try:
+        result = await playlistsearch.load_page(
+            conf=CONF,
+            user_guid=user_guid,
+            keyword=keyword,
+            page=page,
+            size=size,
+            official_total=official_total,
+            deadline=deadline,
+            resolve_platforms=resolve_platforms,
+            fetch_page=fetch_page,
+        )
+    except Exception as exc:
+        logger.warning("playlist search failed: %s", type(exc).__name__)
+        result = playlistsearch.empty_result()
+    room = max(0, size - len(official_page))
+    online_cards = result.cards[:room]
+    data["list"] = official_page + online_cards
+    continuation = 1 if result.open_more and not result.interrupted else 0
+    data["total"] = official_total + result.pool_length + continuation
+    if result.founds:
+        await playlistsearch.grant_delivered(user_guid, result.founds[:len(online_cards)])
+    return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
 @app.api_route("/music/api/v1/search/album", methods=["GET", "HEAD"])

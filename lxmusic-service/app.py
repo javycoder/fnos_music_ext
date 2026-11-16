@@ -2234,6 +2234,7 @@ async def public_playlists(
     page: int = Query(1, ge=1, le=10000),
     limit: int = Query(30, ge=1, le=50),
     cursor: str = Query(""),
+    timeout_s: float | None = Query(None),
 ):
     src = _public_source(source)
     if channel == "charts":
@@ -2242,7 +2243,11 @@ async def public_playlists(
         return {"ok": True, "items": [it for it in items if it["id"]], "total": len(items), "has_more": False}
     if channel == "search":
         # lxserver 原生歌单搜索：SDK 固定页大小（默认 20），limit 不透传
-        data = await LXSERVER.get_song_list_search(src, keyword, page)
+        budget = timeout_s if isinstance(timeout_s, (int, float)) and timeout_s > 0 else None
+        if budget is None:
+            data = await LXSERVER.get_song_list_search(src, keyword, page)
+        else:
+            data = await LXSERVER.get_song_list_search(src, keyword, page, timeout=float(budget))
         raw_items = data.get("list") or []
         items = [LXSERVER.normalize_public_playlist(row, src) for row in raw_items if isinstance(row, dict)]
         try:

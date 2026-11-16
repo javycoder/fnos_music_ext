@@ -619,6 +619,40 @@ def test_song_list_search_client_rejects_bad_input_and_payloads():
         asyncio.run(_with(bad_payload, lambda: client.get_song_list_search("kw", "华语", 1)))
 
 
+def test_song_list_search_budget_covers_lock_wait():
+    client = LxServerClient(base_url="http://lxserver-test", timeout=30)
+
+    async def _run():
+        lock = client.song_list_lock("kw")
+        await lock.acquire()
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError):
+                await client.get_song_list_search("kw", "华语", 1, timeout=0.2)
+            return time.monotonic() - started
+        finally:
+            lock.release()
+            await client.close()
+
+    assert asyncio.run(_run()) < 1.0
+
+
+def test_public_playlist_search_forwards_budget(test_app_client, fake_lx):
+    seen = {}
+
+    async def search(source, text, page=1, timeout=None):
+        seen["timeout"] = timeout
+        return {"list": [], "limit": 20, "total": 0}
+
+    fake_lx.get_song_list_search = search
+    fake_lx.normalize_public_playlist = LxServerClient.normalize_public_playlist
+    response = test_app_client.get("/api/v1/public-playlists", params={
+        "source": "kw", "channel": "search", "keyword": "华语", "page": 1, "timeout_s": 0.4,
+    })
+    assert response.status_code == 200
+    assert seen["timeout"] == pytest.approx(0.4)
+
+
 def test_public_playlist_search_maps_and_infers_more(test_app_client, fake_lx):
     async def search(source, text, page=1):
         if not text.strip():

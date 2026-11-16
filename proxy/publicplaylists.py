@@ -317,6 +317,36 @@ def _card_from_summary(entry: dict, summary: dict) -> dict:
     }
 
 
+def remember_discovery_summary(entry: dict, summary: dict) -> dict | None:
+    """把搜索发现的公开摘要放进内存缓存。只用于展示，不授予访问权。"""
+    if not isinstance(entry, dict) or not isinstance(summary, dict):
+        return None
+    provider = str(entry.get("provider") or "")
+    source = str(entry.get("source") or "").strip()
+    kind = str(entry.get("kind") or "")
+    identifier = str(entry.get("id") or "").strip()
+    name = str(summary.get("name") or "").strip()
+    if provider not in ("netease", "musicbox", "lx") or kind not in ("playlist", "chart"):
+        return None
+    if not source or not identifier or not name:
+        return None
+    try:
+        count = max(0, int(summary.get("track_count") or 0))
+        updated = max(0, int(summary.get("updated_at") or 0))
+    except (TypeError, ValueError):
+        count, updated = 0, 0
+    clean = {
+        "provider": provider,
+        "source": source,
+        "kind": kind,
+        "id": identifier,
+    }
+    payload = {"name": name, "cover_url": str(summary.get("cover_url") or ""), "track_count": count, "updated_at": updated}
+    guid = playlist_guid(clean)
+    _summary_cache[guid] = (payload, time.monotonic() + _SUMMARY_TTL_S)
+    return _card_from_summary(clean, payload)
+
+
 def _summary_disk_path(guid: str) -> str:
     digest = hashlib.sha256(guid.encode()).hexdigest()[:24]
     return os.path.join(cache_dir(), f"summary-{digest}.json")

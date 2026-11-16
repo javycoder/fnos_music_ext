@@ -1007,7 +1007,13 @@ function createService(options = {}) {
           return res.status(400).json({ detail: 'keyword is required for search channel' });
         }
         const offset = (page - 1) * limit;
-        const sResp = await sdk.cloudsearch({ keywords: keyword, type: 1000, limit, offset, cookie, timeout: timeoutMs });
+        const requested = parseInt(req.query.timeout_ms, 10);
+        const budgetMs = Number.isFinite(requested) && requested > 0
+          ? Math.min(timeoutMs, requested)
+          : timeoutMs;
+        const sResp = await sdk.cloudsearch({
+          keywords: keyword, type: 1000, limit, offset, cookie, timeout: budgetMs,
+        });
         const resObj = sResp && sResp.body && sResp.body.result ? sResp.body.result : {};
         const rows = Array.isArray(resObj.playlists) ? resObj.playlists : [];
         const total = nonnegativeIntOrZero(resObj.playlistCount);

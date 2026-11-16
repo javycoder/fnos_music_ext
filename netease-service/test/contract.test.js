@@ -586,3 +586,24 @@ test('QR image and text aliases match original endpoints', async () => {
   assert.strictEqual(txt1.text, txt2.text);
   assert.ok(txt1.text.endsWith('\n'));
 });
+
+test('public playlist search forwards remaining timeout to cloudsearch', async () => {
+  let seen = null;
+  const mockSdk = {
+    cloudsearch: async (params) => {
+      seen = params;
+      return { body: { result: { playlists: [], playlistCount: 0 } } };
+    },
+  };
+  const service = createService({ sdk: mockSdk, timeoutMs: 10000 });
+  const res = await makeRequest(
+    service.app,
+    'GET',
+    '/api/v1/public-playlists?source=netease&channel=search&keyword=abc&timeout_ms=250',
+  );
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.ok, true);
+  assert.strictEqual(seen.type, 1000);
+  assert.strictEqual(seen.timeout, 250);
+  assert.strictEqual(seen.keywords, 'abc');
+});
