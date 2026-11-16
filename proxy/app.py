@@ -7638,6 +7638,22 @@ def _schedule_library_scan(headers: dict | None, user_guid: str = "") -> None:
     _set_scan_slot(user_guid, task=new_task)
 
 
+def _stream_cache_eligibility(resp: httpx.Response) -> tuple[bool, int | None]:
+    """判定上游单次响应是否为完整整轨资源（完整 200 或覆盖 0..N-1 的完整 206），并返回预期字节数。"""
+    length = resp.headers.get("content-length", "")
+    expected = int(length) if length.isdigit() else None
+    if resp.status_code == 200:
+        return True, expected
+    if resp.status_code == 206:
+        # Content-Length proves only this segment, not the entire recording.
+        match = re.fullmatch(r"bytes\s+0-(\d+)/(\d+)", resp.headers.get("content-range", "").strip(), re.I)
+        if match and int(match[1]) + 1 == int(match[2]) and int(match[2]) > 0:
+            total = int(match[2])
+            if expected is None or expected == total:
+                return True, total
+    return False, expected
+
+
 def stream_tee_response(
     resp: httpx.Response,
     guid: str,
@@ -7661,17 +7677,7 @@ def stream_tee_response(
             headers[key] = resp.headers[key]
     if resolved_ext:
         headers["content-type"] = media_type_for_ext(resolved_ext)
-    length = resp.headers.get("content-length", "")
-    expected = int(length) if length.isdigit() else None
-    full_resource = resp.status_code == 200
-    if resp.status_code == 206:
-        # Content-Length proves only this segment, not the entire recording.
-        match = re.fullmatch(r"bytes\s+0-(\d+)/(\d+)", resp.headers.get("content-range", "").strip(), re.I)
-        full_resource = bool(match and int(match[1]) + 1 == int(match[2]) and int(match[2]) > 0)
-        if full_resource:
-            total = int(match[2])
-            full_resource = expected is None or expected == total
-            expected = total
+    full_resource, expected = _stream_cache_eligibility(resp)
     ext = resolved_ext or ext_from_content_type(resp.headers.get("content-type", ""))
 
     async def body() -> AsyncGenerator[bytes, None]:
@@ -7709,7 +7715,7 @@ def stream_tee_response(
             tee_enabled = bool(CONF.get("tee_save_enabled"))
             if tee_enabled and CONF.get("tee_save_by_user"):
                 user_task = asyncio.create_task(_resolve_storage_user(trigger_headers))
-            if should_cache(range_header) and full_resource:
+            if full_resource:
                 try:
                     directory = ((staged_dir() if (use_staged_save() or CONF.get("tee_save_by_user"))
                                   else tee_save_dir())
@@ -10306,8 +10312,8 @@ async def stream_track(request: Request, subpath: str = ""):
                     return RedirectResponse(location, status_code=307, headers={"Cache-Control": "no-store"})
                 # Cache the selected source's bytes under its own GUID, never
                 # splice a failed stream or alias different encodings for seeks.
-                if not should_cache(range_header):
-                    # 定长窗口客户端：本响应过不了 tee 写盘门，注册后台整轨下载兜底
+                if not should_cache(range_header) and not _stream_cache_eligibility(resp)[0]:
+                    # 定长窗口客户端且当前响应非整轨：本响应过不了 tee 写盘门，注册后台整轨下载兜底
                     _register_full_fetch(request, candidate)
                 localmatch.clear_served(guid)
                 return stream_tee_response(resp, candidate, range_header,

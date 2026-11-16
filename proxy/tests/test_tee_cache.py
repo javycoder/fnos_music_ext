@@ -468,6 +468,55 @@ async def test_full_fetch_skips_when_cached_or_tee_off(monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("status_code,content_range,content_length,expect_cached,expect_bg_task", [
+    # 完整 206 响应：当前流直接写盘缓存，不应再调度多余的后台整轨下载
+    (206, "bytes 0-4095/4096", "4096", True, False),
+    # 完整 200 响应：当前流直接写盘缓存，不应再调度多余的后台整轨下载
+    (200, None, "4096", True, False),
+    # 部分切片响应：当前流不写盘，由后台整轨下载兜底落库
+    (206, "bytes 0-1023/4096", "1024", False, True),
+])
+async def test_stream_track_bounded_range_caching_and_full_fetch_coordination(
+    status_code, content_range, content_length, expect_cached, expect_bg_task, monkeypatch
+):
+    """带定长 Range 访问 stream_track：若单次响应已为整轨，直接入库且不重复触发后台下载；切片则交由后台兜底。"""
+    guid = f"online:kuwo:coord_{status_code}_{expect_cached}"
+    audio_bytes = b"M" * 4096
+    info = {"title": "夜曲", "artist": "周杰伦", "album": "十一月的萧邦"}
+
+    monkeypatch.setitem(p.CONF, "musicdl_enabled", True)
+    monkeypatch.setitem(p.CONF, "online_sources", "kuwo")
+    async def fake_open(request, g, range_header, force_mp3=False, fresh_url=False, **kwargs):
+        headers = {"content-type": "audio/mpeg"}
+        if content_range:
+            headers["content-range"] = content_range
+        if content_length:
+            headers["content-length"] = content_length
+        resp = httpx.Response(status_code, headers=headers)
+        chunks = Audio(audio_bytes if status_code == 200 or content_length == "4096" else audio_bytes[:1024])
+        first = b""
+        return (resp, None, "mp3", info, chunks, first)
+
+    monkeypatch.setattr(p, "_open_online_stream", fake_open)
+    monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
+    req = p.Request({
+        "type": "http", "method": "GET", "path": "/music/api/v1/track/stream",
+        "query_string": f"guid={guid}".encode(),
+        "headers": [(b"range", b"bytes=0-4095"), (b"cookie", b"sid=test")],
+        "app": p.app,
+    })
+    resp = await p.stream_track(req)
+    assert resp.status_code == status_code
+    body = b"".join([chunk async for chunk in resp.body_iterator])
+    assert len(body) == (4096 if expect_cached else 1024)
+    assert bool(p.find_cache_file(guid)) == expect_cached
+    if expect_bg_task:
+        assert guid in p._full_fetch_tasks
+    else:
+        assert guid not in p._full_fetch_tasks
+
+
+@pytest.mark.anyio
 async def test_library_scan_disabled_by_default():
     """路径未配置（默认禁用）：落盘后完全不发起扫描。"""
     p._schedule_library_scan({"cookie": "sid=x"})

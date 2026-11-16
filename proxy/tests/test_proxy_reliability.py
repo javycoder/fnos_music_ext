@@ -631,6 +631,39 @@ async def test_only_full_resource_206_can_finalize(content_range, length, cached
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("range_header,status_code,content_range,content_length,cached", [
+    # 定长 Range 且上游返回完整 206：应成功缓存
+    ("bytes=0-4095", 206, "bytes 0-4095/4096", "4096", True),
+    # 定长 Range 但上游忽略 Range 返回完整 200：应成功缓存
+    ("bytes=0-4095", 200, None, "4096", True),
+    # 定长 Range 上游仅返回部分切片（如 0-1023/4096）：绝不缓存
+    ("bytes=0-1023", 206, "bytes 0-1023/4096", "1024", False),
+    # Safari 两字节嗅探 Range (bytes=0-1)：绝不缓存
+    ("bytes=0-1", 206, "bytes 0-1/4096", "2", False),
+    # 非零起点 Range (bytes=100-4095)：绝不缓存
+    ("bytes=100-4095", 206, "bytes 100-4095/4096", "3996", False),
+])
+async def test_bounded_range_full_resource_caching(range_header, status_code, content_range, content_length, cached, tmp_path, monkeypatch):
+    """Issue #128 核心回归：只要单次响应返回整轨资源（完整 206 或完整 200），即应落盘转正；不完整切片严禁落盘。"""
+    monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
+    audio = Audio()
+    headers = {"content-type": "audio/mpeg"}
+    if content_range:
+        headers["content-range"] = content_range
+    if content_length:
+        headers["content-length"] = content_length
+    guid = f"online:kuwo:bounded_{abs(hash((range_header, status_code, content_range)))}"
+    response = p.stream_tee_response(
+        httpx.Response(status_code, stream=audio, headers=headers),
+        guid, range_header, pre_info=song("kuwo:test")
+    )
+    payload = b"".join([chunk async for chunk in response.body_iterator])
+    assert len(payload) == 4096
+    assert bool(p.find_cache_file(guid)) == cached
+    assert not list(tmp_path.rglob("*.part"))
+
+
+@pytest.mark.anyio
 async def test_gzip_audio_rejected_before_first_byte(tmp_path):
     import gzip
     packed = gzip.compress(b"x" * 4096)
