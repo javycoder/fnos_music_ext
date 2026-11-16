@@ -3350,6 +3350,61 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str,
     )
 
 
+def serve_segment_sequence_with_range(paths: list[str], range_header: str | None,
+                                      media_type: str) -> Response:
+    """把连续 fMP4 分片作为一个逻辑资源交付，支持跨片 Range。"""
+    sizes = [os.path.getsize(path) for path in paths]
+    total_size = sum(sizes)
+    if total_size <= 0:
+        raise OSError("empty segment sequence")
+    rng = parse_http_range(range_header, total_size)
+
+    def iter_segments(offset: int, length: int) -> AsyncGenerator[bytes, None]:
+        async def gen() -> AsyncGenerator[bytes, None]:
+            remaining = length
+            skip = offset
+            for path, size in zip(paths, sizes):
+                if remaining <= 0:
+                    break
+                if skip >= size:
+                    skip -= size
+                    continue
+                with open(path, "rb") as fp:
+                    fp.seek(skip)
+                    skip = 0
+                    while remaining > 0:
+                        chunk = fp.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+        return gen()
+
+    if rng is None:
+        headers = _media_stream_headers({
+            "Content-Type": media_type,
+            "Content-Length": str(total_size),
+        })
+        return StreamingResponse(
+            iter_segments(0, total_size),
+            status_code=200,
+            headers=headers,
+        )
+
+    start, end = rng
+    length = end - start + 1
+    headers = _media_stream_headers({
+        "Content-Type": media_type,
+        "Content-Length": str(length),
+        "Content-Range": f"bytes {start}-{end}/{total_size}",
+    })
+    return StreamingResponse(
+        iter_segments(start, length),
+        status_code=206,
+        headers=headers,
+    )
+
+
 def get_upstream_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "upstream_client", None)
     if client is None:
@@ -10487,7 +10542,10 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     rendition = None
-    versioned = re.fullmatch(r"([a-f0-9]{32}|legacy)__(init\.mp4|[0-9]{5}\.m4s)", filename)
+    versioned = re.fullmatch(
+        r"([a-f0-9]{32}|legacy)__(init\.mp4|[0-9]{5}\.m4s|tail-[0-9]{5}\.m4s)",
+        filename,
+    )
     if versioned:
         rendition, filename = versioned.groups()
     if filename != "preset.m3u8" and not tc.valid_segment_name(filename):
@@ -10504,10 +10562,40 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
         if filename == "preset.m3u8":
             # 新播放过程从此固定实际音频版本（本地/在线），分片不得跨版本混供
             playlist = tc.playlist_text(sess)
+            if playlist is None:
+                _on_hls_segment_failure(guid, sess)
+                return JSONResponse(
+                    content={"code": 404, "msg": "playlist unavailable", "data": None},
+                    status_code=404,
+                )
             playlist = playlist.replace('URI="init.mp4"', f'URI="{sess.rendition}__init.mp4"')
             playlist = re.sub(r"(?m)^([0-9]{5}\.m4s)$", lambda m: f"{sess.rendition}__{m[1]}", playlist)
+            playlist = re.sub(
+                r"(?m)^(tail-[0-9]{5}\.m4s)$",
+                lambda m: f"{sess.rendition}__{m[1]}",
+                playlist,
+            )
             return Response(content=playlist, media_type="application/vnd.apple.mpegurl",
                             headers={"X-Accel-Buffering": "no"})
+        tail_start = tc.tail_start_index(filename)
+        if tail_start is not None:
+            segments = await tc.wait_tail_segments(sess, tail_start, timeout=30.0)
+            if segments is None:
+                _on_hls_segment_failure(guid, sess)
+                return JSONResponse(
+                    content={"code": 404, "msg": "segment unavailable", "data": None},
+                    status_code=404,
+                )
+            current = _transcode_live(guid)
+            if current is None or current.rendition != rendition:
+                return Response(status_code=404)
+            paths = [os.path.join(sess.directory, segment.filename) for segment in segments]
+            try:
+                return serve_segment_sequence_with_range(
+                    paths, request.headers.get("range"), "video/iso.segment")
+            except OSError:
+                _on_hls_segment_failure(guid, sess)
+                return Response(status_code=404)
         path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
         if path:
             current = _transcode_live(guid)

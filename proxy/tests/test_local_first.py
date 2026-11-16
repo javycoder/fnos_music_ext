@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import wave
 
@@ -54,6 +55,7 @@ if os.environ.get("FAKE_FFMPEG_FAIL_FIRST_ATTEMPT") == "1" and attempt == 0:
 if "-hls_segment_filename" in args:
     pattern = args[args.index("-hls_segment_filename") + 1]
     segdir = os.path.dirname(os.path.abspath(pattern))
+    hls_time = float(args[args.index("-hls_time") + 1])
     os.makedirs(segdir, exist_ok=True)
     with open(os.path.join(segdir, "init.mp4"), "wb") as f:
         f.write(b"ftypinit")
@@ -63,6 +65,13 @@ if "-hls_segment_filename" in args:
             f.write(b"moofseg" + str(i).encode())
     with open(args[-1], "w") as f:
         f.write("#EXTM3U\\n")
+        f.write("#EXT-X-VERSION:7\\n")
+        f.write("#EXT-X-TARGETDURATION:%d\\n" % (int(hls_time) + 1))
+        f.write("#EXT-X-PLAYLIST-TYPE:EVENT\\n")
+        f.write('#EXT-X-MAP:URI="init.mp4"\\n')
+        for i in range(n):
+            f.write("#EXTINF:%.3f,\\n%05d.m4s\\n" % (hls_time, i))
+        f.write("#EXT-X-ENDLIST\\n")
 sys.exit(0)
 '''
 
@@ -457,10 +466,23 @@ def test_serve_file_with_range_error_hook_on_truncation(tmp_path):
 # === 标准音质转码（HLS）===
 
 def _install_fake_ffmpeg(monkeypatch, tmp_path):
-    script = tmp_path / "fake_ffmpeg_localfirst"
-    script.write_text(FAKE_FFMPEG_SRC)
-    script.chmod(0o755)
-    monkeypatch.setattr(tc, "FFMPEG_BIN", str(script))
+    if sys.platform == "win32":
+        py_script = tmp_path / "fake_ffmpeg_localfirst.py"
+        py_script.write_text(FAKE_FFMPEG_SRC, encoding="utf-8")
+        original_argv = tc._ffmpeg_argv
+
+        def fake_argv(src, headers, sess, directory):
+            return [sys.executable, str(py_script), *original_argv(
+                src, headers, sess, directory)[1:]]
+
+        monkeypatch.setattr(tc, "FFMPEG_BIN", sys.executable)
+        monkeypatch.setattr(tc, "_ffmpeg_argv", fake_argv)
+        script = py_script
+    else:
+        script = tmp_path / "fake_ffmpeg_localfirst"
+        script.write_text(FAKE_FFMPEG_SRC, encoding="utf-8")
+        script.chmod(0o755)
+        monkeypatch.setattr(tc, "FFMPEG_BIN", str(script))
     arglog = tmp_path / "ffmpeg_args.log"
     count = tmp_path / "ffmpeg_count"
     monkeypatch.setenv("FAKE_FFMPEG_ARGLOG", str(arglog))
@@ -499,6 +521,13 @@ def test_completed_hls_rendition_stays_pinned_when_local_appears(env, tmp_path, 
         fp.write(b"original-init")
     with open(os.path.join(directory, "00000.m4s"), "wb") as fp:
         fp.write(b"original-online")
+    with open(os.path.join(directory, tc.PLAYLIST_NAME), "w") as fp:
+        fp.write(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:11\n"
+            "#EXT-X-PLAYLIST-TYPE:EVENT\n"
+            '#EXT-X-MAP:URI="init.mp4"\n'
+            "#EXTINF:10.000,\n00000.m4s\n#EXT-X-ENDLIST\n"
+        )
     tc._write_state(completed)
     with TestClient(app) as client:
         first = client.get(f"/music/api/v1/track/hls/{GUID_KUWO}/preset.m3u8")
