@@ -294,7 +294,8 @@ if [ -z "${FNPACK_BIN}" ]; then
     else
         case "$(uname -m)" in
             x86_64) FNARCH=amd64 ;;
-            aarch64|arm64) FNARCH=arm64 ;;
+            # 上游静态资源的 arm64 命名是 linux-arm（ELF aarch64），不是 linux-arm64
+            aarch64|arm64) FNARCH=arm ;;
             *) echo "ERROR: 不支持的架构 $(uname -m)" >&2; exit 1 ;;
         esac
         FNPACK_VERSION="${FNPACK_VERSION:-1.2.3}"
