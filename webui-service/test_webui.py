@@ -2375,15 +2375,43 @@ def test_download_layout_enum_roundtrip_rejects_invalid_values(env_file, svctl):
 
 def test_cleanup_beta_markup():
     html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    cleanup = html.split('id="page-exp-cleanup"', 1)[1].split("</section>", 1)[0]
     tee = html.split('id="page-tee"', 1)[1].split("</section>", 1)[0]
-    assert 'id="cleanup-open-btn"' in tee
-    assert "清理垃圾文件" in tee and "Beta" in tee
+    assert 'id="cleanup-open-btn"' in cleanup
+    assert "清理垃圾文件" in cleanup and "Beta" in cleanup
+    assert 'id="cleanup-open-btn"' not in tee
     assert "下载完整即保存" in tee
     assert "不必听完整首" in tee
     assert "完整试听在线歌后" not in html
     assert 'id="cleanup-modal" hidden' in html
     assert 'aria-describedby="cleanup-warning"' in html
     assert "此功能为 Beta，可能误删歌曲、封面、歌词等文件，删除后无法自动恢复。是否确认执行？" in html
+
+
+def test_experimental_features_are_grouped_under_dedicated_menu():
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+
+    def page(page_id):
+        return html.split(f'id="page-{page_id}"', 1)[1].split("</section>", 1)[0]
+
+    assert 'id="nav-experimental-title"' in html
+    assert 'id="bottom-experimental-trigger"' in html
+    for page_id in ("exp-direct", "exp-layout", "exp-cleanup"):
+        assert html.count(f'data-page="{page_id}"') == 2
+    for label in ("播放直连", "目录归类与整理", "垃圾清理"):
+        assert f"<span>{label}</span>" in html
+        assert f'role="menuitem" type="button">{label}</button>' in html
+
+    direct = page("exp-direct")
+    assert all(f'id="{element}"' in direct for element in
+               ("direct-netease", "direct-musicdl", "direct-lx"))
+    assert 'id="direct-netease"' not in page("search")
+
+    layout = page("exp-layout")
+    assert 'id="download-layout"' in layout
+    assert 'id="organize-open-btn"' in layout
+    assert 'id="download-layout"' not in page("dirs")
+    assert 'id="organize-open-btn"' not in page("dirs")
 
 
 # ------------------------------------------------------------------ 网关管理员 ---
@@ -3368,15 +3396,16 @@ def test_tee_save_mode_roundtrip_rejects_bad(env_file):
 
 def test_tee_save_mode_ui_bindings():
     """前端下拉框存在、三选项齐全、读写两处与后端键名对上。"""
-    import re
     html = open("webui-service/static/index.html", encoding="utf-8").read()
     js = open("webui-service/static/app.js", encoding="utf-8").read()
     assert 'id="tee-save-mode"' in html
     for val in ("auto", "direct", "staged"):
         assert f'value="{val}"' in html
-    # 位于下载目录卡片内（dir-download 与 tee-save-mode 同卡片）
-    card = re.search(r'下载目录.*?</div>\s*</div>', html, re.S)
-    assert card and "tee-save-mode" in card.group(0)
+    dirs = html.split('id="page-dirs"', 1)[1].split("</section>", 1)[0]
+    layout = html.split('id="page-exp-layout"', 1)[1].split("</section>", 1)[0]
+    assert 'id="dir-download"' in dirs
+    assert 'id="tee-save-mode"' in dirs
+    assert 'id="download-layout"' in layout
     # JS 读 + 写都有，且键名正确
     assert js.count("tee-save-mode") >= 2
     assert "FNMUSIC_TEE_SAVE_MODE" in js

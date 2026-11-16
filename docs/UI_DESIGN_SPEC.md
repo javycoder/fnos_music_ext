@@ -106,12 +106,13 @@
 | 概览 | — | `overview` | 当前音源 · 后台组件状态 · 服务连通性检查 · 洛雪摘要（条件显示） |
 | 音乐源 | — | `source` | 三选一主音源 + 各音源子面板（扫码登录 / 平台多选 / 洛雪脚本与超时） |
 | 播放与推荐 | — | `quality` | 在线播放音质（7 档） · APP下载音质（8 档） · 首页推荐歌单与公共歌单 |
-| 储存 ▾ | 边听边存 / 目录设置 | `tee` / `dirs` | 自动保存开关 + 高级缓存入库参数 + 清理垃圾文件；下载目录 / 归类 / 落盘方式 / 缓存目录 |
-| 高级 ▾ | 搜索与直连 / 洛雪播放策略 / 大模型推荐 | `search` / `lx` / `llm` | 深分页与 302 直连；自动切换与源顺序；AI 用途、接口、高级参数、用量账本 |
+| 储存 ▾ | 边听边存 / 目录设置 | `tee` / `dirs` | 自动保存开关 + 高级缓存入库参数；下载目录 / 落盘方式 / 缓存目录 / 按用户保存 / 管理员扫描 |
+| 高级 ▾ | 搜索设置 / 洛雪播放策略 / 大模型推荐 | `search` / `lx` / `llm` | 深分页；自动切换与源顺序；AI 用途、接口、高级参数、用量账本 |
+| 实验功能 ▾ | 播放直连 / 目录归类与整理 / 垃圾清理 | `exp-direct` / `exp-layout` / `exp-cleanup` | 三源 302 直连；文件夹归类与已有曲库整理；垃圾文件清理与风险确认 |
 | 设置 | — | `settings` | 界面外观（跟随系统 / 浅色 / 深色） |
 | 关于 | — | `about` | 版本、反馈、日志导出、免责声明、打赏 |
 
-**一级折叠**：点标题只展开或收起，不跳页、不标脏；状态存 `localStorage['fnmusic-nav-<group>-expanded']`，首访收起（`aria-expanded=false` + 子容器 `hidden`）。切入子页自动展开并高亮父级：`tee|dirs` → 储存；`search|lx|llm` → 高级（`#nav-*-title` 与 `#bottom-*-trigger` 加 `.active`）。
+**一级折叠**：点标题只展开或收起，不跳页、不标脏；状态存 `localStorage['fnmusic-nav-<group>-expanded']`，首访收起（`aria-expanded=false` + 子容器 `hidden`）。切入子页自动展开并高亮父级：`tee|dirs` → 储存；`search|lx|llm` → 高级；`exp-direct|exp-layout|exp-cleanup` → 实验功能（`#nav-*-title` 与 `#bottom-*-trigger` 加 `.active`）。
 
 **卡片内折叠**：`<details class="adv-fold"><summary>高级：…</summary><div class="adv-body">…</div></details>`，默认收起；summary 13px/600/`--muted`，右侧 `▾` 旋转，展开后顶部 1px 虚线。**禁止**在折叠内部动态增删 `hidden`（表单采集依赖元素恒在）。
 
@@ -192,9 +193,10 @@
 
 ### 移动（≤760px）
 
-- 隐藏侧栏；`.main` 内边距 `max(14px, env(safe-area-inset-top)) 14px calc(56px + 84px + env(safe-area-inset-bottom))`。
-- `.bottom-nav`：高 `56px + safe-area`，毛玻璃；每项竖排「19px 图标 + 10.5px 标签」，激活态为透明底 + 强调色文字（不用实心块，避免拥挤）。
-- 7 个一级入口：概览 / 音源 / 播放 / 储存▾ / 高级▾ / 设置 / 关于；储存与高级向上弹浮层，子项 ≥42px 高，支持外点与 Escape 关闭并回焦。
+- 隐藏侧栏；`.main` 内边距 `max(14px, env(safe-area-inset-top)) 14px calc(var(--bottom-nav-height) + 84px + env(safe-area-inset-bottom))`。
+- `.bottom-nav`：高 `var(--bottom-nav-height) + safe-area`，毛玻璃；每项竖排「19px 图标 + 10.5px 标签」，激活态为透明底 + 强调色文字（不用实心块，避免拥挤）。容器保留 `overflow: visible`，避免子菜单被底栏裁切。
+- 8 个一级入口：概览 / 音源 / 播放 / 储存▾ / 高级▾ / 实验功能▾ / 设置 / 关于；三个分组均向上弹浮层，子项 ≥42px 高，支持外点与 Escape 关闭并回焦。
+- 窄于 352px 时底栏改为两行、每行四入口，`--bottom-nav-height` 提升为 112px；保存条和页面底部留白随之抬升。
 - 触控：按钮 ≥44px；`.lx-item` 竖排、按钮右对齐；`.provider-grid` 与 `.radio-grid` 单列。
 
 ---

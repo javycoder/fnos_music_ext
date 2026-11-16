@@ -12,6 +12,7 @@
   --content-max: 860px;
   --sidebar-w: 228px;
   --main-pad-x: 28px;
+  --bottom-nav-height: 56px;
   --radius: 12px;
   --radius-sm: 8px;
   --radius-pill: 999px;
@@ -668,7 +669,7 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   .sidebar { display: none; }
   .main {
     padding: max(14px, env(safe-area-inset-top, 0px)) 14px
-      calc(56px + 84px + env(safe-area-inset-bottom, 0px));
+      calc(var(--bottom-nav-height) + 84px + env(safe-area-inset-bottom, 0px));
   }
   h2 { font-size: 18px; }
   .card { padding: 16px 15px; }
@@ -681,11 +682,11 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   .lx-order-buttons .btn { min-height: 40px; }
 
   .bottom-nav {
-    display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 45;
-    height: calc(56px + env(safe-area-inset-bottom, 0px)); box-sizing: border-box;
+    display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 47;
+    height: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px)); box-sizing: border-box;
     align-items: stretch; background: var(--nav-bg); border-top: 1px solid var(--line);
     backdrop-filter: blur(10px); padding-bottom: env(safe-area-inset-bottom, 0px);
-    overflow: hidden;
+    overflow: visible;
   }
   .bottom-nav .nav-item {
     flex: 1 1 0; min-width: 0; width: auto; display: flex; flex-direction: column;
@@ -727,7 +728,7 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
     padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
   }
   .save-bar {
-    bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px));
     z-index: 46; justify-content: space-between; flex-wrap: wrap;
     padding: 10px 14px; box-shadow: var(--shadow-up);
   }
@@ -750,6 +751,14 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   .pt-toolbar-actions { margin-left: 0; width: 100%; }
   .pt-toolbar-actions .btn { flex: 1; }
   .pt-sample { max-width: 200px; }
+}
+
+@media (max-width: 351px) {
+  :root { --bottom-nav-height: 112px; }
+  .bottom-nav { flex-wrap: wrap; }
+  .bottom-nav > .nav-item, .bottom-nav > .bottom-nav-group { flex: 0 0 25%; height: 56px; }
+  #bottom-storage-menu { left: auto; right: 0; transform: none; }
+  #bottom-advanced-menu { left: 0; transform: none; }
 }
 
 /* ------------------------------------------------ 平台批量测试面板 */
