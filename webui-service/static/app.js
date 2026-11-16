@@ -36,6 +36,7 @@ let scanAdminPasswordDirty = false;
 let scanAdminPasswordClear = false;
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
+let editRevision = 0;
 let currentPage = "overview";
 let lxSourceListDirty = false; // 避免高级策略保存时重复触发原源列表的激活/校验流程
 const DOWNLOAD_LAYOUT_LABELS = {
@@ -218,6 +219,7 @@ function toast(message, kind) {
 
 function markDirty(note) {
   dirty = true;
+  editRevision++;
   const bar = $("#save-bar");
   if (bar) bar.classList.add("show");
   const noteEl = $("#save-note");
@@ -361,19 +363,25 @@ function switchPage(page) {
 
   const isStorageSub = page === "tee" || page === "dirs";
   const isAdvancedSub = page === "llm" || page === "lx" || page === "search";
+  const isExperimentalSub = page === "exp-direct" || page === "exp-layout" || page === "exp-cleanup";
 
   const storageTitle = $("#nav-storage-title");
   if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
   const advancedTitle = $("#nav-advanced-title");
   if (advancedTitle) advancedTitle.classList.toggle("active", isAdvancedSub);
+  const experimentalTitle = $("#nav-experimental-title");
+  if (experimentalTitle) experimentalTitle.classList.toggle("active", isExperimentalSub);
 
   const bottomStorage = $("#bottom-storage-trigger");
   if (bottomStorage) bottomStorage.classList.toggle("active", isStorageSub);
   const bottomAdvanced = $("#bottom-advanced-trigger");
   if (bottomAdvanced) bottomAdvanced.classList.toggle("active", isAdvancedSub);
+  const bottomExperimental = $("#bottom-experimental-trigger");
+  if (bottomExperimental) bottomExperimental.classList.toggle("active", isExperimentalSub);
 
   if (isStorageSub) setNavGroupExpanded("storage", true, true);
   if (isAdvancedSub) setNavGroupExpanded("advanced", true, true);
+  if (isExperimentalSub) setNavGroupExpanded("experimental", true, true);
 
   closeBottomSubMenu(false);
 
@@ -387,7 +395,7 @@ function switchPage(page) {
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
 
 // 一级菜单纯折叠：不跳页、不标脏、首访收起、记忆到 localStorage
-["storage", "advanced"].forEach((group) => {
+["storage", "advanced", "experimental"].forEach((group) => {
   const expanded = isNavGroupExpanded(group);
   setNavGroupExpanded(group, expanded, false);
   const titleBtn = $("#nav-" + group + "-title");
@@ -404,6 +412,7 @@ $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPag
 [
   ["#bottom-storage-trigger", "#bottom-storage-menu"],
   ["#bottom-advanced-trigger", "#bottom-advanced-menu"],
+  ["#bottom-experimental-trigger", "#bottom-experimental-menu"],
 ].forEach(([triggerSel, menuSel]) => {
   const trigger = $(triggerSel);
   const menu = $(menuSel);
@@ -3156,7 +3165,7 @@ const DIR_FIELDS = [
   { input: "#dir-download", pick: "#dir-download-pick", check: "#dir-download-check", label: "下载目录" },
 ];
 $("#download-layout").addEventListener("change", () => {
-  markDirty("存放方式需保存后生效；已有歌曲可稍后点击「整理」调整");
+  markDirty("文件夹归类方式需保存后生效；已有歌曲可稍后点击「整理」调整");
 });
 let _fsCheckSeq = 0;                // 防抖竞态：只采纳最后一次输入的校验结果
 const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试一次，避免重复弹授权框
@@ -4073,14 +4082,17 @@ function renderUserStorage() {
     : "";
 }
 
-async function loadUserStorage() {
+async function loadUserStorage({ abortIfDirty = false } = {}) {
+  const initialEditRevision = editRevision;
+  if (abortIfDirty && dirty) return false;
   if (!configSchema.FNMUSIC_TEE_SAVE_BY_USER || !$("#user-storage-list")) {
     userStorageReady = false;
     renderUserStorage();
-    return;
+    return true;
   }
   try {
     const response = await api("/api/maintenance/user-storage");
+    if (abortIfDirty && (dirty || editRevision !== initialEditRevision)) return false;
     if (!response || response.ok !== true || !Array.isArray(response.users)) {
       throw new Error((response && response.error) || "用户目录响应无效");
     }
@@ -4088,11 +4100,13 @@ async function loadUserStorage() {
     userStorageReady = true;
     userStorageError = "";
   } catch (exc) {
+    if (abortIfDirty && (dirty || editRevision !== initialEditRevision)) return false;
     userStorageStatus = null;
     userStorageReady = false;
     userStorageError = exc.message;
   }
   renderUserStorage();
+  return true;
 }
 
 function maintenanceSucceeded(response) {
@@ -4304,7 +4318,10 @@ async function openOrganizeModal() {
   if (!organizeInfo) return;
   if (organizeJob && organizeJob.status === "running") return;
   if (organizeInfo.requiresUser) {
-    await loadUserStorage();
+    if (!await loadUserStorage({ abortIfDirty: true })) {
+      toast("请先保存未保存的更改，再执行整理", "fail");
+      return;
+    }
     const guid = ($("#organize-user") && $("#organize-user").value) || "";
     const user = ((userStorageStatus && userStorageStatus.users) || []).find((item) => item.guid === guid);
     if (!user || typeof user.root !== "string" || !user.root) {
@@ -4314,7 +4331,7 @@ async function openOrganizeModal() {
     organizeInfo = { ...organizeInfo, root: user.root, userGuid: guid };
   }
   if (!organizeSettingsSaved()) {
-    toast("请先保存下载目录和存放方式，再执行整理", "fail");
+    toast("请先保存下载目录和文件夹归类方式，再执行整理", "fail");
     return;
   }
   const label = DOWNLOAD_LAYOUT_LABELS[organizeInfo.layout];
@@ -4331,7 +4348,7 @@ async function startOrganize() {
   if ($("#organize-modal").hidden || organizeSubmitting || !organizeConfirmation) return;
   if (!organizeSettingsSaved()) {
     closeOrganizeModal();
-    toast("请先保存下载目录和存放方式，再执行整理", "fail");
+    toast("请先保存下载目录和文件夹归类方式，再执行整理", "fail");
     return;
   }
   if (organizeJob && organizeJob.status === "running") {

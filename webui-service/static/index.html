@@ -18,6 +18,7 @@
     <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.8v14.4L19 12z"/></symbol>
     <symbol id="i-storage" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2.2"/><rect x="3" y="13" width="18" height="7" rx="2.2"/><path d="M6.8 7.5h.02M6.8 16.5h.02"/></symbol>
     <symbol id="i-advanced" viewBox="0 0 24 24"><path d="M4 7.5h9M17.5 7.5H20M4 16.5h3.5M12 16.5h8"/><circle cx="15" cy="7.5" r="2.2"/><circle cx="9.5" cy="16.5" r="2.2"/></symbol>
+    <symbol id="i-experimental" viewBox="0 0 24 24"><path d="M9 3h6M10 3v6l-5.4 8.2A2.5 2.5 0 0 0 6.7 21h10.6a2.5 2.5 0 0 0 2.1-3.8L14 9V3M7.5 16h9"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.8"/><path d="M16 16l4 4"/></symbol>
     <symbol id="i-code" viewBox="0 0 24 24"><path d="M9 8l-4.2 4L9 16M15 8l4.2 4L15 16"/></symbol>
     <symbol id="i-ai" viewBox="0 0 24 24"><rect x="4" y="7.5" width="16" height="11.5" rx="3"/><path d="M9 3.5v4M15 3.5v4M9.2 13.4h.02M14.8 13.4h.02"/></symbol>
@@ -52,9 +53,19 @@
             <svg class="icon" aria-hidden="true"><use href="#i-advanced"/></svg><span>高级</span><span class="nav-arrow" aria-hidden="true">▾</span>
           </button>
           <div class="nav-group-subs" id="nav-advanced-subs" hidden>
-            <button class="nav-item nav-sub" data-page="search" type="button"><span>搜索与直连</span></button>
+            <button class="nav-item nav-sub" data-page="search" type="button"><span>搜索设置</span></button>
             <button class="nav-item nav-sub" data-page="lx" type="button"><span>洛雪播放策略</span></button>
             <button class="nav-item nav-sub" data-page="llm" type="button"><span>大模型推荐</span></button>
+          </div>
+        </div>
+        <div class="nav-group">
+          <button class="nav-item nav-group-title" id="nav-experimental-title" type="button" aria-expanded="false" aria-controls="nav-experimental-subs">
+            <svg class="icon" aria-hidden="true"><use href="#i-experimental"/></svg><span>实验功能</span><span class="nav-arrow" aria-hidden="true">▾</span>
+          </button>
+          <div class="nav-group-subs" id="nav-experimental-subs" hidden>
+            <button class="nav-item nav-sub" data-page="exp-direct" type="button"><span>播放直连</span></button>
+            <button class="nav-item nav-sub" data-page="exp-layout" type="button"><span>目录归类与整理</span></button>
+            <button class="nav-item nav-sub" data-page="exp-cleanup" type="button"><span>垃圾清理</span></button>
           </div>
         </div>
         <div class="nav-section">系统</div>
@@ -339,12 +350,12 @@
         </div>
       </section>
 
-      <!-- 高级：搜索与播放直连 -->
+      <!-- 高级：搜索设置 -->
       <section class="page" id="page-search">
         <div class="page-head">
           <div>
-            <h2><span>搜索与播放直连</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></h2>
-            <p class="page-sub">低频进阶项：搜索翻页策略与 302 直连。日常使用保持默认即可。</p>
+            <h2><span>搜索设置</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></h2>
+            <p class="page-sub">设置搜索翻页策略，日常使用保持默认即可。</p>
           </div>
         </div>
         <div class="card">
@@ -361,6 +372,15 @@
               </label>
             </div>
           </details>
+        </div>
+      </section>
+
+      <section class="page" id="page-exp-direct">
+        <div class="page-head">
+          <div>
+            <h2><span>播放直连</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></h2>
+            <p class="page-sub">分别为不同音源设置播放直连；兼容性取决于客户端和源站。</p>
+          </div>
         </div>
         <div class="card">
           <div class="card-title"><span>播放直连（302 重定向 · Beta）</span><button class="help-btn" type="button" data-help="direct-play" aria-label="播放直连帮助">?</button></div>
@@ -432,6 +452,15 @@
             </div>
           </details>
         </div>
+      </section>
+
+      <section class="page" id="page-exp-cleanup">
+        <div class="page-head">
+          <div>
+            <h2><span>垃圾清理</span></h2>
+            <p class="page-sub">清理遗留文件前请仔细阅读风险提示。</p>
+          </div>
+        </div>
         <div class="card">
           <div class="card-title">清理垃圾文件 <span class="badge">Beta</span></div>
           <p class="hint">清理可能遗留的垃圾文件。此功能可能误删歌曲、封面、歌词等文件，删除后无法自动恢复，请谨慎操作。</p>
@@ -441,19 +470,15 @@
         </div>
       </section>
 
-      <!-- 储存：目录设置 -->
-      <section class="page" id="page-dirs">
+      <section class="page" id="page-exp-layout">
         <div class="page-head">
           <div>
-            <h2><span>目录设置</span><button class="help-btn" type="button" data-help="download-dir" aria-label="目录设置帮助">?</button></h2>
-            <p class="page-sub">决定歌曲存到哪里、怎么分文件夹。建议留空由系统自动探测官方共享曲库，便于飞牛自动入库。</p>
+            <h2><span>目录归类与整理</span><button class="help-btn" type="button" data-help="download-layout" aria-label="目录归类与整理帮助">?</button></h2>
+            <p class="page-sub">设置后续歌曲的文件夹结构，或按已保存的方式整理现有曲库。</p>
           </div>
         </div>
         <div class="card">
-          <div class="card-title"><span>歌曲下载目录</span><button class="help-btn" type="button" data-help="download-dir" aria-label="下载目录帮助">?</button></div>
-          <label class="field"><span>下载保存目录</span>
-            <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
-          </label>
+          <div class="card-title">文件夹归类与整理 <span class="badge">Beta</span></div>
           <label class="field"><span>文件夹归类方式（Beta）</span>
             <select class="input" id="download-layout">
               <option value="flat">直接放根目录（歌曲）</option>
@@ -461,6 +486,33 @@
               <option value="album">按专辑（专辑/歌曲）</option>
               <option value="artist_album">按歌手与专辑（歌手/专辑/歌曲）</option>
             </select>
+          </label>
+          <p class="hint">下载目录与用户目录在「储存 → 目录设置」中设置，请先保存目录和归类方式。</p>
+          <div class="btn-row">
+            <button class="btn" id="organize-open-btn" type="button">按已保存方式整理现有曲库</button>
+          </div>
+          <label class="field" id="organize-user-field" hidden>
+            <span>整理哪个用户</span>
+            <select class="input" id="organize-user"></select>
+          </label>
+          <p class="hint">归类方式仅影响后续下载；「整理」会按所选结构移动下载目录内的全部歌曲，包括自行放入的文件。</p>
+          <p id="organize-status" role="status" aria-live="polite"></p>
+          <pre class="update-changelog" id="organize-details" hidden></pre>
+        </div>
+      </section>
+
+      <!-- 储存：目录设置 -->
+      <section class="page" id="page-dirs">
+        <div class="page-head">
+          <div>
+            <h2><span>目录设置</span><button class="help-btn" type="button" data-help="download-dir" aria-label="目录设置帮助">?</button></h2>
+            <p class="page-sub">决定歌曲和缓存存到哪里。建议留空由系统自动探测官方共享曲库，便于飞牛自动入库。</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>歌曲下载目录</span><button class="help-btn" type="button" data-help="download-dir" aria-label="下载目录帮助">?</button></div>
+          <label class="field"><span>下载保存目录</span>
+            <input class="input" id="dir-download" placeholder="留空自动探测共享曲库目录">
           </label>
           <details class="adv-fold">
             <summary>高级：文件写入模式（落盘方式）</summary>
@@ -479,16 +531,6 @@
             <button class="btn" id="dir-download-pick" hidden>从 NAS 选择</button>
             <span id="dir-download-check" class="dir-check" hidden></span>
           </div>
-          <div class="btn-row">
-            <button class="btn" id="organize-open-btn" type="button">按所选方式整理现有曲库</button>
-          </div>
-          <label class="field" id="organize-user-field" hidden>
-            <span>整理哪个用户</span>
-            <select class="input" id="organize-user"></select>
-          </label>
-          <p class="hint">仅影响后续下载；「整理」会按所选结构移动下载目录内的全部歌曲，包括自行放入的文件。</p>
-          <p id="organize-status" role="status" aria-live="polite"></p>
-          <pre class="update-changelog" id="organize-details" hidden></pre>
         </div>
         <div class="card" id="user-storage-card">
           <div class="card-title"><span>按用户保存</span></div>
@@ -657,7 +699,7 @@
     </main>
   </div>
 
-  <!-- 移动端底部导航：7 个一级入口，储存/高级内含向上弹出的二级菜单 -->
+  <!-- 移动端底部导航：储存、高级和实验功能含向上弹出的二级菜单 -->
   <nav class="bottom-nav" id="bottom-nav">
     <button class="nav-item active" data-page="overview" type="button"><svg class="icon" aria-hidden="true"><use href="#i-overview"/></svg><span>概览</span></button>
     <button class="nav-item" data-page="source" type="button"><svg class="icon" aria-hidden="true"><use href="#i-source"/></svg><span>音源</span></button>
@@ -676,9 +718,19 @@
         <svg class="icon" aria-hidden="true"><use href="#i-advanced"/></svg><span>高级</span>
       </button>
       <div class="bottom-sub-menu" id="bottom-advanced-menu" role="menu" hidden>
-        <button class="bottom-sub-item" data-page="search" role="menuitem" type="button">搜索与直连</button>
+        <button class="bottom-sub-item" data-page="search" role="menuitem" type="button">搜索设置</button>
         <button class="bottom-sub-item" data-page="lx" role="menuitem" type="button">洛雪播放策略</button>
         <button class="bottom-sub-item" data-page="llm" role="menuitem" type="button">大模型推荐</button>
+      </div>
+    </div>
+    <div class="bottom-nav-group">
+      <button class="nav-item bottom-nav-trigger" id="bottom-experimental-trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="bottom-experimental-menu">
+        <svg class="icon" aria-hidden="true"><use href="#i-experimental"/></svg><span>实验功能</span>
+      </button>
+      <div class="bottom-sub-menu" id="bottom-experimental-menu" role="menu" hidden>
+        <button class="bottom-sub-item" data-page="exp-direct" role="menuitem" type="button">播放直连</button>
+        <button class="bottom-sub-item" data-page="exp-layout" role="menuitem" type="button">目录归类与整理</button>
+        <button class="bottom-sub-item" data-page="exp-cleanup" role="menuitem" type="button">垃圾清理</button>
       </div>
     </div>
     <button class="nav-item" data-page="settings" type="button"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span>设置</span></button>
@@ -793,8 +845,12 @@
   </template>
   <template data-help-id="download-dir">
     <p><b>下载保存目录：</b>边听边存、收藏或歌单自动下载的歌曲都存到这里。建议留空由系统自动探测飞牛官方共享曲库，便于音乐自动扫描入库。</p>
-    <p><b>文件夹归类方式：</b>可平铺存放，或按「歌手/专辑」自动建目录。点「按所选方式整理现有曲库」会把下载目录内的全部歌曲（含手动放入的文件）按所选结构移动。</p>
+    <p><b>文件夹归类与整理：</b>请前往「实验功能 → 目录归类与整理」设置。</p>
     <p><b>落盘方式：</b>「自动判定」会在本地盘直接高速写入，远程目录先在本地区下载加工再整体写入，避免产生 <code>.part</code> 残件；直接写入仅建议用于本地盘。</p>
+  </template>
+  <template data-help-id="download-layout">
+    <p><b>文件夹归类方式：</b>可平铺存放，或按「歌手/专辑」自动建目录；保存后只影响后续下载。</p>
+    <p><b>整理已有曲库：</b>会把下载目录内的全部歌曲（含手动放入的文件）按已保存的结构移动，可能影响播放、收藏及歌单关联。请先备份，并在整理后重新扫描曲库。</p>
   </template>
   <template data-help-id="settings-theme">
     <p>外观偏好只保存在当前浏览器，不写入 NAS 配置，也不需要点保存条。</p>

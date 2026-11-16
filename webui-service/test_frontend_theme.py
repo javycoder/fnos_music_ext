@@ -121,6 +121,17 @@ def test_pages_share_centered_content_width_and_save_bar_alignment():
     assert "safe-area-inset-bottom" in mobile
 
 
+def test_mobile_bottom_nav_keeps_submenus_visible_and_wraps_when_narrow():
+    mobile = CSS.split("@media (max-width: 760px)", 1)[1].split("@media (max-width: 351px)", 1)[0]
+    assert re.search(r"\.main\s*\{[^}]*var\(--bottom-nav-height\)", mobile)
+    assert re.search(r"\.save-bar\s*\{[^}]*var\(--bottom-nav-height\)", mobile)
+    assert re.search(r"\.bottom-nav\s*\{[^}]*overflow: visible", mobile)
+    narrow = CSS.split("@media (max-width: 351px)", 1)[1]
+    assert "--bottom-nav-height: 112px" in narrow
+    assert ".bottom-nav { flex-wrap: wrap; }" in narrow
+    assert "flex: 0 0 25%" in narrow
+
+
 @pytest.mark.parametrize("filename", ["theme-boot.js", "app.js"])
 def test_theme_preference_key_matches_boot_and_app(filename):
     assert '"fnmusic-theme"' in (STATIC / filename).read_text(encoding="utf-8")

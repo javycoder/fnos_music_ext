@@ -2535,7 +2535,7 @@ function resetOrganize() {
   els.get("#organize-modal").hidden = true;
 }
 
-test("下载存放方式：新 schema 回填保存，旧 schema 不提交未知字段", async () => {
+test("下载文件夹归类方式：新 schema 回填保存，旧 schema 不提交未知字段", async () => {
   enqueue("/app/fnmusic-ext/api/config", {
     values: { FNMUSIC_DOWNLOAD_LAYOUT: "artist_album" },
     schema: { FNMUSIC_DOWNLOAD_LAYOUT: {} },
@@ -2651,6 +2651,50 @@ test("整理 Beta：刷新恢复及重复点击只查询已有任务", async () 
   assert.strictEqual(els.get("#organize-modal").hidden, true);
   assert.ok(els.get("#organize-status").textContent.includes("整理完成"));
   resetOrganize();
+});
+
+test("整理 Beta：存在未保存编辑时不刷新用户目录、不提交", async () => {
+  reset();
+  resetOrganize();
+  global.clearDirty();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}}; userStorageReady=true; userStorageStatus={users:[{guid:'u1',root:'/old'}]};");
+  global.markDirty("用户目录草稿");
+  enqueue(ORGANIZE_PATH, { ok: true, layout: "flat", requires_user: true, job: null });
+  els.get("#organize-modal").hidden = true;
+
+  await global.openOrganizeModal();
+
+  assert.strictEqual(els.get("#organize-modal").hidden, true);
+  assert.strictEqual(fetchCalls.filter((call) => call.path.endsWith("/api/maintenance/user-storage")).length, 0);
+  assert.strictEqual(fetchCalls.filter((call) => call.path === ORGANIZE_PATH && call.method === "POST").length, 0);
+  assert.ok(els.get("#toast").textContent.includes("请先保存未保存的更改"));
+  global.clearDirty();
+});
+
+test("整理 Beta：用户目录请求期间出现编辑时不覆盖草稿并终止", async () => {
+  reset();
+  resetOrganize();
+  global.clearDirty();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}}; userStorageReady=true; userStorageStatus={users:[{guid:'old-user',root:'/old'}]}; userStorageError='';");
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    global.markDirty("请求期间的新编辑");
+    return { ok: true, status: 200, json: async () => ({ ok: true, users: [{ guid: "new-user", root: "/new" }] }) };
+  };
+  let applied;
+  try {
+    applied = await global.loadUserStorage({ abortIfDirty: true });
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.strictEqual(applied, false);
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(vm.runInThisContext("userStorageStatus.users[0].root"), "/old");
+  assert.strictEqual(vm.runInThisContext("dirty"), true);
+  global.clearDirty();
 });
 
 test("公共歌单用户：切换保留草稿、仅提交修改用户、新用户为空", async () => {
@@ -3005,14 +3049,19 @@ test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆�
   const storageSubs = els.get("#nav-storage-subs");
   const advancedTitle = els.get("#nav-advanced-title");
   const advancedSubs = els.get("#nav-advanced-subs");
+  const experimentalTitle = els.get("#nav-experimental-title");
+  const experimentalSubs = els.get("#nav-experimental-subs");
 
   // 首访收起
   global.setNavGroupExpanded("storage", false, false);
   global.setNavGroupExpanded("advanced", false, false);
+  global.setNavGroupExpanded("experimental", false, false);
   assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
   assert.strictEqual(storageSubs.hidden, true);
   assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "false");
   assert.strictEqual(advancedSubs.hidden, true);
+  assert.strictEqual(experimentalTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(experimentalSubs.hidden, true);
 
   // 点击展开储存
   await storageTitle.dispatch("click");
@@ -3034,6 +3083,13 @@ test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆�
   assert.strictEqual(advancedSubs.hidden, false);
   assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-advanced-expanded"), "true");
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+
+  // 点击展开实验功能
+  await experimentalTitle.dispatch("click");
+  assert.strictEqual(experimentalTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(experimentalSubs.hidden, false);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-experimental-expanded"), "true");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
 test("导航切页：切子页自动展开一级分组并联动高亮", () => {
@@ -3042,8 +3098,11 @@ test("导航切页：切子页自动展开一级分组并联动高亮", () => {
   const storageSubs = els.get("#nav-storage-subs");
   const advancedTitle = els.get("#nav-advanced-title");
   const advancedSubs = els.get("#nav-advanced-subs");
+  const experimentalTitle = els.get("#nav-experimental-title");
+  const experimentalSubs = els.get("#nav-experimental-subs");
   const bottomStorage = els.get("#bottom-storage-trigger");
   const bottomAdvanced = els.get("#bottom-advanced-trigger");
+  const bottomExperimental = els.get("#bottom-experimental-trigger");
 
   // 切到 tee（边听边存）
   global.switchPage("tee");
@@ -3062,16 +3121,29 @@ test("导航切页：切子页自动展开一级分组并联动高亮", () => {
   assert.strictEqual(bottomAdvanced.classList.contains("active"), true);
   assert.strictEqual(storageTitle.classList.contains("active"), false);
   assert.strictEqual(bottomStorage.classList.contains("active"), false);
+  assert.strictEqual(experimentalTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomExperimental.classList.contains("active"), false);
+
+  // 切到 exp-layout（目录归类与整理）
+  global.switchPage("exp-layout");
+  assert.strictEqual(experimentalTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(experimentalSubs.hidden, false);
+  assert.strictEqual(experimentalTitle.classList.contains("active"), true);
+  assert.strictEqual(bottomExperimental.classList.contains("active"), true);
+  assert.strictEqual(storageTitle.classList.contains("active"), false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), false);
 
   // 切到 settings（常规页）
   global.switchPage("settings");
   assert.strictEqual(storageTitle.classList.contains("active"), false);
   assert.strictEqual(advancedTitle.classList.contains("active"), false);
+  assert.strictEqual(experimentalTitle.classList.contains("active"), false);
   assert.strictEqual(bottomStorage.classList.contains("active"), false);
   assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+  assert.strictEqual(bottomExperimental.classList.contains("active"), false);
 });
 
-test("导航归属：「搜索与直连」并入高级分组并联动展开高亮", () => {
+test("导航归属：「搜索设置」保留在高级分组并联动展开高亮", () => {
   reset();
   const advancedTitle = els.get("#nav-advanced-title");
   const advancedSubs = els.get("#nav-advanced-subs");
@@ -3116,6 +3188,25 @@ test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", asyn
 
   // 外点关闭并 focus 返回 trigger
   await global.window.dispatch("click", { target: otherEl });
+  assert.strictEqual(menu.hidden, true);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(global.document.activeElement, trigger);
+});
+
+test("移动底导航：实验功能子菜单独立打开并回焦", async () => {
+  reset();
+  els.get("#cleanup-modal").hidden = true;
+  els.get("#organize-modal").hidden = true;
+  const trigger = els.get("#bottom-experimental-trigger");
+  const menu = els.get("#bottom-experimental-menu");
+
+  menu.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  await trigger.dispatch("click");
+  assert.strictEqual(menu.hidden, false);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "true");
+
+  await global.window.dispatch("keydown", { key: "Escape", preventDefault: () => {} });
   assert.strictEqual(menu.hidden, true);
   assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
   assert.strictEqual(global.document.activeElement, trigger);
