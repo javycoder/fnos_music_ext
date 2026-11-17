@@ -402,6 +402,7 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
   width: 220px; height: 220px; border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: #fff; padding: 0; display: block;
 }
+#qr-img[hidden] { display: none; }
 .report {
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 12px 14px; font-size: 13px; margin-top: 12px;

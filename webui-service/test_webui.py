@@ -3339,8 +3339,8 @@ def test_hidden_toggled_elements_not_defeated_by_display():
         tag_html = m.group(0)
         el_id = _re.search(r'\bid="([\w-]+)"', tag_html)
         classes = _re.search(r'\bclass="([^"]*)"', tag_html)
-        if el_id and classes:
-            entries.append((el_id.group(1), classes.group(1)))
+        if el_id:
+            entries.append((el_id.group(1), classes.group(1) if classes else ""))
     # CSS 里声明了 display:（值非 none）且选择器不带 [hidden] 的块
     visible_decl: list[tuple[str, str]] = []  # (选择器, display 值)
     for block in css.split("}"):
@@ -3353,9 +3353,20 @@ def test_hidden_toggled_elements_not_defeated_by_display():
     assert visible_decl, "CSS 解析异常：未提取到任何 display 声明"
 
     for el_id, classes in entries:
+        id_defeats_hidden = any(
+            _re.search(rf"#{_re.escape(el_id)}(?![\w-])", sel) for sel, _ in visible_decl)
+        if not classes:
+            if not id_defeats_hidden:
+                continue
+            has_fallback = _re.search(
+                rf"#{_re.escape(el_id)}\[hidden\][^{{]*{{[^}}]*display\s*:\s*none", css)
+            assert id_defeats_hidden and has_fallback, (
+                f"#{el_id} 靠 hidden 属性切换，但 ID 规则的 display 声明会压过 UA 的 "
+                f"[hidden] 规则导致常显——需补 #{el_id}[hidden] {{ display: none; }} 兜底")
+            continue
         for cls in classes.split():
             # (?![\w-]) 精确到类名边界：.btn 不匹配 .btn-row / .lx-item-btns
-            defeats_hidden = any(
+            defeats_hidden = id_defeats_hidden or any(
                 _re.search(rf"\.{_re.escape(cls)}(?![\w-])", sel) for sel, _ in visible_decl)
             if not defeats_hidden:
                 continue
@@ -3366,6 +3377,17 @@ def test_hidden_toggled_elements_not_defeated_by_display():
                 f"#{el_id} 靠 hidden 属性切换，但 .{cls} 的 display 声明会压过 UA 的 "
                 f"[hidden] 规则导致常显——需补 .{cls}[hidden] 或 #{el_id}[hidden] "
                 f"{{ display: none; }} 兜底")
+
+
+def test_netease_qr_empty_state_keeps_prompt_without_broken_image():
+    """未生成二维码时仅显示提示，不显示空 src 的破图。"""
+    import re as _re
+
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    css = (HERE / "static" / "style.css").read_text(encoding="utf-8")
+    assert _re.search(r'<img id="qr-img"[^>]*\bhidden\b', html)
+    assert "点击下方按钮生成二维码" in html
+    assert _re.search(r"#qr-img\[hidden\]\s*\{[^}]*display\s*:\s*none", css)
 
 
 # ---------------------------------------------------------------- 落盘方式 ----
