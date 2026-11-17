@@ -71,15 +71,20 @@ sudo appcenter-cli uninstall fnmusic-ext                # 卸载（自动备份�
 
 > 升级请在应用中心内安装新版本 fpk；`install-fpk` 在已安装时不会自动升级。升级脚本会自动备份并恢复用户数据（.env、网易云登录、收藏、播放历史）。
 >
-> **安装包分三种。** 文件名不带架构的 `fnmusic-ext-<版本>.fpk` 是通用包：
-> 不含镜像和宿主机 wheel，安装时联网构建，也是自动更新和 moo 商店的默认选择。
-> `fnmusic-ext-<版本>-prebuilt-amd64.fpk` 与 `fnmusic-ext-<版本>-prebuilt-arm64.fpk`
-> 是手动安装的预构建包，分别只适配 x86_64 和 ARM64，包内已有对应镜像和
-> CPython 3.11/3.12/3.13 的宿主机依赖，正常安装少联网。
-> 环境变量 `FNMUSIC_IMAGE_BUNDLE` 可控制镜像来源：`auto`（默认，有归档走离线、
-> 无归档回落现场构建）、`0`（强制现场构建）、`1`（强制离线，归档缺失或校验
-> 不符时明确失败，不静默降级）。
->
+
+<a id="which-fpk"></a>
+### 我该选择哪一个安装包？
+
+| 安装包 | 说明 |
+| :--- | :--- |
+| `fnmusic-ext-x.y.z.fpk` | 通用安装包，同时适配 ARM64 和 amd64；安装时自动下载依赖，也是自动更新与 moo 商店的默认选择。 |
+| `fnmusic-ext-<版本>-prebuilt-arm64.fpk`（例如 `fnmusic-ext-3.0.0-1-prebuilt-arm64.fpk`） | 适配 ARM64 CPU 的预构建安装包；安装时无需下载依赖。 |
+| `fnmusic-ext-<版本>-prebuilt-amd64.fpk`（例如 `fnmusic-ext-3.0.0-1-prebuilt-amd64.fpk`） | 适配 amd64 CPU 的预构建安装包；安装时无需下载依赖。 |
+
+预构建包已经内置对应架构的应用镜像和 CPython 3.11/3.12/3.13 宿主机 wheel。宿主机 Python 不在支持范围、CPU 架构不匹配，或清单损坏、校验失败、声明的 wheel 缺失时，安装会明确失败或按包型规则回落，不会静默使用错误的架构文件。通用包没有这些预置文件，下载体积更小，也不绑定 CPU 架构。
+
+环境变量 `FNMUSIC_IMAGE_BUNDLE` 可控制镜像来源：`auto`（默认，有归档走离线、无归档回落现场构建）、`0`（强制现场构建）、`1`（强制离线，归档缺失或校验不符时明确失败，不静默降级）。
+
 > 曾用 git clone 脚本方式部署的用户：请先在原部署目录执行 `sudo ./restore.sh` 释放部署登记，再安装 fpk，否则安装会因部署冲突而中止（保护既有部署不被静默接管）。
 
 ### 方式 B：交互向导安装（脚本方式）
