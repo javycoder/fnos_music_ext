@@ -9,7 +9,9 @@ Outputs:
   webui-service/static/icon.png     256x256 favicon + sidebar mark
 
 Master is a 1:1 PNG. White corner fill is flood-cleared to alpha, then a
-rounded-rect silhouette is applied (18% radius, fnOS icon guidelines).
+rounded-rect silhouette is combined with the existing transparency. The 18%
+radius is a design choice; the fnOS guidelines do not prescribe a radius.
+Source colors are treated as sRGB, and outputs are explicitly tagged as sRGB.
 Drawn at master resolution and downscaled with Lanczos.
 
 Run: python3 packaging/fpk/icons/make_icons.py
@@ -19,14 +21,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, PngImagePlugin
 
 ICONS_DIR = Path(__file__).resolve().parent
 FPK_DIR = ICONS_DIR.parent
 REPO_ROOT = FPK_DIR.parent.parent
 MASTER = ICONS_DIR / "master.png"
 
-CORNER_RATIO = 18  # percent; matches existing fnOS silhouette
+CORNER_RATIO = 18
 
 
 def _clear_white_corners(img: Image.Image, thresh: int = 40) -> Image.Image:
@@ -49,19 +51,21 @@ def _rounded_mask(size: int, radius: int) -> Image.Image:
 def build_master() -> Image.Image:
     if not MASTER.is_file():
         raise SystemExit(f"missing source icon: {MASTER}")
-    src = _clear_white_corners(Image.open(MASTER))
+    with Image.open(MASTER) as image:
+        src = _clear_white_corners(image)
     size = src.size[0]
     if src.size[0] != src.size[1]:
         raise SystemExit(f"master must be square, got {src.size}")
-    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    out.paste(src, (0, 0))
-    out.putalpha(_rounded_mask(size, size * CORNER_RATIO // 100))
-    return out
+    mask = _rounded_mask(size, size * CORNER_RATIO // 100)
+    src.putalpha(ImageChops.multiply(src.getchannel("A"), mask))
+    return src
 
 
 def _save_png(img: Image.Image, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(path, format="PNG")
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add(b"sRGB", b"\x00")
+    img.save(path, format="PNG", pnginfo=metadata)
     print(f"wrote {path}")
 
 
