@@ -121,9 +121,12 @@ def test_discovered_playlist_opens_for_same_user_only(monkeypatch):
         online = found["data"]["list"][2]
         guid = online["guid"]
         assert resolve_real_guid(guid).startswith("online:playlist:public:lx:kw:playlist:")
-        assert client.get("/music/api/v1/playlist/detail", params={"guid": guid}).json()["code"] == 0
+        detail = client.get("/music/api/v1/playlist/detail", params={"guid": guid}).json()
+        assert detail["code"] == 0
+        assert detail["data"]["guid"] == guid
         batch = client.get("/music/api/v1/playlist/batch-detail", params={"guids": guid}).json()
         assert len(batch["data"]["list"]) == 1
+        assert batch["data"]["list"][0]["guid"] == guid
         assert client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid}).json()["code"] == 0
         assert client.get("/music/api/v1/static/cover", params={"id": guid}).status_code == 204
 

@@ -10,6 +10,8 @@ const QRCode = require('qrcode');
 const axios = require('axios');
 
 const QUALITY_WHITELIST = new Set(['standard', 'higher', 'exhigh', 'lossless', 'hires', 'jymaster', 'sky']);
+const TRANSIENT_UPSTREAM_CODES = new Set([-448, -447, -460, -462, 408, 429, 500, 502, 503, 504]);
+const RATE_LIMIT_UPSTREAM_CODES = new Set([-448, -447, -460, -462, 429]);
 
 const QUALITY_SLOTS = [
   ['l', 'standard', 'mp3', 128000],
@@ -121,6 +123,7 @@ function createService(options = {}) {
     monotonicMs: () => performance.now(),
   };
   const timeoutMs = options.timeoutMs || 10000;
+  const retryDelayMs = options.retryDelayMs !== undefined ? options.retryDelayMs : 300;
   const cacheMax = options.cacheMax || 4096;
 
   const dataDir = options.dataDir || process.env.SOURCES_DATA_DIR || path.join(process.cwd(), 'sources-data');
@@ -349,6 +352,82 @@ function createService(options = {}) {
     return playable;
   }
 
+  function isTransientSdkError(err) {
+    if (!err || typeof err !== 'object') return false;
+    const bodyCode = Number(err.body && err.body.code);
+    if (Number.isFinite(bodyCode) && TRANSIENT_UPSTREAM_CODES.has(bodyCode)) return true;
+    const status = Number(err.status);
+    if (Number.isFinite(status) && (status === 408 || status === 429 || status >= 500)) return true;
+    const code = String(err.code || '');
+    const msg = String(err.message || '');
+    return code === 'ECONNABORTED' || code === 'ETIMEDOUT' || /timeout/i.test(msg);
+  }
+
+  async function callSdkWithRetry(fn, retries = 1) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (attempt >= retries || !isTransientSdkError(err)) {
+          throw err;
+        }
+        if (retryDelayMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  function hasEmbeddedTrackDetails(item) {
+    if (!item || typeof item !== 'object') return false;
+    const sid = nonnegativeIntOrZero(item.id || item.song_id);
+    if (!sid || !(item.name || item.title || item.song_name)) return false;
+    return (
+      Array.isArray(item.ar)
+      || Array.isArray(item.artists)
+      || typeof item.artist === 'string'
+      || Boolean(item.al || item.album || item.album_name)
+      || Number.isFinite(Number(item.dt ?? item.duration ?? item.duration_ms))
+    );
+  }
+
+  async function resolveTracksFromPlaylistDetail(pResp, targetIds) {
+    if (!Array.isArray(targetIds) || targetIds.length === 0) return [];
+    const parsedIds = targetIds.map(nonnegativeIntOrZero).filter(x => x > 0);
+    if (parsedIds.length === 0) return [];
+
+    const pl = pResp && pResp.body && pResp.body.playlist ? pResp.body.playlist : {};
+    const embeddedTracks = Array.isArray(pl.tracks) ? pl.tracks : [];
+    const privileges = pResp && pResp.body && Array.isArray(pResp.body.privileges) ? pResp.body.privileges : [];
+    const privMap = new Map();
+    for (const p of privileges) {
+      if (p && p.id) privMap.set(nonnegativeIntOrZero(p.id), p);
+    }
+
+    const rowMap = new Map();
+    for (const item of embeddedTracks) {
+      if (!hasEmbeddedTrackDetails(item)) continue;
+      const sid = nonnegativeIntOrZero(item.id || item.song_id);
+      if (sid && !rowMap.has(sid)) {
+        rowMap.set(sid, mapSongDetail(item, privMap.get(sid)));
+      }
+    }
+
+    const missingIds = parsedIds.filter(sid => !rowMap.has(sid));
+    if (missingIds.length > 0) {
+      const fetched = await batchSongDetails(missingIds);
+      for (const row of fetched) {
+        if (row && row.song_id && !rowMap.has(row.song_id)) {
+          rowMap.set(row.song_id, row);
+        }
+      }
+    }
+    return parsedIds.map(sid => rowMap.get(sid)).filter(Boolean);
+  }
+
   async function batchSongDetails(ids) {
     if (!Array.isArray(ids) || ids.length === 0) return [];
     const cookie = getCookieString();
@@ -358,7 +437,7 @@ function createService(options = {}) {
     const allRows = [];
     for (let i = 0; i < parsedIds.length; i += 100) {
       const batch = parsedIds.slice(i, i + 100);
-      const res = await sdk.song_detail({ ids: batch.join(','), cookie, timeout: timeoutMs });
+      const res = await callSdkWithRetry(() => sdk.song_detail({ ids: batch.join(','), cookie, timeout: timeoutMs }));
       const songs = res && res.body && Array.isArray(res.body.songs) ? res.body.songs : [];
       const privileges = res && res.body && Array.isArray(res.body.privileges) ? res.body.privileges : [];
       const privMap = new Map();
@@ -837,14 +916,14 @@ function createService(options = {}) {
       // song/detail call" contract while remaining backward compatible.
       const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 1000, 1), 1000);
       const cookie = getCookieString();
-      const resp = await sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs });
+      const resp = await callSdkWithRetry(() => sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs }));
       const playlist = resp && resp.body && resp.body.playlist ? resp.body.playlist : null;
       if (!playlist || !Array.isArray(playlist.trackIds)) {
         return res.json({ ok: false, error: 'playlist not found or inaccessible', logged_in: true });
       }
       const trackIds = playlist.trackIds.map(t => (typeof t === 'object' ? t.id : t)).map(nonnegativeIntOrZero).filter(x => x > 0);
       const slicedIds = trackIds.slice(offset, offset + limit);
-      const detailed = await batchSongDetails(slicedIds);
+      const detailed = await resolveTracksFromPlaylistDetail(resp, slicedIds);
       const marked = await markNeedsVip(detailed);
       return res.json({
         ok: true,
@@ -904,13 +983,13 @@ function createService(options = {}) {
       if (!boardId) {
         return res.json({ ok: true, data: [], index });
       }
-      const plResp = await sdk.playlist_detail({ id: boardId, cookie, timeout: timeoutMs });
+      const plResp = await callSdkWithRetry(() => sdk.playlist_detail({ id: boardId, cookie, timeout: timeoutMs }));
       const pl = plResp && plResp.body && plResp.body.playlist ? plResp.body.playlist : null;
       const trackIds = pl && Array.isArray(pl.trackIds)
         ? pl.trackIds.map(t => (typeof t === 'object' ? t.id : t)).map(nonnegativeIntOrZero).filter(x => x > 0)
         : [];
       const slicedIds = trackIds.slice(0, 100);
-      const detailed = await batchSongDetails(slicedIds);
+      const detailed = await resolveTracksFromPlaylistDetail(plResp, slicedIds);
       const marked = await markNeedsVip(detailed);
       const playable = await filterPlayableSongIds(marked.map(x => x.song_id));
       const filtered = marked.filter(x => playable.has(x.song_id)).slice(0, limit);
@@ -1112,7 +1191,7 @@ function createService(options = {}) {
       const kind = String(req.query.kind || 'playlist');
       const cookie = getCookieString();
 
-      const pResp = await sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs });
+      const pResp = await callSdkWithRetry(() => sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs }));
       const pl = pResp && pResp.body && pResp.body.playlist ? pResp.body.playlist : null;
       if (!pl || !pl.id) {
         return res.status(404).json({ detail: `playlist ${playlistId} not found` });
@@ -1130,7 +1209,7 @@ function createService(options = {}) {
       if (!playlistId) return res.status(400).json({ detail: 'Invalid playlist_id' });
       const cookie = getCookieString();
 
-      const pResp = await sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs });
+      const pResp = await callSdkWithRetry(() => sdk.playlist_detail({ id: playlistId, cookie, timeout: timeoutMs }));
       const pl = pResp && pResp.body && pResp.body.playlist ? pResp.body.playlist : null;
       if (!pl || !Array.isArray(pl.trackIds)) {
         return res.status(502).json({ detail: `playlist ${playlistId} tracks unavailable` });
@@ -1148,7 +1227,7 @@ function createService(options = {}) {
         seen.add(sid);
         dedupedIds.push(sid);
       }
-      const detailed = await batchSongDetails(dedupedIds);
+      const detailed = await resolveTracksFromPlaylistDetail(pResp, dedupedIds);
       const marked = await markNeedsVip(detailed);
       const total = Math.max(trackIds.length, nonnegativeIntOrZero(pl.trackCount));
       return res.json({
@@ -1303,12 +1382,29 @@ function createService(options = {}) {
 
   // General error handler
   app.use((err, req, res, next) => {
-    const status = err.status || 500;
-    res.status(status).json({
+    const body = err && typeof err.body === 'object' ? err.body : null;
+    const rawCode = body ? Number(body.code) : NaN;
+    const bodyCode = Number.isFinite(rawCode) && rawCode !== 0 ? rawCode : null;
+    const upstreamMsg = body ? String(body.msg || body.message || '').trim() : '';
+    let status = Number(err && err.status) || 500;
+    if (body && status === 400) {
+      status = bodyCode !== null && RATE_LIMIT_UPSTREAM_CODES.has(bodyCode) ? 503 : 502;
+    }
+    const message = (err && err.message)
+      || upstreamMsg
+      || (bodyCode !== null ? `Upstream error ${bodyCode}` : 'Internal Server Error');
+    if (status >= 500 || bodyCode !== null) {
+      console.warn(`[netease-service] ${req.method} ${req.path} -> HTTP ${status} (code=${bodyCode ?? 'none'}): ${message}`);
+    }
+    const payload = {
       ok: false,
-      error: err.message || 'Internal Server Error',
-      detail: err.message,
-    });
+      error: message,
+      detail: message,
+    };
+    if (bodyCode !== null) {
+      payload.upstream_code = bodyCode;
+    }
+    res.status(status).json(payload);
   });
 
   return {

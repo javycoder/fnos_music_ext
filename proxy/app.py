@@ -13177,9 +13177,26 @@ async def playlist_list(request: Request):
     return response
 
 
+def _align_playlist_card_guid(card: dict, requested_guid: str) -> dict:
+    """对齐歌单详情卡片 guid：客户端以伪装 32-hex 请求时回传同形态假 guid。
+
+    客户端搜索结果走 disguise_client_json 后持有 32-hex guid 并据此校验详情
+    `playlist.id === routeParams.playlistId`；而首页列表直出原始 `online:...` 时
+    按原 guid 返回以兼容既有链路。
+    """
+    real_guid = str(card.get("guid") or "")
+    if not real_guid or not is_online_guid(real_guid):
+        return card
+    fake = fake_official_guid(real_guid)
+    if requested_guid and not is_online_guid(requested_guid):
+        return {**card, "guid": fake}
+    return card
+
+
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
-    guid = resolve_real_guid(str(request.query_params.get("guid") or "").strip())
+    raw_guid = str(request.query_params.get("guid") or "").strip()
+    guid = resolve_real_guid(raw_guid)
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
     if public_entry:
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
@@ -13196,7 +13213,7 @@ async def playlist_detail(request: Request):
         tracks = pubpl.cached_tracks(pubpl.playlist_guid(public_entry))
         if tracks is not None:
             card = {**card, "trackCount": len(tracks)}
-        fake_official_guid(str(card.get("guid") or ""))
+        card = _align_playlist_card_guid(card, raw_guid)
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
     if nm_pl_id:
@@ -13208,6 +13225,7 @@ async def playlist_detail(request: Request):
         tracks = nmpl.cached_tracks(nm_pl_id)
         if tracks is not None:
             card = {**card, "trackCount": len(tracks)}
+        card = _align_playlist_card_guid(card, raw_guid)
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
@@ -13240,6 +13258,7 @@ async def playlist_detail(request: Request):
     bundle = await _load_requested_playlist_bundle(request, user_guid, kind, guid)
     rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
     rec["trackCount"] = len(bundle.get("tracks") or [])
+    rec = _align_playlist_card_guid(rec, raw_guid)
     response = JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
     if kind == "liked" and bundle.get("tracks"):
         _mark_liked_response_fetched(user_guid, bundle)
@@ -13249,7 +13268,13 @@ async def playlist_detail(request: Request):
 @app.get("/music/api/v1/playlist/batch-detail")
 async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
-    guids = [resolve_real_guid(g.strip()) for g in raw.split(",") if g.strip()]
+    raw_guids = [g.strip() for g in raw.split(",") if g.strip()]
+    requested_by_real: dict[str, str] = {}
+    guids: list[str] = []
+    for raw_g in raw_guids:
+        real_g = resolve_real_guid(raw_g)
+        guids.append(real_g)
+        requested_by_real.setdefault(real_g, raw_g)
     recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
     public_ids = [resolve_real_guid(g) for g in guids if pubpl.is_public_playlist_guid(resolve_real_guid(g))]
     nm_ids = [
@@ -13310,14 +13335,15 @@ async def playlist_batch_detail(request: Request):
             consumed_liked.append(bundle)
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
-        recs.append(rec)
+        recs.append(_align_playlist_card_guid(rec, requested_by_real.get(g, g)))
     for pid in nm_ids:
         card = nmpl.card_for(pid)
         if card is not None:
             tracks = nmpl.cached_tracks(pid)
             if tracks is not None:
                 card = {**card, "trackCount": len(tracks)}
-            recs.append(card)
+            real_g = str(card.get("guid") or "")
+            recs.append(_align_playlist_card_guid(card, requested_by_real.get(real_g, real_g)))
     for g in public_ids:
         entry = pubpl.entry_from_guid(g)
         if entry is None or not _public_playlist_allowed(user_guid, entry):
@@ -13330,7 +13356,7 @@ async def playlist_batch_detail(request: Request):
             tracks = pubpl.cached_tracks(g)
             if tracks is not None:
                 card = {**card, "trackCount": len(tracks)}
-            recs.append(card)
+            recs.append(_align_playlist_card_guid(card, requested_by_real.get(g, g)))
     response = JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
     for bundle in consumed_liked:
         _mark_liked_response_fetched(user_guid, bundle)
@@ -13357,7 +13383,9 @@ async def playlist_track_list(request: Request):
             return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         try:
             tracks = dailyrec.stamp_playlist_tracks(
-                await pubpl.load_tracks(request.app.state, public_entry, build_online_track)
+                await pubpl.load_tracks(
+                    request.app.state, public_entry, build_online_track, allow_cooldown=False,
+                )
             )
         except Exception as e:
             logger.warning("public playlist track list failed (%s): %s", guid, e)

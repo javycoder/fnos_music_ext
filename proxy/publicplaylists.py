@@ -521,7 +521,7 @@ async def _fetch_tracks(app_state, entry: dict, build_track) -> list:
     return [dict(track) for track in tracks]
 
 
-async def load_tracks(app_state, entry: dict, build_track) -> list:
+async def load_tracks(app_state, entry: dict, build_track, *, allow_cooldown: bool = True) -> list:
     guid = playlist_guid(entry)
     hit = _tracks_cache.get(guid)
     if hit and time.monotonic() < hit[1]:
@@ -530,7 +530,8 @@ async def load_tracks(app_state, entry: dict, build_track) -> list:
         disk = _load_disk_tracks(guid)
         if disk is not None:
             return disk
-        raise RuntimeError("public playlist tracks recently failed")
+        if allow_cooldown:
+            raise RuntimeError("public playlist tracks recently failed")
     existing = _tracks_tasks.get(guid)
     if existing is not None and not existing.done():
         return await asyncio.shield(existing)
@@ -594,6 +595,8 @@ def schedule_prefetch(app_state, conf: dict, cards: list[dict], build_track,
         guid = playlist_guid(entry)
         hit = _tracks_cache.get(guid)
         if hit and now < hit[1]:
+            continue
+        if now < _tracks_fail_until.get(guid, 0.0):
             continue
         if guid not in pending:
             pending.append(guid)

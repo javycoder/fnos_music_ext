@@ -388,3 +388,29 @@ def test_disk_summary_and_tracks_survive_restart():
     assert pubpl.cached_card(pubpl.playlist_guid(SELECTION[0]))["name"] == "[网易] 热歌榜"
     assert len(pubpl.cached_tracks(pubpl.playlist_guid(SELECTION[0]))) == 2
     assert resolve_real_guid(track_fake) == "online:netease:101"
+
+
+def test_foreground_track_list_retries_through_cooldown_without_disk_snapshot():
+    calls = {"tracks": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/public-playlists/3778678":
+            return httpx.Response(200, json={"ok": True, "data": SUMMARY})
+        if request.url.path == "/api/v1/public-playlists/3778678/tracks":
+            calls["tracks"] += 1
+            if calls["tracks"] == 1:
+                return httpx.Response(503, json={"ok": False, "detail": "服务器忙碌，请稍后再试！"})
+            return httpx.Response(200, json={"ok": True, "data": TRACKS, "total": 2, "truncated": False})
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_upstream()), base_url="http://unix")
+    app.state.musicbox_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://musicbox")
+
+    guid = pubpl.playlist_guid(SELECTION[0])
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid})
+        assert first.json()["code"] == -1
+        second = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid})
+        assert second.json()["code"] == 0
+        assert len(second.json()["data"]["list"]) == 2
+    assert calls["tracks"] == 2

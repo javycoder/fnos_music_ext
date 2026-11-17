@@ -622,3 +622,90 @@ test('public playlist search forwards remaining timeout to cloudsearch', async (
   assert.strictEqual(seen.timeout, 250);
   assert.strictEqual(seen.keywords, 'abc');
 });
+
+test('public playlist tracks reuse embedded playlist_detail tracks and only fetch missing IDs', async () => {
+  let songDetailCalls = [];
+  const mockSdk = {
+    login_status: async () => ({ body: { data: { profile: null } } }),
+    playlist_detail: async () => ({
+      body: {
+        playlist: {
+          id: 2124964378,
+          name: '张敬轩',
+          trackCount: 3,
+          trackIds: [{ id: 101 }, { id: 102 }, { id: 103 }],
+          tracks: [
+            { id: 101, name: '酷爱', ar: [{ name: '张敬轩' }], al: { name: '酷爱', picUrl: 'http://p/101.jpg' }, dt: 210000, fee: 0 },
+            { id: 102, name: '春秋', ar: [{ name: '张敬轩' }], al: { name: 'No. Eleven', picUrl: 'http://p/102.jpg' }, dt: 240000, fee: 1 },
+          ],
+        },
+        privileges: [
+          { id: 101, maxbr: 999000 },
+          { id: 102, maxbr: 320000 },
+        ],
+      },
+    }),
+    song_detail: async ({ ids }) => {
+      songDetailCalls.push(ids);
+      return {
+        body: {
+          songs: [{ id: 103, name: '樱花树下', ar: [{ name: '张敬轩' }], al: { name: 'Urban Emotions' }, dt: 250000, fee: 0 }],
+          privileges: [{ id: 103, maxbr: 999000 }],
+        },
+      };
+    },
+  };
+
+  const service = createService({ sdk: mockSdk, retryDelayMs: 5 });
+  const res = await makeRequest(service.app, 'GET', '/api/v1/public-playlists/2124964378/tracks');
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.ok, true);
+  assert.deepStrictEqual(res.body.data.map(x => x.song_id), [101, 102, 103]);
+  assert.strictEqual(res.body.data[0].maxbr, 999000);
+  assert.strictEqual(res.body.data[1].needs_vip, true);
+  assert.deepStrictEqual(songDetailCalls, ['103']);
+});
+
+test('public playlist tracks retry transient -448 and map persistent -448 to 503', async () => {
+  let attempt = 0;
+  const retryingService = createService({
+    retryDelayMs: 5,
+    sdk: {
+      login_status: async () => ({ body: { data: { profile: null } } }),
+      playlist_detail: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          throw { status: 400, body: { code: -448, msg: '服务器忙碌，请稍后再试！' } };
+        }
+        return {
+          body: {
+            playlist: {
+              id: 2124964378,
+              trackCount: 1,
+              trackIds: [{ id: 101 }],
+              tracks: [{ id: 101, name: '酷爱', ar: [{ name: '张敬轩' }], al: { name: '酷爱' }, dt: 210000, fee: 0 }],
+            },
+          },
+        };
+      },
+    },
+  });
+
+  const okRes = await makeRequest(retryingService.app, 'GET', '/api/v1/public-playlists/2124964378/tracks');
+  assert.strictEqual(okRes.status, 200);
+  assert.strictEqual(okRes.body.data.length, 1);
+  assert.strictEqual(attempt, 2);
+
+  const failingService = createService({
+    retryDelayMs: 5,
+    sdk: {
+      playlist_detail: async () => {
+        throw { status: 400, body: { code: -448, msg: '服务器忙碌，请稍后再试！' } };
+      },
+    },
+  });
+  const failRes = await makeRequest(failingService.app, 'GET', '/api/v1/public-playlists/2124964378/tracks');
+  assert.strictEqual(failRes.status, 503);
+  assert.strictEqual(failRes.body.upstream_code, -448);
+  assert.match(failRes.body.detail, /服务器忙碌/);
+});
