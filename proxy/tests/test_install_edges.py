@@ -39,7 +39,7 @@ def run_bash(body: str, env: dict | None = None, cwd: Path | None = None,
     if path:
         env["PATH"] = path
     return subprocess.run([BASH, "-c", body], env=env, cwd=str(cwd) if cwd else None,
-                          capture_output=True, text=True, timeout=90)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
 
 
 def write_stub(bindir: Path, name: str, body: str) -> None:
@@ -75,7 +75,12 @@ log_err() { printf '[ERROR] %s\n' "$*" >&2; }
 cleanup_legacy_sources() { :; }
 remove_conflicting_native_unit() { return 0; }
 reclaim_container() { return 0; }
-ensure_image_current() {
+stage_begin() { :; }
+stage_end() { :; }
+# 3.0.0+：镜像保障统一入口 ensure_app_image（离线资产/现场构建分流见
+# proxy/install_common.sh 与 test_image_bundle.py；此处只验证失败即停在
+# 镜像阶段、不进入健康等待，原始错误保留）
+ensure_app_image() {
     printf 'ensure-image\n' >> "$CALLS"
     if [ "$FAILURE" = ensure ]; then
         printf 'original-ensure-error\n' >&2
@@ -296,6 +301,8 @@ log_warn() { printf 'warn %s\\n' "$*"; }
 log_err() { printf 'err %s\\n' "$*" >&2; }
 warn_unregistered_mdl_platforms() { :; }
 get_fnos_gateway_ports() { printf '5666 5667\\n'; }
+# 以下用例锁的是 6b 外网搜索验收语义；3.0.0 起 6b 默认跳过，须显式开启
+FNMUSIC_VERIFY_SEARCH=1
 TARGET_SOCK=/tmp/verify.sock
 MUSICDL_URL=http://mdl.test
 MUSICBOX_URL=http://mb.test
@@ -814,7 +821,7 @@ def test_base_image_write_preserves_existing_env(tmp_path):
 
 # ----------------------------------------------------------- netease_login.sh ---
 
-NETEASE_TOOLS = ("dirname", "grep", "cut", "tr", "date", "cat", "jq", "printf")
+NETEASE_TOOLS = ("dirname", "grep", "cut", "tr", "tail", "date", "cat", "jq", "printf")
 
 
 def netease_curl_stub(bindir: Path) -> str:
@@ -871,6 +878,30 @@ def run_netease(tmp_path: Path, **env: str) -> subprocess.CompletedProcess:
                           env=full_env, capture_output=True, text=True, timeout=60)
 
 
+def test_netease_login_prefers_new_url_from_environment_and_config(tmp_path):
+    env_dir = tmp_path / "environment"
+    env_dir.mkdir()
+    result = run_netease(env_dir, NETEASE_HEALTHZ_OK="0",
+                         FNMUSIC_NETEASE_URL="http://new.test",
+                         FNMUSIC_MUSICBOX_URL="http://old.test")
+    assert result.returncode == 0
+    log = (env_dir / "nbin" / "netease-curl.log").read_text(encoding="utf-8")
+    assert "http://new.test/healthz" in log
+    config_dir = tmp_path / "config"
+    sandbox = config_dir / "nsandbox"
+    sandbox.mkdir(parents=True)
+    (sandbox / ".env").write_text(
+        "FNMUSIC_MUSICBOX_URL=http://old-config.test\n"
+        "FNMUSIC_NETEASE_URL=http://new-config.test\n",
+        encoding="utf-8",
+    )
+    result = run_netease(config_dir, NETEASE_HEALTHZ_OK="0",
+                         FNMUSIC_NETEASE_URL="", FNMUSIC_MUSICBOX_URL="")
+    assert result.returncode == 0
+    log = (config_dir / "nbin" / "netease-curl.log").read_text(encoding="utf-8")
+    assert "http://new-config.test/healthz" in log
+
+
 @pytest.mark.skipif(shutil.which("jq") is None, reason="需要 jq")
 def test_netease_login_service_down_exits_gracefully(tmp_path):
     result = run_netease(tmp_path, NETEASE_HEALTHZ_OK="0")
@@ -908,7 +939,7 @@ def test_parse_sources_preserves_env_only_when_not_explicit(tmp_path):
     install = (BASE / "install.sh").read_text(encoding="utf-8")
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "FNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=false\nFNMUSIC_NETEASE_ENABLED=false\n",
+        "FNMUSIC_LX_ENABLED='true'\nFNMUSIC_MUSICDL_ENABLED='false'\nFNMUSIC_NETEASE_ENABLED='false'\n",
         encoding="utf-8",
     )
 
@@ -934,6 +965,10 @@ apply_source_row() { :; }
 parse_sources ""
 echo "IMPLICIT: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEEP_SOURCES_FROM_ENV"
 
+# 场景 1b：显式指定 auto，同样应沿用存量 .env 中的 lx
+parse_sources "auto"
+echo "AUTO_ENV: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEEP_SOURCES_FROM_ENV"
+
 # 场景 2：显式传入参数（例如 --sources musicbox），必须优先采用显式选择
 parse_sources "musicbox"
 echo "EXPLICIT: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEEP_SOURCES_FROM_ENV"
@@ -943,5 +978,73 @@ echo "EXPLICIT: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEE
     assert result.returncode == 0, result.stderr
     lines = result.stdout.strip().splitlines()
     assert "IMPLICIT: MDL=0 BOX=0 LX=1 KEEP=1" in lines[0]
-    assert "EXPLICIT: MDL=0 BOX=1 LX=0 KEEP=0" in lines[1]
+    assert "AUTO_ENV: MDL=0 BOX=0 LX=1 KEEP=1" in lines[1]
+    assert "EXPLICIT: MDL=0 BOX=1 LX=0 KEEP=0" in lines[2]
+
+
+def test_parse_sources_auto_defaults_to_musicdl_when_no_env(tmp_path):
+    """全新安装（无 .env）且使用 auto 时默认回退到 musicdl。"""
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    helpers = r'''
+set -eu
+log_info() { :; }
+log_err() { echo "$*" >&2; }
+lx_alias() { echo "kg"; }
+lx_merge() { :; }
+mdl_merge() { :; }
+mdl_platform_lookup() { echo "musicdl kuwo 酷我"; }
+source_lookup_by_id() { echo "musicbox netease 网易"; }
+apply_source_row() { :; }
+'''
+    script = (
+        helpers
+        + f'BASE_DIR="{tmp_path}"\n'
+        + function(install, "read_dotenv_value")
+        + function(install, "parse_sources")
+        + r'''
+parse_sources "auto"
+echo "CLEAN_AUTO: MDL=$ENABLE_MUSICDL BOX=$ENABLE_MUSICBOX LX=$ENABLE_LX KEEP=$KEEP_SOURCES_FROM_ENV"
+'''
+    )
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert "CLEAN_AUTO: MDL=1 BOX=0 LX=0 KEEP=0" in result.stdout.strip()
+
+
+def test_restore_keep_data_restores_before_deploy_mode(tmp_path):
+    """验证 restore_keep_data 能在全新目录下从保留目录成功恢复 .env 与数据项。"""
+    install = (BASE / "install.sh").read_text(encoding="utf-8")
+    base_dir = tmp_path / "repo"
+    keep_dir = tmp_path / "fnmusic-ext-data"
+    keep_dir.mkdir(parents=True)
+    (keep_dir / ".env").write_text("FNMUSIC_LX_ENABLED='true'\nFNMUSIC_DEPLOY_MODE=native\n", encoding="utf-8")
+    (keep_dir / "sources-data").mkdir()
+    (keep_dir / "sources-data" / "test.txt").write_text("hello", encoding="utf-8")
+    (keep_dir / "README.txt").write_text("ignore", encoding="utf-8")
+
+    stubs = r'''
+set -eu
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*"; }
+log_err() { printf '[ERROR] %s\n' "$*" >&2; }
+'''
+    restore_fn = function(install, "restore_keep_data")
+    base_str = str(base_dir).replace("\\", "/")
+    keep_str = str(keep_dir).replace("\\", "/")
+    script = (
+        stubs
+        + f'BASE_DIR="{base_str}"\n'
+        + f'FNMUSIC_KEEP_DIR="{keep_str}"\n'
+        + 'RESTORED_FROM_KEEP_DIR=""\n'
+        + restore_fn
+        + 'restore_keep_data\n'
+        + 'echo "RESTORED: $RESTORED_FROM_KEEP_DIR"\n'
+    )
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert f"RESTORED: {keep_str}" in result.stdout
+    assert (base_dir / ".env").is_file()
+    assert "FNMUSIC_LX_ENABLED='true'" in (base_dir / ".env").read_text(encoding="utf-8")
+    assert (base_dir / "sources-data" / "test.txt").read_text(encoding="utf-8") == "hello"
+    assert not (base_dir / "README.txt").exists()
 

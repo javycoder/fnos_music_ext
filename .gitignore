@@ -54,3 +54,6 @@ dist/
 packaging/fpk/.build/
 
 .cursor/
+.webui_jobs.db
+openspec/
+node_modules/

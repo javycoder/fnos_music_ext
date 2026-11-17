@@ -11,8 +11,8 @@ set -euo pipefail
 #   2. 检测 nodejs（lxserver Node 沙箱）/ ffmpeg（musicdl 无损探针），缺失时
 #      尝试 sudo apt-get 安装，失败给出手动命令
 #   3. lxserver 预编译包落位 .lxserver/：container/lxserver-artifact/ 预置优先
-#      （离线/fpk 场景），缺失走镜像加速下载链；sha256 校验 + 补丁与 Dockerfile
-#      构建层一致，按版本幂等（同版本已就位则跳过）；ARM64 额外补齐锁定
+#      （离线/fpk 场景），缺失走镜像加速下载链；sha256 校验后保持发行包原样，
+#      按版本幂等（同版本已就位则跳过）；ARM64 额外补齐锁定
 #      的 music-tag-native 平台绑定，避免上游 x64 单架构包启动崩溃
 # 本脚本不修改任何系统配置（apt 安装除外，且仅补缺失的两组件）。
 # 可调环境变量: PIP_INDEX / FNMUSIC_VENV_SOURCES_DIR / FNMUSIC_APT_MIRROR /
@@ -77,7 +77,6 @@ log_err() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 # ---------------------------------------------------------------- 1. venv + pip
 REQ_FILES=(
     "${BASE_DIR}/musicdl-service/requirements.txt"
-    "${BASE_DIR}/musicbox-service/requirements.txt"
     "${BASE_DIR}/lxmusic-service/requirements.txt"
     "${BASE_DIR}/webui-service/requirements.txt"
 )
@@ -101,6 +100,11 @@ if [ ! -x "${VENV_DIR}/bin/python" ]; then
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 fi
 VENV_PYTHON="${VENV_DIR}/bin/python"
+if [ -x "${VENV_PYTHON}" ] && "${VENV_PYTHON}" -c "import NEMbox" >/dev/null 2>&1; then
+    log_info "检测到旧版 NEMbox 包，重建音源专用虚拟环境 ${VENV_DIR}..."
+    python3 -c "import shutil, sys; shutil.rmtree(sys.argv[1])" "${VENV_DIR}"
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+fi
 PIP_BIN="${VENV_DIR}/bin/pip"
 if [ ! -x "${VENV_PYTHON}" ] || [ ! -x "${PIP_BIN}" ]; then
     log_err "虚拟环境异常：${VENV_PYTHON} 或 ${PIP_BIN} 不存在。"
@@ -192,14 +196,15 @@ apt_install_packages() {
 
 if ! choose_node_bin; then
     if [ -n "${FNMUSIC_NODE_BIN:-}" ]; then
-        log_err "FNMUSIC_NODE_BIN 不是可执行的 Node 20+：${FNMUSIC_NODE_BIN}"
+        log_err "FNMUSIC_NODE_BIN 不是可执行的 Node >=22.13.0：${FNMUSIC_NODE_BIN}"
         exit 1
     fi
-    log_warn "未探测到 Node 20+，尝试 sudo apt-get 安装..."
+    log_warn "未探测到 Node >=22.13.0，尝试 sudo apt-get 安装..."
     apt_install_packages nodejs || true
     if ! choose_node_bin; then
-        log_err "缺少可用的 Node 20+：lxserver 无法运行。"
-        log_err "可在飞牛应用中心安装 nodejs_v22，或设置 FNMUSIC_NODE_BIN 指向 Node 20+。"
+        log_err "缺少可用的 Node >=22.13.0：lxserver v2.2.0 无法运行。"
+        log_err "请安装 22.13.0 或更高版本（飞牛应用中心 nodejs_v22 需确认版本），"
+        log_err "或设置 FNMUSIC_NODE_BIN 指向合规的 node 可执行文件后重跑。"
         exit 1
     fi
 fi
@@ -290,25 +295,29 @@ else
         mv "${LXSERVER_DIR}.tmp" "${LXSERVER_DIR}"
     fi
     rm -rf "${LXSERVER_DIR}.tmp"
-    # 运行时入口是根级 index.js（supervisord: node index.js），必须存在；
-    # v2.1.2 实际布局主脚本在 server/server/server.js，Dockerfile 的 getLyric
-    # 补丁对 server/server.js 存在才打（同款语义，缺失时静默跳过）
+    # 运行时入口是根级 index.js（supervisord: node index.js），必须存在。
     if [ ! -f "${LXSERVER_DIR}/index.js" ]; then
         log_err "lxserver 包结构异常：未找到入口 index.js。"
         exit 1
-    fi
-    if [ -f "${LXSERVER_DIR}/server/server.js" ]; then
-        sed -i 's/const result = await musicSdk\[source\]\.getLyric(songInfo);/const _res = musicSdk[source].getLyric(songInfo); const result = await (_res \&\& _res.promise ? _res.promise : _res);/g' \
-            "${LXSERVER_DIR}/server/server.js"
     fi
     printf '%s\n' "${LXSERVER_TAG}" > "${LXSERVER_STAMP}"
     log_info "lxserver ${LXSERVER_TAG} 已落位 ${LXSERVER_DIR}。"
 fi
 
-# 与 Docker 构建应用同一份幂等补丁；同版本在位也需修复旧安装的漏补丁。
-if [ -f "${LXSERVER_DIR}/server/server/userApi.js" ]; then
-    "${PYTHON_BIN}" "${BASE_DIR}/container/lxserver_compat.py" \
-        "${LXSERVER_DIR}/server/server/userApi.js"
+# v2.2.0 将源执行模块移到 sources/；构建/原生安装都不再修改上游字节。
+USER_API_JS="${LXSERVER_DIR}/server/server/sources/userApi.js"
+if [ ! -f "${USER_API_JS}" ]; then
+    log_err "lxserver ${LXSERVER_TAG} 包结构异常：缺少 server/server/sources/userApi.js。"
+    exit 1
+fi
+if ! "${NODE_BIN}" -e '
+const api = require(process.argv[1]);
+if (typeof api.loadUserApi !== "function" || typeof api.extractMetadata !== "function") {
+  console.error("loadUserApi/extractMetadata exports missing");
+  process.exit(1);
+}' "${USER_API_JS}"; then
+    log_err "lxserver ${LXSERVER_TAG} 源执行模块导出不符合约定，中止部署。"
+    exit 1
 fi
 
 bash "${BASE_DIR}/container/ensure_lxserver_native.sh" \
@@ -316,5 +325,43 @@ bash "${BASE_DIR}/container/ensure_lxserver_native.sh" \
     --lxserver-dir "${LXSERVER_DIR}" \
     --version-file "${LXSERVER_VERSION_FILE}" \
     --node-bin "${NODE_BIN}"
+
+ensure_netease_deps() {
+    local service_dir="${BASE_DIR}/netease-service"
+    local digest stamp node_path npm_bin
+    if [ ! -f "${service_dir}/package.json" ] || [ ! -f "${service_dir}/package-lock.json" ]; then
+        log_err "缺少网易音源的 npm 依赖清单。"
+        return 1
+    fi
+    digest="$(sha256sum "${service_dir}/package.json" "${service_dir}/package-lock.json" | sha256sum | awk '{print $1}')"
+    stamp="${service_dir}/node_modules/.fnmusic-lock-sha256"
+    if [ "${FNMUSIC_REFRESH_DEPS:-0}" != "1" ] \
+       && [ "$(cat "${stamp}" 2>/dev/null || true)" = "${digest}" ] \
+       && (cd "${service_dir}" && "${NODE_BIN}" -e '
+for (const name of ["express", "axios", "qrcode", "@neteasecloudmusicapienhanced/api"]) require.resolve(name);
+if (require("./node_modules/@neteasecloudmusicapienhanced/api/package.json").version !== "4.41.1") process.exit(1);
+') >/dev/null 2>&1; then
+        log_info "网易音源 Node 依赖已就绪，跳过联网安装。"
+        return 0
+    fi
+    node_path="$(dirname "${NODE_BIN}"):${PATH}"
+    npm_bin="$(PATH="${node_path}" command -v npm || true)"
+    if [ -z "${npm_bin}" ]; then
+        log_err "缺少 npm，无法安装网易音源依赖；请安装与所选 Node 配套的 npm。"
+        return 1
+    fi
+    log_info "安装网易音源锁定的 Node 依赖..."
+    if ! PATH="${node_path}" "${npm_bin}" --prefix "${service_dir}" ci --omit=dev --ignore-scripts \
+       || ! (cd "${service_dir}" && "${NODE_BIN}" -e '
+for (const name of ["express", "axios", "qrcode", "@neteasecloudmusicapienhanced/api"]) require.resolve(name);
+if (require("./node_modules/@neteasecloudmusicapienhanced/api/package.json").version !== "4.41.1") process.exit(1);
+'); then
+        log_err "网易音源 Node 依赖安装或校验失败。"
+        return 1
+    fi
+    printf '%s\n' "${digest}" > "${stamp}"
+}
+
+ensure_netease_deps
 
 log_info "原生音源运行时就绪。"

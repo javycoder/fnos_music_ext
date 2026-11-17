@@ -82,7 +82,7 @@ check_lx_http() {
 }
 
 check musicdl FNMUSIC_MUSICDL_ENABLED
-check musicbox FNMUSIC_NETEASE_ENABLED
+check netease FNMUSIC_NETEASE_ENABLED
 # 网易云歌单常驻（issue #38）：musicbox 非当前音源但常驻开启时应常驻运行。
 # 只捕捉崩溃循环（FATAL/BACKOFF）；webui 对账的主动停止（如未登录回收）属
 # 正常态，不算失败——避免 cookie 失效期间容器长期 unhealthy。
@@ -90,10 +90,10 @@ if [ "$(env_flag FNMUSIC_NETEASE_ENABLED)" != "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_PLAYLIST_RESIDENT)" = "true" ] \
    && [ "$(env_flag FNMUSIC_NETEASE_MY_PLAYLISTS)" = "true" ]; then
     checked=$((checked + 1))
-    _mb_state="$(supervisorctl -c "$SUP_CONF" status musicbox 2>/dev/null || true)"
+    _mb_state="$(supervisorctl -c "$SUP_CONF" status netease 2>/dev/null || supervisorctl -c "$SUP_CONF" status musicbox 2>/dev/null || true)"
     case "$_mb_state" in
         *FATAL*|*BACKOFF*)
-            echo "[healthcheck] musicbox 常驻进程崩溃循环（FATAL/BACKOFF）" >&2
+            echo "[healthcheck] netease 常驻进程崩溃循环（FATAL/BACKOFF）" >&2
             fail=1
             ;;
     esac

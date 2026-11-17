@@ -3,9 +3,81 @@
 需要验证转码路径的用例自行 monkeypatch transcode.FFMPEG_BIN 指向假实现
 （tests 内置 fake_ffmpeg 脚本），其余用例一律走无 ffmpeg 的回落分支。
 """
+import os
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from proxy import transcode as tc
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _share_tls_context():
+    """复用一份 CA 上下文，避免每次 httpx.AsyncClient 重新解析证书库。
+
+    httpx 构造 Transport 时默认调用 create_ssl_context() 加载 certifi 的
+    证书链；Windows 上单次约 1.5 秒。每个 TestClient 生命周期会新建 4~5 个
+    客户端，数百个用例累计数十分钟。证书内容与校验语义不变，只是不再重复
+    解析同一份 cacert.pem。仅在测试会话内生效。
+    """
+    import certifi
+    from httpx import _transports
+
+    cached = ssl.create_default_context(cafile=certifi.where())
+    original = _transports.default.create_ssl_context
+
+    def _create_ssl_context(verify=True, cert=None, trust_env=True):
+        # 自定义 CA / verify=False 必须保持原语义，只复用默认 CA 那条路径。
+        if verify is not True or cert is not None:
+            return original(verify=verify, cert=cert, trust_env=trust_env)
+        return cached
+
+    _transports.default.create_ssl_context = _create_ssl_context
+    try:
+        yield
+    finally:
+        _transports.default.create_ssl_context = original
+
+
+def _python3_works() -> bool:
+    """Windows 的 `python3` 常命中应用执行别名，非交互调用会失败/挂起。"""
+    exe = shutil.which("python3")
+    if not exe:
+        return False
+    try:
+        done = subprocess.run([exe, "-c", "print(1)"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and b"1" in done.stdout
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _python3_shim():
+    """给 bash 子进程提供可用的 python3，保持与 CI Linux 一致的脚本行为。
+
+    安装脚本用 python3 解析 JSON；Windows 上该名字往往指向不可用的应用别名，
+    会让脚本长期挂起。这里只在需要时把一个指向当前解释器的 shim 目录前置到
+    PATH，不改动被测脚本本身。
+    """
+    if os.name != "nt" or _python3_works():
+        yield
+        return
+    shim_dir = Path(tempfile.mkdtemp(prefix="fn-py3-"))
+    shim = shim_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    original = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(shim_dir) + os.pathsep + original
+    try:
+        yield
+    finally:
+        os.environ["PATH"] = original
+        shutil.rmtree(shim_dir, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)

@@ -1158,8 +1158,8 @@ async def call_llm_json(http_client: httpx.AsyncClient, prompt: str) -> list | d
 
 # ------------------------------------------------------- 音源原生推荐（平台 ID 直连） ---
 
-def _musicbox_recommend_item(it: dict) -> dict:
-    """musicbox 推荐/榜单详情行（batch_song_details 已过滤可播）-> 统一候选条目。"""
+def _netease_recommend_item(it: dict) -> dict:
+    """netease 推荐/榜单详情行（batch_song_details 已过滤可播）-> 统一候选条目。"""
     sid = str(it.get("song_id") or it.get("id") or "")
     if not sid:
         return {}
@@ -1178,6 +1178,9 @@ def _musicbox_recommend_item(it: dict) -> dict:
     if it.get("needs_vip") is True:
         item["needs_vip"] = True
     return item
+
+
+_musicbox_recommend_item = _netease_recommend_item
 
 
 def _lx_recommend_item(it: dict) -> dict:
@@ -1236,22 +1239,22 @@ def resolve_source_candidates(
     return out
 
 
-async def fetch_musicbox_recommend(
+async def fetch_netease_recommend(
     client: httpx.AsyncClient, path: str, params: dict
 ) -> list[dict]:
-    """调 musicbox 推荐端点，返回标准化候选；服务不可用/未登录/失败一律返回 []（跳级）。"""
+    """调 netease 推荐端点，返回标准化候选；服务不可用/未登录/失败一律返回 []（跳级）。"""
     try:
         r = await client.get(path, params=params, timeout=15.0)
         if r.status_code != 200:
-            logger.debug("musicbox %s http %s", path, r.status_code)
+            logger.debug("netease %s http %s", path, r.status_code)
             return []
         data = r.json()
     except Exception as e:
-        logger.debug("musicbox %s failed: %s", path, e)
+        logger.debug("netease %s failed: %s", path, e)
         return []
     if not (isinstance(data, dict) and data.get("ok") is True):
         # 未登录/CLI 错误等结构化错误 -> 直接跳级
-        logger.debug("musicbox %s not ok: %.120s", path, data)
+        logger.debug("netease %s not ok: %.120s", path, data)
         return []
     rows = data.get("data")
     if not isinstance(rows, list):
@@ -1259,10 +1262,13 @@ async def fetch_musicbox_recommend(
     out: list[dict] = []
     for it in rows:
         if isinstance(it, dict):
-            item = _musicbox_recommend_item(it)
+            item = _netease_recommend_item(it)
             if item:
                 out.append(item)
     return out
+
+
+fetch_musicbox_recommend = fetch_netease_recommend
 
 
 async def fetch_lx_charts(client: httpx.AsyncClient, limit: int, sources: "list[str] | None" = None) -> list[dict]:
@@ -1325,12 +1331,14 @@ async def _search_keyword(
     lx_client: httpx.AsyncClient | None = None,
     lx_enabled: bool = False,
     lx_sources: "list[str] | None" = None,
+    netease_client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
+    active_netease = netease_client if netease_client is not None else musicbox_client
     async def _mb() -> list[dict]:
-        if not (netease_enabled and musicbox_client):
+        if not (netease_enabled and active_netease):
             return []
         try:
-            r = await musicbox_client.get(
+            r = await active_netease.get(
                 "/api/v1/search",
                 params={"keyword": keyword, "limit": 5, "type": "song"},
                 timeout=8.0,
@@ -1447,10 +1455,11 @@ async def verify_track_playable(
     musicdl_client: httpx.AsyncClient | None,
     musicbox_client: httpx.AsyncClient | None,
     lx_client: httpx.AsyncClient | None,
+    netease_client: httpx.AsyncClient | None = None,
 ) -> bool:
     """issue #23：推荐曲目入列前的逐首可播校验（短预算，只验存在性）。
 
-    - netease：musicbox 解析直链，data.url 非空即通过（quality 用最便宜的
+    - netease：解析直链，data.url 非空即通过（quality 用最便宜的
       standard 档，实际播放仍走完整音质阶梯与降档）
     - lx：lxmusic /api/v1/track/url 解析直链；服务端解析成功即已含 Range
       探活（900s 探活缓存复用，后续正式播放反而更快）
@@ -1464,11 +1473,12 @@ async def verify_track_playable(
         return True  # 非在线条目（理论不会出现）不拦截
     src = parts[1]
     timeout = verify_timeout_s()
+    active_netease = netease_client if netease_client is not None else musicbox_client
     try:
         if src == "netease":
-            if musicbox_client is None:
+            if active_netease is None:
                 return True
-            r = await musicbox_client.get(
+            r = await active_netease.get(
                 f"/api/v1/song/{parts[2]}/url",
                 params={"quality": "standard"}, timeout=timeout,
             )
@@ -1977,7 +1987,9 @@ async def get_or_build_daily(
     recommend_daily: bool = True,
     kind: str = "daily",
     publication_guard=None,
+    netease_client: httpx.AsyncClient | None = None,
 ) -> dict:
+    active_netease = netease_client if netease_client is not None else musicbox_client
     kind = "hot" if kind == "hot" else "daily"
     day = today_key()
     guid = recommend_playlist_guid(kind, day, user_guid)
@@ -2043,15 +2055,15 @@ async def get_or_build_daily(
         # 名额"），其余用户由 llm / local-random 生成各自不同的每日推荐。
         # 锁内二次检查名额，抓取成功即占名额（列表已生成过一次，即便被当前
         # 用户的排除集过滤空也不再给后来用户重复使用）。
-        if not (recommend_daily and netease_enabled and musicbox_client):
+        if not (recommend_daily and netease_enabled and active_netease):
             return []
         if source_slot_claimed(day):
             return []
         async with _SOURCE_SLOT_LOCK:
             if source_slot_claimed(day):
                 return []
-            items = await fetch_musicbox_recommend(
-                musicbox_client, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
+            items = await fetch_netease_recommend(
+                active_netease, "/api/v1/recommend/songs", {"limit": NETEASE_DAILY_LIMIT}
             )
             if not current():
                 return []
@@ -2064,17 +2076,17 @@ async def get_or_build_daily(
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_netease_charts(on_track=None, should_stop=None) -> list[dict]:
-        if not (recommend_hot and netease_enabled and musicbox_client):
+        if not (recommend_hot and netease_enabled and active_netease):
             return []
         # issue #55：网易榜单按日轮换（热歌/新歌/飙升），拉空回退主榜热歌
         idx = netease_chart_index_for_day(day)
-        items = await fetch_musicbox_recommend(
-            musicbox_client, "/api/v1/toplist",
+        items = await fetch_netease_recommend(
+            active_netease, "/api/v1/toplist",
             {"index": idx, "limit": CHART_FETCH_COUNT},
         )
         if not items and idx != NETEASE_TOPLIST_INDEX:
-            items = await fetch_musicbox_recommend(
-                musicbox_client, "/api/v1/toplist",
+            items = await fetch_netease_recommend(
+                active_netease, "/api/v1/toplist",
                 {"index": NETEASE_TOPLIST_INDEX, "limit": CHART_FETCH_COUNT},
             )
         if not items:

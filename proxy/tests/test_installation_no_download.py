@@ -74,6 +74,8 @@ get_fnos_gateway_ports() { printf '8080 8443\\n'; }
         "ENABLE_MUSICBOX": str(int(provider == "musicbox")),
         "ENABLE_LX": str(int(provider == "lxmusic")),
         "FNMUSIC_ONLINE_SOURCES": "kuwo,migu", "LX_SOURCES": "kg,wy",
+        # 本用例锁的就是 6b 外网搜索验收的网络面；3.0.0 起 6b 默认跳过，须显式开启
+        "FNMUSIC_VERIFY_SEARCH": "1",
         "FNMUSIC_LIBRARY_DIR": str(library), "PYTHONDONTWRITEBYTECODE": "1",
     }
     result = subprocess.run(["/bin/bash", "-c", script], cwd=tmp_path, env=env,

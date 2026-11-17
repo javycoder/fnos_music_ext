@@ -19,14 +19,24 @@ const APP_BASE = "/app/fnmusic-ext";
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", lxmusic: "洛雪自定义源", none: "未配置" };
-const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
+const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", netease: "网易云音乐", musicbox: "网易云音乐", lxmusic: "洛雪自定义源", none: "未配置" };
+const PROC_LABEL = { musicdl: "musicdl", netease: "netease", musicbox: "musicbox", lxserver: "lxserver", lxmusic: "lxmusic", webui: "WebUI" };
 
 let configValues = {};   // GET /api/config 的 values
 let configPresence = {}; // .env 显式存在的键（区分默认空与管理员清空）
 let configSchema = {};   // 旧后端缺新键时禁用对应控件且不提交未知键
+let currentConfigRevision = "";
+let userStorageStatus = null;
+let userStorageReady = false;
+let userStorageError = "";
+let savedUserDirs = {};
+let savedUserScans = {};
+let scanAdminPasswordConfigured = false;
+let scanAdminPasswordDirty = false;
+let scanAdminPasswordClear = false;
 let platforms = { enabled: [], registered: [] };
 let dirty = false;
+let editRevision = 0;
 let currentPage = "overview";
 let lxSourceListDirty = false; // 避免高级策略保存时重复触发原源列表的激活/校验流程
 const DOWNLOAD_LAYOUT_LABELS = {
@@ -40,6 +50,10 @@ let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校�
 let lxSourceList = [];    // 本地待保存配置；运行状态轮询不可覆盖 active
 let lxSourceOrder = [];   // 洛雪稳定源 ID 顺序；停用时保留历史位置
 let lxRuntimeSnapshot = null; // /api/status 的只读运行快照
+// CPU 异常按稳定源 ID 缓存：刷新失败时保留已知红标，只把当前读数降为未知。
+let lxCpuAlerts = new Map();
+let lxRuntimeStatusUnknown = false;
+let lxCpuHelpSourceId = "";
 const LX_STATE_LABEL = { unconfigured: "未配置", loading: "初始化中", ready: "可用", degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" };
 const LX_SOURCE_STATUS_LABEL = { success: "运行就绪", failed: "运行失败", loading: "初始化中", unknown: "运行状态未知" };
 let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
@@ -50,6 +64,9 @@ let publicUsersSeq = 0;
 let publicUserGuid = "";
 let publicSelectionMap = {};
 const publicUserChanges = new Set();
+let publicSyncAll = false;
+let publicSharedSelection = [];
+let publicSharedChanged = false;
 let publicCapabilities = null;
 let publicState = {
   provider: "musicbox", channel: "charts", source: "netease", category: "", sort: "",
@@ -67,7 +84,7 @@ const MAX_PUBLIC_DETAIL_CONCURRENCY = 2;
 const publicDetailAbortControllers = new Set();
 const publicDetailInflight = new Map();
 let publicDetailRun = null;
-let publicDetailRunUser = "";
+let publicDetailRunTarget = "";
 let publicProcessSnapshot = null;
 
 async function api(path, options, timeoutMs = 0) {
@@ -202,6 +219,7 @@ function toast(message, kind) {
 
 function markDirty(note) {
   dirty = true;
+  editRevision++;
   const bar = $("#save-bar");
   if (bar) bar.classList.add("show");
   const noteEl = $("#save-note");
@@ -251,6 +269,7 @@ function closeHelp() {
   helpBackgroundState = [];
   if (helpReturnFocus && typeof helpReturnFocus.focus === "function") helpReturnFocus.focus();
   helpReturnFocus = null;
+  lxCpuHelpSourceId = "";
 }
 
 $$("[data-help]").forEach((btn) => btn.addEventListener("click", () => openHelp(btn.dataset.help, btn)));
@@ -343,20 +362,26 @@ function switchPage(page) {
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
 
   const isStorageSub = page === "tee" || page === "dirs";
-  const isAdvancedSub = page === "llm" || page === "lx";
+  const isAdvancedSub = page === "llm" || page === "lx" || page === "search";
+  const isExperimentalSub = page === "exp-direct" || page === "exp-layout" || page === "exp-cleanup";
 
   const storageTitle = $("#nav-storage-title");
   if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
   const advancedTitle = $("#nav-advanced-title");
   if (advancedTitle) advancedTitle.classList.toggle("active", isAdvancedSub);
+  const experimentalTitle = $("#nav-experimental-title");
+  if (experimentalTitle) experimentalTitle.classList.toggle("active", isExperimentalSub);
 
   const bottomStorage = $("#bottom-storage-trigger");
   if (bottomStorage) bottomStorage.classList.toggle("active", isStorageSub);
   const bottomAdvanced = $("#bottom-advanced-trigger");
   if (bottomAdvanced) bottomAdvanced.classList.toggle("active", isAdvancedSub);
+  const bottomExperimental = $("#bottom-experimental-trigger");
+  if (bottomExperimental) bottomExperimental.classList.toggle("active", isExperimentalSub);
 
   if (isStorageSub) setNavGroupExpanded("storage", true, true);
   if (isAdvancedSub) setNavGroupExpanded("advanced", true, true);
+  if (isExperimentalSub) setNavGroupExpanded("experimental", true, true);
 
   closeBottomSubMenu(false);
 
@@ -370,7 +395,7 @@ function switchPage(page) {
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
 
 // 一级菜单纯折叠：不跳页、不标脏、首访收起、记忆到 localStorage
-["storage", "advanced"].forEach((group) => {
+["storage", "advanced", "experimental"].forEach((group) => {
   const expanded = isNavGroupExpanded(group);
   setNavGroupExpanded(group, expanded, false);
   const titleBtn = $("#nav-" + group + "-title");
@@ -387,6 +412,7 @@ $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPag
 [
   ["#bottom-storage-trigger", "#bottom-storage-menu"],
   ["#bottom-advanced-trigger", "#bottom-advanced-menu"],
+  ["#bottom-experimental-trigger", "#bottom-experimental-menu"],
 ].forEach(([triggerSel, menuSel]) => {
   const trigger = $(triggerSel);
   const menu = $(menuSel);
@@ -550,6 +576,8 @@ async function loadStatus(timeoutMs = 0) {
       return `<span class="state-line"><span class="dot ok"></span>${escapeHtml(PROC_LABEL[name])}：正常</span>`;
     }).join("");
     lxRuntimeSnapshot = st.lx_source || null;
+    lxRuntimeStatusUnknown = false;
+    syncLxCpuAlerts((lxRuntimeSnapshot || {}).sources);
     syncLxSourceOrder();
     renderLxSourceList(); // 只同步运行徽标，不重载配置或丢弃尚未保存的编辑。
     renderLxSourceOrder();
@@ -585,6 +613,7 @@ async function loadStatus(timeoutMs = 0) {
   } catch (exc) {
     // 旧快照不能无限期显示绿色“运行就绪”；保留用户尚未保存的编辑。
     lxRuntimeSnapshot = null;
+    lxRuntimeStatusUnknown = true;
     renderLxSourceList();
     $("#ov-provider-body").textContent = "状态加载失败：" + exc.message;
     $("#ov-processes").innerHTML = '<span class="chip"><span class="dot"></span>进程状态未知（获取失败）</span>';
@@ -598,7 +627,9 @@ async function loadConfig(timeoutMs = 0) {
   const cfg = await api("/api/config", undefined, timeoutMs);
   configValues = cfg.values;
   configPresence = cfg.presence || {};
+  currentConfigRevision = cfg.revision || "";
   configSchema = cfg.schema || {};
+  scanAdminPasswordConfigured = Boolean(cfg.scan_admin_password_configured);
   const expectedBuild = typeof window !== "undefined" ? window.FNMUSIC_WEBUI_BUILD || "" : "";
   const apiBuild = cfg.webui_build || "";
   const mismatch = Boolean(expectedBuild && apiBuild && expectedBuild !== apiBuild)
@@ -606,7 +637,10 @@ async function loadConfig(timeoutMs = 0) {
   $("#webui-build-mismatch").hidden = !mismatch;
   applyConfigToForm();
   clearDirty();
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) await loadMusicUsers();
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    try { await loadMusicUsers(); } catch (err) { console.warn("加载歌单用户列表异常", err); }
+  }
+  try { await loadUserStorage(); } catch (err) { console.warn("加载用户目录异常", err); }
 }
 
 function applyConfigToForm() {
@@ -641,17 +675,29 @@ function applyConfigToForm() {
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
+  const supportsSyncAll = Boolean(configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL);
+  const syncAllEl = $("#public-playlists-sync-all");
+  syncAllEl.disabled = !supportsSyncAll || !$("#public-playlists-enabled").checked;
+  publicSyncAll = supportsSyncAll && v.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL === "true";
+  syncAllEl.checked = publicSyncAll;
   publicSelectionDetailSeq++;
+  abortActivePublicDetailRequests();
   publicUserChanges.clear();
+  publicSharedChanged = false;
+  try {
+    const sharedSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
+    publicSharedSelection = Array.isArray(sharedSelection) ? sharedSelection : [];
+  } catch (_) { publicSharedSelection = []; }
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
     try {
       const mapping = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || "{}");
       publicSelectionMap = mapping && typeof mapping === "object" && !Array.isArray(mapping) ? mapping : {};
     } catch (_) { publicSelectionMap = {}; }
-    publicSelection = Array.isArray(publicSelectionMap[publicUserGuid]) ? publicSelectionMap[publicUserGuid] : [];
+    publicSelection = publicSyncAll
+      ? publicSharedSelection
+      : (Array.isArray(publicSelectionMap[publicUserGuid]) ? publicSelectionMap[publicUserGuid] : []);
   } else try {
-    publicSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
-    if (!Array.isArray(publicSelection)) publicSelection = [];
+    publicSelection = publicSharedSelection;
   } catch (_) { publicSelection = []; }
   $("#public-playlists-browser").hidden = !$("#public-playlists-enabled").checked;
   renderMusicUsers();
@@ -677,6 +723,20 @@ function applyConfigToForm() {
   updateScanLabels();
   updateTeeCountLabel();
   updateBindTimeoutLabel();
+  if ($("#tee-save-by-user")) {
+    $("#tee-save-by-user").checked = v.FNMUSIC_TEE_SAVE_BY_USER === "true";
+    $("#tee-save-by-user").disabled = !configSchema.FNMUSIC_TEE_SAVE_BY_USER;
+  }
+  savedUserDirs = parseUserMap(v.FNMUSIC_TEE_SAVE_DIR_BY_USER);
+  savedUserScans = parseUserMap(v.FNMUSIC_LIBRARY_SCAN_BY_USER);
+  if ($("#scan-admin-username")) $("#scan-admin-username").value = v.FNMUSIC_SCAN_ADMIN_USERNAME || "";
+  if ($("#scan-admin-device-id")) $("#scan-admin-device-id").value = v.FNMUSIC_SCAN_ADMIN_DEVICE_ID || "";
+  scanAdminPasswordDirty = false;
+  scanAdminPasswordClear = false;
+  if ($("#scan-admin-password")) {
+    $("#scan-admin-password").value = "";
+    $("#scan-admin-password").placeholder = scanAdminPasswordConfigured ? "已保存，留空表示不修改" : "未配置";
+  }
   $("#llm-base").value = v.FNMUSIC_LLM_BASE_URL || "";
   $("#llm-key").value = v.FNMUSIC_LLM_API_KEY || "";
   $("#llm-model").value = v.FNMUSIC_LLM_MODEL || "";
@@ -690,7 +750,7 @@ function applyConfigToForm() {
   $("#liked-size").value = v.FNMUSIC_LIKED_SIZE ?? "20";
   updateLlmLikedSettings();
   refreshLlmUsage();
-  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
+  $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "30";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
@@ -754,6 +814,8 @@ function collectConfig() {
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
     FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: $("#public-playlists-enabled").checked,
+    ...(configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL
+      ? { FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: publicSyncAll } : {}),
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
@@ -768,6 +830,13 @@ function collectConfig() {
     FNMUSIC_LIBRARY_SCAN_PATH: $("#scan-path").value.trim(),
     FNMUSIC_SCAN_DELAY_S: parseFloat($("#scan-delay").value) || 0,
     FNMUSIC_SCAN_COOLDOWN_S: parseFloat($("#scan-cooldown").value) || 0,
+    ...(configSchema.FNMUSIC_TEE_SAVE_BY_USER && $("#tee-save-by-user")
+      ? { FNMUSIC_TEE_SAVE_BY_USER: $("#tee-save-by-user").checked } : {}),
+    ...(configSchema.FNMUSIC_SCAN_ADMIN_USERNAME && $("#scan-admin-username")
+      ? { FNMUSIC_SCAN_ADMIN_USERNAME: $("#scan-admin-username").value.trim() } : {}),
+    ...(configSchema.FNMUSIC_SCAN_ADMIN_DEVICE_ID && $("#scan-admin-device-id")
+      ? { FNMUSIC_SCAN_ADMIN_DEVICE_ID: $("#scan-admin-device-id").value.trim() } : {}),
+    ...scanAdminPasswordUpdate(),
     FNMUSIC_LLM_BASE_URL: $("#llm-base").value.trim(),
     FNMUSIC_LLM_API_KEY: $("#llm-key").value.trim(),
     FNMUSIC_LLM_MODEL: $("#llm-model").value.trim(),
@@ -777,7 +846,7 @@ function collectConfig() {
     FNMUSIC_LLM_EXTRA_BODY: $("#llm-extra-body").value.trim(),
     FNMUSIC_LLM_LIKED_ENABLED: $("#llm-liked").checked,
     FNMUSIC_LLM_DAILY_ENABLED: $("#llm-daily").checked,
-    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
+    FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "30", 10) || 30,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
@@ -796,19 +865,25 @@ function collectConfig() {
   }
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
     stashPublicUser();
-    if (publicUsersReady && publicUserChanges.size) {
+    if (publicUserChanges.size) {
       const changes = {};
       for (const user of publicUserChanges) {
-        changes[user] = (publicSelectionMap[user] || []).map(({ provider, source, kind, id }) =>
-          ({ provider, source, kind, id }));
+        changes[user] = publicSelectionPayload(publicSelectionMap[user] || []);
       }
       values.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = JSON.stringify(changes);
     }
+    if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL
+        && (publicSharedChanged || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION)) {
+      values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
+        publicSelectionPayload(publicSharedSelection)
+      );
+    }
   } else if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
     values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
-      publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))
+      publicSelectionPayload(publicSelection)
     );
   }
+  Object.assign(values, userStorageConfigPatch());
   const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
   const cacheDir = values.FNMUSIC_CACHE_DIR;
   for (const [label, p] of [["下载目录", dlDir], ["歌曲缓存目录", cacheDir]]) {
@@ -819,6 +894,7 @@ function collectConfig() {
   if (dlDir && cacheDir && (dlDir === cacheDir || dlDir.startsWith(cacheDir + "/") || cacheDir.startsWith(dlDir + "/"))) {
     throw new Error("歌曲缓存目录与下载目录不能相同或互为父子目录");
   }
+  validateUserStoragePatch(values);
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
@@ -846,6 +922,49 @@ function filterConfigBySchema(values) {
   return Object.fromEntries(Object.entries(values).filter(([key]) => supported.has(key)));
 }
 
+async function pollConfigJob(jobId, onProgress, timeoutMs = 60000) {
+  const deadline = performance.now() + timeoutMs;
+  const interval = globalThis.CONFIG_JOB_POLL_INTERVAL ?? 600;
+  while (performance.now() < deadline) {
+    try {
+      const data = await api(`/api/config/jobs/${encodeURIComponent(jobId)}`, undefined,
+        Math.max(1, deadline - performance.now()));
+      const job = data.job;
+      if (!job) throw new Error("无法获取任务详情");
+      if (onProgress) onProgress(job);
+      if (["success", "partial"].includes(job.status)) return job.result || {};
+      if (["failed", "conflict"].includes(job.status)) throw Object.assign(
+        new Error(job.error || job.message || "保存失败"), {terminal: true});
+    } catch (exc) {
+      if (exc.status === 404 || exc.terminal) throw exc;
+    }
+    if (interval > 0) await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  throw new Error("保存已达到时限，请刷新运行状态查看结果");
+}
+
+async function checkActiveConfigJob() {
+  try {
+    const data = await api("/api/config/jobs/active", undefined, 3000);
+    if (!data.active || !data.job) return;
+    const btn = $("#save-btn");
+    btn.disabled = true;
+    try {
+      await pollConfigJob(data.job.job_id, (job) => {
+        btn.textContent = `保存中（${job.progress || 0}%）…`;
+      });
+      await loadConfig(3000);
+      clearDirty();
+      toast("配置已保存生效", "ok");
+    } catch (exc) {
+      toast("保存任务失败：" + exc.message, "fail");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "保存并生效";
+    }
+  } catch (_) { /* 旧后端可无任务接口 */ }
+}
+
 async function saveConfig() {
   const btn = $("#save-btn");
   if (btn.disabled) return;
@@ -865,16 +984,28 @@ async function saveConfig() {
         if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
       }
     }
+    const dirPatch = values.FNMUSIC_TEE_SAVE_DIR_BY_USER || {};
+    for (const [guid, path] of Object.entries(dirPatch)) {
+      if (!path || path === (savedUserDirs[guid] || "")) continue;
+      const res = await fsCheckDir(path, Math.max(1, started + 3000 - performance.now()));
+      if (res.mode === "fail") { toast("用户目录不可用：" + res.message, "fail"); return; }
+    }
     const pendingNew = lxPendingActivationCount();
     btn.textContent = pendingNew > 0
       ? `保存中（快速确认 ${pendingNew} 个新源，一分钟内返回）…`
       : "保存中（一分钟内返回）…";
     if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
-    const result = await api("/api/config", {
+    let result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values }),
+      body: JSON.stringify({ values, base_revision: currentConfigRevision || null }),
     }, remaining());
+    if (result.job_id && ["pending", "running"].includes(result.status)) {
+      result = await pollConfigJob(result.job_id, (job) => {
+        btn.textContent = `保存中（${job.progress || 0}%）…`;
+      }, remaining());
+    }
+    if (result.new_revision) currentConfigRevision = result.new_revision;
     const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
     const warnings = result.warnings || [];
     const parts = [];
@@ -911,6 +1042,8 @@ async function saveConfig() {
     } else {
       toast(parts.join("；") || "配置无变化", "ok");
     }
+    // 只按本次已确认成功的停用操作清标；部分失败或超时不能凭本地表单状态清除。
+    clearLxCpuAlertsAfterSavedConfig(result);
     if (result.values) {
       configValues = { ...configValues, ...result.values };
       applyConfigToForm();
@@ -1022,6 +1155,207 @@ function renderPlatformChips() {
 }
 $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
+$("#platform-test-btn").addEventListener("click", () => {
+  const panel = $("#platform-test-panel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden && !$("#platform-test-tbody").children.length) renderPlatformTestTable([]);
+});
+
+/* -------------------------------------------------------------- 平台批量测试 */
+let platformTestJob = null;
+let platformTestTimer = null;
+let platformTestPolling = false;
+
+function formatPlatformLatency(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 1000) return `${Math.round(n)}ms`;
+  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}s`;
+}
+
+function renderPlatformTestStats(done, total, okCount, failCount) {
+  const setText = (sel, text) => { const el = $(sel); if (el) el.textContent = text; };
+  setText("#platform-test-stat-done", `${done}/${total}`);
+  setText("#platform-test-stat-ok", String(okCount));
+  setText("#platform-test-stat-fail", String(failCount));
+}
+
+function setPlatformTestMessage(text) {
+  const el = $("#platform-test-summary");
+  if (el) el.textContent = text || "";
+}
+
+function renderPlatformTestTable(results) {
+  const tbody = $("#platform-test-tbody");
+  const wrap = $("#platform-test-table-wrap");
+  if (!results || !results.length) { wrap.hidden = true; tbody.innerHTML = ""; return; }
+  wrap.hidden = false;
+  const enabledSet = new Set(platforms.enabled);
+  tbody.innerHTML = results.map((r) => {
+    const ok = r.status === "ok";
+    const cls = ok ? "ok" : "err";
+    const titles = ok ? (r.titles || [r.title]).filter(Boolean).join("、") : (r.error || "");
+    const isOn = enabledSet.has(r.platform);
+    const badge = ok ? '<span class="pt-badge ok">✓ 可用</span>' : '<span class="pt-badge err">✗ 不可用</span>';
+    const toggle = `<button class="btn small platform-toggle${isOn ? " on" : ""}" data-platform="${escapeHtml(r.platform)}" data-on="${isOn}">${isOn ? "停用" : "启用"}</button>`;
+    const count = Number.isFinite(Number(r.count)) ? Number(r.count) : 0;
+    return `<tr class="${cls}">`
+      + `<td class="pt-name">${escapeHtml(r.platform)}</td>`
+      + `<td><div class="pt-status">${badge}${toggle}</div></td>`
+      + `<td class="num">${formatPlatformLatency(r.latency_ms)}</td>`
+      + `<td class="num">${count}</td>`
+      + `<td class="pt-sample" title="${escapeHtml(titles)}">${escapeHtml(titles || "—")}</td>`
+      + `</tr>`;
+  }).join("");
+  tbody.querySelectorAll(".platform-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = btn.dataset.platform;
+      const set = new Set(platforms.enabled);
+      if (set.has(p)) set.delete(p); else set.add(p);
+      platforms.enabled = Array.from(set);
+      renderPlatformChips();
+      renderPlatformTestTable(platformTestJob ? platformTestJob.results : results);
+      markDirty("musicdl 平台已修改");
+    });
+  });
+}
+
+function updatePlatformTestProgress(done, total) {
+  const wrap = $("#platform-test-progress-wrap");
+  const fill = $("#platform-test-progress");
+  const text = $("#platform-test-progress-text");
+  wrap.hidden = false;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  fill.style.width = pct + "%";
+  text.textContent = `${done}/${total} · ${pct}%`;
+}
+
+async function pollPlatformTestJob() {
+  if (platformTestPolling || !platformTestJob || platformTestJob.status !== "running") return;
+  const job = platformTestJob;
+  platformTestPolling = true;
+  try {
+    const data = await api("/api/platforms/test/status?job=" + encodeURIComponent(job.job_id), undefined, 5000);
+    if (platformTestJob !== job || job.status !== "running") return;
+    if (!data.ok) throw new Error(data.error || "status failed");
+    platformTestJob.status = data.status;
+    platformTestJob.results = data.results || [];
+    platformTestJob.progress = data.progress || platformTestJob.progress;
+    renderPlatformTestTable(platformTestJob.results);
+    updatePlatformTestProgress(platformTestJob.progress.done, platformTestJob.progress.total);
+    const okCount = data.ok_count ?? platformTestJob.results.filter((r) => r.status === "ok").length;
+    const failCount = (data.fail_count ?? platformTestJob.results.filter((r) => r.status !== "ok").length);
+    renderPlatformTestStats(platformTestJob.progress.done, platformTestJob.progress.total, okCount, failCount);
+    $("#platform-test-enable-ok").textContent = `启用成功的 (${okCount})`;
+    $("#platform-test-disable-fail").textContent = `关闭无效的 (${failCount})`;
+    if (data.status !== "running") {
+      $("#platform-test-actions").hidden = false;
+      $("#platform-test-start").disabled = false;
+      $("#platform-test-stop").disabled = true;
+      setPlatformTestMessage(data.status === "done" ? "测试完成，可批量启停平台" :
+        data.status === "cancelled" ? "已停止，可操作已完成的结果" : "测试失败，可重新测试");
+      clearTimeout(platformTestTimer);
+      platformTestTimer = null;
+    } else {
+      setPlatformTestMessage("测试进行中…");
+      platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+    }
+  } catch (exc) {
+    if (platformTestJob !== job || job.status !== "running") return;
+    if (exc.status === 404) {
+      job.status = "expired";
+      $("#platform-test-start").disabled = false;
+      $("#platform-test-stop").disabled = true;
+      setPlatformTestMessage("测试记录已过期，请重新测试");
+    } else {
+      setPlatformTestMessage(`查询失败，将重试：${exc.message}`);
+      platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+    }
+  } finally {
+    platformTestPolling = false;
+  }
+}
+
+async function startPlatformTest() {
+  const keyword = $("#platform-test-keyword").value.trim() || "周杰伦";
+  const concurrency = parseInt($("#platform-test-concurrency").value, 10) || 4;
+  $("#platform-test-start").disabled = true;
+  $("#platform-test-stop").disabled = true;
+  clearTimeout(platformTestTimer);
+  platformTestJob = null;
+  $("#platform-test-actions").hidden = true;
+  setPlatformTestMessage("正在启动…");
+  renderPlatformTestStats(0, 0, 0, 0);
+  renderPlatformTestTable([]);
+  $("#platform-test-progress-wrap").hidden = true;
+  try {
+    const data = await api("/api/platforms/test/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword, concurrency }) }, 15000);
+    if (!data.ok) throw new Error(data.error || "start failed");
+    platformTestJob = { job_id: data.job_id, status: "running", results: [], progress: { done: 0, total: data.total } };
+    $("#platform-test-stop").disabled = false;
+    updatePlatformTestProgress(0, data.total);
+    platformTestTimer = setTimeout(pollPlatformTestJob, 1000);
+  } catch (exc) {
+    setPlatformTestMessage(`启动失败：${exc.message}`);
+    $("#platform-test-start").disabled = false;
+    $("#platform-test-stop").disabled = true;
+  }
+}
+
+async function stopPlatformTest() {
+  const job = platformTestJob;
+  if (!job || job.status !== "running") return;
+  $("#platform-test-stop").disabled = true;
+  try {
+    const data = await api("/api/platforms/test/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.job_id }) }, 10000);
+    if (!data.ok) throw new Error(data.error || "stop failed");
+    if (platformTestJob !== job) return;
+    job.status = "cancelled";
+    clearTimeout(platformTestTimer);
+    platformTestTimer = null;
+    $("#platform-test-start").disabled = false;
+    $("#platform-test-actions").hidden = false;
+    setPlatformTestMessage("已停止，可操作已完成的结果");
+  } catch (exc) {
+    if (platformTestJob !== job) return;
+    $("#platform-test-stop").disabled = job.status !== "running";
+    setPlatformTestMessage(`停止失败：${exc.message}`);
+  }
+}
+
+$("#platform-test-start").addEventListener("click", startPlatformTest);
+$("#platform-test-stop").addEventListener("click", stopPlatformTest);
+$("#platform-test-enable-ok").addEventListener("click", () => {
+  const okPlatforms = platformTestJob ? platformTestJob.results.filter((r) => r.status === "ok").map((r) => r.platform) : [];
+  const set = new Set(platforms.enabled);
+  okPlatforms.forEach((p) => set.add(p));
+  platforms.enabled = Array.from(set);
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已启用测试成功的平台");
+});
+$("#platform-test-disable-fail").addEventListener("click", () => {
+  const failPlatforms = platformTestJob ? platformTestJob.results.filter((r) => r.status !== "ok").map((r) => r.platform) : [];
+  const set = new Set(platforms.enabled);
+  failPlatforms.forEach((p) => set.delete(p));
+  platforms.enabled = Array.from(set);
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已关闭测试失败的平台");
+});
+$("#platform-test-enable-all").addEventListener("click", () => {
+  const all = platformTestJob ? platformTestJob.results.map((r) => r.platform) : platforms.registered;
+  platforms.enabled = Array.from(new Set(all));
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已启用全部测试平台");
+});
+$("#platform-test-disable-all").addEventListener("click", () => {
+  platforms.enabled = [];
+  renderPlatformChips();
+  renderPlatformTestTable(platformTestJob ? platformTestJob.results : []);
+  markDirty("已停用全部平台");
+});
 
 /* -------------------------------------------------------------- 公共歌单 */
 const PUBLIC_PROVIDER_OPTIONS = [
@@ -1030,7 +1364,30 @@ const PUBLIC_PROVIDER_OPTIONS = [
 ];
 const PUBLIC_SOURCE_LABEL = { netease: "网易", wy: "网易", kw: "酷我", kg: "酷狗", tx: "QQ", mg: "咪咕" };
 
+function publicSelectionPayload(selection) {
+  return (selection || []).map(({ provider, source, kind, id }) =>
+    ({ provider, source, kind, id }));
+}
+
+function publicSelectionTarget() {
+  return publicSyncAll ? "all" : `user:${publicUserGuid}`;
+}
+
+function publicSelectionEditable() {
+  if (!$("#public-playlists-enabled").checked) return false;
+  if (publicSyncAll) return true;
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+    return publicUsersReady && Boolean(publicUserGuid);
+  }
+  return true;
+}
+
 function stashPublicUser(changed = false) {
+  if (publicSyncAll) {
+    publicSharedSelection = publicSelection;
+    if (changed) publicSharedChanged = true;
+    return;
+  }
   if (!configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || !publicUserGuid) return;
   publicSelectionMap[publicUserGuid] = publicSelection;
   if (changed) publicUserChanges.add(publicUserGuid);
@@ -1043,11 +1400,22 @@ function renderMusicUsers() {
   panel.hidden = !perUser || !$("#public-playlists-enabled").checked;
   if (!perUser) return;
   const selector = $("#public-user");
+  const syncAllEl = $("#public-playlists-sync-all");
+  syncAllEl.disabled = !configSchema.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL
+    || !$("#public-playlists-enabled").checked;
+  syncAllEl.checked = publicSyncAll;
   selector.innerHTML = '<option value="">请先选择飞牛音乐用户</option>' + publicUsers.map((user) =>
     `<option value="${escapeHtml(user.guid)}">${escapeHtml(user.name || user.guid)}${user.role === "admin" ? "（管理员）" : ""}</option>`).join("");
   selector.value = publicUserGuid;
-  selector.disabled = !publicUsersReady || !publicUsers.length;
-  $("#public-playlists-browser").hidden = panel.hidden || !publicUsersReady || !publicUserGuid;
+  selector.disabled = publicSyncAll || !publicUsersReady || !publicUsers.length;
+  $("#public-playlists-browser").hidden = !publicSelectionEditable();
+  $("#public-users-note").textContent = publicSyncAll
+    ? "正在配置所有用户共享的歌单；个人配置已保留。"
+    : (publicUsersReady
+      ? (publicUsers.length
+        ? `共 ${publicUsers.length} 位有效用户。先选择用户，再配置歌单；新用户默认没有公共歌单。`
+        : "飞牛音乐中还没有有效用户。请先登录飞牛音乐，再刷新用户。")
+      : $("#public-users-note").textContent);
 }
 
 async function loadMusicUsers() {
@@ -1064,16 +1432,15 @@ async function loadMusicUsers() {
       publicSelectionMap = data.public_playlists_by_user;
     }
     if (!publicUsers.some((user) => user.guid === publicUserGuid)) publicUserGuid = "";
-    publicSelection = publicSelectionMap[publicUserGuid] || [];
-    $("#public-users-note").textContent = publicUsers.length
-      ? `共 ${publicUsers.length} 位有效用户。先选择用户，再配置歌单；新用户默认没有公共歌单。`
-      : "飞牛音乐中还没有有效用户。请先登录飞牛音乐，再刷新用户。";
+    if (!publicSyncAll) publicSelection = publicSelectionMap[publicUserGuid] || [];
   } catch (exc) {
     if (seq !== publicUsersSeq) return;
     publicUsersReady = false;
-    invalidatePublicBrowse();
-    publicSelectionDetailSeq++;
-    abortActivePublicDetailRequests();
+    if (!publicSyncAll) {
+      invalidatePublicBrowse();
+      publicSelectionDetailSeq++;
+      abortActivePublicDetailRequests();
+    }
     const isDirectRestricted = (exc && (exc.status === 403 || exc.status === 501))
       || String(exc && exc.message || "").includes("403")
       || String(exc && exc.message || "").includes("501")
@@ -1090,7 +1457,7 @@ async function loadMusicUsers() {
       $("#public-users-retry").disabled = false;
       renderMusicUsers();
       renderPublicSelected();
-      if (publicUsersReady) void ensurePublicSelectionDetails();
+      if (publicSelectionEditable()) void ensurePublicSelectionDetails();
       updateResidentAvailability();
     }
   }
@@ -1098,6 +1465,10 @@ async function loadMusicUsers() {
 
 async function selectPublicUser(guid) {
   stashPublicUser();
+  if (publicSyncAll) {
+    renderMusicUsers();
+    return;
+  }
   invalidatePublicBrowse();
   publicSelectionDetailSeq++;
   abortActivePublicDetailRequests();
@@ -1112,18 +1483,20 @@ async function selectPublicUser(guid) {
 $("#public-user").addEventListener("change", () => selectPublicUser($("#public-user").value));
 $("#public-users-retry").addEventListener("click", async () => {
   await loadMusicUsers();
-  if (publicUsersReady && publicUserGuid) await showPublicBrowser();
+  if (publicSelectionEditable()) await showPublicBrowser();
 });
 
 function anyPublicMusicboxSelection() {
   stashPublicUser();
-  const selections = configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER
-    ? Object.values(publicSelectionMap) : [publicSelection];
-  return selections.some((selection) => Array.isArray(selection) && selection.some((item) => item.provider === "musicbox"));
+  const selections = publicSyncAll
+    ? [publicSharedSelection]
+    : (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER ? Object.values(publicSelectionMap) : [publicSelection]);
+  return selections.some((selection) => Array.isArray(selection) && selection.some((item) => item.provider === "netease" || item.provider === "musicbox"));
 }
 
 function publicEntryKey(item) {
-  return [item.provider, item.source, item.provider === "musicbox" ? "playlist" : item.kind, item.id].join("|");
+  const isNetease = item.provider === "netease" || item.provider === "musicbox";
+  return [isNetease ? "netease" : item.provider, item.source, isNetease ? "playlist" : item.kind, item.id].join("|");
 }
 
 function selectedPublicEntry(item) {
@@ -1131,7 +1504,7 @@ function selectedPublicEntry(item) {
 }
 
 function setPublicSelection(item, selected) {
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) return false;
+  if (!publicSelectionEditable()) return false;
   if (selected) {
     if (selectedPublicEntry(item)) return true;
     if (publicSelection.length >= 50) {
@@ -1411,14 +1784,15 @@ function abortActivePublicDetailRequests() {
 }
 
 async function ensurePublicSelectionDetails() {
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) return;
+  if (!publicSelectionEditable()) return;
   // Removing entries cancels only their own work. Browsing never cancels names.
   const keys = new Set(publicSelection.map(publicEntryKey));
   for (const ctrl of publicDetailAbortControllers) {
     if (!keys.has(ctrl.publicKey)) ctrl.abort();
   }
-  if (publicDetailRun && publicDetailRunUser === publicUserGuid) return publicDetailRun;
-  publicDetailRunUser = publicUserGuid;
+  const target = publicSelectionTarget();
+  if (publicDetailRun && publicDetailRunTarget === target) return publicDetailRun;
+  publicDetailRunTarget = target;
   const run = runPublicSelectionDetails();
   publicDetailRun = run;
   try {
@@ -1437,7 +1811,7 @@ async function ensurePublicSelectionDetails() {
 
 async function runPublicSelectionDetails() {
   const seq = ++publicSelectionDetailSeq;
-  const currentUserGuid = publicUserGuid;
+  const currentTarget = publicSelectionTarget();
 
   for (const item of publicSelection) {
     if (item._name) {
@@ -1467,7 +1841,7 @@ async function runPublicSelectionDetails() {
 
   return new Promise((resolve) => {
     function scheduleNext() {
-      if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) {
+      if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget) {
         resolve();
         return;
       }
@@ -1476,7 +1850,7 @@ async function runPublicSelectionDetails() {
         return;
       }
       while (activeWorkers < MAX_PUBLIC_DETAIL_CONCURRENCY && queueIndex < toFetch.length) {
-        if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) {
+        if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget) {
           resolve();
           return;
         }
@@ -1490,7 +1864,7 @@ async function runPublicSelectionDetails() {
           renderPublicSelected();
           publicDetailInflight.get(key).then(() => {
             activeWorkers--;
-            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+            if (seq === publicSelectionDetailSeq && publicSelectionTarget() === currentTarget) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
@@ -1499,7 +1873,7 @@ async function runPublicSelectionDetails() {
             scheduleNext();
           }).catch(() => {
             activeWorkers--;
-            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+            if (seq === publicSelectionDetailSeq && publicSelectionTarget() === currentTarget) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
@@ -1526,7 +1900,7 @@ async function runPublicSelectionDetails() {
         const fetchPromise = (async () => {
           try {
             const detail = await fetchPublicItemDetail(item, controller.signal);
-            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid
+            if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget
                 || !publicSelection.includes(item)) return;
             setPublicDetailCache(key, {
               name: detail.name || "",
@@ -1534,7 +1908,7 @@ async function runPublicSelectionDetails() {
               track_count: detail.track_count || 0,
             }, true);
           } catch (exc) {
-            if (seq !== publicSelectionDetailSeq || publicUserGuid !== currentUserGuid) return;
+            if (seq !== publicSelectionDetailSeq || publicSelectionTarget() !== currentTarget) return;
             if (!publicSelection.includes(item)) return;
             setPublicDetailCache(key, { failed: true, failedAt: Date.now() });
             unavailable = exc.status === 503 && /未运行|not.running|not.started/i.test(exc.message);
@@ -1543,7 +1917,7 @@ async function runPublicSelectionDetails() {
             publicDetailAbortControllers.delete(controller);
             if (publicDetailInflight.get(key) === fetchPromise) publicDetailInflight.delete(key);
             activeWorkers--;
-            if (seq === publicSelectionDetailSeq && publicUserGuid === currentUserGuid) {
+            if (seq === publicSelectionDetailSeq && publicSelectionTarget() === currentTarget) {
               for (const it of publicSelection) {
                 if (publicEntryKey(it) === key) applyPublicDetailCache(it);
               }
@@ -1640,7 +2014,8 @@ function renderPublicControls() {
     `<option value="${item.value}">${item.label}</option>`).join("");
   providerSelect.value = publicState.provider;
 
-  const channels = publicState.provider === "musicbox" ? [
+  const isNetease = publicState.provider === "netease" || publicState.provider === "musicbox";
+  const channels = isNetease ? [
     { id: "charts", name: "排行榜" }, { id: "recommend", name: "推荐歌单" },
     { id: "top", name: "热门与分类" }, { id: "highquality", name: "精品歌单" },
     { id: "account_recommend", name: "账号推荐歌单" },
@@ -1650,7 +2025,7 @@ function renderPublicControls() {
     item.id !== "account_recommend" || logged).map((item) =>
     `<option value="${item.id}">${item.name}</option>`).join("");
   if (![...channelSelect.options].some((opt) => opt.value === publicState.channel)) {
-    publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
+    publicState.channel = isNetease ? "charts" : "top";
   }
   channelSelect.value = publicState.channel;
 
@@ -1690,7 +2065,7 @@ async function loadPublicCategories(seq = publicState.seq) {
     return;
   }
   try {
-    const highquality = provider === "musicbox" && channel === "highquality";
+    const highquality = (provider === "netease" || provider === "musicbox") && channel === "highquality";
     const data = await publicApi("categories", {
       source, kind: channel === "charts" ? "chart" : "playlist",
     }, true, provider);
@@ -1946,7 +2321,7 @@ async function initPublicDefaults() {
 }
 
 async function showPublicBrowser() {
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER && (!publicUsersReady || !publicUserGuid)) {
+  if (!publicSelectionEditable()) {
     renderMusicUsers();
     return;
   }
@@ -1956,6 +2331,26 @@ async function showPublicBrowser() {
   const seq = await reloadPublicBrowser(true);
   if (seq === publicState.seq && saved === "musicdl") $("#public-note").textContent = "当前音源是 musicdl：它没有统一推荐歌单接口；可浏览网易/洛雪，保存后按常驻规则展示网易公共歌单。";
 }
+
+$("#public-playlists-sync-all").addEventListener("change", async () => {
+  const nextSyncAll = $("#public-playlists-sync-all").checked;
+  stashPublicUser();
+  invalidatePublicBrowse();
+  publicSelectionDetailSeq++;
+  abortActivePublicDetailRequests();
+  publicSyncAll = nextSyncAll;
+  $("#public-playlists-sync-all").checked = publicSyncAll;
+  publicSelection = publicSyncAll
+    ? publicSharedSelection
+    : (publicSelectionMap[publicUserGuid] || []);
+  renderMusicUsers();
+  renderPublicSelected();
+  updateResidentAvailability();
+  markDirty(publicSyncAll ? "公共歌单已切换为全部用户共享" : "公共歌单已切换为按用户配置");
+  if (!$("#public-playlists-enabled").checked) return;
+  if (!publicSyncAll && !publicUsersReady) await loadMusicUsers();
+  if (publicSelectionEditable()) await showPublicBrowser();
+});
 
 $("#public-playlists-enabled").addEventListener("change", async () => {
   const enabled = $("#public-playlists-enabled").checked;
@@ -1971,7 +2366,7 @@ $("#public-playlists-enabled").addEventListener("change", async () => {
     return;
   }
   if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
-    if (!publicUsersReady) await loadMusicUsers();
+    if (!publicSyncAll && !publicUsersReady) await loadMusicUsers();
   } else if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
   await showPublicBrowser();
 });
@@ -2180,8 +2575,144 @@ function lxPendingActivationCount() {
   return lxSourceList.filter((i) => i.active && !saved.has(i.url)).length;
 }
 
+function lxCpuAlertFromSource(source) {
+  if (!source || typeof source !== "object") return null;
+  const usage = source.resource_usage;
+  if (!usage || typeof usage !== "object" || usage.abnormal !== true) return null;
+  const sourceId = String(source.id || "").trim();
+  if (!sourceId) return null;
+  const finite = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+  return {
+    sourceId,
+    name: String(source.name || sourceId),
+    runtimeId: String(usage.runtime_id || source.runtime_id || ""),
+    cpuPercent: finite(usage.cpu_percent),
+    thresholdPercent: finite(usage.threshold_percent) ?? 50,
+    requiredDurationS: finite(usage.required_duration_s) ?? 180,
+    highDurationS: finite(usage.high_duration_s),
+    monitoringStatus: String(usage.monitoring_status || "unknown"),
+    detectedAt: String(usage.detected_at || ""),
+    processState: String(source.process_state || ""),
+  };
+}
+
+function syncLxCpuAlerts(sources) {
+  if (!Array.isArray(sources)) return; // 状态不可读时不能据空列表清除历史告警。
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const sourceId = String(source.id || "").trim();
+    if (!sourceId) continue;
+    const alert = lxCpuAlertFromSource(source);
+    if (alert) {
+      lxCpuAlerts.set(sourceId, alert);
+      continue;
+    }
+    const cached = lxCpuAlerts.get(sourceId);
+    if (!cached) continue;
+    const usage = source.resource_usage;
+    const runtimeId = String((usage && usage.runtime_id) || source.runtime_id || "");
+    if (String((usage && usage.monitoring_status) || "") === "stopped"
+        || ["stopped", "disabled"].includes(String(source.process_state || ""))) {
+      lxCpuAlerts.delete(sourceId);
+      continue;
+    }
+    // 进程实例变化即重新计时；同一实例只认后端锁定状态，不能因短暂低载清除。
+    if (cached.runtimeId && runtimeId && runtimeId !== cached.runtimeId) {
+      lxCpuAlerts.delete(sourceId);
+    }
+  }
+  // 当前快照缺少某源时不能确认是停用还是状态接口暂时不完整；保留红标，
+  // 等成功停用操作、显式 stopped 状态或新 runtime_id 再清除。
+}
+
+function findLxCpuAlert(item) {
+  const sourceId = lxStableSourceId(item);
+  return sourceId ? (lxCpuAlerts.get(sourceId) || null) : null;
+}
+
+function lxCpuReadingText(alert) {
+  if (!alert) return "未知";
+  if (lxRuntimeStatusUnknown || alert.cpuPercent == null
+      || alert.monitoringStatus === "unknown") return "未知（当前读数不可用）";
+  return `${alert.cpuPercent.toFixed(1)}%（单核口径）`;
+}
+
+function lxCpuAlertHtml(item) {
+  const alert = findLxCpuAlert(item);
+  if (!alert) return "";
+  const name = escapeHtml(item.name || lxDefaultName(item.url));
+  return `<button class="lx-cpu-alert" type="button" data-cpu-source-id="${escapeHtml(alert.sourceId)}"
+      aria-label="资源异常占用：${name}，查看判定说明" title="资源异常占用">!</button>
+    <span class="lx-cpu-alert-label">资源异常占用</span>`;
+}
+
+function clearLxCpuAlertsAfterSavedConfig(result) {
+  const actions = Array.isArray(result && result.actions) ? result.actions : [];
+  if (!actions.length || !lxCpuAlerts.size) return;
+  const runtimeSources = Array.isArray(lxRuntimeSnapshot && lxRuntimeSnapshot.sources)
+    ? lxRuntimeSnapshot.sources : [];
+  const idForUrl = (url) => {
+    const raw = String(url || "");
+    if (!raw) return "";
+    const local = lxSourceList.find((item) => item && String(item.url || "") === raw);
+    const localId = local ? lxStableSourceId(local) : "";
+    if (localId) return localId;
+    const matches = runtimeSources.filter((source) => source && source.id
+      && String(source.url || "") === raw);
+    return matches.length === 1 ? String(matches[0].id) : "";
+  };
+  for (const action of actions) {
+    if (!action || action.kind !== "lx_activate" || action.op !== "deactivate" || action.ok !== true) continue;
+    const sourceId = String(action.source_id || action.id || "").trim() || idForUrl(action.url);
+    if (sourceId) lxCpuAlerts.delete(sourceId);
+  }
+  renderLxSourceList();
+}
+
+function lxCpuDetectedText(value) {
+  const text = String(value || "");
+  if (!text) return "未知";
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? text : date.toLocaleString();
+}
+
+function fillLxCpuHelp(alert) {
+  const body = $("#help-body");
+  if (!body || !alert || typeof body.querySelectorAll !== "function") return;
+  const values = {
+    source: alert.name,
+    reading: lxCpuReadingText(alert),
+    threshold: `${alert.thresholdPercent}%`,
+    required: `${alert.requiredDurationS} 秒（5 秒统计窗口）`,
+    high: alert.highDurationS == null ? "未知" : `${alert.highDurationS} 秒`,
+    detected: lxCpuDetectedText(alert.detectedAt),
+    runtime: alert.runtimeId || "未知",
+    process: alert.processState || "未知",
+  };
+  body.querySelectorAll("[data-cpu-help]").forEach((node) => {
+    const key = node.getAttribute("data-cpu-help");
+    if (key && Object.prototype.hasOwnProperty.call(values, key)) {
+      node.textContent = String(values[key]);
+    }
+  });
+}
+
+function openLxCpuHelp(item, trigger) {
+  const alert = findLxCpuAlert(item);
+  if (!alert) return;
+  openHelp("lx-source-cpu", trigger);
+  lxCpuHelpSourceId = alert.sourceId;
+  $("#help-title").textContent = "资源异常占用";
+  fillLxCpuHelp(alert);
+}
+
 function findLxRuntimeSource(item, sources) {
   const list = Array.isArray(sources) ? sources : [];
+  const itemId = String((item && (item.id || item.source_id)) || "").trim();
+  if (itemId) {
+    const byId = list.find((s) => s && String(s.id || "") === itemId);
+    if (byId) return byId;
+  }
   const itemUrl = (item && item.url) || "";
   if (itemUrl) {
     const exact = list.find((s) => s && s.url && s.url === itemUrl);
@@ -2400,6 +2931,7 @@ function renderLxSourceList() {
         <div class="lx-item-main">
           <div class="lx-item-header">
             <span class="lx-item-name">${displayName}</span>
+            ${lxCpuAlertHtml(item)}
             ${isActive || wasActive ? `<span class="lx-badge">${configLabel}</span>` : `<span class="muted">${configLabel}</span>`}
             <span class="chip"><span class="dot ${runtime && status === "success" ? "ok" : runtime && status === "failed" ? "err" : ""}"></span>${escapeHtml(runtimeLabel)}</span>
           </div>
@@ -2419,6 +2951,21 @@ function renderLxSourceList() {
   container.querySelectorAll(".lx-btn-del").forEach((btn) => {
     btn.addEventListener("click", () => deleteLxSource(parseInt(btn.dataset.idx, 10)));
   });
+  container.querySelectorAll(".lx-cpu-alert").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const sourceId = String(btn.dataset.cpuSourceId || "");
+      const item = lxSourceList.find((entry) => lxStableSourceId(entry) === sourceId);
+      if (item) openLxCpuHelp(item, btn);
+    });
+  });
+  // 轮询重绘会替换按钮节点；弹窗仍开着时把返回焦点改绑到新节点。
+  if (lxCpuHelpSourceId && !$("#help-modal").hidden) {
+    const replacement = Array.from(container.querySelectorAll(".lx-cpu-alert"))
+      .find((btn) => String(btn.dataset.cpuSourceId || "") === lxCpuHelpSourceId);
+    helpReturnFocus = replacement || container;
+    const alert = lxCpuAlerts.get(lxCpuHelpSourceId);
+    if (alert) fillLxCpuHelp(alert);
+  }
 }
 
 function activateLxSource(idx) {
@@ -2618,7 +3165,7 @@ const DIR_FIELDS = [
   { input: "#dir-download", pick: "#dir-download-pick", check: "#dir-download-check", label: "下载目录" },
 ];
 $("#download-layout").addEventListener("change", () => {
-  markDirty("存放方式需保存后生效；已有歌曲可稍后点击「整理」调整");
+  markDirty("文件夹归类方式需保存后生效；已有歌曲可稍后点击「整理」调整");
 });
 let _fsCheckSeq = 0;                // 防抖竞态：只采纳最后一次输入的校验结果
 const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试一次，避免重复弹授权框
@@ -3043,7 +3590,16 @@ async function checkUpdate() {
 // 有新版本则红点常亮（两处"关于"入口 + 关于页 NEW 标记），不因查看而清除
 function renderUpdateBadge() {
   const has = !!(updateInfo && updateInfo.has_update);
-  $$(".nav-dot").forEach((el) => { el.hidden = !has; });
+  $$(".nav-dot").forEach((el) => {
+    el.hidden = !has;
+    if (!el._updateBound) {
+      el._updateBound = true;
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openUpdateModal();
+      });
+    }
+  });
   $("#about-new").hidden = !has;
 }
 
@@ -3051,6 +3607,10 @@ function fmtDate(iso) {
   const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(iso || ""));
   return m ? m[1] : "-";
 }
+
+let updateTargetSnapshot = null;
+let selfUpdateJobId = null;
+let selfUpdatePollTimer = null;
 
 function openUpdateModal() {
   if (!updateInfo || !updateInfo.has_update) return;
@@ -3062,6 +3622,190 @@ function openUpdateModal() {
   // 升级跳转跟随检查源：GitHub 查到跳 GitHub release 页，Gitee 查到跳 Gitee 发行版页
   $("#update-upgrade-btn").href = latest.html_url || "#";
   $("#update-modal").hidden = false;
+
+  // 重置弹窗内动态区域
+  $("#update-modal-prompt").hidden = true;
+  $("#update-modal-error").hidden = true;
+  $("#update-modal-progress").hidden = !selfUpdateJobId;
+  $("#update-install-btn").hidden = true;
+  $("#update-install-btn").disabled = false;
+  $("#update-upgrade-btn").hidden = false;
+
+  if (selfUpdateJobId) {
+    $("#update-upgrade-btn").hidden = true;
+    return;
+  }
+
+  // 异步解析安装目标与架构匹配（若失败或为直连 501 则降级展示手动升级外链）
+  const tagStr = String(latest.tag_name || latest.version || "").trim();
+  if (!tagStr) return;
+  const tag = tagStr.startsWith("v") ? tagStr : `v${tagStr}`;
+  api(`/api/self-update/target?tag=${encodeURIComponent(tag)}`).then((res) => {
+    if (res && res.ok && res.target) {
+      updateTargetSnapshot = res.target;
+      const verText = formatVersionLabel(res.target.tag || res.target.formal_base);
+      const installVer = res.target.install_version || res.target.formal_base;
+      $("#update-modal-prompt").textContent = `是否下载并安装 ${verText}（安装版本 ${installVer}）？`;
+      $("#update-modal-prompt").hidden = false;
+      $("#update-install-btn").hidden = false;
+      $("#update-install-btn").disabled = false;
+      $("#update-upgrade-btn").hidden = true;
+    }
+  }).catch(() => {
+    $("#update-upgrade-btn").hidden = false;
+  });
+}
+
+async function startSelfUpdate() {
+  if (!updateTargetSnapshot || !updateTargetSnapshot.target_id) return;
+  $("#update-install-btn").disabled = true;
+  $("#update-install-btn").hidden = true;
+  $("#update-upgrade-btn").hidden = true;
+  $("#update-modal-prompt").hidden = true;
+  $("#update-modal-error").hidden = true;
+  $("#update-modal-progress").hidden = false;
+  $("#update-progress-phase").textContent = "正在提交更新任务...";
+  $("#update-progress-bar").style.width = "0%";
+  $("#update-progress-detail").textContent = "准备中...";
+
+  try {
+    const res = await api("/api/self-update", {
+      method: "POST",
+      body: JSON.stringify({
+        target_id: updateTargetSnapshot.target_id,
+        confirm: true,
+      }),
+    });
+    if (res && res.ok && res.job) {
+      selfUpdateJobId = res.job.id;
+      try { localStorage.setItem("fnmusic_self_update_job_id", selfUpdateJobId); } catch (_) {}
+      pollSelfUpdate(selfUpdateJobId);
+    } else {
+      throw new Error((res && res.error) || "创建更新任务失败");
+    }
+  } catch (err) {
+    $("#update-modal-progress").hidden = true;
+    $("#update-modal-error").hidden = false;
+    $("#update-error-text").textContent = err.message || "启动更新失败";
+    $("#update-install-btn").disabled = false;
+    $("#update-install-btn").hidden = false;
+  }
+}
+
+function pollSelfUpdate(jobId) {
+  if (selfUpdatePollTimer) clearTimeout(selfUpdatePollTimer);
+
+  const phaseLabels = {
+    downloading: "正在下载更新包",
+    verifying: "正在校验安装包哈希值",
+    backing_up: "正在备份配置与持久数据",
+    staging: "正在暂存安装包到应用中心",
+    installing: "正在执行原生升级，服务可能短暂重启",
+    restarting: "正在等待服务重启恢复",
+  };
+
+  async function step() {
+    try {
+      const res = await api(`/api/self-update/jobs/${jobId}`);
+      if (!res || !res.ok || !res.job) {
+        throw new Error("查询任务失败");
+      }
+      const job = res.job;
+      const phase = job.phase || "";
+      const status = job.status || "";
+
+      let phaseText = phaseLabels[phase] || "处理中...";
+      if (phase === "downloading" && job.source) {
+        phaseText += ` (${job.source === "gitee" ? "Gitee" : "GitHub"})`;
+      }
+      $("#update-progress-phase").textContent = phaseText;
+
+      if (phase === "downloading") {
+        const dl = Number(job.downloaded_bytes || 0);
+        const total = Number(job.total_bytes || 0);
+        if (total > 0) {
+          const pct = Math.min(100, Math.round((dl / total) * 100));
+          $("#update-progress-bar").style.width = pct + "%";
+          $("#update-progress-detail").textContent =
+            `${(dl / 1024 / 1024).toFixed(1)} MB / ${(total / 1024 / 1024).toFixed(1)} MB (${pct}%)`;
+        } else {
+          $("#update-progress-detail").textContent = `${(dl / 1024 / 1024).toFixed(1)} MB`;
+        }
+      } else {
+        $("#update-progress-bar").style.width = "100%";
+        $("#update-progress-detail").textContent = status === "completed" ? "已完成" : "请稍候...";
+      }
+
+      if (status === "completed") {
+        $("#update-progress-phase").textContent = "升级成功，正在刷新页面...";
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        setTimeout(() => { window.location.reload(); }, 3000);
+        return;
+      }
+
+      if (status === "failed") {
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        $("#update-modal-progress").hidden = true;
+        $("#update-modal-error").hidden = false;
+        const msg = job.message || "";
+        if (msg.includes("下载失败") || msg.includes("GitHub 下载最新版本") || msg.includes("所有下载源均失败")) {
+          $("#update-error-text").textContent = "下载失败，请到 GitHub 下载最新版本。";
+          $("#update-error-link").href = "https://github.com/javycoder/fnos_music_ext/releases";
+          $("#update-error-link").hidden = false;
+        } else {
+          $("#update-error-text").textContent = `升级失败: ${msg || "未知错误"}`;
+          $("#update-error-link").href = "https://github.com/javycoder/fnos_music_ext/releases";
+          $("#update-error-link").hidden = false;
+        }
+        $("#update-install-btn").disabled = false;
+        $("#update-install-btn").hidden = false;
+        $("#update-install-btn").textContent = "重试下载并安装";
+        return;
+      }
+
+      if (status === "unknown") {
+        selfUpdateJobId = null;
+        try { localStorage.removeItem("fnmusic_self_update_job_id"); } catch (_) {}
+        $("#update-modal-progress").hidden = true;
+        $("#update-modal-error").hidden = false;
+        $("#update-error-text").textContent = `安装结果待确认: ${job.message || "请前往飞牛应用中心查看状态"}`;
+        $("#update-error-link").hidden = true;
+        return;
+      }
+
+      const pollInterval = (typeof window !== "undefined" && typeof window.SELF_UPDATE_POLL_INTERVAL === "number")
+        ? window.SELF_UPDATE_POLL_INTERVAL
+        : 1500;
+      selfUpdatePollTimer = setTimeout(step, pollInterval);
+    } catch (_) {
+      const errInterval = (typeof window !== "undefined" && typeof window.SELF_UPDATE_POLL_INTERVAL === "number")
+        ? window.SELF_UPDATE_POLL_INTERVAL
+        : 2000;
+      selfUpdatePollTimer = setTimeout(step, errInterval);
+    }
+  }
+
+  step();
+}
+
+if (typeof window !== "undefined") {
+  window.pollSelfUpdate = pollSelfUpdate;
+  window.startSelfUpdate = startSelfUpdate;
+}
+
+async function checkActiveSelfUpdateJob() {
+  try {
+    const res = await api("/api/self-update");
+    if (res && res.ok && res.job) {
+      if (res.job.status === "queued" || res.job.status === "running") {
+        selfUpdateJobId = res.job.id;
+        openUpdateModal();
+        pollSelfUpdate(selfUpdateJobId);
+      }
+    }
+  } catch (_) {}
 }
 
 function closeUpdateModal() {
@@ -3069,6 +3813,9 @@ function closeUpdateModal() {
 }
 
 $("#about-new").addEventListener("click", openUpdateModal);
+$("#update-install-btn").addEventListener("click", () => {
+  startSelfUpdate().catch(() => {});
+});
 $("#update-cancel-btn").addEventListener("click", closeUpdateModal);
 $("#update-modal").addEventListener("click", (ev) => {
   if (ev.target === ev.currentTarget) closeUpdateModal();  // 点遮罩空白处关闭
@@ -3202,6 +3949,266 @@ window.addEventListener("keydown", (ev) => {
 });
 
 /* ------------------------------------------------------ 下载目录整理 Beta */
+function parseUserMap(raw) {
+  try {
+    const value = typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || {});
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function absoluteDirError(label, path) {
+  if (!path) return "";
+  if (!path.startsWith("/") || path.split("/").includes("..") || /[\u0000-\u001f\u007f]/.test(path)) {
+    return label + "必须是以 / 开头的绝对路径，且不能包含 .. 或控制字符";
+  }
+  return "";
+}
+
+function scanAdminPasswordUpdate() {
+  if (!configSchema.FNMUSIC_SCAN_ADMIN_PASSWORD || !$("#scan-admin-password")) return {};
+  if (scanAdminPasswordClear) return { FNMUSIC_SCAN_ADMIN_PASSWORD: "" };
+  if (!scanAdminPasswordDirty) return {};
+  return { FNMUSIC_SCAN_ADMIN_PASSWORD: $("#scan-admin-password").value };
+}
+
+function userDirInput(guid) {
+  return Array.from(document.querySelectorAll("[data-user-dir]")).find((el) => el.dataset.userDir === guid) || null;
+}
+
+function userStorageConfigPatch() {
+  if (!userStorageReady) return {};
+  const directories = {};
+  const scans = {};
+  for (const row of document.querySelectorAll("[data-user-row]")) {
+    const guid = row.dataset.userRow;
+    const dir = (userDirInput(guid) || {}).value || "";
+    directories[guid] = dir.trim() || null;
+    const mode = (row.querySelector("[data-user-scan-mode]") || {}).value || "inherit";
+    if (mode === "disable") scans[guid] = "";
+    else if (mode === "override") scans[guid] = (row.querySelector("[data-user-scan-value]") || {}).value.trim();
+    else scans[guid] = null;
+  }
+  for (const row of document.querySelectorAll("[data-stale-delete]:checked")) {
+    directories[row.dataset.staleDelete] = null;
+    scans[row.dataset.staleDelete] = null;
+  }
+  const patch = {};
+  if (configSchema.FNMUSIC_TEE_SAVE_DIR_BY_USER) patch.FNMUSIC_TEE_SAVE_DIR_BY_USER = directories;
+  if (configSchema.FNMUSIC_LIBRARY_SCAN_BY_USER) patch.FNMUSIC_LIBRARY_SCAN_BY_USER = scans;
+  return patch;
+}
+
+function validateUserStoragePatch(values) {
+  const directories = values.FNMUSIC_TEE_SAVE_DIR_BY_USER || {};
+  const scans = values.FNMUSIC_LIBRARY_SCAN_BY_USER || {};
+  for (const path of Object.values(directories)) {
+    if (path == null) continue;
+    const error = absoluteDirError("用户下载目录", path);
+    if (error) throw new Error(error);
+  }
+  for (const row of document.querySelectorAll("[data-user-row]")) {
+    if ((row.querySelector("[data-user-scan-mode]") || {}).value !== "override") continue;
+    const value = scans[row.dataset.userRow];
+    if (!value) throw new Error("选择单独设置扫描时必须填写扫描配置");
+    if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error("扫描配置包含控制字符");
+  }
+}
+
+function renderUserStorage() {
+  const list = $("#user-storage-list");
+  const staleBox = $("#user-storage-stale");
+  const organizeUser = $("#organize-user");
+  const organizeField = $("#organize-user-field");
+  if (!list || !staleBox) return;
+  const enabled = Boolean($("#tee-save-by-user") && $("#tee-save-by-user").checked);
+  if (organizeField) organizeField.hidden = !enabled;
+  if (!userStorageReady || !userStorageStatus) {
+    list.textContent = enabled
+      ? ("用户目录状态不可用：" + (userStorageError || "未知错误") + "。本次保存不会修改各用户目录和扫描配置。")
+      : "";
+    staleBox.textContent = "";
+    if (organizeUser) organizeUser.innerHTML = "";
+    return;
+  }
+  const users = Array.isArray(userStorageStatus.users) ? userStorageStatus.users : [];
+  if (organizeUser) {
+    const previous = organizeUser.value;
+    organizeUser.innerHTML = users.map((user) =>
+      `<option value="${escapeHtml(user.guid)}">${escapeHtml(user.name || user.guid)}</option>`).join("");
+    if (previous && Array.from(organizeUser.options).some((option) => option.value === previous)) {
+      organizeUser.value = previous;
+    }
+  }
+  if (!enabled) {
+    list.textContent = "";
+    staleBox.textContent = "";
+    return;
+  }
+  list.innerHTML = users.map((user) => {
+    const custom = savedUserDirs[user.guid] || "";
+    const hasScan = Object.prototype.hasOwnProperty.call(savedUserScans, user.guid);
+    const scan = hasScan ? savedUserScans[user.guid] : null;
+    const mode = scan == null ? "inherit" : (String(scan).trim() ? "override" : "disable");
+    const writable = user.root_writable ? "可写" : (user.root_exists ? "存在但不可写" : "目录尚不可用");
+    return `<div class="user-storage-row" data-user-row="${escapeHtml(user.guid)}">
+      <div class="user-storage-head"><b>${escapeHtml(user.name || "未命名用户")}</b><span class="user-storage-meta">${escapeHtml(user.role || "")}</span></div>
+      <div class="user-storage-status">有效目录：${escapeHtml(user.root || "-")} · ${writable}</div>
+      <div class="user-storage-status">最近扫描：${escapeHtml(user.scan_status || "尚无结果")}</div>
+      <label class="field"><span>自定义目录（留空恢复自动目录）</span>
+        <input class="input" data-user-dir="${escapeHtml(user.guid)}" value="${escapeHtml(custom)}" placeholder="留空使用自动目录">
+      </label>
+      <div class="user-storage-actions">
+        <button class="btn" type="button" data-user-dir-pick="${escapeHtml(user.guid)}">从 NAS 选择</button>
+        <button class="btn" type="button" data-user-scan="${escapeHtml(user.guid)}">扫描此用户</button>
+      </div>
+      <label class="field"><span>曲库扫描</span>
+        <select class="input" data-user-scan-mode="${escapeHtml(user.guid)}">
+          <option value="inherit"${mode === "inherit" ? " selected" : ""}>继承全局扫描</option>
+          <option value="disable"${mode === "disable" ? " selected" : ""}>显式禁用</option>
+          <option value="override"${mode === "override" ? " selected" : ""}>单独设置</option>
+        </select>
+      </label>
+      <label class="field"><span>单独扫描配置</span>
+        <input class="input" data-user-scan-value="${escapeHtml(user.guid)}" value="${escapeHtml(mode === "override" ? scan : "")}" placeholder="路径|JSON正文"${mode === "override" ? "" : " hidden"}>
+      </label>
+    </div>`;
+  }).join("") || "没有读取到飞牛音乐用户。";
+  const stale = Array.isArray(userStorageStatus.stale_user_guids) ? userStorageStatus.stale_user_guids : [];
+  staleBox.innerHTML = stale.length
+    ? "以下配置对应的用户已不在飞牛音乐中。勾选后保存才会删除配置，不会删除已保存的歌曲。" +
+      stale.map((guid) => `<label class="user-storage-stale-row"><input type="checkbox" data-stale-delete="${escapeHtml(guid)}">删除失效用户 ${escapeHtml(guid)} 的目录和扫描配置</label>`).join("")
+    : "";
+}
+
+async function loadUserStorage({ abortIfDirty = false } = {}) {
+  const initialEditRevision = editRevision;
+  if (abortIfDirty && dirty) return false;
+  if (!configSchema.FNMUSIC_TEE_SAVE_BY_USER || !$("#user-storage-list")) {
+    userStorageReady = false;
+    renderUserStorage();
+    return true;
+  }
+  try {
+    const response = await api("/api/maintenance/user-storage");
+    if (abortIfDirty && (dirty || editRevision !== initialEditRevision)) return false;
+    if (!response || response.ok !== true || !Array.isArray(response.users)) {
+      throw new Error((response && response.error) || "用户目录响应无效");
+    }
+    userStorageStatus = response;
+    userStorageReady = true;
+    userStorageError = "";
+  } catch (exc) {
+    if (abortIfDirty && (dirty || editRevision !== initialEditRevision)) return false;
+    userStorageStatus = null;
+    userStorageReady = false;
+    userStorageError = exc.message;
+  }
+  renderUserStorage();
+  return true;
+}
+
+function maintenanceSucceeded(response) {
+  return Boolean(response) && response.ok === true;
+}
+
+async function testScanAdmin() {
+  const status = $("#scan-admin-status");
+  if (!status) return;
+  status.textContent = "正在测试已保存的管理员登录…";
+  try {
+    const response = await api("/api/maintenance/scan-admin-test", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (!maintenanceSucceeded(response)) throw new Error((response && response.error) || "管理员登录测试响应无效");
+    status.textContent = "管理员登录测试成功";
+  } catch (exc) {
+    status.textContent = "管理员登录测试失败：" + exc.message;
+  }
+}
+
+async function scanOneUser(guid) {
+  const status = $("#scan-admin-status");
+  if (status) status.textContent = "正在提交用户扫描…";
+  try {
+    const response = await api("/api/maintenance/scan-user", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_guid: guid }),
+    });
+    if (!maintenanceSucceeded(response)) throw new Error((response && response.error) || "用户扫描响应无效");
+    if (status) status.textContent = "用户扫描已确认";
+    await loadUserStorage();
+  } catch (exc) {
+    if (status) status.textContent = "用户扫描失败：" + exc.message;
+  }
+}
+
+function bindUserStorageControls() {
+  const list = $("#user-storage-list");
+  const staleBox = $("#user-storage-stale");
+  if (list) {
+    list.addEventListener("input", (ev) => {
+      if (ev.target && ev.target.matches && ev.target.matches("[data-user-dir], [data-user-scan-value]")) markDirty();
+    });
+    list.addEventListener("change", (ev) => {
+      const mode = ev.target && ev.target.matches && ev.target.matches("[data-user-scan-mode]") ? ev.target : null;
+      if (!mode) return;
+      const row = mode.closest("[data-user-row]");
+      const input = row && row.querySelector("[data-user-scan-value]");
+      if (input) input.hidden = mode.value !== "override";
+      markDirty();
+    });
+    list.addEventListener("click", async (ev) => {
+      const pick = ev.target && ev.target.closest && ev.target.closest("[data-user-dir-pick]");
+      const scan = ev.target && ev.target.closest && ev.target.closest("[data-user-scan]");
+      if (pick) {
+        const sdk = await loadTrimSdk();
+        if (!sdk) { toast("当前环境不支持 NAS 目录选择（直连 8774 时请直接粘贴路径）", "fail"); return; }
+        try {
+          const result = await sdk.pickUserFile({
+            directory: true, title: "选择用户下载目录", okText: "选择",
+            sidebarGroup: ["myFiles", "otherShare", "favorites"],
+          });
+          const paths = (result && result.data) || [];
+          const input = userDirInput(pick.dataset.userDirPick);
+          if (paths.length && input) {
+            input.value = paths[0];
+            markDirty();
+          }
+        } catch (exc) {
+          toast("NAS 目录选择失败：" + exc.message, "fail");
+        }
+      } else if (scan) {
+        await scanOneUser(scan.dataset.userScan);
+      }
+    });
+  }
+  if (staleBox) staleBox.addEventListener("change", () => markDirty());
+  if ($("#tee-save-by-user")) $("#tee-save-by-user").addEventListener("change", () => {
+    markDirty();
+    renderUserStorage();
+  });
+  if ($("#scan-admin-username")) $("#scan-admin-username").addEventListener("input", () => markDirty());
+  if ($("#scan-admin-device-id")) $("#scan-admin-device-id").addEventListener("input", () => markDirty());
+  if ($("#scan-admin-password")) $("#scan-admin-password").addEventListener("input", () => {
+    scanAdminPasswordDirty = true;
+    scanAdminPasswordClear = false;
+    markDirty();
+  });
+  if ($("#scan-admin-password-clear")) $("#scan-admin-password-clear").addEventListener("click", () => {
+    scanAdminPasswordClear = true;
+    scanAdminPasswordDirty = false;
+    if ($("#scan-admin-password")) {
+      $("#scan-admin-password").value = "";
+      $("#scan-admin-password").placeholder = "保存后清除已保存密码";
+    }
+    markDirty("将清除已保存的扫描管理员密码");
+  });
+  if ($("#scan-admin-test")) $("#scan-admin-test").addEventListener("click", () => { testScanAdmin(); });
+}
+bindUserStorageControls();
+
 let organizeInfo = null;
 let organizeConfirmation = null;
 let organizeJob = null;
@@ -3250,9 +4257,16 @@ function acceptOrganizeJob(response) {
 async function loadOrganizeStatus() {
   try {
     const response = await api(ORGANIZE_PATH);
-    if (!response || response.ok !== true || typeof response.root !== "string" ||
-        !DOWNLOAD_LAYOUT_LABELS[response.layout]) throw new Error("整理状态响应格式无效");
-    organizeInfo = { root: response.root, layout: response.layout };
+    if (!response || response.ok !== true || !DOWNLOAD_LAYOUT_LABELS[response.layout]) {
+      throw new Error("整理状态响应格式无效");
+    }
+    if (response.requires_user === true) {
+      organizeInfo = { root: "", layout: response.layout, requiresUser: true };
+    } else if (typeof response.root !== "string" || !response.root) {
+      throw new Error("整理状态响应格式无效");
+    } else {
+      organizeInfo = { root: response.root, layout: response.layout, requiresUser: false };
+    }
     if (response.job) acceptOrganizeJob(response);
   } catch (exc) {
     organizeInfo = null;
@@ -3284,9 +4298,13 @@ function closeOrganizeModal() {
 function organizeSettingsSaved() {
   const savedLayout = configValues.FNMUSIC_DOWNLOAD_LAYOUT || "flat";
   const savedDir = (configValues.FNMUSIC_TEE_SAVE_DIR || "").trim();
-  return ($("#download-layout").value || "flat") === savedLayout &&
-    $("#dir-download").value.trim() === savedDir &&
-    organizeInfo && organizeInfo.layout === savedLayout;
+  if (($("#download-layout").value || "flat") !== savedLayout) return false;
+  if ($("#dir-download").value.trim() !== savedDir) return false;
+  if (!organizeInfo || organizeInfo.layout !== savedLayout) return false;
+  if (!organizeInfo.requiresUser) return true;
+  const guid = ($("#organize-user") && $("#organize-user").value) || "";
+  const input = userDirInput(guid);
+  return Boolean(guid) && Boolean(input) && input.value.trim() === (savedUserDirs[guid] || "");
 }
 
 async function openOrganizeModal() {
@@ -3299,8 +4317,21 @@ async function openOrganizeModal() {
   await loadOrganizeStatus();
   if (!organizeInfo) return;
   if (organizeJob && organizeJob.status === "running") return;
+  if (organizeInfo.requiresUser) {
+    if (!await loadUserStorage({ abortIfDirty: true })) {
+      toast("请先保存未保存的更改，再执行整理", "fail");
+      return;
+    }
+    const guid = ($("#organize-user") && $("#organize-user").value) || "";
+    const user = ((userStorageStatus && userStorageStatus.users) || []).find((item) => item.guid === guid);
+    if (!user || typeof user.root !== "string" || !user.root) {
+      toast("请先选择一个可整理的用户目录", "fail");
+      return;
+    }
+    organizeInfo = { ...organizeInfo, root: user.root, userGuid: guid };
+  }
   if (!organizeSettingsSaved()) {
-    toast("请先保存下载目录和存放方式，再执行整理", "fail");
+    toast("请先保存下载目录和文件夹归类方式，再执行整理", "fail");
     return;
   }
   const label = DOWNLOAD_LAYOUT_LABELS[organizeInfo.layout];
@@ -3317,7 +4348,7 @@ async function startOrganize() {
   if ($("#organize-modal").hidden || organizeSubmitting || !organizeConfirmation) return;
   if (!organizeSettingsSaved()) {
     closeOrganizeModal();
-    toast("请先保存下载目录和存放方式，再执行整理", "fail");
+    toast("请先保存下载目录和文件夹归类方式，再执行整理", "fail");
     return;
   }
   if (organizeJob && organizeJob.status === "running") {
@@ -3340,6 +4371,7 @@ async function startOrganize() {
         confirm_beta: true,
         root: confirmed.root,
         layout: confirmed.layout,
+      ...(confirmed.userGuid ? { user_guid: confirmed.userGuid } : {}),
       }),
     }));
   } catch (exc) {
@@ -3363,8 +4395,10 @@ $("#organize-modal").addEventListener("click", (ev) => {
   await loadConfig();
   await loadStatus();
   await loadOrganizeStatus();
+  checkActiveSelfUpdateJob().catch(() => {});  // 恢复可能仍在执行的自更新任务
   checkUpdate();  // 进页面即查（后端 TTL 缓存兜住 GitHub 限额），不阻塞启动
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
+  void checkActiveConfigJob();
   if ($("#public-playlists-enabled").checked) await showPublicBrowser();
   setInterval(loadStatus, 15000);
 })();

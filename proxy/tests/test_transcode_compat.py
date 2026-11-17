@@ -7,6 +7,8 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import time
 
 import httpx
@@ -32,7 +34,7 @@ if mode == "hang":
     time.sleep(60)
     sys.exit(0)
 if mode == "ok_delay":
-    time.sleep(0.5)
+    time.sleep(2.0)
 # 解码校验调用（-f null -）：FAKE_FFMPEG_DECODE 控制成败；不落任何文件
 if "-f" in args and "null" in args:
     if os.environ.get("FAKE_FFMPEG_DECODE") == "bad":
@@ -45,6 +47,7 @@ if "-f" in args and "null" in args:
 if "-hls_segment_filename" in args:
     pattern = args[args.index("-hls_segment_filename") + 1]
     segdir = os.path.dirname(os.path.abspath(pattern))
+    hls_time = float(args[args.index("-hls_time") + 1])
     os.makedirs(segdir, exist_ok=True)
     with open(os.path.join(segdir, "init.mp4"), "wb") as f:
         f.write(b"ftypinit" * 4)
@@ -54,6 +57,13 @@ if "-hls_segment_filename" in args:
             f.write(b"moofseg" + str(i).encode())
     with open(args[-1], "w") as f:
         f.write("#EXTM3U\\n")
+        f.write("#EXT-X-VERSION:7\\n")
+        f.write("#EXT-X-TARGETDURATION:%d\\n" % (int(hls_time) + 1))
+        f.write("#EXT-X-PLAYLIST-TYPE:EVENT\\n")
+        f.write('#EXT-X-MAP:URI="init.mp4"\\n')
+        for i in range(n):
+            f.write("#EXTINF:%.3f,\\n%05d.m4s\\n" % (hls_time, i))
+        f.write("#EXT-X-ENDLIST\\n")
     sys.exit(0)
 out = args[-1]
 os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
@@ -80,10 +90,46 @@ def wait_for(pred, timeout: float = 8.0):
 def fake_ffmpeg(tmp_path, monkeypatch):
     """装一个假 ffmpeg；用 mode 参数控制脚本行为（默认 ok）。"""
     def _install(mode: str = "ok", segments: int = 40):
-        script = tmp_path / "fake_ffmpeg"
-        script.write_text(FAKE_FFMPEG_SRC)
-        script.chmod(0o755)
-        monkeypatch.setattr(tc, "FFMPEG_BIN", str(script))
+        if sys.platform == "win32":
+            py_script = tmp_path / "fake_ffmpeg.py"
+            py_script.write_text(FAKE_FFMPEG_SRC, encoding="utf-8")
+            original_argv = tc._ffmpeg_argv
+            real_create = asyncio.create_subprocess_exec
+            real_run = subprocess.run
+
+            def is_hls_command(argv):
+                return "-hls_segment_filename" in argv
+
+            def fake_argv(src, headers, sess, directory):
+                return [sys.executable, str(py_script), *original_argv(
+                    src, headers, sess, directory)[1:]]
+
+            def fake_run(args, *pargs, **kwargs):
+                argv = list(args)
+                if (argv and os.path.normcase(os.path.abspath(str(argv[0])))
+                        == os.path.normcase(os.path.abspath(sys.executable))
+                        and not is_hls_command(argv)):
+                    argv = [sys.executable, str(py_script), *argv[1:]]
+                return real_run(argv, *pargs, **kwargs)
+
+            async def fake_create(*args, **kwargs):
+                argv = list(args)
+                if (argv and os.path.normcase(os.path.abspath(str(argv[0])))
+                        == os.path.normcase(os.path.abspath(sys.executable))
+                        and not is_hls_command(argv)):
+                    argv = [sys.executable, str(py_script), *argv[1:]]
+                return await real_create(*argv, **kwargs)
+
+            monkeypatch.setattr(tc, "FFMPEG_BIN", sys.executable)
+            monkeypatch.setattr(tc, "_ffmpeg_argv", fake_argv)
+            monkeypatch.setattr(subprocess, "run", fake_run)
+            monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+            script = py_script
+        else:
+            script = tmp_path / "fake_ffmpeg"
+            script.write_text(FAKE_FFMPEG_SRC, encoding="utf-8")
+            script.chmod(0o755)
+            monkeypatch.setattr(tc, "FFMPEG_BIN", str(script))
         monkeypatch.setenv("FAKE_FFMPEG_MODE", mode)
         monkeypatch.setenv("FAKE_FFMPEG_SEGMENTS", str(segments))
         return str(script)
@@ -104,9 +150,15 @@ else:
 @pytest.fixture
 def fake_ffprobe(tmp_path, monkeypatch):
     def _install(local_dur: float, src_dur: float):
-        script = tmp_path / "fake_ffprobe"
-        script.write_text(FAKE_FFPROBE_SRC)
-        script.chmod(0o755)
+        if sys.platform == "win32":
+            py_script = tmp_path / "fake_ffprobe.py"
+            py_script.write_text(FAKE_FFPROBE_SRC, encoding="utf-8")
+            script = tmp_path / "fake_ffprobe.bat"
+            script.write_text(f'@"{sys.executable}" "{py_script}" %*\n')
+        else:
+            script = tmp_path / "fake_ffprobe"
+            script.write_text(FAKE_FFPROBE_SRC, encoding="utf-8")
+            script.chmod(0o755)
         monkeypatch.setattr(tc, "FFPROBE_BIN", str(script))
         monkeypatch.setenv("FAKE_FFPROBE_LOCAL_DUR", str(local_dur))
         monkeypatch.setenv("FAKE_FFPROBE_SRC_DUR", str(src_dur))
@@ -245,21 +297,23 @@ def stub_online_download(monkeypatch, source_quality="lossless", ext="flac"):
 
 # === transcode 模块：playlist 合成 ===
 
-def test_playlist_text_floor_count_and_tail():
-    sess = tc.Session(guid="g", directory="/tmp/x", duration_s=269.9, hls_time=10.0, declared_count=26)
+def test_playlist_text_ceil_count_and_tail():
+    sess = tc.Session(guid="g", directory="/tmp/x", duration_s=269.9, hls_time=10.0, declared_count=27)
     text = tc.playlist_text(sess)
     assert "#EXT-X-VERSION:7" in text
     assert '#EXT-X-MAP:URI="init.mp4"' in text
     assert "#EXT-X-ENDLIST" in text
-    assert text.count("#EXTINF:") == 26
+    assert text.count("#EXTINF:") == 27
     assert "00000.m4s" in text and "00025.m4s" in text
-    assert "00026.m4s" not in text          # floor：宁可少一片不越界
-    assert "#EXTINF:19.900," in text        # 尾片 = 269.9 - 10*25
+    assert "\ntail-00026.m4s\n" in text
+    assert "\n00026.m4s\n" not in text
+    assert "#EXTINF:9.900," in text
+    assert "#EXT-X-TARGETDURATION:10" in text
 
 
 def test_declared_count_edges():
     assert tc._declared_count(0, 10) == 1
-    assert tc._declared_count(269.9, 10) == 26
+    assert tc._declared_count(269.9, 10) == 27
     assert tc._declared_count(10, 10) == 1
     assert tc._declared_count(240, 10) == 24
 
@@ -267,10 +321,81 @@ def test_declared_count_edges():
 def test_valid_segment_name():
     assert tc.valid_segment_name("init.mp4")
     assert tc.valid_segment_name("00000.m4s")
+    assert tc.valid_segment_name("tail-00026.m4s")
     assert not tc.valid_segment_name("0000.m4s")
     assert not tc.valid_segment_name("00000.m4s.exe")
     assert not tc.valid_segment_name("preset.m3u8")
     assert not tc.valid_segment_name("../escape")
+    assert tc.tail_start_index("tail-00026.m4s") == 26
+    assert tc.tail_start_index("00026.m4s") is None
+
+
+def test_read_output_playlist_validates_complete_contiguous_files(tmp_path):
+    directory = str(tmp_path / "hls")
+    os.makedirs(directory)
+    with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
+        f.write(b"init")
+    for index in range(3):
+        with open(os.path.join(directory, f"{index:05d}.m4s"), "wb") as f:
+            f.write(f"seg{index}".encode())
+    _write_complete_playlist(directory, 3)
+
+    playlist = tc.read_output_playlist(directory)
+    assert [segment.filename for segment in playlist] == [
+        "00000.m4s", "00001.m4s", "00002.m4s"]
+    assert [segment.duration_s for segment in playlist] == [10.0, 10.0, 10.0]
+
+    playlist_path = os.path.join(directory, tc.PLAYLIST_NAME)
+    with open(playlist_path, "w") as f:
+        f.write(
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+            "#EXTINF:10,\n00000.m4s\n#EXTINF:10,\n00002.m4s\n#EXT-X-ENDLIST\n"
+        )
+    assert tc.read_output_playlist(directory) is None
+
+    _write_complete_playlist(directory, 3)
+    os.unlink(os.path.join(directory, "00001.m4s"))
+    assert tc.read_output_playlist(directory) is None
+
+    with open(os.path.join(directory, "00001.m4s"), "wb"):
+        pass
+    assert tc.read_output_playlist(directory) is None
+
+
+def test_wait_tail_segments_returns_contiguous_suffix(tmp_path):
+    directory = str(tmp_path / "hls")
+    os.makedirs(directory)
+    with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
+        f.write(b"init")
+    for index in range(3):
+        with open(os.path.join(directory, f"{index:05d}.m4s"), "wb") as f:
+            f.write(f"seg{index}".encode())
+    _write_complete_playlist(directory, 3)
+    sess = tc.Session(
+        guid="g", directory=directory, duration_s=30, hls_time=10,
+        declared_count=3, status="done",
+    )
+
+    tail = asyncio.run(tc.wait_tail_segments(sess, 1, timeout=0.1))
+    assert [segment.filename for segment in tail] == ["00001.m4s", "00002.m4s"]
+    assert asyncio.run(tc.wait_tail_segments(sess, 3, timeout=0.1)) is None
+
+
+def test_segment_sequence_range_spans_segment_files(tmp_path):
+    first = tmp_path / "00000.m4s"
+    second = tmp_path / "00001.m4s"
+    first.write_bytes(b"abcde")
+    second.write_bytes(b"fghij")
+    response = appmod.serve_segment_sequence_with_range(
+        [str(first), str(second)], "bytes=3-7", "video/iso.segment")
+
+    async def consume():
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    assert response.status_code == 206
+    assert response.headers["content-range"] == "bytes 3-7/10"
+    assert response.headers["content-length"] == "5"
+    assert asyncio.run(consume()) == b"defgh"
 
 
 # === transcode 模块：会话生命周期（假 ffmpeg） ===
@@ -375,13 +500,13 @@ def test_inflated_metadata_patches_declared_count(tmp_path, fake_ffmpeg, fake_ff
         # 磁盘 state 已按真实时长修正
         state = json.load(open(os.path.join(sess.directory, tc.STATE_NAME)))
         assert state["duration_s"] == 118.0
-        assert state["declared_count"] == 11
+        assert state["declared_count"] == 12
         # 转正缓存可复用，且 playlist 声明与产出一致
         cached = tc.peek_cached(FAKE_KUWO, root)
-        assert cached is not None and cached.declared_count == 11
+        assert cached is not None and cached.declared_count == 12
         text = tc.playlist_text(cached)
-        assert text.count("#EXTINF:") == 11
-        assert "00010.m4s" in text and "00011.m4s" not in text
+        assert text.count("#EXTINF:") == 12
+        assert "00011.m4s" in text and "00012.m4s" not in text
 
     asyncio.run(flow())
 
@@ -414,6 +539,14 @@ def test_usable_cache_rejects_short_segment_dir(tmp_path):
     for i in range(3):
         with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
             f.write(b"moofseg")
+    # 历史毒缓存形态：断流时 ffmpeg 自然退出写出的"自洽"ENDLIST 清单
+    # （编号 0..2 连续非空），但 state 的 declared_count=26 远大于实际分片。
+    with open(os.path.join(directory, tc.PLAYLIST_NAME), "w") as f:
+        f.write("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n"
+                "#EXT-X-MAP:URI=\"init.mp4\"\n")
+        for i in range(3):
+            f.write(f"#EXTINF:10.0,\n{i:05d}.m4s\n")
+        f.write("#EXT-X-ENDLIST\n")
     with open(os.path.join(directory, tc.STATE_NAME), "w") as f:
         json.dump({"guid": FAKE_KUWO, "status": "done", "duration_s": 269,
                    "hls_time": 10, "declared_count": 26, "bitrate": "128k",
@@ -491,6 +624,18 @@ def test_ttl_reap_kills_expired_and_sweeps_orphans(tmp_path, fake_ffmpeg):
     assert not os.path.exists(orphan)
 
 
+def _write_complete_playlist(directory: str, count: int, duration_s: float = 10.0) -> None:
+    with open(os.path.join(directory, tc.PLAYLIST_NAME), "w") as f:
+        f.write("#EXTM3U\n")
+        f.write("#EXT-X-VERSION:7\n")
+        f.write(f"#EXT-X-TARGETDURATION:{int(duration_s) + 1}\n")
+        f.write("#EXT-X-PLAYLIST-TYPE:EVENT\n")
+        f.write('#EXT-X-MAP:URI="init.mp4"\n')
+        for index in range(count):
+            f.write(f"#EXTINF:{duration_s:.3f},\n{index:05d}.m4s\n")
+        f.write("#EXT-X-ENDLIST\n")
+
+
 def _mk_done_cache(root: str, guid: str, size: int, age_s: float) -> str:
     directory = tc.session_dir(root, guid)
     os.makedirs(directory, exist_ok=True)
@@ -500,6 +645,7 @@ def _mk_done_cache(root: str, guid: str, size: int, age_s: float) -> str:
     for i in range(10):
         with open(os.path.join(directory, f"{i:05d}.m4s"), "wb") as f:
             f.write(b"s" * max(0, (size - 16) // 10))
+    _write_complete_playlist(directory, 10)
     state = {"guid": guid, "status": "done", "duration_s": 100, "hls_time": 10,
              "declared_count": 10, "bitrate": "128k", "started_ts": 0, "done_ts": 0}
     spath = os.path.join(directory, tc.STATE_NAME)
@@ -515,8 +661,8 @@ def test_enforce_quota_evicts_lru_oldest_first(tmp_path):
     old = _mk_done_cache(root, "g-old", 10000, age_s=3600)
     mid = _mk_done_cache(root, "g-mid", 10000, age_s=600)
     new = _mk_done_cache(root, "g-new", 10000, age_s=60)
-    # 总量 ~30KB，配额 21KB：只淘汰最旧的 10KB 即回到配额内
-    asyncio.run(tc._enforce_quota(root=root, max_bytes=21000))
+    # 总量约 30KB，配额 25KB：只淘汰最旧的一份即回到配额内
+    asyncio.run(tc._enforce_quota(root=root, max_bytes=25000))
     assert not os.path.exists(old)
     assert os.path.exists(mid) and os.path.exists(new)
 
@@ -532,7 +678,7 @@ async def _wait_event(sess: tc.Session, timeout: float = 8.0) -> bool:
 # === App 播放侧：真转码 HLS ===
 
 def test_hls_transcode_full_flow(env, fake_ffmpeg):
-    fake_ffmpeg("ok_delay", segments=40)
+    fake_ffmpeg("ok_delay", segments=27)
     with TestClient(app) as client:
         resp = client.post("/music/api/v1/track/transcode", json={"guid": FAKE_KUWO})
         assert resp.status_code == 200
@@ -543,6 +689,9 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
         import re
         token = re.search(r'URI="([a-f0-9]{32})__init.mp4"', body)[1]
         assert "00000.m4s" in body and "#EXT-X-ENDLIST" in body
+        assert "00025.m4s" in body
+        assert f"{token}__tail-00026.m4s" in body
+        assert "\n" + token + "__00026.m4s\n" not in body
 
         init = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__init.mp4")
         assert init.status_code == 200
@@ -555,11 +704,26 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
         assert seg.headers["content-type"].startswith("video/iso.segment")
         assert seg.headers["x-accel-buffering"] == "no"
 
+        tail_url = f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__tail-00026.m4s"
+        tail = client.get(tail_url)
+        assert tail.status_code == 200
+        assert tail.content == b"moofseg26"
+        head = client.head(tail_url)
+        assert head.status_code == 200
+        assert head.headers["content-length"] == str(len(b"moofseg26"))
+        rng = client.get(tail_url, headers={"Range": "bytes=2-5"})
+        assert rng.status_code == 206
+        assert rng.content == b"ofse"
+
         assert client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/evil.mp4").status_code == 404
 
         hb = client.post("/music/api/v1/track/transcode/heartbeat", json={"guid": FAKE_KUWO})
         assert hb.status_code == 200 and hb.json()["code"] == 0
         assert wait_for(lambda: FAKE_KUWO not in tc._SESSIONS)  # 假 ffmpeg 退出转正
+        complete = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8").text
+        assert complete.count("#EXTINF:") == 27
+        assert f"{token}__00026.m4s" in complete
+        assert "tail-" not in complete
         quit_resp = client.post("/music/api/v1/track/transcode/quit", json={"guid": FAKE_KUWO})
         assert quit_resp.status_code == 200
 

@@ -297,6 +297,14 @@ verify_acceptance() {
     # 不再经代理播放接口自动取流验收：取流会触发边听边存，让《晴天》等探针
     # 歌曲在用户未播放、未收藏的情况下被自动下载进曲库。实际播放由用户在
     # 客户端手动触发，这里只确认音源搜索链路可用。
+    # 3.0.0+ 默认不在安装/接管关键路径做外网搜索（实测串行探测可让收尾拖长
+    # 数十秒，且空结果只警告不阻断）：安装就绪与外部音源可用性分开报告，
+    # 需要显式诊断时运行 FNMUSIC_VERIFY_SEARCH=1 ./extend.sh。
+    if [ "${FNMUSIC_VERIFY_SEARCH:-0}" != "1" ]; then
+        log_info "验收 6b 跳过：外网搜索改为显式诊断（FNMUSIC_VERIFY_SEARCH=1 ./extend.sh）。"
+        log_info "本地门禁全部通过即视为安装就绪；请在飞牛音乐 Web 端手动搜索试播验证外部音源。"
+        return 0
+    fi
     log_info "验收 6b: 验证音源搜索连通性（在线取流不自动验收，由用户手动试播）..."
 
     local probe_keywords=("晴天" "海阔天空" "稻香")
@@ -500,7 +508,7 @@ ensure_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || exit 1
     fi
-    ensure_image_current || exit 1
+    ensure_app_image || exit 1
 }
 
 # .env 比容器新时需重启让 entrypoint 重读开关：env_newer_than_container 已移入
@@ -594,7 +602,9 @@ fi
 
 # 1.5 检查 Python 虚拟环境与依赖（依赖未变化且校验通过时秒级跳过，见 ensure_proxy_deps.sh）
 log_info "检查 .venv-proxy 虚拟环境与依赖状态..."
+stage_begin "代理依赖保障"
 PIP_INDEX="${PIP_INDEX:-}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
+stage_end "代理依赖保障"
 
 # 1.6 编译与语法检查
 takeover preflight --base "${BASE_DIR}"
@@ -649,11 +659,13 @@ fi
 # 4. 等待接管完成与健康检查
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 4/5: 等待代理服务接管完成并就绪..."
+stage_begin "代理接管就绪"
 # True monotonic deadline; each health request allows 4s (> 2.5s readiness budget).
 if ! takeover ready --timeout 30; then
     log_err "等待代理身份与健康就绪超时（30s）。"
     rollback
 fi
+stage_end "代理接管就绪"
 
 log_info "Unix socket 接管成功且健康探测通过。"
 
@@ -661,9 +673,12 @@ log_info "Unix socket 接管成功且健康探测通过。"
 # 5. 验收测试与自动回滚
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 5/5: 验收链路连通性..."
+stage_begin "验收测试"
 if ! verify_acceptance; then
+    stage_end "验收测试（失败）"
     rollback
 fi
+stage_end "验收测试"
 
 log_info "============================================================"
 trap - ERR INT TERM

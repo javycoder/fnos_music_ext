@@ -34,12 +34,12 @@
 | 能力 | 你可以做什么 |
 | :--- | :--- |
 | **原生入口** | 继续使用官方飞牛音乐 Web / App，无需换一套播放器 |
-| **三类音源** | 在 musicdl、网易云 musicbox、洛雪 lxmusic 中选择主音源 |
+| **三类音源** | 在 musicdl、网易云 netease、洛雪 lxmusic 中选择主音源 |
 | **在线搜索与播放** | 本地结果优先，在线结果随后展示，适配歌词、封面与客户端播放 |
 | **独立音质设置** | 在线播放与 App 下载分别选音质，支持七档偏好及缺档降级 |
-| **推荐与歌单** | 每日推荐、热门推荐、猜你喜欢，以及按用户选择的公共歌单 |
+| **推荐与歌单** | 每日推荐、热门推荐、猜你喜欢，以及按用户或全部用户共享的公共歌单 |
 | **在线转本地** | 边听边存、封面内嵌、可选歌词落盘与收藏自动绑定本地 |
-| **家庭多用户** | 在线收藏隔离，公共歌单按用户配置；网易账号歌单可跨主音源常驻 |
+| **家庭多用户** | 在线收藏隔离，公共歌单支持个人配置或全部用户同步；网易账号歌单可跨主音源常驻 |
 | **集中管理** | 音源配置、主题、日志导出、更新检查与存储维护，一个入口完成 |
 
 **先了解三点：** 主音源三选一，并非同时聚合全部提供者；项目不附送可用的洛雪脚本；安装扩展不等于获得第三方平台的会员或付费内容权限。
@@ -55,14 +55,24 @@
 
 ### 2. 安装扩展
 
-1. 前往 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载正式版 `.fpk`。访问困难时可查看 [Gitee 发行页](https://gitee.com/javycoder/fnos_music_ext/releases)，以该页实际资产与下载说明为准。
+1. 前往 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载正式版 `.fpk`。[Gitee 发行页](https://gitee.com/javycoder/fnos_music_ext/releases) 同步更新说明和 GitHub 下载链接，后续版本不再自动向 Gitee 上传安装包；已有附件保留。
 2. 打开 fnOS **应用中心 → 手动安装**，选择 FPK，按向导选择初始音源并安装。
 3. 从飞牛桌面打开 **fnMusic 扩展管理**，完成下表中的配置并保存。
+
+同一次正式发布提供三个相同版本的安装包。应用内检查更新和 moo 商店都默认使用通用包；预构建包只建议手动安装。
+
+| 安装包 | 适合谁 | 安装时做什么 |
+| :--- | :--- | :--- |
+| `fnmusic-ext-<版本>.fpk` | 自动更新、moo 商店，以及 x86_64 / ARM64 都能安装的通用包 | 不含应用镜像和宿主机 Python 依赖。安装时联网构建镜像，并安装代理依赖 |
+| `fnmusic-ext-<版本>-prebuilt-amd64.fpk` | 手动安装的 x86_64 NAS | manifest 为 `x86`。已放入 amd64 镜像和 CPython 3.11/3.12/3.13 的宿主机 wheel，正常安装少联网 |
+| `fnmusic-ext-<版本>-prebuilt-arm64.fpk` | 手动安装的 ARM64 NAS | manifest 为 `arm`。内容与 amd64 预构建包相同，只是架构不同 |
+
+宿主机 Python 不在 3.11、3.12、3.13 之中，或架构与预构建包不符时，预构建包会改走联网安装依赖。清单损坏、校验失败或声明的 wheel 缺失会直接失败，不会静默改走网络。通用包没有这些预置文件，安装时间更长，但体积更小，也不绑定某一种 CPU。
 
 | 选择的主音源 | 首次配置 |
 | :--- | :--- |
 | **musicdl** | 勾选需要的平台，建议先少量启用，确认搜索与播放正常后再扩展 |
-| **网易云 musicbox** | 按需扫码登录，以使用账号歌单及相应账号权益 |
+| **网易云 netease** | 按需扫码登录，以使用账号歌单及相应账号权益 |
 | **洛雪 lxmusic** | 自行导入可信 `.js` 音源脚本，测试、激活并保存；仅安装服务不代表已具备播放解析能力 |
 
 ### 3. 开始听歌
@@ -86,7 +96,7 @@
 | 主音源 | 适合场景 | 能力与边界 |
 | :--- | :--- | :--- |
 | **musicdl** | 按需选择多个平台搜索 | 当前登记 57 个 SDK 平台类；登记不等于每个平台都可播放，部分资源受登录、DRM 或交付格式限制 |
-| **网易云 musicbox** | 网易搜索、账号歌单与推荐 | 支持扫码登录；会员、付费及试听限制仍由平台和账号决定 |
+| **网易云 netease** | 网易搜索、账号歌单与推荐 | 支持扫码登录；会员、付费及试听限制仍由平台和账号决定 |
 | **洛雪 lxmusic** | 使用自己信任的自定义源脚本 | 搜索、歌词与榜单由内置平台接口提供，播放解析交给用户脚本；不提供或保证可用脚本 |
 
 musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。洛雪兼容层基于 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)，不保证所有第三方脚本兼容或长期有效。
@@ -113,9 +123,9 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 客户端兼容播放可使用 AAC / HLS 转码，相关能力依赖 ffmpeg；兼容转码不等于原文件无损交付。官方旧下载协议中的 `standard` 表示 MP3 320k，与新界面的「标准」128k 不是同一个含义，升级时会迁移旧偏好。
 
 <details>
-<summary><strong>可选：播放直连（Beta）</strong></summary>
+<summary><strong>可选：播放直连（实验功能 · Beta）</strong></summary>
 
-网易、musicdl、洛雪分别提供独立开关，默认关闭。开启后，符合条件的原文件在线播放可通过 HTTPS 302 交给客户端向源站取流；本地文件和完整缓存仍优先由 NAS 供流，HLS 与 App 下载不受此开关影响。
+在「实验功能 → 播放直连」中，网易、musicdl、洛雪分别提供独立开关，默认关闭。开启后，符合条件的原文件在线播放可通过 HTTPS 或 HTTP 302 交给客户端向源站取流；本地文件和完整缓存仍优先由 NAS 供流，HLS 与 App 下载不受此开关影响。HTTP 地址仍会拦截私网与非法目标，但客户端到源站的传输不加密，可能暴露播放请求或被网络中间人篡改。
 
 直连受客户端出口 IP、UA、Referer、CORS、临时链接和平台限制影响，不能保证所有资源或客户端可用。出现无法播放时，先关闭对应直连开关，再重新起播，回到 NAS 代理交付。
 
@@ -133,6 +143,8 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 - **自动切源关闭：** 只在原平台首个就绪且兼容的脚本内降档，不跨脚本或平台。
 - **脚本排序：** 使用稳定脚本 ID；停用保留历史位置，新激活项追加，删除时清理对应项。非洛雪主音源时保存设置不意味着启动洛雪服务。
 
+每个已激活脚本由独立的 Node 子进程运行，搜索与元数据仍复用共享的 lxserver。若某个脚本进程连续三分钟占用超过单个 CPU 核心的 50%，源列表会显示红色感叹号和「资源异常占用」；点击可查看当前读数、阈值和排查建议。该标记只归属对应脚本进程，不表示本项目主服务 CPU 异常，也不会自动停用脚本或结束进程。标记保留到该源成功停用或进程重新启动，之后 CPU 降低不会自动清除。
+
 > **脚本是可执行代码，不是普通配置。** 请只导入可信来源，不能把 Node.js 运行环境当成完整安全沙箱。Docker 模式在容器内执行，native 模式在宿主机执行；新导入脚本不会自动获得不安全 VM 授权。
 
 ### 推荐、歌单与家庭账号
@@ -144,9 +156,10 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 | **公共推荐歌单** | 默认关闭；管理页先选择飞牛音乐用户，再勾选、排序网易或洛雪歌单，每人最多 50 份；musicdl 暂不接入 |
 | **网易账号歌单** | 登录后可只读展示账号自建歌单；这不是向网易账号写入歌单的同步工具 |
 | **网易歌单常驻** | 开启后，切换到 musicdl 或洛雪仍可显示和播放网易歌单；账号歌单需登录，公共歌单可匿名使用 |
+| **在线歌单搜索** | 飞牛音乐搜索歌单时自动查询已启用且就绪的洛雪平台；网易音源或网易歌单常驻开启时包含网易歌单。没有单独开关，也不会自动订阅。单次请求最长 5 秒，出现第一个在线结果后再等最多 2 秒 |
 | **在线收藏** | 家庭用户彼此隔离；可选在显式收藏后自动下载，待官方收录再绑定本地歌曲（加入歌单不再触发自动下载，见下） |
 
-网易歌单常驻会额外保留网易服务，**不代表搜索变为多个提供者混合搜索**。公共歌单按用户保存在配置中，新用户默认没有所选歌单。
+网易歌单常驻会额外保留网易服务，**歌曲和专辑搜索不会因此混合多个提供者**。歌单搜索是例外：常驻开启时可以搜到网易公开歌单。公共歌单默认按用户分别保存，个人模式下的新用户没有所选歌单；勾选“同步全部用户”后，所有登录用户共用共享列表，个人配置仍独立保留，切换并保存后生效。
 
 <details>
 <summary><strong>可选：大模型推荐</strong></summary>
@@ -167,14 +180,14 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 
 「边听边存」默认开启：在线音频完整下载后可保存到本地曲库，后续优先复用已核对的本地文件；切歌后的未完成下载可按并发限制转后台续传。
 
-1. 在「存储 → 目录设置」选择**下载目录**和**歌曲缓存目录**，可使用飞牛文件选择器或手动输入。
+1. 在「储存 → 目录设置」选择**下载目录**和**歌曲缓存目录**，可使用飞牛文件选择器或手动输入。
 2. 下载目录应属于希望被官方扫描的曲库；留空时自动探测共享曲库。缓存目录留空时使用安装目录下的 `cache/`。
-3. 按需选择存放方式、命名规则、封面和歌词选项，保存并生效。
+3. 按需选择命名规则、封面和歌词选项，保存并生效；文件夹归类方式在「实验功能 → 目录归类与整理」设置。
 
 | 设置 | 说明 |
 | :--- | :--- |
 | **下载 / 缓存分离** | 两者不能相同或互为父子；更改缓存目录会迁移去重标记，不搬迁旧音频缓存 |
-| **存放方式（Beta）** | 歌曲平铺、歌手 / 歌曲、专辑 / 歌曲、歌手 / 专辑 / 歌曲；仅影响后续落盘 |
+| **文件夹归类方式（Beta）** | 在「实验功能 → 目录归类与整理」设置；歌曲平铺、歌手 / 歌曲、专辑 / 歌曲、歌手 / 专辑 / 歌曲，仅影响后续落盘 |
 | **文件命名** | 支持 `{artist}`、`{title}`、`{source}`，默认 `{artist} - {title}` |
 | **封面 / 歌词** | 默认内嵌封面；同名 `.lrc` 歌词可选开启，默认关闭 |
 | **收藏自动绑定** | 默认关闭；显式收藏后触发后台下载。官方客户端会把整份搜索结果批量写入自动创建的播放列表，该操作与用户主动保存无法可靠区分，因此加入歌单不再触发自动下载，歌单内容照常保存（[issue #120](https://github.com/javycoder/fnos_music_ext/issues/120)） |
@@ -183,13 +196,13 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 <details>
 <summary><strong>维护前必读：整理已有歌曲与清理文件</strong></summary>
 
-**「整理」会实际移动文件。** 二次确认后递归处理当前下载目录中的歌曲，包含用户自行放入的文件；依据音频标签、官方曲库只读记录和扩展已有记录补充信息，不按文件名猜测歌手或专辑。缺少必要信息、无法识别或被占用的文件会跳过。
+**「整理」会实际移动文件。** 请先在「储存 → 目录设置」保存下载目录，并在「实验功能 → 目录归类与整理」保存文件夹归类方式，再执行整理。二次确认后递归处理当前下载目录中的歌曲，包含用户自行放入的文件；依据音频标签、官方曲库只读记录和扩展已有记录补充信息，不按文件名猜测歌手或专辑。缺少必要信息、无法识别或被占用的文件会跳过。
 
 原文件名和标签保持不变，重名增加序号，可识别的同词干歌词与封面随迁；目录封面仅在关联明确时复制，原图保留。任务在后台运行，刷新页面后可继续查询进度；迁移记录位于歌曲缓存目录 `organize-journal/<任务ID>.jsonl`。
 
 **请先备份，再整理，最后在飞牛音乐中重新扫描曲库。** 文件移动可能影响播放、收藏和歌单关联；整理不直接修改官方数据库，也不保证官方关联自动恢复。建议从飞牛桌面管理员入口使用该维护功能。
 
-「清理垃圾文件（Beta）」用于清理遗留临时文件与过期日志，会展示回收空间。执行前请阅读风险提示并核对范围，不要将其视为曲库备份工具。
+「实验功能 → 垃圾清理」中的「清理垃圾文件（Beta）」用于清理遗留临时文件与过期日志，会展示回收空间。执行前请阅读风险提示并核对范围，不要将其视为曲库备份工具。
 
 </details>
 
@@ -215,16 +228,16 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./install.sh --non-interactive --sources musicdl-kuwo,musicdl-migu --webui --extend
 
 # Docker：网易云 + 管理页，安装后扫码登录
-./install.sh --non-interactive --sources musicbox --webui --extend
+./install.sh --non-interactive --sources netease --webui --extend
 
 # Docker：洛雪 + 管理页，安装后自行导入脚本
 ./install.sh --non-interactive --sources lxmusic --webui --extend
 
 # native：无 Docker，网易云 + 管理页
-./install.sh --deploy native --non-interactive --sources musicbox --webui --extend
+./install.sh --deploy native --non-interactive --sources netease --webui --extend
 ```
 
-native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行为见安装指南。切换部署形态、跨目录接管（`--adopt`）和旧版本迁移应先阅读指南，**不要从多个目录同时接管同一个官方 Socket**。
+native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；洛雪 v2.2.0 要求 **Node.js 22.13.0 或更高版本**，低于该版本会拒绝启动源进程。补装及降级行为见安装指南。切换部署形态、跨目录接管（`--adopt`）和旧版本迁移应先阅读指南，**不要从多个目录同时接管同一个官方 Socket**。
 
 </details>
 
@@ -246,7 +259,7 @@ native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行
 | 目录布局 / 文件名 | `FNMUSIC_DOWNLOAD_LAYOUT` / `FNMUSIC_LIBRARY_NAME_PATTERN` | `flat` / `{artist} - {title}` |
 | 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 分别为 `true` / `false` |
 | 每日 / 热门推荐 | `FNMUSIC_RECOMMEND_DAILY` / `FNMUSIC_RECOMMEND_HOT` | 均为 `true` |
-| 公共 / 网易账号 / 网易常驻歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` / `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 均为 `false` |
+| 公共 / 全用户同步 / 网易账号 / 网易常驻歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` / `FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL` / `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 均为 `false` |
 | 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | `false` |
 | 大模型连接 | `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL` | 只填连接不会启用用途 |
 | 大模型用途 | `FNMUSIC_LLM_DAILY_ENABLED` / `FNMUSIC_LLM_LIKED_ENABLED` | 均为 `false`，独立开启 |
@@ -264,6 +277,7 @@ native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行
 - 卸载前会生成存储卷根目录下的 `fnmusic-ext-backup-<时间戳>.tar.gz`，备份可能含登录态与密钥，请妥善保管。
 - `./restore.sh --full` 是破坏性清理，会删除配置、登录态及部分缓存和用户数据，**不是普通还原或升级命令，也不保证清除所有外置目录与数据**。
 - 管理页「关于」可检查正式版更新，优先 GitHub，失败回退 Gitee；仅展示说明、跳转下载，不自动安装，也不推送预发布更新。
+  有通用包时，更新提示只选择通用包，不会自动改成预构建包。
 
 ## 工作原理
 
@@ -282,7 +296,7 @@ fnmusic-ext 代理（宿主机 systemd）
         ├── 缓存、转码、下载落库 ──► 本地曲库
         └── 按需调用音源服务
                 ├── musicdl   127.0.0.1:8768
-                ├── musicbox  127.0.0.1:8770
+                ├── netease   127.0.0.1:8770
                 └── lxmusic   127.0.0.1:8772
 
 飞牛桌面 / 管理员网关
@@ -301,7 +315,7 @@ fnmusic-ext 代理（宿主机 systemd）
 | 音源与管理服务 | 单个 `fnmusic-sources` 容器，supervisor 按需启停 | 宿主机 systemd + supervisord |
 | 配置与持久数据 | `.env`、`sources-data/` 等持久路径 | 共用相同配置与持久路径 |
 
-服务仅监听本机回环地址。通常只启用当前主音源及可选 WebUI；洛雪自身还包含解析服务，开启网易歌单常驻时可额外保留 musicbox。**切源不是把所有提供者一起启动搜索。**
+服务仅监听本机回环地址。通常只启用当前主音源及可选 WebUI；洛雪自身还包含解析服务，开启网易歌单常驻时可额外保留 netease。**切源不是把所有提供者一起启动搜索。**
 
 ## 常见问题
 
@@ -375,7 +389,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | [贡献指南](CONTRIBUTING.md) | 开发约定、提交与验证要求 |
 | [安全反馈](SECURITY.md) | 安全边界及漏洞报告方式 |
 
-核心代码：`proxy/` 负责代理与业务适配；`musicbox-service/`、`musicdl-service/`、`lxmusic-service/` 提供音源；`webui-service/` 提供管理页；`container/` 管理服务编排；`packaging/fpk/` 构建应用包。
+核心代码：`proxy/` 负责代理与业务适配；`netease-service/`、`musicdl-service/`、`lxmusic-service/` 提供音源；`webui-service/` 提供管理页；`container/` 管理服务编排；`packaging/fpk/` 构建应用包。
 
 ```bash
 # 离线测试统一入口；需先按贡献指南与 CI 准备各服务依赖
@@ -407,7 +421,7 @@ python3 scripts/run_tests.py
 感谢以下开源项目、社区及所有贡献者，让这份扩展成为可能：
 
 - [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl) — 多平台音乐能力。
-- [darknessomi/musicbox](https://github.com/darknessomi/musicbox) — 网易云音乐相关能力。
+- [@neteasecloudmusicapienhanced/api](https://github.com/neteasecloudmusicapienhanced/api) — 网易云音乐增强 API 服务。感谢 darknessomi/musicbox 的早期探索与贡献。
 - [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver) 与洛雪音乐社区 — 自定义源兼容基础。
 - 每一位提交代码、报告问题、完善文档和帮助验证的使用者。
 

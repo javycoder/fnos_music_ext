@@ -460,7 +460,7 @@ def wait_ready(state, seconds):
             body, peer = request(state.target, '/_ext/healthz', min(4, max(0.01, deadline-time.monotonic())))
             if body.get('ok') is True and body.get('upstream') == 'ok' and peer == current['process']:
                 return
-            keys = ('upstream', 'musicdl', 'musicbox', 'lxmusic')
+            keys = ('upstream', 'musicdl', 'netease', 'musicbox', 'lxmusic')
             allowed = ('ok', 'error', 'disabled', 'timeout', 'unavailable')
             reason = 'dependencies: ' + ','.join(k+'='+ (str(body.get(k)) if body.get(k) in allowed else 'not-ready') for k in keys)
         except (OSError, ValueError, Unsafe) as exc:
@@ -517,7 +517,7 @@ _SAFE_OUTCOME = re.compile(
     r'Tee handoff resume rejected for [!-~]{1,120}|'
     r'Background full fetch (?:failed|finalize rejected) for [!-~]{1,120}(?:: [A-Za-z_]{1,40})?|'
     r'Failed to fetch online search from (?:musicdl|lxmusic)|'
-    r'Failed to fetch musicbox search|musicdl search partial errors|'
+    r'Failed to fetch (?:netease|musicbox) search|musicdl search partial errors|'
     r'Suggest musicdl error|Stream startup failed|'
     r'Stream aborted mid-way for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'
     r'tee disk write failed for [!-~]{1,140}: [A-Za-z_][A-Za-z0-9_.]{0,60}|'
@@ -527,7 +527,7 @@ _SAFE_OUTCOME = re.compile(
     r'album detail not synthesizable: source=[!-~]{1,40}|'
     r'forward-unhandled (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,140}(?: \(\#[0-9]+\))?|'
     r'Upstream auth probe failed|'
-    r'(?:musicbox|lxmusic|musicdl)(?: /info| lyric fetch(?: in _online_info)?)? failed|'
+    r'(?:netease|musicbox|lxmusic|musicdl)(?: /info| lyric fetch(?: in _online_info)?)? failed|'
     r'lyric sidecar fetch failed|resolve_(?:lx|netease)_url error|'
     r'llm call failed|daily recommend (?:peek|list inject|llm branch|fallback branch) failed|'
     r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge)|'
@@ -593,8 +593,21 @@ def drain_diagnostics(pipe, secrets=()):
     pipe.close()
 
 
+def venv_python(base: Path) -> Path:
+    """repo/.venv-proxy 可能是指向持久目录（如 @appdata）的符号链接。
+
+    子进程统一使用 resolve 后的真实路径，避免安装期间 repo 目录被应用中心
+    同步（删除包外文件，含该链接）后，子进程 sys.path 走悬空符号链接。
+    """
+    link = base / '.venv-proxy'
+    try:
+        return (link.resolve() if link.is_symlink() else link) / 'bin/python'
+    except OSError:
+        return link / 'bin/python'
+
+
 def preflight(base, env):
-    python = base / '.venv-proxy/bin/python'
+    python = venv_python(base)
     # Imports may create storage directories; all known storage locations go to temp.
     with tempfile.TemporaryDirectory(prefix='fnmusic-preflight-') as temp:
         isolated = env.copy()
@@ -657,21 +670,38 @@ def supervise(state, base):
         staged = Path(temp) / 'listen.sock'
         failure = None
         try:
-            child = subprocess.Popen([str(base / '.venv-proxy/bin/python'), '-m', 'uvicorn',
-                                      'app:app', '--app-dir', str(base / 'proxy'), '--uds', str(staged),
-                                      '--no-access-log'], cwd=base / 'proxy', env=env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            secrets = tuple(v for k, v in env.items() if v and re.search(r'key|token|secret|password|cookie', k, re.I))
-            log_thread = threading.Thread(target=drain_diagnostics, args=(child.stdout, secrets), daemon=True)
-            log_thread.start()
-            deadline = time.monotonic() + 25
+            # 安装/升级刚落地 venv 时，首个子进程可能遇到瞬时导入异常（Python 3.11
+            # FileFinder 秒级 mtime 缓存 + 安装期目录替换），表现为存活检查失败但
+            # 重启进程即恢复；这里自动重试一次，避免把瞬时故障升级成安装失败。
             proxy = None
-            while time.monotonic() < deadline and child.poll() is None:
-                snap = snapshot(staged)
-                if snap['kind'] == 'proxy' and snap['process']['pid'] == child.pid:
-                    proxy = snap
+            for attempt in range(2):
+                child = subprocess.Popen([str(venv_python(base)), '-m', 'uvicorn',
+                                          'app:app', '--app-dir', str(base / 'proxy'), '--uds', str(staged),
+                                          '--no-access-log'], cwd=base / 'proxy', env=env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                secrets = tuple(v for k, v in env.items() if v and re.search(r'key|token|secret|password|cookie', k, re.I))
+                log_thread = threading.Thread(target=drain_diagnostics, args=(child.stdout, secrets), daemon=True)
+                log_thread.start()
+                deadline = time.monotonic() + 25
+                proxy = None
+                while time.monotonic() < deadline and child.poll() is None:
+                    snap = snapshot(staged)
+                    if snap['kind'] == 'proxy' and snap['process']['pid'] == child.pid:
+                        proxy = snap
+                        break
+                    time.sleep(0.1)
+                if proxy:
                     break
-                time.sleep(0.1)
+                if attempt == 0:
+                    print('[takeover] first child failed liveness, retrying once', flush=True)
+                    if child.poll() is None:
+                        child.terminate()
+                        try:
+                            child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait(timeout=3)
+                    time.sleep(2)
             if not proxy:
                 raise Unsafe('child failed liveness before takeover')
             changed = True  # publish may fail after moving official

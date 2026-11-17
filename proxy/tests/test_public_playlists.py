@@ -4,6 +4,8 @@ import json
 import asyncio
 import httpx
 import pytest
+import proxy.app as proxy_app_module
+from fastapi import Response
 from fastapi.testclient import TestClient
 
 from proxy import publicplaylists as pubpl
@@ -91,12 +93,38 @@ def test_selection_guid_and_default_initialization():
     entry = pubpl.parse_selection("", {"netease_enabled": True, "lx_enabled": False})
     assert [item["id"] for item in entry] == ["3778678", "3779629", "19723756", "2884035"]
     guid = pubpl.playlist_guid(entry[0])
-    assert guid == "online:playlist:public:musicbox:netease:chart:3778678"
+    assert guid == "online:playlist:public:netease:netease:chart:3778678"
     assert pubpl.entry_from_guid(guid)["id"] == "3778678"
+    legacy_guid = "online:playlist:public:musicbox:netease:chart:3778678"
+    legacy_entry = pubpl.entry_from_guid(legacy_guid)
+    assert legacy_entry["provider"] == "musicbox"
 
 
 def test_explicit_empty_selection_does_not_restore_defaults():
     assert pubpl.parse_selection("[]", {"netease_enabled": True}) == []
+
+
+def test_active_selection_set_follows_mode_and_runtime_availability():
+    shared = [
+        {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"},
+        {"provider": "lx", "source": "kg", "kind": "playlist", "id": "200"},
+    ]
+    personal = [
+        {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "300"},
+    ]
+    conf = {
+        "public_playlists_enabled": True,
+        "public_playlists_sync_all": True,
+        "public_playlists_selection": json.dumps(shared),
+        "public_playlists_by_user": json.dumps({"a": personal}),
+        "netease_enabled": True,
+        "lx_enabled": False,
+    }
+    assert pubpl.all_configured_selections(conf) == [shared[0]]
+    conf["public_playlists_sync_all"] = False
+    conf["lx_enabled"] = True
+    conf["lx_sources"] = ["kg"]
+    assert pubpl.all_configured_selections(conf) == personal
 
 
 def test_unconfigured_user_cannot_read_public_playlist(monkeypatch):
@@ -111,6 +139,51 @@ def test_unconfigured_user_cannot_read_public_playlist(monkeypatch):
         batch = client.get("/music/api/v1/playlist/batch-detail", params={"guids": guid}).json()
         assert batch["data"]["list"] == []
     assert handler.state["calls"] == 0
+
+
+def test_shared_selection_authorizes_authenticated_new_user(monkeypatch):
+    _wire()
+    monkeypatch.setitem(CONF, "public_playlists_sync_all", True)
+    monkeypatch.setitem(CONF, "public_playlists_by_user", '{"other":[]}')
+
+    async def fake_cover(*_args, **_kwargs):
+        return Response(status_code=204)
+
+    monkeypatch.setattr(proxy_app_module, "_playlist_cover_response", fake_cover)
+    guid = pubpl.playlist_guid(SELECTION[0])
+    with TestClient(app) as client:
+        rows = client.get("/music/api/v1/playlist/list").json()["data"]["list"]
+        assert guid in [row["guid"] for row in rows]
+        assert client.get(
+            "/music/api/v1/playlist/detail", params={"guid": guid}
+        ).json()["code"] == 0
+        assert client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": guid, "size": -1},
+        ).json()["code"] == 0
+        assert client.get("/music/api/v1/static/cover", params={"id": guid}).status_code == 204
+
+
+def test_shared_selection_still_rejects_anonymous_placeholder(monkeypatch):
+    _wire()
+    monkeypatch.setitem(CONF, "public_playlists_sync_all", True)
+
+    def upstream(_request):
+        return httpx.Response(200, json={"code": 0, "data": {}})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream), base_url="http://unix"
+    )
+    guid = pubpl.playlist_guid(SELECTION[0])
+    with TestClient(app) as client:
+        assert client.get(
+            "/music/api/v1/playlist/detail", params={"guid": guid}
+        ).json()["code"] != 0
+        assert client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": guid},
+        ).json()["code"] != 0
+        assert client.get("/music/api/v1/static/cover", params={"id": guid}).status_code == 404
 
 
 @pytest.mark.anyio
@@ -315,3 +388,29 @@ def test_disk_summary_and_tracks_survive_restart():
     assert pubpl.cached_card(pubpl.playlist_guid(SELECTION[0]))["name"] == "[网易] 热歌榜"
     assert len(pubpl.cached_tracks(pubpl.playlist_guid(SELECTION[0]))) == 2
     assert resolve_real_guid(track_fake) == "online:netease:101"
+
+
+def test_foreground_track_list_retries_through_cooldown_without_disk_snapshot():
+    calls = {"tracks": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/public-playlists/3778678":
+            return httpx.Response(200, json={"ok": True, "data": SUMMARY})
+        if request.url.path == "/api/v1/public-playlists/3778678/tracks":
+            calls["tracks"] += 1
+            if calls["tracks"] == 1:
+                return httpx.Response(503, json={"ok": False, "detail": "服务器忙碌，请稍后再试！"})
+            return httpx.Response(200, json={"ok": True, "data": TRACKS, "total": 2, "truncated": False})
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_upstream()), base_url="http://unix")
+    app.state.musicbox_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://musicbox")
+
+    guid = pubpl.playlist_guid(SELECTION[0])
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid})
+        assert first.json()["code"] == -1
+        second = client.get("/music/api/v1/track/playlist-detail/list", params={"playlistGUID": guid})
+        assert second.json()["code"] == 0
+        assert len(second.json()["data"]["list"]) == 2
+    assert calls["tracks"] == 2

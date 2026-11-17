@@ -23,6 +23,11 @@ def isolate_timeout_cooldown(monkeypatch):
 # songInfo 磁盘存储（issue #49）路径在 app 导入时定格：先指向临时目录，
 # 测试既不读写真实数据目录，也能覆盖加载/落盘行为
 os.environ.setdefault("LX_DATA_DIR", tempfile.mkdtemp(prefix="lxmusic-test-data-"))
+# 源运行时不应在测试中触碰系统数据目录；真实 manager 的单元测试会自行指定
+# source_root，这里只给应用导入期的全局实例一个隔离位置。
+os.environ.setdefault(
+    "LX_SOURCE_DATA_DIR", tempfile.mkdtemp(prefix="lxmusic-test-sources-")
+)
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -89,6 +94,8 @@ class FakeLxServerClient:
         self.url_excludes: list[list[str] | None] = []
         # 同步记录每次调用传入的 enableAutoSwitchApiSource（固定脚本必须 false）
         self.url_auto_switch: list[bool] = []
+        # 固定源解析必须显式传稳定脚本 ID，不能靠显示名称推断。
+        self.url_source_ids: list[str | None] = []
         # 非空时按序弹出作为 get_music_url 返回值（先于 url_result 判定），耗尽后返回 None
         self.url_script: list[dict | None] = []
         # 非空时 get_music_url 等待该事件（同测试循环内使用）：并发时序控制
@@ -142,7 +149,8 @@ class FakeLxServerClient:
     async def get_music_url(self, song_info: dict, quality: str = "128k",
                             exclude_api_sources: list[str] | None = None,
                             request_timeout: float | None = None,
-                            auto_switch_api_source: bool = True) -> dict | None:
+                            auto_switch_api_source: bool = True,
+                            source_id: str | None = None) -> dict | None:
         """模拟上游 /api/music/url 的真实返回契约。
 
         真实 lxserver 固定脚本时会在响应里带 ``sourceId``（被执行的脚本 ID）。
@@ -156,6 +164,7 @@ class FakeLxServerClient:
         self.url_excludes.append(list(exclude_api_sources) if exclude_api_sources else None)
         self.url_timeouts.append(request_timeout)
         self.url_auto_switch.append(bool(auto_switch_api_source))
+        self.url_source_ids.append(source_id)
         if self.url_gate is not None:
             await self.url_gate.wait()
         if self.url_script:
@@ -163,7 +172,7 @@ class FakeLxServerClient:
         if self.url_result:
             result = dict(self.url_result)
             if not result.get("sourceId"):
-                result["sourceId"] = self._pinned_script_id(exclude_api_sources)
+                result["sourceId"] = str(source_id or self._pinned_script_id(exclude_api_sources))
             return result
         return None
 
@@ -309,6 +318,102 @@ class FakeLxServerClient:
         pass
 
 
+class FakeSourceRuntimeManager:
+    """验证流程用的源运行时替身；不启动 Node、不读写共享源目录。"""
+
+    def __init__(self, record: dict | None = None):
+        self.record = dict(record or {
+            "id": "temp.js",
+            "name": "temp",
+            "version": "1.0.0",
+            "supportedSources": ["kw"],
+            "qualitys": {"kw": []},
+            "enabled": False,
+        })
+        self.records = [self.record]
+        self.started = False
+        self.closed = False
+        self.close_calls = 0
+        self.start_calls = 0
+        self.upload_calls: list[tuple[str, str, float]] = []
+        self.toggle_calls: list[tuple[str, bool]] = []
+        self.resolve_calls: list[tuple[str, dict, str, float]] = []
+        self.failures: dict[str, BaseException] = {}
+        self.resolve_fn = None
+        self.close_gate: asyncio.Event | None = None
+        self.close_entered: asyncio.Event | None = None
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        failure = self.failures.get("start")
+        if failure is not None:
+            raise failure
+        self.started = True
+
+    async def upload_source(
+        self,
+        filename: str,
+        content: str,
+        *,
+        deadline: float,
+        source_url: str = "",
+    ) -> dict:
+        self.upload_calls.append((filename, content, deadline))
+        failure = self.failures.get("upload")
+        if failure is not None:
+            raise failure
+        return dict(self.record)
+
+    async def set_enabled(
+        self, source_id: str, enabled: bool, *, deadline: float
+    ) -> bool:
+        self.toggle_calls.append((source_id, bool(enabled)))
+        failure = self.failures.get("enable")
+        if failure is not None:
+            raise failure
+        return True
+
+    async def list_sources(self) -> list[dict]:
+        failure = self.failures.get("list")
+        if failure is not None:
+            raise failure
+        return [dict(record) for record in self.records]
+
+    async def resolve(
+        self,
+        source_id: str,
+        song_info: dict,
+        quality: str,
+        *,
+        deadline: float,
+    ) -> dict:
+        self.resolve_calls.append((source_id, dict(song_info), quality, deadline))
+        failure = self.failures.get("resolve")
+        if failure is not None:
+            raise failure
+        if self.resolve_fn is not None:
+            result = self.resolve_fn(source_id, song_info, quality, deadline)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+        return {
+            "url": "https://media.invalid/audio",
+            "sourceId": source_id,
+            "sourceName": self.record.get("name") or "",
+        }
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+        if self.close_entered is not None:
+            self.close_entered.set()
+        if self.close_gate is not None:
+            await self.close_gate.wait()
+        failure = self.failures.get("close")
+        if failure is not None:
+            raise failure
+
+
 def mock_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=5.0)
 
@@ -320,6 +425,11 @@ def fake_lx():
     lxapp.LXSERVER = fake
     yield fake
     lxapp.LXSERVER = orig
+
+
+@pytest.fixture
+def source_runtime_stub() -> FakeSourceRuntimeManager:
+    return FakeSourceRuntimeManager()
 
 
 @pytest.fixture

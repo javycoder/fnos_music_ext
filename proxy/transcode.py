@@ -3,17 +3,21 @@
 官方 App 选"标准音质"后不再直拉原文件，改走服务端转码 HLS：
 POST /track/transcode → GET /track/hls/{guid}/preset.m3u8 → 逐拉 init.mp4 + 000NN.m4s
 （fMP4/AAC），期间 10s 心跳、停止 quit。本模块把在线曲目转成同款规格：
-ffmpeg 输出 fMP4 分片到 cache/hls/{safe_guid}/，playlist 由服务端按时长
+ffmpeg 输出 fMP4 分片到 cache/hls/{safe_guid}/，运行中 playlist 由服务端
 预合成完整 VOD 清单（实测 App 只拉一次 playlist，不能等转码完再给）。
 
 设计要点：
 - 分片用 -hls_flags temp_file：ffmpeg 先写 .tmp 再改名，文件出现即完整，
   服务端无需猜测分片是否写完。
-- 合成分片数取 floor(duration/hls_time)：ffmpeg 实际产出 ceil ≥ floor，
-  App 多要一片会 404、少要一片只是末尾 <1s 尾差，取 floor 永不越界。
+- 合成分片数取 ceil(duration/hls_time)：最后一项指向只读虚拟尾片
+  tail-NNNNN.m4s，由服务端顺序拼接该编号到真实结尾的全部分片。不能只声明
+  floor 后的真实分片，否则客户端会漏掉最后约一整个 hls_time 的音频
+  （issue #131）。
   不设 -hls_init_time：ffmpeg 8 实测它会拖累全部分片按 init 时长切割
   （issue #50：~4s 分片 + 10s 声明清单 → 客户端只播 ~40% 就到清单末尾
   跳歌、seek 到结尾落在媒体时间线外必跳歌）。
+- ffmpeg 完成后读取它写出的真实 playlist，按全部分片与真实 EXTINF
+  交付最终清单；缓存复用前同样要求清单完整、连续且所有分片存在。
 - 会话 heartbeat 续期；超时 / quit 杀进程；完整缓存在配额内 LRU 复用，
   半成品目录（running 中被杀 / failed）直接清理不残留。
 - rc==0 不等于产出完整（issue #50）：源站半途断连时 ffmpeg 照样以 0 退出，
@@ -25,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -37,13 +42,21 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("fnmusic-ext.transcode")
 
 _SEGMENT_RE = re.compile(r"^\d{5}\.m4s$")
+_TAIL_SEGMENT_RE = re.compile(r"^tail-(\d{5})\.m4s$")
 INIT_NAME = "init.mp4"
 PLAYLIST_NAME = "preset.m3u8"
 STATE_NAME = "state.json"
+_MAX_PLAYLIST_BYTES = 1024 * 1024
 
 # 测试注入点：假 ffmpeg 脚本路径（ pytest 用，生产读环境探测）
 FFMPEG_BIN = os.environ.get("FNMUSIC_FFMPEG_BIN") or shutil.which("ffmpeg")
 FFPROBE_BIN = os.environ.get("FNMUSIC_FFPROBE_BIN") or shutil.which("ffprobe")
+
+
+@dataclass(frozen=True)
+class HlsSegment:
+    filename: str
+    duration_s: float
 
 
 @dataclass
@@ -145,10 +158,11 @@ def _produced_count(directory: str) -> int:
 
 
 def _usable_cache(directory: str, expected_bitrate: str | None = None) -> dict | None:
-    """磁盘上已完整（done + init 存在 + 分片覆盖声明清单）的转码缓存，返回 state。
+    """磁盘上已完整（done + init + 可信真实清单）的转码缓存，返回 state。
 
-    分片数不足的 done 目录一律拒用：历史版本把半途断流的半成品转正成
-    "完整"缓存（issue #50：播一半分片 404 跳歌），此校验让带毒缓存自愈。
+    清单必须带 ENDLIST、分片编号从 0 连续且每个文件非空。历史版本把半途
+    断流的半成品转正成"完整"缓存（issue #50），或只凭 floor 分片数交付
+    漏尾音频（issue #131）；此校验让带毒缓存自愈。
     若指定 expected_bitrate，比特率不匹配的缓存不得混用。
     """
     state = _read_state(directory)
@@ -158,11 +172,15 @@ def _usable_cache(directory: str, expected_bitrate: str | None = None) -> dict |
         return None
     if expected_bitrate is not None and str(state.get("bitrate") or "").strip() != str(expected_bitrate).strip():
         return None
-    try:
-        declared = int(state.get("declared_count") or 1)
-    except (TypeError, ValueError):
-        declared = 1
-    if _produced_count(directory) < declared:
+    segments = read_output_playlist(directory)
+    if segments is None:
+        return None
+    # issue #50 修复前转正的历史毒缓存：源站断连时 ffmpeg rc=0 自然退出并写
+    # 出自洽 ENDLIST 清单，但实际分片少于 state 记录的 declared_count——按
+    # 新写入语义（finalize 时 declared_count == produced）必然一致，不一致
+    # 即历史半成品，拒用并触发重转自愈。
+    declared = state.get("declared_count")
+    if isinstance(declared, int) and declared > 0 and declared != len(segments):
         return None
     return state
 
@@ -170,27 +188,109 @@ def _usable_cache(directory: str, expected_bitrate: str | None = None) -> dict |
 def _declared_count(duration_s: float, hls_time: float) -> int:
     if duration_s <= 0 or hls_time <= 0:
         return 1
-    return max(1, int(duration_s // hls_time))
+    return max(1, math.ceil(duration_s / hls_time - 1e-9))
 
 
-def playlist_text(sess: Session) -> str:
-    """按声明分片数预合成完整 VOD playlist（App 只拉一次，必须一次给全）。"""
-    hls_time = sess.hls_time
-    count = sess.declared_count
+def read_output_playlist(directory: str) -> tuple[HlsSegment, ...] | None:
+    """读取 ffmpeg 已收尾的输出清单；缺失、不完整或不连续一律返回 None。"""
+    path = os.path.join(directory, PLAYLIST_NAME)
+    try:
+        if os.path.getsize(path) > _MAX_PLAYLIST_BYTES:
+            return None
+        with open(path, encoding="utf-8") as fp:
+            lines = [line.strip() for line in fp]
+    except (OSError, UnicodeError):
+        return None
+    if not lines or lines[0] != "#EXTM3U":
+        return None
+
+    segments: list[HlsSegment] = []
+    pending_duration: float | None = None
+    saw_map = False
+    saw_end = False
+    for line in lines[1:]:
+        if not line:
+            continue
+        if saw_end:
+            return None
+        if line == "#EXT-X-ENDLIST":
+            saw_end = True
+            continue
+        if line.startswith("#EXT-X-MAP:"):
+            match = re.search(r'URI="([^"]+)"', line)
+            if not match or match.group(1) != INIT_NAME:
+                return None
+            saw_map = True
+            continue
+        if line.startswith("#EXTINF:"):
+            if pending_duration is not None:
+                return None
+            try:
+                duration = float(line.partition(":")[2].split(",", 1)[0])
+            except ValueError:
+                return None
+            if not math.isfinite(duration) or duration <= 0:
+                return None
+            pending_duration = duration
+            continue
+        if line.startswith("#"):
+            continue
+        if pending_duration is None or not _SEGMENT_RE.fullmatch(line):
+            return None
+        index = int(line[:5])
+        if index != len(segments):
+            return None
+        segment_path = os.path.join(directory, line)
+        try:
+            if os.path.getsize(segment_path) <= 0:
+                return None
+        except OSError:
+            return None
+        segments.append(HlsSegment(line, pending_duration))
+        pending_duration = None
+    if pending_duration is not None or not saw_map or not saw_end or not segments:
+        return None
+    return tuple(segments)
+
+
+def _target_duration(segments: tuple[HlsSegment, ...] | list[HlsSegment]) -> int:
+    return max(1, math.ceil(max(seg.duration_s for seg in segments) - 1e-9))
+
+
+def _render_playlist(segments: tuple[HlsSegment, ...] | list[HlsSegment]) -> str:
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
-        f"#EXT-X-TARGETDURATION:{int(hls_time) + 1}",
+        f"#EXT-X-TARGETDURATION:{_target_duration(segments)}",
         "#EXT-X-PLAYLIST-TYPE:VOD",
         "#EXT-X-MEDIA-SEQUENCE:0",
         '#EXT-X-MAP:URI="init.mp4"',
     ]
-    for i in range(count):
-        seg_len = hls_time if i < count - 1 else max(0.5, sess.duration_s - hls_time * (count - 1))
-        lines.append(f"#EXTINF:{seg_len:.3f},")
-        lines.append(f"{i:05d}.m4s")
+    for segment in segments:
+        lines.append(f"#EXTINF:{segment.duration_s:.3f},")
+        lines.append(segment.filename)
     lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
+
+
+def playlist_text(sess: Session) -> str | None:
+    """运行中预合成完整 VOD；已完成会话改用 ffmpeg 真实分片与时长。"""
+    if sess.status == "done":
+        segments = read_output_playlist(sess.directory)
+        if segments is None:
+            logger.warning("transcode playlist invalid: guid=%s", sess.guid)
+            return None
+        return _render_playlist(segments)
+
+    count = max(1, sess.declared_count)
+    segments = [
+        HlsSegment(f"{index:05d}.m4s", sess.hls_time)
+        for index in range(count - 1)
+    ]
+    tail_index = count - 1
+    tail_duration = max(0.001, sess.duration_s - sess.hls_time * tail_index)
+    segments.append(HlsSegment(f"tail-{tail_index:05d}.m4s", tail_duration))
+    return _render_playlist(segments)
 
 
 def _ffmpeg_argv(src: str, headers: dict | None, sess: Session, directory: str) -> list[str]:
@@ -251,35 +351,47 @@ async def _finalize_complete_output(sess: Session) -> None:
     客户端播到断点后首个缺失分片 404 跳歌、快进到结尾必 404，且残缺缓存被
     永久复用（每次播放都在同一位置断）。此处按产出覆盖度裁决：
     - 产出时长覆盖声明时长（ffprobe 本地产出，探针误差内）→ 转正；
-    - 无 ffprobe 时退化为分片数覆盖声明清单（floor，完整转码必满足）；
+    - 无 ffprobe 时用真实清单 EXTINF 总时长覆盖声明时长；
     - 音源真实时长 ≈ 产出时长（元数据虚高）→ 按真实时长修正常量后转正，
       重播自然播完，不再向客户端声明永不存在的分片；
     - 其余（传输中途截断）→ 不转正、清目录，下次播放整轨重转。
     """
-    produced = _produced_count(sess.directory)
+    segments = read_output_playlist(sess.directory)
+    if segments is None:
+        logger.warning(
+            "transcode output playlist invalid, cache discarded: guid=%s", sess.guid)
+        sess.status = "failed"
+        _remove_dir(sess.directory)
+        _SESSIONS.pop(sess.guid, None)
+        return
+    produced = len(segments)
+    playlist_duration = sum(segment.duration_s for segment in segments)
     real = await probe_duration(os.path.join(sess.directory, PLAYLIST_NAME)) \
         if FFPROBE_BIN else 0.0
-    covered = (real + 2.0 >= sess.duration_s) if real > 0 \
-        else (produced >= sess.declared_count)
+    measured = real if real > 0 else playlist_duration
+    covered = measured + 2.0 >= sess.duration_s
     if not covered:
         src_dur = await probe_duration(sess.src, sess.headers) \
             if (FFPROBE_BIN and sess.src) else 0.0
-        if src_dur > 0 and src_dur <= real + 3.0:
+        if src_dur > 0 and src_dur <= measured + 3.0:
             logger.warning(
                 "transcode metadata duration inflated: guid=%s declared=%.1fs real=%.1fs",
-                sess.guid, sess.duration_s, real)
-            sess.duration_s = real
-            sess.declared_count = max(1, _declared_count(real, sess.hls_time))
+                sess.guid, sess.duration_s, measured)
+            sess.duration_s = measured
+            sess.declared_count = produced
         else:
             logger.warning(
                 "transcode output truncated, cache discarded: guid=%s "
                 "produced=%d segs (%.1fs) declared=%d segs (%.1fs) src_probe=%.1fs",
-                sess.guid, produced, real, sess.declared_count,
+                sess.guid, produced, measured, sess.declared_count,
                 sess.duration_s, src_dur)
             sess.status = "failed"
             _remove_dir(sess.directory)
             _SESSIONS.pop(sess.guid, None)
             return
+    else:
+        sess.duration_s = measured
+        sess.declared_count = produced
     sess.status = "done"
     sess.done_ts = time.time()
     # 转正：LRU 访问时间 = 完成时间
@@ -615,7 +727,14 @@ async def probe_duration(src: str, headers: dict | None = None) -> float:
 
 
 def valid_segment_name(filename: str) -> bool:
-    return filename == INIT_NAME or bool(_SEGMENT_RE.match(filename))
+    return (filename == INIT_NAME
+            or bool(_SEGMENT_RE.fullmatch(filename))
+            or bool(_TAIL_SEGMENT_RE.fullmatch(filename)))
+
+
+def tail_start_index(filename: str) -> int | None:
+    match = _TAIL_SEGMENT_RE.fullmatch(filename)
+    return int(match.group(1)) if match else None
 
 
 async def wait_file(path: str, sess: Session | None, timeout: float = 30.0) -> str | None:
@@ -629,6 +748,38 @@ async def wait_file(path: str, sess: Session | None, timeout: float = 30.0) -> s
         if time.monotonic() >= deadline:
             return None
         await asyncio.sleep(0.25)
+
+
+async def wait_tail_segments(
+    sess: Session,
+    start_index: int,
+    timeout: float = 30.0,
+) -> tuple[HlsSegment, ...] | None:
+    """等转码收尾后返回 start_index 到真实结尾的连续分片。"""
+    if start_index < 0:
+        return None
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if sess.status in ("failed", "aborted"):
+            return None
+        if sess.status == "done":
+            segments = read_output_playlist(sess.directory)
+            if segments is None or start_index >= len(segments):
+                return None
+            tail = segments[start_index:]
+            for offset, segment in enumerate(tail, start=start_index):
+                if segment.filename != f"{offset:05d}.m4s":
+                    return None
+            return tail
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            await asyncio.wait_for(sess.exit_event.wait(), timeout=min(0.5, remaining))
+        except asyncio.TimeoutError:
+            pass
+        if sess.exit_event.is_set() and sess.status != "done":
+            return None
 
 
 async def maintain(root: str, ttl_s: float, max_bytes: int) -> None:

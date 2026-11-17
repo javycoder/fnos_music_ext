@@ -619,6 +619,40 @@ def test_song_list_search_client_rejects_bad_input_and_payloads():
         asyncio.run(_with(bad_payload, lambda: client.get_song_list_search("kw", "华语", 1)))
 
 
+def test_song_list_search_budget_covers_lock_wait():
+    client = LxServerClient(base_url="http://lxserver-test", timeout=30)
+
+    async def _run():
+        lock = client.song_list_lock("kw")
+        await lock.acquire()
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError):
+                await client.get_song_list_search("kw", "华语", 1, timeout=0.2)
+            return time.monotonic() - started
+        finally:
+            lock.release()
+            await client.close()
+
+    assert asyncio.run(_run()) < 1.0
+
+
+def test_public_playlist_search_forwards_budget(test_app_client, fake_lx):
+    seen = {}
+
+    async def search(source, text, page=1, timeout=None):
+        seen["timeout"] = timeout
+        return {"list": [], "limit": 20, "total": 0}
+
+    fake_lx.get_song_list_search = search
+    fake_lx.normalize_public_playlist = LxServerClient.normalize_public_playlist
+    response = test_app_client.get("/api/v1/public-playlists", params={
+        "source": "kw", "channel": "search", "keyword": "华语", "page": 1, "timeout_s": 0.4,
+    })
+    assert response.status_code == 200
+    assert seen["timeout"] == pytest.approx(0.4)
+
+
 def test_public_playlist_search_maps_and_infers_more(test_app_client, fake_lx):
     async def search(source, text, page=1):
         if not text.strip():
@@ -1123,7 +1157,9 @@ def test_verify_source_json_format_guard():
 
 @pytest.mark.parametrize("stage", ["search", "resolve"])
 @pytest.mark.parametrize("failure", ["connect", 503, 500])
-def test_verify_real_client_search_resolve_failures(test_app_client, monkeypatch, stage, failure):
+def test_verify_real_client_search_resolve_failures(
+    test_app_client, source_runtime_stub, monkeypatch, stage, failure
+):
     import verify_source
     from lxserver_client import LxServerClient
 
@@ -1137,11 +1173,6 @@ def test_verify_real_client_search_resolve_failures(test_app_client, monkeypatch
             if failure == "connect":
                 raise httpx.ConnectError("internal offline", request=request)
             return httpx.Response(failure, json={"error": "upstream script failed"})
-        if path.endswith("/upload"):
-            return httpx.Response(200, json={"success": True, "id": "temp"})
-        if path.endswith("/list"):
-            return httpx.Response(200, json=[
-                {"id": "temp", "name": "X", "supportedSources": ["kw"]}])
         if path == "/api/music/search":
             return httpx.Response(200, json=[
                 {"name": "Song", "singer": "Artist", "songmid": "1", "source": "kw"}])
@@ -1159,9 +1190,31 @@ def test_verify_real_client_search_resolve_failures(test_app_client, monkeypatch
     async def no_wait(*args):
         pass
 
+    async def media_probe(_client, url, *_args, **_kwargs):
+        return True, url, "audio/mpeg", 1024
+
     monkeypatch.setattr(verify_source, "_new_temp_client", factory)
+    monkeypatch.setattr(
+        verify_source, "_new_temp_manager", lambda *_args, **_kwargs: source_runtime_stub
+    )
     monkeypatch.setattr(verify_source, "download_script", download)
     monkeypatch.setattr(verify_source.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(lxapp, "probe_url", media_probe)
+    if stage == "resolve":
+        request = httpx.Request("GET", "http://lx.test/api/music/url")
+        if failure == "connect":
+            error = httpx.ConnectError("internal offline", request=request)
+        elif failure == 503:
+            error = httpx.HTTPStatusError(
+                "service unavailable", request=request,
+                response=httpx.Response(503, request=request),
+            )
+        else:
+            error = httpx.HTTPStatusError(
+                "upstream failed", request=request,
+                response=httpx.Response(500, request=request),
+            )
+        source_runtime_stub.failures["resolve"] = error
     res = test_app_client.post("/api/v1/source/verify", json={"url": "https://external/x.js"})
     data = res.json()["data"]
     if failure == 500:
@@ -1172,8 +1225,12 @@ def test_verify_real_client_search_resolve_failures(test_app_client, monkeypatch
         assert res.status_code == 503
         assert data["category"] == "service_unavailable"
         assert data["stage"] == "lxmusic_to_lxserver"
-    assert failed_path in calls
-    assert "/api/custom-source/delete" in calls
+    if stage == "search":
+        assert failed_path in calls
+    else:
+        assert "/api/music/search" in calls
+    assert source_runtime_stub.close_calls == 1
+    assert source_runtime_stub.toggle_calls == [("temp.js", True)]
 
 
 def test_verify_external_download_failure_is_not_internal(test_app_client, monkeypatch):
@@ -1210,64 +1267,52 @@ def test_source_set_external_import_failure_is_not_internal(test_app_client, fak
     assert not fake_lx.toggle_calls
 
 
-@pytest.mark.parametrize("failure_stage", ["upload", "list", "toggle", "search", "resolve"])
-def test_verify_reports_unreachable_lxserver(test_app_client, tmp_path, monkeypatch, failure_stage):
-    """校验时连不上 lxserver：报 service_unavailable，不当成脚本问题（issue #78）。"""
-    import httpx as _httpx
+@pytest.mark.parametrize("failure_stage", ["upload", "enable", "search", "resolve"])
+def test_verify_distinguishes_metadata_and_source_process_failures(
+    test_app_client, fake_lx, source_runtime_stub, tmp_path, monkeypatch, failure_stage
+):
+    """元数据服务不可达报 503；临时源进程故障保留为 runtime 类。"""
     import verify_source
+    from source_runtime import SourceProcessUnavailable
 
-    closed = []
-    deleted = []
+    async def media_probe(_client, url, *_args, **_kwargs):
+        return True, url, "audio/mpeg", 1024
 
-    def fail(stage):
-        if failure_stage == stage:
-            raise _httpx.ConnectError("All connection attempts failed")
+    async def unavailable_search(*_args, **_kwargs):
+        raise httpx.ConnectError("All connection attempts failed")
 
-    class DeadClient:
-        """在各校验阶段断连，确保都不会退化成脚本 resolve 失败。"""
+    if failure_stage == "search":
+        monkeypatch.setattr(fake_lx, "search", unavailable_search)
+    elif failure_stage == "upload":
+        source_runtime_stub.failures["upload"] = SourceProcessUnavailable()
+    elif failure_stage == "enable":
+        source_runtime_stub.failures["enable"] = SourceProcessUnavailable()
+    else:
+        source_runtime_stub.failures["resolve"] = httpx.ConnectError(
+            "All connection attempts failed"
+        )
 
-        async def upload_custom_source(self, filename, script_content):
-            fail("upload")
-            return {"id": "temp"}
-
-        async def list_custom_sources(self):
-            fail("list")
-            return [{"id": "temp", "name": "X", "supportedSources": ["kw"]}]
-
-        async def toggle_custom_source(self, source_id, enabled):
-            fail("toggle")
-
-        async def search(self, *args, **kwargs):
-            fail("search")
-            return [{"id": "lx:kw:1"}]
-
-        def get_cached_song_info(self, *args):
-            return {"songmid": "1"}
-
-        async def get_music_url(self, *args, **kwargs):
-            fail("resolve")
-
-        async def delete_custom_source(self, source_id):
-            deleted.append(source_id)
-
-        async def close(self):
-            closed.append(True)
-
-    async def no_wait(*args):
-        pass
-
-    monkeypatch.setattr(verify_source, "_new_temp_client", lambda **kw: DeadClient())
-    monkeypatch.setattr(verify_source.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(verify_source, "_new_temp_client", lambda **_kwargs: fake_lx)
+    monkeypatch.setattr(
+        verify_source, "_new_temp_manager", lambda *_args, **_kwargs: source_runtime_stub
+    )
+    monkeypatch.setattr(lxapp, "probe_url", media_probe)
     script = tmp_path / "x.js"
     script.write_text("/*!\n * @name X\n */\nconsole.log(1);", encoding="utf-8")
     res = test_app_client.post("/api/v1/source/verify", json={"url": f"file://{script}"})
-    assert closed == [True]
-    assert deleted == ([] if failure_stage == "upload" else ["temp"])
-    assert res.status_code == 503
     data = res.json()["data"]
-    assert data["category"] == "service_unavailable"
-    assert data["stage"] == "lxmusic_to_lxserver"
-    assert "lxserver 不可连接" in data["message"]
+    if failure_stage in ("search", "resolve"):
+        assert res.status_code == 503
+        assert data["category"] == "service_unavailable"
+        assert data["stage"] == "lxmusic_to_lxserver"
+        assert "lxserver 不可连接" in data["message"]
+    else:
+        assert res.status_code == 200
+        assert data["category"] == "runtime"
+        assert "source_process_unavailable" in data["message"]
+    assert source_runtime_stub.close_calls == 1
+    assert fake_lx.upload_calls == []
+    assert fake_lx.deleted_ids == []
 
 
 def test_source_set_http_url_activates_target(test_app_client, fake_lx):
@@ -2243,10 +2288,10 @@ def _spy_get_music_url(fake_lx, seen):
     original = fake_lx.get_music_url
 
     async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None,
-                  auto_switch_api_source=True):
+                  auto_switch_api_source=True, source_id=None):
         seen.append(dict(song_info))
         return await original(song_info, quality, exclude_api_sources, request_timeout,
-                              auto_switch_api_source)
+                              auto_switch_api_source, source_id=source_id)
 
     fake_lx.get_music_url = spy
 
@@ -2399,7 +2444,7 @@ def test_lx_timeouts_hot_reload_clears_negative_cache_and_circuit_breaker(tmp_pa
 async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_enlarged_timeout(fake_lx, monkeypatch, fresh_url_cache):
     """慢源解析超时保护：超出单次解析超时放弃/接力，调大参数后成功取链。"""
     async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None,
-                                 request_timeout=None, auto_switch_api_source=True):
+                                 request_timeout=None, auto_switch_api_source=True, source_id=None):
         fake_lx.url_timeouts.append(request_timeout)
         await asyncio.sleep(0.1)
         return {"url": "https://media.test/slow.mp3", "type": "128k", "sourceId": "source1"}
@@ -2451,3 +2496,32 @@ def test_track_url_endpoint_uses_hot_reloaded_timeouts(test_app_client, fake_lx,
         assert fake_lx.url_timeouts[-1] == 11.5
     finally:
         restore()
+
+
+def test_search_accepts_lxserver_v2_paged_payload():
+    """lxserver v2.2.0 起搜索响应是分页对象 {list, total, ...} 而非裸数组。
+
+    回归：按数组断言时真实 dict 响应被静默丢成空列表，LX 搜索永远 0 结果
+    （2026-11-16 NAS 实机 3.0.0-1 验证发现）。两种形态都必须返回歌曲。"""
+    song = {"name": "晴天", "singer": "周杰伦", "source": "kw", "songmid": "228908"}
+    payloads = [
+        {"list": [song], "total": 1, "allPage": 1, "pageSize": 20, "fetchedPages": 1},
+        [song],  # 旧版本/兼容实现仍直接返回数组
+    ]
+    for payload in payloads:
+        client = LxServerClient(base_url="http://test", timeout=5.0)
+
+        def handler(request, payload=payload):
+            return httpx.Response(200, json=payload)
+
+        async def run():
+            client._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), base_url="http://test")
+            try:
+                return await client.search("晴天", source="kw", limit=5)
+            finally:
+                await client.close()
+
+        items = asyncio.run(run())
+        assert len(items) == 1, f"payload form {type(payload).__name__} lost results"
+        assert items[0]["id"] == "lx:kw:228908"

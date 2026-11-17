@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import ssl
 import pytest
 import httpx
 
@@ -9,6 +10,7 @@ from proxy.netease_direct import (
     parse_netease_https_candidate,
     upgrade_netease_media_url,
     NeteaseDirectProbeError,
+    NeteaseDirectUpgradeUnavailable,
 )
 
 
@@ -210,7 +212,7 @@ async def test_upgrade_successful_200_stream_probe_stops_early():
 async def test_upgrade_fails_on_http_404():
     raw = "http://m7.music.126.net/track_404.mp3"
     transport = httpx.MockTransport(lambda _req: httpx.Response(404, text="Not Found"))
-    with pytest.raises(NeteaseDirectProbeError, match="http_status_404"):
+    with pytest.raises(NeteaseDirectUpgradeUnavailable, match="http_status_404"):
         await upgrade_netease_media_url(
             raw,
             resolver=public_dns_resolver(),
@@ -232,6 +234,81 @@ async def test_upgrade_fails_on_invalid_audio_magic():
             resolver=public_dns_resolver(),
             transport=transport,
         )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_connection_refused_is_availability_failure():
+    raw = "http://m7.music.126.net/track.mp3"
+
+    def handler(_req):
+        raise httpx.ConnectError("Connection refused")
+
+    with pytest.raises(NeteaseDirectUpgradeUnavailable, match="probe_exception:ConnectError"):
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(handler),
+        )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_all_addresses_failed_is_availability_failure():
+    """多地址 CDN 全部连接失败（httpx 聚合文案 + 底层 errno）按暂时不可用回退 HTTP。"""
+    import errno as _errno
+
+    raw = "http://m7.music.126.net/track.mp3"
+
+    # 形态一：聚合文案（无 __cause__）
+    def handler_aggregated(_req):
+        raise httpx.ConnectError("All connection attempts failed")
+
+    with pytest.raises(NeteaseDirectUpgradeUnavailable, match="probe_exception:ConnectError"):
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(handler_aggregated),
+        )
+
+    # 形态二：本地化系统错误消息 + 底层 OSError errno=ECONNREFUSED
+    def handler_errno(_req):
+        cause = OSError(_errno.ECONNREFUSED, "连接被拒绝(本地化消息)")
+        raise httpx.ConnectError("[Errno 111] 连接被拒绝") from cause
+
+    with pytest.raises(NeteaseDirectUpgradeUnavailable, match="probe_exception:ConnectError"):
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(handler_errno),
+        )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_ssl_error_remains_security_failure():
+    raw = "http://m7.music.126.net/track.mp3"
+
+    def handler(_req):
+        raise ssl.SSLError("CERTIFICATE_VERIFY_FAILED")
+
+    with pytest.raises(NeteaseDirectProbeError, match="probe_exception:SSLError") as caught:
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=httpx.MockTransport(handler),
+        )
+    assert type(caught.value) is NeteaseDirectProbeError
+
+
+@pytest.mark.asyncio
+async def test_upgrade_forbidden_status_remains_security_failure():
+    raw = "http://m7.music.126.net/track.mp3"
+    transport = httpx.MockTransport(lambda _req: httpx.Response(403))
+    with pytest.raises(NeteaseDirectProbeError, match="http_status_403") as caught:
+        await upgrade_netease_media_url(
+            raw,
+            resolver=public_dns_resolver(),
+            transport=transport,
+        )
+    assert type(caught.value) is NeteaseDirectProbeError
 
 
 @pytest.mark.asyncio
@@ -551,7 +628,7 @@ async def test_app_resolve_direct_target_netease_ext_legacy_pin_falls_back(monke
 
 
 @pytest.mark.asyncio
-async def test_app_resolve_direct_target_netease_fails_on_probe_failure(monkeypatch):
+async def test_app_resolve_direct_target_netease_falls_back_on_unavailable_https(monkeypatch):
     song_id = "4040404"
     guid = f"online:netease:{song_id}"
     http_url = "http://m701.music.126.net/audio.mp3"
@@ -576,12 +653,13 @@ async def test_app_resolve_direct_target_netease_fails_on_probe_failure(monkeypa
     monkeypatch.setattr(netease_direct_mod, "upgrade_netease_media_url", patched_upgrade)
 
     req = make_request()
-    with pytest.raises(NeteaseDirectProbeError):
-        await proxy_app._resolve_direct_target(req, guid, "netease")
+    target = await proxy_app._resolve_direct_target(req, guid, "netease")
+    assert target.url == http_url
+    assert target.protocol == "http"
 
 
 @pytest.mark.asyncio
-async def test_app_direct_redirect_response_netease_explicitly_rejects_on_probe_failure(monkeypatch):
+async def test_app_direct_redirect_response_netease_falls_back_on_unavailable_https(monkeypatch):
     song_id = "4040404"
     guid = f"online:netease:{song_id}"
     http_url = "http://m701.music.126.net/audio.mp3"
@@ -593,6 +671,7 @@ async def test_app_direct_redirect_response_netease_explicitly_rejects_on_probe_
     async def auth(_req): return True
     monkeypatch.setattr(proxy_app, "_strict_direct_play_auth", auth)
     monkeypatch.setattr(proxy_app, "resolve_netease_url", lambda _c, _id: _async_val(http_url))
+    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url, **_: MediaURLDecision(True, host="m701.music.126.net"))
 
     def probe_handler(_req):
         return httpx.Response(404, text="Not Found")
@@ -608,7 +687,8 @@ async def test_app_direct_redirect_response_netease_explicitly_rejects_on_probe_
 
     resp = await proxy_app._direct_redirect_response(make_request(), guid)
     assert resp is not None
-    assert resp.status_code == 502
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == http_url
 
 
 @pytest.mark.asyncio

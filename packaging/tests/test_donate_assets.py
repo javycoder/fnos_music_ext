@@ -79,7 +79,7 @@ def test_main_fails_when_archive_missing_even_without_configured_channels(tmp_pa
     assert exc.value.code == 1
 
 
-@pytest.mark.parametrize("filename,job_name", [("ci.yml", "fpk"), ("release.yml", "release")])
+@pytest.mark.parametrize("filename,job_name", [("ci.yml", "fpk"), ("release.yml", "package")])
 def test_workflows_generate_channels_independently_and_verify_payload(filename, job_name):
     workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text(encoding="utf-8"))
     job = workflow["jobs"][job_name]

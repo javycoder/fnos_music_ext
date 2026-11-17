@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, v2.9.0]
+    branches: [main, dev, "3.0.0", v2.9.0]
   pull_request:
 
 permissions:
@@ -29,6 +29,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install NetEase test dependencies
+        run: npm ci --prefix netease-service --omit=dev --ignore-scripts
+
       - name: Install audio and proxy test tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg nginx
 
@@ -47,18 +50,23 @@ jobs:
       - name: Python compile check
         run: >
           python -m py_compile proxy/app.py proxy/recommend.py proxy/publicplaylists.py proxy/env_merge.py proxy/version.py
+          proxy/netease_legacy.py
           lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py
           musicdl-service/app.py musicdl-service/hardening.py
-          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py
           webui-service/app.py
+
+      - name: Node syntax check
+        run: |
+          node --check netease-service/app.js
+          node --check netease-service/service.js
 
       - name: Verify official music compatibility record
         run: python scripts/check_music_compat.py
 
-      # 服务各用独立解释器，避免 app/conftest/环境变量污染；仅服务之间限2并行。
-      # proxy/socket/部署与打包用例保守串行；覆盖率跨进程合并，仅展示不设门槛。
+      # 每个测试根只调度一次；proxy 按整文件拆成独立进程分片（非 xdist、非线程），
+      # 分片间无重叠，新增测试文件自动纳入。覆盖率跨进程合并，仅展示不设门槛。
       - name: Run tests
-        run: python scripts/run_tests.py --jobs 2 --coverage
+        run: python scripts/run_tests.py --jobs 2 --shards 2 --coverage
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -143,7 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [musicdl, musicbox, lxmusic]
+        service: [musicdl, lxmusic]
         python: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
@@ -154,6 +162,21 @@ jobs:
         run: python -m pip install -r '${{ matrix.service }}-service/requirements.txt'
       - name: Offline dependency and CLI contract
         run: python tests/integration/production_contract.py '${{ matrix.service }}' --app-dir '${{ matrix.service }}-service'
+
+  production-netease:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install real production dependencies
+        run: npm ci --prefix netease-service --omit=dev --ignore-scripts
+      - name: Offline dependency and contract
+        run: python tests/integration/production_contract.py netease --app-dir netease-service
 
   # amd64 镜像只在下方矩阵构建一次，复用它验证 musicdl 与洛雪。
   # 不再另起 images job 重建相同 Dockerfile/参数及重复跑非 root 契约。
@@ -198,7 +221,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=fnmusic-images-${{ matrix.arch }}
       - name: Verify non-root contract for each bundled service
         run: |
-          for svc in musicdl musicbox lxmusic; do
+          for svc in musicdl netease lxmusic; do
             docker run --rm --platform '${{ matrix.platform }}' --network none --user 1000 --entrypoint python \
               -v "$PWD/tests/integration/production_contract.py:/tmp/production_contract.py:ro" \
               fnmusic-sources:ci /tmp/production_contract.py \
@@ -272,3 +295,86 @@ jobs:
           test "$(docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf pid lxserver)" = "$lx_pid"
           docker exec "$name" python -c 'import urllib.request,json; d=json.load(urllib.request.urlopen("http://127.0.0.1:8003/healthz", timeout=3)); assert d.get("ok") is True'
           docker exec "$name" supervisorctl -c /etc/supervisor/supervisord.conf status lxmusic | grep -q RUNNING
+
+  # 3.0.0+：FPK 内嵌预构建应用镜像归档的完整链路验证——
+  # build.sh 从最终 staging 构建 amd64 镜像并 docker save 归档 → 组装 FPK →
+  # 用 image_bundle.py ensure 把归档重新 load 回 docker 并核对镜像身份，
+  # 确认 NAS 侧离线导入路径（免 apt/pip 现场构建）在 CI 上真实可走。
+  # arm64 预构建包由 release 矩阵在 ARM runner 上按同一 build.sh 流程产出。
+  fpk-image-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o /tmp/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64"
+          chmod +x /tmp/fnpack
+      - name: Build FPK with embedded image archive
+        env:
+          FPK_IMAGE_ASSETS: require
+          FPK_IMAGE_ARCH: amd64
+        run: |
+          ./packaging/fpk/build.sh --fnpack /tmp/fnpack --out dist
+          test -s dist/fnmusic-ext-*-prebuilt-amd64.fpk
+          test -s dist/fnmusic-ext-*-prebuilt-amd64.fpk.sha256
+          test -s packaging/fpk/.build/fpk/app/repo/assets/proxy-wheels/manifest.json
+      - name: Reload staged archive and verify image identity
+        run: |
+          staging="$(ls -d packaging/fpk/.build/fpk)"
+          bundle="${staging}/app/repo/assets/image"
+          test -f "${bundle}/manifest.json"
+          # 按清单里的镜像 ID 彻底移除本地镜像（仅删标签会留下悬空镜像，
+          # ensure 会走“补引用”而不是真实 docker load 导入路径）
+          image_id="$(python3 -c "import json,sys;print(json.load(open('${bundle}/manifest.json'))['image_id'])")"
+          docker rmi fnmusic-sources:latest >/dev/null 2>&1 || true
+          docker rmi "${image_id}" >/dev/null 2>&1 || true
+          python3 proxy/image_bundle.py ensure --bundle-dir "${bundle}"
+          python3 - <<'PY'
+          import json, pathlib, subprocess, sys
+          bundle = pathlib.Path("packaging/fpk/.build/fpk/app/repo/assets/image")
+          manifest = json.loads((bundle / "manifest.json").read_text())
+          wheels = pathlib.Path("packaging/fpk/.build/fpk/app/repo/assets/proxy-wheels/manifest.json")
+          wheel_manifest = json.loads(wheels.read_text())
+          assert wheel_manifest["arch"] == "amd64"
+          assert wheel_manifest["python_versions"] == ["3.11", "3.12", "3.13"]
+          # ensure 已做严格身份裁决：经典存储 Id == config 摘要；containerd 存储
+          # Id 是 load 生成的 manifest 摘要，以 ensure 写下的 .loaded-id.json 快照为准。
+          marker = bundle / ".loaded-id.json"
+          if marker.is_file():
+              snapshot = json.loads(marker.read_text())
+              assert snapshot["image_id"] == manifest["image_id"], "marker 与清单版本不符"
+              want_id = snapshot["loaded_id"]
+          else:
+              want_id = manifest["image_id"]
+          out = subprocess.run(["docker", "image", "inspect", "fnmusic-sources:latest",
+                                "--format", "{{.Id}} {{.Architecture}}"],
+                               capture_output=True, text=True, check=True).stdout.split()
+          image_id, arch = out[0], out[1]
+          assert image_id == want_id, f"{image_id} != {want_id}"
+          assert arch == manifest["arch"], f"{arch} != {manifest['arch']}"
+          print(f"bundle reload verified: {image_id[:19]} linux/{arch} (config {manifest['image_id'][:19]})")
+          PY
+      - name: Smoke musicdl from the loaded image
+        run: |
+          mkdir -p /tmp/fnrepo-bundle
+          printf '%s\n' 'FNMUSIC_MUSICDL_ENABLED=true' 'FNMUSIC_WEBUI_ENABLED=false' > /tmp/fnrepo-bundle/.env
+          name="fnmusic-ci-bundle"
+          cleanup() { docker logs "$name" 2>&1 | tail -50; docker rm -f "$name"; }
+          trap cleanup EXIT
+          docker run -d --name "$name" --network none -v /tmp/fnrepo-bundle:/repo fnmusic-sources:latest
+          ready=0
+          for attempt in $(seq 1 40); do
+            if docker exec "$name" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8001/healthz", timeout=2)' 2>/dev/null; then
+              ready=1; break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1 || { echo "ERROR: 归档镜像 musicdl 未就绪"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fpk-image-bundle-amd64
+          path: dist/
+          retention-days: 7

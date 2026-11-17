@@ -2,7 +2,7 @@
 # scripts/update_lxserver.sh - 更新或预下载 lxserver release 包
 # 用法:
 #   ./scripts/update_lxserver.sh [TAG] [CACHE_DIR]
-#   例如: ./scripts/update_lxserver.sh v2.1.2
+#   例如: ./scripts/update_lxserver.sh v2.2.0
 # 说明:
 #   - 预编译包默认保存在打包构建缓存目录 packaging/fpk/.build/cache/ 中（已被 gitignore），
 #     确保本项目源码树保持纯净，不携带任何二进制预编译包；
@@ -16,24 +16,27 @@ CACHE_DIR="${2:-${REPO_ROOT}/packaging/fpk/.build/cache}"
 
 mkdir -p "${CACHE_DIR}"
 
-if [ -z "${TARGET_TAG}" ]; then
-    if [ -f "${VERSION_FILE}" ]; then
-        # shellcheck disable=SC1090
-        source "${VERSION_FILE}"
-        TARGET_TAG="${LXSERVER_TAG:-v2.1.2}"
-        EXPECTED_SHA="${LXSERVER_SHA256:-}"
-    else
-        TARGET_TAG="v2.1.2"
-        EXPECTED_SHA=""
-    fi
-else
-    EXPECTED_SHA=""
-fi
-
 # music-tag-native 平台绑定与 lxserver 发行版独立演进。更新 lxserver 时保留
 # 当前锁定值，保证 ARM64 包始终经过 sha256 校验，不会被版本重写意外移除。
 LXSERVER_NATIVE_VERSION="${LXSERVER_NATIVE_VERSION:-0.2.5}"
 LXSERVER_NATIVE_ARM64_SHA256="${LXSERVER_NATIVE_ARM64_SHA256:-d3cfe25fc2e6f5d4d11861dadd54a62701b60c4a9901988befcdf4551c886461}"
+
+if [ -f "${VERSION_FILE}" ]; then
+    # 显式指定上游 tag 时也只更新 lxserver 三项；native 锁定值必须从现场继承。
+    # shellcheck disable=SC1090
+    source "${VERSION_FILE}"
+fi
+
+if [ -z "${TARGET_TAG}" ]; then
+    TARGET_TAG="${LXSERVER_TAG:-v2.2.0}"
+    EXPECTED_SHA="${LXSERVER_SHA256:-}"
+else
+    # 已核实发行包的摘要固定在此处；未知 tag 只允许下载后记录计算值。
+    case "${TARGET_TAG}" in
+        v2.2.0) EXPECTED_SHA="a4bf30a6f3e9437961cbbcba1eb4b88cbe6737c485a2b5a00b72e4e4580ba9d8" ;;
+        *) EXPECTED_SHA="" ;;
+    esac
+fi
 
 ZIP_NAME="lx-music-sync-server-${TARGET_TAG}-server.zip"
 TARGET_FILE="${CACHE_DIR}/${ZIP_NAME}"

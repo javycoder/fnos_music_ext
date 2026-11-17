@@ -478,7 +478,8 @@ def _copy_cover(source: str, target: str, job: dict, root: str) -> None:
 
 def _busy(runtime, path: str) -> bool:
     if any(bool(getattr(runtime, name, None)) for name in
-           ("_tee_active", "_full_fetch_tasks", "_tee_handoff_active")):
+           ("_tee_active", "_full_fetch_tasks", "_tee_handoff_active",
+            "_ensure_user_save_tasks")):
         return True
     transcode = getattr(runtime, "tc", None)
     leased = getattr(transcode, "playback_in_use", None)
@@ -518,7 +519,12 @@ def _extension_metadata(runtime, path: str, refs) -> tuple[str, str]:
             continue
         for guid, entry in list(metadata.items()):
             safe_guid = getattr(runtime, "cache_safe_guid", lambda value: value)(guid)
-            if os.path.basename(ref_path) == safe_guid + ".ref":
+            name = os.path.basename(ref_path)
+            prefix, separator, suffix = name.partition("__")
+            user_ref = (separator == "__" and suffix == safe_guid + ".ref"
+                        and prefix.startswith("u_") and len(prefix) == 66
+                        and all(char in "0123456789abcdef" for char in prefix[2:]))
+            if name == safe_guid + ".ref" or user_ref:
                 return str(entry.get("artist") or ""), str(entry.get("album") or "")
     return "", ""
 

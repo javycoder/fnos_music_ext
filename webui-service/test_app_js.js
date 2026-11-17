@@ -159,7 +159,22 @@ function reset() {
   global.helpTemplates = [];
   localStore.clear();
   try {
-    vm.runInThisContext("if (typeof abortActivePublicDetailRequests !== 'undefined') { publicSelectionDetailSeq++; abortActivePublicDetailRequests(); publicProcessSnapshot = null; }");
+    vm.runInThisContext(`if (typeof abortActivePublicDetailRequests !== 'undefined') {
+      publicSelectionDetailSeq++;
+      abortActivePublicDetailRequests();
+      publicSelection = [];
+      publicSelectionMap = {};
+      publicUserChanges.clear();
+      publicUserGuid = "";
+      publicUsers = [];
+      publicUsersReady = false;
+      publicSyncAll = false;
+      publicSharedSelection = [];
+      publicSharedChanged = false;
+      publicDetailRunTarget = "";
+      publicProcessSnapshot = null;
+      $("#public-playlists-enabled").checked = true;
+    }`);
   } catch (_) {}
 }
 
@@ -1422,6 +1437,91 @@ test("switchPage('about') 顺带触发检查更新", async () => {
   assert.strictEqual(els.get("#nav-dot-desktop").hidden, false);
 });
 
+test("openUpdateModal：解析快照成功展示确认询问与下载安装按钮", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  enqueue("/app/fnmusic-ext/api/self-update/target", {
+    ok: true,
+    target: {
+      target_id: "snap-1",
+      tag: "v2.9.0",
+      formal_base: "2.9.0",
+      install_version: "2.9.0-0",
+      architecture: "amd64",
+      asset_name: "fnmusic-ext-2.9.0-0.x86_64.fpk",
+      source: "gitee",
+    },
+  });
+  await global.checkUpdate();
+  global.openUpdateModal();
+  await new Promise((r) => realSetTimeout(r, 0));
+  assert.strictEqual(els.get("#update-modal-prompt").hidden, false);
+  assert.ok(els.get("#update-modal-prompt").textContent.includes("是否下载并安装 v2.9.0（安装版本 2.9.0-0）？"));
+  assert.strictEqual(els.get("#update-install-btn").hidden, false);
+  assert.strictEqual(els.get("#update-upgrade-btn").hidden, true);
+});
+
+test("startSelfUpdate：点击下载安装提交 POST 并启动进度轮询", async () => {
+  global.window.SELF_UPDATE_POLL_INTERVAL = 10;
+  enqueue("/app/fnmusic-ext/api/self-update", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "running",
+      phase: "downloading",
+      source: "gitee",
+      downloaded_bytes: 5242880,
+      total_bytes: 10485760,
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/self-update/jobs/job-1", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "running",
+      phase: "downloading",
+      source: "gitee",
+      downloaded_bytes: 5242880,
+      total_bytes: 10485760,
+    },
+  });
+  await els.get("#update-install-btn").dispatch("click");
+  await new Promise((r) => realSetTimeout(r, 20));
+  assert.strictEqual(els.get("#update-modal-progress").hidden, false);
+  assert.ok(els.get("#update-progress-phase").textContent.includes("Gitee"));
+  assert.strictEqual(els.get("#update-progress-bar").style.width, "50%");
+});
+
+test("pollSelfUpdate：双源下载失败展示指定文案与 GitHub 链接", async () => {
+  global.window.SELF_UPDATE_POLL_INTERVAL = 10;
+  enqueue("/app/fnmusic-ext/api/self-update/jobs/job-1", {
+    ok: true,
+    job: {
+      id: "job-1",
+      status: "failed",
+      phase: "downloading",
+      source: "github",
+      message: "所有下载源均失败: 下载失败，请到 GitHub 下载最新版本。",
+    },
+  });
+  await new Promise((r) => realSetTimeout(r, 30));
+  assert.strictEqual(els.get("#update-modal-progress").hidden, true);
+  assert.strictEqual(els.get("#update-modal-error").hidden, false);
+  assert.strictEqual(els.get("#update-error-text").textContent, "下载失败，请到 GitHub 下载最新版本。");
+  assert.strictEqual(els.get("#update-error-link").hidden, false);
+  assert.strictEqual(els.get("#update-install-btn").textContent, "重试下载并安装");
+});
+
+test("nav-dot 点击直接弹出更新弹窗并阻止冒泡", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", UPDATE_PAYLOAD);
+  const dot = stubEl();
+  qsaRegistry.set(".nav-dot", [dot]);
+  await global.checkUpdate();
+  let stopped = false;
+  await dot.dispatch("click", { stopPropagation: () => { stopped = true; } });
+  assert.strictEqual(stopped, true);
+  assert.strictEqual(els.get("#update-modal").hidden, false);
+});
+
 const CLEANUP_PATH = "/app/fnmusic-ext/api/maintenance/cleanup";
 const cleanupResponse = (status, extra = {}) => ({ ok: true, job: {
   id: "cleanup-1", status, phase: "scan", scanned: 10, removed: 2,
@@ -2435,7 +2535,7 @@ function resetOrganize() {
   els.get("#organize-modal").hidden = true;
 }
 
-test("下载存放方式：新 schema 回填保存，旧 schema 不提交未知字段", async () => {
+test("下载文件夹归类方式：新 schema 回填保存，旧 schema 不提交未知字段", async () => {
   enqueue("/app/fnmusic-ext/api/config", {
     values: { FNMUSIC_DOWNLOAD_LAYOUT: "artist_album" },
     schema: { FNMUSIC_DOWNLOAD_LAYOUT: {} },
@@ -2553,6 +2653,50 @@ test("整理 Beta：刷新恢复及重复点击只查询已有任务", async () 
   resetOrganize();
 });
 
+test("整理 Beta：存在未保存编辑时不刷新用户目录、不提交", async () => {
+  reset();
+  resetOrganize();
+  global.clearDirty();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}}; userStorageReady=true; userStorageStatus={users:[{guid:'u1',root:'/old'}]};");
+  global.markDirty("用户目录草稿");
+  enqueue(ORGANIZE_PATH, { ok: true, layout: "flat", requires_user: true, job: null });
+  els.get("#organize-modal").hidden = true;
+
+  await global.openOrganizeModal();
+
+  assert.strictEqual(els.get("#organize-modal").hidden, true);
+  assert.strictEqual(fetchCalls.filter((call) => call.path.endsWith("/api/maintenance/user-storage")).length, 0);
+  assert.strictEqual(fetchCalls.filter((call) => call.path === ORGANIZE_PATH && call.method === "POST").length, 0);
+  assert.ok(els.get("#toast").textContent.includes("请先保存未保存的更改"));
+  global.clearDirty();
+});
+
+test("整理 Beta：用户目录请求期间出现编辑时不覆盖草稿并终止", async () => {
+  reset();
+  resetOrganize();
+  global.clearDirty();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}}; userStorageReady=true; userStorageStatus={users:[{guid:'old-user',root:'/old'}]}; userStorageError='';");
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    global.markDirty("请求期间的新编辑");
+    return { ok: true, status: 200, json: async () => ({ ok: true, users: [{ guid: "new-user", root: "/new" }] }) };
+  };
+  let applied;
+  try {
+    applied = await global.loadUserStorage({ abortIfDirty: true });
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.strictEqual(applied, false);
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(vm.runInThisContext("userStorageStatus.users[0].root"), "/old");
+  assert.strictEqual(vm.runInThisContext("dirty"), true);
+  global.clearDirty();
+});
+
 test("公共歌单用户：切换保留草稿、仅提交修改用户、新用户为空", async () => {
   enqueue("/app/fnmusic-ext/api/config", {
     schema: { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} },
@@ -2602,6 +2746,7 @@ test("公共歌单用户：查询失败禁用配置，重试恢复", async () =>
 test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   vm.runInThisContext(`
     configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER = {};
+    $("#public-playlists-enabled").checked = true;
     publicUsersReady = true; publicUsers = [{guid:"a"},{guid:"b"}];
     publicUserGuid = "a"; publicSelectionMap = {a:[
       {provider:"musicbox",source:"netease",kind:"playlist",id:"7108"}
@@ -2622,6 +2767,179 @@ test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   assert.ok(!els.get("#public-selected").innerHTML.includes("旧用户详情"));
   enqueue("/app/fnmusic-ext/api/config", {values:{}});
   await global.loadConfig();
+});
+
+test("公共歌单：全部用户与个人配置独立记忆并同时提交", async () => {
+  reset();
+  const shared = [{ provider: "musicbox", source: "netease", kind: "chart", id: "all-1" }];
+  const userA = [{ provider: "musicbox", source: "netease", kind: "chart", id: "a-1" }];
+  const userB = [{ provider: "lx", source: "kg", kind: "playlist", id: "b-1" }];
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    presence: { FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: true },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "false",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify(shared),
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({ a: userA, b: userB }),
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true,
+    users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }],
+    public_playlists_by_user: { a: userA, b: userB },
+  });
+  await global.loadConfig();
+  await global.selectPublicUser("a");
+  vm.runInThisContext(`publicSelection.push(
+    {provider:"musicbox",source:"netease",kind:"chart",id:"a-2"}
+  ); stashPublicUser(true);`);
+  global.movePublicSelection(1, -1);
+  vm.runInThisContext(`
+    publicSelection.splice(1, 1);
+    stashPublicUser(true);
+  `);
+  await global.selectPublicUser("b");
+  vm.runInThisContext(`publicSelection.push(
+    {provider:"lx",source:"kg",kind:"playlist",id:"b-2"}
+  ); stashPublicUser(true);`);
+  await global.selectPublicUser("a");
+
+  els.get("#public-playlists-sync-all").checked = true;
+  await els.get("#public-playlists-sync-all").dispatch("change");
+  assert.strictEqual(vm.runInThisContext("publicSyncAll"), true);
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["all-1"]);
+  vm.runInThisContext(`publicSelection.push(
+    {provider:"musicbox",source:"netease",kind:"chart",id:"all-2"}
+  ); stashPublicUser(true);`);
+  global.movePublicSelection(1, -1);
+  vm.runInThisContext(`
+    publicSelection.splice(1, 1);
+    stashPublicUser(true);
+  `);
+
+  els.get("#public-playlists-sync-all").checked = false;
+  await els.get("#public-playlists-sync-all").dispatch("change");
+  assert.strictEqual(vm.runInThisContext("publicSyncAll"), false);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a-2"]);
+  let values = global.collectConfig();
+  assert.strictEqual(values.FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL, false);
+  assert.deepStrictEqual(
+    JSON.parse(values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION).map(({id}) => id),
+    ["all-2"],
+  );
+  const changes = JSON.parse(values.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER);
+  assert.deepStrictEqual(changes.a.map(({id}) => id), ["a-2"]);
+  assert.deepStrictEqual(changes.b.map(({id}) => id), ["b-1", "b-2"]);
+
+  // 保存后的完整回填恢复两套草稿；随后共享列表显式清空也必须持久化为 []。
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    presence: { FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: true },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "false",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify([{ ...shared[0], id: "all-2" }]),
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({
+        a: [{ ...userA[0], id: "a-2" }],
+        b: [{ ...userB[0], id: "b-1" }, { ...userB[0], id: "b-2" }],
+      }),
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true,
+    users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }],
+    public_playlists_by_user: {
+      a: [{ ...userA[0], id: "a-2" }],
+      b: [{ ...userB[0], id: "b-1" }, { ...userB[0], id: "b-2" }],
+    },
+  });
+  await global.loadConfig();
+  await global.selectPublicUser("a");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a-2"]);
+  els.get("#public-playlists-sync-all").checked = true;
+  await els.get("#public-playlists-sync-all").dispatch("change");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["all-2"]);
+  vm.runInThisContext(`
+    publicSelection.splice(0, 1);
+    stashPublicUser(true);
+  `);
+  values = global.collectConfig();
+  assert.deepStrictEqual(JSON.parse(values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION), []);
+
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    presence: { FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: true },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: "[]",
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: JSON.stringify({ a: [], b: [] }),
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ok: true,
+    users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }],
+    public_playlists_by_user: { a: [], b: [] },
+  });
+  await global.loadConfig();
+  assert.strictEqual(vm.runInThisContext("publicSyncAll"), true);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection"), []);
+});
+
+test("公共歌单：共享模式用户查询失败仍可编辑全部列表", async () => {
+  reset();
+  const shared = [{ provider: "musicbox", source: "netease", kind: "chart", id: "all" }];
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: {
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {},
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: {},
+    },
+    values: {
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_SELECTION: JSON.stringify(shared),
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: "{}",
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", new Error("数据库不可读"));
+  await global.loadConfig();
+  assert.strictEqual(vm.runInThisContext("publicSelectionEditable()"), true);
+  assert.strictEqual(els.get("#public-user").disabled, true);
+  assert.strictEqual(els.get("#public-playlists-browser").hidden, false);
+  assert.ok(els.get("#public-users-note").textContent.includes("共享"));
+  assert.strictEqual(global.setPublicSelection({
+    provider: "lx", source: "kg", kind: "playlist", id: "new", name: "新歌单",
+  }, true), true);
+});
+
+test("公共歌单：旧后端缺少全用户开关时禁用且不提交未知字段", async () => {
+  reset();
+  vm.runInThisContext(`
+    configSchema = { FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: {} };
+    configValues = {
+      FNMUSIC_NETEASE_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: "true",
+      FNMUSIC_PUBLIC_PLAYLISTS_BY_USER: "{}",
+    };
+    configPresence = {};
+    applyConfigToForm();
+  `);
+  assert.strictEqual(els.get("#public-playlists-sync-all").disabled, true);
+  assert.strictEqual(
+    global.collectConfig().FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL,
+    undefined,
+  );
 });
 
 test("洛雪超时设置：loadConfig 回填默认与已存参数 + 输入标脏", async () => {
@@ -2731,14 +3049,19 @@ test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆�
   const storageSubs = els.get("#nav-storage-subs");
   const advancedTitle = els.get("#nav-advanced-title");
   const advancedSubs = els.get("#nav-advanced-subs");
+  const experimentalTitle = els.get("#nav-experimental-title");
+  const experimentalSubs = els.get("#nav-experimental-subs");
 
   // 首访收起
   global.setNavGroupExpanded("storage", false, false);
   global.setNavGroupExpanded("advanced", false, false);
+  global.setNavGroupExpanded("experimental", false, false);
   assert.strictEqual(storageTitle.getAttribute("aria-expanded"), "false");
   assert.strictEqual(storageSubs.hidden, true);
   assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "false");
   assert.strictEqual(advancedSubs.hidden, true);
+  assert.strictEqual(experimentalTitle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(experimentalSubs.hidden, true);
 
   // 点击展开储存
   await storageTitle.dispatch("click");
@@ -2760,6 +3083,13 @@ test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆�
   assert.strictEqual(advancedSubs.hidden, false);
   assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-advanced-expanded"), "true");
   assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
+
+  // 点击展开实验功能
+  await experimentalTitle.dispatch("click");
+  assert.strictEqual(experimentalTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(experimentalSubs.hidden, false);
+  assert.strictEqual(global.window.localStorage.getItem("fnmusic-nav-experimental-expanded"), "true");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), false);
 });
 
 test("导航切页：切子页自动展开一级分组并联动高亮", () => {
@@ -2768,8 +3098,11 @@ test("导航切页：切子页自动展开一级分组并联动高亮", () => {
   const storageSubs = els.get("#nav-storage-subs");
   const advancedTitle = els.get("#nav-advanced-title");
   const advancedSubs = els.get("#nav-advanced-subs");
+  const experimentalTitle = els.get("#nav-experimental-title");
+  const experimentalSubs = els.get("#nav-experimental-subs");
   const bottomStorage = els.get("#bottom-storage-trigger");
   const bottomAdvanced = els.get("#bottom-advanced-trigger");
+  const bottomExperimental = els.get("#bottom-experimental-trigger");
 
   // 切到 tee（边听边存）
   global.switchPage("tee");
@@ -2788,13 +3121,40 @@ test("导航切页：切子页自动展开一级分组并联动高亮", () => {
   assert.strictEqual(bottomAdvanced.classList.contains("active"), true);
   assert.strictEqual(storageTitle.classList.contains("active"), false);
   assert.strictEqual(bottomStorage.classList.contains("active"), false);
+  assert.strictEqual(experimentalTitle.classList.contains("active"), false);
+  assert.strictEqual(bottomExperimental.classList.contains("active"), false);
+
+  // 切到 exp-layout（目录归类与整理）
+  global.switchPage("exp-layout");
+  assert.strictEqual(experimentalTitle.getAttribute("aria-expanded"), "true");
+  assert.strictEqual(experimentalSubs.hidden, false);
+  assert.strictEqual(experimentalTitle.classList.contains("active"), true);
+  assert.strictEqual(bottomExperimental.classList.contains("active"), true);
+  assert.strictEqual(storageTitle.classList.contains("active"), false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), false);
 
   // 切到 settings（常规页）
   global.switchPage("settings");
   assert.strictEqual(storageTitle.classList.contains("active"), false);
   assert.strictEqual(advancedTitle.classList.contains("active"), false);
+  assert.strictEqual(experimentalTitle.classList.contains("active"), false);
   assert.strictEqual(bottomStorage.classList.contains("active"), false);
   assert.strictEqual(bottomAdvanced.classList.contains("active"), false);
+  assert.strictEqual(bottomExperimental.classList.contains("active"), false);
+});
+
+test("导航归属：「搜索设置」保留在高级分组并联动展开高亮", () => {
+  reset();
+  const advancedTitle = els.get("#nav-advanced-title");
+  const advancedSubs = els.get("#nav-advanced-subs");
+  const storageSubs = els.get("#nav-storage-subs");
+  global.switchPage("search");
+  assert.strictEqual(advancedTitle.getAttribute("aria-expanded"), "true", "搜索页应展开高级分组");
+  assert.strictEqual(advancedSubs.hidden, false);
+  assert.strictEqual(advancedTitle.classList.contains("active"), true);
+  assert.notStrictEqual(storageSubs.hidden, undefined, "储存分组仍可独立折叠");
+  global.switchPage("overview");
+  assert.strictEqual(advancedTitle.classList.contains("active"), false, "切走后父级高亮清除");
 });
 
 test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", async () => {
@@ -2828,6 +3188,25 @@ test("移动底导航：父项弹子菜单支持外点/Escape/focus返回", asyn
 
   // 外点关闭并 focus 返回 trigger
   await global.window.dispatch("click", { target: otherEl });
+  assert.strictEqual(menu.hidden, true);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(global.document.activeElement, trigger);
+});
+
+test("移动底导航：实验功能子菜单独立打开并回焦", async () => {
+  reset();
+  els.get("#cleanup-modal").hidden = true;
+  els.get("#organize-modal").hidden = true;
+  const trigger = els.get("#bottom-experimental-trigger");
+  const menu = els.get("#bottom-experimental-menu");
+
+  menu.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  await trigger.dispatch("click");
+  assert.strictEqual(menu.hidden, false);
+  assert.strictEqual(trigger.getAttribute("aria-expanded"), "true");
+
+  await global.window.dispatch("keydown", { key: "Escape", preventDefault: () => {} });
   assert.strictEqual(menu.hidden, true);
   assert.strictEqual(trigger.getAttribute("aria-expanded"), "false");
   assert.strictEqual(global.document.activeElement, trigger);
@@ -3158,7 +3537,7 @@ test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐�
   assert.strictEqual(alipayWrap.hidden, false);
   assert.strictEqual(donateCard.hidden, false);
 
-  // 支付宝二维码也加载失败 → 隐藏支付宝项并收起外层打赏卡片
+  // 支付宝二维码也加载失败 → 隐藏支付宝项并收起外层卡片
   alipayImg.onerror();
   assert.strictEqual(alipayWrap.hidden, true);
   assert.strictEqual(donateCard.hidden, true);
@@ -3210,6 +3589,259 @@ test("保存：目录检查立即禁用按钮，重复点击不会发起第二�
     release();
     global.fetch = original;
   }
+});
+
+test("checkActiveConfigJob：页面初始化恢复未完成任务", async () => {
+  reset();
+  global.CONFIG_JOB_POLL_INTERVAL = 0;
+  // 1. 查询活动任务：发现进行中任务
+  enqueue("/app/fnmusic-ext/api/config/jobs/active", {
+    ok: true,
+    active: true,
+    job: {
+      job_id: "cfg_active_999",
+      status: "running",
+      progress: 80,
+      message: "正在激活洛雪音源...",
+    },
+  });
+  // 2. 轮询至完成
+  enqueue("/app/fnmusic-ext/api/config/jobs/cfg_active_999", {
+    ok: true,
+    job: {
+      job_id: "cfg_active_999",
+      status: "success",
+      progress: 100,
+      result: { ok: true, changed: [], actions: [] },
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  enqueue("/app/fnmusic-ext/api/status", { ok: true, current_provider: "none", processes: {} });
+
+  await global.checkActiveConfigJob();
+
+  assert.strictEqual(els.get("#save-btn").disabled, false);
+  assert.strictEqual(els.get("#save-btn").textContent, "保存并生效");
+  assert.ok(els.get("#toast").textContent.includes("配置已保存生效"));
+});
+
+test("HTML/CSS：平台批量测试 UI 入口与表格容器", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "static", "style.css"), "utf8");
+  for (const id of ["platform-test-btn", "platform-test-panel", "platform-test-keyword",
+                    "platform-test-concurrency", "platform-test-start", "platform-test-stop",
+                    "platform-test-progress-wrap", "platform-test-progress", "platform-test-progress-text",
+                    "platform-test-summary", "platform-test-actions", "platform-test-enable-ok",
+                    "platform-test-disable-fail", "platform-test-enable-all", "platform-test-disable-all",
+                    "platform-test-table", "platform-test-tbody"]) {
+    assert.ok(html.includes(`id="${id}"`), `HTML 必须包含 id="${id}"`);
+  }
+  assert.ok(css.includes(".data-table"), "CSS 必须包含 .data-table 样式");
+  assert.ok(css.includes(".progress-bar"), "CSS 必须包含 .progress-bar 样式");
+});
+
+test("平台测试：轮询临时失败后继续查询", async () => {
+  reset();
+  vm.runInThisContext('clearTimeout(platformTestTimer); platformTestJob = {job_id:"retry", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", new Error("temporary outage"));
+  await global.pollPlatformTestJob();
+  assert.ok(els.get("#platform-test-summary").textContent.includes("将重试"));
+  assert.ok(vm.runInThisContext("platformTestTimer !== null"));
+  enqueue("/app/fnmusic-ext/api/platforms/test/status",
+    {ok:true, status:"done", results:[], progress:{done:1,total:1}});
+  await global.pollPlatformTestJob();
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+  assert.strictEqual(vm.runInThisContext("platformTestTimer"), null);
+});
+
+test("平台测试：停止后迟到的轮询不覆盖状态", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"stop", status:"running", results:[], progress:{done:0,total:1}};');
+  let release;
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", {__rawResponse:true, resp:{
+    ok:true, status:200, json:() => new Promise((resolve) => { release = resolve; }),
+  }});
+  const polling = global.pollPlatformTestJob();
+  await tick(0);
+  enqueue("/app/fnmusic-ext/api/platforms/test/stop", {ok:true});
+  await global.stopPlatformTest();
+  release({ok:true, status:"running", results:[], progress:{done:0,total:1}});
+  await polling;
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "cancelled");
+  assert.ok(els.get("#platform-test-summary").textContent.includes("已停止"));
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+});
+
+test("平台测试：停止失败保留任务并允许重试", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"stop-fail", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/stop", new Error("unavailable"));
+  await global.stopPlatformTest();
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "running");
+  assert.strictEqual(els.get("#platform-test-stop").disabled, false);
+  assert.ok(els.get("#platform-test-summary").textContent.includes("停止失败"));
+});
+
+test("平台测试：记录过期恢复开始按钮", async () => {
+  reset();
+  vm.runInThisContext('platformTestJob = {job_id:"expired", status:"running", results:[], progress:{done:0,total:1}};');
+  enqueue("/app/fnmusic-ext/api/platforms/test/status", {__rawResponse:true, resp:{
+    ok:false, status:404, json:async () => ({error:"job not found or expired"}),
+  }});
+  await global.pollPlatformTestJob();
+  assert.strictEqual(vm.runInThisContext("platformTestJob.status"), "expired");
+  assert.strictEqual(els.get("#platform-test-start").disabled, false);
+});
+
+test("洛雪源 CPU 异常：按稳定 ID 显示红标，同名源不串告警", async () => {
+  vm.runInThisContext(`
+    lxSourceList = [
+      {id: "a.js", name: "同名源", url: "file:///data/lxserver/users/source/_open/a.js", active: true},
+      {id: "b.js", name: "同名源", url: "file:///data/lxserver/users/source/_open/b.js", active: true},
+    ];
+    lxSourceOrder = [];
+    lxRuntimeSnapshot = {state: "ready", sources: [
+      {id: "a.js", name: "同名源", status: "success", runtime_id: "r1", resource_usage: {
+        abnormal: true, cpu_percent: 78.4, threshold_percent: 50, required_duration_s: 180,
+        high_duration_s: 185, monitoring_status: "ok", runtime_id: "r1",
+        detected_at: "2026-01-01T00:00:00Z", reason: "sustained_source_cpu"}},
+      {id: "b.js", name: "同名源", status: "success", runtime_id: "r2", resource_usage: {
+        abnormal: false, cpu_percent: 2.1, threshold_percent: 50, required_duration_s: 180,
+        high_duration_s: 0, monitoring_status: "ok", runtime_id: "r2", detected_at: ""}},
+    ]};
+    lxCpuAlerts.clear();
+    lxRuntimeStatusUnknown = false;
+    syncLxCpuAlerts(lxRuntimeSnapshot.sources);
+    syncLxSourceOrder();
+    renderLxSourceList();
+  `);
+  const html = els.get("#lx-source-list").innerHTML;
+  assert.strictEqual((html.match(/class="lx-cpu-alert"/g) || []).length, 1);
+  assert.ok(html.includes('data-cpu-source-id="a.js"'));
+  assert.ok(html.includes("资源异常占用"));
+  assert.ok(html.includes('aria-label="资源异常占用：同名源，查看判定说明"'));
+  assert.ok(!html.includes('data-cpu-source-id="b.js"'));
+});
+
+test("洛雪源 CPU 异常：刷新失败保留红标，新运行实例才清除", async () => {
+  reset();
+  const ready = (runtimeId, abnormal) => ({
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: {state: "ready", sources: [{
+      id: "a.js", name: "源A", status: "success", runtime_id: runtimeId,
+      resource_usage: {abnormal, cpu_percent: abnormal ? 70 : 1,
+        threshold_percent: 50, required_duration_s: 180, high_duration_s: abnormal ? 181 : 0,
+        monitoring_status: "ok", runtime_id: runtimeId, detected_at: abnormal ? "2026-01-01T00:00:00Z" : ""},
+    }]},
+  });
+  vm.runInThisContext(`lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: true}];
+    lxSourceOrder = []; lxCpuAlerts.clear(); lxRuntimeStatusUnknown = false;`);
+  enqueue("/app/fnmusic-ext/api/status", ready("r1", true));
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'));
+  enqueue("/app/fnmusic-ext/api/status", new Error("状态接口超时"));
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "刷新失败不能清除已确认的告警");
+  enqueue("/app/fnmusic-ext/api/status", ready("r1", false));
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "同一运行实例的低载读数不能自动解除告警");
+  enqueue("/app/fnmusic-ext/api/status", ready("r2", false));
+  await global.loadStatus();
+  assert.ok(!els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "新运行实例应清除旧告警");
+});
+
+test("洛雪源 CPU 异常：快照暂时缺源不清标，显式停止才清除", async () => {
+  reset();
+  vm.runInThisContext(`lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: true}];
+    lxSourceOrder = []; lxCpuAlerts.clear();
+    lxCpuAlerts.set("a.js", {sourceId: "a.js", name: "源A", runtimeId: "r1", cpuPercent: 70});
+    lxRuntimeStatusUnknown = false;
+    renderLxSourceList();`);
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: {state: "ready", sources: []},
+  });
+  await global.loadStatus();
+  assert.ok(els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "快照暂时缺源不能当作已停用");
+  enqueue("/app/fnmusic-ext/api/status", {
+    version: "t", current_provider: "lxmusic", processes: {}, services: {},
+    lx_source: {state: "ready", sources: [{
+      id: "a.js", name: "源A", status: "stopped", process_state: "stopped", runtime_id: "",
+      resource_usage: {abnormal: false, monitoring_status: "stopped", runtime_id: ""},
+    }]},
+  });
+  await global.loadStatus();
+  assert.ok(!els.get("#lx-source-list").innerHTML.includes('data-cpu-source-id="a.js"'),
+    "显式 stopped 状态应清除红标");
+});
+
+test("洛雪源 CPU 异常：只有确认成功的停用才清除红标", async () => {
+  vm.runInThisContext(`
+    lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: false}];
+    lxRuntimeSnapshot = {state: "ready", sources: [
+      {id: "a.js", name: "源A", url: "file:///a.js", status: "success"},
+      {id: "b.js", name: "源A", url: "file:///b.js", status: "success"},
+    ]};
+    lxCpuAlerts.clear();
+    lxCpuAlerts.set("a.js", {sourceId: "a.js", name: "源A", runtimeId: "r1", cpuPercent: 70});
+    lxCpuAlerts.set("b.js", {sourceId: "b.js", name: "源A", runtimeId: "r2", cpuPercent: 60});
+  `);
+  global.clearLxCpuAlertsAfterSavedConfig({
+    complete: false,
+    actions: [
+      {kind: "lx_activate", op: "deactivate", ok: false, url: "file:///a.js", source: "源A"},
+      {kind: "lx_activate", op: "deactivate", ok: true, url: "file:///b.js", source: "源A"},
+    ],
+  });
+  assert.strictEqual(vm.runInThisContext('lxCpuAlerts.has("a.js")'), true,
+    "停用结果未确认时不能清除告警");
+  assert.strictEqual(vm.runInThisContext('lxCpuAlerts.has("b.js")'), false,
+    "同名源只清除确认停用的稳定 ID");
+  global.clearLxCpuAlertsAfterSavedConfig({
+    complete: true,
+    actions: [{kind: "lx_activate", op: "deactivate", ok: true, url: "file:///a.js", source: "源A"}],
+  });
+  assert.strictEqual(vm.runInThisContext('lxCpuAlerts.has("a.js")'), false,
+    "确认停用后清除告警");
+});
+
+test("洛雪源 CPU 异常：帮助弹窗复用焦点往返并在重绘后改绑按钮", async () => {
+  const template = stubEl();
+  template.dataset.helpId = "lx-source-cpu";
+  global.helpTemplates = [template];
+  els.get("#help-modal").hidden = true;
+  vm.runInThisContext(`
+    lxSourceList = [{id: "a.js", name: "源A", url: "file:///a.js", active: true}];
+    lxSourceOrder = [];
+    lxRuntimeSnapshot = {state: "ready", sources: [{id: "a.js", name: "源A", status: "success",
+      resource_usage: {abnormal: true, cpu_percent: 80, threshold_percent: 50,
+        required_duration_s: 180, high_duration_s: 181, monitoring_status: "ok",
+        runtime_id: "r1", detected_at: "2026-01-01T00:00:00Z"}}]};
+    lxCpuAlerts.clear();
+    syncLxCpuAlerts(lxRuntimeSnapshot.sources);
+  `);
+  const trigger = stubEl();
+  trigger.getAttribute = () => "查看资源异常占用";
+  const item = vm.runInThisContext("lxSourceList[0]");
+  global.openLxCpuHelp(item, trigger);
+  assert.strictEqual(els.get("#help-modal").hidden, false);
+  assert.strictEqual(els.get("#help-title").textContent, "资源异常占用");
+  assert.strictEqual(vm.runInThisContext("lxCpuHelpSourceId"), "a.js");
+  global.closeHelp();
+  assert.strictEqual(document.activeElement, trigger);
+
+  const replacement = stubEl();
+  replacement.dataset.cpuSourceId = "a.js";
+  const list = els.get("#lx-source-list");
+  list.querySelectorAll = (selector) => selector === ".lx-cpu-alert" ? [replacement] : [];
+  vm.runInThisContext(`$("#help-modal").hidden = false; lxCpuHelpSourceId = "a.js"; helpReturnFocus = null;
+    renderLxSourceList();`);
+  assert.strictEqual(vm.runInThisContext("helpReturnFocus"), replacement);
+  vm.runInThisContext(`$("#help-modal").hidden = true; lxCpuHelpSourceId = "";`);
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

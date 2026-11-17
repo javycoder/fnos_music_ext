@@ -73,8 +73,9 @@ fnmusic_log_tail_brief() {
 fnmusic_run_logged() {
     # Run a command, appending a timestamped copy of its combined output to
     # FNMUSIC_DURABLE_LOG. The return status is the command's, not tee's.
-    local stamp rc pipefail_on=0
+    local stamp rc pipefail_on=0 start_secs
     stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)"
+    start_secs="${SECONDS}"
     printf '\n===== %s %s =====\n' "${stamp}" "$*" >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
     if set -o | grep -q 'pipefail[[:space:]]*on'; then
         pipefail_on=1
@@ -85,6 +86,12 @@ fnmusic_run_logged() {
     if [ "${pipefail_on}" -eq 1 ]; then
         set -o pipefail
     fi
+    # 3.0.0+：补记结束时间与总耗时。install.sh 事件 done 之后仍会 exec extend
+    # 接管与验收（2026-11-03 实测尾段可观），只有本行能给出 hook 级完整时长。
+    stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown-time)"
+    printf '===== %s exit=%s elapsed=%ss %s =====\n' \
+        "${stamp}" "${rc}" "$((SECONDS - start_secs))" "$*" \
+        >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
     return "${rc}"
 }
 
@@ -110,8 +117,14 @@ fnmusic_cleanup_sources_container() {
 fnmusic_env_source() {
     # 0 when the selected audio source recorded in .env matches $1.
     [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
-    local key="$1"
-    grep -q "^${key}=true" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
+    local key="$1" val
+    val="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null \
+        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" \
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//" | tr '[:upper:]' '[:lower:]')"
+    case "${val}" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 fnmusic_saved_source() {
@@ -123,8 +136,10 @@ fnmusic_saved_source() {
 }
 
 fnmusic_saved_lx_url() {
-    [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
-    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+    [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
+    grep -E "^[[:space:]]*(export[[:space:]]+)?LX_SOURCE_URL[[:space:]]*=" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null \
+        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?LX_SOURCE_URL[[:space:]]*=[[:space:]]*//" \
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//"
 }
 
 fnmusic_data_items() {
@@ -133,7 +148,7 @@ fnmusic_data_items() {
     # 会按 cwd 展开，把不存在于 repo 的文件名传给 tar 导致备份失败。
     local p f rel items=""
     [ -n "${FNMUSIC_REPO_DIR}" ] || return 0
-    for p in ".env" ".env.bak*" "sources-data" "musicbox-data" "musicdl_outputs" \
+    for p in ".env" ".env.bak*" "config" "sources-data" "musicbox-data" "musicdl_outputs" \
              "online_favorites" "online_favorites.json" "play_history" "playlist_tracks" \
              "recommend_cache" "nm_playlists_cache" "public_playlists_cache" "cache" \
              "llm_usage.json" "album_registry.json" "bind_registry.json"; do

@@ -376,6 +376,13 @@ async def test_transcode_session_bitrate_isolation(tmp_path, monkeypatch):
     # 磁盘上已存在一个 128k 完成状态的转码会话
     (tmp_path / "hls" / "GUID_BITRATE_TEST" / tc.INIT_NAME).write_bytes(b"init_data")
     (tmp_path / "hls" / "GUID_BITRATE_TEST" / "00000.m4s").write_bytes(b"seg_0")
+    (tmp_path / "hls" / "GUID_BITRATE_TEST" / tc.PLAYLIST_NAME).write_text(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:11\n"
+        "#EXT-X-PLAYLIST-TYPE:EVENT\n"
+        '#EXT-X-MAP:URI="init.mp4"\n'
+        "#EXTINF:10.000,\n00000.m4s\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
     dummy_sess = tc.Session(
         guid="GUID_BITRATE_TEST", directory=sess_dir, duration_s=10.0,
         hls_time=10.0, declared_count=1, bitrate="128k", status="done",

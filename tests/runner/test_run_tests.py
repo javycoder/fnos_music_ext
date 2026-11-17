@@ -37,6 +37,79 @@ def test_all_pytest_roots_run_exactly_once():
     assert "tests/integration" in runner.SUITES["infrastructure"]
 
 
+def test_proxy_shards_cover_every_file_exactly_once():
+    discovered = runner.proxy_test_files()
+    assert discovered, "proxy test discovery must not be empty"
+    for count in (1, 2, 3):
+        plan = runner.proxy_shards(count)
+        scheduled = [path for paths in plan for path in paths]
+        expected = {f"{runner.PROXY_ROOT}/{name}" for name in discovered}
+        if count == 1:
+            # 单分片保留整目录路径，便于按目录直接运行/诊断。
+            assert scheduled == [runner.PROXY_ROOT]
+            continue
+        assert set(scheduled) == expected, count
+        assert len(scheduled) == len(expected), "a file must not run twice"
+    # 独占组始终最后单独执行，不与并行分片重叠。
+    serial = runner.proxy_shards(3)[-1]
+    assert all(Path(path).name in runner.PROXY_EXCLUSIVE for path in serial)
+    assert not any(
+        Path(path).name in runner.PROXY_EXCLUSIVE
+        for paths in runner.proxy_shards(3)[:-1] for path in paths
+    )
+
+
+def test_new_proxy_file_is_scheduled_by_default(tmp_path, monkeypatch):
+    """新增测试文件即使没有权重条目也必须进入某个分片。"""
+    root = tmp_path / "proxy" / "tests"
+    root.mkdir(parents=True)
+    for name in ("test_known.py", "test_brand_new.py"):
+        (root / name).write_text("", encoding="utf-8")
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "PROXY_EXCLUSIVE", ())
+    scheduled = [path for paths in runner.proxy_shards(2) for path in paths]
+    assert f"{runner.PROXY_ROOT}/test_brand_new.py" in scheduled
+
+
+def test_shard_children_get_isolated_state_dirs(tmp_path, monkeypatch, capsys):
+    captured = {}
+    monkeypatch.setenv("HOME", "/production/home")
+    monkeypatch.setenv("XDG_DATA_HOME", "/production/data")
+    monkeypatch.setenv("WEBUI_REPO_DIR", "/production/repo")
+    monkeypatch.setenv("SOURCES_DATA_DIR", "/production/sources")
+    monkeypatch.setenv("NETEASE_SESSION_FILE", "/production/session.json")
+    monkeypatch.setenv("NETEASE_COOKIE", "do-not-inherit")
+
+    class FakeProcess:
+        pid = 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, cwd, env, stdout, stderr, start_new_session):
+        captured["env"] = dict(env)
+        captured["command"] = list(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+    work = tmp_path / "work"
+    (work / "coverage").mkdir(parents=True)
+    assert runner.run_phase({"proxy-1": ("proxy/tests",)}, 1, work, False) == {"proxy-1": 0}
+    env = captured["env"]
+    # 每个分片独占应用状态，避免并发写同一份注册表/缓存。
+    for key in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                "XDG_RUNTIME_DIR", "WEBUI_REPO_DIR", "SOURCES_DATA_DIR", "NETEASE_SESSION_FILE",
+                "FNMUSIC_HOME", "FNMUSIC_LOG_DIR", "FNMUSIC_ALBUM_REGISTRY",
+                "FNMUSIC_CACHE_DIR", "FNMUSIC_LIBRARY_DIR", "FNMUSIC_FAV_DIR"):
+        assert env[key].startswith(str(work / "proxy-1")), key
+        if key in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                   "XDG_RUNTIME_DIR", "WEBUI_REPO_DIR", "SOURCES_DATA_DIR"):
+            assert Path(env[key]).is_dir()
+    assert "NETEASE_COOKIE" not in env
+    assert any(arg.startswith("--basetemp=") for arg in captured["command"])
+    capsys.readouterr()
+
+
 def test_command_uses_current_interpreter_without_extra_node_or_xdist():
     command = runner.pytest_command(("webui-service",), False)
     assert command[:4] == [sys.executable, "-m", "pytest", "webui-service"]
@@ -66,9 +139,12 @@ def test_main_preserves_phase_barriers_and_deduplicates_selection(monkeypatch):
     monkeypatch.setattr(runner, "run_phase", fake_phase)
     # Failure must be reported but must not skip remaining suites/phases.
     assert runner.main(["--jobs", "1"]) == 1
-    assert calls == [(["proxy"], 1, False),
-                     (["webui", "musicdl", "lxmusic"], 1, False),
-                     (["infrastructure"], 1, False)]
+    # proxy 被拆成独立分片，但仍先于服务与基础设施阶段，且只调度一次。
+    proxy_phase, exclusive_phase, *rest = calls
+    assert proxy_phase[0] and all(name.startswith("proxy-") for name in proxy_phase[0])
+    assert len(exclusive_phase[0]) == 1 and exclusive_phase[1] == 1
+    assert rest == [(["webui", "musicdl", "lxmusic"], 1, False),
+                    (["infrastructure"], 1, False)]
     calls.clear()
     assert runner.main(["--suite", "lxmusic", "--suite", "lxmusic"]) == 0
     assert [names for names, _, _ in calls if names] == [["lxmusic"]]
@@ -102,6 +178,30 @@ record('end')
 print('probe output ' + name)
 sys.exit(3 if name == 'second' else 0)
 """
+
+
+@pytest.mark.parametrize("jobs", [2, 3])
+def test_exclusive_proxy_shard_waits_for_all_parallel_processes(tmp_path, monkeypatch, jobs):
+    """用真实进程观察独占组，不能只检查它在分片清单里排最后。"""
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "proxy_shards", lambda count: [
+        ("proxy/tests/test_shared_a.py",),
+        ("proxy/tests/test_shared_b.py",),
+        ("proxy/tests/test_maintenance.py",),
+    ])
+    probe = PROBE.replace(
+        "time.sleep(.05)", "time.sleep(.3 if name == 'test_shared_b' else .02)",
+    )
+    monkeypatch.setattr(runner, "pytest_command", lambda paths, coverage: [
+        sys.executable, "-c", probe, Path(paths[0]).stem, str(events),
+    ])
+    assert runner.main(["--suite", "proxy", "--jobs", str(jobs)]) == 0
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    starts = {row["name"]: row["at"] for row in rows if row["event"] == "start"}
+    ends = {row["name"]: row["at"] for row in rows if row["event"] == "end"}
+    assert len(starts) == len(ends) == 3
+    assert starts["test_maintenance"] >= max(ends["test_shared_a"], ends["test_shared_b"])
 
 
 @pytest.mark.parametrize("jobs", [1, 2])
@@ -281,7 +381,15 @@ def test_ci_uses_runner_and_retains_unique_image_checks():
     ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     jobs = ci["jobs"]
     commands = [step.get("run", "") for step in jobs["test"]["steps"]]
-    assert "python scripts/run_tests.py --jobs 2 --coverage" in commands
+    assert "python scripts/run_tests.py --jobs 2 --shards 2 --coverage" in commands
+    install = "npm ci --prefix netease-service --omit=dev --ignore-scripts"
+    assert commands.index(install) < commands.index(
+        "python scripts/run_tests.py --jobs 2 --shards 2 --coverage"
+    )
+    node_checks = next(step["run"] for step in jobs["test"]["steps"]
+                       if step.get("name") == "Node syntax check")
+    assert "node --check netease-service/app.js" in node_checks.splitlines()
+    assert "node --check netease-service/service.js" in node_checks.splitlines()
     assert not any("python -m pytest" in command for command in commands)
     assert "images" not in jobs
     images = jobs["images-multiarch"]

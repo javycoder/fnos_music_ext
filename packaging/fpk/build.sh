@@ -10,6 +10,13 @@ set -euo pipefail
 #   packaging/fpk/build.sh --stage-only DIR    # 只组装不打包（结构测试用）
 #   packaging/fpk/build.sh --fnpack /path/fnpack --out dist
 # 环境变量: FNPACK_VERSION（默认 1.2.3）
+#           FPK_IMAGE_ASSETS=require|auto|skip（默认 auto）
+#           skip：通用包，platform=all，不含镜像和宿主 wheel，安装时现场构建
+#           require：必须同时生成对应架构镜像和宿主 wheelhouse，文件名带
+#           -prebuilt-amd64/-prebuilt-arm64，manifest platform 为 x86 或 arm
+#           auto：本机 Docker 可用时按 require，否则按 skip
+#           另有 FPK_IMAGE_ARCH / FPK_IMAGE_BASE / FPK_IMAGE_PIP_INDEX /
+#           FPK_IMAGE_APT_MIRROR / FPK_IMAGE_GZIP_LEVEL
 # ==============================================================================
 
 FPK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -100,17 +107,18 @@ rsync -a --delete \
     --exclude='tests/' --exclude='docs/' --exclude='pytest.ini' \
     --exclude='CONTRIBUTING.md' --exclude='AGENTS.md' \
     --exclude='test_*.py' --exclude='test_*.js' --exclude='conftest.py' --exclude='smoke_test.sh' --exclude='run_tests.py' \
-    --exclude='.venv*/' --exclude='__pycache__/' --exclude='.pytest_cache/' \
+    --exclude='.venv*/' --exclude='__pycache__/' --exclude='.pytest_cache/' --exclude='node_modules/' \
     --exclude='*.pyc' --exclude='*.log' --exclude='*.logzip' \
     --exclude='fnmusic-logs-*-????????.zip' --exclude='logs/' --exclude='/logs' \
     --exclude='*.part' --exclude='.DS_Store' \
     --exclude='cache/' --exclude='sources-data/' --exclude='backup/' \
-    --exclude='musicbox-data/' --exclude='musicdl_outputs/' \
+    --exclude='musicbox-data/' --exclude='musicbox-service/' --exclude='musicdl_outputs/' \
     --exclude='recommend_cache/' --exclude='public_playlists_cache/' --exclude='play_history/' \
     --exclude='online_favorites/' --exclude='online_favorites.json' \
     --exclude='llm_usage.json' --exclude='llm_usage.json.*' \
     --exclude='playlist_tracks/' --exclude='album_registry.json' --exclude='bind_registry.json' \
     --exclude='*.fpk' \
+    --exclude='assets/image/' --exclude='assets/proxy-wheels/' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
 
 # 注入预编译包至打包 staging 目录，实现 fpk 离线内嵌而不污染源码树
@@ -135,8 +143,135 @@ if [ -f "${REPO_ROOT}/container/lxserver.version" ]; then
     fi
 fi
 
+# ------------------------------------------------------------------------------
+# 1.5 应用镜像离线资产（3.0.0+）
+# CI/正式打包：从最终 staging 构建 docker 镜像 → docker save | gzip → app/repo/assets/image/
+# 安装端 proxy/image_bundle.py 优先复用/导入该归档，NAS 正常安装不再现场执行
+# apt/pip BuildKit 构建（2026-11-03 实测该段占 261s 安装的约 84%）。
+# FPK_IMAGE_ASSETS: require（CI：Docker 不可用即失败）| auto（默认：本机有 Docker
+# 才构建，--stage-only 结构测试不受影响）| skip（显式跳过）
+# FPK_IMAGE_ARCH: 目标架构（默认本机）；arm64 交叉构建需 buildx + QEMU
+# ------------------------------------------------------------------------------
+# --stage-only 结构测试默认不构建镜像（CI 的 ubuntu runner 有 Docker，auto 会
+# 意外触发数分钟构建）；显式 FPK_IMAGE_ASSETS=require 仍可在 stage-only 强制构建。
+if [ "${STAGE_ONLY}" -eq 1 ] && [ -z "${FPK_IMAGE_ASSETS:-}" ]; then
+    IMAGE_ASSET_MODE="skip"
+else
+    IMAGE_ASSET_MODE="${FPK_IMAGE_ASSETS:-auto}"
+fi
+ASSET_ARCH_SUFFIX=""
+MANIFEST_PLATFORM="all"
+if [ "${IMAGE_ASSET_MODE}" != "skip" ]; then
+    case "$(uname -m)" in
+        x86_64) _HOST_ARCH=amd64 ;;
+        aarch64|arm64) _HOST_ARCH=arm64 ;;
+        *) _HOST_ARCH="" ;;
+    esac
+    IMAGE_ARCH="${FPK_IMAGE_ARCH:-${_HOST_ARCH}}"
+    if [ -n "${IMAGE_ARCH}" ] && docker info >/dev/null 2>&1; then
+        BUNDLE_DIR="${STAGE}/app/repo/assets/image"
+        mkdir -p "${BUNDLE_DIR}"
+        echo "[fpk] 从最终 staging 构建应用镜像归档 (linux/${IMAGE_ARCH})..."
+        GIT_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+        # buildx 默认 attestation 会让产物成为 manifest list，inspect/save 拿不到
+        # RootFS.DiffIds；需要经典单平台镜像（支持的 docker 上显式关闭）。
+        ASSET_BUILD_FLAGS=()
+        if docker build --help 2>&1 | grep -q -- '--provenance'; then
+            ASSET_BUILD_FLAGS+=(--provenance=false --sbom=false)
+        fi
+        DOCKER_BUILDKIT=1 docker build \
+            --platform "linux/${IMAGE_ARCH}" \
+            -f "${STAGE}/app/repo/container/Dockerfile" \
+            --build-arg BASE_IMAGE="${FPK_IMAGE_BASE:-python:3.13-slim}" \
+            --build-arg PIP_INDEX_URL="${FPK_IMAGE_PIP_INDEX:-https://pypi.org/simple}" \
+            --build-arg APT_MIRROR="${FPK_IMAGE_APT_MIRROR:-}" \
+            "${ASSET_BUILD_FLAGS[@]}" \
+            -t fnmusic-sources:latest \
+            "${STAGE}/app/repo"
+        DOCKERFILE_SHA="$(sha256sum "${STAGE}/app/repo/container/Dockerfile" | awk '{print $1}')"
+        ARCHIVE="${BUNDLE_DIR}/fnmusic-sources-image.tar.gz"
+        echo "[fpk] docker save | gzip → ${ARCHIVE} ..."
+        docker save fnmusic-sources:latest | gzip "-${FPK_IMAGE_GZIP_LEVEL:-6}" > "${ARCHIVE}"
+        ARCHIVE_SHA="$(sha256sum "${ARCHIVE}" | awk '{print $1}')"
+        ARCHIVE_BYTES="$(stat -c %s "${ARCHIVE}")"
+        # 镜像身份（image_id = config 摘要 / rootfs.diff_ids / 架构）直接从导出
+        # 归档提取：不依赖 docker image inspect（buildx/containerd 形态下 inspect
+        # 的 Go 模板可能拿到 manifest list 而缺 RootFS），且校验的正是实际随包
+        # 交付的产物。
+        python3 - "${BUNDLE_DIR}" "${IMAGE_ARCH}" \
+            "${ARCHIVE_SHA}" "${ARCHIVE_BYTES}" "${DOCKERFILE_SHA}" "${VERSION}" "${GIT_COMMIT}" <<'PY'
+import datetime, hashlib, json, pathlib, sys, tarfile
+(bundle, arch, sha, size, dockerfile_sha, version, commit) = sys.argv[1:]
+archive = pathlib.Path(bundle, "fnmusic-sources-image.tar.gz")
+with tarfile.open(archive, "r:gz") as tar:
+    member = tar.extractfile("manifest.json")
+    if member is None:
+        raise SystemExit("归档缺少 manifest.json（docker save 输出异常）")
+    saved = json.load(member)
+    if not isinstance(saved, list) or len(saved) != 1:
+        raise SystemExit(f"docker save 归档应恰好含一个镜像条目: {saved!r}")
+    config_path = saved[0].get("Config") or ""
+    if not config_path:
+        raise SystemExit(f"归档 manifest.json 缺少 Config: {saved[0]!r}")
+    config_bytes = tar.extractfile(config_path).read()
+    config = json.loads(config_bytes)
+image_id = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+diff_ids = (config.get("rootfs") or {}).get("diff_ids")
+if not isinstance(diff_ids, list) or not diff_ids:
+    raise SystemExit(f"镜像 config 缺少 rootfs.diff_ids: {config.get('rootfs')!r}")
+if config.get("architecture") != arch:
+    raise SystemExit(f"镜像架构 {config.get('architecture')!r} 与目标 {arch!r} 不符")
+manifest = {
+    "schema": 1,
+    "app": "fnmusic-ext",
+    "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "arch": arch,
+    "platform": f"linux/{arch}",
+    "image_tag": "fnmusic-sources:latest",
+    "image_id": image_id,
+    "rootfs_diff_ids": diff_ids,
+    "archive": "fnmusic-sources-image.tar.gz",
+    "archive_sha256": sha,
+    "archive_bytes": int(size),
+    "dockerfile_sha256": dockerfile_sha,
+    "app_version": version,
+    "source_commit": commit,
+}
+pathlib.Path(bundle, "manifest.json").write_text(
+    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(f"[fpk] 镜像身份: {image_id} ({len(diff_ids)} 层, {config.get('architecture')})")
+PY
+        IMAGE_ID="$(python3 -c "import json,pathlib; print(json.loads(pathlib.Path('${BUNDLE_DIR}/manifest.json').read_text(encoding='utf-8'))['image_id'])")"
+        echo "[fpk] 镜像资产就绪: ${IMAGE_ID#sha256:} 归档 $(du -m "${ARCHIVE}" | cut -f1)MB"
+        case "${IMAGE_ARCH}" in
+            amd64) MANIFEST_PLATFORM="x86" ;;
+            arm64) MANIFEST_PLATFORM="arm" ;;
+            *)
+                echo "ERROR: 预构建包不支持架构 ${IMAGE_ARCH}" >&2
+                exit 1
+                ;;
+        esac
+        echo "[fpk] 构建宿主 wheelhouse (${IMAGE_ARCH}, CPython 3.11/3.12/3.13)..."
+        if ! bash "${REPO_ROOT}/packaging/proxy-wheels/build.sh" \
+            "${IMAGE_ARCH}" \
+            "${STAGE}/app/repo/assets/proxy-wheels" \
+            "${STAGE}/app/repo/proxy/requirements.txt"; then
+            echo "ERROR: 预构建包必须同时包含镜像归档和宿主 wheelhouse" >&2
+            exit 1
+        fi
+        # 预构建包带架构名；通用在线包保持历史的无后缀文件名。
+        ASSET_ARCH_SUFFIX="-prebuilt-${IMAGE_ARCH}"
+    elif [ "${IMAGE_ASSET_MODE}" = "require" ]; then
+        echo "ERROR: FPK_IMAGE_ASSETS=require，但 Docker 不可用或无法识别架构" >&2
+        exit 1
+    else
+        echo "[WARN] Docker 不可用，跳过镜像资产构建；该 FPK 安装时将回落现场构建路径。"
+    fi
+fi
+
 # 正式和预发布的 manifest、包内 VERSION、文件名均保留数字 -N；通道另存 RELEASE_CHANNEL。
-sed "s/@VERSION@/${VERSION}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+sed -e "s/@VERSION@/${VERSION}/g" -e "s/@PLATFORM@/${MANIFEST_PLATFORM}/g" \
+    "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/"
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"
@@ -159,7 +294,8 @@ if [ -z "${FNPACK_BIN}" ]; then
     else
         case "$(uname -m)" in
             x86_64) FNARCH=amd64 ;;
-            aarch64|arm64) FNARCH=arm64 ;;
+            # 上游静态资源的 arm64 命名是 linux-arm（ELF aarch64），不是 linux-arm64
+            aarch64|arm64) FNARCH=arm ;;
             *) echo "ERROR: 不支持的架构 $(uname -m)" >&2; exit 1 ;;
         esac
         FNPACK_VERSION="${FNPACK_VERSION:-1.2.3}"
@@ -189,7 +325,7 @@ if [ -z "${BUILT}" ]; then
 fi
 
 mkdir -p "${OUT_DIR}"
-FINAL="${OUT_DIR}/fnmusic-ext-${VERSION}.fpk"
+FINAL="${OUT_DIR}/fnmusic-ext-${VERSION}${ASSET_ARCH_SUFFIX}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
 

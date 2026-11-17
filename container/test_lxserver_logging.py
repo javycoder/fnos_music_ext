@@ -30,7 +30,7 @@ ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
 
 # fnmusic 各服务的进程日志仍然汇/docker logs（stdout），唯独 lxserver 需要独立
 # 落盘供导出；这几个进程必须保持原状。
-STDOUT_PROGRAMS = ("musicdl", "musicbox", "lxmusic", "webui")
+STDOUT_PROGRAMS = ("musicdl", "netease", "lxmusic", "webui")
 
 
 @pytest.fixture(scope="module")

@@ -45,7 +45,8 @@ _FETCH_TIMEOUT_S = 10.0
 _TRACKS_FETCH_TIMEOUT_S = 60.0
 _PERSIST_MIN_INTERVAL_S = 5.0
 _MAX_PLAYLISTS = 100          # 注入歌单数上限（与上游 limit 一致）
-_MAX_TRACKS = 1000            # 每歌单曲目上限（批量详情单次调用上限）
+_PAGE_TRACKS = 1000           # 每页曲目数（上游批量详情单次调用上限）
+_MAX_TRACKS_TOTAL = 20000     # 每歌单曲量硬上限（防异常 total 拉爆；issue #133 后全量注入）
 
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 
@@ -361,38 +362,68 @@ def cover_url_for(playlist_id: int) -> str:
 
 # --------------------------------------------------------------- 曲目 --
 
+async def _fetch_tracks_page(client: httpx.AsyncClient, pid: int, offset: int) -> dict:
+    """单页曲目：{rows, total, page_size}；http/结构错误抛异常由调用方回落磁盘。"""
+    r = await client.get(
+        f"/api/v1/user/playlists/{pid}/tracks",
+        params={"offset": offset, "limit": _PAGE_TRACKS},
+        timeout=_TRACKS_FETCH_TIMEOUT_S,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"http {r.status_code}")
+    data = r.json()
+    if not (isinstance(data, dict) and data.get("ok") is True):
+        raise RuntimeError("not_ok")
+    rows = [row for row in data.get("data") or [] if isinstance(row, dict)]
+    try:
+        total = int(data.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    return {"rows": rows, "total": total, "page_size": _PAGE_TRACKS}
+
+
 async def _fetch_tracks(client: httpx.AsyncClient, playlist_id: int, build_track) -> list:
     pid = int(playlist_id)
     key = str(pid)
+    tracks: list = []
     try:
-        r = await client.get(
-            f"/api/v1/user/playlists/{pid}/tracks", timeout=_TRACKS_FETCH_TIMEOUT_S
-        )
-        if r.status_code != 200:
-            raise RuntimeError(f"http {r.status_code}")
-        data = r.json()
+        # issue #133：歌单超 1000 首时分页拉全量。total 缺失（旧上游）时以
+        # "不满页即止"收敛；总上限防异常 total 把内存/磁盘拉爆。
+        offset = 0
+        total_known = 0
+        while True:
+            page = await _fetch_tracks_page(client, pid, offset)
+            for row in page["rows"]:
+                candidate = dailyrec._netease_recommend_item(row)
+                if not candidate.get("id"):
+                    continue
+                try:
+                    track = build_track(candidate)
+                except Exception as e:
+                    logger.debug("nm track build failed (%s): %s", pid, e)
+                    continue
+                if isinstance(track, dict) and track.get("guid"):
+                    tracks.append(track)
+            fetched = len(page["rows"])
+            offset += fetched
+            if page["total"] > 0:
+                total_known = page["total"]
+                if offset >= min(total_known, _MAX_TRACKS_TOTAL):
+                    break
+            if fetched < page["page_size"]:
+                break  # 尾页（或旧上游单段响应）：已到尽头
+            if offset >= _MAX_TRACKS_TOTAL:
+                logger.warning("nm tracks capped at %d for %s", _MAX_TRACKS_TOTAL, pid)
+                break
+            await asyncio.sleep(0.15)  # 页间小间隔：对网易批量详情保持温和
     except Exception as e:
         logger.debug("nm tracks fetch failed (%s): %s", pid, e)
         disk = _load_disk_tracks(pid)
         return [dict(t) for t in disk] if disk is not None else []
-    if not (isinstance(data, dict) and data.get("ok") is True):
-        logger.debug("nm tracks not ok (%s)", pid)
+    if not tracks:
+        logger.debug("nm tracks empty (%s)", pid)
         disk = _load_disk_tracks(pid)
         return [dict(t) for t in disk] if disk is not None else []
-    tracks: list = []
-    for row in data.get("data") or []:
-        if not isinstance(row, dict):
-            continue
-        candidate = dailyrec._musicbox_recommend_item(row)
-        if not candidate.get("id"):
-            continue
-        try:
-            track = build_track(candidate)
-        except Exception as e:
-            logger.debug("nm track build failed (%s): %s", pid, e)
-            continue
-        if isinstance(track, dict) and track.get("guid"):
-            tracks.append(track)
     _tracks_cache[key] = (tracks, time.monotonic() + _TRACKS_TTL_S)
     if key in _tracks_order:
         _tracks_order.remove(key)

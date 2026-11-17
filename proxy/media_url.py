@@ -1,7 +1,7 @@
 """外部直连媒体 URL 的安全校验与主机名脱敏模块。
 
 本模块属于 proxy 目录。主要提供两个功能：
-1. validate_media_url：在将 302 重定向交付给客户端前，严格检查目标 URL 是否为公开合规的 HTTPS 地址，拦截私网 IPv4 与私网 IPv6，防止服务端请求伪造（SSRF）；
+1. validate_media_url：在将 302 重定向交付给客户端前，检查目标 URL 是否为公开合规的 HTTP(S) 地址；默认仅允许 HTTPS，调用方可显式放宽协议，但私网 IPv4 与 IPv6 始终拦截，防止服务端请求伪造（SSRF）；
 2. hostname_for_log：从媒体 URL 中仅提取纯净主机名，剥离查询参数与用户凭据，确保运行日志绝不泄露安全敏感信息。
 """
 from __future__ import annotations

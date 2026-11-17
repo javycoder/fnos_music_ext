@@ -153,11 +153,20 @@ function resetTestState() {
   localStore.clear();
   publicDetailCache.clear();
   publicSelection = [];
+  publicSelectionMap = {};
+  publicUserChanges.clear();
+  publicUserGuid = "";
+  publicUsers = [];
+  publicUsersReady = false;
+  publicSyncAll = false;
+  publicSharedSelection = [];
+  publicSharedChanged = false;
   publicDetailAbortControllers.clear();
   publicDetailInflight.clear();
   publicDetailRun = null;
-  publicDetailRunUser = "";
+  publicDetailRunTarget = "";
   publicProcessSnapshot = null;
+  $("#public-playlists-enabled").checked = true;
 }
 
 test("浏览名称持久化，刷新后恢复且渲染不延长有效期", async () => {
@@ -464,6 +473,32 @@ test("换用户与取消过期请求防串：序列递增或用户切换中止�
   await p1;
   assert.strictEqual(aborted, true, "切换序列/换用户时应 abort 之前的请求");
   assert.notStrictEqual(itemUserA._name, "用户A的榜单", "已过期的请求结果绝不落入当前状态防串台");
+});
+
+test("同一用户 GUID 下切换共享模式，迟到详情响应不得写入个人列表", async () => {
+  resetTestState();
+  configSchema = {};
+  publicUserGuid = "same-user";
+  publicSyncAll = false;
+  const identity = { provider: "musicbox", source: "netease", kind: "chart", id: "same-target" };
+  const personalItem = { ...identity };
+  publicSelection = [personalItem];
+  let release;
+  enqueue("/app/fnmusic-ext/api/public-playlists/same-target", async () => {
+    await new Promise((resolve) => { release = resolve; });
+    return { ok: true, data: { name: "个人结果" } };
+  });
+  const oldRun = ensurePublicSelectionDetails();
+  await tick(0);
+  assert.strictEqual(typeof release, "function");
+
+  publicSyncAll = true;
+  publicSelection = [{ ...identity }];
+  release();
+  await oldRun;
+
+  assert.notStrictEqual(personalItem._name, "个人结果");
+  assert.strictEqual(publicSelection[0]._name, undefined);
 });
 
 test("capabilities 刷新不能反复清失败", async () => {

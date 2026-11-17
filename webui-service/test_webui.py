@@ -73,6 +73,70 @@ def test_invalid_public_user_mapping(value):
         webui.validate_updates({"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": value})
 
 
+def test_public_selection_rows_only_use_active_mode(env_file):
+    shared = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"}]
+    personal = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "200"}]
+    by_user = json.dumps({"a": personal})
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "true",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": by_user,
+    }) == shared
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "false",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": by_user,
+    }) == personal
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "false",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+    }) == []
+    assert webui._public_selection_rows({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": "[]",
+    }) == []
+
+
+def test_public_sync_all_and_personal_lists_save_atomically(env_file):
+    env_file.write_text(
+        BASE_ENV
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{}'\n",
+        encoding="utf-8",
+    )
+    shared = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"}]
+    personal = [{"provider": "lx", "source": "kg", "kind": "playlist", "id": "200"}]
+    webui.write_env({
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "true",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": json.dumps(shared),
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": json.dumps({"a": personal}),
+    })
+    values = webui.read_env()
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL"] == "true"
+    assert json.loads(values["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"]) == shared
+    assert json.loads(values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": personal}
+
+
+def test_public_sync_toggle_does_not_rewrite_either_list(env_file):
+    shared = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "100"}]
+    personal = [{"provider": "lx", "source": "kg", "kind": "playlist", "id": "200"}]
+    shared_raw = json.dumps(shared, ensure_ascii=False)
+    personal_raw = json.dumps({"a": personal}, ensure_ascii=False)
+    env_file.write_text(
+        BASE_ENV
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='{shared_raw}'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{personal_raw}'\n",
+        encoding="utf-8",
+    )
+
+    webui.write_env({"FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": "true"})
+
+    values = webui.read_env()
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL"] == "true"
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] == shared_raw
+    assert values["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"] == personal_raw
+
+
 @pytest.fixture(autouse=True)
 def lx_ready_mock(monkeypatch):
     """业务测试仅 mock 就绪；真实恢复行为由 test_lx_ready.py 覆盖。"""
@@ -241,11 +305,25 @@ def test_put_noop_returns_empty_change(env_file):
         assert r.json()["changed"] == []
 
 
+def test_platform_test_start_returns_503_when_musicdl_unreachable(env_file):
+    with authed_client() as client:
+        resp = client.post("/api/platforms/test/start", json={"keyword": "周杰伦", "concurrency": 4})
+        assert resp.status_code == 503
+        assert resp.json().get("ok") is False
+
+
+def test_platform_test_status_unknown_job_returns_404(env_file):
+    with authed_client() as client:
+        resp = client.get("/api/platforms/test/status?job=nonexistent")
+        assert resp.status_code == 404
+        assert resp.json().get("error") == "job not found or expired"
+
+
 def test_search_timeout_defaults_and_saves(env_file):
     with authed_client() as client:
         view = client.get("/api/config")
         assert view.status_code == 200
-        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "15"
+        assert view.json()["values"]["FNMUSIC_SEARCH_TIMEOUT"] == "30"
         assert "FNMUSIC_SEARCH_PROBE" not in view.json()["values"]
         assert "FNMUSIC_SEARCH_PROBE" not in view.json()["schema"]
         saved = client.put("/api/config", json={"values": {"FNMUSIC_SEARCH_TIMEOUT": 9}})
@@ -1375,7 +1453,7 @@ def test_status_aggregates_processes_and_health(env_file, svctl, monkeypatch):
         assert r.status_code == 200
         rj = r.json()
         assert rj["version"] == "v2.0.0"
-        assert rj["current_provider"] == "musicbox"
+        assert rj["current_provider"] in ("netease", "musicbox")
         assert rj["processes"]["musicbox"]["state"] == "RUNNING"
         # lxserver 与 lxmusic 并列出现在进程概览，便于定位洛雪链路哪一环故障
         assert rj["processes"]["lxserver"]["state"] == "STOPPED"
@@ -1802,6 +1880,29 @@ def test_public_playlists_allow_anonymous_resident(env_file, svctl, resident_sta
     assert not [a for a in actions if a.get("kind") == "resident" and a.get("op") == "stop"]
 
 
+def test_public_sync_mode_toggle_reconciles_resident_musicbox(env_file, svctl, resident_state):
+    personal = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "200"}]
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+                .replace("FNMUSIC_MUSICDL_ENABLED='false'", "FNMUSIC_MUSICDL_ENABLED='true'")
+        + "FNMUSIC_NETEASE_PLAYLIST_RESIDENT='true'\nFNMUSIC_NETEASE_MY_PLAYLISTS='false'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED='true'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL='false'\n"
+        + "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION='[]'\n"
+        + f"FNMUSIC_PUBLIC_PLAYLISTS_BY_USER='{json.dumps({'a': personal})}'\n",
+        encoding="utf-8",
+    )
+    webui._resident_state["active"] = True
+    with authed_client() as client:
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL": True,
+        }})
+    assert saved.status_code == 200, saved.text
+    assert ("stop", "musicbox") in svctl.calls
+    assert webui._resident_state["active"] is False
+    assert json.loads(webui.read_env()["FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"]) == {"a": personal}
+
+
 def test_public_playlist_selection_rejects_invalid_payload(env_file, svctl):
     with authed_client() as client:
         saved = client.put("/api/config", json={"values": {
@@ -1815,7 +1916,8 @@ def test_public_playlist_selection_rejects_invalid_payload(env_file, svctl):
 def test_public_playlist_save_contract_strips_display_only_fields():
     """管理页内部可保留展示字段，但写入配置必须只保存稳定身份四字段。"""
     js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
-    needle = "publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))"
+    needle = "publicSelectionPayload(publicSelection)"
+    assert "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL" in js
     assert needle in js
     assert "_name: item.name" in js and "_cover_url: item.cover_url" in js
 
@@ -2273,15 +2375,43 @@ def test_download_layout_enum_roundtrip_rejects_invalid_values(env_file, svctl):
 
 def test_cleanup_beta_markup():
     html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    cleanup = html.split('id="page-exp-cleanup"', 1)[1].split("</section>", 1)[0]
     tee = html.split('id="page-tee"', 1)[1].split("</section>", 1)[0]
-    assert 'id="cleanup-open-btn"' in tee
-    assert "清理垃圾文件" in tee and "Beta" in tee
+    assert 'id="cleanup-open-btn"' in cleanup
+    assert "清理垃圾文件" in cleanup and "Beta" in cleanup
+    assert 'id="cleanup-open-btn"' not in tee
     assert "下载完整即保存" in tee
     assert "不必听完整首" in tee
     assert "完整试听在线歌后" not in html
     assert 'id="cleanup-modal" hidden' in html
     assert 'aria-describedby="cleanup-warning"' in html
     assert "此功能为 Beta，可能误删歌曲、封面、歌词等文件，删除后无法自动恢复。是否确认执行？" in html
+
+
+def test_experimental_features_are_grouped_under_dedicated_menu():
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+
+    def page(page_id):
+        return html.split(f'id="page-{page_id}"', 1)[1].split("</section>", 1)[0]
+
+    assert 'id="nav-experimental-title"' in html
+    assert 'id="bottom-experimental-trigger"' in html
+    for page_id in ("exp-direct", "exp-layout", "exp-cleanup"):
+        assert html.count(f'data-page="{page_id}"') == 2
+    for label in ("播放直连", "目录归类与整理", "垃圾清理"):
+        assert f"<span>{label}</span>" in html
+        assert f'role="menuitem" type="button">{label}</button>' in html
+
+    direct = page("exp-direct")
+    assert all(f'id="{element}"' in direct for element in
+               ("direct-netease", "direct-musicdl", "direct-lx"))
+    assert 'id="direct-netease"' not in page("search")
+
+    layout = page("exp-layout")
+    assert 'id="download-layout"' in layout
+    assert 'id="organize-open-btn"' in layout
+    assert 'id="download-layout"' not in page("dirs")
+    assert 'id="organize-open-btn"' not in page("dirs")
 
 
 # ------------------------------------------------------------------ 网关管理员 ---
@@ -3155,10 +3285,40 @@ def test_update_check_gitee_null_body_degrades(env_file, update_cache_clean):
     assert rj["has_update"] is False
 
 
+def test_update_check_filters_draft_and_prerelease(env_file, update_cache_clean):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "api.github.com" in str(request.url):
+            # GitHub 是草稿或预发布，应自动回退到 Gitee 的正式版
+            return httpx.Response(200, json=dict(GH_RELEASE, draft=True))
+        return httpx.Response(200, json=GT_RELEASE)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        rj = client.get("/api/update-check").json()
+    assert rj["ok"] is True
+    assert rj["source"] == "gitee"
+    assert rj["has_update"] is True
+    assert len(calls) == 2
+
+
 def test_update_check_requires_admin(env_file, update_cache_clean):
     with TestClient(webui.app) as client:
         r = client.get("/api/update-check")
     assert r.status_code == 403
+
+
+def test_self_update_direct_access_returns_501(env_file):
+    with authed_client() as client:
+        r1 = client.get("/api/self-update")
+        assert r1.status_code == 501
+        assert "当前访问方式不支持自动更新" in r1.json()["error"]
+
+        r2 = client.post("/api/self-update", json={"target_id": "a" * 32, "confirm": True})
+        assert r2.status_code == 501
+        assert "当前访问方式不支持自动更新" in r2.json()["error"]
 
 
 def test_hidden_toggled_elements_not_defeated_by_display():
@@ -3179,8 +3339,8 @@ def test_hidden_toggled_elements_not_defeated_by_display():
         tag_html = m.group(0)
         el_id = _re.search(r'\bid="([\w-]+)"', tag_html)
         classes = _re.search(r'\bclass="([^"]*)"', tag_html)
-        if el_id and classes:
-            entries.append((el_id.group(1), classes.group(1)))
+        if el_id:
+            entries.append((el_id.group(1), classes.group(1) if classes else ""))
     # CSS 里声明了 display:（值非 none）且选择器不带 [hidden] 的块
     visible_decl: list[tuple[str, str]] = []  # (选择器, display 值)
     for block in css.split("}"):
@@ -3193,9 +3353,20 @@ def test_hidden_toggled_elements_not_defeated_by_display():
     assert visible_decl, "CSS 解析异常：未提取到任何 display 声明"
 
     for el_id, classes in entries:
+        id_defeats_hidden = any(
+            _re.search(rf"#{_re.escape(el_id)}(?![\w-])", sel) for sel, _ in visible_decl)
+        if not classes:
+            if not id_defeats_hidden:
+                continue
+            has_fallback = _re.search(
+                rf"#{_re.escape(el_id)}\[hidden\][^{{]*{{[^}}]*display\s*:\s*none", css)
+            assert id_defeats_hidden and has_fallback, (
+                f"#{el_id} 靠 hidden 属性切换，但 ID 规则的 display 声明会压过 UA 的 "
+                f"[hidden] 规则导致常显——需补 #{el_id}[hidden] {{ display: none; }} 兜底")
+            continue
         for cls in classes.split():
             # (?![\w-]) 精确到类名边界：.btn 不匹配 .btn-row / .lx-item-btns
-            defeats_hidden = any(
+            defeats_hidden = id_defeats_hidden or any(
                 _re.search(rf"\.{_re.escape(cls)}(?![\w-])", sel) for sel, _ in visible_decl)
             if not defeats_hidden:
                 continue
@@ -3206,6 +3377,17 @@ def test_hidden_toggled_elements_not_defeated_by_display():
                 f"#{el_id} 靠 hidden 属性切换，但 .{cls} 的 display 声明会压过 UA 的 "
                 f"[hidden] 规则导致常显——需补 .{cls}[hidden] 或 #{el_id}[hidden] "
                 f"{{ display: none; }} 兜底")
+
+
+def test_netease_qr_empty_state_keeps_prompt_without_broken_image():
+    """未生成二维码时仅显示提示，不显示空 src 的破图。"""
+    import re as _re
+
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    css = (HERE / "static" / "style.css").read_text(encoding="utf-8")
+    assert _re.search(r'<img id="qr-img"[^>]*\bhidden\b', html)
+    assert "点击下方按钮生成二维码" in html
+    assert _re.search(r"#qr-img\[hidden\]\s*\{[^}]*display\s*:\s*none", css)
 
 
 # ---------------------------------------------------------------- 落盘方式 ----
@@ -3236,15 +3418,16 @@ def test_tee_save_mode_roundtrip_rejects_bad(env_file):
 
 def test_tee_save_mode_ui_bindings():
     """前端下拉框存在、三选项齐全、读写两处与后端键名对上。"""
-    import re
     html = open("webui-service/static/index.html", encoding="utf-8").read()
     js = open("webui-service/static/app.js", encoding="utf-8").read()
     assert 'id="tee-save-mode"' in html
     for val in ("auto", "direct", "staged"):
         assert f'value="{val}"' in html
-    # 位于下载目录卡片内（dir-download 与 tee-save-mode 同卡片）
-    card = re.search(r'下载目录.*?</div>\s*</div>', html, re.S)
-    assert card and "tee-save-mode" in card.group(0)
+    dirs = html.split('id="page-dirs"', 1)[1].split("</section>", 1)[0]
+    layout = html.split('id="page-exp-layout"', 1)[1].split("</section>", 1)[0]
+    assert 'id="dir-download"' in dirs
+    assert 'id="tee-save-mode"' in dirs
+    assert 'id="download-layout"' in layout
     # JS 读 + 写都有，且键名正确
     assert js.count("tee-save-mode") >= 2
     assert "FNMUSIC_TEE_SAVE_MODE" in js

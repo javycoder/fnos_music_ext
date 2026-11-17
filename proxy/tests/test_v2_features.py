@@ -168,6 +168,8 @@ def conf_guard():
         "FNMUSIC_TEE_SAVE_ENABLED", "FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_TEE_CACHE_MAX",
         "FNMUSIC_CACHE_DIR",
         "FNMUSIC_RECOMMEND_HOT", "FNMUSIC_RECOMMEND_DAILY", "FNMUSIC_COVER_ENRICH",
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL", "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION",
+        "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER",
         "FNMUSIC_LLM_BASE_URL", "FNMUSIC_LLM_API_KEY", "FNMUSIC_LLM_MODEL",
         "FNMUSIC_SEARCH_TIMEOUT",
     ]
@@ -193,6 +195,7 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
         "FNMUSIC_TEE_SAVE_ENABLED=false\n"
         "FNMUSIC_TEE_CACHE_MAX=999\n"
         "FNMUSIC_RECOMMEND_HOT=false\n"
+        "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL=true\n"
         "LX_SOURCES=kw,kg\n"
         "FNMUSIC_LLM_API_KEY='sk-test'\n"
         "FNMUSIC_LLM_BASE_URL=https://llm.example.com/v1/\n"
@@ -207,6 +210,7 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
     assert CONF["tee_save_enabled"] is False
     assert CONF["tee_cache_max"] == 100  # 钳制到 1-100
     assert CONF["recommend_hot"] is False
+    assert CONF["public_playlists_sync_all"] is True
     assert CONF["lx_sources"] == ["kw", "kg"]
     # LLM 密钥只进环境变量（recommend 直接读 env，绝不进 CONF）
     assert os.environ.get("FNMUSIC_LLM_API_KEY") == "sk-test"
@@ -216,6 +220,27 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
     assert CONF["music_db"] != "/should/not/apply.db"
     # 幂等：再跑一次无变化
     assert apply_env_hot_reload(str(env_file)) == []
+
+
+def test_env_hot_reload_sync_all_preserves_both_selection_sets(tmp_path, conf_guard):
+    shared = json.dumps([
+        {"provider": "musicbox", "source": "netease", "kind": "chart", "id": "shared"},
+    ], ensure_ascii=False)
+    personal = json.dumps({
+        "a": [{"provider": "lx", "source": "kg", "kind": "playlist", "id": "personal"}],
+    }, ensure_ascii=False)
+    CONF["public_playlists_sync_all"] = False
+    CONF["public_playlists_selection"] = shared
+    CONF["public_playlists_by_user"] = personal
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL=true\n", encoding="utf-8")
+
+    changed = apply_env_hot_reload(str(env_file))
+
+    assert "public_playlists_sync_all" in changed
+    assert CONF["public_playlists_sync_all"] is True
+    assert CONF["public_playlists_selection"] == shared
+    assert CONF["public_playlists_by_user"] == personal
 
 
 def test_env_hot_reload_ignores_invalid_values(tmp_path, conf_guard):

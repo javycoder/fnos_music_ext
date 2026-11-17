@@ -624,6 +624,11 @@ class LxServerClient:
             logger.warning("lxserver search error %s for %s (%s)", resp.status_code, keyword, src)
             return []
         data = resp.json()
+        if isinstance(data, dict):
+            # lxserver v2.2.0 起搜索响应是分页对象 {list, total, allPage, ...}；
+            # 直接按数组断言会把真实结果静默丢成空列表（2026-11-16 NAS 实机
+            # 3.0.0-1 验证发现）。旧版本/兼容实现直接返回数组，两种形态都接受。
+            data = data.get("list") or []
         if not isinstance(data, list):
             return []
 
@@ -771,10 +776,13 @@ class LxServerClient:
             raise RuntimeError("lxserver song lists returned invalid payload")
         return data
 
-    async def get_song_list_search(self, source: str, text: str, page: int = 1) -> dict:
+    async def get_song_list_search(
+        self, source: str, text: str, page: int = 1, *, timeout: float | None = None,
+    ) -> dict:
         """歌单关键词搜索（lxserver 原生 /api/music/songList/search，v2.1.2 起自带）。
 
         上游 SDK 固定页大小（默认 20），不透传 limit；返回 {list, limit, total, source}。
+        timeout 同时限制排队等锁和上游请求，避免慢源占住锁后拖过调用方预算。
         """
         src = normalize_source(source)
         keyword = str(text or "").strip()
@@ -783,9 +791,22 @@ class LxServerClient:
         if not keyword:
             raise ValueError("empty search keyword")
         params = {"source": src, "text": keyword, "page": max(1, int(page or 1))}
-        async with self.song_list_lock(src):
-            client = await self.get_client()
-            resp = await client.get("/api/music/songList/search", params=params, timeout=self.timeout)
+
+        if timeout is None:
+            async with self.song_list_lock(src):
+                client = await self.get_client()
+                resp = await client.get("/api/music/songList/search", params=params, timeout=self.timeout)
+        else:
+            deadline = time.monotonic() + timeout
+            async with asyncio.timeout(timeout):
+                async with self.song_list_lock(src):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("song list search budget exhausted")
+                    client = await self.get_client()
+                    resp = await client.get(
+                        "/api/music/songList/search", params=params, timeout=remaining,
+                    )
         if resp.status_code != 200:
             raise RuntimeError(f"lxserver song list search error {resp.status_code}: {resp.text[:160]}")
         data = resp.json()

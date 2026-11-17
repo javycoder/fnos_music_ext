@@ -432,8 +432,8 @@ print_featured_source_menu() {
         [ -z "${id}" ] && continue
         [ "${star}" = "1" ] || continue
         case "${provider}" in
-            musicbox)
-                echo "  ${id}) ${label} (musicbox) [端口 8770] — 高品质/无损/歌词封面"
+            netease|musicbox)
+                echo "  ${id}) ${label} (netease) [端口 8770] — 高品质/无损/歌词封面"
                 ;;
             musicdl)
                 echo "  ${id}) mdl-${short} ${label}"
@@ -468,7 +468,7 @@ read_dotenv_value() {
     # 缺少键是正常存量配置，不应因 grep=1 + pipefail 中断覆盖安装。
     { grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "${file}" 2>/dev/null || true; } \
         | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" \
-        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]|['\"]$//g"
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//"
 }
 
 parse_sources() {
@@ -480,6 +480,10 @@ parse_sources() {
     # BASE_DIR 用默认空值：单测单独抽取本函数在 set -u 下裸跑，不定义 BASE_DIR
     local env_file="${BASE_DIR:-}/.env"
     local explicit=0
+    if [ "${raw}" = "auto" ]; then
+        raw=""
+        SOURCES_EXPLICIT=0
+    fi
     [ "${SOURCES_EXPLICIT:-0}" -eq 1 ] && explicit=1
     [ -n "${raw}" ] && [ "${raw}" != "musicdl" ] && explicit=1
 
@@ -488,11 +492,12 @@ parse_sources() {
         keep_mdl="$(read_dotenv_value "${env_file}" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         keep_box="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         keep_lx="$(read_dotenv_value "${env_file}" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-        if [ -n "${keep_mdl}${keep_box}${keep_lx}" ]; then
-            ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
-            case "${keep_mdl}" in true|1|yes|on) ENABLE_MUSICDL=1 ;; esac
-            case "${keep_box}" in true|1|yes|on) ENABLE_MUSICBOX=1 ;; esac
-            case "${keep_lx}" in true|1|yes|on) ENABLE_LX=1 ;; esac
+        local has_keep=0
+        ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
+        case "${keep_box}" in true|1|yes|on) ENABLE_MUSICBOX=1; has_keep=1 ;; esac
+        case "${keep_lx}" in true|1|yes|on) ENABLE_LX=1; has_keep=1 ;; esac
+        case "${keep_mdl}" in true|1|yes|on) ENABLE_MUSICDL=1; has_keep=1 ;; esac
+        if [ "${has_keep}" -eq 1 ]; then
             KEEP_SOURCES_FROM_ENV=1
             MDL_EXPLICIT=0
             MDL_PLATFORMS=""
@@ -509,6 +514,7 @@ parse_sources() {
     MDL_PLATFORMS=""
     LX_EXPLICIT=0
     MDL_EXPLICIT=0
+    [ -z "${raw}" ] && raw="musicdl"
     local picked=()
     # 支持 --sources=1,2,62 与 --sources 1,2,62 两种形式
     raw="${raw#*=}"
@@ -521,8 +527,8 @@ parse_sources() {
         part="${part%"${part##*[![:space:]]}"}"
         [ -z "${part}" ] && continue
         case "${part}" in
-            musicbox|netease|netease-musicbox)
-                ENABLE_MUSICBOX=1; picked+=("musicbox") ;;
+            netease|musicbox|netease-musicbox)
+                ENABLE_MUSICBOX=1; picked+=("netease") ;;
             musicdl|mdl)
                 ENABLE_MUSICDL=1; picked+=("musicdl") ;;
             lx|lxmusic)
@@ -570,7 +576,7 @@ parse_sources() {
                 }
                 [ "${provider}" != "lx" ] || picked+=("lxmusic")
                 [ "${provider}" != "musicdl" ] || picked+=("musicdl")
-                [ "${provider}" != "musicbox" ] || picked+=("musicbox")
+                [ "${provider}" != "musicbox" ] && [ "${provider}" != "netease" ] || picked+=("netease")
                 ;;
         esac
     done
@@ -641,6 +647,50 @@ while [ $# -gt 0 ]; do
         *) log_err "未知参数: $1"; usage; exit 1 ;;
     esac
 done
+
+# 卸载保留数据恢复：检测到持久目录且当前目录无 .env 时自动恢复。
+# 必须在 resolve_deploy_mode 及向导之前恢复，以便自动继承历史部署形态和音源选择。
+RESTORED_FROM_KEEP_DIR=""
+restore_keep_data() {
+    local vol keep_dir restore_ok=1
+    vol="$(readlink -f "${BASE_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
+    vol="${vol:-/vol1/}"
+    case "${vol}" in
+        */) ;;
+        *) vol="${vol}/" ;;
+    esac
+    keep_dir="${FNMUSIC_KEEP_DIR:-${vol}fnmusic-ext-data}"
+    [ -d "${keep_dir}" ] || return 0
+    [ ! -f "${BASE_DIR}/.env" ] || return 0
+
+    log_info "检测到历史保留的音乐源与配置文件 (${keep_dir})，正在恢复..."
+    mkdir -p "${BASE_DIR}" 2>/dev/null || true
+    (
+        shopt -s dotglob nullglob
+        for _k_item in "${keep_dir}"/*; do
+            [ -e "${_k_item}" ] || continue
+            _k_name="$(basename "${_k_item}")"
+            [ "${_k_name}" = "." ] || [ "${_k_name}" = ".." ] || [ "${_k_name}" = "README.txt" ] || [ "${_k_name}" = ".env" ] && continue
+            if ! cp -a "${_k_item}" "${BASE_DIR}/"; then
+                exit 1
+            fi
+        done
+        if [ -f "${keep_dir}/.env" ]; then
+            if ! cp -a "${keep_dir}/.env" "${BASE_DIR}/.env"; then
+                exit 1
+            fi
+        fi
+    ) || restore_ok=0
+
+    if [ "${restore_ok}" -eq 1 ] && [ -f "${BASE_DIR}/.env" ]; then
+        RESTORED_FROM_KEEP_DIR="${keep_dir}"
+        log_info "历史音乐源数据已恢复至 ${BASE_DIR}"
+    else
+        log_warn "历史数据未完全成功恢复，将保留备份目录以防止数据丢失: ${keep_dir}"
+        RESTORED_FROM_KEEP_DIR=""
+    fi
+}
+restore_keep_data
 
 run_docker() {
     if docker info >/dev/null 2>&1; then
@@ -791,7 +841,7 @@ precheck_environment() {
             log_info "原生模式 Python 已选定: ${FNMUSIC_SELECTED_PYTHON} ($(runtime_python_version "${FNMUSIC_SELECTED_PYTHON}"))。"
         fi
         if ! choose_node_bin; then
-            log_warn "未检测到 Node 20+（lxserver 需要）：安装阶段将尝试自动探测或 sudo apt-get 补装。"
+            log_warn "未检测到 Node >=22.13.0（lxserver v2.2.0 需要）：安装阶段将尝试自动探测或 sudo apt-get 补装。"
         else
             log_info "原生模式 Node 已选定: ${FNMUSIC_SELECTED_NODE} (${FNMUSIC_NODE_SOURCE})。"
         fi
@@ -1011,16 +1061,35 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         echo "  1) musicbox — 网易云音乐盒子（高品质/无损/歌词封面；推荐安装后扫码登录）"
         echo "  2) musicdl  — 聚合音源（多平台可选：酷我/咪咕/酷狗/QQ/B站等）"
         echo "  3) lxmusic  — 洛雪音乐自定义源（解析播放只走用户源；源脚本装后在管理页配置：URL / 上传 .js / NAS 选择）"
-        local_choice="$(prompt "请选择音源 (输入 1/2/3)" "2")"
+        def_choice="2"
+        if [ -f "${BASE_DIR}/.env" ]; then
+            prev_mdl="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            prev_box="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            prev_lx="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            case "${prev_box}" in true|1|yes|on) def_choice="1" ;; esac
+            case "${prev_lx}" in true|1|yes|on) def_choice="3" ;; esac
+            case "${prev_mdl}" in true|1|yes|on) def_choice="2" ;; esac
+        fi
+        # 直接读原始输入（不经 prompt 归并默认值）：键入任何选项都算显式选择，
+        # 不被存量 .env 的音源继承逻辑覆盖；回车才沿用推导出的默认值。
+        local_choice=""
+        read -r -p "请选择音源 (输入 1/2/3) [${def_choice}]: " local_choice || true
+        [ -n "${local_choice}" ] && SOURCES_EXPLICIT=1
+        local_choice="${local_choice:-${def_choice}}"
         case "${local_choice}" in
             1) SOURCES_RAW="musicbox" ;;
             3) SOURCES_RAW="lxmusic" ;;
             *) SOURCES_RAW="musicdl" ;;
         esac
         if [ "${SOURCES_RAW}" = "musicdl" ]; then
-            echo "【musicdl 平台多选】输入平台编号（逗号分隔），直接回车用默认精选（酷我+咪咕）"
+            echo "【musicdl 平台多选】输入平台编号（逗号分隔），直接回车沿用提示所示默认值"
             print_featured_mdl_menu
-            mdl_choice="$(prompt "输入编号（2=酷我 4=咪咕 3=酷狗 5=QQ ...）" "2,4")"
+            def_mdl_choice="2,4"
+            if [ -f "${BASE_DIR}/.env" ]; then
+                prev_mdl_plat="$(read_dotenv_value "${BASE_DIR}/.env" "FNMUSIC_ONLINE_SOURCES" | tr -d '[:space:]')"
+                [ -n "${prev_mdl_plat}" ] && def_mdl_choice="all"
+            fi
+            mdl_choice="$(prompt "输入编号（2=酷我 4=咪咕 3=酷狗 5=QQ ...）" "${def_mdl_choice}")"
             case "${mdl_choice}" in
                 ''|all|ALL) : ;;  # 空=默认精选；all=沿用 .env 既有平台白名单
                 *) SOURCES_RAW="$(printf '%s' "${mdl_choice}" | tr ' ' ',')" ;;
@@ -1071,7 +1140,7 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         *) RUN_EXTEND=1 ;;
     esac
 else
-    SOURCES_RAW="${SOURCES_RAW:-musicdl}"
+    SOURCES_RAW="${SOURCES_RAW:-auto}"
     WEBUI_CHOICE="${WEBUI_CHOICE:-no}"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
@@ -1159,40 +1228,9 @@ LX_SUMMARY=""
 [ -n "${LX_PLATFORMS}" ] && LX_SUMMARY="(${LX_PLATFORMS})"
 
 SELECTED=""
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} musicbox[8770]"
+[ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} netease[8770]"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl[8768]${MDL_SUMMARY}"
 [ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lxmusic[8772]${LX_SUMMARY}"
-
-# 卸载保留数据恢复：检测到持久目录且当前目录无 .env 时自动恢复
-VOL="$(readlink -f "${BASE_DIR}" 2>/dev/null | sed -n 's#^\(/vol[0-9]\+/\).*#\1#p')"
-VOL="${VOL:-/vol1/}"
-case "${VOL}" in
-    */) ;;
-    *) VOL="${VOL}/" ;;
-esac
-KEEP_DATA_DIR="${FNMUSIC_KEEP_DIR:-${VOL}fnmusic-ext-data}"
-RESTORED_FROM_KEEP_DIR=""
-if [ -d "${KEEP_DATA_DIR}" ] && [ ! -f "${BASE_DIR}/.env" ]; then
-    log_info "检测到历史保留的音乐源与配置文件 (${KEEP_DATA_DIR})，正在恢复..."
-    RESTORE_OK=1
-    (
-        shopt -s dotglob nullglob
-        for _k_item in "${KEEP_DATA_DIR}"/*; do
-            [ -e "${_k_item}" ] || continue
-            _k_name="$(basename "${_k_item}")"
-            [ "${_k_name}" = "." ] || [ "${_k_name}" = ".." ] || [ "${_k_name}" = "README.txt" ] && continue
-            if ! cp -a "${_k_item}" "${BASE_DIR}/"; then
-                exit 1
-            fi
-        done
-    ) || RESTORE_OK=0
-    if [ "${RESTORE_OK}" -eq 1 ] && [ -f "${BASE_DIR}/.env" ]; then
-        RESTORED_FROM_KEEP_DIR="${KEEP_DATA_DIR}"
-        log_info "历史音乐源数据已恢复至 ${BASE_DIR}"
-    else
-        log_warn "历史数据未完全成功恢复，将保留备份目录以防止数据丢失: ${KEEP_DATA_DIR}"
-    fi
-fi
 
 # Reapply after retained-data restoration, before any service starts.
 configure_app_logs || { log_err "无法安全配置私有共享日志目录: ${APP_LOG_DIR}"; exit 1; }
@@ -1239,11 +1277,11 @@ find "${SOURCES_DATA_DIR}" -type f -exec chmod 0600 {} + 2>/dev/null || true
 # 归一化服务源码权限：umask 077 环境检出的文件为 600，会导致镜像内 appuser 读不到 app.py
 chmod 0644 \
     "${BASE_DIR}/musicdl-service/app.py" "${BASE_DIR}/musicdl-service/hardening.py" \
-    "${BASE_DIR}/musicbox-service/app.py" "${BASE_DIR}/musicbox-service/runner.py" \
-    "${BASE_DIR}/musicbox-service/netease_ext.py" \
-    "${BASE_DIR}/musicbox-service/playback.py" \
-    "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
-    "${BASE_DIR}/lxmusic-service/verify_source.py" "${BASE_DIR}/lxmusic-service/js/bridge.js" \
+    "${BASE_DIR}/netease-service/app.js" "${BASE_DIR}/netease-service/service.js" \
+    "${BASE_DIR}/lxmusic-service/app.py" "${BASE_DIR}/lxmusic-service/lxserver_client.py" \
+    "${BASE_DIR}/lxmusic-service/managed_client.py" "${BASE_DIR}/lxmusic-service/source_runtime.py" \
+    "${BASE_DIR}/lxmusic-service/source_cpu.py" "${BASE_DIR}/lxmusic-service/verify_source.py" \
+    "${BASE_DIR}/lxmusic-service/source_worker.cjs" "${BASE_DIR}/lxmusic-service/lx_vm_bridge.cjs" \
     "${BASE_DIR}/webui-service/app.py" "${BASE_DIR}/webui-service/static/index.html" \
     "${BASE_DIR}/webui-service/static/app.js" "${BASE_DIR}/webui-service/static/style.css" \
     2>/dev/null || true
@@ -1506,7 +1544,9 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 log_info "安装代理依赖..."
 # venv 创建 + 多源回退（阿里→清华→官方 PyPI）统一由 ensure_proxy_deps.sh 负责
+stage_begin "代理依赖保障"
 PIP_INDEX="${PIP_INDEX}" bash "${BASE_DIR}/ensure_proxy_deps.sh"
+stage_end "代理依赖保障"
 
 install_unit() {
     local src="$1" dest="$2"
@@ -1569,11 +1609,14 @@ install_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || return 1
     fi
-    if ! ensure_image_current; then
-        log_err "Docker 镜像保障失败（复用或重建应用镜像未成功），请查看上方原始错误。"
+    stage_begin "应用镜像保障"
+    if ! ensure_app_image; then
+        stage_end "应用镜像保障（失败）"
+        log_err "Docker 镜像保障失败（离线导入或现场构建未成功），请查看上方原始错误。"
         log_err "应用中心安装日志：${FNMUSIC_DURABLE_LOG:-/var/log/apps/fnmusic-ext-install.log}。"
         return 1
     fi
+    stage_end "应用镜像保障"
     # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的
     # 运行中容器不会重启（切源/升级恢复 .env 后输出仍是 "Container ... Running"）：
     # 所选音源与旧进程集不一致时，下方 healthz 必然等满超时，先重启对齐再等待。
@@ -1588,9 +1631,9 @@ install_sources_container() {
     if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
         waited=1
         if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
-            log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
+            log_info "netease 已就绪 http://127.0.0.1:8770/healthz"
         else
-            log_err "等待 musicbox healthz 超时"
+            log_err "等待 netease healthz 超时"
             diagnose_sources_container "${CONTAINER_NAME}"
             return 1
         fi
@@ -1754,9 +1797,9 @@ install_sources_native() {
     if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
         waited=1
         if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
-            log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
+            log_info "netease 已就绪 http://127.0.0.1:8770/healthz"
         else
-            log_err "等待 musicbox healthz 超时"
+            log_err "等待 netease healthz 超时"
             diagnose_native
             return 1
         fi
@@ -1931,8 +1974,7 @@ log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
 log_info "已启用音源（${MODE_LABEL}）:${SELECTED}"
 log_install "done version=${FNMUSIC_VERSION} deploy=${DEPLOY_MODE} sources=${SELECTED} webui=${WEBUI_FLAG}"
 log_info "------------------------------------------------------------"
-log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
-[ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
+[ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • netease   [8770] 网易云音源     http://127.0.0.1:8770/healthz"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源${MDL_SUMMARY:+ 平台${MDL_SUMMARY}}   http://127.0.0.1:8768/healthz"
 [ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8772] 洛雪自定义源${LX_SUMMARY:+ 平台${LX_SUMMARY}}   http://127.0.0.1:8772/healthz"
 if [ "${WEBUI_FLAG}" = "true" ]; then
@@ -1973,23 +2015,32 @@ log_info "============================================================"
 
 if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info ""
-    log_info "==> 检测到已启用网易云音源 (musicbox)，即将进入扫码登录流程..."
+    log_info "==> 检测到已启用网易云音源 (netease)，即将进入扫码登录流程..."
     bash "${BASE_DIR}/netease_login.sh" || true
-fi
-
-if [ -n "${RESTORED_FROM_KEEP_DIR}" ] && [ -d "${RESTORED_FROM_KEEP_DIR}" ] && [ -f "${BASE_DIR}/.env" ]; then
-    rm -rf "${RESTORED_FROM_KEEP_DIR}" 2>/dev/null || true
-    log_info "已清理安装过渡目录: ${RESTORED_FROM_KEEP_DIR}"
 fi
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
     # Forward --adopt so the chained extend also skips the registry check.
-    if [ "${ADOPT}" -eq 1 ]; then
-        exec /bin/bash "${BASE_DIR}/extend.sh" --force --adopt
+    local_extend_args=(--force)
+    [ "${ADOPT}" -eq 1 ] && local_extend_args+=(--adopt)
+    if ! /bin/bash "${BASE_DIR}/extend.sh" "${local_extend_args[@]}"; then
+        log_err "extend.sh 接管扩展失败，保留备份目录以防止数据丢失: ${RESTORED_FROM_KEEP_DIR:-无}"
+        exit 1
     fi
-    exec /bin/bash "${BASE_DIR}/extend.sh" --force
+else
+    # Without --extend the socket is not taken over yet, but this checkout still
+    # owns the machine-wide resources (containers/units); register it so a second
+    # checkout cannot silently take them over later.
+    takeover deployment-remember --base "${BASE_DIR}" --deploy-mode "${DEPLOY_MODE}" || true
 fi
-# Without --extend the socket is not taken over yet, but this checkout still
-# owns the machine-wide resources (containers/units); register it so a second
-# checkout cannot silently take them over later.
-takeover deployment-remember --base "${BASE_DIR}" --deploy-mode "${DEPLOY_MODE}" || true
+
+# 仅在整体验收与启用成功后，且未自定义 FNMUSIC_KEEP_DIR 时，才清理默认的保留数据目录
+if [ -z "${FNMUSIC_KEEP_DIR:-}" ] && [ -n "${RESTORED_FROM_KEEP_DIR}" ] && [ -d "${RESTORED_FROM_KEEP_DIR}" ] && [ -f "${BASE_DIR}/.env" ]; then
+    case "${RESTORED_FROM_KEEP_DIR}" in
+        */fnmusic-ext-data)
+            rm -rf "${RESTORED_FROM_KEEP_DIR}" 2>/dev/null || true
+            log_info "已清理安装过渡目录: ${RESTORED_FROM_KEEP_DIR}"
+            ;;
+    esac
+fi
+

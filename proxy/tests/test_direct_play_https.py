@@ -18,6 +18,13 @@ from proxy.direct_play import DirectMediaTarget, DirectTargetBindings
 from proxy.media_url import MediaURLDecision
 
 
+class _MediaServer(ThreadingHTTPServer):
+    """Shutdown polling is test cleanup, not a behaviour under test."""
+
+    def serve_forever(self, poll_interval=0.01):
+        return super().serve_forever(poll_interval=poll_interval)
+
+
 @pytest.fixture
 def synthetic_cdns(tmp_path, monkeypatch):
     if not shutil.which("openssl"):
@@ -115,7 +122,7 @@ def synthetic_cdns(tmp_path, monkeypatch):
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certificate, private_key)
-    servers = [ThreadingHTTPServer(("127.0.0.1", 0), MediaHandler) for _ in range(2)]
+    servers = [_MediaServer(("127.0.0.1", 0), MediaHandler) for _ in range(2)]
     first, second = servers
     threads = []
     for server in servers:
@@ -175,7 +182,7 @@ async def test_real_https_audio_and_seek_without_nas_audio_body(monkeypatch, syn
     monkeypatch.setattr(proxy_app, "resolve_local_play", no_local)
     monkeypatch.setattr(proxy_app, "_open_online_stream", forbidden)
     monkeypatch.setattr(proxy_app, "_resolve_direct_target", resolve)
-    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url: MediaURLDecision(
+    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url, **_kwargs: MediaURLDecision(
         url.startswith(tuple(fixture["origins"])), host="isolated-fixture"))
     official = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(
@@ -284,7 +291,7 @@ async def test_controlled_https_entry_307_to_cross_origin_302_cdn_chain(monkeypa
     monkeypatch.setattr(proxy_app, "resolve_local_play", no_local)
     monkeypatch.setattr(proxy_app, "_open_online_stream", forbidden_stream)
     monkeypatch.setattr(proxy_app, "_resolve_direct_target", resolve_target)
-    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url: MediaURLDecision(
+    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url, **_kwargs: MediaURLDecision(
         url.startswith(tuple(fixture["origins"])), host="cdn-a.test"))
 
     # 模拟官方用户鉴权接口 /music/api/v1/user/me
@@ -407,7 +414,7 @@ async def test_direct_play_root_cause_analysis_absolute_302_versus_entry_307(mon
 
     monkeypatch.setattr(proxy_app, "resolve_local_play", no_local)
     monkeypatch.setattr(proxy_app, "_resolve_direct_target", resolve_target)
-    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url: MediaURLDecision(
+    monkeypatch.setattr(proxy_app, "validate_media_url", lambda url, **_kwargs: MediaURLDecision(
         url.startswith(tuple(fixture["origins"])), host="cdn-a.test"))
 
     official = httpx.AsyncClient(

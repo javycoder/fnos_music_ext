@@ -532,6 +532,12 @@ def hls(env, name, status='done', age=2 * m.DAY, size=1):
                                         'declared_count': 1}, age=age)
     init = put(folder / 'init.mp4', age=age)
     segment = put(folder / '00000.m4s', age=age)
+    put(folder / 'preset.m3u8', (
+        '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n'
+        '#EXT-X-PLAYLIST-TYPE:EVENT\n'
+        '#EXT-X-MAP:URI="init.mp4"\n'
+        '#EXTINF:10.000,\n00000.m4s\n#EXT-X-ENDLIST\n'
+    ), age=age)
     if size > 1:
         with segment.open('r+b') as stream:
             stream.truncate(size)

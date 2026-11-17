@@ -10,8 +10,12 @@
                 "type": "radio",
                 "field": "wizard_sources",
                 "label": "初始音源（三选一）",
-                "initValue": "musicdl",
+                "initValue": "auto",
                 "options": [
+                    {
+                        "label": "自动沿用（推荐：沿用上次配置的音源；无记录时使用聚合音源）",
+                        "value": "auto"
+                    },
                     {
                         "label": "musicdl — 聚合音源（免登录，酷我/咪咕等多平台可选）",
                         "value": "musicdl"

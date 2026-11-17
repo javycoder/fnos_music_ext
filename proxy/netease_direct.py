@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import re
 import socket
 import ssl
@@ -34,6 +35,64 @@ MAX_REDIRECT_HOPS = 3
 
 class NeteaseDirectProbeError(RuntimeError):
     """Raised when probing an upgraded NetEase HTTPS target fails."""
+
+
+class NeteaseDirectUpgradeUnavailable(NeteaseDirectProbeError):
+    """Raised when an upgraded NetEase HTTPS target is only temporarily unusable."""
+
+
+UPGRADE_UNAVAILABLE_HTTP_STATUSES = frozenset({404, 405, 410, 500, 501, 502, 503, 504})
+UPGRADE_UNAVAILABLE_CONNECT_REASONS = (
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+    # httpx 在主机解析出多个地址且全部连接失败时的聚合文案（网易 CDN 常见
+    # 多 A 记录/双栈），底层 errno 藏在 __cause__ 链之外的消息里
+    "all connection attempts failed",
+)
+UPGRADE_UNAVAILABLE_CONNECT_ERRNOS = frozenset({
+    errno.ECONNREFUSED,
+    errno.ENETUNREACH,
+    errno.EHOSTUNREACH,
+})
+
+
+def _has_ssl_error(exc: BaseException) -> bool:
+    current = exc
+    while current is not None:
+        if isinstance(current, ssl.SSLError):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _is_upgrade_unavailable(exc: BaseException) -> bool:
+    message = str(exc)
+    status_match = re.fullmatch(r"http_status_(\d{3})", message)
+    if status_match and int(status_match.group(1)) in UPGRADE_UNAVAILABLE_HTTP_STATUSES:
+        return True
+    current = exc
+    while current is not None:
+        if isinstance(current, (httpx.ConnectTimeout, httpx.ReadTimeout)):
+            return True
+        if isinstance(current, httpx.ConnectError) and not _has_ssl_error(current):
+            reason = str(current).lower()
+            if any(marker in reason for marker in UPGRADE_UNAVAILABLE_CONNECT_REASONS):
+                return True
+            # 多地址失败时 httpx 聚合为 ConnectError("All connection attempts
+            # failed")，真实原因在各地址的 OSError errno 上；中文/本地化系统
+            # 错误消息匹配不到英文短语，按 errno 判定。
+            if isinstance(current.__cause__, OSError):
+                cause_errno = getattr(current.__cause__, "errno", None)
+                if cause_errno in UPGRADE_UNAVAILABLE_CONNECT_ERRNOS:
+                    return True
+        # httpcore 的 ConnectError 在 __cause__ 下还有各地址的底层 OSError
+        if isinstance(current, OSError) and not isinstance(current, httpx.ConnectError):
+            if (getattr(current, "errno", None) in UPGRADE_UNAVAILABLE_CONNECT_ERRNOS
+                    and not _has_ssl_error(current)):
+                return True
+        current = current.__cause__
+    return False
 
 
 def is_allowed_netease_cdn_host(
@@ -285,8 +344,12 @@ async def upgrade_netease_media_url(
     try:
         return await asyncio.wait_for(_do_probe(), timeout=timeout)
     except asyncio.TimeoutError:
-        raise NeteaseDirectProbeError("probe_timeout")
-    except NeteaseDirectProbeError:
+        raise NeteaseDirectUpgradeUnavailable("probe_timeout")
+    except NeteaseDirectProbeError as exc:
+        if _is_upgrade_unavailable(exc):
+            raise NeteaseDirectUpgradeUnavailable(str(exc)) from exc
         raise
     except Exception as exc:
+        if _is_upgrade_unavailable(exc):
+            raise NeteaseDirectUpgradeUnavailable(f"probe_exception:{type(exc).__name__}") from exc
         raise NeteaseDirectProbeError(f"probe_exception:{type(exc).__name__}") from exc

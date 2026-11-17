@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -201,8 +202,6 @@ def _run_release_sandbox(tmp_path, releases, *, tag='v2.10.0b', fail='', current
     if not shutil.which('jq'):
         pytest.skip('release shell sandbox requires jq')
     state = tmp_path / 'state.json'
-    state.write_text(json.dumps(dict(releases=releases, fail=fail, current=current,
-                                    appeared=appeared, lists=0, calls=[])))
     gh = tmp_path / 'gh'
     # Only this executable handles gh; unexpected commands fail closed, no network.
     gh.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
@@ -242,14 +241,41 @@ def _run_release_sandbox(tmp_path, releases, *, tag='v2.10.0b', fail='', current
                     assert any(r['id'] == rid for r in state['releases'])
                     state['releases'] = [r for r in state['releases'] if r['id'] != rid]
                     finish()
-                if endpoint.startswith(root + 'git/refs/tags/'):
-                    finish()
             if args[:1] == ['api'] and len(args) == 2 and endpoint.startswith(root + 'releases/'):
                 rid = int(endpoint.rsplit('/', 1)[1])
                 release = next(r for r in state['releases'] if r['id'] == rid)
                 finish(state['current'] if state['current'] is not None else release)
         if args[:2] == ['release', 'view']:
-            finish(code=0 if any(r['tag_name'] == args[2] for r in state['releases']) else 1)
+            release = next((r for r in state['releases'] if r['tag_name'] == args[2]), None)
+            if release is None:
+                finish(code=1)
+            if '--json' in args:
+                finish({'isDraft': bool(release.get('draft')), 'assets': release.get('assets') or []})
+            finish()
+        def _assets_from_args():
+            found = []
+            for arg in args:
+                if not (arg.endswith('.fpk') or arg.endswith('.sha256')):
+                    continue
+                asset_digest = ''
+                if arg.endswith('.fpk'):
+                    sidecar = Path(arg + '.sha256')
+                    if sidecar.is_file():
+                        asset_digest = 'sha256:' + sidecar.read_text(encoding='utf-8').split()[0].lower()
+                found.append({'name': Path(arg).name, 'digest': asset_digest})
+            return found
+        if args[:2] == ['release', 'create']:
+            state['releases'].append({
+                'id': 900, 'tag_name': args[2], 'prerelease': '--prerelease' in args,
+                'draft': True, 'assets': _assets_from_args(),
+            })
+            finish()
+        if args[:2] == ['release', 'upload']:
+            uploaded = _assets_from_args()
+            for release in state['releases']:
+                if release['tag_name'] == args[2]:
+                    release['assets'] = uploaded
+            finish()
         if args[:2] in (['release', 'create'], ['release', 'edit'], ['release', 'upload']):
             finish()
         finish(code=99)
@@ -257,8 +283,16 @@ def _run_release_sandbox(tmp_path, releases, *, tag='v2.10.0b', fail='', current
     gh.chmod(0o755)
     dist = tmp_path / 'dist'
     dist.mkdir()
-    (dist / 'fnmusic-ext-2.10.0b.fpk').touch()
-    (dist / 'fnmusic-ext-2.10.0b.fpk.sha256').touch()
+    package = dist / 'fnmusic-ext-2.10.0b.fpk'
+    package.write_bytes(b'')
+    digest = hashlib.sha256(package.read_bytes()).hexdigest()
+    (dist / f'{package.name}.sha256').write_text(f"{digest}  {package.name}\n", encoding='utf-8')
+    for release in releases:
+        if release.get('tag_name') == tag and not release.get('draft'):
+            release['assets'] = [{'name': package.name, 'digest': f'sha256:{digest}'}]
+    # 初始状态最后落盘：assets 预填必须先于沙箱 gh 读到 state.json。
+    state.write_text(json.dumps(dict(releases=releases, fail=fail, current=current,
+                                    appeared=appeared, lists=0, calls=[])))
     # Run both actual workflow scripts in one fail-fast shell, as Actions does.
     script = _release_step(CLEANUP_STEP) + '\n' + _release_step(PUBLISH_STEP)
     env = dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}', TAG=tag,
@@ -288,18 +322,18 @@ def test_release_cleanup_workflow_contract():
     assert 'GH_TOKEN: ${{ github.token }}' in cleanup
     assert 'GH_REPO: ${{ github.repository }}' in cleanup
     assert 'contents: write' in workflow
+    assert '/git/refs/tags/' not in _release_step(CLEANUP_STEP)
     for name in (CLEANUP_STEP, PUBLISH_STEP):
         subprocess.run(['bash', '-n'], input=_release_step(name), text=True, check=True)
 
 
-def test_release_cleanup_deletes_release_then_tag_before_publish(tmp_path):
+def test_release_cleanup_deletes_releases_but_preserves_tags(tmp_path):
     # Includes a second page and an old version outside the target's minor series.
     result, calls = _run_release_sandbox(tmp_path, [
         _release('v2.10.0a', 1), _release('v2.9.0a', 2)])
     assert result.returncode == 0, result.stderr
     assert _deletions(calls) == [
-        'repos/example/music/releases/1', 'repos/example/music/git/refs/tags/v2.10.0a',
-        'repos/example/music/releases/2', 'repos/example/music/git/refs/tags/v2.9.0a']
+        'repos/example/music/releases/1', 'repos/example/music/releases/2']
     last_delete = max(i for i, c in enumerate(calls) if c[:3] == ['api', '--method', 'DELETE'])
     assert last_delete < calls.index(_published(calls)[0])
     assert sum('--paginate' in c for c in calls) == 2
@@ -312,8 +346,7 @@ def test_release_cleanup_protects_formal_draft_and_retry_target(tmp_path):
         _release('v2.8.0a', 3, draft=True),
         _release('v2.10.0b', 4), _release('v2.7.0a', 5)])
     assert result.returncode == 0, result.stderr
-    assert _deletions(calls) == [
-        'repos/example/music/releases/5', 'repos/example/music/git/refs/tags/v2.7.0a']
+    assert _deletions(calls) == ['repos/example/music/releases/5']
     assert _published(calls)[0][:3] == ['release', 'edit', 'v2.10.0b']
 
 
@@ -346,9 +379,7 @@ def test_release_cleanup_blocks_unrecognized_prerelease_without_deleting(tmp_pat
     ('repos/example/music/releases?per_page=100', []),
     ('repos/example/music/releases/1', []),
     ('DELETE:repos/example/music/releases/1', ['releases/1']),
-    ('DELETE:repos/example/music/git/refs/tags/v2.10.0a',
-     ['releases/1', 'git/refs/tags/v2.10.0a']),
-    ('final-list', ['releases/1', 'git/refs/tags/v2.10.0a']),
+    ('final-list', ['releases/1']),
 ])
 def test_release_cleanup_api_failure_stops_publication(tmp_path, fail, attempted):
     result, calls = _run_release_sandbox(tmp_path, [_release('v2.10.0a')], fail=fail)
@@ -424,8 +455,9 @@ def test_stable_release_requires_main_ancestry_and_explicit_formal_flag():
 def test_gitee_never_transfers_or_deletes_attachments():
     """Gitee 只同步说明；安装包必须保留在 GitHub Release。"""
     workflow = RELEASE_WORKFLOW.read_text()
-    assert 'actions/upload-artifact@v4' not in workflow
-    assert 'actions/download-artifact@v4' not in workflow
+    gitee = workflow.split("  publish-gitee:\n", 1)[1]
+    assert 'actions/upload-artifact@v4' not in gitee
+    assert 'actions/download-artifact@v4' not in gitee
     assert 'upload_attach' not in workflow
     assert 'attach_files' not in workflow
     assert '-F ' not in workflow
@@ -439,8 +471,19 @@ def test_gitee_notes_use_install_revision_and_github_links():
     assert 'version="$(tr -d \'[:space:]\' < VERSION)"' in script
     assert 'fnmusic-ext-${version}.fpk' in script
     assert 'github_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"' in script
-    assert 'echo "- [${fpk_name}](${github_base}/${fpk_name})"' in script
-    assert 'echo "- [${fpk_name}.sha256](${github_base}/${fpk_name}.sha256)"' in script
+    assert 'echo "- [${name}](${github_base}/${name})"' in script
+    assert 'echo "- [${name}.sha256](${github_base}/${name}.sha256)"' in script
+
+
+def test_gitee_links_use_the_actual_built_fpk_name():
+    workflow = RELEASE_WORKFLOW.read_text()
+    script = _unindent_run(_gitee_step_script())
+    assert 'fpk_name: ${{ steps.release-fpk.outputs.name }}' in workflow
+    assert 'FPK_NAME: ${{ needs.release.outputs.fpk_name }}' in workflow
+    assert 'fpk_name="${FPK_NAME:-}"' in script
+    assert '"fnmusic-ext-${version}.fpk"' in script
+    assert '"fnmusic-ext-${version}-prebuilt-amd64.fpk"' in script
+    assert '"fnmusic-ext-${version}-prebuilt-arm64.fpk"' in script
 
 
 def test_gitee_publish_runs_after_moo_index_and_never_blocks_release():

@@ -212,6 +212,7 @@ def common_functions() -> str:
     text = (BASE / "proxy/install_common.sh").read_text(encoding="utf-8")
     return "".join(function(text, name) for name in (
         "compute_build_fingerprint", "app_image_fingerprint", "env_value",
+        "fnmusic_image_bundle_dir", "app_image_bundle_mode", "ensure_app_image",
         "ensure_image_current"))
 
 
