@@ -45,6 +45,7 @@ from proxy.env_merge import (  # noqa: E402
     parse_env_file,
     preserve_user_comments,
     render_env,
+    resolve_musicdl_official_search,
     write_env_atomic,
 )
 from proxy.fnlog import (  # noqa: E402
@@ -196,6 +197,9 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LX_ENABLED": {"kind": "bool", "default": "false", "group": "provider", "reload": "process", "label": "洛雪自定义源"},
     "FNMUSIC_NETEASE_DIRECT_PLAY": {"kind": "bool", "default": "false", "group": "direct", "reload": "hot", "label": "网易云播放直连"},
     "FNMUSIC_MUSICDL_DIRECT_PLAY": {"kind": "bool", "default": "false", "group": "direct", "reload": "hot", "label": "musicdl 播放直连"},
+    # 实验开关：新版 musicdl 官方聚合搜索（不影响网易与洛雪）。SCHEMA default 只是
+    # 文档兜底；GET /api/config 用 resolve_musicdl_official_search 按存量/新装给出真实默认。
+    "FNMUSIC_MUSICDL_OFFICIAL_SEARCH": {"kind": "bool", "default": "true", "group": "musicdl", "reload": "hot", "label": "新版 musicdl 聚合搜索"},
     "FNMUSIC_LX_DIRECT_PLAY": {"kind": "bool", "default": "false", "group": "direct", "reload": "hot", "label": "洛雪播放直连"},
     "FNMUSIC_ONLINE_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 启用平台"},
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
@@ -1733,6 +1737,11 @@ async def api_config():
         if items:
             values["LX_SOURCE_LIST"] = _dumps_lx_list(items)
     config_values = {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()}
+    # 实验开关的默认值按存量/新装判定（已装且启用 musicdl 的老用户默认旧版，
+    # 其余默认新版），不能用 SCHEMA 静态 default——否则老用户一保存就被锁进新版。
+    config_values["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"] = (
+        "true" if resolve_musicdl_official_search(values, env_file_exists=ENV_PATH.is_file()) else "false"
+    )
     # GET 只计算旧配置的兼容视图，不写 .env；真正迁移由共享模块和保存流程完成。
     config_values.update(quality_migration(values))
     password_configured = bool(str(values.get("FNMUSIC_SCAN_ADMIN_PASSWORD") or "").strip())

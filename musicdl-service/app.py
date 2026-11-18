@@ -38,14 +38,16 @@ from musicdl import musicdl  # noqa: E402
 # worker 也是从 musicdl-service 目录启动，两个进程共用同一份 search_core
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import search_core  # noqa: E402  归一化与媒体履约判据（worker 与 API 共用同一份）
+import search_engines  # noqa: E402  搜索接口 + 旧版/新版（官方聚合）双引擎
 from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy, SearchProgress  # noqa: E402
 
 # 复用仓库根（容器内 /srv）的 proxy.env_merge 解析 .env；独立运行无仓库结构时退回纯环境变量
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try:
-    from proxy.env_merge import parse_env_file  # noqa: E402
+    from proxy.env_merge import parse_env_file, resolve_musicdl_official_search  # noqa: E402
 except ImportError:
     parse_env_file = None
+    resolve_musicdl_official_search = None
 
 # 统一日志：主进程把诊断落盘到 logs/musicdl.log（脱敏、轮转、保留与 proxy 一致），
 # 管理页日志包按文件名自动收录。独立运行无 fnlog 时退回纯 stdout/stderr。
@@ -210,6 +212,51 @@ def _log_worker_line(source: str, text: str) -> None:
 
 
 SOURCE_WORKERS = SourceBulkhead(SOURCE_NAMES.values(), on_worker_line=_log_worker_line)
+
+# 新版（官方聚合）引擎独享的 worker 坑位：与旧版逐源池互不影响。
+OFFICIAL_WORKERS = SourceBulkhead(
+    [search_engines.OFFICIAL_WORKER_KEY], on_worker_line=_log_worker_line)
+
+# 引擎经该动态视图在调用期取用本模块状态；测试 monkeypatch 后立即生效。
+_DEPS = search_engines.AppGlobalsProxy(globals())
+LEGACY_ENGINE = search_engines.LegacySearchEngine(_DEPS)
+OFFICIAL_ENGINE = search_engines.OfficialSearchEngine(_DEPS)
+
+
+def _official_search_enabled() -> bool:
+    """实时解析实验开关 FNMUSIC_MUSICDL_OFFICIAL_SEARCH（每次请求读，不缓存）。
+
+    .env 优先（与 _startup_sources 同一语义：容器 restart 继承的环境可能陈旧），
+    进程环境变量只补文件里缺的键。缺键时走老用户判定：已安装且启用 musicdl
+    默认旧版，其余默认新版（env_merge.resolve_musicdl_official_search 是唯一
+    实现，安装脚本与 WebUI 共用，避免默认值漂移）。
+    """
+    env: dict = {}
+    file_ok = False
+    if parse_env_file is not None:
+        env_path = Path(os.environ.get("FNMUSIC_ENV_FILE", "/repo/.env"))
+        try:
+            kv, _ = parse_env_file(env_path)
+            env = dict(kv)
+            # parse_env_file 对缺失文件不抛异常而返回空表：存在性必须单独判定
+            file_ok = env_path.exists()
+        except Exception:
+            env = {}
+    for key in ("FNMUSIC_MUSICDL_OFFICIAL_SEARCH", "FNMUSIC_MUSICDL_ENABLED"):
+        if not str(env.get(key) or "").strip() and os.environ.get(key):
+            env[key] = os.environ[key]
+    if resolve_musicdl_official_search is not None:
+        # .env 不可读但进程环境已启用 musicdl：视为存量部署（老用户）。
+        return resolve_musicdl_official_search(
+            env, env_file_exists=file_ok or "FNMUSIC_MUSICDL_ENABLED" in os.environ)
+    # 仓库结构不可用（独立运行）：按同样的规则本地兜底，缺键默认新版。
+    raw = str(env.get("FNMUSIC_MUSICDL_OFFICIAL_SEARCH") or "").strip().lower()
+    if raw in ("true", "1", "yes", "on"):
+        return True
+    if raw in ("false", "0", "no", "off"):
+        return False
+    musicdl_on = str(env.get("FNMUSIC_MUSICDL_ENABLED") or "").strip().lower() in ("true", "1", "yes", "on")
+    return not (file_ok and musicdl_on)
 
 
 def _source_client(name: str) -> str:
@@ -594,7 +641,10 @@ async def lifespan(app: FastAPI):
         try:
             await SOURCE_WORKERS.aclose()
         finally:
-            await app.state.http.aclose()
+            try:
+                await OFFICIAL_WORKERS.aclose()
+            finally:
+                await app.state.http.aclose()
 
 
 app = FastAPI(title="musicdl-service", lifespan=lifespan)
@@ -605,6 +655,8 @@ async def healthz():
     return {
         "ok": True,
         "sources": CONF["sources"],
+        # 当前搜索实现：official=musicdl 官方聚合（实验开关），legacy=自实现聚合
+        "search_engine": "official" if _official_search_enabled() else "legacy",
         "cache_size": len(_SONG_CACHE),
         "cache_entries": len(SEARCH_CACHE),
         "breaker_open": SOURCE_BREAKER.get_open_sources(),
@@ -649,174 +701,26 @@ async def search(
     if sources:
         raw_src_list = [_source_client(s) for s in sources.split(",") if s.strip()]
     raw_src_list = list(dict.fromkeys(raw_src_list))
-    sources_key = ",".join(sorted(raw_src_list))
-    cache_key = f"{sources_key}|limit={limit}"
+    # 每次请求实时选引擎：实验开关（FNMUSIC_MUSICDL_OFFICIAL_SEARCH）热生效。
+    engine = OFFICIAL_ENGINE if _official_search_enabled() else LEGACY_ENGINE
+    request = search_engines.SearchRequest(keyword=keyword, sources=raw_src_list, limit=limit)
+    cache_key = engine.cache_key(request)
     _STATS["searches"] += 1
 
     async def _do_search() -> dict:
-        # 1. 过滤熔断中的源
-        active_src_list = [s for s in raw_src_list if not SOURCE_BREAKER.is_open(s)]
-
-        # 2. 查缓存（命中直接返回）
-        cached = SEARCH_CACHE.get(keyword, cache_key)
-        # Search results alone cannot serve playback after song-cache eviction.
-        if cached is not None and all(_cache_get(item["id"]) for item in cached):
-            return {
-                "ok": True,
-                "cached": True,
-                "keyword": keyword,
-                "items": cached,
-                "errors": {},
-            }
-
-        # 全被熔断且无缓存，直接返回空结果（不报错）
-        if not active_src_list:
-            return {
-                "ok": True,
-                "cached": False,
-                "keyword": keyword,
-                "items": [],
-                "errors": {s: "circuit breaker open" for s in raw_src_list},
-            }
-
-        progress_by_source = {}
-
-        def collect(source):
-            progress = progress_by_source.get(source)
-            items = []
-            for item, headers, lyric in progress.finish() if progress else []:
-                _cache_put(item, keyword, headers, lyric)
-                items.append(item)
-            return items
-
-        async def one(source: str):
-            timeout = ADAPTIVE.timeout_for(source)
-            started = time.monotonic()
-            progress = SearchProgress(limit, started + timeout)
-            progress_by_source[source] = progress
-            fetch_size = max(limit * 2, 10)
-            payload = _search_payload(source, keyword, fetch_size, limit, None, timeout)
-
-            def on_entry(entry):
-                # worker 每确认一首即上交：[item, download_headers, lyric]
-                progress.append((entry[0], entry[1], entry[2]))
-
-            try:
-                result = await SOURCE_WORKERS.run(source, payload, timeout=timeout, on_entry=on_entry)
-                progress.partial = bool(result.get("partial"))
-                latency = time.monotonic() - started
-                items = collect(source)
-                if progress.partial:
-                    # 已经交出歌就不要再把超时往下压。压到搜不完一页后，下次还是 0 条。
-                    if not items:
-                        ADAPTIVE.record_failure(source)
-                    return source, items, "partial results (probe deadline reached)"
-                ADAPTIVE.record_success(source, latency)
-                if items:
-                    SOURCE_BREAKER.record_success(source, latency)
-                else:
-                    _note_empty_source_result(source, SOURCE_BREAKER, ADAPTIVE)
-                return source, items, None
-            except SourceBusy as exc:
-                # Admission rejection is not another upstream failure.
-                return source, collect(source), str(exc)
-            except asyncio.TimeoutError:
-                items = collect(source)
-                if not items:
-                    SOURCE_BREAKER.record_failure(source)
-                    ADAPTIVE.record_failure(source)
-                suffix = " (partial results)" if items else ""
-                return source, items, f"timeout after {timeout:.1f}s{suffix}"
-            except asyncio.CancelledError:
-                # The aggregate owner collects this closed snapshot on the
-                # global deadline, never the still-running worker.
-                progress.finish()
-                raise
-            except Exception as e:  # 单源失败不影响其他源
-                _STATS["errors"] += 1
-                SOURCE_BREAKER.record_failure(source)
-                return source, collect(source), f"{type(e).__name__}: {e}"
-
-        results: list = []
-        slots = asyncio.Semaphore(max(1, int(CONF.get("concurrency") or 1)))
-
-        async def limited(source: str):
-            # issue #116：排队时间不计入单源预算——拿到槽位后才开始它自己的超时，
-            # 否则站点一多，后面排队的源必然在起跑线上就超时。
-            async with slots:
-                return await one(source)
-
-        pending = {asyncio.create_task(limited(s), name=s): s for s in active_src_list}
-        overall = max(float(CONF["search_timeout"]), 4.0)
-        deadline = time.monotonic() + overall
-        try:
-            # issue #116：只按整体截止收口，不再「凑够 N 条就砍掉其余源」或「有结果
-            # 后再等固定几秒」——那正是勾选多站点却只剩约 10 首的原因。
-            while pending:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                done, _ = await asyncio.wait(
-                    pending.keys(), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done:
-                    pending.pop(task, None)
-                    try:
-                        results.append(task.result())
-                    except Exception as e:  # noqa: BLE001
-                        _STATS["errors"] += 1
-                        results.append((task.get_name(), [], f"{type(e).__name__}: {e}"))
-        finally:
-            for task in pending:
-                task.cancel()
-            if pending:
-                cleanup = asyncio.gather(*pending, return_exceptions=True)
-                interrupted = False
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        interrupted = True
-                if interrupted:
-                    raise asyncio.CancelledError
-        if pending:
-            # 整体截止时，已确认的歌照常并入；没排到槽位/没跑完的源记 skipped，
-            # 一律不记熔断、不压自适应超时——否则站点选多了会把「还没来得及跑」
-            # 的源逐个打成故障，下次搜索直接空结果（issue #116）。
-            for _task, src in pending.items():
-                items = collect(src)
-                results.append((src, items,
-                                "skipped (deadline)" + (" (partial results)" if items else "")))
-
-        all_items = []
-        seen_ids = set()
-        for _, items, _ in results:
-            for item in items:
-                if item["id"] not in seen_ids:
-                    seen_ids.add(item["id"])
-                    all_items.append(item)
-
-        errors = {src: err for src, _, err in results if err}
-        for s in raw_src_list:
-            if s not in active_src_list:
-                errors.setdefault(s, "circuit breaker open")
-        # Partial/error results must remain retryable, not become a long-lived
-        # apparently complete cache hit with errors silently removed.
-        if not errors:
-            if all_items:
-                SEARCH_CACHE.put(keyword, cache_key, all_items)
-            else:
-                SEARCH_CACHE.put(keyword, cache_key, [], ttl=CONF["neg_cache_ttl"])
-
+        outcome = await engine.search(request)
         return {
             "ok": True,
-            "cached": False,
+            "cached": outcome.cached,
             "keyword": keyword,
-            "items": all_items,
-            "errors": errors,
+            "items": outcome.items,
+            "errors": outcome.errors,
+            "engine": engine.name,
         }
 
     return await SINGLE_FLIGHT.run((keyword, cache_key), _do_search)
+
+
 
 
 @app.get("/info")

@@ -184,6 +184,36 @@ def parse_env_file(path: str | Path, *, strict: bool = False) -> "tuple[list[tup
     return kv, others
 
 
+TRUTHY = {"true", "1", "yes", "on"}
+
+
+def _env_flag(raw: "str | None") -> "bool | None":
+    """解析 .env 布尔值；空值/无法识别返回 None（视为未设置）。"""
+    value = str(raw or "").strip().lower()
+    if value in TRUTHY:
+        return True
+    if value in {"false", "0", "no", "off"}:
+        return False
+    return None
+
+
+def resolve_musicdl_official_search(env: dict, *, env_file_exists: bool) -> bool:
+    """缺省 musicdl 官方聚合搜索开关（FNMUSIC_MUSICDL_OFFICIAL_SEARCH）。
+
+    规则：键已存在时服从用户值；缺键时——已安装（.env 存在）且当前启用了
+    musicdl 的老用户默认旧版（自实现聚合，行为不变），其余（全新安装、
+    未启用 musicdl 的存量安装）默认新版（musicdl 官方聚合）。安装脚本与
+    musicdl 服务入口共用本函数，避免两套默认值漂移。
+    """
+    flag = _env_flag(env.get("FNMUSIC_MUSICDL_OFFICIAL_SEARCH"))
+    if flag is not None:
+        return flag
+    musicdl_on = _env_flag(env.get("FNMUSIC_MUSICDL_ENABLED")) is True
+    if env_file_exists and musicdl_on:
+        return False
+    return True
+
+
 def merge_env(
     existing: "list[tuple[str, str]]",
     desired: "list[tuple[str, str]]",

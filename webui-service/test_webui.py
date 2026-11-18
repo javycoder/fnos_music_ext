@@ -218,10 +218,35 @@ def test_config_view_merges_defaults(env_file):
         assert rj["values"]["FNMUSIC_NETEASE_DIRECT_PLAY"] == "false"
         assert rj["values"]["FNMUSIC_MUSICDL_DIRECT_PLAY"] == "false"
         assert rj["values"]["FNMUSIC_LX_DIRECT_PLAY"] == "false"
+        # BASE_ENV 未启用 musicdl 且缺实验开关键：默认新版官方聚合
+        assert rj["values"]["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"] == "true"
+        assert rj["schema"]["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"]["kind"] == "bool"
+        assert rj["schema"]["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"]["reload"] == "hot"
         assert rj["webui_build"] == webui.STATIC_BUILD_ID
         page = client.get("/").text
         assert f'window.FNMUSIC_WEBUI_BUILD = "{webui.STATIC_BUILD_ID}"' in page
         assert f"app.js?build={webui.STATIC_BUILD_ID}" in page
+
+
+def test_musicdl_official_search_default_and_roundtrip(env_file):
+    """实验开关：已启用 musicdl 的老安装缺键默认旧版；保存过的值优先于默认。"""
+    env_file.write_text(
+        BASE_ENV
+        .replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+        .replace("FNMUSIC_MUSICDL_ENABLED='false'", "FNMUSIC_MUSICDL_ENABLED='true'"),
+        encoding="utf-8")
+    with authed_client() as client:
+        # 已安装且启用 musicdl、缺键 → 默认旧版自实现聚合（false）
+        assert client.get("/api/config").json()["values"]["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"] == "false"
+        # 用户显式开启新版：热键，保存即写 .env
+        r = client.put("/api/config", json={"values": {"FNMUSIC_MUSICDL_OFFICIAL_SEARCH": True}})
+        assert r.status_code == 200
+        assert "FNMUSIC_MUSICDL_OFFICIAL_SEARCH" in r.json()["changed"]
+        assert r.json()["actions"] == []
+        assert webui.read_env()["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"] == "true"
+        # 已保存的值优先于老用户默认
+        view = client.get("/api/config").json()["values"]["FNMUSIC_MUSICDL_OFFICIAL_SEARCH"]
+        assert view == "true"
 
 
 # ------------------------------------------------------------------ PUT 校验 ---
@@ -2396,9 +2421,9 @@ def test_experimental_features_are_grouped_under_dedicated_menu():
 
     assert 'id="nav-experimental-title"' in html
     assert 'id="bottom-experimental-trigger"' in html
-    for page_id in ("exp-direct", "exp-layout", "exp-cleanup"):
+    for page_id in ("exp-direct", "exp-musicdl-search", "exp-layout", "exp-cleanup"):
         assert html.count(f'data-page="{page_id}"') == 2
-    for label in ("播放直连", "目录归类与整理", "垃圾清理"):
+    for label in ("播放直连", "musicdl 搜索", "目录归类与整理", "垃圾清理"):
         assert f"<span>{label}</span>" in html
         assert f'role="menuitem" type="button">{label}</button>' in html
 
@@ -2406,6 +2431,15 @@ def test_experimental_features_are_grouped_under_dedicated_menu():
     assert all(f'id="{element}"' in direct for element in
                ("direct-netease", "direct-musicdl", "direct-lx"))
     assert 'id="direct-netease"' not in page("search")
+
+    musicdl_search = page("exp-musicdl-search")
+    assert 'id="musicdl-official-search"' in musicdl_search
+    assert 'data-help="musicdl-official-search"' in musicdl_search
+    assert 'id="musicdl-official-search"' not in page("search")
+    # 问号帮助说明新旧区别，并声明不影响网易与洛雪
+    assert "官方" in html.split('data-help-id="musicdl-official-search"', 1)[1].split("</template>", 1)[0]
+    assert "自己实现" in html.split('data-help-id="musicdl-official-search"', 1)[1].split("</template>", 1)[0]
+    assert "不影响网易云和洛雪" in html
 
     layout = page("exp-layout")
     assert 'id="download-layout"' in layout

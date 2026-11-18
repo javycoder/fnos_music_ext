@@ -57,9 +57,14 @@ def main() -> int:
         try:
             # 记录实际进入过的阶段；失败时用它给出可定位的 search/probe 标记。
             stages: list = []
-            result = search_core.run_search_task(
-                task, lambda entry: _emit(proto_fd, {"type": "entry", "entry": entry}),
-                on_stage=stages.append)
+            if task.get("op") == "official_search":
+                # 官方聚合：一次库调用，无探活阶段；仍走同一 entry/error 协议。
+                result = search_core.run_official_search_task(
+                    task, lambda entry: _emit(proto_fd, {"type": "entry", "entry": entry}))
+            else:
+                result = search_core.run_search_task(
+                    task, lambda entry: _emit(proto_fd, {"type": "entry", "entry": entry}),
+                    on_stage=stages.append)
             _emit(proto_fd, {"type": "result",
                              "count": int(result.get("count") or 0),
                              "partial": bool(result.get("partial")) or any(

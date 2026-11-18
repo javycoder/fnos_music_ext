@@ -72,7 +72,7 @@ try:
     from . import transcode as tc
     from . import quality_policy as qp
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
-    from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic
+    from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search
     from .fnlog import diag as fn_diag
     from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
     from .version import get_version
@@ -96,7 +96,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import transcode as tc  # type: ignore
     import quality_policy as qp  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
-    from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic  # type: ignore
+    from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search  # type: ignore
     from fnlog import diag as fn_diag  # type: ignore
     from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
     from version import get_version  # type: ignore
@@ -170,6 +170,27 @@ def _safe_scan_number(raw: str, default: float, lo: float, hi: float):
         return default
 
 
+def _initial_musicdl_official_search() -> bool:
+    """musicdl 官方聚合搜索开关的启动初值（仅诊断展示用，真正选引擎的是
+    musicdl 服务每次请求实时读 .env）。缺键时按统一规则判定：存量部署且已
+    启用 musicdl → 旧版；否则新版。"""
+    env: dict = {}
+    file_ok = False
+    try:
+        path = os.environ.get("FNMUSIC_ENV_FILE") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+        env = dict(parse_env_file(path)[0])
+        # parse_env_file 对缺失文件不抛异常而返回空表：存在性必须单独判定
+        file_ok = os.path.exists(path)
+    except Exception:
+        env = {}
+    for key in ("FNMUSIC_MUSICDL_OFFICIAL_SEARCH", "FNMUSIC_MUSICDL_ENABLED"):
+        if not str(env.get(key) or "").strip() and os.environ.get(key):
+            env[key] = os.environ[key]
+    return resolve_musicdl_official_search(
+        env, env_file_exists=file_ok or "FNMUSIC_MUSICDL_ENABLED" in os.environ)
+
+
 CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "netease_url": os.environ.get("FNMUSIC_NETEASE_URL") or os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
@@ -180,6 +201,8 @@ CONF = {
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
     "netease_direct_play": os.environ.get("FNMUSIC_NETEASE_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "musicdl_direct_play": os.environ.get("FNMUSIC_MUSICDL_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
+    # 实验开关：新版 musicdl 官方聚合搜索。代理只按它清搜索缓存，不改请求目标。
+    "musicdl_official_search": _initial_musicdl_official_search(),
     "lx_direct_play": os.environ.get("FNMUSIC_LX_DIRECT_PLAY", "false").strip().lower() in ("true", "1", "yes", "on"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
@@ -631,6 +654,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_NETEASE_DIRECT_PLAY": ("netease_direct_play", "direct_bool"),
     "FNMUSIC_MUSICDL_DIRECT_PLAY": ("musicdl_direct_play", "direct_bool"),
+    "FNMUSIC_MUSICDL_OFFICIAL_SEARCH": ("musicdl_official_search", "bool"),
     "FNMUSIC_LX_DIRECT_PLAY": ("lx_direct_play", "direct_bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),

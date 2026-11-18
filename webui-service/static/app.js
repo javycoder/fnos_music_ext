@@ -363,7 +363,7 @@ function switchPage(page) {
 
   const isStorageSub = page === "tee" || page === "dirs";
   const isAdvancedSub = page === "llm" || page === "lx" || page === "search";
-  const isExperimentalSub = page === "exp-direct" || page === "exp-layout" || page === "exp-cleanup";
+  const isExperimentalSub = page === "exp-direct" || page === "exp-musicdl-search" || page === "exp-layout" || page === "exp-cleanup";
 
   const storageTitle = $("#nav-storage-title");
   if (storageTitle) storageTitle.classList.toggle("active", isStorageSub);
@@ -667,6 +667,7 @@ function applyConfigToForm() {
     ["#direct-netease", "FNMUSIC_NETEASE_DIRECT_PLAY"],
     ["#direct-musicdl", "FNMUSIC_MUSICDL_DIRECT_PLAY"],
     ["#direct-lx", "FNMUSIC_LX_DIRECT_PLAY"],
+    ["#musicdl-official-search", "FNMUSIC_MUSICDL_OFFICIAL_SEARCH"],
   ].forEach(([selector, key]) => {
     const el = $(selector);
     el.disabled = !configSchema[key];
@@ -800,6 +801,8 @@ function collectConfig() {
     ...(configSchema.FNMUSIC_NETEASE_DIRECT_PLAY ? { FNMUSIC_NETEASE_DIRECT_PLAY: $("#direct-netease").checked } : {}),
     ...(configSchema.FNMUSIC_MUSICDL_DIRECT_PLAY ? { FNMUSIC_MUSICDL_DIRECT_PLAY: $("#direct-musicdl").checked } : {}),
     ...(configSchema.FNMUSIC_LX_DIRECT_PLAY ? { FNMUSIC_LX_DIRECT_PLAY: $("#direct-lx").checked } : {}),
+    ...(configSchema.FNMUSIC_MUSICDL_OFFICIAL_SEARCH
+      ? { FNMUSIC_MUSICDL_OFFICIAL_SEARCH: $("#musicdl-official-search").checked } : {}),
     ...(configSchema.FNMUSIC_PLAY_QUALITY ? {
       FNMUSIC_PLAY_QUALITY: ($$("input[name=play-quality]").find((el) => el.checked) || {}).value || "lossless",
     } : {}),

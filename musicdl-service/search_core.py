@@ -339,6 +339,63 @@ def search_one_source(source: str, keyword: str, limit: int) -> list:
     return list(result.values())[0] if result else []
 
 
+def _build_official_client(sources: list):
+    """官方聚合构造点：测试可拦截这里检查真实传给 SDK 的参数。
+
+    只传 music_sources 白名单；init_music_clients_cfg / clients_threadings /
+    requests_overrides / search_rules 一律不传（不支持的参数直接忽略）。
+    """
+    from musicdl import musicdl
+
+    return musicdl.MusicClient(music_sources=list(sources))
+
+
+def search_official(sources: list, keyword: str) -> dict:
+    """官方聚合搜索（worker 进程内执行，阻塞）。
+
+    一次 MusicClient 调用交给 musicdl 库自带的聚合（内部线程池等全部平台）。
+    官方 search(keyword) 只接受关键词：limit、单站超时、熔断、并发槽都不是它
+    的参数，按实验开关的约定「不支持的参数直接忽略」，也绝不注入 timeout
+    （部分源自带显式 timeout，注入同名键会触发重复关键字 TypeError）。
+    白名单必须显式传入：空列表会让库回落到它内置的 5 个默认源，覆盖用户
+    在管理页勾选的平台。
+    """
+    wanted = [str(s or "").strip() for s in sources if str(s or "").strip()]
+    if not wanted:
+        raise ValueError("official search requires a non-empty platform whitelist")
+    client = _build_official_client(wanted)
+    result = client.search(keyword=keyword)
+    return result if isinstance(result, dict) else {}
+
+
+def run_official_search_task(task: dict, emit) -> dict:
+    """执行官方聚合搜索任务：一次库调用 → 归一化初筛 → 确认一首上交一首。
+
+    与 run_search_task 的差异：不做直链探活（探活是旧版自研聚合的行为，
+    新版交由官方聚合）。库内部把单站异常吞成该站空列表，这里不伪造每站
+    错误；按请求白名单顺序展开结果，库内部 set() 打乱的顺序不外泄。
+    """
+    sources = [str(s or "").strip() for s in (task.get("sources") or []) if str(s or "").strip()]
+    keyword = str(task.get("keyword") or "")
+    try:
+        result = search_official(sources, keyword)
+    except BaseException as exc:  # noqa: BLE001 统一转成带阶段的搜索异常
+        raise SearchStageError(exc) from exc
+    count = 0
+    for source in sources:
+        for song in result.get(source) or []:
+            if not song:
+                continue
+            item = normalize(song, keyword)
+            if not is_candidate_playable(song, item):
+                continue
+            headers = _download_request_headers(song)
+            lyric = str(getattr(song, "lyric", "") or "")
+            emit([item, headers, lyric])
+            count += 1
+    return {"count": count, "partial": False}
+
+
 def _looks_like_media(sample: bytes, content_type: str) -> bool:
     """用实际字节前缀判断是不是媒体，而不是只看 Content-Type。
 
