@@ -485,6 +485,35 @@ input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent);
 .public-selected .btn-row { margin: 0; flex: none; flex-wrap: nowrap; }
 .public-selected .btn { padding: 3px 8px; font-size: 12px; }
 
+/* 已选歌单长按拖动：浮起卡片 + 其余条目让位 */
+#public-selected .public-selected {
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  touch-action: pan-y;
+}
+body.is-public-reordering { overflow: hidden; touch-action: none; cursor: grabbing; }
+body.is-public-reordering #public-selected .public-selected {
+  touch-action: none;
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.public-selected.is-reorder-source { background: transparent; border-style: dashed; box-shadow: none; }
+.public-selected.is-reorder-source > * { visibility: hidden; }
+#public-reorder-ghost {
+  position: fixed; z-index: 48; margin: 0; pointer-events: none;
+  justify-content: flex-start;
+  transform: scale(1) translateY(0); will-change: transform;
+  box-shadow: var(--shadow);
+}
+#public-reorder-ghost .min { flex: 1; }
+#public-reorder-ghost.is-lifted {
+  transform: scale(1.04) translateY(-8px);
+  box-shadow: var(--shadow-lg);
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  body.is-public-reordering #public-selected .public-selected { transition: none; }
+  #public-reorder-ghost.is-lifted { transition: none; }
+}
+
 /* Token 用量表 */
 .usage-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 .usage-table th, .usage-table td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; }

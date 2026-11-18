@@ -1528,14 +1528,85 @@ function setPublicSelection(item, selected) {
   return true;
 }
 
-function movePublicSelection(index, delta) {
-  const next = index + delta;
-  if (next < 0 || next >= publicSelection.length) return;
-  const items = publicSelection.splice(index, 1);
-  publicSelection.splice(next, 0, items[0]);
+// 长按拖动排序：按住 320ms 且位移不超过 10px 才抬起卡片，避免和页面滚动抢手势。
+const PUBLIC_REORDER_HOLD_MS = 320;
+const PUBLIC_REORDER_SLOP_PX = 10;
+let publicReorderSession = null;
+let publicReorderSuppressClick = false;
+
+// 返回抽走被拖项后的插入下标（0..n-1）。命中用拖动开始时的静止矩形，
+// 不能用实时 getBoundingClientRect，否则让位位移会反过来影响命中而抖动。
+function publicReorderDropIndex(from, pointerY, origins) {
+  const list = Array.isArray(origins) ? origins : [];
+  if (!Number.isInteger(from) || from < 0 || from >= list.length) return -1;
+  if (!Number.isFinite(pointerY)) return from;
+  let index = 0;
+  for (let i = 0; i < list.length; i += 1) {
+    if (i === from) continue;
+    const entry = list[i] || {};
+    const top = Number(entry.top);
+    const height = Number(entry.height);
+    if (!Number.isFinite(top) || !Number.isFinite(height)) continue;
+    if (pointerY > top + height / 2) index += 1;
+  }
+  return index;
+}
+
+// 计算让位位移：按拖动开始时的矩形重新堆叠，返回每一项的 translateY。
+function publicReorderOffsets(from, dropIndex, origins, gap) {
+  const list = Array.isArray(origins) ? origins : [];
+  const total = list.length;
+  const offsets = new Array(total).fill(0);
+  if (!Number.isInteger(from) || from < 0 || from >= total) return offsets;
+  if (!Number.isInteger(dropIndex)) return offsets;
+  const gapPx = Number.isFinite(gap) && gap >= 0 ? gap : 8;
+  const order = [];
+  for (let i = 0; i < total; i += 1) if (i !== from) order.push(i);
+  order.splice(Math.min(Math.max(dropIndex, 0), total - 1), 0, from);
+  const tops = list.map((entry) => Number(entry && entry.top) || 0);
+  const listTop = Math.min(...tops);
+  let cursor = listTop;
+  for (const index of order) {
+    const height = Number(list[index] && list[index].height) || 0;
+    offsets[index] = cursor - tops[index];
+    cursor += height + gapPx;
+  }
+  return offsets;
+}
+
+// 只有落在列表矩形内且仍在视口内才算有效放置；其余（应用外、卡片外）一律取消。
+function publicReorderPointerInside(x, y, listRect, viewport) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  const rect = listRect || {};
+  const left = Number(rect.left);
+  const top = Number(rect.top);
+  const right = Number(rect.right);
+  const bottom = Number(rect.bottom);
+  if (![left, top, right, bottom].every(Number.isFinite)) return false;
+  if (right - left <= 0 || bottom - top <= 0) return false;
+  const view = viewport || {};
+  const width = Number(view.width);
+  const height = Number(view.height);
+  if (!(width > 0) || !(height > 0)) return false;
+  if (x < 0 || y < 0 || x > width || y > height) return false;
+  return x >= left && x <= right && y >= top && y <= bottom;
+}
+
+function reorderPublicSelectionTo(from, to) {
+  if (!publicSelectionEditable()) return false;
+  const total = publicSelection.length;
+  if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+  if (from < 0 || to < 0 || from >= total || to >= total || from === to) return false;
+  const moved = publicSelection.splice(from, 1);
+  publicSelection.splice(to, 0, moved[0]);
   stashPublicUser(true);
   renderPublicSelected();
   markDirty("公共歌单顺序已修改");
+  return true;
+}
+
+function movePublicSelection(index, delta) {
+  reorderPublicSelectionTo(index, index + delta);
 }
 
 function loadPublicMetadataStorage() {
@@ -1622,6 +1693,17 @@ function setPublicDetailCache(key, entry, isFromNetwork = false) {
   }
 }
 
+// 状态判定：idle / loading / success / error / unavailable
+// 只在 inflight 显示 loading，空 name 失败、缓存不当成功；兼容原有 _detail_failed 断言
+function publicSelectedTitle(item) {
+  if (item._name) return escapeHtml(item._name);
+  if (item._detail_status === "stopped") return "音源未运行";
+  if (item._detail_status === "unavailable") return "音源不可用";
+  if (item._detail_status === "error" || item._detail_failed) return "名称获取失败";
+  if (item._detail_status === "loading") return "正在获取歌单名称…";
+  return "等待获取歌单名称";
+}
+
 function renderPublicSelected() {
   const box = $("#public-selected");
   if (!box) return;
@@ -1635,25 +1717,10 @@ function renderPublicSelected() {
         });
       }
     }
-    // 状态判定：idle / loading / success / error / unavailable
-    // 只在 inflight 显示 loading，空 name 失败、缓存不当成功；兼容原有 _detail_failed 断言
-    let title = "";
-    if (item._name) {
-      title = escapeHtml(item._name);
-    } else if (item._detail_status === "stopped") {
-      title = "音源未运行";
-    } else if (item._detail_status === "unavailable") {
-      title = "音源不可用";
-    } else if (item._detail_status === "error" || item._detail_failed) {
-      title = "名称获取失败";
-    } else if (item._detail_status === "loading") {
-      title = "正在获取歌单名称…";
-    } else {
-      title = "等待获取歌单名称";
-    }
+    const title = publicSelectedTitle(item);
     const showRetry = item._detail_failed || ["error", "unavailable", "stopped"].includes(item._detail_status);
     return `
-    <div class="public-selected">
+    <div class="public-selected" data-public-index="${index}">
       <img src="${escapeHtml(item._cover_url || "")}" alt="" ${item._cover_url ? "" : "hidden"}>
       <div class="min">
         <b>${title}</b>
@@ -1683,7 +1750,317 @@ function renderPublicSelected() {
       updateResidentAvailability();
       renderPublicSelected(); renderPublicList(); markDirty("公共歌单选择已修改");
     }));
+  // 详情补齐会整表重绘：拖动会话仍有效时重建虚线槽与让位位移，失效则取消且不提交。
+  syncPublicReorderAfterRender();
 }
+
+/* 已选歌单长按拖动：指针事件统一鼠标与触屏，拖动期间不改数组，只在松手时提交 */
+function publicReorderViewport() {
+  if (typeof window === "undefined") return { width: 0, height: 0 };
+  return { width: Number(window.innerWidth) || 0, height: Number(window.innerHeight) || 0 };
+}
+
+function publicReorderListBox() {
+  if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
+  return document.querySelector("#public-selected");
+}
+
+function publicReorderRows() {
+  const box = publicReorderListBox();
+  if (!box || typeof box.querySelectorAll !== "function") return [];
+  return Array.from(box.querySelectorAll(".public-selected") || []);
+}
+
+// 测量前先清除 transform，避免把上一帧的让位位移当成新基线。
+function measurePublicReorderOrigins(rows) {
+  return rows.map((row) => {
+    if (row && row.style) row.style.transform = "";
+    const rect = row && typeof row.getBoundingClientRect === "function" ? row.getBoundingClientRect() : null;
+    if (!rect) return { top: 0, height: 0, left: 0, width: 0 };
+    return { top: rect.top, height: rect.height, left: rect.left, width: rect.width };
+  });
+}
+
+function measurePublicReorderGap(origins) {
+  if (!Array.isArray(origins) || origins.length < 2) return 8;
+  const gap = origins[1].top - (origins[0].top + origins[0].height);
+  if (!Number.isFinite(gap) || gap < 0 || gap >= 80) return 8;
+  return gap;
+}
+
+function publicReorderGhostHtml(item) {
+  const cover = escapeHtml(item._cover_url || "");
+  const meta = escapeHtml(PUBLIC_SOURCE_LABEL[item.source] || item.source);
+  return `<img src="${cover}" alt="" ${item._cover_url ? "" : "hidden"}>`
+    + `<div class="min"><b>${publicSelectedTitle(item)}</b><span>${meta} · `
+    + `${item.kind === "chart" ? "榜单" : "歌单"} · ${escapeHtml(String(item.id))}</span></div>`;
+}
+
+function updatePublicReorderGhost(session) {
+  const ghost = session && session.ghost;
+  if (!ghost || !ghost.style) return;
+  const left = Number(session.ghostLeft);
+  const top = Number(session.ghostTop);
+  if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+  ghost.style.left = `${left}px`;
+  ghost.style.top = `${top}px`;
+  const origin = session.origins && session.origins[session.from];
+  const width = Number(origin && origin.width);
+  if (Number.isFinite(width) && width > 0) ghost.style.width = `${width}px`;
+  const item = publicSelection[session.from];
+  if (!item) return;
+  const html = publicReorderGhostHtml(item);
+  if (ghost.innerHTML !== html) ghost.innerHTML = html;
+}
+
+function createPublicReorderGhost(session) {
+  if (typeof document === "undefined" || typeof document.createElement !== "function") return;
+  const item = publicSelection[session.from];
+  if (!item) return;
+  const ghost = document.createElement("div");
+  ghost.id = "public-reorder-ghost";
+  ghost.className = "public-selected";
+  ghost.setAttribute("aria-hidden", "true");
+  ghost.innerHTML = publicReorderGhostHtml(item);
+  if (document.body && typeof document.body.appendChild === "function") document.body.appendChild(ghost);
+  session.ghost = ghost;
+  updatePublicReorderGhost(session);
+}
+
+// 先入 DOM 再等两帧加 is-lifted，否则浮起的过渡不会播放。
+function liftPublicReorderGhost(session) {
+  const ghost = session && session.ghost;
+  if (!ghost || !ghost.classList) return;
+  const raf = typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
+    ? window.requestAnimationFrame.bind(window) : null;
+  if (!raf) { ghost.classList.add("is-lifted"); return; }
+  raf(() => { if (publicReorderSession === session) ghost.classList.add("is-lifted"); });
+}
+
+function applyPublicReorderVisuals(remeasure) {
+  const session = publicReorderSession;
+  if (!session || session.phase !== "dragging") return;
+  const rows = publicReorderRows();
+  if (!rows.length || rows.length !== publicSelection.length) return;
+  if (remeasure || !Array.isArray(session.origins) || session.origins.length !== rows.length) {
+    session.origins = measurePublicReorderOrigins(rows);
+    session.gap = measurePublicReorderGap(session.origins);
+  }
+  const offsets = publicReorderOffsets(session.from, session.dropIndex, session.origins, session.gap);
+  rows.forEach((row, index) => {
+    if (row.style) row.style.transform = offsets[index] ? `translateY(${offsets[index]}px)` : "";
+    if (row.classList) row.classList.toggle("is-reorder-source", index === session.from);
+  });
+  updatePublicReorderGhost(session);
+}
+
+function syncPublicReorderAfterRender() {
+  const session = publicReorderSession;
+  if (!session) return;
+  const item = publicSelection[session.from];
+  const expected = Array.isArray(session.origins) ? session.origins.length : publicSelection.length;
+  if (!item || publicSelection.length !== expected || publicEntryKey(item) !== session.entryKey) {
+    cancelPublicReorder();
+    return;
+  }
+  if (session.phase === "dragging") applyPublicReorderVisuals(true);
+}
+
+function publicReorderTeardown(session) {
+  if (!session) return;
+  if (session.holdTimer) {
+    clearTimeout(session.holdTimer);
+    session.holdTimer = null;
+  }
+  if (session.captureEl && typeof session.captureEl.releasePointerCapture === "function") {
+    try { session.captureEl.releasePointerCapture(session.pointerId); } catch (_) {}
+  }
+  publicReorderRows().forEach((row) => {
+    if (row.style) row.style.transform = "";
+    if (row.classList) row.classList.remove("is-reorder-source");
+  });
+  const ghost = session.ghost;
+  session.ghost = null;
+  try {
+    if (ghost && ghost.parentNode && typeof ghost.parentNode.removeChild === "function") {
+      ghost.parentNode.removeChild(ghost);
+    } else if (ghost && typeof ghost.remove === "function") {
+      ghost.remove();
+    }
+  } catch (_) {}
+  if (typeof document !== "undefined" && document.body && document.body.classList) {
+    document.body.classList.remove("is-public-reordering");
+  }
+}
+
+function cancelPublicReorder() {
+  const session = publicReorderSession;
+  if (!session) return;
+  publicReorderSession = null;
+  publicReorderTeardown(session);
+}
+
+function beginPublicReorder(session) {
+  if (publicReorderSession !== session || session.phase !== "pending") return;
+  const rows = publicReorderRows();
+  if (rows.length !== publicSelection.length || !rows[session.from]) { cancelPublicReorder(); return; }
+  const origins = measurePublicReorderOrigins(rows);
+  const origin = origins[session.from];
+  if (!origin || !(origin.width > 0) || !(origin.height > 0)) { cancelPublicReorder(); return; }
+  session.origins = origins;
+  session.gap = measurePublicReorderGap(origins);
+  session.phase = "dragging";
+  session.dropIndex = session.from;
+  session.grabX = session.startX - origin.left;
+  session.grabY = session.startY - origin.top;
+  session.ghostLeft = origin.left;
+  session.ghostTop = origin.top;
+  const box = publicReorderListBox();
+  if (box && typeof box.setPointerCapture === "function") {
+    try { box.setPointerCapture(session.pointerId); session.captureEl = box; } catch (_) {}
+  }
+  createPublicReorderGhost(session);
+  if (typeof document !== "undefined" && document.body && document.body.classList) {
+    document.body.classList.add("is-public-reordering");
+  }
+  applyPublicReorderVisuals(false);
+  liftPublicReorderGhost(session);
+}
+
+// 按钮、输入和链接保持原生点击，不参与长按拖动。
+function publicReorderRowFromTarget(target) {
+  if (!target || typeof target.closest !== "function") return null;
+  if (target.closest("button, a, input, textarea, select")) return null;
+  return target.closest("#public-selected .public-selected");
+}
+
+function publicReorderPointerDown(event) {
+  if (!event) return;
+  const active = publicReorderSession;
+  if (active && active.phase === "dragging") return;
+  if (typeof event.button === "number" && event.button !== 0) return;
+  if (!publicSelectionEditable() || publicSelection.length < 2) return;
+  const row = publicReorderRowFromTarget(event.target);
+  if (!row) return;
+  const from = Number(row.dataset && row.dataset.publicIndex);
+  if (!Number.isInteger(from) || from < 0 || from >= publicSelection.length) return;
+  if (event.pointerId === undefined || event.pointerId === null) return;
+  cancelPublicReorder();
+  const session = {
+    pointerId: event.pointerId,
+    from,
+    entryKey: publicEntryKey(publicSelection[from]),
+    startX: Number(event.clientX) || 0,
+    startY: Number(event.clientY) || 0,
+    phase: "pending",
+    holdTimer: null,
+    origins: null,
+    gap: 8,
+    dropIndex: from,
+    ghost: null,
+    captureEl: null,
+    grabX: 0,
+    grabY: 0,
+    ghostLeft: 0,
+    ghostTop: 0,
+    outside: false,
+  };
+  publicReorderSession = session;
+  const timer = setTimeout(() => beginPublicReorder(session), PUBLIC_REORDER_HOLD_MS);
+  if (timer && typeof timer.unref === "function") timer.unref();
+  session.holdTimer = timer;
+}
+
+function publicReorderPointerMove(event) {
+  const session = publicReorderSession;
+  if (!session || !event || event.pointerId !== session.pointerId) return;
+  const x = Number(event.clientX);
+  const y = Number(event.clientY);
+  if (session.phase === "pending") {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (Math.hypot(x - session.startX, y - session.startY) > PUBLIC_REORDER_SLOP_PX) cancelPublicReorder();
+    return;
+  }
+  if (session.phase !== "dragging") return;
+  if (typeof event.preventDefault === "function") event.preventDefault();
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  const box = publicReorderListBox();
+  const rect = box && typeof box.getBoundingClientRect === "function" ? box.getBoundingClientRect() : null;
+  const inside = publicReorderPointerInside(x, y, rect, publicReorderViewport());
+  session.outside = !inside;
+  session.ghostLeft = x - session.grabX;
+  session.ghostTop = y - session.grabY;
+  updatePublicReorderGhost(session);
+  if (!inside) return;
+  const next = publicReorderDropIndex(session.from, y, session.origins);
+  if (next < 0 || next === session.dropIndex) return;
+  session.dropIndex = next;
+  applyPublicReorderVisuals(false);
+}
+
+function finishPublicReorder(event) {
+  const session = publicReorderSession;
+  if (!session) return;
+  const from = session.from;
+  const dropIndex = session.dropIndex;
+  const entryKey = session.entryKey;
+  const box = publicReorderListBox();
+  const rect = box && typeof box.getBoundingClientRect === "function" ? box.getBoundingClientRect() : null;
+  const inside = publicReorderPointerInside(
+    Number(event && event.clientX), Number(event && event.clientY), rect, publicReorderViewport());
+  publicReorderSession = null;
+  publicReorderTeardown(session);
+  // 只有松手仍在列表内时才需要吞掉补发的 click；拖到列表外取消时不打扰后续点击。
+  publicReorderSuppressClick = inside;
+  if (!inside || dropIndex === from) return;
+  const item = publicSelection[from];
+  if (!item || publicEntryKey(item) !== entryKey) return;
+  reorderPublicSelectionTo(from, dropIndex);
+}
+
+function publicReorderPointerUp(event) {
+  const session = publicReorderSession;
+  if (!session || !event || event.pointerId !== session.pointerId) return;
+  if (session.phase === "pending") { cancelPublicReorder(); return; }
+  finishPublicReorder(event);
+}
+
+// 拖动结束的松手会补发一次 click：落在按钮上不能误删或误换页。
+function publicReorderClickGuard(event) {
+  if (!publicReorderSuppressClick) return;
+  publicReorderSuppressClick = false;
+  const box = publicReorderListBox();
+  if (!box || typeof box.contains !== "function" || !event || !box.contains(event.target)) return;
+  if (typeof event.preventDefault === "function") event.preventDefault();
+  if (typeof event.stopPropagation === "function") event.stopPropagation();
+}
+
+function publicReorderContextMenu(event) {
+  const session = publicReorderSession;
+  if (!session || !event) return;
+  if (session.phase !== "dragging" && session.phase !== "pending") return;
+  if (typeof event.preventDefault === "function") event.preventDefault();
+}
+
+function publicReorderAbort() {
+  cancelPublicReorder();
+}
+
+(function installPublicReorderGestures() {
+  if (typeof document === "undefined" || typeof document.addEventListener !== "function") return;
+  document.addEventListener("pointerdown", publicReorderPointerDown, true);
+  document.addEventListener("pointermove", publicReorderPointerMove, { capture: true, passive: false });
+  document.addEventListener("pointerup", publicReorderPointerUp, true);
+  document.addEventListener("pointercancel", publicReorderAbort, true);
+  document.addEventListener("contextmenu", publicReorderContextMenu, true);
+  document.addEventListener("click", publicReorderClickGuard, true);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) cancelPublicReorder();
+  });
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("blur", publicReorderAbort);
+  }
+})();
 
 function renderPublicList() {
   const box = $("#public-list");

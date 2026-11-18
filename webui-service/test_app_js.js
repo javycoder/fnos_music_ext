@@ -173,6 +173,8 @@ function reset() {
       publicSharedChanged = false;
       publicDetailRunTarget = "";
       publicProcessSnapshot = null;
+      publicReorderSession = null;
+      publicReorderSuppressClick = false;
       $("#public-playlists-enabled").checked = true;
     }`);
   } catch (_) {}
@@ -2767,6 +2769,180 @@ test("公共歌单用户：切换用户后丢弃旧详情响应", async () => {
   assert.ok(!els.get("#public-selected").innerHTML.includes("旧用户详情"));
   enqueue("/app/fnmusic-ext/api/config", {values:{}});
   await global.loadConfig();
+});
+
+test("已选歌单拖动：插入下标按静止中线判定上/下半区", async () => {
+  const origins = [
+    { top: 100, height: 60 }, // A
+    { top: 168, height: 60 }, // B
+    { top: 236, height: 60 }, // C
+  ];
+  // 拖 A：落在 B 中线之下、C 中线之上 -> 插到 B 之后
+  assert.strictEqual(global.publicReorderDropIndex(0, 220, origins), 1);
+  // 拖 A：所有其它中线之下 -> 末尾
+  assert.strictEqual(global.publicReorderDropIndex(0, 300, origins), 2);
+  // 拖 A：所有中线之上 -> 原位
+  assert.strictEqual(global.publicReorderDropIndex(0, 50, origins), 0);
+  // 拖 C：落在 A、B 中线之间 -> 插到 A 之后
+  assert.strictEqual(global.publicReorderDropIndex(2, 150, origins), 1);
+  assert.strictEqual(global.publicReorderDropIndex(-1, 150, origins), -1);
+  assert.strictEqual(global.publicReorderDropIndex(0, NaN, origins), 0);
+});
+
+test("已选歌单拖动：让位位移把其余条目推开并留出插入槽", async () => {
+  const origins = [
+    { top: 100, height: 60 },
+    { top: 168, height: 60 },
+    { top: 236, height: 60 },
+  ];
+  // A 插到 B、C 之间：B 上移一格，C 不动，A 的空槽落在 B 与 C 之间
+  assert.deepStrictEqual(global.publicReorderOffsets(0, 1, origins, 8), [68, -68, 0]);
+  // C 插到最前：A、B 各下移一格
+  assert.deepStrictEqual(global.publicReorderOffsets(2, 0, origins, 8), [68, 68, -136]);
+  // 不等高条目按各自高度堆叠，不允许互相压住
+  const uneven = [
+    { top: 0, height: 40 },
+    { top: 48, height: 80 },
+    { top: 136, height: 40 },
+  ];
+  assert.deepStrictEqual(global.publicReorderOffsets(1, 0, uneven, 8), [88, -48, 0]);
+  const tops = global.publicReorderOffsets(1, 0, uneven, 8).map((dy, i) => uneven[i].top + dy);
+  const spans = tops.map((top, i) => [top, top + uneven[i].height]).sort((a, b) => a[0] - b[0]);
+  spans.slice(1).forEach((span, i) => assert.ok(span[0] >= spans[i][1], "让位后条目不能重叠"));
+});
+
+test("已选歌单拖动：只有列表内且视口内的松手才算有效放置", async () => {
+  const rect = { left: 10, top: 20, right: 410, bottom: 620 };
+  const view = { width: 420, height: 800 };
+  assert.strictEqual(global.publicReorderPointerInside(200, 300, rect, view), true);
+  assert.strictEqual(global.publicReorderPointerInside(10, 20, rect, view), true);
+  assert.strictEqual(global.publicReorderPointerInside(410, 620, rect, view), true);
+  assert.strictEqual(global.publicReorderPointerInside(9, 300, rect, view), false);
+  assert.strictEqual(global.publicReorderPointerInside(200, 621, rect, view), false);
+  assert.strictEqual(global.publicReorderPointerInside(500, 300, rect, view), false);
+  assert.strictEqual(global.publicReorderPointerInside(200, 300, rect, { width: 0, height: 0 }), false);
+  assert.strictEqual(global.publicReorderPointerInside(NaN, 300, rect, view), false);
+  assert.strictEqual(global.publicReorderPointerInside(200, 300, { left: 0, top: 0, right: 0, bottom: 0 }, view), false);
+  assert.strictEqual(global.publicReorderPointerInside(200, 300, null, view), false);
+});
+
+test("已选歌单拖动：松手后才提交顺序并打脏，原位与越界不提交", async () => {
+  reset();
+  vm.runInThisContext(`
+    delete configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER;
+    publicSyncAll = false;
+    publicSelection = [
+      {provider:"musicbox",source:"netease",kind:"playlist",id:"a"},
+      {provider:"musicbox",source:"netease",kind:"chart",id:"b"},
+      {provider:"lx",source:"kg",kind:"playlist",id:"c"},
+    ];
+    dirty = false;
+  `);
+  assert.strictEqual(global.reorderPublicSelectionTo(2, 0), true);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["c", "a", "b"]);
+  assert.strictEqual(vm.runInThisContext("dirty"), true);
+  assert.strictEqual(els.get("#save-note").textContent, "公共歌单顺序已修改");
+  assert.strictEqual(global.reorderPublicSelectionTo(1, 1), false);
+  assert.strictEqual(global.reorderPublicSelectionTo(0, 9), false);
+  assert.strictEqual(global.reorderPublicSelectionTo(-1, 0), false);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["c", "a", "b"]);
+  global.movePublicSelection(0, 1);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a", "c", "b"]);
+  els.get("#public-playlists-enabled").checked = false;
+  assert.strictEqual(global.reorderPublicSelectionTo(0, 2), false);
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a", "c", "b"]);
+  els.get("#public-playlists-enabled").checked = true;
+});
+
+test("已选歌单拖动：长按才浮起卡片，拖动让位，松手提交，拖出列表取消", async () => {
+  reset();
+  vm.runInThisContext(`
+    delete configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER;
+    publicSelection = [
+      {provider:"musicbox",source:"netease",kind:"playlist",id:"a",_name:"A"},
+      {provider:"musicbox",source:"netease",kind:"chart",id:"b",_name:"B"},
+      {provider:"lx",source:"kg",kind:"playlist",id:"c",_name:"C"},
+    ];
+    dirty = false;
+  `);
+  global.renderPublicSelected();
+  const box = els.get("#public-selected");
+  const originalQsa = box.querySelectorAll;
+  const originalRect = box.getBoundingClientRect;
+  const rows = [0, 1, 2].map((index) => {
+    const row = stubEl();
+    row.dataset.publicIndex = String(index);
+    row.closest = (sel) => (sel === "#public-selected .public-selected" ? row : null);
+    row.getBoundingClientRect = () => ({
+      top: 100 + index * 68, height: 60, left: 10, width: 380,
+      right: 390, bottom: 160 + index * 68,
+    });
+    return row;
+  });
+  box.querySelectorAll = (sel) => (sel === ".public-selected" ? rows : []);
+  box.getBoundingClientRect = () => ({ top: 100, left: 10, right: 390, bottom: 296 });
+  const prevWidth = global.window.innerWidth;
+  const prevHeight = global.window.innerHeight;
+  global.window.innerWidth = 800;
+  global.window.innerHeight = 600;
+  try {
+    // 未到 320ms 不浮起
+    global.publicReorderPointerDown({ target: rows[0], button: 0, pointerId: 7, clientX: 100, clientY: 120 });
+    assert.strictEqual(vm.runInThisContext("publicReorderSession.phase"), "pending");
+    await tick(340);
+    assert.strictEqual(vm.runInThisContext("publicReorderSession.phase"), "dragging");
+    assert.ok(document.body._children.some((el) => el.id === "public-reorder-ghost"), "长按后必须浮起卡片");
+    assert.ok(document.body.classList.contains("is-public-reordering"));
+    // 指针拖出列表：松手不得改动顺序
+    global.publicReorderPointerMove({ pointerId: 7, clientX: 500, clientY: 120, preventDefault() {} });
+    global.publicReorderPointerUp({ pointerId: 7, clientX: 500, clientY: 120 });
+    assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["a", "b", "c"]);
+    assert.strictEqual(vm.runInThisContext("dirty"), false, "拖出列表取消后不能打脏");
+    assert.strictEqual(document.body.classList.contains("is-public-reordering"), false);
+    assert.strictEqual(vm.runInThisContext("publicReorderSession"), null);
+    // 列表内拖到 B 中线之下、C 中线之上：B 上移让位，源槽下移
+    global.publicReorderPointerDown({ target: rows[0], button: 0, pointerId: 8, clientX: 100, clientY: 120 });
+    await tick(340);
+    global.publicReorderPointerMove({ pointerId: 8, clientX: 100, clientY: 220, preventDefault() {} });
+    assert.strictEqual(vm.runInThisContext("publicReorderSession.dropIndex"), 1);
+    assert.strictEqual(rows[1].style.transform, "translateY(-68px)");
+    assert.strictEqual(rows[0].style.transform, "translateY(68px)");
+    assert.ok(rows[0].classList.contains("is-reorder-source"));
+    global.publicReorderPointerUp({ pointerId: 8, clientX: 100, clientY: 220 });
+    assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["b", "a", "c"]);
+    assert.strictEqual(vm.runInThisContext("dirty"), true);
+    assert.strictEqual(els.get("#save-note").textContent, "公共歌单顺序已修改");
+  } finally {
+    box.querySelectorAll = originalQsa;
+    box.getBoundingClientRect = originalRect;
+    if (prevWidth === undefined) delete global.window.innerWidth; else global.window.innerWidth = prevWidth;
+    if (prevHeight === undefined) delete global.window.innerHeight; else global.window.innerHeight = prevHeight;
+    if (document.body._children) document.body._children = [];
+    vm.runInThisContext("publicReorderSession = null;");
+  }
+});
+
+test("已选歌单拖动：详情重绘保留会话，条目被移除时取消且不改顺序", async () => {
+  reset();
+  vm.runInThisContext(`
+    delete configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER;
+    publicSelection = [
+      {provider:"musicbox",source:"netease",kind:"playlist",id:"a"},
+      {provider:"musicbox",source:"netease",kind:"chart",id:"b"},
+    ];
+    publicReorderSession = {
+      pointerId: 1, from: 0, entryKey: publicEntryKey(publicSelection[0]),
+      phase: "dragging", dropIndex: 0,
+      origins: [{top:0,height:40,left:0,width:300},{top:48,height:40,left:0,width:300}],
+      gap: 8, ghost: null, holdTimer: null, captureEl: null,
+    };
+  `);
+  global.renderPublicSelected();
+  assert.ok(vm.runInThisContext("publicReorderSession !== null"), "同一条目重绘后会话必须保留");
+  vm.runInThisContext("publicSelection.splice(0, 1);");
+  global.renderPublicSelected();
+  assert.strictEqual(vm.runInThisContext("publicReorderSession"), null, "条目被移除后必须取消拖动");
+  assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["b"]);
 });
 
 test("公共歌单：全部用户与个人配置独立记忆并同时提交", async () => {
