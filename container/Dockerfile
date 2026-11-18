@@ -196,7 +196,7 @@ RUN set -eu; \
 COPY --chown=appuser:appuser netease-service/service.js netease-service/app.js /srv/netease-service/
 
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
-COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/worker.py /srv/musicdl-service/
+COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/search_engines.py musicdl-service/worker.py /srv/musicdl-service/
 # 音质 + 播放编排新模块随本轮一并分发：
 #   proxy/quality_policy.py        —— A 组（主智能体）共享七档音质策略
 #   lxmusic-service/playback_policy.py —— B 组（洛雪）播放编排
