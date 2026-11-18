@@ -31,6 +31,17 @@ def _release_slow_source_threads():
     yield
     _RELEASE_SLOW_SOURCES.set()
 
+
+@pytest.fixture(autouse=True)
+def _pin_legacy_search_engine(monkeypatch):
+    """本文件的既有用例都在验证自实现聚合（旧版引擎）的行为。
+
+    宿主机没有 /repo/.env，缺键时按新默认会解析成新版官方聚合；这里显式
+    钉住实验开关为 false，保证这些用例始终走 LEGACY_ENGINE。新版引擎的
+    专项用例在自己的测试里改回 true。
+    """
+    monkeypatch.setenv("FNMUSIC_MUSICDL_OFFICIAL_SEARCH", "false")
+
 # 在导入 app 之前 stub 掉 musicdl 包（宿主环境未安装，服务跑在 Docker 里）
 _musicdl_stub = types.ModuleType("musicdl")
 _musicdl_stub.MusicClient = object
@@ -1027,3 +1038,123 @@ def test_deadline_skipped_source_is_not_breaker_failure(clean_state, monkeypatch
         assert app_module.SOURCE_BREAKER._failures.get("MiguMusicClient", 0) == 0
         assert "MiguMusicClient" not in app_module.ADAPTIVE.stats()
     asyncio.run(main())
+
+
+# ------------------------------------------------ 新版（官方聚合）引擎行为 ---
+
+def _official_entries(keyword, sources):
+    return [[search_core.normalize(_FakeSong(i + 1, source), keyword), {}, ""]
+            for i, source in enumerate(sources)]
+
+
+class _FakeOfficialPool:
+    """替身 official worker 池：记录 payload/timeout，按脚本交付条目。"""
+
+    def __init__(self, entries=None, error=None):
+        self.entries = entries or []
+        self.error = error
+        self.payloads = []
+        self.timeouts = []
+
+    async def run(self, source, payload, *, timeout, on_entry=None):
+        assert source == "official"
+        self.payloads.append(payload)
+        self.timeouts.append(timeout)
+        if self.error is not None:
+            raise self.error
+        for entry in self.entries:
+            on_entry(entry)
+        return {"count": len(self.entries), "partial": False}
+
+    async def aclose(self):
+        pass
+
+
+def _select_official(monkeypatch):
+    """无键 + 无 .env → 新版官方聚合（宿主机没有 /repo/.env）。"""
+    monkeypatch.delenv("FNMUSIC_MUSICDL_OFFICIAL_SEARCH", raising=False)
+    monkeypatch.delenv("FNMUSIC_ENV_FILE", raising=False)
+    monkeypatch.delenv("FNMUSIC_MUSICDL_ENABLED", raising=False)
+
+
+def test_official_engine_default_and_ignores_limit(clean_state, monkeypatch):
+    """缺键默认新版：一次官方调用、op=official_search、limit 不截断、逐源池不被触碰。"""
+    _select_official(monkeypatch)
+    pool = _FakeOfficialPool(entries=_official_entries("k", ["KuwoMusicClient", "MiguMusicClient"]))
+    monkeypatch.setattr(app_module, "OFFICIAL_WORKERS", pool)
+
+    class _Boom:
+        async def run(self, *args, **kwargs):
+            raise AssertionError("legacy per-source pool must not be used")
+
+        async def aclose(self):
+            pass
+    monkeypatch.setattr(app_module, "SOURCE_WORKERS", _Boom())
+
+    from fastapi.testclient import TestClient
+    with TestClient(app_module.app) as client:
+        data = client.get("/search", params={"keyword": "k", "limit": 1,
+                                             "sources": "kuwo,migu"}).json()
+        assert data["engine"] == "official"
+        assert data["errors"] == {}
+        # limit=1 不截断官方结果：官方 search() 没有 limit 参数
+        assert [it["id"] for it in data["items"]] == ["kuwo:1", "migu:2"]
+        assert len(pool.payloads) == 1
+        payload = pool.payloads[0]
+        assert payload["op"] == "official_search"
+        assert payload["sources"] == ["KuwoMusicClient", "MiguMusicClient"]
+        assert payload["keyword"] == "k"
+        # 条目已进曲目缓存，后续 /info、/stream 可用
+        assert client.get("/info", params={"id": "kuwo:1"}).status_code == 200
+
+
+def test_official_engine_timeout_returns_empty_and_keeps_breaker_closed(clean_state, monkeypatch):
+    """官方聚合超时：交空可重试、不打开任何平台熔断；下一次搜索恢复正常。"""
+    _select_official(monkeypatch)
+    monkeypatch.setattr(app_module, "OFFICIAL_WORKERS",
+                        _FakeOfficialPool(error=asyncio.TimeoutError()))
+    from fastapi.testclient import TestClient
+    with TestClient(app_module.app) as client:
+        data = client.get("/search", params={"keyword": "k", "sources": "kuwo"}).json()
+        assert data["engine"] == "official"
+        assert data["items"] == []
+        assert data["errors"] == {"official": "timeout"}
+        assert app_module.SOURCE_BREAKER.get_open_sources() == []
+        assert app_module.SOURCE_BREAKER._failures.get("KuwoMusicClient", 0) == 0
+        # 超时结果不落搜索缓存：换上正常池后同一关键词可立即重试成功
+        pool = _FakeOfficialPool(entries=_official_entries("k", ["KuwoMusicClient"]))
+        monkeypatch.setattr(app_module, "OFFICIAL_WORKERS", pool)
+        data = client.get("/search", params={"keyword": "k", "sources": "kuwo"}).json()
+        assert data["engine"] == "official"
+        assert [it["id"] for it in data["items"]] == ["kuwo:1"]
+        assert data["errors"] == {}
+
+
+def test_search_cache_is_isolated_per_engine(clean_state, monkeypatch):
+    """缓存键含引擎名：官方结果不会被旧版命中，切回旧版重新聚合。"""
+    _select_official(monkeypatch)
+    pool = _FakeOfficialPool(entries=_official_entries("iso", ["KuwoMusicClient"]))
+    monkeypatch.setattr(app_module, "OFFICIAL_WORKERS", pool)
+    calls = []
+
+    def _legacy_search(source, keyword, limit):
+        calls.append(source)
+        return [_FakeSong(9, source)]
+    monkeypatch.setattr(search_core, "search_one_source", _legacy_search)
+    # 三个请求共用一个 TestClient：with 退出会触发 lifespan 关闭共享 worker 池
+    from fastapi.testclient import TestClient
+    with TestClient(app_module.app) as client:
+        first = client.get("/search", params={"keyword": "iso", "limit": 5,
+                                              "sources": "kuwo"}).json()
+        assert first["engine"] == "official" and first["cached"] is False
+        second = client.get("/search", params={"keyword": "iso", "limit": 5,
+                                               "sources": "kuwo"}).json()
+        assert second["engine"] == "official" and second["cached"] is True
+        # 切回旧版：同一关键词/limit 不命中官方缓存，走自实现聚合
+        monkeypatch.setenv("FNMUSIC_MUSICDL_OFFICIAL_SEARCH", "false")
+        third = client.get("/search", params={"keyword": "iso", "limit": 5,
+                                              "sources": "kuwo"}).json()
+    assert third["engine"] == "legacy"
+    assert third["cached"] is False
+    assert calls == ["KuwoMusicClient"]
+    assert [it["id"] for it in third["items"]] == ["kuwo:9"]

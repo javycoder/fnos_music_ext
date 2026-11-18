@@ -29,6 +29,16 @@ import pytest
 
 _HERE = Path(__file__).resolve().parent
 
+
+@pytest.fixture(autouse=True)
+def _pin_legacy_search_engine(monkeypatch):
+    """/search 相关契约用例默认旧版自实现聚合。
+
+    宿主机没有 /repo/.env，缺键会落到新版官方聚合的默认；显式钉住开关，
+    这些既有断言（熔断/探活/预算）才始终针对 LEGACY_ENGINE。
+    """
+    monkeypatch.setenv("FNMUSIC_MUSICDL_OFFICIAL_SEARCH", "false")
+
 # ---------------------------------------------------------------- 1. 依赖固定
 
 # reproducible hashes pinned by the release integration suite
@@ -218,6 +228,64 @@ def test_search_one_source_skips_timeout_for_conflicting_sources(monkeypatch):
     captured.clear()
     search_core.search_one_source("KuwoMusicClient", "晴天", 10)
     assert "timeout" in captured["overrides"]
+
+
+def test_search_official_passes_only_whitelist_and_keyword(monkeypatch):
+    """官方聚合契约：构造只传 music_sources，search 只收 keyword。
+
+    limit/超时/熔断/并发都不是官方 search() 的参数，一律不注入；注入
+    timeout 还会触发部分源（Soda，#103）的重复关键字 TypeError。
+    """
+    captured = {}
+
+    class _OfficialClient:
+        def __init__(self, music_sources=None, **kwargs):
+            captured["music_sources"] = music_sources
+            captured["extra"] = kwargs
+
+        def search(self, keyword):
+            captured["keyword"] = keyword
+            return {"KuwoMusicClient": [], "MiguMusicClient": []}
+
+    monkeypatch.setattr(search_core, "_build_official_client",
+                        lambda sources: _OfficialClient(music_sources=sources))
+    result = search_core.search_official(["KuwoMusicClient", "MiguMusicClient"], "晴天")
+    assert captured["music_sources"] == ["KuwoMusicClient", "MiguMusicClient"]
+    # 除白名单外没有任何构造参数：cfg/线程数/requests_overrides 都不传
+    assert captured["extra"] == {}
+    assert captured["keyword"] == "晴天"
+    assert result == {"KuwoMusicClient": [], "MiguMusicClient": []}
+
+
+def test_search_official_rejects_empty_whitelist(monkeypatch):
+    """空白名单必须直接失败：空列表会让库回落到内置 5 个默认源。"""
+    monkeypatch.setattr(search_core, "_build_official_client",
+                        lambda sources: pytest.fail("must not build a client without sources"))
+    with pytest.raises(ValueError):
+        search_core.search_official([], "晴天")
+
+
+def test_run_official_search_task_filters_and_keeps_whitelist_order(monkeypatch):
+    """官方结果按请求白名单顺序展开；条目走 normalize+初筛，不做探活。"""
+    good_kuwo = _FakeSongInfo(identifier="1", song_name="晴天")
+    good_migu = _FakeSongInfo(identifier="2", song_name="晴天", source="MiguMusicClient")
+    trial = _FakeSongInfo(identifier="3", song_name="晴天 (试听)")
+    no_url = _FakeSongInfo(identifier="4", song_name="无直链", download_url="")
+
+    class _Client:
+        def search(self, keyword):
+            # 库返回顺序与白名单相反，且夹带应被初筛挡掉的条目
+            return {"KuwoMusicClient": [good_kuwo, trial, no_url],
+                    "MiguMusicClient": [good_migu]}
+
+    monkeypatch.setattr(search_core, "_build_official_client", lambda sources: _Client())
+    emitted = []
+    result = search_core.run_official_search_task(
+        {"sources": ["MiguMusicClient", "KuwoMusicClient"], "keyword": "晴天"},
+        lambda entry: emitted.append(entry))
+    # 白名单顺序（migu 在前）；试听/无直链被初筛挡掉；无探活阶段
+    assert [e[0]["id"] for e in emitted] == ["migu:2", "kuwo:1"]
+    assert result == {"count": 2, "partial": False}
 
 
 def test_worker_does_not_use_global_socket_timeout(monkeypatch):

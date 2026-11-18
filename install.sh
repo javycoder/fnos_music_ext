@@ -1318,6 +1318,23 @@ print(json.dumps([{"name": _name(u), "url": u, "active": True} for u in urls],
 ' "$1" 2>/dev/null || echo "[]"
 }
 
+# musicdl 官方聚合搜索默认值（实验开关）：已安装且当前启用 musicdl 的老用户
+# 默认旧版自实现聚合（false），其余（全新安装 / 未启用 musicdl 的存量安装）
+# 默认新版官方聚合（true）。键已存在时 env_merge 保留用户值；该键不进
+# ENV_EXPLICIT，升级重装一律不覆盖用户在实验页保存过的选择。
+if [ -f "${ENV_PATH}" ]; then
+    MDL_OFFICIAL_FLAG="$(python3 -c '
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from proxy.env_merge import parse_env_file, resolve_musicdl_official_search
+kv = dict(parse_env_file(Path(sys.argv[1]))[0])
+print("true" if resolve_musicdl_official_search(kv, env_file_exists=True) else "false")
+' "${ENV_PATH}" "${BASE_DIR}" 2>/dev/null || echo "true")"
+else
+    MDL_OFFICIAL_FLAG="true"
+fi
+
 ENV_DESIRED="$(mktemp)"
 {
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
@@ -1375,6 +1392,7 @@ ENV_DESIRED="$(mktemp)"
         echo "FNMUSIC_LLM_MODEL=''"
     fi
     echo "FNMUSIC_SEARCH_PROBE='false'"
+    echo "FNMUSIC_MUSICDL_OFFICIAL_SEARCH='${MDL_OFFICIAL_FLAG}'"
     # 其余情况不输出 LLM 键：env_merge 将原样保留 .env 中已保存的密钥
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"

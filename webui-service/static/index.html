@@ -64,6 +64,7 @@
           </button>
           <div class="nav-group-subs" id="nav-experimental-subs" hidden>
             <button class="nav-item nav-sub" data-page="exp-direct" type="button"><span>播放直连</span></button>
+            <button class="nav-item nav-sub" data-page="exp-musicdl-search" type="button"><span>musicdl 搜索</span></button>
             <button class="nav-item nav-sub" data-page="exp-layout" type="button"><span>目录归类与整理</span></button>
             <button class="nav-item nav-sub" data-page="exp-cleanup" type="button"><span>垃圾清理</span></button>
           </div>
@@ -373,6 +374,20 @@
               </label>
             </div>
           </details>
+        </div>
+      </section>
+
+      <section class="page" id="page-exp-musicdl-search">
+        <div class="page-head">
+          <div>
+            <h2><span>musicdl 搜索</span><button class="help-btn" type="button" data-help="musicdl-official-search" aria-label="musicdl 搜索帮助">?</button></h2>
+            <p class="page-sub">选择 musicdl 多平台搜索的实现方式；不影响网易云和洛雪。</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>聚合搜索（Beta）</span><button class="help-btn" type="button" data-help="musicdl-official-search" aria-label="musicdl 搜索帮助">?</button></div>
+          <label class="switch-row"><span>新版聚合搜索<span class="sub">musicdl 官方聚合，可能更稳定；关闭后使用原来的搜索</span></span><input type="checkbox" id="musicdl-official-search"></label>
+          <p class="hint">常有反馈 musicdl 搜索不好用，因此引入新版官方聚合供选择；此选项不影响网易云和洛雪。</p>
         </div>
       </section>
 
@@ -730,6 +745,7 @@
       </button>
       <div class="bottom-sub-menu" id="bottom-experimental-menu" role="menu" hidden>
         <button class="bottom-sub-item" data-page="exp-direct" role="menuitem" type="button">播放直连</button>
+        <button class="bottom-sub-item" data-page="exp-musicdl-search" role="menuitem" type="button">musicdl 搜索</button>
         <button class="bottom-sub-item" data-page="exp-layout" role="menuitem" type="button">目录归类与整理</button>
         <button class="bottom-sub-item" data-page="exp-cleanup" role="menuitem" type="button">垃圾清理</button>
       </div>
@@ -806,6 +822,11 @@
   </template>
   <template data-help-id="direct-musicdl">
     <p>各聚合平台防盗链差异大：有的要求特定请求头，有的限制 IP，客户端直连可能被拒。某个平台播不出来就关掉这一项，改回 NAS 代理转发。</p>
+  </template>
+  <template data-help-id="musicdl-official-search">
+    <p><b>新版：</b>使用 musicdl 官方的聚合搜索，可能更稳定。</p>
+    <p><b>旧版：</b>使用本项目作者自己实现的聚合搜索。取消勾选即回到旧版。</p>
+    <p>鉴于常有反馈 musicdl 搜索不好用，因此引入新版。此选项不影响网易云和洛雪的音乐源。</p>
   </template>
   <template data-help-id="direct-lx">
     <p>兼容性取决于你用的洛雪脚本与目标 CDN。换脚本后若出现「能搜到但播不出」，优先关闭此项。</p>
