@@ -23,7 +23,24 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICE = ROOT / "musicdl-service"
-MODULES = ("app.py", "hardening.py", "search_core.py", "worker.py")
+MODULES = ("app.py", "hardening.py", "search_core.py", "search_engines.py", "worker.py")
+
+
+def _sibling_runtime_modules(*entrypoints: str) -> set[str]:
+    """app/worker 顶层导入的同目录 .py，必须出现在镜像 COPY 里。"""
+    required = set(entrypoints)
+    for entry in entrypoints:
+        tree = ast.parse((SERVICE / entry).read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".", 1)[0])
+        for name in names:
+            if (SERVICE / f"{name}.py").is_file():
+                required.add(f"{name}.py")
+    return required
 
 
 def load_hardening():
@@ -47,12 +64,13 @@ def test_container_explicit_copy_contains_complete_worker_runtime(tmp_path):
                 assert source.startswith("musicdl-service/")
                 shutil.copyfile(ROOT / source, tmp_path / Path(source).name)
                 copied.add(Path(source).name)
+    assert _sibling_runtime_modules("app.py", "worker.py") <= set(MODULES)
     assert set(MODULES) <= copied
     for name in MODULES:
         compile((tmp_path / name).read_text(), name, "exec")
     ignore = (ROOT / ".dockerignore").read_text().splitlines()
     assert "!musicdl-service/" in ignore
-    assert not any(line in ignore for line in ("**/worker.py", "**/search_core.py"))
+    assert not any(line in ignore for line in ("**/worker.py", "**/search_core.py", "**/search_engines.py"))
     # The shared file logger must also be available in the image.
     assert any("proxy/fnlog.py" in line and line.startswith("COPY ")
                for line in dockerfile.splitlines())
