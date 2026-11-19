@@ -170,6 +170,15 @@ def _safe_scan_number(raw: str, default: float, lo: float, hi: float):
         return default
 
 
+def _web_search_limit_from_env(raw: str | None, default: int = 50) -> int:
+    """FNMUSIC_WEB_SEARCH_RESULT_LIMIT 安全解析：缺失/非法/越界回落默认 50。"""
+    try:
+        value = int(str(raw or "").strip())
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if 1 <= value <= 200 else default
+
+
 def _initial_musicdl_official_search() -> bool:
     """musicdl 官方聚合搜索开关的启动初值（仅诊断展示用，真正选引擎的是
     musicdl 服务每次请求实时读 .env）。缺键时按统一规则判定：存量部署且已
@@ -214,6 +223,10 @@ CONF = {
     # 分页参数，深分页只作用于网易/洛雪。
     "search_deep_page": os.environ.get("FNMUSIC_SEARCH_DEEP_PAGE", "true").lower() in ("true", "1", "yes"),
     "search_deep_max_pages": max(1, int(os.environ.get("FNMUSIC_SEARCH_DEEP_MAX_PAGES", "10"))),
+    # 网页版单曲搜索一次返回的合计上限（issue #139）：官方网页单曲不翻页，
+    # 只能控制单次响应数量；1-200，默认 50。显式分页请求与 App 不受它影响。
+    "web_search_result_limit": _web_search_limit_from_env(
+        os.environ.get("FNMUSIC_WEB_SEARCH_RESULT_LIMIT")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -665,6 +678,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "LX_PROBE_TIMEOUT": ("lx_probe_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
+    "FNMUSIC_WEB_SEARCH_RESULT_LIMIT": ("web_search_result_limit", "web_search_limit"),
     "FNMUSIC_PLAY_QUALITY": ("play_quality", "play_quality"),
     "FNMUSIC_DOWNLOAD_QUALITY": ("download_quality", "download_quality"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
@@ -869,6 +883,15 @@ def _env_watch_parse(raw: str, kind: str):
             return max(1, min(50, int(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "web_search_limit":
+        # 空串=恢复默认 50；非法/越界返回 None，保持上次有效值
+        if not raw:
+            return 50
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if 1 <= value <= 200 else None
     return raw
 
 
@@ -1566,6 +1589,51 @@ def extract_keyword(request: Request) -> str:
     """前端打包用 q，部分调用/验收用 keyword。"""
     params = request.query_params
     return (params.get("keyword") or params.get("q") or params.get("query") or "").strip()
+
+
+_WEB_BROWSER_UA_RE = re.compile(r"Mozilla/", re.IGNORECASE)
+
+
+def _is_unpaged_web_track_search(request: Request) -> bool:
+    """识别「官方网页版单曲搜索且未显式分页」的请求（issue #139）。
+
+    官方网页（1.1.19 实测 bundle）单曲搜索只发一次 GET /search/track?q=…，
+    不带 page/size，也不会请求第二页；这类请求的返回窗口改由
+    FNMUSIC_WEB_SEARCH_RESULT_LIMIT 控制。识别结论只用于响应窗口选择，
+    不作为鉴权或安全边界：
+      - 排除原生 App（Dart/Flutter UA）与任何显式 page/size 参数；
+      - 首选 Fetch Metadata（浏览器 fetch 必带 Sec-Fetch-*，非浏览器客户端不带）；
+      - 无 Fetch Metadata 时要求浏览器 UA 且 Referer 指向官方 /music 页面，
+        反代丢头或证据不足一律走原有默认，不猜测。
+    """
+    path = request.url.path
+    if path != "/music/api/v1/search/track" and not path.startswith("/music/api/v1/search/track/"):
+        return False
+    if request.method.upper() not in ("GET", "HEAD"):
+        return False
+    if "page" in request.query_params or "size" in request.query_params:
+        return False
+    ua = (request.headers.get("user-agent") or "").strip()
+    ua_lower = ua.lower()
+    if "dart" in ua_lower or "flutter" in ua_lower:
+        return False
+    if request.headers.get("sec-fetch-dest") or request.headers.get("sec-fetch-mode"):
+        return True
+    if not _WEB_BROWSER_UA_RE.search(ua):
+        return False
+    referer = request.headers.get("referer") or ""
+    referer_path = urlsplit(referer).path if referer else ""
+    return referer_path.startswith("/music")
+
+
+def _cap_official_search_echo(upstream_json: dict, size: int) -> None:
+    """把官方回声列表截到窗口内（网页无参单曲被新关键词取代时仍受上限约束）。"""
+    data = upstream_json.get("data")
+    if not isinstance(data, dict):
+        return
+    lst = data.get("list")
+    if isinstance(lst, list) and len(lst) > size:
+        lst[:] = lst[:size]
 
 
 def online_guid_from_item(item: dict) -> str:
@@ -6211,6 +6279,7 @@ async def search_track(request: Request):
     if keyword:
         _note_user_keyword(_credential_scope(request), keyword)
 
+    web_window = _is_unpaged_web_track_search(request)
     page_str = request.query_params.get("page")
     try:
         page = int(page_str) if page_str else 1
@@ -6222,7 +6291,10 @@ async def search_track(request: Request):
     size_str = request.query_params.get("size")
     default_size = 50
     if "page" not in request.query_params and "size" not in request.query_params:
-        if music_compat.supports_search_default_100():
+        if web_window:
+            # 官方网页单曲不翻页：单次返回上限由配置决定（issue #139）
+            default_size = int(CONF.get("web_search_result_limit") or 50)
+        elif music_compat.supports_search_default_100():
             default_size = 100
     try:
         size = int(size_str) if size_str else default_size
@@ -6230,6 +6302,12 @@ async def search_track(request: Request):
         size = 50
     if size < 1:
         size = 50
+    # 窗口策略取证：web_config=网页无参走配置；explicit=客户端显式分页；
+    # legacy_default=无法识别的客户端沿用版本默认（50/100）。
+    diagnostic["window_policy"] = (
+        "web_config" if web_window
+        else "explicit" if ("page" in request.query_params or "size" in request.query_params)
+        else "legacy_default")
 
     url_path = request.url.path
     if request.url.query:
@@ -6272,6 +6350,9 @@ async def search_track(request: Request):
     scope = _credential_scope(request)
     if _USER_SEARCH_WORD.get(scope) != keyword:
         diagnostic["outcome"] = "superseded"
+        if web_window:
+            # 网页无参请求即使被新关键词取代，也只交付窗口内的官方结果
+            _cap_official_search_echo(upstream_json, size)
         return JSONResponse(content=disguise_client_json(upstream_json), status_code=upstream_resp.status_code, headers=resp_headers)
 
     key = _search_scope(request) + ":" + keyword
@@ -6367,8 +6448,9 @@ async def search_track(request: Request):
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     diagnostic["online_page"] = max(0, len(ensure_search_list(merged)) - diagnostic["local"])
     merged["data"]["total"] = original_total + total_online
-    # 预取下一页的在线段：源未取尽且池未填满时后台先取一轮，连续翻页零等待
-    if CONF.get("search_deep_page"):
+    # 预取下一页的在线段：源未取尽且池未填满时后台先取一轮，连续翻页零等待。
+    # 网页无参请求不会翻页，跳过预取，避免只为不存在的下一页打上游。
+    if CONF.get("search_deep_page") and not web_window:
         _schedule_deep_prefetch(request, keyword, entry, max(0, (page + 1) * size - original_total))
     fav_set = await _online_favorite_set(request)
     if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
@@ -14029,8 +14111,10 @@ async def _aggregate_album_search_rows(request: Request, keyword: str, limit: in
             groups.setdefault((src, album_name), []).append(it)
 
     out: list[dict] = []
-    # 每组取曲目数最多的前 N 个专辑；代表曲目注册伪装专辑（详情走聚合适配）
-    for (src, album_name), items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+    # 每组取曲目数最多的前 N 个专辑；代表曲目注册伪装专辑（详情走聚合适配）。
+    # 次级键固定（源、专辑名）：音源响应完成顺序不得影响跨页顺序。
+    for (src, album_name), items in sorted(
+            groups.items(), key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1])):
         rep = items[0]
         try:
             rep_guid = online_guid_from_item(rep)
@@ -14064,6 +14148,124 @@ async def _online_album_search(request: Request, keyword: str, limit: int) -> li
             seen.add(name_key)
             out.append(obj)
     return out[:limit]
+
+
+# 显式分页专辑搜索的在线池快照（issue #139）：同一搜索的后续页必须看到同一份
+# 在线专辑（顺序与内容稳定），否则跨页会重复/丢条。池只做短缓存，不落盘。
+_ALBUM_POOL_TTL_S = 120.0
+_ALBUM_POOL_ERR_TTL_S = 5.0
+_ALBUM_POOL_MAX_ENTRIES = 64
+_ALBUM_POOL_MAX_BUILDERS = 8
+_ALBUM_POOL_WAIT_S = 10.0
+_ALBUM_POOL_BUILD_TIMEOUT_S = 10.0
+_album_pool_cache: "OrderedDict[str, dict]" = OrderedDict()
+_album_pool_lock = asyncio.Lock()
+
+
+def _sweep_album_pool(now: float) -> None:
+    for key in list(_album_pool_cache):
+        entry = _album_pool_cache[key]
+        task = entry.get("task")
+        if task is not None and task.done():
+            # 构建任务已结束但仍挂着 task 引用 = 异常/取消终止，条目作废
+            _album_pool_cache.pop(key, None)
+            continue
+        if task is None and now >= entry.get("expires", 0.0):
+            _album_pool_cache.pop(key, None)
+    while len(_album_pool_cache) > _ALBUM_POOL_MAX_ENTRIES:
+        _album_pool_cache.popitem(last=False)
+
+
+async def _build_paged_album_pool(request: Request, keyword: str, entry: dict) -> None:
+    """构建在线专辑池快照：聚合结果按 guid 去重、顺序固定，写入缓存条目。"""
+    try:
+        items = await asyncio.wait_for(
+            _online_album_search(request, keyword, _ALBUM_SEARCH_LIMIT),
+            timeout=_ALBUM_POOL_BUILD_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("paged album pool build failed for %r: %s", keyword, e)
+        items = []
+    pool: list[dict] = []
+    seen: set[str] = set()
+    for obj in items or []:
+        guid = str(obj.get("guid") or "")
+        if not guid or guid in seen:
+            continue
+        seen.add(guid)
+        pool.append(obj)
+    entry["items"] = pool
+    entry["expires"] = asyncio.get_running_loop().time() + (
+        _ALBUM_POOL_TTL_S if pool else _ALBUM_POOL_ERR_TTL_S)
+    entry["task"] = None
+
+
+async def _get_paged_album_pool(request: Request, keyword: str) -> list[dict]:
+    """取显式分页搜索的稳定在线专辑池：同键共享一次构建，等待有上限。
+
+    超时/超额返回空列表（降级为仅官方结果），不取消共享中的构建任务；
+    构建失败或空结果的快照只短暂保留，避免把偶发失败当成长期事实。
+    """
+    if not keyword:
+        return []
+    key = _search_scope(request) + ":" + keyword
+    now = asyncio.get_running_loop().time()
+    async with _album_pool_lock:
+        _sweep_album_pool(now)
+        entry = _album_pool_cache.get(key)
+        if entry is not None and entry.get("task") is None:
+            if now < entry.get("expires", 0.0):
+                return entry.get("items") or []
+            _album_pool_cache.pop(key, None)
+            entry = None
+        if entry is None:
+            running = sum(1 for e in _album_pool_cache.values() if e.get("task"))
+            if running >= _ALBUM_POOL_MAX_BUILDERS:
+                return []
+            entry = {"task": None, "items": [], "expires": 0.0}
+            _album_pool_cache[key] = entry
+            entry["task"] = asyncio.create_task(
+                _build_paged_album_pool(request, keyword, entry))
+        task = entry["task"]
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_ALBUM_POOL_WAIT_S)
+    except asyncio.TimeoutError:
+        return []
+    return entry.get("items") or []
+
+
+async def _search_album_paged(request: Request, envelope: dict, headers: dict,
+                              keyword: str, page: int, size: int) -> Response:
+    """/search/album 显式分页：官方本页 + 稳定在线池的全局布局切片。
+
+    官方两个已知怪癖与单曲搜索同源处理：越界页回钳第 1 页（起点越过官方
+    total 时清空官方回声，防止官方条目拼上在线切片逐页重复）、忽略 size
+    全量返回（超过单页窗口时本地切片）。官方短页且仍有官方后续（异常形态）
+    时原样交付本页，不用在线条目冒充缺失的官方结果。
+    """
+    data = envelope.get("data")
+    raw_list = data.get("list") if isinstance(data, dict) else None
+    official_total = data.get("total") if isinstance(data, dict) else None
+    if (not isinstance(raw_list, list) or not isinstance(official_total, int)
+            or official_total < 0):
+        return JSONResponse(content=disguise_client_json(envelope), headers=headers)
+    official = [row for row in raw_list if isinstance(row, dict)]
+    start = (page - 1) * size
+    if start >= official_total and official:
+        official = []
+    if len(official) > size:
+        official = official[start:start + size]
+    if official and len(official) < size and start + len(official) < official_total:
+        data["list"] = official
+        data["total"] = official_total
+        return JSONResponse(content=disguise_client_json(envelope), headers=headers)
+    pool = await _get_paged_album_pool(request, keyword) if keyword else []
+    lo, hi = playlistsearch.online_bounds(page, size, official_total)
+    data["list"] = official + pool[lo:hi]
+    data["total"] = official_total + len(pool)
+    return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
 def _playlist_search_total(data: dict, page: int, size: int, official: list) -> int:
@@ -14166,11 +14368,31 @@ async def search_playlist(request: Request, subpath: str = ""):
 async def search_album(request: Request, subpath: str = ""):
     upstream_client = get_upstream_client(request.app)
     envelope = await fetch_upstream_envelope(request, upstream_client)
-    if not isinstance(envelope, dict) or envelope.get("code") != 0:
+    if not isinstance(envelope, dict):
+        return envelope
+    headers = envelope.pop("_ext_headers", {}) or {}
+    if envelope.get("code") != 0:
         # 官方错误（含未登录 401 信封）原样透传，不吞官方语义
-        return envelope if not isinstance(envelope, dict) else JSONResponse(content=envelope)
+        return JSONResponse(content=envelope, headers=headers)
 
     keyword = str(request.query_params.get("q") or request.query_params.get("keyword") or request.query_params.get("wd") or "").strip()
+
+    # 显式分页（官方网页专辑 Tab 实测：page 从 1 起、size 默认 24）：官方本页
+    # 在前，在线专辑按全局布局补在官方 total 之后，跨页零重复（issue #139）。
+    page_raw = request.query_params.get("page")
+    size_raw = request.query_params.get("size")
+    if page_raw is not None or size_raw is not None:
+        try:
+            page = int(page_raw) if page_raw else 1
+            size = int(size_raw) if size_raw else 24
+        except (TypeError, ValueError):
+            page = size = 0
+        if page >= 1 and 1 <= size <= 100:
+            return await _search_album_paged(request, envelope, headers, keyword, page, size)
+        # 非法显式分页（含 size=-1 等特殊约定）：原样交付官方响应，不在线扩展
+        return JSONResponse(content=disguise_client_json(envelope), headers=headers)
+
+    # 无分页参数：保留既有行为——官方结果后追加一批在线专辑（同名去重）
     online: list[dict] = []
     if keyword:
         try:
@@ -14200,7 +14422,7 @@ async def search_album(request: Request, subpath: str = ""):
             data["total"] = data["total"] + len(add)
         elif "total" not in data:
             data["total"] = len(data["list"])
-    return JSONResponse(content=disguise_client_json(envelope))
+    return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
 @app.post("/music/api/v1/event/report")

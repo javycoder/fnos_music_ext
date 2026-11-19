@@ -35,6 +35,8 @@ def clean_album_state(tmp_path, monkeypatch):
     from proxy import app as app_mod
     monkeypatch.setattr(app_mod, "_ALBUM_REGISTRY_PATH", str(tmp_path / "album_registry.json"))
     monkeypatch.setattr(app_mod, "_ALBUM_PERSIST_LAST", 0.0)
+    # 显式分页的在线专辑池快照同样不得跨用例泄漏
+    app_mod._album_pool_cache.clear()
     app.state.lx_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
         base_url="http://127.0.0.1:8772",
@@ -42,6 +44,7 @@ def clean_album_state(tmp_path, monkeypatch):
     yield
     _SEARCH_CACHE.clear()
     _FAKE_ALBUM_REGISTRY.clear()
+    app_mod._album_pool_cache.clear()
 
 
 # ---------------------------------------------------------------- WS4.1 三源 VO 结构
@@ -307,6 +310,146 @@ def test_search_album_official_error_passthrough(monkeypatch):
     with TestClient(app) as client:
         body = client.get("/music/api/v1/search/album", params={"keyword": "x"}).json()
         assert body["code"] == 401
+        # 显式分页形态下官方错误同样透传
+        paged = client.get("/music/api/v1/search/album", params={"q": "x", "page": 1, "size": 24}).json()
+        assert paged["code"] == 401
+        assert "_ext_headers" not in paged
+
+
+# ---------------------------------------------------------------- /search/album 显式分页（issue #139）
+
+
+def _paged_official_album_handler(total=49):
+    """官方专辑搜索 mock：正常页按 page/size 给窗口；越界页回钳第 1 页；
+    size=-1 按官方约定返回全部；非法分页参数返回空列表。"""
+    items = [{"guid": f"official-album-{i}", "name": f"官方专辑{i:02d}", "trackCount": 1, "artists": []}
+             for i in range(total)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/search/album"):
+            try:
+                page = int(request.url.params.get("page", "1"))
+                size = int(request.url.params.get("size", "24"))
+            except ValueError:
+                return httpx.Response(200, json={"code": 0, "msg": "ok",
+                                                 "data": {"list": [], "total": total}},
+                                      headers={"x-upstream-test": "yes"})
+            if size == -1:
+                window = items[:]
+            elif page < 1:
+                window = items[:24]
+            else:
+                window = items[(page - 1) * size:(page - 1) * size + size] or items[:size]
+            return httpx.Response(200, json={"code": 0, "msg": "ok",
+                                             "data": {"list": window, "total": total}},
+                                  headers={"x-upstream-test": "yes"})
+        return httpx.Response(200, json={"code": 0, "data": None}, headers={"x-upstream-test": "yes"})
+
+    return handler
+
+
+def _netease_album_pages_handler(calls):
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/search" and request.url.params.get("type") == "album":
+            return httpx.Response(200, json={"ok": True, "data": [
+                {"album_id": 1000 + i, "album_name": f"在线专辑{i:02d}", "artist": "歌手", "pic_url": ""}
+                for i in range(10)
+            ]})
+        return httpx.Response(404, json={"ok": False})
+    return handler
+
+
+def _wire_paged_album(monkeypatch, upstream_handler, netease_handler):
+    monkeypatch.setitem(CONF, "netease_enabled", netease_handler is not None)
+    monkeypatch.setitem(CONF, "musicdl_enabled", False)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix")
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(netease_handler), base_url="http://127.0.0.1:8770"
+    ) if netease_handler else httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"ok": False})),
+        base_url="http://127.0.0.1:8770")
+
+
+def test_search_album_paged_layout_24_24_11(monkeypatch):
+    """官方 49 + 在线 10：page=1/2/3（size=24）→ 24/24/11，跨页零重复，total=59。"""
+    calls: list = []
+    _wire_paged_album(monkeypatch, _paged_official_album_handler(49),
+                      _netease_album_pages_handler(calls))
+    with TestClient(app) as client:
+        pages = [client.get("/music/api/v1/search/album",
+                            params={"q": "周杰伦", "page": n, "size": 24}).json() for n in (1, 2, 3)]
+    assert [len(b["data"]["list"]) for b in pages] == [24, 24, 11]
+    guids = [x["guid"] for b in pages for x in b["data"]["list"]]
+    assert len(guids) == len(set(guids)), "跨页不得重复"
+    assert all(b["data"]["total"] == 59 for b in pages)
+    assert all(b["code"] == 0 for b in pages)
+    # 本地优先：前两页纯官方，第三页 = 1 官方 + 10 在线
+    assert pages[0]["data"]["list"][0]["name"] == "官方专辑00"
+    assert pages[0]["data"]["list"][-1]["name"] == "官方专辑23"
+    assert pages[2]["data"]["list"][0]["name"] == "官方专辑48"
+    assert [x["name"] for x in pages[2]["data"]["list"][1:]] == [f"在线专辑{i:02d}" for i in range(10)]
+    # 上游响应头不丢、内部 _ext_headers 不泄漏
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/search/album", params={"q": "周杰伦", "page": 1, "size": 24})
+        assert resp.headers.get("x-upstream-test") == "yes"
+        assert "_ext_headers" not in resp.json()
+
+
+def test_search_album_paged_pool_shared_across_requests(monkeypatch):
+    """同一搜索的后续页复用同一份在线池：netease 专辑搜索只打一次。"""
+    calls: list = []
+    _wire_paged_album(monkeypatch, _paged_official_album_handler(49),
+                      _netease_album_pages_handler(calls))
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/search/album", params={"q": "叶惠美", "page": 1, "size": 24}).json()
+        second = client.get("/music/api/v1/search/album", params={"q": "叶惠美", "page": 2, "size": 24}).json()
+    assert first["data"]["total"] == 59 and second["data"]["total"] == 59
+    search_calls = [c for c in calls if c[0] == "/api/v1/search" and c[1].get("type") == "album"]
+    assert len(search_calls) == 1, "在线池必须按 (scope, keyword) 共享一次构建"
+
+
+@pytest.mark.parametrize("params", [
+    {"q": "x", "page": 1, "size": -1},   # 官方约定 size=-1=全部：透传，不在线扩展
+    {"q": "x", "page": 0, "size": 24},   # 非法页号：透传
+    {"q": "x", "page": 1, "size": 0},    # 非法页大小：透传
+    {"q": "x", "page": 1, "size": 101},  # 超大页大小：透传
+    {"q": "x", "page": "abc"},           # 非整数：透传
+])
+def test_search_album_paged_invalid_params_passthrough(monkeypatch, params):
+    """非法显式分页不进入在线合并，原样交付官方响应。"""
+    calls: list = []
+    _wire_paged_album(monkeypatch, _paged_official_album_handler(49),
+                      _netease_album_pages_handler(calls))
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/search/album", params=params).json()
+    assert body["code"] == 0
+    assert body["data"]["total"] == 49
+    assert not [c for c in calls if c[0] == "/api/v1/search"], "透传分支不得查询在线音源"
+
+
+def test_search_album_paged_short_official_page_degrades(monkeypatch):
+    """官方短页且仍有官方后续（异常形态）：原样交付本页，不用在线条目冒充。"""
+    calls: list = []
+    items = [{"guid": f"official-album-{i}", "name": f"官方专辑{i:02d}", "trackCount": 1, "artists": []}
+             for i in range(49)]
+
+    def short_handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        size = int(request.url.params.get("size", "24"))
+        window = items[:5] if page == 2 else items[(page - 1) * size:(page - 1) * size + size]
+        return httpx.Response(200, json={"code": 0, "msg": "ok",
+                                         "data": {"list": window, "total": 49}})
+
+    _wire_paged_album(monkeypatch, short_handler, _netease_album_pages_handler(calls))
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/search/album", params={"q": "x", "page": 2, "size": 24}).json()
+    assert len(body["data"]["list"]) == 5
+    assert body["data"]["total"] == 49
+    assert all(x["name"].startswith("官方专辑") for x in body["data"]["list"])
+    assert not [c for c in calls if c[0] == "/api/v1/search"], "降级分支不得查询在线音源"
 
 
 def test_register_fake_album_richer_snapshot_overrides_stub():

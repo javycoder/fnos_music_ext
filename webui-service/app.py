@@ -254,6 +254,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "30", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
+    "FNMUSIC_WEB_SEARCH_RESULT_LIMIT": {"kind": "int", "default": "50", "min": 1, "max": 200, "strict": True, "group": "search", "reload": "hot", "label": "Web 搜索结果数量"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易云歌单常驻"},
 }

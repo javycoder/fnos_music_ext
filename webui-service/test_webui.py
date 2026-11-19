@@ -365,6 +365,26 @@ def test_search_timeout_defaults_and_saves(env_file):
     assert "FNMUSIC_SEARCH_TIMEOUT='60'" in env_file.read_text(encoding="utf-8")
 
 
+def test_web_search_result_limit_defaults_saves_and_rejects(env_file):
+    """/api/config：默认 50、合法保存、strict 越界/非整数拒绝且不写入。"""
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_WEB_SEARCH_RESULT_LIMIT"] == "50"
+        assert view.json()["schema"]["FNMUSIC_WEB_SEARCH_RESULT_LIMIT"]["min"] == 1
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_WEB_SEARCH_RESULT_LIMIT": 80}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_WEB_SEARCH_RESULT_LIMIT" in saved.json()["changed"]
+    assert "FNMUSIC_WEB_SEARCH_RESULT_LIMIT='80'" in env_file.read_text(encoding="utf-8")
+    with authed_client() as client:
+        again = client.get("/api/config")
+        assert again.json()["values"]["FNMUSIC_WEB_SEARCH_RESULT_LIMIT"] == "80"
+        for bad in (0, 201, "abc", 12.5):
+            rejected = client.put("/api/config", json={"values": {"FNMUSIC_WEB_SEARCH_RESULT_LIMIT": bad}})
+            assert rejected.status_code == 400, bad
+    assert "FNMUSIC_WEB_SEARCH_RESULT_LIMIT='80'" in env_file.read_text(encoding="utf-8")
+
+
 def test_search_probe_is_ignored_while_valid_settings_save_atomically(env_file):
     before = env_file.read_bytes()
     with authed_client() as client:
