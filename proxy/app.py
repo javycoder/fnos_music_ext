@@ -14260,7 +14260,7 @@ async def _search_album_paged(request: Request, envelope: dict, headers: dict,
         official = []
     if len(official) > size:
         official = official[start:start + size]
-    if official and len(official) < size and start + len(official) < official_total:
+    if len(official) < size and start + len(official) < official_total:
         data["list"] = official
         data["total"] = official_total
         return JSONResponse(content=disguise_client_json(envelope), headers=headers)

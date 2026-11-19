@@ -511,6 +511,8 @@ def test_no_provider_cooldown_expiry_and_key(monkeypatch):
 @pytest.mark.anyio
 @pytest.mark.parametrize("usage", [
     {"prompt_tokens": "abc", "completion_tokens": 3},
+    {"prompt_tokens": "²", "completion_tokens": 3},
+    {"prompt_tokens": "9" * 5000, "completion_tokens": 3},
     {"prompt_tokens": -5, "completion_tokens": 3, "total_tokens": "x"},
     {"prompt_tokens": True, "completion_tokens": 3},
     {"total_tokens": 20},
@@ -532,6 +534,40 @@ async def test_invalid_usage_fields_never_drop_the_request(monkeypatch, usage):
     assert today["requests"] == 1
     assert today["unknownUsageRequests"] == 1
     assert today["unknownUsageByCause"]["missingUsage"] == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("choices", [{"unexpected": "mapping"}, [{"message": ["not a dict"]}]])
+async def test_malformed_chat_structure_still_records_usage(monkeypatch, choices):
+    """异常正文字段不能使整次请求或可证实的用量从账本消失。"""
+    _configure_llm(monkeypatch)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={
+        "choices": choices,
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+    }))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(dailyrec.LLMFailure):
+            await dailyrec.call_llm(client, "p")
+
+    today = llm_usage.used_today()
+    assert today["requests"] == 1
+    assert today["total"] == 10
+    assert today["unknownUsageRequests"] == 0
+
+
+@pytest.mark.anyio
+async def test_malformed_chat_without_usage_is_classified_invalid(monkeypatch):
+    _configure_llm(monkeypatch)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={
+        "choices": [{"message": ["not a dict"]}],
+    }))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(dailyrec.LLMFailure):
+            await dailyrec.call_llm(client, "p")
+    today = llm_usage.used_today()
+    assert today["requests"] == today["unknownUsageRequests"] == 1
+    assert today["unknownUsageByCause"]["invalidResponse"] == 1
 
 
 @pytest.mark.anyio

@@ -148,8 +148,14 @@ def _safe_causes(value: object, unknown_total: int) -> dict:
             return {}
         if isinstance(raw, int):
             count = raw
-        elif isinstance(raw, str) and raw.strip().isdigit():
-            count = int(raw.strip())
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not (text.isascii() and text.isdecimal()):
+                return {}
+            significant = text.lstrip("0") or "0"
+            if len(significant) > len(str(_UNKNOWN_CAUSES_MAX)):
+                return {}
+            count = int(significant)
         else:
             return {}
         if count < 0 or count > _UNKNOWN_CAUSES_MAX:

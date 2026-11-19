@@ -452,6 +452,20 @@ def test_search_album_paged_short_official_page_degrades(monkeypatch):
     assert not [c for c in calls if c[0] == "/api/v1/search"], "降级分支不得查询在线音源"
 
 
+def test_search_album_paged_empty_official_page_degrades(monkeypatch):
+    """仍应有官方结果的空页不能用在线结果冒充，也不能虚增总数。"""
+    calls: list = []
+
+    def empty_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 25}})
+
+    _wire_paged_album(monkeypatch, empty_handler, _netease_album_pages_handler(calls))
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/search/album", params={"q": "x", "page": 2, "size": 24}).json()
+    assert body["data"] == {"list": [], "total": 25}
+    assert not [c for c in calls if c[0] == "/api/v1/search"]
+
+
 def test_register_fake_album_richer_snapshot_overrides_stub():
     """issue #28 真机复现的合并 bug：首次解析失败的 stub（仅 id/source）先占位后，
     更全的后到信息必须能覆盖它，否则专辑合成/命名永远拿到残缺条目。"""

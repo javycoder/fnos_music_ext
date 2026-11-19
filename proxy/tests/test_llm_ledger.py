@@ -545,6 +545,7 @@ def test_legacy_day_unknown_is_unclassified(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("causes", [
     {"httpError": -1}, {"httpError": True}, {"httpError": "abc"},
+    {"httpError": "²"}, {"httpError": "9" * 5000},
     {"httpError": 2, "missingUsage": 2},
 ])
 def test_invalid_or_overflowing_causes_fall_back_to_unclassified(tmp_path, monkeypatch, causes):

@@ -173,7 +173,7 @@ function renderLlmUsage(u) {
   if (u.withinLimit === false) text += "；已达上限，次日重置";
   if (Number(u.unknownUsageRequests)) {
     const causes = usageCauseText(u);
-    text += `；其中 ${usageNumber(u.unknownUsageRequests)} 次用量未知${causes ? `（${causes}）` : ""}，未计入 token`;
+    text += `；其中 ${usageNumber(u.unknownUsageRequests)} 次用量未知${causes ? `（${causes}）` : ""}，未知部分未计入 token`;
   }
   const failure = usageFailureText(u.lastFailure);
   if (failure) text += `；最近失败：${failure}`;
@@ -184,7 +184,7 @@ function renderLlmUsage(u) {
   el.textContent = text;
   el.dataset.lastUsageText = text;
   const summary = $("#llm-usage-summary");
-  if (summary) summary.textContent = !available ? "累计与历史数据暂不可读取，不能视为零用量；请检查账本状态后重试。" : `累计 token ${usageNumber(u.allTime?.total)}（输入 ${usageNumber(u.allTime?.prompt)} / 输出 ${usageNumber(u.allTime?.completion)}），请求尝试 ${usageNumber(u.allTime?.requests)} 次，其中 ${usageNumber(u.allTime?.unknownUsageRequests)} 次用量未知未计入 token。统计起点 ${usageDate(u.statsStartedAt)}。仅统计本扩展记录到的调用，不等于服务商账单。${u.historyIncomplete ? "历史不完整：旧版已丢失的记录无法恢复。" : ""}每日上限只按已记录 token 计算，用量未知的部分可能使实际消耗超过该上限。`;
+  if (summary) summary.textContent = !available ? "累计与历史数据暂不可读取，不能视为零用量；请检查账本状态后重试。" : `累计 token ${usageNumber(u.allTime?.total)}（输入 ${usageNumber(u.allTime?.prompt)} / 输出 ${usageNumber(u.allTime?.completion)}），请求尝试 ${usageNumber(u.allTime?.requests)} 次，其中 ${usageNumber(u.allTime?.unknownUsageRequests)} 次用量未知，其未知部分未计入 token。统计起点 ${usageDate(u.statsStartedAt)}。仅统计本扩展记录到的调用，不等于服务商账单。${u.historyIncomplete ? "历史不完整：旧版已丢失的记录无法恢复。" : ""}每日上限只按已记录 token 计算，用量未知的部分可能使实际消耗超过该上限。`;
   const history = $("#llm-usage-history");
   if (history) history.innerHTML = available && (u.history || []).length
     ? `<table class="usage-table"><thead><tr><th>日期（北京时间）</th><th>输入</th><th>输出</th><th>总 token</th><th>请求</th><th>用量未知</th><th>最近失败（该日最后一次）</th></tr></thead><tbody>${u.history.map((day) => {

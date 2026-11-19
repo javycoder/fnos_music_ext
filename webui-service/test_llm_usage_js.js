@@ -34,6 +34,8 @@ vm.runInContext(section, context);
   await context.refreshLlmUsage();
   assert.match($("#llm-usage-line").textContent, /100/);
   assert.match($("#llm-usage-line").textContent, /3 次用量未知/);
+  assert.match($("#llm-usage-line").textContent, /未知部分未计入 token/);
+  assert.match($("#llm-usage-summary").textContent, /未知部分未计入 token/);
   assert.match($("#llm-usage-line").textContent, /HTTP 错误 2/);
   assert.match($("#llm-usage-line").textContent, /响应缺用量 1/);
   assert.ok(!$("#llm-usage-line").textContent.includes("历史未分类"), "零值分类不应出现在摘要里");

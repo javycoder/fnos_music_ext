@@ -1105,9 +1105,12 @@ def _as_token_int(value: object) -> int | None:
         return value if 0 <= value <= _MAX_TOKEN_VALUE else None
     if isinstance(value, str):
         text = value.strip()
-        if text.isdigit():
-            number = int(text)
-            return number if number <= _MAX_TOKEN_VALUE else None
+        if text.isascii() and text.isdecimal():
+            # 限制有效位数后再转换：Unicode 数字或超长数字不能让记账抛错。
+            significant = text.lstrip("0") or "0"
+            if len(significant) <= len(str(_MAX_TOKEN_VALUE)):
+                number = int(significant)
+                return number if number <= _MAX_TOKEN_VALUE else None
     return None
 
 
@@ -1160,7 +1163,9 @@ def _llm_structure_ok(protocol: str, body: dict) -> bool:
     if protocol == "responses":
         return isinstance(body.get("output"), list) or isinstance(body.get("output_text"), str)
     choices = body.get("choices")
-    return isinstance(choices, list) and bool(choices)
+    return (isinstance(choices, list) and bool(choices)
+            and isinstance(choices[0], dict)
+            and isinstance(choices[0].get("message"), dict))
 
 
 def _llm_error_code(body: object) -> str:
@@ -1205,11 +1210,11 @@ def _extract_llm_text(protocol: str, body: dict) -> tuple[str, str, str]:
         if not texts and isinstance(body.get("output_text"), str):
             texts.append(body["output_text"])
         return "".join(texts), "", status
-    choices = body.get("choices") or []
-    if choices and isinstance(choices[0], dict):
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         finish = str(choices[0].get("finish_reason") or "")
-        msg = choices[0].get("message") or {}
-        return str(msg.get("content") or ""), finish, status
+        msg = choices[0].get("message")
+        return str(msg.get("content") or "") if isinstance(msg, dict) else "", finish, status
     return "", "", status
 
 
