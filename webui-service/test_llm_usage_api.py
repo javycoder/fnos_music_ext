@@ -21,8 +21,13 @@ def test_usage_saved_limit_and_history(tmp_path, monkeypatch):
     ledger = tmp_path / "usage.json"
     ledger.write_text(json.dumps({"version": 2, "timezone": "Asia/Shanghai",
         "historyIncomplete": False, "statsStartedAt": "20261027", "days": {
-            "20261027": {"prompt": 10, "completion": 5, "total": 15, "requests": 1},
-            "20261028": {"prompt": 20, "completion": 6, "total": 26, "requests": 2},
+            "20261027": {"prompt": 10, "completion": 5, "total": 15, "requests": 1,
+                         "unknownUsageRequests": 2,
+                         "unknownUsageByCause": {"httpError": 1, "missingUsage": 1}},
+            "20261028": {"prompt": 20, "completion": 6, "total": 26, "requests": 2,
+                         "unknownUsageRequests": 1,
+                         "lastFailure": {"reason": "http-503", "detail": "no provider",
+                                         "at": 1763553170, "code": "no_provider"}},
         }}), encoding="utf-8")
     monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(ledger))
     monkeypatch.setenv("FNMUSIC_LLM_DAILY_TOKEN_LIMIT", "1000000")
@@ -40,6 +45,14 @@ def test_usage_saved_limit_and_history(tmp_path, monkeypatch):
         assert usage["total"] == 26
         assert usage["allTime"]["total"] == 41
         assert [day["date"] for day in usage["history"]] == ["20261027"]
+        # 未知原因分类逐层透传：当日未分类、历史按原因拆分、错误码随最近失败展示
+        assert usage["unknownUsageByCause"]["unclassified"] == 1
+        assert usage["lastFailure"]["code"] == "no_provider"
+        history_day = usage["history"][0]
+        assert history_day["unknownUsageByCause"] == {
+            "httpError": 1, "transportError": 0, "invalidResponse": 0,
+            "missingUsage": 1, "unclassified": 0}
+        assert usage["allTime"]["unknownUsageByCause"]["httpError"] == 1
         env.write_text("FNMUSIC_LLM_DAILY_TOKEN_LIMIT=0\n", encoding="utf-8")
         assert client.get("/api/llm/usage").json()["usage"]["dailyLimit"] == 0
         for query in ["limit=0", "limit=101", "offset=-1", "limit=bad"]:

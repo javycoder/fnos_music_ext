@@ -1,7 +1,8 @@
 """每日大模型 token 记账与限额（issue #83, v2 ledger）。
 
 状态文件 llm_usage.json（0644 原子写）按日永久保留 prompt/completion/total
-token 与请求数、未返回 usage 的请求数以及最近失败原因。
+token 与请求数、未返回完整 usage 的请求数（按 HTTP 错误 / 网络超时取消 /
+响应无效 / 响应缺失用量 分类，旧记录计入未分类）以及最近失败原因与错误码。
 严格基于中国标准时间 UTC+8 切日，并返回 timezone 标注。
 跨日不丢失历史记录，旧 flat 记录自动平滑迁移且标记 historyIncomplete 与 statsStartedAt。
 
@@ -26,6 +27,14 @@ DEFAULT_DAILY_TOKEN_LIMIT = 1_000_000
 _MAX_INT = 1_000_000_000
 _TZ_SHANGHAI = timezone(timedelta(hours=8))
 TIMEZONE_LABEL = "Asia/Shanghai"
+
+# 用量未知的原因分类：把“请求本身失败”和“成功响应缺用量”分开计数，
+# 界面与 healthz 才能说明未知到底来自哪一侧，而不是把两者混成一个数字。
+# 旧账本没有这一维，读取时差额落进 unclassified（历史未分类），绝不为它们虚构分类。
+UNKNOWN_CAUSES = ("httpError", "transportError", "invalidResponse", "missingUsage")
+_UNKNOWN_CAUSES_MAX = 1_000_000
+# 上游错误码（如 no_provider）：只接受短小安全字符，避免把任意正文写进账本。
+_ERROR_CODE_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 
 # 内存账本与元信息缓存
 _MEM_LEDGER: dict | None = None
@@ -81,7 +90,85 @@ def _safe_failure(val: object) -> dict | None:
         "reason": reason[:80],
         "detail": detail[:500],
         "at": at,
+        "code": _safe_error_code(val.get("code"), reason, detail),
     }
+
+
+def _extract_error_code(detail: str) -> str:
+    """从完整 JSON 形态的历史失败详情里只读提取上游错误码。
+
+    旧账本没有独立的 code 字段，但 http-* 失败会把响应正文前 300 字符存进
+    detail；能解析出 error.code / error.type 时补全展示，解析不了就留空，
+    绝不猜测。
+    """
+    text = (detail or "").strip()
+    if not text.startswith("{"):
+        return ""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    candidates: list[object] = []
+    if isinstance(error, dict):
+        candidates.extend([error.get("code"), error.get("type")])
+    candidates.append(data.get("code"))
+    for candidate in candidates:
+        code = str(candidate or "").strip()
+        if code and _ERROR_CODE_RE.fullmatch(code):
+            return code
+    return ""
+
+
+def _safe_error_code(value: object, reason: str, detail: str) -> str:
+    """上游错误码：显式字段优先，http-* 历史记录再从 detail 只读补全。"""
+    code = str(value or "").strip()
+    if not code and reason.startswith("http-"):
+        code = _extract_error_code(detail)
+    return code if _ERROR_CODE_RE.fullmatch(code) else ""
+
+
+def _safe_causes(value: object, unknown_total: int) -> dict:
+    """解析某日的未知原因分类。
+
+    分类和不得超过当日未知总数；字段损坏（非整数、负数、布尔）或越界时整体
+    退回“未分类”（返回空映射），绝不伪造分类。
+    """
+    if not isinstance(value, dict) or not value:
+        return {}
+    total = 0
+    out: dict[str, int] = {}
+    for key in UNKNOWN_CAUSES:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bool):
+            return {}
+        if isinstance(raw, int):
+            count = raw
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            count = int(raw.strip())
+        else:
+            return {}
+        if count < 0 or count > _UNKNOWN_CAUSES_MAX:
+            return {}
+        if count:
+            out[key] = count
+            total += count
+    if total > unknown_total:
+        return {}
+    return out
+
+
+def _causes_summary(day: dict) -> dict:
+    """未知原因汇总：四个分类 + 未分类差额，总和与 unknownUsageRequests 对齐。"""
+    unknown_total = _safe_int(day.get("unknownUsageRequests"))
+    causes = _safe_causes(day.get("unknownUsageByCause"), unknown_total)
+    out = {key: int(causes.get(key, 0)) for key in UNKNOWN_CAUSES}
+    out["unclassified"] = max(0, unknown_total - sum(out.values()))
+    return out
 
 
 def _state_path() -> str:
@@ -117,6 +204,7 @@ def _empty_day() -> dict:
         "total": 0,
         "requests": 0,
         "unknownUsageRequests": 0,
+        "unknownUsageByCause": {},
         "lastFailure": None,
     }
 
@@ -143,6 +231,8 @@ def _migrate_old_flat(data: dict, today: str) -> dict:
         "total": _safe_int(data.get("total")),
         "requests": _safe_int(data.get("requests")),
         "unknownUsageRequests": _safe_int(data.get("unknownUsageRequests")),
+        # 旧 flat 记录没有任何原因维度，全部计为未分类。
+        "unknownUsageByCause": {},
         "lastFailure": _safe_failure(data.get("lastFailure")),
     }
     days = {old_date: day_record}
@@ -184,6 +274,8 @@ def _parse_ledger_content(raw_bytes: bytes, today: str) -> tuple[dict | None, bo
                 "total": _safe_int(val.get("total")),
                 "requests": _safe_int(val.get("requests")),
                 "unknownUsageRequests": _safe_int(val.get("unknownUsageRequests")),
+                "unknownUsageByCause": _safe_causes(
+                    val.get("unknownUsageByCause"), _safe_int(val.get("unknownUsageRequests"))),
                 "lastFailure": _safe_failure(val.get("lastFailure")),
             }
         return ledger, False
@@ -348,6 +440,42 @@ def _load_or_sync(*, read_only: bool = False) -> tuple[dict, str, str]:
     return _MEM_LEDGER, _STATUS, _STATUS_MSG
 
 
+def _apply_record(
+    day: dict,
+    *,
+    actual_request: bool,
+    usage: dict | None,
+    is_unknown_usage: bool,
+    unknown_cause: str | None,
+    failure_reason: str | None,
+    failure_detail: str,
+    failure_code: str,
+) -> None:
+    """把一次调用累加进某日记录：正常写入与损坏保护两条分支共用同一套口径。"""
+    if actual_request:
+        day["requests"] += 1
+    if usage:
+        day["prompt"] += _safe_int(usage.get("prompt"))
+        day["completion"] += _safe_int(usage.get("completion"))
+        day["total"] += _safe_int(usage.get("total"))
+    if is_unknown_usage:
+        day["unknownUsageRequests"] += 1
+        # 未知原因分类只做增量；未给类别（旧调用点）保持未分类。
+        if unknown_cause in UNKNOWN_CAUSES:
+            causes = day.get("unknownUsageByCause")
+            if not isinstance(causes, dict):
+                causes = {}
+                day["unknownUsageByCause"] = causes
+            causes[unknown_cause] = _safe_int(causes.get(unknown_cause)) + 1
+    if failure_reason:
+        day["lastFailure"] = _safe_failure({
+            "reason": failure_reason,
+            "detail": failure_detail,
+            "at": int(time.time()),
+            "code": failure_code,
+        })
+
+
 def record(
     usage: dict | None = None,
     failure_reason: str | None = None,
@@ -355,13 +483,16 @@ def record(
     *,
     actual_request: bool = True,
     is_unknown_usage: bool = False,
+    unknown_cause: str | None = None,
+    failure_code: str = "",
 ) -> None:
     """记一次 LLM 请求或失败。
 
     actual_request=True: 发生实际 HTTP 尝试，requests 计数 +1；
     actual_request=False: 例如 quota 拦截在请求前被拒绝，仅记 failure，不加 requests；
     usage 非空: 累加 prompt/completion/total；
-    is_unknown_usage=True: 未能获取 usage 统计，累加 unknownUsageRequests，不估算假 token；
+    is_unknown_usage=True: 未能获取完整 usage，累加 unknownUsageRequests，不估算假 token；
+    unknown_cause: 未知原因分类（UNKNOWN_CAUSES 之一），未给则计入“未分类”；
     failure_reason 非空: 覆盖记录最近失败（经安全脱敏，截断 API key 等凭据）。
     """
     global _STATE, _STATE_DAY
@@ -375,40 +506,32 @@ def record(
         # 保护损坏文件：若磁盘已损坏，绝不悄然覆盖原损坏文件
         if status == "corrupt":
             day = ledger["days"].setdefault(today, _empty_day())
-            if actual_request:
-                day["requests"] += 1
-            if usage:
-                day["prompt"] += _safe_int(usage.get("prompt"))
-                day["completion"] += _safe_int(usage.get("completion"))
-                day["total"] += _safe_int(usage.get("total"))
-            if is_unknown_usage:
-                day["unknownUsageRequests"] += 1
-            if failure_reason:
-                day["lastFailure"] = _safe_failure({
-                    "reason": failure_reason,
-                    "detail": failure_detail,
-                    "at": int(time.time()),
-                })
+            _apply_record(
+                day,
+                actual_request=actual_request,
+                usage=usage,
+                is_unknown_usage=is_unknown_usage,
+                unknown_cause=unknown_cause,
+                failure_reason=failure_reason,
+                failure_detail=failure_detail,
+                failure_code=failure_code,
+            )
             _STATE = dict(day)
             _STATE["date"] = today
             _STATE_DAY = today
             return
 
         day = ledger["days"].setdefault(today, _empty_day())
-        if actual_request:
-            day["requests"] += 1
-        if usage:
-            day["prompt"] += _safe_int(usage.get("prompt"))
-            day["completion"] += _safe_int(usage.get("completion"))
-            day["total"] += _safe_int(usage.get("total"))
-        if is_unknown_usage:
-            day["unknownUsageRequests"] += 1
-        if failure_reason:
-            day["lastFailure"] = _safe_failure({
-                "reason": failure_reason,
-                "detail": failure_detail,
-                "at": int(time.time()),
-            })
+        _apply_record(
+            day,
+            actual_request=actual_request,
+            usage=usage,
+            is_unknown_usage=is_unknown_usage,
+            unknown_cause=unknown_cause,
+            failure_reason=failure_reason,
+            failure_detail=failure_detail,
+            failure_code=failure_code,
+        )
 
         _atomic_save(path, ledger)
         _STATE = dict(day)
@@ -468,6 +591,12 @@ def summary(
         all_total = sum(_safe_int(d.get("total")) for d in days.values())
         all_requests = sum(_safe_int(d.get("requests")) for d in days.values())
         all_unknown = sum(_safe_int(d.get("unknownUsageRequests")) for d in days.values())
+        # 未知原因分类按日累加，未分类差额一并带入全期，总和与 all_unknown 对齐。
+        all_causes = {key: 0 for key in UNKNOWN_CAUSES}
+        all_causes["unclassified"] = 0
+        for day_value in days.values():
+            for cause, count in _causes_summary(day_value).items():
+                all_causes[cause] += count
 
         # 历史记录明细（按日期降序）
         h_limit = max(0, min(100, _safe_int(history_limit, 0)))
@@ -486,6 +615,7 @@ def summary(
                     "total": _safe_int(d_val.get("total")),
                     "requests": _safe_int(d_val.get("requests")),
                     "unknownUsageRequests": _safe_int(d_val.get("unknownUsageRequests")),
+                    "unknownUsageByCause": _causes_summary(d_val),
                     "lastFailure": d_val.get("lastFailure"),
                 })
 
@@ -500,6 +630,7 @@ def summary(
             "total": total_tokens,
             "requests": _safe_int(today_data.get("requests")),
             "unknownUsageRequests": _safe_int(today_data.get("unknownUsageRequests")),
+            "unknownUsageByCause": _causes_summary(today_data),
             "lastFailure": today_data.get("lastFailure"),
             "dailyLimit": effective_limit,
             "withinLimit": within,
@@ -517,6 +648,7 @@ def summary(
                 "total": all_total,
                 "requests": all_requests,
                 "unknownUsageRequests": all_unknown,
+                "unknownUsageByCause": all_causes,
             },
             "history": history_items,
         }

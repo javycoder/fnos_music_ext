@@ -132,26 +132,66 @@ const LLM_USAGE_PAGE_SIZE = 30;
 const usageNumber = (value) => Math.max(0, Number(value) || 0).toLocaleString();
 const usageDate = (value) => /^\d{8}$/.test(String(value || ""))
   ? `${String(value).slice(0, 4)}-${String(value).slice(4, 6)}-${String(value).slice(6, 8)}` : "未知";
+// 本段被独立前端测试整段摘出运行，转义工具必须自包含，不能依赖外部 escapeHtml。
+const usageEscape = (value) => String(value ?? "").replace(/[&<>"']/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+// 未知用量的原因分类：请求失败与“成功但缺用量”必须分开显示。
+const USAGE_CAUSES = [
+  ["httpError", "HTTP 错误"],
+  ["transportError", "网络/超时/取消"],
+  ["invalidResponse", "响应无效"],
+  ["missingUsage", "响应缺用量"],
+  ["unclassified", "历史未分类"],
+];
+
+function usageCauseText(day) {
+  const causes = (day && day.unknownUsageByCause) || {};
+  return USAGE_CAUSES
+    .map(([key, label]) => [label, Math.max(0, Number(causes[key]) || 0)])
+    .filter(([, count]) => count > 0)
+    .map(([label, count]) => `${label} ${usageNumber(count)}`)
+    .join("、");
+}
+
+function usageFailureText(failure) {
+  if (!failure || !failure.reason) return "";
+  const when = Number(failure.at) > 0
+    ? `，${new Date(Number(failure.at) * 1000).toLocaleString()}` : "";
+  const code = failure.code ? ` [${failure.code}]` : "";
+  const detail = failure.detail ? `（${String(failure.detail).slice(0, 120)}）` : "";
+  return `${failure.reason}${code}${detail}${when}`;
+}
 
 function renderLlmUsage(u) {
   const el = $("#llm-usage-line");
   if (!el) return;
   const available = !u.status || u.status === "ok";
-  let text = available ? `今日 token：输入 ${usageNumber(u.prompt)} / 输出 ${usageNumber(u.completion)} / 总计 ${usageNumber(u.total)}`
+  let text = available ? `今日已记录 token：输入 ${usageNumber(u.prompt)} / 输出 ${usageNumber(u.completion)} / 总计 ${usageNumber(u.total)}`
     : `账本${u.status === "missing" ? "尚无记录" : "不可用"}：${u.statusMessage || u.status}（不能视为已用 0）`;
   text += Number(u.dailyLimit) > 0 ? `；每日上限 ${usageNumber(u.dailyLimit)}` : "；每日不限额";
-  if (available) text += `；实际请求 ${usageNumber(u.requests)} 次`;
+  if (available) text += `；请求尝试 ${usageNumber(u.requests)} 次`;
   if (u.withinLimit === false) text += "；已达上限，次日重置";
-  if (Number(u.unknownUsageRequests)) text += `；${usageNumber(u.unknownUsageRequests)} 次未返回用量，未计入 token`;
-  if (u.lastFailure?.reason) text += `；最近失败：${u.lastFailure.reason}${u.lastFailure.detail ? `（${String(u.lastFailure.detail).slice(0, 120)}）` : ""}`;
+  if (Number(u.unknownUsageRequests)) {
+    const causes = usageCauseText(u);
+    text += `；其中 ${usageNumber(u.unknownUsageRequests)} 次用量未知${causes ? `（${causes}）` : ""}，未计入 token`;
+  }
+  const failure = usageFailureText(u.lastFailure);
+  if (failure) text += `；最近失败：${failure}`;
+  if (u.lastFailure && u.lastFailure.code === "no_provider") {
+    text += "；该错误表示所配模型在当前服务商无可用提供者，请核对模型名称、账号权限与服务商路由";
+  }
   text += `；北京时间 UTC+08:00；更新于 ${new Date().toLocaleTimeString()}`;
   el.textContent = text;
   el.dataset.lastUsageText = text;
   const summary = $("#llm-usage-summary");
-  if (summary) summary.textContent = !available ? "累计与历史数据暂不可读取，不能视为零用量；请检查账本状态后重试。" : `累计 token ${usageNumber(u.allTime?.total)}（输入 ${usageNumber(u.allTime?.prompt)} / 输出 ${usageNumber(u.allTime?.completion)}），实际请求 ${usageNumber(u.allTime?.requests)} 次。统计起点 ${usageDate(u.statsStartedAt)}。${u.historyIncomplete ? "历史不完整：旧版已丢失的记录无法恢复。" : "仅统计本扩展记录到的调用。"}`;
+  if (summary) summary.textContent = !available ? "累计与历史数据暂不可读取，不能视为零用量；请检查账本状态后重试。" : `累计 token ${usageNumber(u.allTime?.total)}（输入 ${usageNumber(u.allTime?.prompt)} / 输出 ${usageNumber(u.allTime?.completion)}），请求尝试 ${usageNumber(u.allTime?.requests)} 次，其中 ${usageNumber(u.allTime?.unknownUsageRequests)} 次用量未知未计入 token。统计起点 ${usageDate(u.statsStartedAt)}。仅统计本扩展记录到的调用，不等于服务商账单。${u.historyIncomplete ? "历史不完整：旧版已丢失的记录无法恢复。" : ""}每日上限只按已记录 token 计算，用量未知的部分可能使实际消耗超过该上限。`;
   const history = $("#llm-usage-history");
   if (history) history.innerHTML = available && (u.history || []).length
-    ? `<table class="usage-table"><thead><tr><th>日期（北京时间）</th><th>输入</th><th>输出</th><th>总 token</th><th>请求</th></tr></thead><tbody>${u.history.map((day) => `<tr><td>${usageDate(day.date)}</td><td>${usageNumber(day.prompt)}</td><td>${usageNumber(day.completion)}</td><td>${usageNumber(day.total)}</td><td>${usageNumber(day.requests)}${Number(day.unknownUsageRequests) ? `（${usageNumber(day.unknownUsageRequests)} 次用量未知）` : ""}</td></tr>`).join("")}</tbody></table>`
+    ? `<table class="usage-table"><thead><tr><th>日期（北京时间）</th><th>输入</th><th>输出</th><th>总 token</th><th>请求</th><th>用量未知</th><th>最近失败（该日最后一次）</th></tr></thead><tbody>${u.history.map((day) => {
+      const causes = usageCauseText(day);
+      const dayFailure = usageFailureText(day.lastFailure);
+      return `<tr><td>${usageDate(day.date)}</td><td>${usageNumber(day.prompt)}</td><td>${usageNumber(day.completion)}</td><td>${usageNumber(day.total)}</td><td>${usageNumber(day.requests)}</td><td>${Number(day.unknownUsageRequests) ? `${usageNumber(day.unknownUsageRequests)} 次${causes ? `（${usageEscape(causes)}）` : ""}` : "-"}</td><td>${dayFailure ? usageEscape(dayFailure) : "-"}</td></tr>`;
+    }).join("")}</tbody></table>`
     : `<p class="hint">${available ? "暂无历史记录。" : "历史记录暂不可读取。"}</p>`;
   if ($("#llm-usage-prev")) $("#llm-usage-prev").disabled = llmUsageOffset === 0;
   if ($("#llm-usage-next")) $("#llm-usage-next").disabled = llmUsageOffset + LLM_USAGE_PAGE_SIZE >= Number(u.totalDays || 0);

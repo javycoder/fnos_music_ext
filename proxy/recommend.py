@@ -26,6 +26,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 import time
 import zlib
 from datetime import datetime
@@ -1017,14 +1018,67 @@ class LLMFailure(Exception):
     """LLM 调用失败，携带稳定 reason 码（issue #83）。
 
     reason 进入 tierFailures（如 "llm:empty-content"）与 WebUI 用量面板的
-    最近失败展示：token-limit / not-configured / timeout / network /
-    http-<status> / bad-response / empty-content / parse。
+    最近失败展示：token-limit / not-configured / no-provider / timeout /
+    network / http-<status> / bad-response / empty-content / parse。
+    code 是上游错误码（如 no_provider），用于短时抑制与面板提示，不进入
+    reason 以免改变既有 tierFailures 文案。
     """
 
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", code: str = ""):
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = (detail or reason)[:500]
+        self.code = code
+
+
+# 上游明确“无可用提供者”（HTTP 503 + error.code=no_provider）时，同配置在
+# 冷却窗口内不再发出请求：这类失败与本次参数无关，重试只会连续产生未知用量。
+# 进程内状态，不落盘、不跨重启；以凭据哈希为键，绝不保存密钥原文。
+NO_PROVIDER_COOLDOWN_S = 300.0
+_NO_PROVIDER_LOCK = threading.Lock()
+_NO_PROVIDER_UNTIL: dict[str, float] = {}
+_NO_PROVIDER_MAX_KEYS = 32
+
+
+def _no_provider_key() -> str:
+    """当前 LLM 配置指纹（Base URL/协议/模型/密钥哈希/附加参数）。"""
+    material = json.dumps({
+        "base": llm_base_url(),
+        "protocol": llm_protocol(),
+        "model": llm_model(),
+        "key": hashlib.sha256(llm_api_key().encode("utf-8")).hexdigest(),
+        "extra": llm_extra_body(),
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def no_provider_cooldown_remaining(key: str | None = None) -> float:
+    """同配置剩余冷却秒数；0 表示可以正常发起请求。"""
+    key = key or _no_provider_key()
+    now = time.monotonic()
+    with _NO_PROVIDER_LOCK:
+        until = _NO_PROVIDER_UNTIL.get(key)
+        if until is None:
+            return 0.0
+        if until <= now:
+            _NO_PROVIDER_UNTIL.pop(key, None)
+            return 0.0
+        return until - now
+
+
+def _mark_no_provider(key: str) -> None:
+    now = time.monotonic()
+    with _NO_PROVIDER_LOCK:
+        for stale in [k for k, until in _NO_PROVIDER_UNTIL.items() if until <= now]:
+            _NO_PROVIDER_UNTIL.pop(stale, None)
+        if len(_NO_PROVIDER_UNTIL) >= _NO_PROVIDER_MAX_KEYS:
+            _NO_PROVIDER_UNTIL.clear()
+        _NO_PROVIDER_UNTIL[key] = now + NO_PROVIDER_COOLDOWN_S
+
+
+def _clear_no_provider(key: str) -> None:
+    with _NO_PROVIDER_LOCK:
+        _NO_PROVIDER_UNTIL.pop(key, None)
 
 
 def _llm_endpoint(base: str) -> tuple[str, str]:
@@ -1034,27 +1088,95 @@ def _llm_endpoint(base: str) -> tuple[str, str]:
     return protocol, (base if base.endswith(suffix) else f"{base}{suffix}")
 
 
+_MAX_TOKEN_VALUE = 1_000_000_000
+_ERROR_CODE_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+
+def _as_token_int(value: object) -> int | None:
+    """安全解析 token 计数：仅接受非负整数或十进制整数字符串。
+
+    布尔、浮点、负数、非数字字符串与越界值一律视为无效并返回 None。
+    旧实现直接 int() 会在第三方返回异常字段时抛 ValueError，导致整次调用
+    连请求数都没记上——未知用量因此凭空消失。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= _MAX_TOKEN_VALUE else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            number = int(text)
+            return number if number <= _MAX_TOKEN_VALUE else None
+    return None
+
+
 def _llm_usage(protocol: str, body: dict) -> dict:
-    """归一化 usage：chat 与 responses 两套字段名统一成 prompt/completion 口径。"""
+    """归一化 usage：chat 与 responses 两套字段名统一成 prompt/completion 口径。
+
+    unknown=True 表示用量不完整：整段缺失、全部字段无效，或只有部分字段可证实。
+    可证实的字段照常计入、其余不估算——既不把未知当成确定的 0，也不因为个别
+    字段格式不对就丢弃整次调用的记账。合法的显式 0 不算未知。
+    """
     usage = body.get("usage") if isinstance(body, dict) else None
     if not isinstance(usage, dict) or not usage:
         return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True}
-    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
-    completion = usage.get("completion_tokens", usage.get("output_tokens"))
+    prompt_raw = usage.get("prompt_tokens")
+    if prompt_raw is None:
+        prompt_raw = usage.get("input_tokens")
+    completion_raw = usage.get("completion_tokens")
+    if completion_raw is None:
+        completion_raw = usage.get("output_tokens")
+    prompt = _as_token_int(prompt_raw)
+    completion = _as_token_int(completion_raw)
+    total = _as_token_int(usage.get("total_tokens"))
     details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
-    reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else 0
-    total = usage.get("total_tokens")
+    reasoning = _as_token_int(details.get("reasoning_tokens")) if isinstance(details, dict) else None
     if prompt is None and completion is None and total is None:
         return {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True}
+    partial = False
     if total is None:
-        total = (int(prompt or 0)) + (int(completion or 0))
+        if prompt is not None and completion is not None:
+            total = prompt + completion
+        else:
+            # 只有一侧可证实：按可证实部分累计，同时标记用量不完整。
+            total = (prompt or 0) + (completion or 0)
+            partial = True
+    elif prompt is None or completion is None:
+        partial = True
     return {
-        "prompt": int(prompt or 0),
-        "completion": int(completion or 0),
-        "total": int(total or 0),
-        "reasoning": int(reasoning or 0),
-        "unknown": False,
+        "prompt": prompt or 0,
+        "completion": completion or 0,
+        "total": total,
+        "reasoning": reasoning or 0,
+        "unknown": partial,
     }
+
+
+def _llm_structure_ok(protocol: str, body: dict) -> bool:
+    """响应是否具备该协议的正文字段结构（只用于区分失败原因分类）。"""
+    if not isinstance(body, dict):
+        return False
+    if protocol == "responses":
+        return isinstance(body.get("output"), list) or isinstance(body.get("output_text"), str)
+    choices = body.get("choices")
+    return isinstance(choices, list) and bool(choices)
+
+
+def _llm_error_code(body: object) -> str:
+    """从错误响应里提取上游错误码（安全字符白名单，取不到返回空串）。"""
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    candidates: list[object] = []
+    if isinstance(error, dict):
+        candidates.extend([error.get("code"), error.get("type")])
+    candidates.append(body.get("code"))
+    for candidate in candidates:
+        code = str(candidate or "").strip()
+        if code and _ERROR_CODE_RE.fullmatch(code):
+            return code
+    return ""
 
 
 def _extract_llm_text(protocol: str, body: dict) -> tuple[str, str, str]:
@@ -1127,6 +1249,13 @@ async def _llm_complete(
         detail = f"当日 token 已达上限 {limit}，明日自动重置"
         llm_usage.record(None, "token-limit", detail, actual_request=False)
         raise LLMFailure("token-limit", detail)
+    cooldown_key = _no_provider_key()
+    cooldown = no_provider_cooldown_remaining(cooldown_key)
+    if cooldown > 0:
+        # 上一轮已确认“无可用提供者”：冷却期内不发请求，也不增加请求计数。
+        detail = (f"上游报告无可用提供者（no-provider），约 {int(cooldown) + 1} 秒内不再重试；"
+                  "请核对模型名称、账号权限与服务商路由")
+        raise LLMFailure("no-provider", detail, code="no_provider")
     protocol, url = _llm_endpoint(base)
     payload: dict = {"model": llm_model()}
     if protocol == "responses":
@@ -1153,28 +1282,58 @@ async def _llm_complete(
     }
     try:
         resp = await http_client.post(url, json=payload, headers=headers, timeout=llm_timeout_s())
+    except asyncio.CancelledError:
+        # 请求已发出后被取消（配置变更/任务取消）：按实际尝试记一次账后原样抛出，
+        # 绝不吞掉取消。取消不是模型失败，不覆盖“最近失败”原因。
+        llm_usage.record(None, actual_request=True, unknown_cause="transportError")
+        raise
     except LLMFailure:
         raise
     except httpx.TimeoutException as e:
-        llm_usage.record(None, "timeout", str(e), actual_request=True)
+        llm_usage.record(None, "timeout", str(e), actual_request=True,
+                         unknown_cause="transportError")
         raise LLMFailure("timeout", str(e)) from e
     except Exception as e:
-        llm_usage.record(None, "network", str(type(e).__name__), actual_request=True)
+        llm_usage.record(None, "network", str(type(e).__name__), actual_request=True,
+                         unknown_cause="transportError")
         raise LLMFailure("network", str(e)) from e
     if resp.status_code >= 400:
         snippet = (resp.text or "").strip()[:300]
-        llm_usage.record(None, f"http-{resp.status_code}", snippet, actual_request=True)
-        raise LLMFailure(f"http-{resp.status_code}", snippet)
+        error_body: object = None
+        try:
+            error_body = resp.json()
+        except ValueError:
+            error_body = None
+        code = _llm_error_code(error_body)
+        # 错误响应也可能带 usage（部分网关对已生成内容计费）：有就如实记入，
+        # 拿不到才计入未知，绝不一律当成未知。
+        usage = (_llm_usage(protocol, error_body) if isinstance(error_body, dict)
+                 else {"prompt": 0, "completion": 0, "total": 0, "reasoning": 0, "unknown": True})
+        is_unknown = bool(usage.get("unknown", False))
+        llm_usage.record(
+            usage, f"http-{resp.status_code}", snippet, actual_request=True,
+            is_unknown_usage=is_unknown,
+            unknown_cause="httpError" if is_unknown else None,
+            failure_code=code,
+        )
+        if resp.status_code == 503 and code == "no_provider":
+            _mark_no_provider(cooldown_key)
+        raise LLMFailure(f"http-{resp.status_code}", snippet, code=code)
+    _clear_no_provider(cooldown_key)
     try:
         body = resp.json()
     except ValueError as e:
-        llm_usage.record(None, "bad-response", "响应不是合法 JSON", actual_request=True)
+        llm_usage.record(None, "bad-response", "响应不是合法 JSON", actual_request=True,
+                         unknown_cause="invalidResponse")
         raise LLMFailure("bad-response", "响应不是合法 JSON") from e
     if not isinstance(body, dict):
-        llm_usage.record(None, "bad-response", "响应不是 JSON 对象", actual_request=True)
+        llm_usage.record(None, "bad-response", "响应不是 JSON 对象", actual_request=True,
+                         unknown_cause="invalidResponse")
         raise LLMFailure("bad-response", "响应不是 JSON 对象")
     usage = _llm_usage(protocol, body)
     is_unknown = bool(usage.get("unknown", False))
+    # 结构损坏与“模型没输出正文”是两件事：前者归响应无效，后者归缺用量。
+    missing_cause = "missingUsage" if _llm_structure_ok(protocol, body) else "invalidResponse"
     content, finish, status = _extract_llm_text(protocol, body)
     if not content.strip():
         # issue #83 核心：HTTP 200 但正文为空（推理 token 耗尽预算）必须显式失败，
@@ -1182,9 +1341,12 @@ async def _llm_complete(
         # empty-content 时 actual HTTP 尝试已发生，且消耗了 token，
         # 一次性记录 usage 与 failure，绝不重复记账 (actual_request=True)。
         detail = _empty_content_detail(protocol, finish, status, usage)
-        llm_usage.record(usage, "empty-content", detail, actual_request=True, is_unknown_usage=is_unknown)
+        llm_usage.record(usage, "empty-content", detail, actual_request=True,
+                         is_unknown_usage=is_unknown,
+                         unknown_cause=missing_cause if is_unknown else None)
         raise LLMFailure("empty-content", detail)
-    llm_usage.record(usage, actual_request=True, is_unknown_usage=is_unknown)
+    llm_usage.record(usage, actual_request=True, is_unknown_usage=is_unknown,
+                     unknown_cause=missing_cause if is_unknown else None)
     logger.debug("llm %s ok: finish=%s status=%s usage=%s",
                  protocol, finish or "-", status or "-", usage)
     return content
@@ -1197,7 +1359,10 @@ async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
     )
     recs = parse_llm_recommendations(content)
     if not recs:
-        raise LLMFailure("parse", "正文未解析出候选歌曲")
+        detail = "正文未解析出候选歌曲"
+        # 正文已记账，这里只补充失败原因：不重复计数请求与 token。
+        llm_usage.record(None, "parse", detail, actual_request=False)
+        raise LLMFailure("parse", detail)
     return recs
 
 
@@ -1212,7 +1377,10 @@ async def call_llm_json(http_client: httpx.AsyncClient, prompt: str) -> list | d
     try:
         return json.loads(content)
     except ValueError as error:
-        raise LLMFailure("parse", f"正文不是合法 JSON: {error}") from error
+        detail = f"正文不是合法 JSON: {error}"
+        # 同 call_llm：正文已记账，这里只补充失败原因，不重复计数。
+        llm_usage.record(None, "parse", detail, actual_request=False)
+        raise LLMFailure("parse", detail) from error
 
 
 # ------------------------------------------------------- 音源原生推荐（平台 ID 直连） ---

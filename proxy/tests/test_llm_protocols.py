@@ -410,3 +410,184 @@ async def test_daily_build_records_token_limit_failure(monkeypatch):
         )
     assert hits["n"] == 0
     assert "llm:token-limit" in payload["tierFailures"]
+
+
+# ------------------------------------------- 未知用量归因与 no_provider 冷却 --
+
+@pytest.mark.anyio
+async def test_http_error_with_usage_is_recorded_not_unknown(monkeypatch):
+    """错误响应也可能带 usage：有就如实记入，只有拿不到才计入未知。"""
+    _configure_llm(monkeypatch)
+    body = {"error": {"message": "rate limited", "code": "rate_limited"},
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}
+    transport = httpx.MockTransport(lambda r: httpx.Response(429, json=body))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(dailyrec.LLMFailure) as excinfo:
+            await dailyrec.call_llm(client, "p")
+
+    assert excinfo.value.reason == "http-429"
+    today = llm_usage.used_today()
+    assert today["requests"] == 1
+    assert today["unknownUsageRequests"] == 0
+    assert (today["prompt"], today["completion"], today["total"]) == (7, 3, 10)
+    assert today["lastFailure"]["code"] == "rate_limited"
+
+
+@pytest.mark.anyio
+async def test_no_provider_503_records_cause_and_cools_down(monkeypatch):
+    """503 + no_provider：记账一次未知后短时抑制同配置重试，配置变化立即放行。"""
+    _configure_llm(monkeypatch)
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(503, json={"error": {
+            "message": "模型 test-model 的提供者均不可用（上游来源模型清单不含该模型）",
+            "code": "no_provider"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(dailyrec.LLMFailure) as first:
+            await dailyrec.call_llm(client, "p")
+        assert first.value.reason == "http-503"
+        assert first.value.code == "no_provider"
+        today = llm_usage.used_today()
+        assert today["requests"] == 1
+        assert today["unknownUsageRequests"] == 1
+        assert today["unknownUsageByCause"]["httpError"] == 1
+        assert today["lastFailure"]["code"] == "no_provider"
+
+        # 冷却期内：不发请求、不增加请求计数，也不覆盖最近失败
+        with pytest.raises(dailyrec.LLMFailure) as second:
+            await dailyrec.call_llm(client, "p")
+        assert second.value.reason == "no-provider"
+        assert hits["n"] == 1
+        assert llm_usage.used_today()["requests"] == 1
+        assert llm_usage.used_today()["lastFailure"]["code"] == "no_provider"
+
+        # 换成另一个模型 → 新配置键 → 立即允许再次尝试
+        monkeypatch.setenv("FNMUSIC_LLM_MODEL", "another-model")
+        with pytest.raises(dailyrec.LLMFailure) as third:
+            await dailyrec.call_llm(client, "p")
+        assert third.value.reason == "http-503"
+        assert hits["n"] == 2
+
+
+@pytest.mark.anyio
+async def test_other_503_codes_do_not_cool_down(monkeypatch):
+    """只有 no_provider 触发抑制；其他 503 仍按原逻辑逐次尝试。"""
+    _configure_llm(monkeypatch)
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(503, json={"error": {"code": "overloaded"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        for _ in range(2):
+            with pytest.raises(dailyrec.LLMFailure):
+                await dailyrec.call_llm(client, "p")
+
+    assert hits["n"] == 2
+    assert llm_usage.used_today()["unknownUsageByCause"]["httpError"] == 2
+
+
+def test_no_provider_cooldown_expiry_and_key(monkeypatch):
+    _configure_llm(monkeypatch)
+    key = dailyrec._no_provider_key()
+    assert dailyrec.no_provider_cooldown_remaining(key) == 0.0
+
+    dailyrec._mark_no_provider(key)
+    assert dailyrec.no_provider_cooldown_remaining(key) > 0
+
+    monkeypatch.setenv("FNMUSIC_LLM_MODEL", "other-model")
+    assert dailyrec._no_provider_key() != key, "模型变化必须产生新配置键"
+
+    dailyrec._NO_PROVIDER_UNTIL[key] = time.monotonic() - 1
+    assert dailyrec.no_provider_cooldown_remaining(key) == 0.0
+    assert key not in dailyrec._NO_PROVIDER_UNTIL
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("usage", [
+    {"prompt_tokens": "abc", "completion_tokens": 3},
+    {"prompt_tokens": -5, "completion_tokens": 3, "total_tokens": "x"},
+    {"prompt_tokens": True, "completion_tokens": 3},
+    {"total_tokens": 20},
+    {"foo": 1},
+])
+async def test_invalid_usage_fields_never_drop_the_request(monkeypatch, usage):
+    """字段异常只让用量变成“不完整”，绝不抛异常、也绝不漏记这次请求。"""
+    _configure_llm(monkeypatch)
+    content = json.dumps(_CANDIDATES, ensure_ascii=False)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+        "usage": usage}))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        recs = await dailyrec.call_llm(client, "p")
+
+    assert len(recs) == len(_CANDIDATES)
+    today = llm_usage.used_today()
+    assert today["requests"] == 1
+    assert today["unknownUsageRequests"] == 1
+    assert today["unknownUsageByCause"]["missingUsage"] == 1
+
+
+@pytest.mark.anyio
+async def test_explicit_zero_usage_is_not_unknown(monkeypatch):
+    """合法的显式 0 是已知用量，不能被当成“未返回用量”。"""
+    _configure_llm(monkeypatch)
+    content = json.dumps(_CANDIDATES, ensure_ascii=False)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        await dailyrec.call_llm(client, "p")
+
+    today = llm_usage.used_today()
+    assert today["requests"] == 1
+    assert today["unknownUsageRequests"] == 0
+
+
+@pytest.mark.anyio
+async def test_cancelled_request_is_recorded_then_reraised(monkeypatch):
+    """请求途中被取消：记一次实际尝试后原样抛出，取消绝不被吞掉。"""
+    _configure_llm(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await dailyrec.call_llm(client, "p")
+
+    today = llm_usage.used_today()
+    assert today["requests"] == 1
+    assert today["unknownUsageByCause"]["transportError"] == 1
+    assert today["lastFailure"] is None, "取消不是模型失败，不应覆盖最近失败"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parse_json", [False, True])
+async def test_parse_failure_updates_reason_without_double_counting(monkeypatch, parse_json):
+    """正文已记账后解析失败：只补失败原因，不重复计请求与 token。"""
+    _configure_llm(monkeypatch)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=_chat_body(
+        "not json at all",
+        usage={"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16})))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(dailyrec.LLMFailure) as excinfo:
+            if parse_json:
+                await dailyrec.call_llm_json(client, "p")
+            else:
+                await dailyrec.call_llm(client, "p")
+
+    assert excinfo.value.reason == "parse"
+    today = llm_usage.used_today()
+    assert today["requests"] == 1
+    assert today["total"] == 16
+    assert today["unknownUsageRequests"] == 0
+    assert today["lastFailure"]["reason"] == "parse"

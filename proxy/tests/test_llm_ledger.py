@@ -9,9 +9,10 @@
 6. 权限/保存失败 status 明确，写者保留内存账本并在后续重试落盘；
 7. 请求计数：actual HTTP attempt 一次计数一次，quota 拒绝仅记 failure 不增 requests，empty-content 单次记账不 double count；
 8. 未知 usage 不估算假 token 并累加 unknownUsageRequests；
-9. 安全脱敏：failure 截断且绝不泄露 API key / Bearer 凭据；
-10. 多线程并发 record 安全；
-11. summary 默认 history_limit=0 轻量返回，支持分页 history_limit 与 history_offset。
+9. 未知原因分类：HTTP 错误 / 网络超时取消 / 响应无效 / 响应缺用量，旧账本与损坏分类回落未分类；
+10. 安全脱敏：failure 截断且绝不泄露 API key / Bearer 凭据，错误码白名单；
+11. 多线程并发 record 安全；
+12. summary 默认 history_limit=0 轻量返回，支持分页 history_limit 与 history_offset。
 """
 from __future__ import annotations
 
@@ -483,4 +484,117 @@ def test_total_days_does_not_include_unrecorded_today(tmp_path, monkeypatch):
     assert s_after["totalDays"] == 3
     assert len(s_after["history"]) == 3
     assert s_after["history"][0]["date"] == "20261028"
+
+
+# ----------------------------------------------------------- 11. 未知用量原因分类 ---
+
+def test_unknown_causes_are_split_and_verified_tokens_kept(tmp_path, monkeypatch):
+    """未知按原因分类；可证实的 token 照常计入，取消不覆盖最近失败。"""
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(tmp_path / "usage.json"))
+    monkeypatch.setattr(llm_usage, "_today", lambda: "20261119")
+
+    llm_usage.record(None, "http-503", '{"error":{"code":"no_provider"}}',
+                     actual_request=True, unknown_cause="httpError", failure_code="no_provider")
+    llm_usage.record(None, "timeout", "timed out", actual_request=True, unknown_cause="transportError")
+    # 请求途中的取消：发生了实际尝试，但没有模型失败可写
+    llm_usage.record(None, actual_request=True, unknown_cause="transportError")
+    # 成功但只有部分用量可证实：可证实的 token 计入，同时记一次缺用量
+    llm_usage.record({"prompt": 10, "completion": 5, "total": 15},
+                     actual_request=True, is_unknown_usage=True, unknown_cause="missingUsage")
+
+    summary = llm_usage.summary()
+    assert summary["requests"] == 4
+    assert summary["unknownUsageRequests"] == 4
+    assert summary["total"] == 15
+    assert summary["unknownUsageByCause"] == {
+        "httpError": 1, "transportError": 2, "invalidResponse": 0,
+        "missingUsage": 1, "unclassified": 0,
+    }
+    assert summary["lastFailure"]["reason"] == "timeout"
+    assert summary["allTime"]["unknownUsageByCause"]["transportError"] == 2
+
+
+def test_record_without_cause_stays_unclassified(tmp_path, monkeypatch):
+    """旧调用点不给类别时仍只记总数，不猜测原因。"""
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(tmp_path / "usage.json"))
+    llm_usage.record(None, actual_request=True)
+    summary = llm_usage.summary()
+    assert summary["unknownUsageRequests"] == 1
+    assert summary["unknownUsageByCause"]["unclassified"] == 1
+
+
+def test_legacy_day_unknown_is_unclassified(tmp_path, monkeypatch):
+    """升级前的历史日没有原因维度：全部计入未分类，数字本身一点都不改。"""
+    usage_file = tmp_path / "usage.json"
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    monkeypatch.setattr(llm_usage, "_today", lambda: "20261119")
+    usage_file.write_text(json.dumps({"version": 2, "timezone": "Asia/Shanghai",
+        "historyIncomplete": False, "statsStartedAt": "20261117", "days": {
+            "20261118": {"prompt": 0, "completion": 0, "total": 0, "requests": 14,
+                         "unknownUsageRequests": 14, "lastFailure": None},
+        }}), encoding="utf-8")
+
+    summary = llm_usage.summary(history_limit=10, read_only=True)
+    day = summary["history"][0]
+    assert day["unknownUsageRequests"] == 14
+    assert day["unknownUsageByCause"] == {"httpError": 0, "transportError": 0,
+                                         "invalidResponse": 0, "missingUsage": 0,
+                                         "unclassified": 14}
+    assert summary["allTime"]["unknownUsageByCause"]["unclassified"] == 14
+
+
+@pytest.mark.parametrize("causes", [
+    {"httpError": -1}, {"httpError": True}, {"httpError": "abc"},
+    {"httpError": 2, "missingUsage": 2},
+])
+def test_invalid_or_overflowing_causes_fall_back_to_unclassified(tmp_path, monkeypatch, causes):
+    """分类损坏或总和超过未知总数时整体退回未分类，绝不产生假分类。"""
+    usage_file = tmp_path / "usage.json"
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    monkeypatch.setattr(llm_usage, "_today", lambda: "20261119")
+    usage_file.write_text(json.dumps({"version": 2, "days": {
+        "20261118": {"requests": 3, "unknownUsageRequests": 3,
+                     "unknownUsageByCause": causes},
+    }}), encoding="utf-8")
+
+    history = llm_usage.summary(history_limit=10, read_only=True)["history"][0]
+    assert history["unknownUsageByCause"]["unclassified"] == 3
+    assert history["unknownUsageByCause"]["httpError"] == 0
+
+
+def test_corrupt_ledger_still_categorises_in_memory(tmp_path, monkeypatch):
+    """损坏文件保护分支与正常分支共用同一套分类口径，且绝不覆盖原文件。"""
+    usage_file = tmp_path / "usage.json"
+    usage_file.write_text("{broken", encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    original = usage_file.read_bytes()
+
+    llm_usage.record(None, "http-500", "boom", actual_request=True, unknown_cause="httpError")
+
+    summary = llm_usage.summary()
+    assert summary["status"] == "corrupt"
+    assert summary["unknownUsageByCause"]["httpError"] == 1
+    assert usage_file.read_bytes() == original
+
+
+def test_failure_code_whitelist_and_legacy_detail(tmp_path, monkeypatch):
+    """错误码只收安全字符；旧账本可从 JSON 形态的 detail 只读补全。"""
+    usage_file = tmp_path / "usage.json"
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    monkeypatch.setattr(llm_usage, "_today", lambda: "20261119")
+
+    llm_usage.record(None, "http-500", "x", actual_request=True, failure_code="bad code<script>")
+    assert llm_usage.summary()["lastFailure"]["code"] == ""
+
+    llm_usage.record(None, "http-503", '{"error":{"code":"no_provider","message":"m"}}',
+                     actual_request=True, failure_code="no_provider")
+    assert llm_usage.summary()["lastFailure"]["code"] == "no_provider"
+
+    usage_file.write_text(json.dumps({"version": 2, "days": {
+        "20261118": {"requests": 1, "unknownUsageRequests": 1,
+                     "lastFailure": {"reason": "http-503",
+                                     "detail": '{"error":{"code":"no_provider"}}', "at": 1}},
+    }}), encoding="utf-8")
+    history = llm_usage.summary(history_limit=10, read_only=True)["history"][0]
+    assert history["lastFailure"]["code"] == "no_provider"
 

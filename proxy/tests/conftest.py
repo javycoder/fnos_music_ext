@@ -111,6 +111,7 @@ def _isolate_llm_usage_state(tmp_path, monkeypatch):
     """LLM token 账本指到临时文件并清空进程内当日缓存，
     防止用例把 llm_usage.json 写进真实仓库、或跨用例串账。"""
     from proxy import llm_usage
+    from proxy import recommend
 
     monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(tmp_path / "llm_usage.json"))
     monkeypatch.setattr(llm_usage, "_STATE", None)
@@ -119,3 +120,5 @@ def _isolate_llm_usage_state(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_usage, "_LAST_PATH", None)
     monkeypatch.setattr(llm_usage, "_STATUS", "ok")
     monkeypatch.setattr(llm_usage, "_STATUS_MSG", "正常")
+    # no_provider 冷却窗口是进程内状态：不隔离会让先跑用例的 503 抑制后续用例的请求。
+    monkeypatch.setattr(recommend, "_NO_PROVIDER_UNTIL", {})
