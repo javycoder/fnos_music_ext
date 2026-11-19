@@ -363,6 +363,10 @@
         <div class="card">
           <div class="card-title"><span>在线搜索与翻页策略</span><button class="help-btn" type="button" data-help="search" aria-label="搜索设置帮助">?</button></div>
           <label class="switch-row"><span>开启搜索自动深分页<span class="sub">首屏有效结果不够时自动向后翻页补齐，本地歌曲始终置顶</span></span><input type="checkbox" id="search-deep"></label>
+          <label class="field"><span>Web 搜索结果数量</span>
+            <input class="input" id="search-web-limit" type="number" min="1" max="200" step="1" inputmode="numeric">
+          </label>
+          <p class="hint">仅影响网页版单曲搜索的一次返回数量；数值越大搜索耗时与失败概率可能越高，请适度设置。</p>
           <details class="adv-fold">
             <summary>高级：超时与翻页上限</summary>
             <div class="adv-body">
@@ -846,6 +850,7 @@
   <template data-help-id="search">
     <p><b>自动深分页：</b>首屏有效结果不够填满列表时，自动向后翻页补齐。本地曲库歌曲始终排在最前；musicdl 不支持分页，仅参与首屏。关闭后只显示首次搜索结果。</p>
     <p><b>超时与页数：</b>单次搜索默认最多等 15 秒，超时只交付本地结果；自动翻页默认最多 10 页，避免频繁请求触发音源风控。</p>
+    <p><b>Web 搜索结果数量：</b>官方网页版的单曲搜索会一次显示接口返回的全部结果，不会自动请求下一页。本插件需要联网搜索音源，不能一次性返回太多结果：数量设得越大，搜索耗时可能越长，搜索失败的概率也可能上升，因此请结合自己的需求适度设置本数值（默认 50）。此设置只影响网页版单曲搜索，不影响 App 和主动分页的请求。</p>
   </template>
   <template data-help-id="tee-save">
     <p><b>边听边存：</b>在线试听时只要音频在后台缓冲下载完整，就自动保存进本地曲库，无需把整首听完。关闭后仅保留少量临时滚动缓存。</p>

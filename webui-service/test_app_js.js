@@ -3219,6 +3219,64 @@ test("洛雪超时设置：面板隐藏时即使包含无效值也不阻断保�
   assert.strictEqual("LX_PROBE_TIMEOUT" in cfg, false);
 });
 
+test("Web 搜索结果数量：loadConfig 回填默认与已存值 + 输入标脏", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: {} } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#search-web-limit").value, "50");
+  assert.strictEqual(els.get("#search-web-limit").disabled, false);
+
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: "120" },
+    schema: { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: {} },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#search-web-limit").value, "120");
+
+  els.get("#save-bar").classList.remove("show");
+  els.get("#search-web-limit").dispatch("input");
+  assert.strictEqual(els.get("#save-bar").classList.contains("show"), true);
+});
+
+test("Web 搜索结果数量：collectConfig 校验 1–200 整数，空白按默认提交", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: {} } });
+  await global.loadConfig();
+
+  for (const [text, expected] of [["80", 80], ["1", 1], ["200", 200], ["", 50], ["   ", 50]]) {
+    els.get("#search-web-limit").value = text;
+    assert.strictEqual(global.collectConfig().FNMUSIC_WEB_SEARCH_RESULT_LIMIT, expected, text);
+  }
+  for (const bad of ["0", "201", "-3", "12.5", "abc"]) {
+    els.get("#search-web-limit").value = bad;
+    assert.throws(() => global.collectConfig(), /Web 搜索结果数量必须是 1–200 的整数/, bad);
+  }
+  els.get("#search-web-limit").value = "80";
+});
+
+test("Web 搜索结果数量：旧后端缺 schema 时禁用且不提交未知键", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: "80" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#search-web-limit").disabled, true);
+  assert.strictEqual(els.get("#search-web-limit").value, "80");
+  els.get("#search-web-limit").value = "999"; // 即使无效也不提交，不阻断保存
+  const cfg = global.collectConfig();
+  assert.ok(!("FNMUSIC_WEB_SEARCH_RESULT_LIMIT" in cfg));
+});
+
+test("HTML：搜索设置含 Web 搜索结果数量输入与问号说明", () => {
+  const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+  const field = /<input class="input" id="search-web-limit" type="number" min="1" max="200" step="1"/;
+  assert.ok(field.test(html), "搜索设置卡片应有 #search-web-limit 数字输入（1-200）");
+  const help = html.match(/<template data-help-id="search">[\s\S]*?<\/template>/);
+  assert.ok(help, "搜索设置帮助模板存在");
+  assert.ok(help[0].includes("不会自动请求下一页"), "帮助需说明官方网页单曲不翻页");
+  assert.ok(help[0].includes("适度设置"), "帮助需引导适度设置数值");
+  assert.ok(help[0].includes("不影响 App"), "帮助需说明不影响 App");
+});
+
 test("导航折叠：一级纯折叠不跳页、不标脏，localStorage 记忆状态", async () => {
   reset();
   const storageTitle = els.get("#nav-storage-title");

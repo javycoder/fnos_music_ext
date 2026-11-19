@@ -248,6 +248,16 @@ function lxTimeoutNumber(selector, label) {
   return value;
 }
 
+function webSearchLimitNumber() {
+  const text = $("#search-web-limit").value.trim();
+  if (!text) return 50; // 空白按默认提交，不把清空当成无效编辑
+  const num = Number(text);
+  if (!Number.isInteger(num) || num < 1 || num > 200) {
+    throw new Error("Web 搜索结果数量必须是 1–200 的整数");
+  }
+  return num;
+}
+
 function toast(message, kind) {
   const el = $("#toast");
   el.textContent = message;
@@ -794,6 +804,9 @@ function applyConfigToForm() {
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "30";
   $("#search-deep").checked = v.FNMUSIC_SEARCH_DEEP_PAGE !== "false";
   $("#search-deep-max").value = v.FNMUSIC_SEARCH_DEEP_MAX_PAGES || "10";
+  const webLimitEl = $("#search-web-limit");
+  webLimitEl.disabled = !configSchema.FNMUSIC_WEB_SEARCH_RESULT_LIMIT;
+  webLimitEl.value = v.FNMUSIC_WEB_SEARCH_RESULT_LIMIT || "50";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
   $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
   $("#lx-url").value = "";
@@ -892,6 +905,8 @@ function collectConfig() {
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "30", 10) || 30,
     FNMUSIC_SEARCH_DEEP_PAGE: $("#search-deep").checked,
     FNMUSIC_SEARCH_DEEP_MAX_PAGES: parseInt($("#search-deep-max").value || "10", 10) || 10,
+    ...(configSchema.FNMUSIC_WEB_SEARCH_RESULT_LIMIT
+      ? { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: webSearchLimitNumber() } : {}),
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
@@ -3679,7 +3694,7 @@ DIR_FIELDS.forEach(bindDirField);
 })();
 
 /* -------------------------------------------------------------- 表单脏标记 */
-["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#bind-timeout", "#handoff-max", "#scan-path", "#lx-resolver-timeout", "#lx-url-timeout", "#lx-probe-timeout"].forEach((sel) =>
+["#tee-max", "#llm-base", "#llm-key", "#llm-model", "#liked-refresh-hours", "#liked-size", "#search-timeout", "#search-deep-max", "#search-web-limit", "#bind-timeout", "#handoff-max", "#scan-path", "#lx-resolver-timeout", "#lx-url-timeout", "#lx-probe-timeout"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 ["#llm-liked", "#llm-daily"].forEach((sel) => $(sel).addEventListener("change", () => {
   updateLlmLikedSettings();

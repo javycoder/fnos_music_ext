@@ -150,7 +150,7 @@ _HOT_ENV_KEYS = [
     "musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources",
     "quality_mode", "tee_save_enabled", "tee_save_dir", "tee_cache_max", "cache_dir",
     "recommend_hot", "recommend_daily", "cover_enrich", "llm_base_url", "llm_model",
-    "search_timeout",
+    "search_timeout", "web_search_result_limit",
 ]
 
 
@@ -171,7 +171,7 @@ def conf_guard():
         "FNMUSIC_PUBLIC_PLAYLISTS_SYNC_ALL", "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION",
         "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER",
         "FNMUSIC_LLM_BASE_URL", "FNMUSIC_LLM_API_KEY", "FNMUSIC_LLM_MODEL",
-        "FNMUSIC_SEARCH_TIMEOUT",
+        "FNMUSIC_SEARCH_TIMEOUT", "FNMUSIC_WEB_SEARCH_RESULT_LIMIT",
     ]
     env_snapshot = {k: os.environ.get(k) for k in env_keys}
     yield
@@ -261,6 +261,32 @@ def test_env_hot_reload_ignores_invalid_values(tmp_path, conf_guard):
 
 def test_env_hot_reload_missing_file_noop(tmp_path, conf_guard):
     assert apply_env_hot_reload(str(tmp_path / "nope.env")) == []
+
+
+def test_env_hot_reload_web_search_limit(tmp_path, conf_guard):
+    """FNMUSIC_WEB_SEARCH_RESULT_LIMIT 热重载：合法生效、非法保持、空值恢复默认。"""
+    CONF["web_search_result_limit"] = 50
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_WEB_SEARCH_RESULT_LIMIT=120\n", encoding="utf-8")
+    changed = apply_env_hot_reload(str(env_file))
+    assert "web_search_result_limit" in changed
+    assert CONF["web_search_result_limit"] == 120
+    assert os.environ.get("FNMUSIC_WEB_SEARCH_RESULT_LIMIT") == "120"
+    # 幂等：再跑一次无变化
+    assert apply_env_hot_reload(str(env_file)) == []
+    # 越界值忽略，保持上次有效值
+    env_file.write_text("FNMUSIC_WEB_SEARCH_RESULT_LIMIT=999\n", encoding="utf-8")
+    assert apply_env_hot_reload(str(env_file)) == []
+    assert CONF["web_search_result_limit"] == 120
+    # 非整数值同样忽略
+    env_file.write_text("FNMUSIC_WEB_SEARCH_RESULT_LIMIT=abc\n", encoding="utf-8")
+    assert apply_env_hot_reload(str(env_file)) == []
+    assert CONF["web_search_result_limit"] == 120
+    # 显式空值恢复默认 50
+    env_file.write_text("FNMUSIC_WEB_SEARCH_RESULT_LIMIT=\n", encoding="utf-8")
+    changed = apply_env_hot_reload(str(env_file))
+    assert "web_search_result_limit" in changed
+    assert CONF["web_search_result_limit"] == 50
 
 
 def test_env_hot_reload_cache_dir_migrates_refs(tmp_path, conf_guard):
