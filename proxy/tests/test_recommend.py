@@ -1575,14 +1575,25 @@ async def test_daily_case3_all_users_llm(tmp_path, monkeypatch, order, concurren
 
 def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, monkeypatch):
     """本地随机歌单下发兼容：真实官方 guid 原样穿透（不做 online 伪装），
-    歌单封面取本地曲目官方 coverId 并透传官方静态封面端点。"""
+    封面引用为官方 album_ 前缀形态；上游只认该形态（issue #138 现场），
+    旧版本缓存裸写的封面资源 guid 在下发与取图两条路径都被归一且不回写。"""
     db = tmp_path / "music.db"
     _make_local_db(db, n_tracks=25)
+    # 官方库真实形态：曲目 guid 与封面资源 guid 都是 32hex 且互不相同
+    cover_of = {}
+    con = sqlite3.connect(db)
+    for i in range(1, 26):
+        track_hex, cover_hex = f"{i:032x}", f"{i + 0x8000:032x}"
+        con.execute("UPDATE track SET guid = ?, cover_guid = ? WHERE id = ?", (track_hex, cover_hex, i))
+        cover_of[track_hex] = cover_hex
+    con.commit()
+    con.close()
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "netease_enabled", False)
 
-    cover_calls = {"n": 0, "id": ""}
+    album_refs = {f"album_{cover}" for cover in cover_of.values()}
+    cover_calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -1591,9 +1602,12 @@ def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, mon
         if path.endswith("/playlist/list"):
             return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
         if path == "/music/api/v1/static/cover":
-            cover_calls["n"] += 1
-            cover_calls["id"] = request.url.params.get("coverId")
-            return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"fake", headers={"content-type": "image/png"})
+            cover_id = request.url.params.get("coverId")
+            cover_calls.append(cover_id)
+            # 严格模拟官方：只有 album_ 前缀形态能出图，裸 id 一律 404
+            if cover_id in album_refs:
+                return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"fake", headers={"content-type": "image/png"})
+            return httpx.Response(404)
         return httpx.Response(200, json={"code": 0, "data": None})
 
     app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
@@ -1617,19 +1631,79 @@ def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, mon
         )
         tracks = tracks_resp.json()["data"]["list"]
         assert len(tracks) == dailyrec.PLAYLIST_SIZE
-        # 真实官方 guid 不做伪装，反解即自身；audioSpec 带真实路径与时长
+        # 真实官方 guid 不做伪装，反解即自身；封面引用为官方 album_ 形态
         for t in tracks:
             g = str(t["guid"])
-            assert g.startswith("lt") and resolve_real_guid(g) == g
+            assert g in cover_of and resolve_real_guid(g) == g
+            assert t["coverId"] == f"album_{cover_of[g]}"
+            assert t["album"]["coverId"] == f"album_{cover_of[g]}"
             assert t["audioSpec"]["path"].endswith(".flac")
             assert t["duration"] > 0
             assert t["artists"] and t["artists"][0]["name"]
             assert t["album"]["name"]
 
+        # 单曲封面直达：严格上游只认 album_ 形态，裸 id 会 404
+        for t in tracks[:3]:
+            cover = client.get("/music/api/v1/static/cover", params={"coverId": t["coverId"]})
+            assert cover.status_code == 200
+            assert cover.content.startswith(b"\x89PNG\r\n\x1a\n")
+        # 歌单封面：候选取本地曲目官方 coverId 并透传官方静态封面端点
         cover = client.get("/music/api/v1/static/cover", params={"coverId": daily["coverId"]})
         assert cover.status_code == 200
-        assert cover_calls["n"] == 1
-        assert cover_calls["id"] in {track["coverId"] for track in tracks}
+        assert cover.content.startswith(b"\x89PNG\r\n\x1a\n")  # 真图而非占位图
+        assert cover_calls[-1] in {track["coverId"] for track in tracks}
+
+        # issue #138：升级前旧缓存裸写封面资源 guid —— 磁盘改回裸值后，
+        # 下发与取图仍应是 album_ 形态，且缓存文件不被回写
+        stale_path = dailyrec.cache_path("u1", dailyrec.today_key())
+        with open(stale_path, encoding="utf-8") as f:
+            stale = json.load(f)
+        assert stale["tracks"]
+        for t in stale["tracks"]:
+            for holder in (t, t.get("album") if isinstance(t.get("album"), dict) else None):
+                if holder and str(holder.get("coverId") or "").startswith("album_"):
+                    holder["coverId"] = str(holder["coverId"])[len("album_"):]
+        with open(stale_path, "w", encoding="utf-8") as f:
+            json.dump(stale, f, ensure_ascii=False)
+
+        tracks_resp = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": daily["guid"], "page": 1, "size": 50},
+        )
+        tracks = tracks_resp.json()["data"]["list"]
+        assert all(t["coverId"] == f"album_{cover_of[str(t['guid'])]}" for t in tracks)
+        cover_calls.clear()
+        cover = client.get("/music/api/v1/static/cover", params={"coverId": daily["coverId"]})
+        assert cover.status_code == 200
+        assert cover.content.startswith(b"\x89PNG\r\n\x1a\n")  # 裸候选会全 404 落到占位图
+        assert cover_calls[-1] in {track["coverId"] for track in tracks}
+        with open(stale_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        assert all(not str(t.get("coverId") or "").startswith("album_") for t in disk["tracks"])
+
+
+def test_normalize_recommend_local_covers_scopes_and_copy():
+    """issue #138 归一化：只补本地行裸 32hex 封面引用，其余原样，且不改入参。"""
+    guid, cover = "a" * 32, "b" * 32
+    stale = {"guid": guid, "source": "local", "coverId": cover,
+             "album": {"guid": "c" * 32, "name": "专辑", "coverId": cover}}
+    fixed = dailyrec.normalize_recommend_local_covers([stale])
+    assert fixed[0]["coverId"] == f"album_{cover}"
+    assert fixed[0]["album"]["coverId"] == f"album_{cover}"
+    # 入参对象与嵌套 album 不被修改
+    assert stale["coverId"] == cover
+    assert stale["album"]["coverId"] == cover
+
+    keep = [
+        {"guid": guid, "source": "local", "coverId": guid},              # 无封面回落形态（等于曲目 guid）
+        {"guid": guid, "source": "local", "coverId": f"album_{cover}"},  # 已是官方形态
+        {"guid": guid, "source": "local", "coverId": ""},                # 空值
+        {"guid": "online:wy:1", "coverId": "online:wy:1"},               # 在线行
+        {"guid": guid, "coverId": cover},                                # 未标记本地的行
+        {"guid": "lt1", "source": "local", "coverId": "cover1"},         # 非 32hex 官方 guid
+        "not-a-dict",
+    ]
+    assert dailyrec.normalize_recommend_local_covers(keep) == keep
 
 
 def test_invalidate_today_cache_all_users(tmp_path):

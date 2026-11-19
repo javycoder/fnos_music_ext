@@ -11873,7 +11873,8 @@ async def static_cover(request: Request, subpath: str = ""):
             cached = await _load_requested_playlist_bundle(request, user_guid, playlist_kind, guid)
         else:
             cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
-        tracks = (cached or {}).get("tracks") or []
+        # issue #138：历史缓存里的裸封面引用先归一（副本），候选封面才是官方形态
+        tracks = dailyrec.normalize_recommend_local_covers((cached or {}).get("tracks") or [])
         response = await _playlist_cover_response(request, guid, tracks)
         response.headers["Cache-Control"] = "private, no-store"
         return response
@@ -13550,6 +13551,8 @@ async def playlist_track_list(request: Request):
         return auth_resp
     bundle = await _load_requested_playlist_bundle(request, user_guid, kind, guid)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    # issue #138：旧缓存可能裸写封面资源 guid，下发前统一归一为 album_ 形态
+    tracks = dailyrec.normalize_recommend_local_covers(tracks)
     register_online_meta(tracks)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)

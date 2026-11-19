@@ -306,6 +306,40 @@ def test_playlist_cover_and_no_cover_fallback(client, library, monkeypatch):
     assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 200
 
 
+def test_stale_liked_cache_cover_refs_normalized(client, library):
+    """issue #138：liked.json 旧版裸写的封面引用在下发时归一为 album_ 形态，缓存不回写。"""
+    test_client, _ = client
+    guid = rec.recommend_playlist_guid("liked", user_guid="u1")
+    # 官方库真实形态：曲目 guid 与封面资源 guid 均为 32hex 且互不相同
+    for i in range(1, 51):
+        edit(library, "UPDATE track SET guid = ?, cover_guid = ? WHERE id = ?",
+             (f"{i:032x}", f"{i + 0x9000:032x}", i))
+
+    listing = test_client.get("/music/api/v1/track/playlist-detail/list",
+                              params={"playlistGUID": guid, "size": -1}).json()["data"]
+    tracks = listing["list"]
+    assert tracks and all(str(t["coverId"]).startswith("album_") for t in tracks)
+    expected = {t["guid"]: t["coverId"] for t in tracks}
+
+    path = cache_path()
+    with open(path, encoding="utf-8") as f:
+        stale = json.load(f)
+    for t in stale["tracks"]:
+        t["coverId"] = str(t["coverId"])[len("album_"):]
+        if isinstance(t.get("album"), dict):
+            t["album"]["coverId"] = str(t["album"]["coverId"])[len("album_"):]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(stale, f, ensure_ascii=False)
+
+    listing = test_client.get("/music/api/v1/track/playlist-detail/list",
+                              params={"playlistGUID": guid, "size": -1}).json()["data"]
+    assert {t["guid"]: t["coverId"] for t in listing["list"]} == expected
+    assert test_client.get("/music/api/v1/static/cover", params={"coverId": guid}).status_code == 200
+    with open(path, encoding="utf-8") as f:
+        disk = json.load(f)
+    assert all(not str(t.get("coverId")).startswith("album_") for t in disk["tracks"])
+
+
 def test_order_independent_of_other_recommendation_switches(client, monkeypatch):
     from proxy import app as proxy_app
 

@@ -741,6 +741,65 @@ def build_local_track(row: dict) -> dict:
     }
 
 
+# 官方封面引用的类型前缀（app.py _official_cover_file_response 同款口径）
+_COVER_REF_PREFIXES = ("track_", "album_", "artist_", "playlist_")
+_BARE_OFFICIAL_GUID = re.compile(r"[0-9a-f]{32}\Z", re.IGNORECASE)
+
+
+def _normalize_bare_cover_ref(value: str, track_guid: str) -> str:
+    """旧格式裸封面资源引用 → album_ 前缀形态；其余情况原样返回。
+
+    只把“裸 32hex 且不等于曲目自身 guid”视为旧版本裸写的封面资源 guid
+    （等于曲目 guid 的裸值是无封面回落形态，与官方自建歌单一致，不臆改）。
+    """
+    ref = str(value or "")
+    if (not ref or ref.startswith(_COVER_REF_PREFIXES)
+            or not _BARE_OFFICIAL_GUID.fullmatch(ref)):
+        return ref
+    if ref.lower() == track_guid.lower():
+        return ref
+    return "album_" + ref.lower()
+
+
+def normalize_recommend_local_covers(tracks: list[dict]) -> list[dict]:
+    """issue #138：推荐歌单本地曲目历史裸 coverId 的响应期归一化。
+
+    旧版本 build_local_track 把封面资源 guid 裸写在 track.coverId /
+    album.coverId；官方封面端点按类型前缀定位资源，裸 id 直读未命中后
+    透传官方必失败。升级当日的每日推荐缓存/回退 bundle、猜你喜欢
+    liked.json 与 LLM 持久批次都可能仍是旧格式，且各缓存有自己的生命周期，
+    读取路径统一归一最稳。规则：仅处理“本地行 + 官方 32hex guid”的曲目，
+    裸 32hex 封面引用补 album_ 前缀（track 与 album 两处）；在线伪装 id、
+    官方前缀形态、空值、无封面回落形态一律原样。返回副本，不修改传入
+    对象、不回写缓存。
+    """
+    out: list[dict] = []
+    for t in tracks or []:
+        if not isinstance(t, dict):
+            out.append(t)
+            continue
+        guid = str(t.get("guid") or "")
+        is_local_row = (str(t.get("source") or "") == "local") or (t.get("is_local") is True)
+        if not (is_local_row and _BARE_OFFICIAL_GUID.fullmatch(guid)):
+            out.append(t)
+            continue
+        cover = str(t.get("coverId") or "")
+        new_cover = _normalize_bare_cover_ref(cover, guid)
+        album = t.get("album")
+        album_cover = str(album.get("coverId") or "") if isinstance(album, dict) else ""
+        new_album_cover = _normalize_bare_cover_ref(album_cover, guid) if isinstance(album, dict) else ""
+        if new_cover == cover and new_album_cover == album_cover:
+            out.append(t)
+            continue
+        item = dict(t)
+        if new_cover != cover:
+            item["coverId"] = new_cover
+        if new_album_cover != album_cover:
+            item["album"] = {**album, "coverId": new_album_cover}
+        out.append(item)
+    return out
+
+
 def _item_title_artist(item: dict) -> tuple[str, str]:
     track = item.get("track") if isinstance(item.get("track"), dict) else item
     title = str(track.get("title") or track.get("name") or "").strip()
