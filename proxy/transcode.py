@@ -738,11 +738,19 @@ def tail_start_index(filename: str) -> int | None:
 
 
 async def wait_file(path: str, sess: Session | None, timeout: float = 30.0) -> str | None:
-    """等分片落盘（temp_file 改名后出现即完整）；会话失败立即返回。"""
+    """等完整 HLS 文件落盘；会话失败立即返回。
+
+    ffmpeg 的 temp_file 只覆盖媒体分片，不覆盖 init.mp4；首个分片原子
+    发布后初始化文件才必然写完，避免读取空文件或不完整的 MP4 头。
+    """
     deadline = time.monotonic() + timeout
+    init_file = bool(sess and os.path.basename(path) == INIT_NAME)
     while True:
         if os.path.isfile(path):
-            return path
+            if not init_file or os.path.isfile(os.path.join(sess.directory, "00000.m4s")):
+                return path
+            if sess.status == "done":
+                return None  # 完成的缓存缺少首片，不会再有写入
         if sess and sess.exit_event.is_set() and sess.status != "done":
             return None
         if time.monotonic() >= deadline:

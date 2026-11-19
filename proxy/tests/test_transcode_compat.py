@@ -50,7 +50,13 @@ if "-hls_segment_filename" in args:
     hls_time = float(args[args.index("-hls_time") + 1])
     os.makedirs(segdir, exist_ok=True)
     with open(os.path.join(segdir, "init.mp4"), "wb") as f:
-        f.write(b"ftypinit" * 4)
+        if mode == "init_partial_delay":
+            f.write(b"ftyp")
+            f.flush()
+            time.sleep(1.0)
+            f.write(b"init" + b"ftypinit" * 3)
+        else:
+            f.write(b"ftypinit" * 4)
     n = int(os.environ.get("FAKE_FFMPEG_SEGMENTS", "40"))
     for i in range(n):
         with open(os.path.join(segdir, "%05d.m4s" % i), "wb") as f:
@@ -579,6 +585,34 @@ def test_wait_file_returns_path_and_none_on_failure(tmp_path, fake_ffmpeg):
     assert yes == existing
 
 
+def test_wait_init_until_first_atomic_segment_is_ready(tmp_path):
+    """ffmpeg 直接写 init.mp4，不能把文件存在当成初始化内容完整。"""
+    init = tmp_path / tc.INIT_NAME
+    init.write_bytes(b"ftyp")  # 模拟 init 已创建但尚未完整写入
+    sess = tc.Session(guid=FAKE_KUWO, directory=str(tmp_path), duration_s=100,
+                      hls_time=10, declared_count=10, status="running")
+
+    async def flow():
+        task = asyncio.create_task(tc.wait_file(str(init), sess, timeout=2))
+        await asyncio.sleep(0.35)
+        assert not task.done()
+        init.write_bytes(b"ftypinit")
+        (tmp_path / "00000.m4s").write_bytes(b"moofseg")
+        assert await task == str(init)
+
+    asyncio.run(flow())
+
+
+@pytest.mark.parametrize("status", ["failed", "done"])
+def test_wait_init_missing_first_segment_fails_closed(tmp_path, status):
+    init = tmp_path / tc.INIT_NAME
+    init.write_bytes(b"ftyp")
+    sess = tc.Session(guid=FAKE_KUWO, directory=str(tmp_path), duration_s=100,
+                      hls_time=10, declared_count=10, status=status)
+    sess.exit_event.set()
+    assert asyncio.run(tc.wait_file(str(init), sess, timeout=0.5)) is None
+
+
 def test_quit_session_kills_and_removes_halfway(tmp_path, fake_ffmpeg):
     fake_ffmpeg("hang")
     src = str(tmp_path / "in.mp3")
@@ -726,6 +760,19 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
         assert "tail-" not in complete
         quit_resp = client.post("/music/api/v1/track/transcode/quit", json={"guid": FAKE_KUWO})
         assert quit_resp.status_code == 200
+
+
+def test_hls_init_waits_for_complete_header(env, fake_ffmpeg):
+    fake_ffmpeg("init_partial_delay", segments=27)
+    with TestClient(app) as client:
+        resp = client.post("/music/api/v1/track/transcode", json={"guid": FAKE_KUWO})
+        assert resp.status_code == 200
+        body = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8").text
+        import re
+        token = re.search(r'URI="([a-f0-9]{32})__init.mp4"', body)[1]
+        init = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/{token}__init.mp4")
+        assert init.status_code == 200
+        assert init.content == b"ftypinit" * 4
 
 
 def test_hls_stub_fallback_without_ffmpeg(env):
