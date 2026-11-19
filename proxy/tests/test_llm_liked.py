@@ -367,7 +367,7 @@ async def test_persistent_first_fetch_refresh_retry_and_stale_ack(setup, monkeyp
     assert lr.load_llm_bundle("u1")["firstFetchedAt"] == 0
     assert lr.llm_build_due("u1", fingerprint, fetched)
     assert Path(lr._liked_path("u1")).parent.name == hashlib.sha256(b"u1").hexdigest()
-    assert "secret" not in Path(lr._liked_path("u1")).read_text()
+    assert "secret" not in Path(lr._liked_path("u1")).read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
