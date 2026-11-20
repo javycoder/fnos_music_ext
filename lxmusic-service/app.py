@@ -42,6 +42,8 @@ from lxserver_client import (
     UnsafeVmRequired,
     is_lxserver_unreachable,
     map_lxserver_song,
+    normalize_catalog_album,
+    normalize_catalog_artist,
     normalize_source,
     parse_interval_to_seconds,
     SourceOperationBusy,
@@ -188,6 +190,11 @@ LXSERVER = ManagedLxServerClient(
 
 # 内存曲目缓存: id -> {"item": dict, "ts": float}
 _SONG_CACHE: dict[str, dict] = {}
+_CATALOG_CACHE: dict[tuple, dict] = {}
+_CATALOG_INFLIGHT: dict[tuple, asyncio.Task] = {}
+_CATALOG_CACHE_TTL_S = 120.0
+_CATALOG_CACHE_ERR_TTL_S = 5.0
+_CATALOG_CACHE_MAX = 64
 # 播放直链缓存: (canonical_id, tier) -> {"data": dict | None, "ts": float}；data=None 为失败负缓存
 _URL_CACHE: dict[tuple[str, str], dict] = {}
 # 同键在途解析合并：key -> Future（与 musicdl SingleFlight 同型的 shielded-future 去重）
@@ -2106,6 +2113,197 @@ async def search_tracks(
     if isinstance(gate_res, Exception):
         return _err(f"search failed: {gate_res}", 500)
     return gate_res
+
+
+def _catalog_sources(raw: str = "") -> list[str]:
+    wanted = [normalize_source(value) for value in str(raw or "").split(",") if value.strip()]
+    if not wanted:
+        wanted = [normalize_source(value) for value in CONF["sources"]]
+    return [value for value in dict.fromkeys(wanted) if value in ("tx", "wy")]
+
+
+async def _catalog_cached(key: tuple, loader):
+    now = time.monotonic()
+    entry = _CATALOG_CACHE.get(key)
+    if entry is not None and now < entry.get("expires", 0.0):
+        return entry["value"]
+    task = _CATALOG_INFLIGHT.get(key)
+    if task is None:
+        task = asyncio.create_task(loader())
+        _CATALOG_INFLIGHT[key] = task
+    try:
+        value = await asyncio.shield(task)
+    finally:
+        if task.done() and _CATALOG_INFLIGHT.get(key) is task:
+            _CATALOG_INFLIGHT.pop(key, None)
+    ttl = _CATALOG_CACHE_TTL_S if value else _CATALOG_CACHE_ERR_TTL_S
+    _CATALOG_CACHE[key] = {"value": value, "expires": time.monotonic() + ttl}
+    while len(_CATALOG_CACHE) > _CATALOG_CACHE_MAX:
+        _CATALOG_CACHE.pop(next(iter(_CATALOG_CACHE)))
+    return value
+
+
+async def _artist_songs_cached(source: str, artist_id: str, order: str) -> list[dict]:
+    key = ("artist-tracks", source, artist_id, order)
+
+    async def load():
+        rows = await LXSERVER.get_artist_songs(source, artist_id, order)
+        items = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            item = map_lxserver_song(raw, fallback_source=source)
+            LXSERVER.cache_song_info(item["id"], raw)
+            _cache_put(item)
+            items.append(item)
+        return items
+
+    return await _catalog_cached(key, load)
+
+
+async def _album_songs_cached(source: str, album_id: str) -> dict:
+    key = ("album-tracks", source, album_id)
+
+    async def load():
+        data = await LXSERVER.get_album_songs(source, album_id)
+        items = []
+        for raw in data.get("list") or []:
+            if not isinstance(raw, dict):
+                continue
+            item = map_lxserver_song(raw, fallback_source=source)
+            LXSERVER.cache_song_info(item["id"], raw)
+            _cache_put(item)
+            items.append(item)
+        return {
+            "items": items,
+            "album": {
+                "id": album_id,
+                "name": str(data.get("name") or ""),
+                "artist_id": str(data.get("artistId") or ""),
+                "artist": str(data.get("artistName") or ""),
+                "cover_url": str(data.get("picUrl") or data.get("img") or ""),
+                "publish_time": data.get("publishTime") or "",
+                "description": str(data.get("desc") or ""),
+            },
+        }
+
+    return await _catalog_cached(key, load)
+
+
+@app.get("/api/v1/catalog/search")
+async def catalog_search(
+    kind: str = Query("artist", pattern="^(artist|album)$"),
+    keyword: str = Query("", alias="keyword"),
+    q: str = Query("", alias="q"),
+    sources: str = Query(""),
+    limit: int = Query(16, ge=1, le=50),
+    page: int = Query(1, ge=1),
+):
+    """内部歌手/专辑搜索；只覆盖 lxserver 原生支持的 tx/wy。"""
+    kw = (keyword or q or "").strip()
+    wanted = _catalog_sources(sources)
+    if not kw or not wanted:
+        return {"ok": True, "items": [], "errors": {}, "sources": wanted, "total": 0}
+
+    async def one(src: str):
+        try:
+            data = await LXSERVER.search_catalog(kw, kind, src, page=page, limit=limit)
+            rows = data.get("list") or []
+            normalize = normalize_catalog_artist if kind == "artist" else normalize_catalog_album
+            items = [item for row in rows if isinstance(row, dict)
+                     for item in [normalize(row, src)] if item]
+            return src, items, int(data.get("total") or len(items)), None
+        except Exception as exc:
+            return src, [], 0, exc
+
+    results = await asyncio.gather(*(one(src) for src in wanted))
+    items: list[dict] = []
+    errors: dict[str, str] = {}
+    total = 0
+    for _src, rows, part_total, error in results:
+        if isinstance(error, Exception):
+            errors[_src] = str(error)
+            continue
+        total += part_total
+        items.extend(rows)
+    return {"ok": True, "items": items, "errors": errors, "sources": wanted,
+            "total": max(total, len(items))}
+
+
+@app.get("/api/v1/catalog/artist")
+async def catalog_artist(
+    source: str = Query(...),
+    id: str = Query(..., alias="id"),
+):
+    src = normalize_source(source)
+    if src not in ("tx", "wy") or not id:
+        return _err("unsupported catalog source or artist id", 400)
+    try:
+        data = await LXSERVER.get_artist_detail(src, id)
+    except Exception as exc:
+        return _err(f"artist detail failed: {exc}", 502)
+    artist = normalize_catalog_artist(
+        {"id": id, **data, "name": data.get("name"), "picUrl": data.get("avatar"),
+         "musicSize": data.get("musicSize"), "albumSize": data.get("albumSize")},
+        src,
+    )
+    if not artist:
+        return _err("artist detail invalid", 502)
+    artist["desc"] = str(data.get("desc") or "")
+    return {"ok": True, "artist": artist}
+
+
+@app.get("/api/v1/catalog/artist/tracks")
+async def catalog_artist_tracks(
+    source: str = Query(...),
+    id: str = Query(..., alias="id"),
+    order: str = Query("hot"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+):
+    src = normalize_source(source)
+    if src not in ("tx", "wy") or not id:
+        return _err("unsupported catalog source or artist id", 400)
+    try:
+        items = await _artist_songs_cached(src, id, "time" if order == "time" else "hot")
+    except Exception as exc:
+        return _err(f"artist songs failed: {exc}", 502)
+    start = (page - 1) * limit
+    return {"ok": True, "items": items[start:start + limit], "total": len(items)}
+
+
+@app.get("/api/v1/catalog/artist/albums")
+async def catalog_artist_albums(
+    source: str = Query(...),
+    id: str = Query(..., alias="id"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=100),
+):
+    src = normalize_source(source)
+    if src not in ("tx", "wy") or not id:
+        return _err("unsupported catalog source or artist id", 400)
+    try:
+        data = await LXSERVER.get_artist_albums(src, id, page=page)
+    except Exception as exc:
+        return _err(f"artist albums failed: {exc}", 502)
+    items = [item for row in (data.get("list") or []) if isinstance(row, dict)
+             for item in [normalize_catalog_album(row, src)] if item][:limit]
+    return {"ok": True, "items": items, "total": int(data.get("total") or len(items))}
+
+
+@app.get("/api/v1/catalog/album")
+async def catalog_album(
+    source: str = Query(...),
+    id: str = Query(..., alias="id"),
+):
+    src = normalize_source(source)
+    if src not in ("tx", "wy") or not id:
+        return _err("unsupported catalog source or album id", 400)
+    try:
+        data = await _album_songs_cached(src, id)
+    except Exception as exc:
+        return _err(f"album songs failed: {exc}", 502)
+    return {"ok": True, "album": data["album"], "items": data["items"], "total": len(data["items"])}
 
 
 # 免登录榜单目标：平台 -> (榜单名, bangid 内置回退值)。

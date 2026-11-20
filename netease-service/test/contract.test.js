@@ -13,7 +13,7 @@ function makeRequest(app, method, urlPath, headers = {}, body = null) {
       const req = http.request({
         host: '127.0.0.1',
         port,
-        path: urlPath,
+        path: encodeURI(urlPath),
         method,
         headers: {
           ...headers,
@@ -85,6 +85,9 @@ test('Quality slots and lyric cleaning functions', () => {
   assert.strictEqual(mapped.name, 'Song A');
   assert.strictEqual(mapped.artist, 'Artist A');
   assert.strictEqual(mapped.album_name, 'Album A');
+  assert.deepStrictEqual(mapped.artists, [{ id: 0, name: 'Artist A' }]);
+  assert.strictEqual(mapped.artist_id, 0);
+  assert.strictEqual(mapped.album_id, 0);
   assert.strictEqual(mapped.duration_ms, 240000);
   assert.strictEqual(mapped.maxbr, 999000);
   assert.strictEqual(mapped.has_sq, true);
@@ -97,6 +100,56 @@ test('Quality slots and lyric cleaning functions', () => {
   const rawLrc = '{"t":0,"c":[{"tx":"作词: "}]}\n[00:10.00]Line 1\n{"t":2000,"c":[{"tx":"作曲: "}]}\n[00:20.00]Line 2';
   const cleaned = cleanLyric(rawLrc);
   assert.strictEqual(cleaned, '[00:10.00]Line 1\n[00:20.00]Line 2');
+});
+
+test('GET /api/v1 artist search and detail contracts expose native IDs', async () => {
+  const mockSdk = {
+    cloudsearch: async ({ keywords, type }) => {
+      assert.strictEqual(keywords, '周杰伦');
+      assert.strictEqual(type, 100);
+      return { body: { result: { artists: [{
+        id: 6458, name: '周杰伦', picUrl: 'http://pic/artist.jpg',
+        alias: ['Jay'], albumSize: 20, musicSize: 300,
+      }] } } };
+    },
+    artist_songs: async ({ id, limit, offset, order }) => {
+      assert.strictEqual(id, 6458);
+      assert.strictEqual(limit, 20);
+      assert.strictEqual(offset, 0);
+      assert.strictEqual(order, 'hot');
+      return { body: { total: 1, songs: [{
+        id: 186016, name: '晴天', ar: [{ id: 6458, name: '周杰伦' }],
+        al: { id: 3920, name: '叶惠美', picUrl: 'http://pic/album.jpg' }, dt: 269000,
+      }], privileges: [] } };
+    },
+    artist_album: async ({ id, limit, offset }) => {
+      assert.strictEqual(id, 6458);
+      assert.strictEqual(limit, 20);
+      assert.strictEqual(offset, 0);
+      return { body: { artist: { albumSize: 1 }, hotAlbums: [{
+        id: 3920, name: '叶惠美', picUrl: 'http://pic/album.jpg',
+        artists: [{ id: 6458, name: '周杰伦' }], size: 10, publishTime: 1000,
+      }] } };
+    },
+  };
+  const service = createService({ sdk: mockSdk });
+
+  const search = await makeRequest(service.app, 'GET', '/api/v1/search?keyword=周杰伦&type=artist');
+  assert.strictEqual(search.body.data[0].id, 6458);
+  assert.strictEqual(search.body.data[0].musicSize, 300);
+
+  const tracks = await makeRequest(
+    service.app, 'GET', '/api/v1/artist/6458/tracks?limit=20&offset=0&order=hot');
+  assert.strictEqual(tracks.body.total, 1);
+  assert.strictEqual(tracks.body.data[0].artist_id, 6458);
+  assert.strictEqual(tracks.body.data[0].album_id, 3920);
+  assert.deepStrictEqual(tracks.body.data[0].artists, [{ id: 6458, name: '周杰伦' }]);
+
+  const albums = await makeRequest(
+    service.app, 'GET', '/api/v1/artist/6458/albums?limit=20&offset=0');
+  assert.strictEqual(albums.body.total, 1);
+  assert.strictEqual(albums.body.data[0].id, 3920);
+  assert.strictEqual(albums.body.data[0].artistName, '周杰伦');
 });
 
 test('GET /healthz returns netease provider and upstream version offline', async () => {

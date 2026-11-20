@@ -54,11 +54,18 @@ function mapSongDetail(item, privilege = null) {
   const sid = item.id || item.song_id || 0;
   const songId = nonnegativeIntOrZero(sid);
   const name = String(item.name || item.title || item.song_name || '');
+  const rawArtists = Array.isArray(item.ar)
+    ? item.ar
+    : (Array.isArray(item.artists) ? item.artists : []);
+  const artists = rawArtists
+    .filter(a => a && a.name)
+    .map(a => ({
+      id: nonnegativeIntOrZero(a.id),
+      name: String(a.name),
+    }));
   let artist = '';
-  if (Array.isArray(item.ar)) {
-    artist = item.ar.filter(a => a && a.name).map(a => String(a.name)).join(' / ');
-  } else if (Array.isArray(item.artists)) {
-    artist = item.artists.filter(a => a && a.name).map(a => String(a.name)).join(' / ');
+  if (artists.length > 0) {
+    artist = artists.map(a => a.name).join(' / ');
   } else if (item.artist) {
     artist = String(item.artist);
   }
@@ -72,7 +79,10 @@ function mapSongDetail(item, privilege = null) {
     song_id: songId,
     name,
     artist,
+    artists,
+    artist_id: artists.length > 0 ? artists[0].id : 0,
     album_name: albumName,
+    album_id: nonnegativeIntOrZero(al.id || item.album_id || 0),
     album_pic_url: albumPicUrl,
     duration_ms: durationMs,
     has_sq: Boolean(item.sq),
@@ -683,7 +693,14 @@ function createService(options = {}) {
         return res.json({ ok: true, code: 200, data: albums });
       }
       if (typeStr === 'artist') {
-        const artists = Array.isArray(result.artists) ? result.artists : [];
+        const artists = (Array.isArray(result.artists) ? result.artists : []).map(a => ({
+          id: nonnegativeIntOrZero(a.id),
+          name: String(a.name || ''),
+          picUrl: String(a.picUrl || a.img1v1Url || ''),
+          alias: Array.isArray(a.alias) ? a.alias : [],
+          albumSize: nonnegativeIntOrZero(a.albumSize),
+          musicSize: nonnegativeIntOrZero(a.musicSize),
+        })).filter(a => a.id && a.name);
         return res.json({ ok: true, code: 200, data: artists });
       }
       if (typeStr === 'playlist') {
@@ -816,6 +833,65 @@ function createService(options = {}) {
         data: hotSongs,
         artist: body.artist || {},
         hotSongs,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // 7.1 Artist tracks (native paging; proxy maps to official artistGUID lists)
+  app.get('/api/v1/artist/:artist_id/tracks', async (req, res, next) => {
+    try {
+      const artistId = nonnegativeIntOrZero(req.params.artist_id);
+      if (!artistId) return res.status(400).json({ detail: 'Invalid artist_id' });
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+      const order = String(req.query.order || 'hot').trim() === 'time' ? 'time' : 'hot';
+      const cookie = getCookieString();
+
+      const resp = await sdk.artist_songs({ id: artistId, limit, offset, order, cookie, timeout: timeoutMs });
+      const body = resp && resp.body ? resp.body : {};
+      const songs = Array.isArray(body.songs) ? body.songs : [];
+      const privileges = Array.isArray(body.privileges) ? body.privileges : [];
+      const privilegeMap = new Map(privileges.map(p => [Number(p && p.id), p]));
+      const data = songs.map(song => mapSongDetail(song, privilegeMap.get(Number(song.id))));
+      return res.json({
+        ok: true,
+        code: 200,
+        data,
+        total: nonnegativeIntOrZero(body.total) || data.length,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // 7.2 Artist albums (native paging)
+  app.get('/api/v1/artist/:artist_id/albums', async (req, res, next) => {
+    try {
+      const artistId = nonnegativeIntOrZero(req.params.artist_id);
+      if (!artistId) return res.status(400).json({ detail: 'Invalid artist_id' });
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+      const cookie = getCookieString();
+
+      const resp = await sdk.artist_album({ id: artistId, limit, offset, cookie, timeout: timeoutMs });
+      const body = resp && resp.body ? resp.body : {};
+      const albums = Array.isArray(body.hotAlbums) ? body.hotAlbums : [];
+      const data = albums.map(album => ({
+        id: nonnegativeIntOrZero(album.id),
+        name: String(album.name || ''),
+        picUrl: String(album.picUrl || ''),
+        artistName: (Array.isArray(album.artists) ? album.artists : [])
+          .filter(a => a && a.name).map(a => String(a.name)).join(' / '),
+        size: nonnegativeIntOrZero(album.size),
+        publishTime: nonnegativeIntOrZero(album.publishTime),
+      })).filter(album => album.id && album.name);
+      return res.json({
+        ok: true,
+        code: 200,
+        data,
+        total: nonnegativeIntOrZero(body.artist && body.artist.albumSize) || data.length,
       });
     } catch (err) {
       next(err);
