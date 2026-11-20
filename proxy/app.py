@@ -11861,6 +11861,69 @@ async def _online_cover_delivery(cover: str, guid: str = "") -> Response | None:
 
 _COVER_UNRESOLVED_SEEN: set[str] = set()
 
+# 裸曲目 guid → 专辑封面资源引用的归位缓存（issue #138 后续：无内嵌图曲目的
+# 封面引用被构建器回落成曲目自身 guid，官方封面按类型前缀定位资源，裸 id
+# 直读与透传都无法命中；官方口径是引用专辑的封面资源——同专辑任一有
+# 内嵌图曲目的 cover_guid）。
+_ALBUM_COVER_HEAL_TTL_S = 600.0
+_ALBUM_COVER_HEAL_MAX = 4096
+_ALBUM_COVER_HEAL_CACHE: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
+
+
+def _album_cover_heal_ref(value: str) -> str:
+    """裸曲目 guid → 专辑封面资源引用（album_ 前缀）；其余形态或查不到返回 ""。
+
+    只处理裸 32hex：带类型前缀（track_/album_/...）的引用与在线伪装 id 各有
+    归属，不在此列。只读官方库（track.album_id 关联同专辑任一有内嵌图且未
+    删除的曲目取其 cover_guid）；结果带 TTL 缓存（命中与未命中都缓存，避免
+    重复扫描），全专辑无封面返回 ""（维持原有占位行为，不臆造引用）。
+    """
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", raw, re.IGNORECASE):
+        return ""
+    key = raw.lower()
+    now = time.monotonic()
+    cached = _ALBUM_COVER_HEAL_CACHE.get(key)
+    if cached is not None:
+        if cached[0] > now:
+            return cached[1]
+        _ALBUM_COVER_HEAL_CACHE.pop(key, None)
+    path = str(CONF.get("music_db") or dailyrec.music_db_path())
+    if not path:
+        return ""
+    row = None
+    try:
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    try:
+        with musicdb.privileged_read():
+            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
+                row = con.execute(
+                    """
+                    SELECT s.cover_guid
+                      FROM track t
+                      JOIN track s ON s.album_id = t.album_id
+                     WHERE t.guid = ? COLLATE NOCASE
+                       AND t.is_admin_deleted = 0 AND t.is_audio_file_deleted = 0
+                       AND s.cover_guid IS NOT NULL AND s.cover_guid != ''
+                       AND s.is_admin_deleted = 0 AND s.is_audio_file_deleted = 0
+                     LIMIT 1
+                    """, (raw,)).fetchone()
+    except Exception as exc:
+        logger.debug("album cover heal query failed: %s", type(exc).__name__)
+        return ""
+    cover_guid = str((row or (None,))[0] or "").strip()
+    ref = f"album_{cover_guid}" if cover_guid else ""
+    if len(_ALBUM_COVER_HEAL_CACHE) >= _ALBUM_COVER_HEAL_MAX:
+        expired = [k for k, (exp, _) in _ALBUM_COVER_HEAL_CACHE.items() if exp <= now]
+        for k in expired:
+            _ALBUM_COVER_HEAL_CACHE.pop(k, None)
+        while len(_ALBUM_COVER_HEAL_CACHE) >= _ALBUM_COVER_HEAL_MAX:
+            _ALBUM_COVER_HEAL_CACHE.popitem(last=False)
+    _ALBUM_COVER_HEAL_CACHE[key] = (now + _ALBUM_COVER_HEAL_TTL_S, ref)
+    return ref
+
 
 async def _playlist_cover_response(request: Request, guid: str, tracks: list,
                                    cover_url: str = "") -> Response:
@@ -11893,6 +11956,13 @@ async def _playlist_cover_response(request: Request, guid: str, tracks: list,
                 else:
                     size = request.query_params.get("size")
                     response = _official_cover_file_response(value, size)
+                    if response is None:
+                        # 裸曲目 guid（无内嵌图回落形态）：归位到专辑封面资源再试。
+                        # 归位成功后续透传官方也用带前缀引用（官方按前缀定位资源）。
+                        healed = _album_cover_heal_ref(value)
+                        if healed:
+                            value = healed
+                            response = _official_cover_file_response(value, size)
                     if response is None:
                         params = {"coverId": value}
                         if size:
@@ -11985,6 +12055,28 @@ async def static_cover(request: Request, subpath: str = ""):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
             return local_resp
+        # 裸曲目 guid（无内嵌图回落形态）：归位到专辑封面资源。官方封面按
+        # 类型前缀定位资源，裸 id 直读未命中后透传官方必失败；同专辑任一有
+        # 内嵌图曲目的封面资源才是官方口径的正确引用。
+        healed_ref = _album_cover_heal_ref(guid)
+        if healed_ref:
+            size = request.query_params.get("size")
+            healed_resp = _official_cover_file_response(healed_ref, size)
+            if healed_resp is not None:
+                return healed_resp
+            try:
+                params = {"coverId": healed_ref}
+                if size:
+                    params["size"] = size
+                fetched = await get_upstream_client(request.app).get(
+                    "/music/api/v1/static/cover", params=params,
+                    headers=copy_incoming_headers(request),
+                )
+                mime = _sniff_image_mime(fetched.content)
+                if fetched.status_code == 200 and mime:
+                    return Response(content=fetched.content, media_type=mime)
+            except (TimeoutError, httpx.HTTPError):
+                pass
         # 32hex 且不在伪装反查表、官方封面文件也未命中：伪装 id 反解失败取证
         # （典型：代理重启后反查表未热身，App 持有的 coverId 查不到在线曲目）
         raw = str(guid or "")
