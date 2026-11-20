@@ -14930,19 +14930,28 @@ async def album_artist_detail_list(request: Request):
     return JSONResponse(content=disguise_client_json(_artist_page(request, total, albums)))
 
 
-def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str] | None":
-    """网易专辑搜索行（CLI 与 web 兜底两种形状）→ (album_id, 名称, 歌手, 封面)。"""
+def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str, str] | None":
+    """网易专辑搜索行（CLI 与 web 兜底两种形状）→ (album_id, 名称, 歌手, 封面, 歌手 ID)。"""
     album_id = str(row.get("album_id") or row.get("albumId") or row.get("id") or "")
     name = str(row.get("album_name") or row.get("name") or row.get("title") or "").strip()
     if not album_id or album_id in ("0", "None") or not name:
         return None
     ar = row.get("artists") or row.get("artist") or []
+    artist_id = ""
     if isinstance(ar, list):
-        artist = " / ".join(str(a.get("name") or "") for a in ar if isinstance(a, dict) and a.get("name"))
+        names = [str(a.get("name") or "") for a in ar if isinstance(a, dict) and a.get("name")]
+        artist = " / ".join(names)
+        for a in ar:
+            if not isinstance(a, dict) or not a.get("name"):
+                continue
+            candidate = str(a.get("id") or "").strip()
+            if candidate and candidate not in ("0", "None"):
+                artist_id = candidate
+                break
     else:
         artist = str(ar or "")
     cover = str(row.get("pic_url") or row.get("picUrl") or row.get("coverImgUrl") or row.get("cover") or "")
-    return album_id, name, artist, cover
+    return album_id, name, artist, cover, artist_id
 
 
 async def _netease_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
@@ -14972,7 +14981,7 @@ async def _netease_album_search_rows(request: Request, keyword: str, limit: int)
         norm = _normalize_netease_album_row(row)
         if norm is None:
             continue
-        album_id, name, artist, cover = norm
+        album_id, name, artist, cover, artist_id = norm
         if album_id in seen:
             continue
         seen.add(album_id)
@@ -14980,7 +14989,14 @@ async def _netease_album_search_rows(request: Request, keyword: str, limit: int)
         # 形态对齐曲目锚点约定：专辑 guid = 锚点 + ":album"（register 内部拼）
         anchor = f"online:netease:album:{album_id}"
         register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id, persist=True)
-        out.append(_album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0))
+        obj = _album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0)
+        if artist_id and artist:
+            artist_fake = register_fake_artist(
+                artist_real_guid("netease", "", artist_id),
+                source="netease", platform="", artist_id=artist_id, name=artist,
+            )
+            obj["artists"] = [{"guid": artist_fake, "name": artist, "coverId": None}]
+        out.append(obj)
         if len(out) >= limit:
             break
     return out

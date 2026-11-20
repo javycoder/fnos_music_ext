@@ -46,6 +46,12 @@ def _netease_artist_handler(request: httpx.Request) -> httpx.Response:
              "albumSize": index, "musicSize": index + 1}
             for index in range(10)
         ]})
+    if path == "/api/v1/search" and request.url.params.get("type") == "album":
+        return httpx.Response(200, json={"ok": True, "data": [{
+            "album_id": 900, "album_name": "网易专辑", "artist": "网易歌手0",
+            "artists": [{"id": 6000, "name": "网易歌手0"}],
+            "pic_url": "http://pic.test/a.jpg",
+        }]})
     if path == "/api/v1/artist/6000":
         return httpx.Response(200, json={"ok": True, "artist": {
             "id": 6000, "name": "网易歌手0", "picUrl": "http://pic.test/a.jpg",
@@ -245,3 +251,26 @@ def test_issue141_online_album_dedup_keeps_different_artists(monkeypatch):
 
     rows = asyncio.run(app_mod._online_album_search(None, "叶惠美", 10))
     assert [row["guid"] for row in rows] == ["n1", "l1", "l2"]
+
+
+def test_issue141_netease_album_card_artist_is_clickable(monkeypatch):
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
+    monkeypatch.setitem(CONF, "musicdl_enabled", False)
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_official_artist_handler), base_url="http://official")
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_netease_artist_handler), base_url="http://netease")
+    app.state.netease_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404)), base_url="http://netease")
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404)), base_url="http://lx")
+
+    with TestClient(app) as client:
+        found = client.get("/music/api/v1/search/album", params={"q": "网易专辑"}).json()
+        card = next(row for row in found["data"]["list"] if row["name"] == "网易专辑")
+        artist_guid = card["artists"][0]["guid"]
+        detail = client.get("/music/api/v1/artist/detail", params={"guid": artist_guid}).json()
+
+    assert detail["code"] == 0
+    assert detail["data"]["name"] == "网易歌手0"
