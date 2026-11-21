@@ -55,7 +55,7 @@ except ImportError:  # 兼容脚本式启动（无包上下文）
 try:
     from . import recommend as dailyrec
     from .direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
-    from .scan_auth import ScanAdminSession, ScanAuthError
+    from .scan_auth import ScanAdminSession, ScanAuthError, authx_header
     from . import localrecommend as localrec
     from . import localmatch
     from . import music_compat
@@ -79,7 +79,7 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     from direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings  # type: ignore
-    from scan_auth import ScanAdminSession, ScanAuthError  # type: ignore
+    from scan_auth import ScanAdminSession, ScanAuthError, authx_header  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
     import music_compat  # type: ignore
