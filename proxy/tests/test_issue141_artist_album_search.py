@@ -155,6 +155,10 @@ def test_issue141_artist_lists_keep_provider_page(monkeypatch, source, kind, fie
     assert data["total"] == 3
     assert data["sort"] == "createdAt"
     assert [row[field] for row in data["list"]] == ["第 2 页"]
+    if kind == "track":
+        for key in ("createdAt", "updatedAt"):
+            assert type(data["list"][0][key]) is int
+            assert data["list"][0][key] == 0
 
 
 @pytest.mark.parametrize("kind,error_message", [
