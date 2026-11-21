@@ -75,6 +75,7 @@ try:
     from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search
     from .fnlog import diag as fn_diag
     from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
+    from .fscheck import probe_dir_writable as _probe_dir_writable
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
@@ -99,6 +100,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search  # type: ignore
     from fnlog import diag as fn_diag  # type: ignore
     from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
+    from fscheck import probe_dir_writable as _probe_dir_writable  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -5769,27 +5771,12 @@ async def _run_cleanup_locked(job: dict) -> None:
         job.update(status="completed", phase="清理完成")
 
 
-def _probe_dir_writable(directory: str) -> bool:
-    probe = os.path.join(directory, f".fnmusic-fscheck-{os.getpid()}-{uuid4().hex}")
-    try:
-        fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-        os.close(fd)
-        return True
-    except OSError:
-        return False
-    finally:
-        try:
-            os.unlink(probe)
-        except OSError:
-            pass
-
-
 def _fs_check_target(path: str) -> tuple[bool, bool]:
     """目录存在性与可写性探测（与 webui_gateway.handle_fs_check 同语义）。
 
     以当前（降权后）proxy 身份探测——下载/缓存目录的真实落盘方就是它，
-    结论比 root 视角更贴近实际。无副作用：不创建目录，临时探测文件即落
-    即删；目录不存在时用最近存在祖先目录的可写性代表"能否创建"。
+    结论比 root 视角更贴近实际。不创建目录，探测文件尽力删除；
+    目录不存在时用最近存在祖先目录的可写性代表"能否创建"。
     """
     exists = writable = False
     ancestor = path

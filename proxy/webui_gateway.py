@@ -28,7 +28,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from urllib.parse import parse_qs, unquote
 from pathlib import Path
 
@@ -43,6 +42,7 @@ except ImportError:  # Development-machine unit tests run on non-Linux hosts.
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+from proxy.fscheck import probe_dir_writable as _probe_dir_writable
 from proxy.self_update import (
     get_active_job,
     get_capability,
@@ -222,22 +222,6 @@ def handle_host_file(client: socket.socket, headers: dict[str, str], head_raw: b
     finally:
         try:
             client.close()
-        except OSError:
-            pass
-
-
-def _probe_dir_writable(path: str) -> bool:
-    """写入试探：os.access 对只读挂载等场景可能误报，落一个临时文件再删才算数。"""
-    probe = os.path.join(path, f".fnmusic-fscheck-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-    try:
-        fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-        os.close(fd)
-        return True
-    except OSError:
-        return False
-    finally:
-        try:
-            os.unlink(probe)
         except OSError:
             pass
 
