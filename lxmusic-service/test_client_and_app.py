@@ -341,6 +341,34 @@ def test_catalog_normalization_and_native_lxserver_contract():
     ]
 
 
+@pytest.mark.parametrize("page,size,native_pages", [(2, 20, [1]), (3, 20, [1, 2]), (2, 55, [2, 3])])
+def test_catalog_artist_albums_translates_fixed_native_pages(monkeypatch, test_app_client, page, size, native_pages):
+    calls = []
+    upstream = LxServerClient(base_url="http://test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/music/artistAlbums"
+        assert set(request.url.params) == {"source", "id", "page"}
+        native_page = int(request.url.params["page"])
+        calls.append(native_page)
+        start = (native_page - 1) * 50
+        return httpx.Response(200, json={"total": 110, "list": [
+            {"id": str(index), "name": f"专辑 {index}"} for index in range(start + 1, min(start + 50, 110) + 1)
+        ]})
+
+    upstream._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    monkeypatch.setattr(lxapp, "LXSERVER", upstream)
+    response = test_app_client.get("/api/v1/catalog/artist/albums", params={
+        "source": "tx", "id": "700", "page": page, "limit": size,
+    })
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert calls == native_pages
+    assert data["total"] == 110
+    assert [int(row["id"]) for row in data["items"]] == list(range(
+        (page - 1) * size + 1, min(page * size, 110) + 1))
+
+
 def test_map_lxserver_song_kuwo():
     raw = {
         "name": "海阔天空",

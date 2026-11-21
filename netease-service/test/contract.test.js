@@ -150,6 +150,7 @@ test('GET /api/v1 artist search and detail contracts expose native IDs', async (
   assert.strictEqual(albums.body.total, 1);
   assert.strictEqual(albums.body.data[0].id, 3920);
   assert.strictEqual(albums.body.data[0].artistName, '周杰伦');
+  assert.deepStrictEqual(albums.body.data[0].artists, [{ id: 6458, name: '周杰伦' }]);
 });
 
 test('GET /healthz returns netease provider and upstream version offline', async () => {
