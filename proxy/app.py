@@ -12096,8 +12096,11 @@ async def _official_album_cover_ref(request: Request, album_guid: str) -> str:
         payload = fetched.json()
         if not isinstance(payload, dict) or payload.get("code") != 0:
             return ""
-        ref = str((payload.get("data") or {}).get("coverId") or "").strip()
-        return ref if ref.startswith("album_") else ""
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("coverId"), str):
+            return ""
+        ref = data["coverId"].strip()
+        return ref if re.fullmatch(r"album_[0-9a-fA-F]{32}", ref) else ""
     except (TimeoutError, httpx.HTTPError, ValueError):
         return ""
 
