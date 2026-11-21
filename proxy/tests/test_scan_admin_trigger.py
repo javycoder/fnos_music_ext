@@ -82,3 +82,27 @@ async def test_maintenance_scan_user_admin_path_sends_request(monkeypatch):
     assert payload.get("ok") is True, f"手动扫描未确认：{payload}"
     assert captured, "手动扫描请求未发出（authx_header NameError 被吞）"
     assert captured[0].headers.get("authx"), "手动扫描必须带 authx 签名头"
+
+
+def test_scan_slot_records_wall_clock_for_ui(monkeypatch, tmp_path):
+    """扫描状态须记录墙钟时间并由 user-storage 状态带回（UI「最近扫描」展示）。"""
+    import time as _time
+    guid = "u9-wall-clock"
+    before = _time.time()
+    try:
+        proxy_app._set_scan_slot(guid, last_attempt=_time.monotonic(), status="ok")
+        state = proxy_app._scan_state(guid)
+        assert before - 1 <= state.get("last_at", 0) <= _time.time() + 1
+        assert state["status"] == "ok"
+
+        monkeypatch.setitem(proxy_app.CONF, "tee_save_dir", str(tmp_path))
+        monkeypatch.setitem(proxy_app.CONF, "tee_save_dir_by_user", "")
+        monkeypatch.setitem(proxy_app.CONF, "library_scan_by_user", "")
+        monkeypatch.setitem(proxy_app.CONF, "library_scan_path", "")
+        status = proxy_app._user_storage_status(
+            [{"guid": guid, "name": "甲", "role": "admin", "status": "active"}])
+        entry = next(e for e in status["users"] if e["guid"] == guid)
+        assert entry["scan_status"] == "ok"
+        assert entry["scan_last_at"] == state["last_at"], "user-storage 必须带回扫描墙钟时间"
+    finally:
+        proxy_app._scan_state_by_user.pop(guid, None)
