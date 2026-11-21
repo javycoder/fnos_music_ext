@@ -4078,6 +4078,32 @@ test("洛雪源 CPU 异常：帮助弹窗复用焦点往返并在重绘后改绑
   vm.runInThisContext(`$("#help-modal").hidden = true; lxCpuHelpSourceId = "";`);
 });
 
+test("扫描状态展示：outcome 码映射与墙钟时间渲染", () => {
+  // 友好文案映射
+  assert.strictEqual(global.scanOutcomeText("ok"), "扫描成功");
+  assert.strictEqual(global.scanOutcomeText("admin_120001"), "管理员登录失败（120001）");
+  assert.strictEqual(global.scanOutcomeText("http_500"), "官方响应 HTTP 500");
+  assert.strictEqual(global.scanOutcomeText("business_unconfirmed"), "官方业务码未确认");
+  assert.strictEqual(global.scanOutcomeText("exception"), "发送异常");
+  assert.strictEqual(global.scanOutcomeText("some_new_code"), "some_new_code");
+  assert.strictEqual(global.scanOutcomeText(""), "");
+  // 时间格式化：非法值返回空，合法值形如 2026-11-21 13:45:32
+  assert.strictEqual(global.formatScanTime(0), "");
+  assert.strictEqual(global.formatScanTime("abc"), "");
+  assert.match(global.formatScanTime(1795238086.97), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  // 行文案：成功带时间、失败带原因与时间、无结果显示占位
+  const line = global.scanStatusLine({ scan_status: "ok", scan_last_at: 1795238086.97 });
+  assert.ok(line.startsWith("扫描成功 · ") && /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(line));
+  const failed = global.scanStatusLine({ scan_status: "admin_120001", scan_last_at: 1795238086.97 });
+  assert.ok(failed.startsWith("扫描失败：管理员登录失败（120001） · "));
+  const bare = global.scanStatusLine({ scan_status: "exception", scan_last_at: 0 });
+  assert.strictEqual(bare, "扫描失败：发送异常");
+  assert.strictEqual(global.scanStatusLine({}), "尚无结果");
+  assert.strictEqual(global.scanStatusLine({ scan_status: "running" }), "扫描进行中…");
+  assert.strictEqual(global.scanStatusLine({ scan_status: "pending" }), "等待扫描…");
+  assert.strictEqual(global.scanStatusLine({ scan_status: "ok", scan_last_at: 1e20 }), "扫描成功");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

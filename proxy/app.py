@@ -55,7 +55,7 @@ except ImportError:  # 兼容脚本式启动（无包上下文）
 try:
     from . import recommend as dailyrec
     from .direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings
-    from .scan_auth import ScanAdminSession, ScanAuthError
+    from .scan_auth import ScanAdminSession, ScanAuthError, authx_header
     from . import localrecommend as localrec
     from . import localmatch
     from . import music_compat
@@ -79,7 +79,7 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     from direct_play import DirectMediaTarget, DirectTargetBindings, FileTargetBindings  # type: ignore
-    from scan_auth import ScanAdminSession, ScanAuthError  # type: ignore
+    from scan_auth import ScanAdminSession, ScanAuthError, authx_header  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
     import music_compat  # type: ignore
@@ -5846,6 +5846,7 @@ def _user_storage_status(users: list[dict]) -> dict:
             "scan_body": scan_body,
             "scan_status": str(state.get("status") or ""),
             "scan_last_attempt": float(state.get("last_attempt") or 0.0),
+            "scan_last_at": float(state.get("last_at") or 0.0),
             "scan_task_running": bool(state.get("task") and not state["task"].done()),
         })
     return {
@@ -5892,9 +5893,7 @@ async def _maintenance_scan_user(user_guid: str) -> tuple[int, dict]:
         outcome = f"admin_{exc.code}"
     except Exception:
         outcome = "exception"
-    state = _scan_state(user_guid, create=True)
-    state["last_attempt"] = time.monotonic()
-    state["status"] = outcome
+    _set_scan_slot(user_guid, last_attempt=time.monotonic(), status=outcome)
     if outcome == "ok":
         return 200, {"ok": True, "outcome": outcome, "tested_at": time.time()}
     return 200, {"ok": False, "error": f"用户扫描未确认：{outcome}",
@@ -7814,6 +7813,8 @@ def _set_scan_slot(user_guid: str, *, last_attempt: float | None = None,
         state["pending_headers"] = pending_headers
     if status:
         state["status"] = status
+        # 墙钟时间戳：UI「最近扫描」展示用（monotonic 只能算流逝，不能换算时刻）
+        state["last_at"] = time.time()
 
 
 async def _send_scan_request(client: httpx.AsyncClient, scan_path: str,
@@ -7897,7 +7898,7 @@ async def _run_scan_worker(initial_wait: float, user_guid: str = "") -> None:
                 await asyncio.sleep(remaining)
         _last, _task, pending = _scan_slot(user_guid)
         if not pending and user_guid:
-            _scan_state_by_user.pop(user_guid, None)
+            _scan_state(user_guid)["task"] = None
 
 
 def _schedule_library_scan(headers: dict | None, user_guid: str = "") -> None:
@@ -14899,7 +14900,10 @@ async def track_artist_detail_list(request: Request):
     total = body.get("total")
     if type(total) is not int or total < len(infos):
         total = len(infos)
-    tracks = [build_online_track(info) for info in infos]
+    tracks = [
+        dict(build_online_track(info), createdAt=0, updatedAt=0)
+        for info in infos
+    ]
     register_online_meta(tracks)
     return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, tracks)))
 

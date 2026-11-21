@@ -4451,6 +4451,45 @@ function validateUserStoragePatch(values) {
   }
 }
 
+function scanOutcomeText(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (s === "ok") return "扫描成功";
+  if (s === "pending") return "等待扫描…";
+  if (s === "running") return "扫描进行中…";
+  if (s === "sending") return "正在发送扫描请求…";
+  if (s === "disabled") return "未配置/已禁用";
+  if (s === "exception") return "发送异常";
+  if (s === "business_unconfirmed") return "官方业务码未确认";
+  if (s === "invalid_json") return "官方响应非 JSON";
+  if (s === "response_too_large") return "官方响应超限";
+  if (s.startsWith("admin_")) return `管理员登录失败（${s.slice(6)}）`;
+  if (s.startsWith("http_")) return `官方响应 HTTP ${s.slice(5)}`;
+  return s; // 未知码原样展示
+}
+
+function formatScanTime(epoch) {
+  const n = Number(epoch);
+  if (!n || !isFinite(n) || n <= 0) return "";
+  const d = new Date(n * 1000);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+       + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function scanStatusLine(user) {
+  const raw = String((user && user.scan_status) || "").trim();
+  if (!raw) return "尚无结果";
+  const text = scanOutcomeText(raw);
+  const formatted = formatScanTime(user.scan_last_at);
+  const time = formatted ? ` · ${formatted}` : "";
+  if (raw === "ok" || raw === "pending" || raw === "running" || raw === "sending" || raw === "disabled") {
+    return text + time;
+  }
+  return `扫描失败：${text}${time}`;
+}
+
 function renderUserStorage() {
   const list = $("#user-storage-list");
   const staleBox = $("#user-storage-stale");
@@ -4490,7 +4529,7 @@ function renderUserStorage() {
     return `<div class="user-storage-row" data-user-row="${escapeHtml(user.guid)}">
       <div class="user-storage-head"><b>${escapeHtml(user.name || "未命名用户")}</b><span class="user-storage-meta">${escapeHtml(user.role || "")}</span></div>
       <div class="user-storage-status">有效目录：${escapeHtml(user.root || "-")} · ${writable}</div>
-      <div class="user-storage-status">最近扫描：${escapeHtml(user.scan_status || "尚无结果")}</div>
+      <div class="user-storage-status">最近扫描：${escapeHtml(scanStatusLine(user))}</div>
       <label class="field"><span>自定义目录（留空恢复自动目录）</span>
         <input class="input" data-user-dir="${escapeHtml(user.guid)}" value="${escapeHtml(custom)}" placeholder="留空使用自动目录">
       </label>
@@ -4571,8 +4610,9 @@ async function scanOneUser(guid) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_guid: guid }),
     });
-    if (!maintenanceSucceeded(response)) throw new Error((response && response.error) || "用户扫描响应无效");
-    if (status) status.textContent = "用户扫描已确认";
+    const at = response && response.tested_at ? ` · ${formatScanTime(response.tested_at)}` : "";
+    if (!maintenanceSucceeded(response)) throw new Error((response && response.error || "用户扫描响应无效") + at);
+    if (status) status.textContent = "用户扫描已确认" + at;
     await loadUserStorage();
   } catch (exc) {
     if (status) status.textContent = "用户扫描失败：" + exc.message;
