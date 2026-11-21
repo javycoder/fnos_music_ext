@@ -7898,7 +7898,7 @@ async def _run_scan_worker(initial_wait: float, user_guid: str = "") -> None:
                 await asyncio.sleep(remaining)
         _last, _task, pending = _scan_slot(user_guid)
         if not pending and user_guid:
-            _scan_state_by_user.pop(user_guid, None)
+            _scan_state(user_guid)["task"] = None
 
 
 def _schedule_library_scan(headers: dict | None, user_guid: str = "") -> None:

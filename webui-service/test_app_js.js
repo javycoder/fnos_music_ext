@@ -4100,6 +4100,8 @@ test("扫描状态展示：outcome 码映射与墙钟时间渲染", () => {
   assert.strictEqual(bare, "扫描失败：发送异常");
   assert.strictEqual(global.scanStatusLine({}), "尚无结果");
   assert.strictEqual(global.scanStatusLine({ scan_status: "running" }), "扫描进行中…");
+  assert.strictEqual(global.scanStatusLine({ scan_status: "pending" }), "等待扫描…");
+  assert.strictEqual(global.scanStatusLine({ scan_status: "ok", scan_last_at: 1e20 }), "扫描成功");
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

@@ -4451,12 +4451,11 @@ function validateUserStoragePatch(values) {
   }
 }
 
-/* -------------------------------------- 每用户扫描状态展示（3.2.0-1）---- */
-
 function scanOutcomeText(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
   if (s === "ok") return "扫描成功";
+  if (s === "pending") return "等待扫描…";
   if (s === "running") return "扫描进行中…";
   if (s === "sending") return "正在发送扫描请求…";
   if (s === "disabled") return "未配置/已禁用";
@@ -4473,6 +4472,7 @@ function formatScanTime(epoch) {
   const n = Number(epoch);
   if (!n || !isFinite(n) || n <= 0) return "";
   const d = new Date(n * 1000);
+  if (Number.isNaN(d.getTime())) return "";
   const p = (x) => String(x).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
        + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
@@ -4482,8 +4482,9 @@ function scanStatusLine(user) {
   const raw = String((user && user.scan_status) || "").trim();
   if (!raw) return "尚无结果";
   const text = scanOutcomeText(raw);
-  const time = user && user.scan_last_at ? ` · ${formatScanTime(user.scan_last_at)}` : "";
-  if (raw === "ok" || raw === "running" || raw === "sending" || raw === "disabled") {
+  const formatted = formatScanTime(user.scan_last_at);
+  const time = formatted ? ` · ${formatted}` : "";
+  if (raw === "ok" || raw === "pending" || raw === "running" || raw === "sending" || raw === "disabled") {
     return text + time;
   }
   return `扫描失败：${text}${time}`;
