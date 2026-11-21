@@ -356,6 +356,8 @@ def map_lxserver_song(song: dict, fallback_source: str = "") -> dict:
         # 兼容旧搜索器字段
         "songmid": str(song.get("songmid") or identifier),
         "album_id": str(song.get("albumId") or ""),
+        "artists": song.get("artists") if isinstance(song.get("artists"), list) else [],
+        "artist_id": str(song.get("artistId") or song.get("singerId") or ""),
     }
 
     # 针对酷狗保留 hash 映射
@@ -377,6 +379,51 @@ def map_lxserver_song(song: dict, fallback_source: str = "") -> dict:
         item["copyrightId"] = str(song.get("copyrightId") or identifier)
 
     return item
+
+
+def normalize_catalog_artist(row: dict, source: str) -> dict | None:
+    """lxserver 歌手搜索/详情行 → 统一歌手对象。"""
+    src = normalize_source(source or row.get("source"))
+    if src not in ("tx", "wy"):
+        return None
+    artist_id = str(row.get("id") or row.get("mid") or "").strip()
+    name = str(row.get("name") or "").strip()
+    if not artist_id or not name:
+        return None
+    alias = row.get("alias") if isinstance(row.get("alias"), list) else []
+    return {
+        "source": "lx",
+        "lx_source": src,
+        "id": artist_id,
+        "name": name,
+        "pic_url": str(row.get("picUrl") or row.get("avatar") or ""),
+        "alias": [str(value) for value in alias if value],
+        "album_count": int(row.get("albumSize") or row.get("albumCount") or 0),
+        "track_count": int(row.get("musicSize") or row.get("trackCount") or 0),
+    }
+
+
+def normalize_catalog_album(row: dict, source: str) -> dict | None:
+    """lxserver 专辑搜索/歌手专辑行 → 统一专辑对象。"""
+    src = normalize_source(source or row.get("source"))
+    if src not in ("tx", "wy"):
+        return None
+    album_id = str(row.get("id") or row.get("mid") or "").strip()
+    name = str(row.get("name") or "").strip()
+    if not album_id or not name:
+        return None
+    artist = str(row.get("artistName") or row.get("singer") or "").strip()
+    return {
+        "source": "lx",
+        "lx_source": src,
+        "id": album_id,
+        "name": name,
+        "pic_url": str(row.get("picUrl") or row.get("img") or ""),
+        "artist": artist,
+        "artist_id": str(row.get("artistId") or ""),
+        "track_count": int(row.get("size") or row.get("total") or 0),
+        "publish_time": row.get("publishTime") or "",
+    }
 
 
 class LxServerClient:
@@ -644,6 +691,114 @@ class LxServerClient:
             if len(results) >= limit:
                 break
         return results
+
+    # --------------------------------------------------------- 歌手/专辑目录 --
+    async def search_catalog(
+        self,
+        keyword: str,
+        kind: str,
+        source: str,
+        page: int = 1,
+        limit: int = 20,
+    ) -> dict:
+        """lxserver 原生歌手/专辑搜索（仅 tx/wy 实现）。"""
+        src = normalize_source(source)
+        search_type = {"artist": "singer", "album": "album"}.get(kind)
+        if src not in ("tx", "wy") or not search_type:
+            raise ValueError("unsupported catalog source or type")
+        params = {
+            "name": keyword,
+            "source": src,
+            "type": search_type,
+            "page": max(1, int(page or 1)),
+            "limit": max(1, int(limit or 20)),
+        }
+        client = await self.get_client()
+        resp = await client.get("/api/music/search", params=params, timeout=self.timeout)
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver catalog search error {resp.status_code}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver catalog search returned invalid payload")
+        return data
+
+    async def get_artist_detail(self, source: str, artist_id: str) -> dict:
+        src = normalize_source(source)
+        if src not in ("tx", "wy") or not artist_id:
+            raise ValueError("unsupported catalog source or artist id")
+        client = await self.get_client()
+        resp = await client.get(
+            "/api/music/artistDetail",
+            params={"source": src, "id": artist_id},
+            timeout=self.timeout,
+        )
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver artist detail error {resp.status_code}")
+        data = resp.json()
+        if not isinstance(data, dict) or not data.get("id"):
+            raise RuntimeError("lxserver artist detail returned invalid payload")
+        return data
+
+    async def get_artist_songs(self, source: str, artist_id: str, order: str = "hot") -> list[dict]:
+        src = normalize_source(source)
+        if src not in ("tx", "wy") or not artist_id:
+            raise ValueError("unsupported catalog source or artist id")
+        client = await self.get_client()
+        resp = await client.get(
+            "/api/music/artistSongs",
+            params={"source": src, "id": artist_id, "order": order or "hot"},
+            timeout=max(self.timeout, 25.0),
+        )
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver artist songs error {resp.status_code}")
+        data = resp.json()
+        if not isinstance(data, list):
+            raise RuntimeError("lxserver artist songs returned invalid payload")
+        return data
+
+    async def get_artist_albums(self, source: str, artist_id: str, page: int = 1) -> dict:
+        src = normalize_source(source)
+        if src not in ("tx", "wy") or not artist_id:
+            raise ValueError("unsupported catalog source or artist id")
+        client = await self.get_client()
+        resp = await client.get(
+            "/api/music/artistAlbums",
+            params={"source": src, "id": artist_id, "page": max(1, int(page or 1))},
+            timeout=self.timeout,
+        )
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver artist albums error {resp.status_code}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver artist albums returned invalid payload")
+        return data
+
+    async def get_album_songs(self, source: str, album_id: str) -> dict:
+        src = normalize_source(source)
+        if src not in ("tx", "wy") or not album_id:
+            raise ValueError("unsupported catalog source or album id")
+        client = await self.get_client()
+        resp = await client.get(
+            "/api/music/albumSongs",
+            params={"source": src, "id": album_id},
+            timeout=max(self.timeout, 25.0),
+        )
+        if resp.status_code in _LXSERVER_UNAVAILABLE_STATUSES:
+            resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"lxserver album songs error {resp.status_code}")
+        data = resp.json()
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise RuntimeError("lxserver album songs returned invalid payload")
+        return data
 
     # ------------------------------------------------------------- 播放链接解析 --
     @log_lxserver_transport_errors("resolve")
