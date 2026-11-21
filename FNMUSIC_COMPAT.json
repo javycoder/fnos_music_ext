@@ -5,5 +5,5 @@
     "1.1.19"
   ],
   "checked_at": "2026-11-21",
-  "notes": "1.0.10 为既有适配基线。2026-11-20 通过局域网只读核对 NAS 的 /var/apps/trim.music/manifest：appname=trim.music，version=1.1.19；2026-11-21 通过同一 NAS 的官方音乐 /music/api/v1/sys/config 确认运行版本仍为 1.1.19。协议适配由项目回归测试覆盖；此记录仅说明版本和协议适配基线，不控制运行时行为。"
+  "notes": "1.0.10 为既有适配基线。2026-11-21 通过局域网只读核对 NAS 的 /var/apps/trim.music/manifest：appname=trim.music，version=1.1.19；官方音乐 /music/api/v1/sys/config 返回同一运行版本。协议适配由项目回归测试覆盖；此记录仅说明版本和协议适配基线，不控制运行时行为。"
 }
