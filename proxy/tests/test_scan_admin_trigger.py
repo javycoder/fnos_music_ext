@@ -6,6 +6,8 @@
 ScanAuthError——NameError 被 except Exception 吞成 outcome="exception"。
 现有用例只覆盖自定义路径分支（不带 authx_header），该断点无测试触达。
 """
+import time
+
 import httpx
 import pytest
 
@@ -84,25 +86,30 @@ async def test_maintenance_scan_user_admin_path_sends_request(monkeypatch):
     assert captured[0].headers.get("authx"), "手动扫描必须带 authx 签名头"
 
 
-def test_scan_slot_records_wall_clock_for_ui(monkeypatch, tmp_path):
-    """扫描状态须记录墙钟时间并由 user-storage 状态带回（UI「最近扫描」展示）。"""
-    import time as _time
+@pytest.mark.asyncio
+async def test_scan_worker_retains_result_and_cooldown_for_user(monkeypatch, tmp_path):
     guid = "u9-wall-clock"
-    before = _time.time()
-    try:
-        proxy_app._set_scan_slot(guid, last_attempt=_time.monotonic(), status="ok")
-        state = proxy_app._scan_state(guid)
-        assert before - 1 <= state.get("last_at", 0) <= _time.time() + 1
-        assert state["status"] == "ok"
+    monkeypatch.setattr(proxy_app, "_scan_state_by_user", {})
+    monkeypatch.setitem(proxy_app.CONF, "tee_save_dir", str(tmp_path))
+    monkeypatch.setitem(proxy_app.CONF, "tee_save_dir_by_user", "")
+    monkeypatch.setitem(proxy_app.CONF, "library_scan_by_user", "")
+    monkeypatch.setitem(proxy_app.CONF, "library_scan_path", "/music/test-scan")
+    monkeypatch.setitem(proxy_app.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(proxy_app.CONF, "scan_cooldown_s", 60)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={"code": 0}))
+    before = time.time()
+    async with httpx.AsyncClient(transport=transport, base_url="http://official.test") as client:
+        monkeypatch.setattr(proxy_app, "get_upstream_client", lambda _app: client)
+        proxy_app._schedule_library_scan({"cookie": "music-token=fixture-session"}, guid)
+        await proxy_app._scan_slot(guid)[1]
 
-        monkeypatch.setitem(proxy_app.CONF, "tee_save_dir", str(tmp_path))
-        monkeypatch.setitem(proxy_app.CONF, "tee_save_dir_by_user", "")
-        monkeypatch.setitem(proxy_app.CONF, "library_scan_by_user", "")
-        monkeypatch.setitem(proxy_app.CONF, "library_scan_path", "")
-        status = proxy_app._user_storage_status(
-            [{"guid": guid, "name": "甲", "role": "admin", "status": "active"}])
-        entry = next(e for e in status["users"] if e["guid"] == guid)
-        assert entry["scan_status"] == "ok"
-        assert entry["scan_last_at"] == state["last_at"], "user-storage 必须带回扫描墙钟时间"
-    finally:
-        proxy_app._scan_state_by_user.pop(guid, None)
+    last_attempt, task, pending = proxy_app._scan_slot(guid)
+    assert last_attempt > 0
+    assert task is None
+    assert not pending
+    status = proxy_app._user_storage_status(
+        [{"guid": guid, "name": "甲", "role": "admin", "status": "active"}])
+    entry = next(entry for entry in status["users"] if entry["guid"] == guid)
+    assert entry["scan_status"] == "ok"
+    assert before <= entry["scan_last_at"] <= time.time()
+    assert not entry["scan_task_running"]
