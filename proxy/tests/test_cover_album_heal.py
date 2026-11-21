@@ -185,6 +185,29 @@ def test_static_cover_coverless_album_passthrough(heal_env):
         assert called_cover_id == LONELY_GUID
 
 
+@pytest.mark.parametrize("album_data", [["unexpected"], {"coverId": "album_invalid"}])
+def test_static_cover_malformed_album_keeps_original_fallback(heal_env, album_data):
+    """专辑详情异常时，封面端点仍按原曲目标识回退。"""
+    seen_cover_ids = []
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/album/detail":
+            return httpx.Response(200, json={"code": 0, "data": album_data})
+        seen_cover_ids.append(request.url.params.get("coverId"))
+        return httpx.Response(200, content=OFFICIAL_COVER_BYTES,
+                              headers={"content-type": "image/jpeg"})
+
+    _mock_upstream(upstream_handler)
+
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/static/cover",
+                              params={"coverId": OFFICIAL_ALBUM_GUID})
+        assert response.status_code == 200
+        assert response.content == OFFICIAL_COVER_BYTES
+        assert seen_cover_ids == [OFFICIAL_ALBUM_GUID]
+        assert OFFICIAL_ALBUM_GUID not in proxy_app._ALBUM_COVER_HEAL_CACHE
+
+
 def test_playlist_cover_response_heals_bare_candidate(heal_env):
     """歌单卡片封面候选里的裸 coverId 同样归位（候选封面取专辑资源）。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
