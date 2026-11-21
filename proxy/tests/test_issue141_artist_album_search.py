@@ -49,7 +49,7 @@ def _netease_artist_handler(request: httpx.Request) -> httpx.Response:
     if path == "/api/v1/search" and request.url.params.get("type") == "album":
         return httpx.Response(200, json={"ok": True, "data": [{
             "album_id": 900, "album_name": "网易专辑", "artist": "网易歌手0",
-            "artists": [{"id": 6000, "name": "网易歌手0"}],
+            "artists": [{"id": 6000, "name": "网易歌手0"}, {"id": 6001, "name": "网易歌手1"}],
             "pic_url": "http://pic.test/a.jpg",
         }]})
     if path == "/api/v1/artist/6000":
@@ -67,7 +67,8 @@ def _netease_artist_handler(request: httpx.Request) -> httpx.Response:
     if path == "/api/v1/artist/6000/albums":
         return httpx.Response(200, json={"ok": True, "total": 1, "data": [{
             "id": 900, "name": "网易专辑", "picUrl": "http://pic.test/a.jpg",
-            "artistName": "网易歌手0", "size": 10, "publishTime": 1000,
+            "artistName": "网易歌手0 / 网易歌手1", "size": 10, "publishTime": 1000,
+            "artists": [{"id": 6000, "name": "网易歌手0"}, {"id": 6001, "name": "网易歌手1"}],
         }]})
     return httpx.Response(404, json={"ok": False})
 
@@ -109,6 +110,82 @@ def test_issue141_search_and_artist_detail_pages(monkeypatch):
             "artistGUID": artist_guid, "page": 1, "size": 20}).json()
         assert albums["data"]["total"] == 1
         assert albums["data"]["list"][0]["name"] == "网易专辑"
+        assert [resolve_fake_artist(row["guid"])["artist_id"]
+                for row in albums["data"]["list"][0]["artists"]] == ["6000", "6001"]
+
+
+@pytest.mark.parametrize("source", ["netease", "lx"])
+@pytest.mark.parametrize("kind,field", [("track", "title"), ("album", "name")])
+def test_issue141_artist_lists_keep_provider_page(monkeypatch, source, kind, field):
+    monkeypatch.setitem(CONF, "netease_enabled", source == "netease")
+    monkeypatch.setitem(CONF, "lx_enabled", source == "lx")
+    monkeypatch.setitem(CONF, "lx_sources", ["tx"])
+    platform = "tx" if source == "lx" else ""
+    artist_guid = app_mod.register_fake_artist(
+        app_mod.artist_real_guid(source, platform, "6000"),
+        source=source, platform=platform, artist_id="6000", name="在线歌手",
+    )
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_official_artist_handler), base_url="http://official")
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith(f"/{kind}s")
+        assert request.url.params["page"] == "2"
+        assert request.url.params["limit"] == "2"
+        if source == "netease":
+            assert request.url.params["offset"] == "2"
+        row = {"id": "601", "name": "第 2 页", "title": "第 2 页",
+               "source": "lx", "lx_source": "tx", "artist": "在线歌手"}
+        return httpx.Response(200, json={
+            "ok": True, "total": 3, "data" if source == "netease" else "items": [row],
+        })
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(provider), base_url="http://source")
+    if source == "netease":
+        app.state.musicbox_client = upstream
+        app.state.netease_client = upstream
+    else:
+        app.state.lx_client = upstream
+
+    with TestClient(app) as client:
+        data = client.get(f"/music/api/v1/{kind}/artist-detail/list", params={
+            "artistGUID": artist_guid, "page": 2, "size": 2, "sort": "createdAt",
+        }).json()["data"]
+
+    assert data["total"] == 3
+    assert data["sort"] == "createdAt"
+    assert [row[field] for row in data["list"]] == ["第 2 页"]
+
+
+@pytest.mark.parametrize("kind,error_message", [
+    ("track", "歌手歌曲获取失败"), ("album", "歌手专辑获取失败"),
+])
+@pytest.mark.parametrize("failure", ["timeout", "invalid_json", "missing_list"])
+def test_issue141_artist_list_provider_failure_returns_business_error(monkeypatch, kind, error_message, failure):
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "lx_sources", ["tx"])
+    artist_guid = app_mod.register_fake_artist(
+        app_mod.artist_real_guid("lx", "tx", "700"),
+        source="lx", platform="tx", artist_id="700", name="洛雪歌手",
+    )
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_official_artist_handler), base_url="http://official")
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith(f"/{kind}s")
+        if failure == "timeout":
+            raise httpx.ReadTimeout("test timeout", request=request)
+        if failure == "invalid_json":
+            return httpx.Response(200, content=b"<html>")
+        return httpx.Response(200, json={"ok": True, "total": 3})
+
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(provider), base_url="http://lx")
+    with TestClient(app) as client:
+        response = client.get(f"/music/api/v1/{kind}/artist-detail/list",
+                              params={"artistGUID": artist_guid})
+    assert response.status_code == 200
+    assert response.json() == {"code": -1, "msg": error_message, "data": None}
 
 
 def _lx_catalog_handler(request: httpx.Request) -> httpx.Response:
@@ -225,6 +302,48 @@ def test_issue141_pending_lx_track_artist_requires_native_verification(monkeypat
     assert entry["artist_id"] == "700"
 
 
+@pytest.mark.parametrize("artist_available", [True, False])
+def test_issue141_pending_artist_checks_track_in_same_name_albums(monkeypatch, artist_available):
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "lx_sources", ["tx"])
+    track = build_online_track({
+        "id": "lx:tx:100", "source": "lx", "lx_source": "tx", "songmid": "100",
+        "title": "洛雪歌曲", "artist": "洛雪歌手", "album": "洛雪专辑",
+        "album_id": "wrong", "duration_s": 200, "ext": "mp3",
+    })
+    pending_guid = track["artists"][0]["guid"]
+    album_ids = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/catalog/album":
+            album_id = request.url.params["id"]
+            album_ids.append(album_id)
+            if album_id != "800":
+                return httpx.Response(200, json={
+                    "album": {"name": "洛雪专辑", "artist": "同名专辑歌手", "artist_id": "123"},
+                    "items": [{"songmid": "999", "artist": "同名专辑歌手"}],
+                })
+        if request.url.path == "/api/v1/catalog/search":
+            return httpx.Response(200, json={"items": [
+                {"id": "wrong", "name": "洛雪专辑"}, {"id": "800", "name": "洛雪专辑"},
+            ]})
+        if request.url.path == "/api/v1/catalog/artist" and not artist_available:
+            raise httpx.ReadTimeout("test timeout", request=request)
+        return _lx_catalog_handler(request)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_official_artist_handler), base_url="http://official")
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(provider), base_url="http://lx")
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/artist/detail", params={"guid": pending_guid})
+
+    assert album_ids == ["wrong", "800"]
+    assert response.status_code == 200
+    assert response.json()["code"] == (0 if artist_available else -1)
+    assert resolve_fake_artist(pending_guid)["pending"] is not artist_available
+
+
 def test_issue141_online_album_dedup_keeps_different_artists(monkeypatch):
     async def netease_rows(_request, _keyword, _limit):
         return [
@@ -269,6 +388,9 @@ def test_issue141_netease_album_card_artist_is_clickable(monkeypatch):
     with TestClient(app) as client:
         found = client.get("/music/api/v1/search/album", params={"q": "网易专辑"}).json()
         card = next(row for row in found["data"]["list"] if row["name"] == "网易专辑")
+        assert [row["name"] for row in card["artists"]] == ["网易歌手0", "网易歌手1"]
+        assert [resolve_fake_artist(row["guid"])["artist_id"]
+                for row in card["artists"]] == ["6000", "6001"]
         artist_guid = card["artists"][0]["guid"]
         detail = client.get("/music/api/v1/artist/detail", params={"guid": artist_guid}).json()
 

@@ -2282,13 +2282,29 @@ async def catalog_artist_albums(
     src = normalize_source(source)
     if src not in ("tx", "wy") or not id:
         return _err("unsupported catalog source or artist id", 400)
+    # lxserver 2.2.0 只接受页码，每页固定 50 张。先按原始位置取交集，
+    # 再归一结果，避免页长不同时跳过专辑或因坏数据移动分页边界。
+    native_size = 50
+    start = (page - 1) * limit
+    end = start + limit
+    items = []
+    total = 0
     try:
-        data = await LXSERVER.get_artist_albums(src, id, page=page)
+        async with asyncio.timeout(13.0):
+            for native_page in range(start // native_size + 1, (end - 1) // native_size + 2):
+                data = await LXSERVER.get_artist_albums(src, id, page=native_page)
+                rows = data["list"]
+                native_start = (native_page - 1) * native_size
+                reported_total = int(data.get("total") or 0)
+                total = reported_total or (native_start + len(rows) if rows else total)
+                window = rows[max(start - native_start, 0):min(end - native_start, native_size)]
+                items.extend(item for row in window if isinstance(row, dict)
+                             for item in [normalize_catalog_album(row, src)] if item)
+                if len(rows) < native_size or (reported_total and native_start + native_size >= reported_total):
+                    break
     except Exception as exc:
         return _err(f"artist albums failed: {exc}", 502)
-    items = [item for row in (data.get("list") or []) if isinstance(row, dict)
-             for item in [normalize_catalog_album(row, src)] if item][:limit]
-    return {"ok": True, "items": items, "total": int(data.get("total") or len(items))}
+    return {"ok": True, "items": items, "total": total}
 
 
 @app.get("/api/v1/catalog/album")

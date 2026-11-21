@@ -1879,7 +1879,7 @@ def _track_artist_list(item: dict, guid: str, src: str, artist: str, album: str)
         if not name:
             continue
         native_id = str(raw.get("id") or "").strip()
-        if native_id and (src == "netease" or (src == "lx" and platform in ("tx", "wy"))):
+        if native_id not in ("", "0", "None") and (src == "netease" or (src == "lx" and platform in ("tx", "wy"))):
             real = artist_real_guid(src, platform, native_id)
             fake = register_fake_artist(
                 real, source=src, platform=platform, artist_id=native_id, name=name,
@@ -1892,7 +1892,7 @@ def _track_artist_list(item: dict, guid: str, src: str, artist: str, album: str)
     if not artist:
         return []
     native_id = str(item.get("artist_id") or "").strip()
-    if native_id and (src == "netease" or (src == "lx" and platform in ("tx", "wy"))):
+    if native_id not in ("", "0", "None") and (src == "netease" or (src == "lx" and platform in ("tx", "wy"))):
         real = artist_real_guid(src, platform, native_id)
         fake = register_fake_artist(
             real, source=src, platform=platform, artist_id=native_id, name=artist,
@@ -14618,6 +14618,20 @@ async def search_artist(request: Request, subpath: str = ""):
     return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
+async def _artist_source_payload(
+    client: httpx.AsyncClient, path: str, params: dict, timeout: float
+) -> dict:
+    try:
+        response = await client.get(path, params=params, timeout=timeout)
+        if response.status_code == 200:
+            body = response.json()
+            if isinstance(body, dict) and body.get("ok") is not False:
+                return body
+    except (httpx.HTTPError, TimeoutError, ValueError) as error:
+        logger.debug("artist source request failed: %s", type(error).__name__)
+    return {}
+
+
 async def _native_artist_payload(entry: dict) -> dict | None:
     source = str(entry.get("source") or "")
     platform = str(entry.get("platform") or "").lower()
@@ -14635,35 +14649,24 @@ async def _native_artist_payload(entry: dict) -> dict | None:
         params = {"source": platform, "id": artist_id}
     else:
         return None
-    try:
-        response = await client.get(path, params=params, timeout=10.0)
-    except Exception as error:
-        logger.warning("artist detail failed for %s/%s: %s", source, artist_id, error)
-        return None
-    if response.status_code != 200:
-        return None
-    try:
-        body = response.json()
-    except Exception:
+    body = await _artist_source_payload(client, path, params, 10.0)
+    artist = body.get("artist")
+    if not isinstance(artist, dict) or not artist.get("id"):
         return None
     if source == "netease":
-        artist = body.get("artist") if isinstance(body, dict) else {}
-        name = str((artist or {}).get("name") or entry.get("name") or "").strip()
+        name = str(artist.get("name") or entry.get("name") or "").strip()
         if not name:
             return None
         register_fake_artist(
             str(entry.get("real_guid") or artist_real_guid(source, platform, artist_id)),
             source=source, platform=platform, artist_id=artist_id, name=name,
-            cover_url=str((artist or {}).get("picUrl") or (artist or {}).get("img1v1Url") or ""),
+            cover_url=str(artist.get("picUrl") or artist.get("img1v1Url") or ""),
         )
         return _artist_list_obj(
             source, platform, artist_id, name,
-            str((artist or {}).get("picUrl") or (artist or {}).get("img1v1Url") or ""),
-            (artist or {}).get("albumSize") or 0, (artist or {}).get("musicSize") or 0,
+            str(artist.get("picUrl") or artist.get("img1v1Url") or ""),
+            artist.get("albumSize") or 0, artist.get("musicSize") or 0,
         )
-    artist = body.get("artist") if isinstance(body, dict) else {}
-    if not isinstance(artist, dict) or not artist.get("id"):
-        return None
     return _artist_list_obj(
         "lx", platform, str(artist.get("id")), str(artist.get("name") or ""),
         str(artist.get("pic_url") or ""), artist.get("album_count") or 0,
@@ -14686,76 +14689,62 @@ async def _verify_pending_artist(entry: dict) -> bool:
             or not album_id or not songmid):
         return False
 
-    async def fetch_album(candidate_id: str) -> dict:
-        try:
-            response = await get_lx_client(app).get(
-                "/api/v1/catalog/album",
-                params={"source": platform, "id": candidate_id},
-                timeout=15.0,
-            )
-        except Exception as error:
-            logger.info("pending artist album verification failed: %s", error)
-            return {}
-        if response.status_code != 200:
-            return {}
-        try:
-            body = response.json()
-        except Exception:
-            return {}
-        if not isinstance(body, dict):
-            return {}
-        return body
+    client = get_lx_client(app)
+    wanted_artist = localmatch.split_artist_set(str(entry.get("name") or ""))
+    if len(wanted_artist) != 1:
+        return False
 
-    body = await fetch_album(album_id)
-    if not body and album_name:
-        try:
-            search_response = await get_lx_client(app).get(
-                "/api/v1/catalog/search",
-                params={"kind": "album", "q": album_name, "sources": platform,
-                        "page": 1, "limit": 20},
-                timeout=15.0,
-            )
-            search_body = search_response.json() if search_response.status_code == 200 else {}
-        except Exception:
-            search_body = {}
-        rows = search_body.get("items") if isinstance(search_body, dict) else []
-        wanted_album = localmatch.title_key(album_name)
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            if localmatch.title_key(row.get("name") or "") != wanted_album:
-                continue
-            body = await fetch_album(str(row.get("id") or ""))
-            if body:
-                break
-    album = body.get("album") if isinstance(body, dict) else {}
-    rows = body.get("items") if isinstance(body, dict) else []
-    track = next((row for row in rows or [] if isinstance(row, dict)
-                  and str(row.get("songmid") or "") == songmid), None)
-    if not isinstance(album, dict) or track is None:
+    async def verified_album_artist_id(candidate_id: str) -> str:
+        body = await _artist_source_payload(
+            client, "/api/v1/catalog/album", {"source": platform, "id": candidate_id}, 8.0)
+        album, rows = body.get("album"), body.get("items")
+        if not isinstance(album, dict) or not isinstance(rows, list):
+            return ""
+        candidate_artist_id = str(album.get("artist_id") or "").strip()
+        if candidate_artist_id in ("", "0", "None"):
+            return ""
+        if localmatch.split_artist_set(str(album.get("artist") or "")) != wanted_artist:
+            return ""
+        if any(isinstance(row, dict) and str(row.get("songmid") or "") == songmid
+               and localmatch.split_artist_set(str(row.get("artist") or "")) == wanted_artist
+               for row in rows):
+            return candidate_artist_id
+        return ""
+
+    try:
+        # 直查、同名候选和歌手详情共享时限；专辑名只用于找候选，不用于确认身份。
+        async with asyncio.timeout(15.0):
+            album_artist_id = await verified_album_artist_id(album_id)
+            if not album_artist_id and album_name:
+                search_body = await _artist_source_payload(
+                    client, "/api/v1/catalog/search",
+                    {"kind": "album", "q": album_name, "sources": platform, "page": 1, "limit": 20}, 8.0)
+                rows = search_body.get("items")
+                wanted_album = localmatch.title_key(album_name)
+                seen = {album_id}
+                for row in rows[:20] if isinstance(rows, list) else []:
+                    if not isinstance(row, dict) or localmatch.title_key(str(row.get("name") or "")) != wanted_album:
+                        continue
+                    candidate_id = str(row.get("id") or "").strip()
+                    if not candidate_id or candidate_id in seen:
+                        continue
+                    seen.add(candidate_id)
+                    album_artist_id = await verified_album_artist_id(candidate_id)
+                    if album_artist_id:
+                        break
+            if not album_artist_id:
+                return False
+            detail_body = await _artist_source_payload(
+                client, "/api/v1/catalog/artist", {"source": platform, "id": album_artist_id}, 8.0)
+    except TimeoutError:
         return False
-    album_artist = str(album.get("artist") or "")
-    track_artist = str(track.get("artist") or "")
-    album_artist_id = str(album.get("artist_id") or "").strip()
-    album_set = localmatch.split_artist_set(album_artist)
-    track_set = localmatch.split_artist_set(track_artist)
-    if (not album_artist_id or album_artist_id in ("0", "None") or len(album_set) != 1
-            or len(track_set) != 1 or album_set != track_set):
-        return False
-    detail_response = await get_lx_client(app).get(
-        "/api/v1/catalog/artist",
-        params={"source": platform, "id": album_artist_id},
-        timeout=10.0,
-    )
-    if detail_response.status_code != 200:
-        return False
-    detail_body = detail_response.json()
-    detail = detail_body.get("artist") if isinstance(detail_body, dict) else {}
-    if not isinstance(detail, dict) or not detail.get("id"):
+    detail = detail_body.get("artist")
+    if (not isinstance(detail, dict) or not detail.get("id")
+            or localmatch.split_artist_set(str(detail.get("name") or "")) != wanted_artist):
         return False
     register_fake_artist(
         str(entry.get("real_guid") or ""), source="lx", platform=platform,
-        artist_id=str(detail.get("id")), name=str(detail.get("name") or album_artist),
+        artist_id=str(detail["id"]), name=str(detail["name"]),
         cover_url=str(detail.get("pic_url") or ""), pending=False,
     )
     return True
@@ -14823,25 +14812,13 @@ async def artist_detail(request: Request):
     return JSONResponse(content=disguise_client_json({"code": 0, "msg": "ok", "data": artist}))
 
 
-def _artist_page(request: Request, total: int, rows: list[dict]) -> dict:
-    try:
-        page = max(int(request.query_params.get("page") or 1), 1)
-    except (TypeError, ValueError):
-        page = 1
-    try:
-        size = int(request.query_params.get("size") or 50)
-    except (TypeError, ValueError):
-        size = 50
-    if size == -1:
-        size = max(len(rows), 1)
-    if size < 1:
-        size = 50
-    start = (page - 1) * size
+def _artist_page_envelope(request: Request, total: int, rows: list[dict]) -> dict:
+    """音源已返回当前页，代理只封装结果，不再分页。"""
     return {
         "code": 0,
         "msg": "ok",
         "data": {
-            "list": rows[start:start + size],
+            "list": rows,
             "total": total,
             "sort": request.query_params.get("sort") or "",
         },
@@ -14891,41 +14868,40 @@ async def track_artist_detail_list(request: Request):
     artist_id = str(entry.get("artist_id") or "")
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
-        size = min(max(int(request.query_params.get("size") or 50), 1), 200)
+        max_size = 100 if source == "netease" else 200
+        size = min(max(int(request.query_params.get("size") or 50), 1), max_size)
     except (TypeError, ValueError):
         page, size = 1, 50
     sort = str(request.query_params.get("sort") or "").lower()
     order = "time" if "createdat" in sort else "hot"
     if source == "netease" and CONF.get("netease_enabled") and _netease_runtime_usable():
-        response = await get_netease_client(app).get(
+        body = await _artist_source_payload(
+            get_netease_client(request.app),
             f"/api/v1/artist/{artist_id}/tracks",
-            params={"page": page, "limit": size, "offset": (page - 1) * size, "order": order},
-            timeout=20.0,
+            {"page": page, "limit": size, "offset": (page - 1) * size, "order": order}, 20.0,
         )
     elif source == "lx" and platform in _lx_catalog_platforms():
-        response = await get_lx_client(app).get(
+        body = await _artist_source_payload(
+            get_lx_client(request.app),
             "/api/v1/catalog/artist/tracks",
-            params={"source": platform, "id": artist_id, "page": page,
-                    "limit": size, "order": order},
-            timeout=25.0,
+            {"source": platform, "id": artist_id, "page": page, "limit": size, "order": order}, 25.0,
         )
     else:
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持歌手歌曲", "data": None})
-    if response.status_code != 200:
+    rows = body.get("data" if source == "netease" else "items")
+    if not isinstance(rows, list):
         return JSONResponse(content={"code": -1, "msg": "歌手歌曲获取失败", "data": None})
-    body = response.json()
     if source == "netease":
-        rows = body.get("data") if isinstance(body, dict) else []
-        infos = [info for row in rows or [] if isinstance(row, dict)
+        infos = [info for row in rows if isinstance(row, dict)
                  for info in [_netease_artist_track_info(row)] if info]
-        total = int(body.get("total") or len(infos))
     else:
-        infos = body.get("items") if isinstance(body, dict) else []
-        infos = [row for row in infos or [] if isinstance(row, dict)]
-        total = int(body.get("total") or len(infos))
+        infos = [row for row in rows if isinstance(row, dict)]
+    total = body.get("total")
+    if type(total) is not int or total < len(infos):
+        total = len(infos)
     tracks = [build_online_track(info) for info in infos]
     register_online_meta(tracks)
-    return JSONResponse(content=disguise_client_json(_artist_page(request, total, tracks)))
+    return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, tracks)))
 
 
 async def _lx_catalog_album_search_rows(keyword: str, limit: int) -> list[dict]:
@@ -15006,41 +14982,30 @@ async def album_artist_detail_list(request: Request):
     except (TypeError, ValueError):
         page, size = 1, 50
     if source == "netease" and CONF.get("netease_enabled") and _netease_runtime_usable():
-        response = await get_netease_client(app).get(
+        body = await _artist_source_payload(
+            get_netease_client(request.app),
             f"/api/v1/artist/{artist_id}/albums",
-            params={"page": page, "limit": size, "offset": (page - 1) * size},
-            timeout=15.0,
+            {"page": page, "limit": size, "offset": (page - 1) * size}, 15.0,
         )
     elif source == "lx" and platform in _lx_catalog_platforms():
-        response = await get_lx_client(app).get(
+        body = await _artist_source_payload(
+            get_lx_client(request.app),
             "/api/v1/catalog/artist/albums",
-            params={"source": platform, "id": artist_id, "page": page, "limit": size},
-            timeout=15.0,
+            {"source": platform, "id": artist_id, "page": page, "limit": size}, 15.0,
         )
     else:
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持歌手专辑", "data": None})
-    if response.status_code != 200:
+    rows = body.get("data" if source == "netease" else "items")
+    if not isinstance(rows, list):
         return JSONResponse(content={"code": -1, "msg": "歌手专辑获取失败", "data": None})
-    body = response.json()
-    rows = body.get("data") if source == "netease" and isinstance(body, dict) else (
-        body.get("items") if isinstance(body, dict) else [])
     albums: list[dict] = []
-    for row in rows or []:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         if source == "netease":
-            album_id = str(row.get("id") or "").strip()
-            name = str(row.get("name") or "").strip()
-            artist_name = str(row.get("artistName") or "")
-            if not album_id or not name:
-                continue
-            anchor = f"online:netease:album:{album_id}"
-            register_fake_album(
-                anchor, name, {"source": "netease", "cover_url": str(row.get("picUrl") or ""),
-                               "artist": artist_name},
-                album_id=album_id, persist=True,
-            )
-            albums.append(_album_list_obj(f"{anchor}:album", name, artist_name, anchor, row.get("size") or 0))
+            normalized = _normalize_netease_album_row(row)
+            if normalized is not None:
+                albums.append(_netease_album_card(*normalized, track_count=row.get("size") or 0))
         else:
             platform_id = str(row.get("lx_source") or platform).lower()
             album_id = str(row.get("id") or "").strip()
@@ -15060,32 +15025,41 @@ async def album_artist_detail_list(request: Request):
                 )
                 album["artists"] = [{"guid": artist_fake, "name": artist_name, "coverId": None}]
             albums.append(album)
-    total = int(body.get("total") or len(albums)) if isinstance(body, dict) else len(albums)
-    return JSONResponse(content=disguise_client_json(_artist_page(request, total, albums)))
+    total = body.get("total")
+    if type(total) is not int or total < len(albums):
+        total = len(albums)
+    return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, albums)))
 
 
-def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str, str] | None":
-    """网易专辑搜索行（CLI 与 web 兜底两种形状）→ (album_id, 名称, 歌手, 封面, 歌手 ID)。"""
-    album_id = str(row.get("album_id") or row.get("albumId") or row.get("id") or "")
+def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str, list] | None":
+    """网易专辑列表行 → (album_id, 名称, 歌手名称, 封面, 原生歌手列表)。"""
+    album_id = str(row.get("album_id") or row.get("albumId") or row.get("id") or "").strip()
     name = str(row.get("album_name") or row.get("name") or row.get("title") or "").strip()
     if not album_id or album_id in ("0", "None") or not name:
         return None
-    ar = row.get("artists") or row.get("artist") or []
-    artist_id = ""
-    if isinstance(ar, list):
-        names = [str(a.get("name") or "") for a in ar if isinstance(a, dict) and a.get("name")]
-        artist = " / ".join(names)
-        for a in ar:
-            if not isinstance(a, dict) or not a.get("name"):
-                continue
-            candidate = str(a.get("id") or "").strip()
-            if candidate and candidate not in ("0", "None"):
-                artist_id = candidate
-                break
-    else:
-        artist = str(ar or "")
+    raw_artists = row.get("artists") or row.get("artist") or row.get("artistName") or ""
+    artists = raw_artists if isinstance(raw_artists, list) else []
+    artist = (" / ".join(str(person["name"]) for person in artists
+                         if isinstance(person, dict) and person.get("name"))
+              if artists else str(raw_artists))
     cover = str(row.get("pic_url") or row.get("picUrl") or row.get("coverImgUrl") or row.get("cover") or "")
-    return album_id, name, artist, cover, artist_id
+    return album_id, name, artist, cover, artists
+
+
+def _netease_album_card(
+    album_id: str, name: str, artist: str, cover: str, artists: list, *, track_count: int = 0
+) -> dict:
+    anchor = f"online:netease:album:{album_id}"
+    register_fake_album(
+        anchor, name, {"source": "netease", "cover_url": cover, "artist": artist},
+        album_id=album_id, persist=True,
+    )
+    guid = f"{anchor}:album"
+    card = _album_list_obj(guid, name, artist, guid, track_count)
+    artist_refs = _track_artist_list({"artists": artists}, guid, "netease", artist, name) if artists else []
+    if artist_refs:
+        card["artists"] = artist_refs
+    return card
 
 
 async def _netease_album_search_rows(request: Request, keyword: str, limit: int) -> list[dict]:
@@ -15115,22 +15089,11 @@ async def _netease_album_search_rows(request: Request, keyword: str, limit: int)
         norm = _normalize_netease_album_row(row)
         if norm is None:
             continue
-        album_id, name, artist, cover, artist_id = norm
+        album_id = norm[0]
         if album_id in seen:
             continue
         seen.add(album_id)
-        # 锚点 guid 仅供专辑伪装登记/反解，不对应任何真实曲目；
-        # 形态对齐曲目锚点约定：专辑 guid = 锚点 + ":album"（register 内部拼）
-        anchor = f"online:netease:album:{album_id}"
-        register_fake_album(anchor, name, {"cover_url": cover} if cover else {}, album_id=album_id, persist=True)
-        obj = _album_list_obj(f"{anchor}:album", name, artist, f"{anchor}:album", 0)
-        if artist_id and artist:
-            artist_fake = register_fake_artist(
-                artist_real_guid("netease", "", artist_id),
-                source="netease", platform="", artist_id=artist_id, name=artist,
-            )
-            obj["artists"] = [{"guid": artist_fake, "name": artist, "coverId": None}]
-        out.append(obj)
+        out.append(_netease_album_card(*norm))
         if len(out) >= limit:
             break
     return out

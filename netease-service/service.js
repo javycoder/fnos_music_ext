@@ -878,15 +878,20 @@ function createService(options = {}) {
       const resp = await sdk.artist_album({ id: artistId, limit, offset, cookie, timeout: timeoutMs });
       const body = resp && resp.body ? resp.body : {};
       const albums = Array.isArray(body.hotAlbums) ? body.hotAlbums : [];
-      const data = albums.map(album => ({
-        id: nonnegativeIntOrZero(album.id),
-        name: String(album.name || ''),
-        picUrl: String(album.picUrl || ''),
-        artistName: (Array.isArray(album.artists) ? album.artists : [])
-          .filter(a => a && a.name).map(a => String(a.name)).join(' / '),
-        size: nonnegativeIntOrZero(album.size),
-        publishTime: nonnegativeIntOrZero(album.publishTime),
-      })).filter(album => album.id && album.name);
+      const data = albums.filter(Boolean).map(album => {
+        const artists = (Array.isArray(album.artists) ? album.artists : [])
+          .filter(artist => artist && artist.name)
+          .map(artist => ({ id: nonnegativeIntOrZero(artist.id), name: String(artist.name) }));
+        return {
+          id: nonnegativeIntOrZero(album.id),
+          name: String(album.name || ''),
+          picUrl: String(album.picUrl || ''),
+          artistName: artists.map(artist => artist.name).join(' / '),
+          artists,
+          size: nonnegativeIntOrZero(album.size),
+          publishTime: nonnegativeIntOrZero(album.publishTime),
+        };
+      }).filter(album => album.id && album.name);
       return res.json({
         ok: true,
         code: 200,
