@@ -14900,7 +14900,10 @@ async def track_artist_detail_list(request: Request):
     total = body.get("total")
     if type(total) is not int or total < len(infos):
         total = len(infos)
-    tracks = [build_online_track(info) for info in infos]
+    tracks = [
+        dict(build_online_track(info), createdAt=0, updatedAt=0)
+        for info in infos
+    ]
     register_online_meta(tracks)
     return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, tracks)))
 
