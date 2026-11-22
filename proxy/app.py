@@ -75,6 +75,7 @@ try:
     from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search
     from .fnlog import diag as fn_diag
     from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
+    from .fscheck import probe_dir_writable as _probe_dir_writable
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
@@ -99,6 +100,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search  # type: ignore
     from fnlog import diag as fn_diag  # type: ignore
     from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
+    from fscheck import probe_dir_writable as _probe_dir_writable  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
@@ -5052,6 +5054,10 @@ _ALBUM_PERSIST_LAST = 0.0
 _FAKE_ARTIST_REGISTRY: dict[str, dict] = {}
 _ARTIST_REGISTRY_MAX = 4096
 _ARTIST_REGISTRY_TTL_S = 3600.0
+_ARTIST_SEARCH_REGISTRY_PATH = os.path.join(_HOME, "cache", "artist_search_registry.json")
+_ARTIST_SEARCH_REGISTRY_MAX = 512
+_ARTIST_SEARCH_REGISTRY_TTL_S = 14 * 86400
+_ARTIST_SEARCH_REGISTRY: dict[str, dict] | None = None
 
 
 def _album_name_from_obj(track_obj: dict) -> str:
@@ -5314,26 +5320,103 @@ def register_fake_artist(
     return fake
 
 
+def _load_searched_artists() -> dict[str, dict]:
+    global _ARTIST_SEARCH_REGISTRY
+    if _ARTIST_SEARCH_REGISTRY is not None:
+        return _ARTIST_SEARCH_REGISTRY
+    _ARTIST_SEARCH_REGISTRY = {}
+    try:
+        with open(_ARTIST_SEARCH_REGISTRY_PATH, encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, ValueError):
+        return _ARTIST_SEARCH_REGISTRY
+    if not isinstance(payload, dict):
+        return _ARTIST_SEARCH_REGISTRY
+    now = time.time()
+    for guid, entry in list(payload.items())[-_ARTIST_SEARCH_REGISTRY_MAX:]:
+        if not isinstance(entry, dict):
+            continue
+        expires = entry.get("expires")
+        source, platform, artist_id = (entry.get(key) for key in ("source", "platform", "artist_id"))
+        if type(expires) is not int or not now < expires <= now + _ARTIST_SEARCH_REGISTRY_TTL_S:
+            continue
+        if (source, platform) not in (("netease", ""), ("lx", "tx"), ("lx", "wy")):
+            continue
+        if not isinstance(artist_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", artist_id):
+            continue
+        real_guid = artist_real_guid(source, platform, artist_id)
+        if fake_official_guid(real_guid) != guid:
+            continue
+        _ARTIST_SEARCH_REGISTRY[guid] = {
+            "real_guid": real_guid, "source": source, "platform": platform, "artist_id": artist_id,
+            "name": str(entry.get("name") or ""), "cover_url": str(entry.get("cover_url") or ""),
+            "expires": expires,
+        }
+    return _ARTIST_SEARCH_REGISTRY
+
+
+def _remember_searched_artists(rows: list[dict]) -> None:
+    """Persist only canonical identities exposed by artist search, not per-track aliases."""
+    if not rows:
+        return
+    registry = _load_searched_artists()
+    now = int(time.time())
+    for row in rows:
+        guid = row["guid"]
+        entry = _FAKE_ARTIST_REGISTRY.get(guid)
+        if entry is not None:
+            registry.pop(guid, None)
+            registry[guid] = {
+                key: entry[key] for key in ("real_guid", "source", "platform", "artist_id", "name", "cover_url")
+            }
+            registry[guid]["expires"] = now + _ARTIST_SEARCH_REGISTRY_TTL_S
+    snapshot = {guid: entry for guid, entry in
+                list(registry.items())[-_ARTIST_SEARCH_REGISTRY_MAX:] if entry["expires"] > now}
+    registry.clear()
+    registry.update(snapshot)
+    directory = os.path.dirname(_ARTIST_SEARCH_REGISTRY_PATH)
+    temp_path = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=directory, suffix=".tmp", encoding="utf-8", delete=False) as file:
+            temp_path = file.name
+            json.dump(snapshot, file, ensure_ascii=False)
+        os.replace(temp_path, _ARTIST_SEARCH_REGISTRY_PATH)
+    except OSError as error:
+        logger.debug("artist search registry persist failed: %s", type(error).__name__)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            with contextlib.suppress(OSError):
+                os.unlink(temp_path)
+
+
 def resolve_fake_artist(candidate: str) -> dict | None:
     """客户端回传的歌手伪装 guid → 登记条目；本地/官方 guid 返回 None。"""
     raw = str(candidate or "").strip()
     fake = raw[len("artist_"):] if raw.startswith("artist_") else raw
     if not re.fullmatch(r"[0-9a-f]{32}", fake or "", re.IGNORECASE):
         return None
+    fake = fake.lower()
     entry = _FAKE_ARTIST_REGISTRY.get(fake)
-    if entry is None:
-        return None
-    if float(entry.get("expires") or 0) < time.time():
+    now = time.time()
+    if entry is not None:
+        if entry["expires"] > now:
+            return entry
         _FAKE_ARTIST_REGISTRY.pop(fake, None)
-        return None
-    return entry
+    registry = _load_searched_artists()
+    entry = registry.get(fake)
+    if entry is not None:
+        if entry["expires"] > now:
+            return entry
+        registry.pop(fake, None)
+    return None
 
 
 def artist_entry_from_real_guid(real_guid: str) -> "dict | None":
     raw = str(real_guid or "")
     if ":artist:" not in raw:
         return None
-    return _FAKE_ARTIST_REGISTRY.get(fake_official_guid(raw))
+    return resolve_fake_artist(fake_official_guid(raw))
 
 
 def _register_fakes_from_items(items) -> None:
@@ -5769,27 +5852,12 @@ async def _run_cleanup_locked(job: dict) -> None:
         job.update(status="completed", phase="清理完成")
 
 
-def _probe_dir_writable(directory: str) -> bool:
-    probe = os.path.join(directory, f".fnmusic-fscheck-{os.getpid()}-{uuid4().hex}")
-    try:
-        fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-        os.close(fd)
-        return True
-    except OSError:
-        return False
-    finally:
-        try:
-            os.unlink(probe)
-        except OSError:
-            pass
-
-
 def _fs_check_target(path: str) -> tuple[bool, bool]:
     """目录存在性与可写性探测（与 webui_gateway.handle_fs_check 同语义）。
 
     以当前（降权后）proxy 身份探测——下载/缓存目录的真实落盘方就是它，
-    结论比 root 视角更贴近实际。无副作用：不创建目录，临时探测文件即落
-    即删；目录不存在时用最近存在祖先目录的可写性代表"能否创建"。
+    结论比 root 视角更贴近实际。不创建目录，探测文件尽力删除；
+    目录不存在时用最近存在祖先目录的可写性代表"能否创建"。
     """
     exists = writable = False
     ancestor = path
@@ -14460,7 +14528,9 @@ async def _online_artist_search(keyword: str, limit: int) -> list[dict]:
             logger.debug("online artist search branch failed: %s", part)
         else:
             parts.append(part)
-    return _interleave_online_rows(parts, limit)
+    rows = _interleave_online_rows(parts, limit)
+    _remember_searched_artists(rows)
+    return rows
 
 
 _ARTIST_POOL_TTL_S = 120.0
@@ -14810,6 +14880,7 @@ async def artist_detail(request: Request):
     artist = await _native_artist_payload(entry)
     if artist is None:
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持歌手详情", "data": None})
+    artist["guid"] = fake_official_guid(entry["real_guid"])
     return JSONResponse(content=disguise_client_json({"code": 0, "msg": "ok", "data": artist}))
 
 
