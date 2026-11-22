@@ -1,5 +1,7 @@
 """Issue #141：在线歌手与原生专辑搜索/详情契约回归。"""
 import asyncio
+import json
+import time
 
 import httpx
 import pytest
@@ -17,6 +19,8 @@ def clean_issue141_state(monkeypatch, tmp_path):
     app_mod._album_pool_cache.clear()
     monkeypatch.setattr(app_mod, "_ALBUM_REGISTRY_PATH", str(tmp_path / "album_registry.json"))
     monkeypatch.setattr(app_mod, "_ALBUM_PERSIST_LAST", 0.0)
+    monkeypatch.setattr(app_mod, "_ARTIST_SEARCH_REGISTRY_PATH", tmp_path / "artist_search_registry.json")
+    monkeypatch.setattr(app_mod, "_ARTIST_SEARCH_REGISTRY", None)
     yield
     app_mod._FAKE_ARTIST_REGISTRY.clear()
     app_mod._artist_pool_cache.clear()
@@ -112,6 +116,45 @@ def test_issue141_search_and_artist_detail_pages(monkeypatch):
         assert albums["data"]["list"][0]["name"] == "网易专辑"
         assert [resolve_fake_artist(row["guid"])["artist_id"]
                 for row in albums["data"]["list"][0]["artists"]] == ["6000", "6001"]
+
+
+def test_artist_search_link_survives_proxy_restart(monkeypatch):
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
+    monkeypatch.setitem(CONF, "musicdl_enabled", False)
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_official_artist_handler), base_url="http://official")
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_netease_artist_handler), base_url="http://netease")
+
+    with TestClient(app) as client:
+        search = client.get("/music/api/v1/search/artist", params={
+            "q": "歌手", "page": 2, "size": 24,
+        }).json()["data"]["list"]
+        artist_guid = search[6]["guid"]
+        monkeypatch.setattr(app_mod, "_FAKE_ARTIST_REGISTRY", {})
+        monkeypatch.setattr(app_mod, "_ARTIST_SEARCH_REGISTRY", None)
+
+        detail = client.get("/music/api/v1/artist/detail", params={"guid": artist_guid}).json()
+        assert detail["data"]["guid"] == artist_guid
+        assert detail["data"]["name"] == "网易歌手0"
+        for kind in ("track", "album"):
+            body = client.get(f"/music/api/v1/{kind}/artist-detail/list", params={
+                "artistGUID": artist_guid, "page": 1, "size": 20,
+            }).json()
+            assert body["data"]["total"] == 1
+
+
+def test_artist_search_registry_ignores_expired_and_invalid_entries():
+    path = app_mod._ARTIST_SEARCH_REGISTRY_PATH
+    expired = app_mod.fake_official_guid("online:netease:artist:6000")
+    other = app_mod.fake_official_guid("online:netease:artist:6001")
+    path.write_text(json.dumps({
+        expired: {"source": "netease", "platform": "", "artist_id": "6000", "expires": 1},
+        other: {"source": "netease", "platform": "", "artist_id": "6000", "expires": int(time.time()) + 60},
+    }), encoding="utf-8")
+    assert resolve_fake_artist(expired) is None
+    assert resolve_fake_artist(other) is None
 
 
 @pytest.mark.parametrize("source", ["netease", "lx"])
@@ -301,6 +344,7 @@ def test_issue141_pending_lx_track_artist_requires_native_verification(monkeypat
     with TestClient(app) as client:
         detail = client.get("/music/api/v1/artist/detail", params={"guid": pending_guid}).json()
     assert detail["code"] == 0
+    assert detail["data"]["guid"] == pending_guid
     entry = resolve_fake_artist(pending_guid)
     assert entry["pending"] is False
     assert entry["artist_id"] == "700"
