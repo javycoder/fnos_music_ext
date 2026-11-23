@@ -1285,8 +1285,9 @@ async def _llm_complete(
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    timeout_s = llm_timeout_s()
     try:
-        resp = await http_client.post(url, json=payload, headers=headers, timeout=llm_timeout_s())
+        resp = await http_client.post(url, json=payload, headers=headers, timeout=timeout_s)
     except asyncio.CancelledError:
         # 请求已发出后被取消（配置变更/任务取消）：按实际尝试记一次账后原样抛出，
         # 绝不吞掉取消。取消不是模型失败，不覆盖“最近失败”原因。
@@ -1295,9 +1296,20 @@ async def _llm_complete(
     except LLMFailure:
         raise
     except httpx.TimeoutException as e:
-        llm_usage.record(None, "timeout", str(e), actual_request=True,
+        if isinstance(e, httpx.ConnectTimeout):
+            phase = "连接"
+        elif isinstance(e, httpx.ReadTimeout):
+            phase = "读取响应"
+        elif isinstance(e, httpx.WriteTimeout):
+            phase = "发送请求"
+        elif isinstance(e, httpx.PoolTimeout):
+            phase = "等待连接池"
+        else:
+            phase = "阶段未知"
+        detail = f"{phase}超时（配置 {timeout_s:g} 秒）"
+        llm_usage.record(None, "timeout", detail, actual_request=True,
                          unknown_cause="transportError")
-        raise LLMFailure("timeout", str(e)) from e
+        raise LLMFailure("timeout", detail) from e
     except Exception as e:
         llm_usage.record(None, "network", str(type(e).__name__), actual_request=True,
                          unknown_cause="transportError")

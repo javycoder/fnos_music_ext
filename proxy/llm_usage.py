@@ -25,6 +25,8 @@ _LOCK = threading.Lock()
 
 DEFAULT_DAILY_TOKEN_LIMIT = 1_000_000
 _MAX_INT = 1_000_000_000
+_LEGACY_CLAMPED_FAILURE_AT = 1_000_000_000
+_MAX_FAILURE_AT = 253_402_300_799
 _TZ_SHANGHAI = timezone(timedelta(hours=8))
 TIMEZONE_LABEL = "Asia/Shanghai"
 
@@ -78,6 +80,21 @@ def _safe_int(val: object, default: int = 0) -> int:
         return default
 
 
+def _safe_failure_at(value: object) -> int:
+    if isinstance(value, str):
+        if not (value.isascii() and value.isdecimal()):
+            return 0
+        significant = value.lstrip("0")
+        if not significant or len(significant) > len(str(_MAX_FAILURE_AT)):
+            return 0
+        value = int(significant)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    if value == _LEGACY_CLAMPED_FAILURE_AT or not 0 < value <= _MAX_FAILURE_AT:
+        return 0
+    return value
+
+
 def _safe_failure(val: object) -> dict | None:
     if not isinstance(val, dict):
         return None
@@ -85,7 +102,7 @@ def _safe_failure(val: object) -> dict | None:
     if not reason:
         return None
     detail = _sanitize_failure_text(str(val.get("detail") or ""))
-    at = _safe_int(val.get("at"), int(time.time()))
+    at = _safe_failure_at(val.get("at"))
     return {
         "reason": reason[:80],
         "detail": detail[:500],
