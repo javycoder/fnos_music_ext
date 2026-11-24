@@ -164,6 +164,24 @@ test('GET /healthz returns netease provider and upstream version offline', async
   assert.strictEqual(res.body.version, '4.41.1');
 });
 
+test('artist catalogs distinguish missing counts and real zero without using page length', async () => {
+  const service = createService({ sdk: {
+    cloudsearch: async () => ({ body: { result: { artists: [
+      { id: 1, name: 'Unknown' }, { id: 2, name: 'Empty', musicSize: 0 },
+    ] } } }),
+    artist_songs: async ({ id }) => ({ body: id === 1
+      ? { songs: [{ id: 300, name: 'One page row' }] }
+      : { songs: [], total: 0 } }),
+  } });
+  const search = await makeRequest(service.app, 'GET', '/api/v1/search?keyword=artist&type=artist');
+  assert.deepStrictEqual(search.body.data.map(row => row.musicSize), [null, 0]);
+  const unknown = await makeRequest(service.app, 'GET', '/api/v1/artist/1/tracks?limit=1');
+  assert.strictEqual(unknown.body.total, null);
+  assert.strictEqual(unknown.body.data.length, 1);
+  const empty = await makeRequest(service.app, 'GET', '/api/v1/artist/2/tracks?limit=1');
+  assert.strictEqual(empty.body.total, 0);
+});
+
 test('GET /api/v1/search validation and mapping', async () => {
   const mockSdk = {
     cloudsearch: async ({ keywords, type, limit, offset }) => {

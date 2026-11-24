@@ -381,6 +381,15 @@ def map_lxserver_song(song: dict, fallback_source: str = "") -> dict:
     return item
 
 
+def _catalog_artist_count(*values: Any) -> int | None:
+    for value in values:
+        if type(value) is int and value >= 0:
+            return value
+        if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 10:
+            return int(value)
+    return None
+
+
 def normalize_catalog_artist(row: dict, source: str) -> dict | None:
     """lxserver 歌手搜索/详情行 → 统一歌手对象。"""
     src = normalize_source(source or row.get("source"))
@@ -398,8 +407,8 @@ def normalize_catalog_artist(row: dict, source: str) -> dict | None:
         "name": name,
         "pic_url": str(row.get("picUrl") or row.get("avatar") or ""),
         "alias": [str(value) for value in alias if value],
-        "album_count": int(row.get("albumSize") or row.get("albumCount") or 0),
-        "track_count": int(row.get("musicSize") or row.get("trackCount") or 0),
+        "album_count": _catalog_artist_count(row.get("albumSize"), row.get("albumCount")),
+        "track_count": _catalog_artist_count(row.get("musicSize"), row.get("trackCount")),
     }
 
 

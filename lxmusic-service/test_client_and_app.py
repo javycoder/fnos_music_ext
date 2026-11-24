@@ -369,6 +369,29 @@ def test_catalog_artist_albums_translates_fixed_native_pages(monkeypatch, test_a
         (page - 1) * size + 1, min(page * size, 110) + 1))
 
 
+@pytest.mark.parametrize("count,expected", [(None, None), (0, 0), ("1245", 1245), ("bad", None), (True, None)])
+def test_catalog_artist_preserves_unknown_count(count, expected):
+    row = normalize_catalog_artist({"id": "123", "name": "陈奕迅", "musicSize": count}, "wy")
+    assert row["track_count"] == expected
+
+
+@pytest.mark.parametrize("count,malformed,complete", [(0, False, True), (2, False, True), (100, False, False),
+                                                     (1, True, False)])
+def test_catalog_artist_tracks_marks_possible_truncation(monkeypatch, test_app_client, count, malformed, complete):
+    lxapp._CATALOG_CACHE.clear()
+    mock = LxServerClient(base_url="http://test")
+
+    async def songs(*args):
+        return [{"songmid": f"song-{index}", "name": "歌"} if not malformed else {} for index in range(count)]
+
+    monkeypatch.setattr(mock, "get_artist_songs", songs)
+    monkeypatch.setattr(lxapp, "LXSERVER", mock)
+    data = test_app_client.get("/api/v1/catalog/artist/tracks",
+                               params={"id": "test-artist", "source": "tx", "limit": 1}).json()
+    assert data["total"] == (0 if malformed else count)
+    assert data["complete"] is complete
+
+
 def test_map_lxserver_song_kuwo():
     raw = {
         "name": "海阔天空",

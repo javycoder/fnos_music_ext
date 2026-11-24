@@ -58,6 +58,7 @@ try:
     from .scan_auth import ScanAdminSession, ScanAuthError, authx_header
     from . import localrecommend as localrec
     from . import localmatch
+    from . import artist_identity
     from . import music_compat
     from .organize import target_dir as layout_target_dir, safe_part as safe_layout_part
     from .userstorage import (
@@ -83,6 +84,7 @@ except ImportError:  # uvicorn --app-dir proxy
     from scan_auth import ScanAdminSession, ScanAuthError, authx_header  # type: ignore
     import localrecommend as localrec
     import localmatch  # type: ignore
+    import artist_identity  # type: ignore
     import music_compat  # type: ignore
     from organize import target_dir as layout_target_dir, safe_part as safe_layout_part
     from userstorage import (  # type: ignore
@@ -14371,14 +14373,28 @@ def _album_list_obj(album_guid: str, album_name: str, artist: str, cover_ref: st
 _ARTIST_SEARCH_LIMIT = 10
 
 
+def _artist_count(*values: Any) -> int | None:
+    for value in values:
+        if type(value) is int and value >= 0:
+            return value
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,10}", value):
+            return int(value)
+    return None
+
+
+def _artist_public_card(row: dict) -> dict:
+    return dict(row, trackCount=_artist_count(row.get("trackCount")) or 0,
+                albumCount=_artist_count(row.get("albumCount")) or 0)
+
+
 def _artist_list_obj(
     source: str,
     platform: str,
     artist_id: str,
     name: str,
     cover_url: str = "",
-    album_count: int = 0,
-    track_count: int = 0,
+    album_count: Any = None,
+    track_count: Any = None,
 ) -> dict:
     real = artist_real_guid(source, platform, artist_id)
     fake = register_fake_artist(
@@ -14393,8 +14409,8 @@ def _artist_list_obj(
         "guid": fake,
         "name": name,
         "coverId": fake,
-        "albumCount": int(album_count or 0),
-        "trackCount": int(track_count or 0),
+        "albumCount": _artist_count(album_count),
+        "trackCount": _artist_count(track_count),
     }
 
 
@@ -14438,8 +14454,8 @@ async def _netease_artist_search_rows(keyword: str, limit: int) -> list[dict]:
         out.append(_artist_list_obj(
             "netease", "", artist_id, name,
             str(row.get("picUrl") or row.get("img1v1Url") or ""),
-            row.get("albumSize") or row.get("albumCount") or 0,
-            row.get("musicSize") or row.get("trackCount") or 0,
+            _artist_count(row.get("albumSize"), row.get("albumCount")),
+            _artist_count(row.get("musicSize"), row.get("trackCount")),
         ))
         if len(out) >= limit:
             break
@@ -14471,7 +14487,7 @@ async def _lx_artist_search_rows(keyword: str, limit: int) -> list[dict]:
     rows = body.get("items") if isinstance(body, dict) else None
     if not isinstance(rows, list):
         return []
-    out: list[dict] = []
+    by_platform: dict[str, list[dict]] = {platform: [] for platform in platforms}
     seen: set[tuple[str, str]] = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -14483,13 +14499,11 @@ async def _lx_artist_search_rows(keyword: str, limit: int) -> list[dict]:
         if platform not in platforms or not artist_id or not name or identity in seen:
             continue
         seen.add(identity)
-        out.append(_artist_list_obj(
+        by_platform[platform].append(_artist_list_obj(
             "lx", platform, artist_id, name, str(row.get("pic_url") or ""),
-            row.get("album_count") or 0, row.get("track_count") or 0,
+            row.get("album_count"), row.get("track_count"),
         ))
-        if len(out) >= limit:
-            break
-    return out
+    return _interleave_online_rows(list(by_platform.values()), limit)
 
 
 def _interleave_online_rows(parts: list[list[dict]], limit: int) -> list[dict]:
@@ -14518,8 +14532,8 @@ def _interleave_online_rows(parts: list[list[dict]], limit: int) -> list[dict]:
 
 async def _online_artist_search(keyword: str, limit: int) -> list[dict]:
     netease_rows, lx_rows = await asyncio.gather(
-        _netease_artist_search_rows(keyword, limit),
-        _lx_artist_search_rows(keyword, limit),
+        _artist_optional(_netease_artist_search_rows(keyword, limit), 7.5, []),
+        _artist_optional(_lx_artist_search_rows(keyword, limit), 7.5, []),
         return_exceptions=True,
     )
     parts: list[list[dict]] = []
@@ -14537,9 +14551,9 @@ _ARTIST_POOL_TTL_S = 120.0
 _ARTIST_POOL_ERR_TTL_S = 5.0
 _ARTIST_POOL_MAX_ENTRIES = 64
 _ARTIST_POOL_MAX_BUILDERS = 8
-_ARTIST_POOL_WAIT_S = 8.0
+_ARTIST_POOL_WAIT_S = 25.0
 _ARTIST_POOL_BUILD_TIMEOUT_S = 8.0
-_artist_pool_cache: "OrderedDict[str, dict]" = OrderedDict()
+_artist_pool_cache: OrderedDict[tuple, dict] = OrderedDict()
 _artist_pool_lock = asyncio.Lock()
 
 
@@ -14556,48 +14570,63 @@ def _sweep_artist_pool(now: float) -> None:
         _artist_pool_cache.popitem(last=False)
 
 
-async def _build_paged_artist_pool(keyword: str, entry: dict) -> None:
+async def _build_paged_artist_pool(request: Request, keyword: str, user_guid: str, entry: dict,
+                                   official: list[dict], total: int, start: int) -> None:
+    overlays = {}
     try:
-        items = await asyncio.wait_for(
-            _online_artist_search(keyword, _ARTIST_SEARCH_LIMIT),
-            timeout=_ARTIST_POOL_BUILD_TIMEOUT_S,
+        items = await _artist_optional(
+            _online_artist_search(keyword, _ARTIST_SEARCH_LIMIT), _ARTIST_POOL_BUILD_TIMEOUT_S, [],
         )
+        items, overlays = await _prepare_artist_search(request, user_guid, items, official, total, start)
     except asyncio.CancelledError:
         raise
     except Exception as error:
-        logger.debug("paged artist pool build failed for %r: %s", keyword, error)
+        logger.debug("artist search pool failed: %s", type(error).__name__)
         items = []
     entry["items"] = items
+    entry["overlays"] = overlays
     entry["expires"] = asyncio.get_running_loop().time() + (
         _ARTIST_POOL_TTL_S if items else _ARTIST_POOL_ERR_TTL_S)
     entry["task"] = None
 
 
-async def _get_paged_artist_pool(request: Request, keyword: str) -> list[dict]:
-    if not keyword:
-        return []
-    key = _search_scope(request) + ":" + keyword
+async def _get_paged_artist_pool(request: Request, keyword: str, user_guid: str,
+                                 official: list[dict], total: int, start: int) -> tuple[list[dict], dict]:
+    key = (_search_scope(request), user_guid, keyword, total)
     now = asyncio.get_running_loop().time()
     async with _artist_pool_lock:
         _sweep_artist_pool(now)
         entry = _artist_pool_cache.get(key)
         if entry is not None and entry.get("task") is None:
             if now < entry.get("expires", 0.0):
-                return entry.get("items") or []
+                return entry["items"], entry["overlays"]
             _artist_pool_cache.pop(key, None)
             entry = None
         if entry is None:
             if sum(1 for item in _artist_pool_cache.values() if item.get("task")) >= _ARTIST_POOL_MAX_BUILDERS:
-                return []
+                return [], {}
             entry = {"task": None, "items": [], "expires": 0.0}
             _artist_pool_cache[key] = entry
-            entry["task"] = asyncio.create_task(_build_paged_artist_pool(keyword, entry))
+            entry["task"] = asyncio.create_task(
+                _build_paged_artist_pool(request, keyword, user_guid, entry, official, total, start),
+            )
         task = entry["task"]
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=_ARTIST_POOL_WAIT_S)
     except asyncio.TimeoutError:
-        return []
-    return entry.get("items") or []
+        return [], {}
+    return entry["items"], entry["overlays"]
+
+
+async def _artist_search_results(request: Request, keyword: str, official: list[dict],
+                                 total: int, start: int) -> tuple[list[dict], list[dict], Response | None]:
+    if not keyword:
+        return official, [], None
+    is_authed, user_guid, auth_response = await _probe_upstream_auth(request, get_upstream_client(request.app))
+    if not is_authed or not user_guid or user_guid == "shared":
+        return official, [], auth_response
+    pool, overlays = await _get_paged_artist_pool(request, keyword, user_guid, official, total, start)
+    return [dict(row, **overlays.get(row.get("guid"), {})) for row in official], pool, None
 
 
 async def _search_artist_paged(
@@ -14620,17 +14649,11 @@ async def _search_artist_paged(
         data["total"] = official_total
         return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
-    pool: list[dict] = []
-    if keyword:
-        try:
-            is_authed, user_guid, auth_response = await _probe_upstream_auth(
-                request, get_upstream_client(request.app))
-        except Exception:
-            is_authed, user_guid, auth_response = False, "", None
-        if not is_authed and auth_response is not None:
-            return auth_response
-        if is_authed and user_guid and user_guid != "shared":
-            pool = await _get_paged_artist_pool(request, keyword)
+    official, pool, auth_response = await _artist_search_results(
+        request, keyword, official, official_total, start,
+    )
+    if auth_response is not None:
+        return auth_response
     lo, hi = playlistsearch.online_bounds(page, size, official_total)
     data["list"] = official + pool[lo:hi]
     data["total"] = official_total + len(pool)
@@ -14660,32 +14683,19 @@ async def search_artist(request: Request, subpath: str = ""):
             return await _search_artist_paged(request, envelope, headers, keyword, page, size)
         return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
-    online: list[dict] = []
-    if keyword:
-        try:
-            is_authed, user_guid, auth_response = await _probe_upstream_auth(
-                request, get_upstream_client(request.app))
-        except Exception:
-            is_authed, user_guid, auth_response = False, "", None
-        if not is_authed and auth_response is not None:
-            return auth_response
-        if is_authed and user_guid and user_guid != "shared":
-            try:
-                online = await asyncio.wait_for(
-                    _online_artist_search(keyword, _ARTIST_SEARCH_LIMIT), timeout=8.0)
-            except asyncio.TimeoutError:
-                logger.debug("online artist search timed out for %r", keyword)
-            except Exception as error:
-                logger.warning("online artist search failed: %s", error)
-    if online:
-        data = envelope.get("data")
+    data = envelope.get("data")
+    rows = data.get("list") if isinstance(data, dict) else None
+    official = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    total = data.get("total") if isinstance(data, dict) else None
+    total = total if type(total) is int and total >= len(official) else len(official)
+    official, online, auth_response = await _artist_search_results(request, keyword, official, total, 0)
+    if auth_response is not None:
+        return auth_response
+    if isinstance(rows, list) or online:
         if not isinstance(data, dict):
-            data = {"list": [], "total": 0}
-            envelope["data"] = data
-        rows = data.get("list") if isinstance(data.get("list"), list) else []
-        data["list"] = rows + online
-        total = data.get("total")
-        data["total"] = (total if isinstance(total, int) else len(rows)) + len(online)
+            data = envelope["data"] = {}
+        data["list"] = official + online
+        data["total"] = total + len(online)
     return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
@@ -14703,24 +14713,90 @@ async def _artist_source_payload(
     return {}
 
 
-async def _native_artist_payload(entry: dict) -> dict | None:
-    source = str(entry.get("source") or "")
-    platform = str(entry.get("platform") or "").lower()
-    artist_id = str(entry.get("artist_id") or "").strip()
-    if not artist_id:
+def _artist_io_gate(application) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    state = application.state
+    if getattr(state, "artist_io_loop", None) is not loop:
+        state.artist_io_loop = loop
+        state.artist_io_gate = asyncio.Semaphore(4)
+    return state.artist_io_gate
+
+
+async def _artist_official_data(request: Request, path: str, params) -> dict:
+    try:
+        headers = copy_incoming_headers(request)
+        if "authx" in headers:
+            headers["authx"] = authx_header(path)
+        async with _artist_io_gate(request.app):
+            response = await get_upstream_client(request.app).get(
+                path, headers=headers, params=params, timeout=5.0,
+            )
+        body = response.json()
+        if (response.status_code == 200 and isinstance(body, dict) and body.get("code") == 0
+                and isinstance(body.get("data"), dict)):
+            return body["data"]
+    except (httpx.HTTPError, ValueError):
+        pass
+    return {}
+
+
+def _artist_provider(entry: dict) -> tuple[str, str, str] | None:
+    source, platform, artist_id = (str(entry.get(key) or "")
+                                  for key in ("source", "platform", "artist_id"))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", artist_id) or artist_id == "0":
         return None
+    if source == "netease" and not platform and CONF.get("netease_enabled") and _netease_runtime_usable():
+        return source, platform, artist_id
+    if source == "lx" and CONF.get("lx_enabled") and platform in _lx_catalog_platforms():
+        return source, platform, artist_id
+    return None
+
+
+async def _artist_online_page(application, entry: dict, kind: str,
+                              page: int, size: int, order: str = "hot") -> dict:
+    provider = _artist_provider(entry)
+    if not provider:
+        return {}
+    source, platform, artist_id = provider
+    params: dict[str, int | str] = {"page": page, "limit": size}
+    if kind == "tracks":
+        params["order"] = order
+    if source == "netease":
+        params["offset"] = (page - 1) * size
+        client = get_netease_client(application)
+        path = f"/api/v1/artist/{artist_id}/{kind}"
+    else:
+        params.update(source=platform, id=artist_id)
+        client = get_lx_client(application)
+        path = f"/api/v1/catalog/artist/{kind}"
+    async with _artist_io_gate(application):
+        body = await _artist_source_payload(client, path, params, 20.0 if source == "netease" else 25.0)
+    return dict(body, rows=body.get("data" if source == "netease" else "items"))
+
+
+def _artist_online_track_count(entry: dict, body: dict, reported: int | None = None) -> int | None:
+    rows, total = body.get("rows"), _artist_count(body.get("total"))
+    if not isinstance(rows, list) or total is None or total < len(rows):
+        return None
+    if entry["source"] == "lx" and body.get("complete") is not True and total != reported:
+        return None
+    return total
+
+
+async def _native_artist_payload(entry: dict) -> dict | None:
+    provider = _artist_provider(entry)
+    if not provider:
+        return None
+    source, platform, artist_id = provider
     client = get_netease_client(app) if source == "netease" else get_lx_client(app)
     if source == "netease":
-        if not (CONF.get("netease_enabled") and _netease_runtime_usable()):
-            return None
         path = f"/api/v1/artist/{artist_id}"
         params: dict = {"limit": 1}
-    elif source == "lx" and platform in _lx_catalog_platforms():
+    else:
         path = "/api/v1/catalog/artist"
         params = {"source": platform, "id": artist_id}
-    else:
-        return None
-    body = await _artist_source_payload(client, path, params, 10.0)
+    async with _artist_io_gate(app):
+        body = await _artist_source_payload(client, path, params, 10.0)
     artist = body.get("artist")
     if not isinstance(artist, dict) or not artist.get("id"):
         return None
@@ -14736,13 +14812,588 @@ async def _native_artist_payload(entry: dict) -> dict | None:
         return _artist_list_obj(
             source, platform, artist_id, name,
             str(artist.get("picUrl") or artist.get("img1v1Url") or ""),
-            artist.get("albumSize") or 0, artist.get("musicSize") or 0,
+            artist.get("albumSize"), artist.get("musicSize"),
         )
     return _artist_list_obj(
         "lx", platform, str(artist.get("id")), str(artist.get("name") or ""),
-        str(artist.get("pic_url") or ""), artist.get("album_count") or 0,
-        artist.get("track_count") or 0,
+        str(artist.get("pic_url") or ""), artist.get("album_count"),
+        artist.get("track_count"),
     )
+
+
+async def _enrich_artist_card(application, row: dict, entry: dict, *, detail: dict | None = None) -> dict:
+    if row.get("trackCount") and row.get("albumCount") is not None:
+        return row
+    if detail is None:
+        detail = await _native_artist_payload(entry) or {}
+    albums = _artist_count(row.get("albumCount"), detail.get("albumCount"))
+    tracks = row.get("trackCount") or detail.get("trackCount")
+    if not tracks:
+        body = await _artist_online_page(application, entry, "tracks", 1, 1)
+        tracks = _artist_online_track_count(entry, body)
+    return dict(row, trackCount=tracks, albumCount=albums)
+
+
+def _artist_catalog_identity(entry: dict) -> tuple[str, str]:
+    source, platform, artist_id = (entry[key] for key in ("source", "platform", "artist_id"))
+    if (source == "netease" or platform == "wy") and re.fullmatch(r"[1-9][0-9]*", artist_id):
+        return "wy", artist_id
+    return platform or source, artist_id
+
+
+def _artist_provider_rank(entry: dict) -> int:
+    return {("netease", ""): 0, ("lx", "wy"): 1, ("lx", "tx"): 2}[(entry["source"], entry["platform"])]
+
+
+def _artist_recording(row: dict, subject: str, artist_id: str, *, online: bool) -> tuple | None:
+    title = localmatch.title_key(row.get("title") or "")
+    album = localmatch.title_key(_album_name_from_obj(row))
+    if not title or not album:
+        return None
+    credits = row.get("artists")
+    if isinstance(credits, list) and credits:
+        if any(not isinstance(credit, dict) or not credit.get("name") for credit in credits):
+            return None
+        names = tuple(sorted(localmatch.normalize_text(credit["name"]) for credit in credits))
+        subject_ids = {str(credit.get("id" if online else "guid") or "")
+                       for credit in credits if localmatch.normalize_text(credit["name"]) == subject}
+        subject_ids.difference_update(("", "0", "None"))
+        if subject_ids and subject_ids != {artist_id}:
+            return None
+    else:
+        names = tuple(sorted(localmatch.split_artist_set(row.get("artist") or "")))
+        if online and row.get("artist_id") not in (None, "", "0", 0, artist_id):
+            return None
+    if subject not in names or names.count(subject) != 1:
+        return None
+    spec = row.get("audioSpec")
+    try:
+        duration = float(row.get("duration_s") or 0) if online else float(
+            row.get("duration") or row.get("durationMs") or row.get("duration_ms")
+            or (spec.get("duration") if isinstance(spec, dict) else 0) or 0) / 1000
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return (title, album, names, localmatch.normalize_text(row.get("version") or "")), duration
+
+
+def _artist_recording_pairs(local: list[dict], online: list[dict],
+                            card: dict, entry: dict, *, solo: bool = False) -> dict[int, int]:
+    subject = localmatch.normalize_text(card.get("name") or "")
+    local_groups: dict[tuple, list[tuple[int, float]]] = {}
+    online_groups: dict[tuple, list[tuple[int, float]]] = {}
+    for rows, groups, artist_id, is_online in (
+        (local, local_groups, card["guid"], False),
+        (online, online_groups, entry["artist_id"], True),
+    ):
+        for index, row in enumerate(rows):
+            recording = _artist_recording(row, subject, artist_id, online=is_online)
+            if recording is None:
+                continue
+            key, duration = recording
+            if not solo or key[2] == (subject,):
+                groups.setdefault(key, []).append((index, duration))
+    pairs = {}
+    for key, candidates in online_groups.items():
+        targets = local_groups.get(key, [])
+        if not targets or max(len(candidates), len(targets)) > 32:
+            continue
+        for remote_index, remote_duration in candidates:
+            matches = [(index, duration) for index, duration in targets
+                       if abs(duration - remote_duration) <= 2]
+            if len(matches) == 1:
+                local_index, local_duration = matches[0]
+                if sum(abs(duration - local_duration) <= 2 for _, duration in candidates) == 1:
+                    pairs[remote_index] = local_index
+    return pairs
+
+
+def _artist_identity_proven(card: dict, entry: dict, local: list[dict], online: list[dict],
+                            trusted_ids: frozenset[tuple[str, str]] = frozenset()) -> bool:
+    subject = localmatch.normalize_text(card.get("name") or "")
+    if not subject or subject != localmatch.normalize_text(entry.get("name") or ""):
+        return False
+    pairs = _artist_recording_pairs(local, online, card, entry, solo=True)
+    if pairs and _artist_catalog_identity(entry) in trusted_ids:
+        return True
+    titles = {localmatch.title_key(online[index]["title"]) for index in pairs}
+    albums = {localmatch.title_key(_album_name_from_obj(online[index])) for index in pairs}
+    return len(titles) >= 3 and len(albums) >= 2
+
+
+def _artist_verified_edges(matches: dict[tuple[str, str], set[str]]) -> set[tuple[tuple[str, str], str]]:
+    inverse: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for identity, local_guids in matches.items():
+        for guid in local_guids:
+            inverse.setdefault((identity[0], guid), set()).add(identity)
+    return {(identity, guid) for identity, local_guids in matches.items() if len(local_guids) == 1
+            for guid in local_guids if len(inverse[identity[0], guid]) == 1}
+
+
+_ARTIST_CATALOG_PAGE_SIZE = 100
+_ARTIST_TRACK_LIMIT = 2000
+_ARTIST_ALBUM_LIMIT = 200
+_ARTIST_MERGE_PATH = os.path.join(_HOME, "cache", "artist_merge_bindings.json")
+_ARTIST_MERGE_TTL = 86400
+_artist_merge_bindings: dict[str, dict] | None = None
+_artist_catalogs: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+_artist_catalog_builders: dict[str, asyncio.Task] = {}
+
+
+async def _artist_local_page(request: Request, guid: str, kind: str, page: int,
+                             size: int = _ARTIST_CATALOG_PAGE_SIZE) -> dict:
+    path = f"/music/api/v1/{kind}/artist-detail/list"
+    params = {"artistGUID": guid, "page": page, "size": size}
+    return await _artist_official_data(request, path, params)
+
+
+def _artist_track_isrc(track_guid: str, artist_guid: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", track_guid) or not re.fullmatch(r"[0-9a-fA-F]{32}", artist_guid):
+        return ""
+    try:
+        with dailyrec._music_db(str(CONF["music_db"])) as conn:
+            row = conn.execute(
+                "SELECT t.isrc FROM track t JOIN track_artist ta ON ta.track_id=t.id "
+                "JOIN artist a ON a.id=ta.artist_id WHERE t.guid=? AND a.guid=? "
+                "AND t.is_audio_file_deleted=0 AND t.is_admin_deleted=0",
+                (track_guid, artist_guid),
+            ).fetchone()
+        return artist_identity.normalize_isrc(row[0]) if row else ""
+    except (OSError, sqlite3.Error):
+        return ""
+
+
+async def _artist_public_evidence(card: dict, page: dict) -> frozenset[tuple[str, str]]:
+    rows = page.get("list")
+    if not isinstance(rows, list) or not 0 < len(rows) <= 2 or page.get("total") != len(rows):
+        return frozenset()
+    subject = localmatch.normalize_text(card.get("name") or "")
+    evidence = []
+    for track in rows:
+        if not isinstance(track, dict):
+            continue
+        recording = _artist_recording(track, subject, card["guid"], online=False)
+        if recording is None or recording[0][2] != (subject,):
+            continue
+        isrc = artist_identity.normalize_isrc(track.get("isrc"))
+        if not isrc:
+            isrc = await asyncio.to_thread(_artist_track_isrc, str(track.get("guid") or ""), card["guid"])
+        if isrc:
+            result = await artist_identity.public_artist_ids(isrc)
+            if result and localmatch.title_key(result[0]) == recording[0][0]:
+                evidence.append(result[1])
+    return frozenset.intersection(*evidence) if evidence else frozenset()
+
+
+def _artist_track_infos(entry: dict, rows: list) -> list[dict]:
+    if entry["source"] == "netease":
+        return [info for row in rows if isinstance(row, dict)
+                for info in [_netease_artist_track_info(row)] if info]
+    return [row for row in rows if isinstance(row, dict)
+            and row.get("id") and str(row.get("lx_source") or "").lower() == entry["platform"]]
+
+
+def _artist_album_id(row: dict, *, online: bool) -> str:
+    value = (row.get("album_id") or row.get("id")) if online else row.get("guid")
+    return str(value or "")
+
+
+async def _collect_artist_pages(fetch: Callable, first: dict, rows_key: str,
+                                id_of: Callable, limit: int) -> list[dict] | None:
+    total = first.get("total")
+    if type(total) is not int or not 0 <= total <= limit:
+        return None
+    size = _ARTIST_CATALOG_PAGE_SIZE
+    page_count = max(1, (total + size - 1) // size)
+    if not isinstance(first.get(rows_key), list) or len(first[rows_key]) != min(total, size):
+        return None
+    pages = [first, *await asyncio.gather(*(fetch(page) for page in range(2, page_count + 1)))]
+    rows = []
+    seen = set()
+    for page, payload in enumerate(pages):
+        part = payload.get(rows_key)
+        if (payload.get("total") != total or not isinstance(part, list)
+                or len(part) != min(total - page * size, size)):
+            return None
+        for row in part:
+            key = id_of(row) if isinstance(row, dict) else None
+            if not key or key in ("0", "None") or key in seen:
+                return None
+            seen.add(key)
+            rows.append(row)
+    return rows
+
+
+def _artist_album_groups(tracks: list[dict], *, online: bool) -> dict[str, set[int]]:
+    groups: dict[str, set[int]] = {}
+    for index, row in enumerate(tracks):
+        album = row.get("album")
+        key = row.get("album_id") if online else album.get("guid") if isinstance(album, dict) else None
+        if key:
+            groups.setdefault(str(key), set()).add(index)
+    return groups
+
+
+def _artist_duplicate_albums(local_albums: list[dict], online_albums: list[dict],
+                             local_tracks: list[dict], online_tracks: list[dict],
+                             pairs: dict[int, int], subject: str) -> set[str]:
+    def compatible_credits(album):
+        credits = album.get("artists")
+        names = ({localmatch.normalize_text(credit["name"]) for credit in credits
+                  if isinstance(credit, dict) and credit.get("name")} if isinstance(credits, list)
+                 else localmatch.split_artist_set(album.get("artist") or album.get("artistName") or ""))
+        return not names or names == {subject}
+
+    local_groups = _artist_album_groups(local_tracks, online=False)
+    online_groups = _artist_album_groups(online_tracks, online=True)
+    local_editions: dict[tuple, list[str]] = {}
+    for album in local_albums:
+        guid = album["guid"]
+        tracks = local_groups.get(guid, set())
+        title = localmatch.title_key(album.get("name") or "")
+        if (tracks and title and compatible_credits(album)
+                and _artist_count(album.get("trackCount")) == len(tracks)):
+            local_editions.setdefault((title, frozenset(tracks)), []).append(guid)
+    candidates: dict[tuple, list[str]] = {}
+    for album in online_albums:
+        album_id = _artist_album_id(album, online=True)
+        tracks = online_groups.get(album_id, set())
+        title = localmatch.title_key(album.get("name") or album.get("album_name") or "")
+        if (tracks and title and compatible_credits(album) and tracks <= pairs.keys()
+                and _artist_count(album.get("track_count"), album.get("size")) == len(tracks)):
+            key = (title, frozenset(pairs[index] for index in tracks))
+            candidates.setdefault(key, []).append(album_id)
+    return {ids[0] for key, ids in candidates.items()
+            if len(ids) == 1 and len(local_editions.get(key, ())) == 1}
+
+
+async def _build_artist_catalog(request: Request, card: dict, entry: dict,
+                                local_first: dict, online_first: dict,
+                                reported_tracks: int | None = None,
+                                trusted_ids: frozenset[tuple[str, str]] = frozenset()) -> dict | None:
+    guid = card["guid"]
+    size = _ARTIST_CATALOG_PAGE_SIZE
+    online_total = _artist_online_track_count(entry, online_first, reported_tracks)
+    if online_total is None or online_total > _ARTIST_TRACK_LIMIT:
+        return None
+    local_album_first, online_album_first = await asyncio.gather(
+        _artist_local_page(request, guid, "album", 1),
+        _artist_online_page(request.app, entry, "albums", 1, size),
+    )
+    if entry["source"] == "lx" and online_album_first.get("total_known") is not True:
+        return None
+    local_tracks, local_albums, online_rows, online_albums = await asyncio.gather(
+        _collect_artist_pages(lambda page: _artist_local_page(request, guid, "track", page),
+                              local_first, "list", lambda row: row.get("guid"), _ARTIST_TRACK_LIMIT),
+        _collect_artist_pages(lambda page: _artist_local_page(request, guid, "album", page),
+                              local_album_first, "list", lambda row: row.get("guid"), _ARTIST_ALBUM_LIMIT),
+        _collect_artist_pages(lambda page: _artist_online_page(request.app, entry, "tracks", page, size),
+                              online_first, "rows", lambda row: row.get("id") or row.get("song_id"),
+                              _ARTIST_TRACK_LIMIT),
+        _collect_artist_pages(lambda page: _artist_online_page(request.app, entry, "albums", page, size),
+                              online_album_first, "rows", lambda row: _artist_album_id(row, online=True),
+                              _ARTIST_ALBUM_LIMIT),
+    )
+    if any(rows is None for rows in (local_tracks, local_albums, online_rows, online_albums)):
+        return None
+    online_tracks = _artist_track_infos(entry, online_rows)
+    if (len(online_tracks) != len(online_rows) or any(not row.get("title") for row in online_tracks)
+            or not _artist_identity_proven(card, entry, local_tracks, online_tracks, trusted_ids)):
+        return None
+    if entry["source"] == "netease":
+        valid_album = lambda row: _normalize_netease_album_row(row) is not None
+    else:
+        valid_album = lambda row: (bool(row.get("name") and row.get("id"))
+                                   and row.get("lx_source", entry["platform"]) == entry["platform"])
+    if not all(valid_album(row) for row in online_albums):
+        return None
+    pairs = _artist_recording_pairs(local_tracks, online_tracks, card, entry)
+    album_duplicates = _artist_duplicate_albums(
+        local_albums, online_albums, local_tracks, online_tracks, pairs,
+        localmatch.normalize_text(card["name"]),
+    )
+    retained_tracks = [row for index, row in enumerate(online_tracks) if index not in pairs]
+    retained_albums = [row for row in online_albums if _artist_album_id(row, online=True) not in album_duplicates]
+    track_count = len(local_tracks) + len(retained_tracks)
+    album_count = len(local_albums) + len(retained_albums)
+    if track_count > _ARTIST_TRACK_LIMIT or album_count > _ARTIST_ALBUM_LIMIT:
+        return None
+    return {"card": dict(card, trackCount=track_count, albumCount=album_count), "provider": entry,
+            "track": (local_tracks, retained_tracks), "album": (local_albums, retained_albums)}
+
+
+async def _artist_optional(awaitable, timeout: float, fallback):
+    try:
+        async with asyncio.timeout(timeout):
+            return await awaitable
+    except (httpx.HTTPError, TimeoutError, ValueError):
+        return fallback
+
+
+def _artist_merge_key(user_guid: str, guid: str) -> str:
+    return hashlib.sha256(json.dumps([user_guid, guid, _source_config()], sort_keys=True).encode()).hexdigest()
+
+
+def _load_artist_merge_bindings() -> dict[str, dict]:
+    global _artist_merge_bindings
+    if _artist_merge_bindings is not None:
+        return _artist_merge_bindings
+    _artist_merge_bindings = {}
+    try:
+        with open(_ARTIST_MERGE_PATH, encoding="utf-8") as handle:
+            data = json.loads(handle.read(1024 * 1024))
+    except (OSError, ValueError):
+        return _artist_merge_bindings
+    if not isinstance(data, dict):
+        return _artist_merge_bindings
+    now = time.time()
+    for key, record in list(data.items())[-_ARTIST_SEARCH_REGISTRY_MAX:]:
+        if not isinstance(record, dict) or not re.fullmatch(r"[0-9a-f]{64}", key):
+            continue
+        guid, name, provider, expires = (record.get(field) for field in ("guid", "name", "provider", "expires"))
+        if (not isinstance(guid, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", guid)
+                or not isinstance(name, str) or not 0 < len(name) <= 256
+                or not isinstance(provider, dict) or type(expires) is not int
+                or not now < expires <= now + _ARTIST_MERGE_TTL):
+            continue
+        source, platform, artist_id = (provider.get(field) for field in ("source", "platform", "artist_id"))
+        if (source, platform) not in (("netease", ""), ("lx", "wy"), ("lx", "tx")):
+            continue
+        if not isinstance(artist_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", artist_id):
+            continue
+        _artist_merge_bindings[key] = {
+            "guid": guid, "name": name, "expires": expires,
+            "provider": {"source": source, "platform": platform, "artist_id": artist_id, "name": name},
+        }
+    return _artist_merge_bindings
+
+
+def _remember_artist_catalog(user_guid: str, catalog: dict) -> None:
+    card, provider = catalog["card"], catalog["provider"]
+    guid, name = card["guid"], card["name"]
+    key = _artist_merge_key(user_guid, guid)
+    _artist_catalogs[key] = (time.monotonic() + _ARTIST_POOL_TTL_S, catalog)
+    _artist_catalogs.move_to_end(key)
+    while len(_artist_catalogs) > 16:
+        _artist_catalogs.popitem(last=False)
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", guid) or not 0 < len(name) <= 256:
+        return
+    registry = _load_artist_merge_bindings()
+    now = int(time.time())
+    registry.pop(key, None)
+    registry[key] = {
+        "guid": guid, "name": name, "expires": now + _ARTIST_MERGE_TTL,
+        "provider": {field: provider[field] for field in ("source", "platform", "artist_id")},
+    }
+    for old_key in list(registry):
+        if registry[old_key]["expires"] <= now:
+            registry.pop(old_key)
+    while len(registry) > _ARTIST_SEARCH_REGISTRY_MAX:
+        registry.pop(next(iter(registry)))
+    dailyrec._atomic_write_json(_ARTIST_MERGE_PATH, registry)
+
+
+async def _restore_artist_catalog(request: Request, user_guid: str, binding: dict) -> dict | None:
+    guid = binding["guid"]
+    entry = dict(binding["provider"], name=binding["name"])
+    card, local_page, online_page, detail = await asyncio.gather(
+        _artist_official_data(request, "/music/api/v1/artist/detail", {"guid": guid}),
+        _artist_local_page(request, guid, "track", 1),
+        _artist_online_page(request.app, entry, "tracks", 1, _ARTIST_CATALOG_PAGE_SIZE),
+        _native_artist_payload(entry),
+    )
+    if card.get("guid") != guid or not detail or not isinstance(local_page.get("list"), list):
+        return None
+    entry["name"] = detail["name"]
+    rows = online_page.get("rows")
+    trusted_ids = await _artist_public_evidence(card, local_page)
+    if not isinstance(rows, list) or not _artist_identity_proven(
+            card, entry, [row for row in local_page["list"] if isinstance(row, dict)],
+            _artist_track_infos(entry, rows), trusted_ids):
+        return None
+    catalog = await _build_artist_catalog(request, card, entry, local_page, online_page,
+                                          detail.get("trackCount"), trusted_ids)
+    if catalog is not None:
+        _remember_artist_catalog(user_guid, catalog)
+    return catalog
+
+
+async def _get_merged_artist_catalog(request: Request, guid: str) -> dict | None:
+    if not guid:
+        return None
+    bindings = _load_artist_merge_bindings()
+    if not (any(binding["guid"] == guid for binding in bindings.values())
+            or any(catalog["card"]["guid"] == guid for _, catalog in _artist_catalogs.values())):
+        return None
+    is_authed, user_guid, _ = await _probe_upstream_auth(request, get_upstream_client(request.app))
+    if not is_authed or not user_guid or user_guid == "shared":
+        return None
+    key = _artist_merge_key(user_guid, guid)
+    cached = _artist_catalogs.get(key)
+    if cached and cached[0] > time.monotonic() and _artist_provider(cached[1]["provider"]):
+        _artist_catalogs.move_to_end(key)
+        return cached[1]
+    binding = bindings.get(key)
+    if not binding or binding["expires"] <= time.time() or not _artist_provider(binding["provider"]):
+        return None
+    task = _artist_catalog_builders.get(key)
+    if task is None:
+        if len(_artist_catalog_builders) >= _ARTIST_POOL_MAX_BUILDERS:
+            return None
+        task = asyncio.create_task(_artist_optional(_restore_artist_catalog(request, user_guid, binding), 16.0, None))
+        _artist_catalog_builders[key] = task
+        task.add_done_callback(lambda finished: _artist_catalog_builders.pop(key, None))
+    return await asyncio.shield(task)
+
+
+async def _artist_search_official(request: Request, current: list[dict],
+                                  total: int, start: int) -> list[dict] | None:
+    if start == 0 and len(current) == total:
+        rows = current
+    elif 0 < total <= 100:
+        params = [(key, value) for key, value in request.query_params.multi_items()
+                  if key not in ("page", "size")] + [("page", 1), ("size", 100)]
+        data = await _artist_official_data(request, request.url.path, params)
+        rows = data.get("list")
+        if data.get("total") != total or not isinstance(rows, list) or len(rows) != total:
+            return None
+    else:
+        return None
+    ids = {row.get("guid") for row in rows if isinstance(row, dict) and isinstance(row.get("guid"), str)}
+    return rows if "" not in ids and len(ids) == len(rows) else None
+
+
+async def _verify_artist_search(request: Request, user_guid: str, current: list[dict], total: int, start: int,
+                                candidates: list[tuple[dict, dict]], overlays: dict) -> set[tuple[str, str]]:
+    if not candidates or not total:
+        return set()
+    official = await _artist_search_official(request, current, total, start)
+    if not official:
+        return set()
+    local_names: dict[str, list[dict]] = {}
+    online_names = {localmatch.normalize_text(row["name"]) for row, _ in candidates}
+    for row in official:
+        name = localmatch.normalize_text(row.get("name") or "")
+        if name and name in online_names:
+            local_names.setdefault(name, []).append(row)
+    locals_to_check = [row for group in local_names.values() if len(group) <= 4 for row in group]
+    if not locals_to_check:
+        return set()
+    online_to_check = [(row, entry) for row, entry in candidates
+                       if 0 < len(local_names.get(localmatch.normalize_text(row["name"]), ())) <= 4]
+
+    async def sample_local(card):
+        data = await _artist_local_page(request, card["guid"], "track", 1)
+        return card["guid"], data
+
+    async def sample_online(row, entry):
+        data = await _artist_online_page(request.app, entry, "tracks", 1, _ARTIST_CATALOG_PAGE_SIZE)
+        return row["guid"], data
+
+    local_by_guid = dict(await asyncio.gather(*(sample_local(card) for card in locals_to_check)))
+    trusted_values = await asyncio.gather(*(
+        _artist_public_evidence(card, local_by_guid[card["guid"]]) for card in locals_to_check
+    ))
+    trusted = {card["guid"]: ids for card, ids in zip(locals_to_check, trusted_values)}
+    online_by_guid = dict(await asyncio.gather(*(
+        sample_online(row, entry) for row, entry in online_to_check
+        if any(len(local_by_guid[card["guid"]].get("list") or []) >= 3
+               for card in local_names[localmatch.normalize_text(row["name"])])
+    )))
+    matches: dict[tuple[str, str], set[str]] = {}
+    verified: dict[tuple[tuple[str, str], str], list[tuple[dict, dict]]] = {}
+    failures: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for row, entry in online_to_check:
+        name = localmatch.normalize_text(row["name"])
+        identity = _artist_catalog_identity(entry)
+        sample = online_by_guid.get(row["guid"], {}).get("rows")
+        cards = local_names[name]
+        if any(not isinstance(local_by_guid[card["guid"]].get("list"), list) for card in cards):
+            failures.setdefault((name, identity[0]), set()).add(identity)
+            continue
+        if row["guid"] in online_by_guid and not isinstance(sample, list):
+            failures.setdefault((name, identity[0]), set()).add(identity)
+        infos = _artist_track_infos(entry, sample) if isinstance(sample, list) else []
+        for card in cards:
+            guid = card["guid"]
+            tracks = [track for track in local_by_guid[guid]["list"] if isinstance(track, dict)]
+            if identity in trusted[guid] or _artist_identity_proven(card, entry, tracks, infos):
+                matches.setdefault(identity, set()).add(guid)
+                verified.setdefault((identity, guid), []).append((row, entry))
+
+    by_local: dict[str, list[tuple[dict, dict]]] = {}
+    for identity, guid in sorted(_artist_verified_edges(matches)):
+        for row, entry in verified[identity, guid]:
+            if (identity in trusted[guid]
+                    or not failures.get((localmatch.normalize_text(row["name"]), identity[0]), set()) - {identity}):
+                by_local.setdefault(guid, []).append((row, entry))
+
+    async def build_local(card):
+        guid = card["guid"]
+        options = sorted(by_local[guid], key=lambda candidate: _artist_provider_rank(candidate[1]))
+        for row, entry in options:
+            reported = _artist_count(row.get("trackCount"))
+            first = online_by_guid.get(row["guid"])
+            if not first or not isinstance(first.get("rows"), list):
+                first = await _artist_online_page(request.app, entry, "tracks", 1, _ARTIST_CATALOG_PAGE_SIZE)
+            if entry["source"] == "lx" and not reported and first.get("complete") is not True:
+                detail = await _native_artist_payload(entry)
+                reported = _artist_count(detail.get("trackCount")) if detail else None
+            catalog = await _build_artist_catalog(
+                request, card, entry, local_by_guid[guid], first, reported, trusted[guid],
+            )
+            if catalog is not None:
+                return catalog, {_artist_catalog_identity(option) for _, option in options}
+        return None, set()
+
+    built = await asyncio.gather(*(build_local(card) for card in locals_to_check if card["guid"] in by_local))
+    hidden: set[tuple[str, str]] = set()
+    for catalog, identities in built:
+        if catalog is not None:
+            _remember_artist_catalog(user_guid, catalog)
+            card = catalog["card"]
+            overlays[card["guid"]] = {key: card[key] for key in ("trackCount", "albumCount")}
+            hidden.update(identities)
+    return hidden
+
+
+async def _prepare_artist_search(request: Request, user_guid: str, online: list[dict],
+                                 official: list[dict], total: int, start: int) -> tuple[list[dict], dict]:
+    candidates = []
+    for row in online:
+        entry = resolve_fake_artist(row["guid"])
+        if entry and _artist_provider(entry):
+            candidates.append((row, entry))
+
+    async def enrich_online(row, entry):
+        return await _artist_optional(_enrich_artist_card(request.app, row, entry), 5.0, row)
+
+    async def enrich_local(row):
+        guid = row["guid"]
+        body = await _artist_optional(_artist_local_page(request, guid, "track", 1, 1), 5.0, {})
+        return guid, _artist_count(body.get("total"))
+
+    merged_overlays: dict[str, dict] = {}
+    enriched, local_counts, hidden = await asyncio.gather(
+        asyncio.gather(*(enrich_online(row, entry) for row, entry in candidates)),
+        asyncio.gather(*(enrich_local(row) for row in official[:10]
+                         if row.get("guid") and _artist_count(row.get("trackCount")) == 0)),
+        _artist_optional(_verify_artist_search(request, user_guid, official, total, start,
+                                               candidates, merged_overlays), 16.0, set()),
+    )
+    by_identity: dict[tuple[str, str], tuple[dict, dict]] = {}
+    for row, (_, entry) in zip(enriched, candidates):
+        key = _artist_catalog_identity(entry)
+        if key in hidden:
+            continue
+        previous = by_identity.get(key)
+        if previous is None or (bool(row.get("trackCount")), -_artist_provider_rank(entry)) > (
+                bool(previous[0].get("trackCount")), -_artist_provider_rank(previous[1])):
+            by_identity[key] = row, entry
+    overlays = {guid: {"trackCount": count} for guid, count in local_counts if count is not None}
+    overlays.update(merged_overlays)
+    return [_artist_public_card(row) for row, _ in by_identity.values()], overlays
 
 
 def _pending_artist_native_id(entry: dict) -> str:
@@ -14870,7 +15521,8 @@ async def artist_detail(request: Request):
     ).strip()
     entry = resolve_fake_artist(raw_guid)
     if entry is None:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        merged = await _merged_artist_response(request, raw_guid, "artist")
+        return merged if merged is not None else await forward_to_upstream(request, get_upstream_client(request.app))
     is_authed, _user_guid, auth_response = await _probe_upstream_auth(
         request, get_upstream_client(request.app))
     if not is_authed and auth_response is not None:
@@ -14881,7 +15533,8 @@ async def artist_detail(request: Request):
     if artist is None:
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持歌手详情", "data": None})
     artist["guid"] = fake_official_guid(entry["real_guid"])
-    return JSONResponse(content=disguise_client_json({"code": 0, "msg": "ok", "data": artist}))
+    artist = await _enrich_artist_card(request.app, artist, entry, detail=artist)
+    return JSONResponse(content=disguise_client_json({"code": 0, "msg": "ok", "data": _artist_public_card(artist)}))
 
 
 def _artist_page_envelope(request: Request, total: int, rows: list[dict]) -> dict:
@@ -14912,9 +15565,74 @@ def _netease_artist_track_info(row: dict, fallback_album: str = "", fallback_cov
         "album_id": str(row.get("album_id") or ""),
         "duration_s": (float(row.get("duration_ms") or 0) / 1000.0
                        if isinstance(row.get("duration_ms"), (int, float)) else 0.0),
+        "version": str(row.get("version") or ""),
         "ext": "flac" if row.get("has_sq") or row.get("sq") else "mp3",
         "cover_url": str(row.get("album_pic_url") or fallback_cover or ""),
     }
+
+
+def _artist_list_params(request: Request, max_size: int) -> tuple[int, int]:
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+        size = min(max(int(request.query_params.get("size") or 50), 1), max_size)
+        return page, size
+    except (TypeError, ValueError):
+        return 1, 50
+
+
+def _artist_online_track_cards(infos: list[dict]) -> list[dict]:
+    tracks = [dict(build_online_track(info), createdAt=0, updatedAt=0) for info in infos]
+    register_online_meta(tracks)
+    return tracks
+
+
+def _artist_scoped_sort(rows: list[dict], kind: str, raw_sort: str) -> list[dict]:
+    fields = ("createdAt",) if kind == "track" else ("newTrackAddedAt", "releaseYear", "title")
+    field = next((field for field in fields if field.lower() in raw_sort.lower()), None)
+    if field is None:
+        return rows
+    descending = "desc" in raw_sort.lower() or raw_sort.startswith("-")
+
+    def sort_key(row):
+        if field == "title":
+            return localmatch.title_key(row.get("name") or row.get("title") or "")
+        value = row.get(field)
+        if field == "releaseYear" and value is None:
+            value = row.get("originalReleaseYear")
+        if isinstance(value, (int, float)):
+            return f"{value:025.6f}"
+        return str(value or "")
+
+    return sorted(rows, key=sort_key, reverse=descending)
+
+
+async def _merged_artist_response(request: Request, guid: str, kind: str) -> Response | None:
+    catalog = await _get_merged_artist_catalog(request, guid)
+    if catalog is None:
+        return None
+    if kind == "artist":
+        detail = await _artist_official_data(request, "/music/api/v1/artist/detail", {"guid": guid})
+        card = catalog["card"]
+        if detail.get("guid") != guid or localmatch.normalize_text(detail.get("name") or "") != localmatch.normalize_text(card["name"]):
+            return None
+        payload = {"code": 0, "msg": "ok", "data": dict(
+            detail, trackCount=card["trackCount"], albumCount=card["albumCount"],
+        )}
+    else:
+        page, size = _artist_list_params(request, 200 if kind == "track" else 100)
+        local, online = catalog[kind]
+        sort = request.query_params.get("sort") or ""
+        local = _artist_scoped_sort(local, kind, sort)
+        if kind == "album" and "title" in sort.lower():
+            online = _artist_scoped_sort(online, kind, sort)
+        start = (page - 1) * size
+        end = start + size
+        online_page = online[max(0, start - len(local)):max(0, end - len(local))]
+        provider = catalog["provider"]
+        online_cards = (_artist_online_track_cards(online_page) if kind == "track"
+                        else _artist_online_album_cards(provider, online_page))
+        payload = _artist_page_envelope(request, len(local) + len(online), local[start:end] + online_cards)
+    return JSONResponse(content=disguise_client_json(payload))
 
 
 @app.api_route("/music/api/v1/track/artist-detail/list", methods=["GET", "HEAD"])
@@ -14928,7 +15646,8 @@ async def track_artist_detail_list(request: Request):
     ).strip()
     entry = resolve_fake_artist(raw_guid)
     if entry is None:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        merged = await _merged_artist_response(request, raw_guid, "track")
+        return merged if merged is not None else await forward_to_upstream(request, get_upstream_client(request.app))
     is_authed, _user_guid, auth_response = await _probe_upstream_auth(
         request, get_upstream_client(request.app))
     if not is_authed and auth_response is not None:
@@ -14936,46 +15655,20 @@ async def track_artist_detail_list(request: Request):
     if entry.get("pending") and not await _verify_pending_artist(entry):
         return JSONResponse(content={"code": -1, "msg": "该音源暂无法确认歌手身份", "data": None})
     source = str(entry.get("source") or "")
-    platform = str(entry.get("platform") or "").lower()
-    artist_id = str(entry.get("artist_id") or "")
-    try:
-        page = max(int(request.query_params.get("page") or 1), 1)
-        max_size = 100 if source == "netease" else 200
-        size = min(max(int(request.query_params.get("size") or 50), 1), max_size)
-    except (TypeError, ValueError):
-        page, size = 1, 50
+    page, size = _artist_list_params(request, 100 if source == "netease" else 200)
     sort = str(request.query_params.get("sort") or "").lower()
     order = "time" if "createdat" in sort else "hot"
-    if source == "netease" and CONF.get("netease_enabled") and _netease_runtime_usable():
-        body = await _artist_source_payload(
-            get_netease_client(request.app),
-            f"/api/v1/artist/{artist_id}/tracks",
-            {"page": page, "limit": size, "offset": (page - 1) * size, "order": order}, 20.0,
-        )
-    elif source == "lx" and platform in _lx_catalog_platforms():
-        body = await _artist_source_payload(
-            get_lx_client(request.app),
-            "/api/v1/catalog/artist/tracks",
-            {"source": platform, "id": artist_id, "page": page, "limit": size, "order": order}, 25.0,
-        )
-    else:
+    if not _artist_provider(entry):
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持歌手歌曲", "data": None})
-    rows = body.get("data" if source == "netease" else "items")
+    body = await _artist_online_page(request.app, entry, "tracks", page, size, order)
+    rows = body.get("rows")
     if not isinstance(rows, list):
         return JSONResponse(content={"code": -1, "msg": "歌手歌曲获取失败", "data": None})
-    if source == "netease":
-        infos = [info for row in rows if isinstance(row, dict)
-                 for info in [_netease_artist_track_info(row)] if info]
-    else:
-        infos = [row for row in rows if isinstance(row, dict)]
+    infos = _artist_track_infos(entry, rows)
     total = body.get("total")
     if type(total) is not int or total < len(infos):
         total = len(infos)
-    tracks = [
-        dict(build_online_track(info), createdAt=0, updatedAt=0)
-        for info in infos
-    ]
-    register_online_meta(tracks)
+    tracks = _artist_online_track_cards(infos)
     return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, tracks)))
 
 
@@ -15041,38 +15734,30 @@ async def album_artist_detail_list(request: Request):
     ).strip()
     entry = resolve_fake_artist(raw_guid)
     if entry is None:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        merged = await _merged_artist_response(request, raw_guid, "album")
+        return merged if merged is not None else await forward_to_upstream(request, get_upstream_client(request.app))
     is_authed, _user_guid, auth_response = await _probe_upstream_auth(
         request, get_upstream_client(request.app))
     if not is_authed and auth_response is not None:
         return auth_response
     if entry.get("pending") and not await _verify_pending_artist(entry):
         return JSONResponse(content={"code": -1, "msg": "该音源暂无法确认歌手身份", "data": None})
-    source = str(entry.get("source") or "")
-    platform = str(entry.get("platform") or "").lower()
-    artist_id = str(entry.get("artist_id") or "")
-    try:
-        page = max(int(request.query_params.get("page") or 1), 1)
-        size = min(max(int(request.query_params.get("size") or 50), 1), 100)
-    except (TypeError, ValueError):
-        page, size = 1, 50
-    if source == "netease" and CONF.get("netease_enabled") and _netease_runtime_usable():
-        body = await _artist_source_payload(
-            get_netease_client(request.app),
-            f"/api/v1/artist/{artist_id}/albums",
-            {"page": page, "limit": size, "offset": (page - 1) * size}, 15.0,
-        )
-    elif source == "lx" and platform in _lx_catalog_platforms():
-        body = await _artist_source_payload(
-            get_lx_client(request.app),
-            "/api/v1/catalog/artist/albums",
-            {"source": platform, "id": artist_id, "page": page, "limit": size}, 15.0,
-        )
-    else:
+    page, size = _artist_list_params(request, 100)
+    if not _artist_provider(entry):
         return JSONResponse(content={"code": -1, "msg": "该音源暂不支持歌手专辑", "data": None})
-    rows = body.get("data" if source == "netease" else "items")
+    body = await _artist_online_page(request.app, entry, "albums", page, size)
+    rows = body.get("rows")
     if not isinstance(rows, list):
         return JSONResponse(content={"code": -1, "msg": "歌手专辑获取失败", "data": None})
+    albums = _artist_online_album_cards(entry, rows)
+    total = body.get("total")
+    if type(total) is not int or total < len(albums):
+        total = len(albums)
+    return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, albums)))
+
+
+def _artist_online_album_cards(entry: dict, rows: list) -> list[dict]:
+    source, platform = entry["source"], entry["platform"]
     albums: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -15092,7 +15777,8 @@ async def album_artist_detail_list(request: Request):
             item = {"source": "lx", "lx_source": platform_id, "artist": artist_name,
                     "artist_id": str(row.get("artist_id") or ""), "cover_url": str(row.get("pic_url") or "")}
             register_fake_album(anchor, name, item, album_id=album_id, persist=True)
-            album = _album_list_obj(f"{anchor}:album", name, artist_name, anchor, row.get("track_count") or 0)
+            album = _album_list_obj(f"{anchor}:album", name, artist_name, anchor,
+                                    _artist_count(row.get("track_count")) or 0)
             if item["artist_id"] and artist_name:
                 artist_fake = register_fake_artist(
                     artist_real_guid("lx", platform_id, item["artist_id"]),
@@ -15100,10 +15786,7 @@ async def album_artist_detail_list(request: Request):
                 )
                 album["artists"] = [{"guid": artist_fake, "name": artist_name, "coverId": None}]
             albums.append(album)
-    total = body.get("total")
-    if type(total) is not int or total < len(albums):
-        total = len(albums)
-    return JSONResponse(content=disguise_client_json(_artist_page_envelope(request, total, albums)))
+    return albums
 
 
 def _normalize_netease_album_row(row: dict) -> "tuple[str, str, str, str, list] | None":
