@@ -25,6 +25,10 @@ def clean_issue141_state(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod, "_artist_merge_bindings", None)
     monkeypatch.setattr(app_mod, "_artist_catalogs", app_mod.OrderedDict())
     monkeypatch.setattr(app_mod, "_artist_catalog_builders", {})
+    monkeypatch.setattr(app_mod, "_artist_public_builders", {})
+    monkeypatch.setattr(app_mod.artist_identity, "_CACHE", app_mod.OrderedDict())
+    monkeypatch.setattr(app_mod.artist_identity, "_INFLIGHT", {})
+    monkeypatch.setattr(app_mod.artist_identity, "_unreachable_until", 0.0)
     yield
     app_mod._FAKE_ARTIST_REGISTRY.clear()
     app_mod._artist_pool_cache.clear()
@@ -403,6 +407,45 @@ def test_public_artist_identity_requires_matching_independent_backlink(monkeypat
     assert len(requested) == 3
 
 
+def test_public_lookup_pauses_after_unreachable_host(monkeypatch):
+    identity = app_mod.artist_identity
+    requested = []
+
+    async def unreachable(client, url, params=None):
+        requested.append(url)
+        raise httpx.ConnectTimeout("blocked", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(identity, "_public_json", unreachable)
+
+    async def run():
+        return [await identity.public_artist_ids(code) for code in ("USA2P2459596", "HKH090112503")]
+
+    assert asyncio.run(run()) == [None, None]
+    assert len(requested) == 1
+    assert identity._unreachable_until > time.monotonic()
+
+
+@pytest.mark.parametrize("answer,minimum_ttl,breaker", [
+    ({}, 3000, False),
+    (httpx.ReadTimeout("slow"), 30, False),
+    (httpx.ConnectError("blocked"), 30, True),
+])
+def test_public_lookup_failure_ttl_and_breaker(monkeypatch, answer, minimum_ttl, breaker):
+    identity = app_mod.artist_identity
+
+    async def respond(client, url, params=None):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(identity, "_public_json", respond)
+
+    assert asyncio.run(identity.public_artist_ids("USA2P2459596")) is None
+    expires, result = identity._CACHE["USA2P2459596"]
+    assert result is None and expires - time.monotonic() > minimum_ttl
+    assert (identity._unreachable_until > time.monotonic()) is breaker
+
+
 @pytest.mark.parametrize("mode", ["ambiguous", "two_locals", "different-credit", "invalid-page"])
 def test_artist_search_does_not_merge_ambiguous_or_incomplete_catalogs(merged_artist_services, mode):
     artist_guid, settings, _ = merged_artist_services
@@ -427,8 +470,101 @@ def test_artist_binding_reauthenticates_and_restores_after_restart(monkeypatch, 
         params = {"artistGUID": artist_guid}
         assert client.get(path, params=params, headers={"cookie": "second-user"}).json()["data"]["total"] == 4
         assert client.get(path, params=params).json()["data"]["total"] == 7
-        monkeypatch.setitem(CONF, "netease_enabled", False)
-        assert client.get(path, params=params).json()["data"]["total"] == 4
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    assert client.get(path, params=params).json()["data"]["total"] == 4
+
+
+def test_search_does_not_wait_for_slow_public_lookup(monkeypatch, merged_artist_services):
+    artist_guid, settings, _ = merged_artist_services
+    settings.update(single=True, extras=1)
+    state = {"calls": 0, "finished": False}
+
+    async def lookup(isrc):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            await asyncio.sleep(2.0)
+            state["finished"] = True
+        return "曲目甲", frozenset({("wy", "6000")})
+
+    monkeypatch.setattr(app_mod.artist_identity, "public_artist_ids", lookup)
+    monkeypatch.setattr(app_mod, "_ARTIST_PUBLIC_WAIT_S", 0.05)
+    params = {"q": "陈奕迅"}
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert state["finished"] is False
+        assert first["total"] == 3 and first["list"][0]["guid"] == artist_guid
+        assert first["list"][0]["trackCount"] == 1
+        deadline = time.monotonic() + 10
+        while not state["finished"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert state["finished"] is True
+        app_mod._artist_pool_cache.clear()
+        merged = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert merged["total"] == 2 and merged["list"][0]["trackCount"] == 5
+        assert state["calls"] == 2
+
+
+def test_search_returns_before_slow_merge_and_uses_it_afterwards(monkeypatch, merged_artist_services):
+    artist_guid, _, _ = merged_artist_services
+    prepare = app_mod._prepare_artist_search
+    # 等待上限不得超过加入合并核验之前的取值：最坏情况下搜索不比以前慢。
+    assert app_mod._ARTIST_POOL_WAIT_S <= 8.0
+
+    async def slow_prepare(*args):
+        await asyncio.sleep(0.3)
+        return await prepare(*args)
+
+    monkeypatch.setattr(app_mod, "_prepare_artist_search", slow_prepare)
+    monkeypatch.setattr(app_mod, "_ARTIST_POOL_WAIT_S", 0.05)
+    params = {"q": "陈奕迅"}
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert first["total"] == 3 and first["list"][0]["guid"] == artist_guid
+        assert first["list"][0]["trackCount"] == 0
+        assert [resolve_fake_artist(row["guid"])["artist_id"] for row in first["list"][1:]] == ["6000", "6001"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(entry.get("task") is None and entry.get("items")
+                   for entry in list(app_mod._artist_pool_cache.values())):
+                break
+            time.sleep(0.05)
+        merged = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert merged["total"] == 2 and merged["list"][0]["trackCount"] == 1205
+
+
+def test_search_keeps_online_results_when_identity_verification_crashes(monkeypatch, merged_artist_services):
+    artist_guid, _, _ = merged_artist_services
+
+    async def crash(*args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_mod, "_verify_artist_search", crash)
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+    assert data["total"] == 3
+    assert data["list"][0]["guid"] == artist_guid and data["list"][0]["trackCount"] == 4
+    assert [resolve_fake_artist(row["guid"])["artist_id"] for row in data["list"][1:]] == ["6000", "6001"]
+    assert not app_mod._artist_catalogs
+
+
+def test_artist_page_falls_back_when_merged_view_restore_crashes(monkeypatch, merged_artist_services):
+    artist_guid, settings, _ = merged_artist_services
+    settings["extras"] = 2
+    path = "/music/api/v1/track/artist-detail/list"
+    params = {"artistGUID": artist_guid}
+
+    async def crash(*args):
+        raise RuntimeError("boom")
+
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+        assert cards["list"][0]["trackCount"] == 7
+        assert app_mod._artist_catalogs[next(iter(app_mod._artist_catalogs))][0] - time.monotonic() > 1500
+        monkeypatch.setattr(app_mod, "_restore_artist_catalog", crash)
+        app_mod._artist_catalogs.clear()
+        app_mod._artist_merge_bindings = None
+        response = client.get(path, params=params)
+    assert response.status_code == 200 and response.json()["data"]["total"] == 4
 
 
 @pytest.mark.parametrize("source", ["netease", "lx"])

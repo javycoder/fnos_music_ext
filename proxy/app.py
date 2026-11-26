@@ -14551,8 +14551,12 @@ _ARTIST_POOL_TTL_S = 120.0
 _ARTIST_POOL_ERR_TTL_S = 5.0
 _ARTIST_POOL_MAX_ENTRIES = 64
 _ARTIST_POOL_MAX_BUILDERS = 8
-_ARTIST_POOL_WAIT_S = 25.0
+# 首个搜索请求的等待上限，与加入合并核验之前一致：核验与合并目录在后台任务里继续
+# 构建，超时先返回未合并的结果，后续请求再拿到合并后的结果。
+_ARTIST_POOL_WAIT_S = 8.0
 _ARTIST_POOL_BUILD_TIMEOUT_S = 8.0
+# 外部公开库核验只等有限时间；超时后查询在后台继续并写入缓存，下次搜索直接复用。
+_ARTIST_PUBLIC_WAIT_S = 5.0
 _artist_pool_cache: OrderedDict[tuple, dict] = OrderedDict()
 _artist_pool_lock = asyncio.Lock()
 
@@ -14572,17 +14576,22 @@ def _sweep_artist_pool(now: float) -> None:
 
 async def _build_paged_artist_pool(request: Request, keyword: str, user_guid: str, entry: dict,
                                    official: list[dict], total: int, start: int) -> None:
+    items: list[dict] = []
     overlays = {}
     try:
         items = await _artist_optional(
             _online_artist_search(keyword, _ARTIST_SEARCH_LIMIT), _ARTIST_POOL_BUILD_TIMEOUT_S, [],
         )
+        # 在线结果先落池：核验还没完成时，等待超时的请求也能拿到未合并的在线歌手。
+        entry["online"] = items
         items, overlays = await _prepare_artist_search(request, user_guid, items, official, total, start)
     except asyncio.CancelledError:
         raise
     except Exception as error:
-        logger.debug("artist search pool failed: %s", type(error).__name__)
-        items = []
+        # 合并核验只是在线搜索的增强：核验出错时退回未合并的在线结果，不整组清空。
+        logger.warning("artist search merge skipped: %s", type(error).__name__)
+        overlays = {}
+        items = [_artist_public_card(row) for row in items]
     entry["items"] = items
     entry["overlays"] = overlays
     entry["expires"] = asyncio.get_running_loop().time() + (
@@ -14614,7 +14623,7 @@ async def _get_paged_artist_pool(request: Request, keyword: str, user_guid: str,
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=_ARTIST_POOL_WAIT_S)
     except asyncio.TimeoutError:
-        return [], {}
+        return [_artist_public_card(row) for row in entry.get("online") or []], {}
     return entry["items"], entry["overlays"]
 
 
@@ -14936,6 +14945,10 @@ _ARTIST_TRACK_LIMIT = 2000
 _ARTIST_ALBUM_LIMIT = 200
 _ARTIST_MERGE_PATH = os.path.join(_HOME, "cache", "artist_merge_bindings.json")
 _ARTIST_MERGE_TTL = 86400
+# 合并目录在内存中的有效期。重建需逐页拉取本地与在线曲目（实测 2–5 秒），有效期太短
+# 会让每次隔一会儿再打开歌手都要等重建；曲库变化后最迟这段时间内或下次搜索时刷新。
+_ARTIST_CATALOG_TTL_S = 1800.0
+_artist_public_builders: dict[str, asyncio.Task] = {}
 _artist_merge_bindings: dict[str, dict] | None = None
 _artist_catalogs: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _artist_catalog_builders: dict[str, asyncio.Task] = {}
@@ -14984,6 +14997,27 @@ async def _artist_public_evidence(card: dict, page: dict) -> frozenset[tuple[str
             if result and localmatch.title_key(result[0]) == recording[0][0]:
                 evidence.append(result[1])
     return frozenset.intersection(*evidence) if evidence else frozenset()
+
+
+async def _trusted_artist_ids(card: dict, page: dict) -> frozenset[tuple[str, str]]:
+    """外网核验限时等待：等不到就按无外部证据处理，同一歌手的查询在后台继续。"""
+    guid = card["guid"]
+
+    def finished(task: asyncio.Task) -> None:
+        _artist_public_builders.pop(guid, None)
+        if not task.cancelled() and task.exception() is not None:
+            logger.debug("artist public evidence failed: %s", type(task.exception()).__name__)
+
+    task = _artist_public_builders.get(guid)
+    if task is None:
+        task = asyncio.create_task(_artist_public_evidence(card, page))
+        _artist_public_builders[guid] = task
+        task.add_done_callback(finished)
+    try:
+        async with asyncio.timeout(_ARTIST_PUBLIC_WAIT_S):
+            return await asyncio.shield(task)
+    except TimeoutError:
+        return frozenset()
 
 
 def _artist_track_infos(entry: dict, rows: list) -> list[dict]:
@@ -15173,7 +15207,7 @@ def _remember_artist_catalog(user_guid: str, catalog: dict) -> None:
     card, provider = catalog["card"], catalog["provider"]
     guid, name = card["guid"], card["name"]
     key = _artist_merge_key(user_guid, guid)
-    _artist_catalogs[key] = (time.monotonic() + _ARTIST_POOL_TTL_S, catalog)
+    _artist_catalogs[key] = (time.monotonic() + _ARTIST_CATALOG_TTL_S, catalog)
     _artist_catalogs.move_to_end(key)
     while len(_artist_catalogs) > 16:
         _artist_catalogs.popitem(last=False)
@@ -15244,7 +15278,12 @@ async def _get_merged_artist_catalog(request: Request, guid: str) -> dict | None
         task = asyncio.create_task(_artist_optional(_restore_artist_catalog(request, user_guid, binding), 16.0, None))
         _artist_catalog_builders[key] = task
         task.add_done_callback(lambda finished: _artist_catalog_builders.pop(key, None))
-    return await asyncio.shield(task)
+    try:
+        return await asyncio.shield(task)
+    except Exception as error:
+        # 合并视图恢复失败时退回官方数据，歌手详情、曲目与专辑列表不因此报错。
+        logger.warning("artist merged view unavailable: %s", type(error).__name__)
+        return None
 
 
 async def _artist_search_official(request: Request, current: list[dict],
@@ -15293,7 +15332,7 @@ async def _verify_artist_search(request: Request, user_guid: str, current: list[
 
     local_by_guid = dict(await asyncio.gather(*(sample_local(card) for card in locals_to_check)))
     trusted_values = await asyncio.gather(*(
-        _artist_public_evidence(card, local_by_guid[card["guid"]]) for card in locals_to_check
+        _trusted_artist_ids(card, local_by_guid[card["guid"]]) for card in locals_to_check
     ))
     trusted = {card["guid"]: ids for card, ids in zip(locals_to_check, trusted_values)}
     online_by_guid = dict(await asyncio.gather(*(
@@ -15375,12 +15414,21 @@ async def _prepare_artist_search(request: Request, user_guid: str, online: list[
         return guid, _artist_count(body.get("total"))
 
     merged_overlays: dict[str, dict] = {}
+
+    async def verify():
+        try:
+            return await _artist_optional(_verify_artist_search(request, user_guid, official, total, start,
+                                                               candidates, merged_overlays), 16.0, set())
+        except Exception as error:
+            # 核验出错只放弃本次合并，已取得的在线结果与本地曲目数照常返回。
+            logger.warning("artist identity verification skipped: %s", type(error).__name__)
+            return set()
+
     enriched, local_counts, hidden = await asyncio.gather(
         asyncio.gather(*(enrich_online(row, entry) for row, entry in candidates)),
         asyncio.gather(*(enrich_local(row) for row in official[:10]
                          if row.get("guid") and _artist_count(row.get("trackCount")) == 0)),
-        _artist_optional(_verify_artist_search(request, user_guid, official, total, start,
-                                               candidates, merged_overlays), 16.0, set()),
+        verify(),
     )
     by_identity: dict[tuple[str, str], tuple[dict, dict]] = {}
     for row, (_, entry) in zip(enriched, candidates):
