@@ -2143,20 +2143,21 @@ async def _catalog_cached(key: tuple, loader):
     return value
 
 
-async def _artist_songs_cached(source: str, artist_id: str, order: str) -> list[dict]:
+async def _artist_songs_cached(source: str, artist_id: str, order: str) -> dict:
     key = ("artist-tracks", source, artist_id, order)
 
     async def load():
         rows = await LXSERVER.get_artist_songs(source, artist_id, order)
         items = []
         for raw in rows:
-            if not isinstance(raw, dict):
+            if not isinstance(raw, dict) or not (raw.get("songmid") or raw.get("id")):
                 continue
             item = map_lxserver_song(raw, fallback_source=source)
             LXSERVER.cache_song_info(item["id"], raw)
             _cache_put(item)
             items.append(item)
-        return items
+        complete = len(items) == len(rows) and (not rows or len(rows) % 100 != 0)
+        return {"items": items, "complete": complete}
 
     return await _catalog_cached(key, load)
 
@@ -2265,11 +2266,13 @@ async def catalog_artist_tracks(
     if src not in ("tx", "wy") or not id:
         return _err("unsupported catalog source or artist id", 400)
     try:
-        items = await _artist_songs_cached(src, id, "time" if order == "time" else "hot")
+        catalog = await _artist_songs_cached(src, id, "time" if order == "time" else "hot")
     except Exception as exc:
         return _err(f"artist songs failed: {exc}", 502)
     start = (page - 1) * limit
-    return {"ok": True, "items": items[start:start + limit], "total": len(items)}
+    items = catalog["items"]
+    return {"ok": True, "items": items[start:start + limit], "total": len(items),
+            "complete": catalog["complete"]}
 
 
 @app.get("/api/v1/catalog/artist/albums")
@@ -2289,6 +2292,7 @@ async def catalog_artist_albums(
     end = start + limit
     items = []
     total = 0
+    total_known = False
     try:
         async with asyncio.timeout(13.0):
             for native_page in range(start // native_size + 1, (end - 1) // native_size + 2):
@@ -2297,6 +2301,8 @@ async def catalog_artist_albums(
                 native_start = (native_page - 1) * native_size
                 reported_total = int(data.get("total") or 0)
                 total = reported_total or (native_start + len(rows) if rows else total)
+                total_known = (reported_total >= native_start + len(rows) and reported_total > 0
+                               or len(rows) < native_size and (bool(rows) or native_page == 1))
                 window = rows[max(start - native_start, 0):min(end - native_start, native_size)]
                 items.extend(item for row in window if isinstance(row, dict)
                              for item in [normalize_catalog_album(row, src)] if item)
@@ -2304,7 +2310,7 @@ async def catalog_artist_albums(
                     break
     except Exception as exc:
         return _err(f"artist albums failed: {exc}", 502)
-    return {"ok": True, "items": items, "total": total}
+    return {"ok": True, "items": items, "total": total, "total_known": total_known}
 
 
 @app.get("/api/v1/catalog/album")

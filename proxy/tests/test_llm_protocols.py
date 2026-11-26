@@ -217,6 +217,35 @@ async def test_http_error_timeout_and_bad_json_reasons(monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(("error_type", "phase", "message"), [
+    (httpx.ConnectTimeout, "连接", ""),
+    (httpx.ReadTimeout, "读取响应", ""),
+    (httpx.WriteTimeout, "发送请求", ""),
+    (httpx.PoolTimeout, "等待连接池", ""),
+    (httpx.TimeoutException, "阶段未知", "private provider diagnostics"),
+])
+async def test_timeout_phase_records_safe_detail_once(monkeypatch, error_type, phase, message):
+    _configure_llm(monkeypatch)
+    monkeypatch.setenv("FNMUSIC_LLM_TIMEOUT_S", "12.5")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert all(value == 12.5 for value in request.extensions["timeout"].values())
+        raise error_type(message, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(dailyrec.LLMFailure) as excinfo:
+            await dailyrec.call_llm_json(client, "p")
+
+    detail = f"{phase}超时（配置 12.5 秒）"
+    assert (excinfo.value.reason, excinfo.value.detail) == ("timeout", detail)
+    today = llm_usage.used_today()
+    assert today["requests"] == today["unknownUsageRequests"] == 1
+    assert today["unknownUsageByCause"]["transportError"] == 1
+    assert today["lastFailure"]["reason"] == "timeout"
+    assert today["lastFailure"]["detail"] == detail
+
+
+@pytest.mark.anyio
 async def test_unparseable_content_raises_parse(monkeypatch):
     _configure_llm(monkeypatch)
     transport = _capture_transport(

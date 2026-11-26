@@ -39,6 +39,48 @@ def test_unknown_http_failures_count_once_but_quota_is_not_unknown(tmp_path, mon
     assert result["unknownUsageRequests"] == 1
 
 
+def test_failure_timestamp_round_trips_without_counter_cap(tmp_path, monkeypatch):
+    usage_file = tmp_path / "usage.json"
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    monkeypatch.setattr(llm_usage, "_today", lambda: "20261123")
+    monkeypatch.setattr(llm_usage.time, "time", lambda: 1_795_433_600)
+
+    llm_usage.record(None, "timeout", "读取响应超时", unknown_cause="transportError")
+
+    stored = json.loads(usage_file.read_text(encoding="utf-8"))
+    failure = stored["days"]["20261123"]["lastFailure"]
+    assert failure["at"] == 1_795_433_600
+    result = llm_usage.summary(history_limit=1, read_only=True)
+    assert result["lastFailure"] == result["history"][0]["lastFailure"] == failure
+
+
+@pytest.mark.parametrize(("raw_at", "expected"), [
+    ("1795433600", 1_795_433_600),
+    (1_000_000_000, 0),
+    ("1000000000", 0),
+    (None, 0),
+    (True, 0),
+    (0, 0),
+    (-1, 0),
+    (1.5, 0),
+    ("５", 0),
+    ("bogus", 0),
+    (253_402_300_800, 0),
+    ("9" * 5000, 0),
+])
+def test_failure_timestamp_normalizes_on_read_without_rewriting(tmp_path, monkeypatch, raw_at, expected):
+    usage_file = tmp_path / "usage.json"
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+    original = json.dumps({"version": 2, "days": {
+        "20261122": {"lastFailure": {"reason": "timeout", "detail": "读取响应超时", "at": raw_at}},
+    }})
+    usage_file.write_text(original, encoding="utf-8")
+
+    failure = llm_usage.summary(history_limit=1, read_only=True)["history"][0]["lastFailure"]
+    assert failure == {"reason": "timeout", "detail": "读取响应超时", "at": expected, "code": ""}
+    assert usage_file.read_text(encoding="utf-8") == original
+
+
 # ----------------------------------------------------------- 1. 跨日与 v2 存储 ---
 
 def test_v2_ledger_multi_day_accumulation(tmp_path, monkeypatch):

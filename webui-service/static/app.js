@@ -155,8 +155,10 @@ function usageCauseText(day) {
 
 function usageFailureText(failure) {
   if (!failure || !failure.reason) return "";
-  const when = Number(failure.at) > 0
-    ? `，${new Date(Number(failure.at) * 1000).toLocaleString()}` : "";
+  const timestamp = Number(failure.at);
+  const date = new Date(timestamp * 1000);
+  const when = Number.isSafeInteger(timestamp) && timestamp > 0 && !Number.isNaN(date.getTime())
+    ? `，${date.toLocaleString(undefined, { timeZone: "Asia/Shanghai" })}` : "";
   const code = failure.code ? ` [${failure.code}]` : "";
   const detail = failure.detail ? `（${String(failure.detail).slice(0, 120)}）` : "";
   return `${failure.reason}${code}${detail}${when}`;

@@ -30,6 +30,11 @@ function nonnegativeIntOrZero(val) {
   }
 }
 
+function artistCount(val) {
+  const count = typeof val === 'string' && /^\d+$/.test(val) ? Number(val) : val;
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
 function mapQualitySlots(raw) {
   if (!raw || typeof raw !== 'object') return {};
   const out = {};
@@ -698,8 +703,8 @@ function createService(options = {}) {
           name: String(a.name || ''),
           picUrl: String(a.picUrl || a.img1v1Url || ''),
           alias: Array.isArray(a.alias) ? a.alias : [],
-          albumSize: nonnegativeIntOrZero(a.albumSize),
-          musicSize: nonnegativeIntOrZero(a.musicSize),
+          albumSize: artistCount(a.albumSize),
+          musicSize: artistCount(a.musicSize),
         })).filter(a => a.id && a.name);
         return res.json({ ok: true, code: 200, data: artists });
       }
@@ -851,7 +856,8 @@ function createService(options = {}) {
 
       const resp = await sdk.artist_songs({ id: artistId, limit, offset, order, cookie, timeout: timeoutMs });
       const body = resp && resp.body ? resp.body : {};
-      const songs = Array.isArray(body.songs) ? body.songs : [];
+      if (!Array.isArray(body.songs)) return res.status(502).json({ ok: false, detail: 'Invalid artist songs' });
+      const songs = body.songs;
       const privileges = Array.isArray(body.privileges) ? body.privileges : [];
       const privilegeMap = new Map(privileges.map(p => [Number(p && p.id), p]));
       const data = songs.map(song => mapSongDetail(song, privilegeMap.get(Number(song.id))));
@@ -859,7 +865,7 @@ function createService(options = {}) {
         ok: true,
         code: 200,
         data,
-        total: nonnegativeIntOrZero(body.total) || data.length,
+        total: artistCount(body.total),
       });
     } catch (err) {
       next(err);
@@ -877,7 +883,8 @@ function createService(options = {}) {
 
       const resp = await sdk.artist_album({ id: artistId, limit, offset, cookie, timeout: timeoutMs });
       const body = resp && resp.body ? resp.body : {};
-      const albums = Array.isArray(body.hotAlbums) ? body.hotAlbums : [];
+      if (!Array.isArray(body.hotAlbums)) return res.status(502).json({ ok: false, detail: 'Invalid artist albums' });
+      const albums = body.hotAlbums;
       const data = albums.filter(Boolean).map(album => {
         const artists = (Array.isArray(album.artists) ? album.artists : [])
           .filter(artist => artist && artist.name)
@@ -896,7 +903,7 @@ function createService(options = {}) {
         ok: true,
         code: 200,
         data,
-        total: nonnegativeIntOrZero(body.artist && body.artist.albumSize) || data.length,
+        total: artistCount(body.artist?.albumSize),
       });
     } catch (err) {
       next(err);

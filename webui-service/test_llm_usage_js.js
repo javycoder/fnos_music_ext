@@ -23,6 +23,13 @@ const context = vm.createContext({ $, document: doc, Date, Number, String, Math,
 });
 vm.runInContext(section, context);
 (async () => {
+  const timestamp = 1795433600;
+  const shanghaiTime = new Date(timestamp * 1000).toLocaleString(undefined, { timeZone: "Asia/Shanghai" });
+  assert.equal(context.usageFailureText({ reason: "timeout", at: timestamp }), `timeout，${shanghaiTime}`);
+  for (const at of [0, null, undefined, "bogus", Number.MAX_SAFE_INTEGER]) {
+    assert.equal(context.usageFailureText({ reason: "timeout", detail: "读取响应超时", at }), "timeout（读取响应超时）");
+  }
+
   payload = { date: "20261028", total: 100, prompt: 70, completion: 30, requests: 2, dailyLimit: 10000000, status: "ok", statsStartedAt: "20261027", historyIncomplete: true,
     unknownUsageRequests: 3, unknownUsageByCause: { httpError: 2, missingUsage: 1, unclassified: 0 },
     lastFailure: { reason: "http-503", detail: '<img src=x onerror="alert(1)">no provider', at: 1763553170, code: "no_provider" },

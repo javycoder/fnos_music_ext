@@ -21,6 +21,14 @@ def clean_issue141_state(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod, "_ALBUM_PERSIST_LAST", 0.0)
     monkeypatch.setattr(app_mod, "_ARTIST_SEARCH_REGISTRY_PATH", tmp_path / "artist_search_registry.json")
     monkeypatch.setattr(app_mod, "_ARTIST_SEARCH_REGISTRY", None)
+    monkeypatch.setattr(app_mod, "_ARTIST_MERGE_PATH", str(tmp_path / "artist_merge_bindings.json"))
+    monkeypatch.setattr(app_mod, "_artist_merge_bindings", None)
+    monkeypatch.setattr(app_mod, "_artist_catalogs", app_mod.OrderedDict())
+    monkeypatch.setattr(app_mod, "_artist_catalog_builders", {})
+    monkeypatch.setattr(app_mod, "_artist_public_builders", {})
+    monkeypatch.setattr(app_mod.artist_identity, "_CACHE", app_mod.OrderedDict())
+    monkeypatch.setattr(app_mod.artist_identity, "_INFLIGHT", {})
+    monkeypatch.setattr(app_mod.artist_identity, "_unreachable_until", 0.0)
     yield
     app_mod._FAKE_ARTIST_REGISTRY.clear()
     app_mod._artist_pool_cache.clear()
@@ -155,6 +163,408 @@ def test_artist_search_registry_ignores_expired_and_invalid_entries():
     }), encoding="utf-8")
     assert resolve_fake_artist(expired) is None
     assert resolve_fake_artist(other) is None
+
+
+@pytest.mark.parametrize(
+    "detail, catalog, expected",
+    [
+        (1297, None, 1297),
+        (None, {"total": 1234, "complete": True}, 1234),
+        (None, {"total": 2000, "complete": False}, 0),
+        (None, {"total": 0, "complete": True}, 0),
+        (None, None, 0),
+    ],
+)
+def test_lx_search_count_uses_detail_or_complete_catalog(monkeypatch, detail, catalog, expected):
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "lx_sources", ["tx"])
+    paths = []
+
+    def official(request):
+        if request.url.path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "listener"}})
+        return httpx.Response(200, json={"code": 0, "data": {"total": 0, "list": []}})
+
+    def lx(request):
+        paths.append(request.url.path)
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200, json={"items": [{
+                "lx_source": "tx", "id": "qq-artist", "name": "陈奕迅", "track_count": None,
+            }]})
+        if request.url.path.endswith("/artist"):
+            return httpx.Response(200, json={"artist": {
+                "id": "qq-artist", "name": "陈奕迅", "track_count": detail, "album_count": 17,
+            }})
+        if request.url.path.endswith("/tracks") and catalog is not None:
+            assert request.url.params["limit"] == "1"
+            return httpx.Response(200, json={**catalog, "items": [{}] if catalog["total"] else []})
+        return httpx.Response(502)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(official), base_url="http://official")
+    app.state.lx_client = httpx.AsyncClient(transport=httpx.MockTransport(lx), base_url="http://lx")
+    with TestClient(app) as client:
+        params = {"q": "陈奕迅", "page": 1, "size": 24}
+        for _ in range(2):
+            card = client.get("/music/api/v1/search/artist", params=params).json()["data"]["list"][0]
+            assert card["trackCount"] == expected
+            assert card["albumCount"] == 17
+        assert paths.count("/api/v1/catalog/artist") == 1
+        assert paths.count("/api/v1/catalog/artist/tracks") == (detail is None)
+        artist = client.get("/music/api/v1/artist/detail", params={"guid": card["guid"]}).json()["data"]
+        assert artist["trackCount"] == expected
+
+
+@pytest.fixture
+def merged_artist_services(monkeypatch):
+    artist_guid = "a" * 32
+    second_guid = "b" * 32
+    artist_name = "陈奕迅"
+    settings = {"mode": "normal", "extras": 1200, "single": False}
+    provider_calls = []
+    local_album_specs = [("local-a", "第一张", 2), ("local-b", "第二张", 1), ("local-c", "本地专辑", 1)]
+    local_recordings = [
+        ("曲目甲", "local-a", "第一张"), ("曲目乙", "local-a", "第一张"),
+        ("曲目丙", "local-b", "第二张"), ("仅本地", "local-c", "本地专辑"),
+    ]
+    monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
+    monkeypatch.setitem(CONF, "lx_sources", ["wy"])
+
+    def paged(rows, request, *, online=False):
+        size = int(request.url.params.get("limit" if online else "size", 100))
+        page = int(request.url.params.get("page", 1))
+        start = (page - 1) * size
+        return rows[start:start + size]
+
+    def official(request):
+        path, params = request.url.path, request.url.params
+        if path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "data": {"guid": request.headers.get("cookie", "listener")}})
+        local_guid = params.get("artistGUID") or params.get("guid") or artist_guid
+        local_artist = {"guid": local_guid, "name": artist_name, "trackCount": 0,
+                        "albumCount": 3, "coverId": "local-cover"}
+        if path.endswith("/search/artist"):
+            rows = [local_artist]
+            if settings["mode"] == "two_locals":
+                rows.append(dict(local_artist, guid=second_guid))
+        elif path.endswith("/artist/detail"):
+            return httpx.Response(200, json={"code": 0, "data": dict(local_artist, extra="official")})
+        elif path.endswith("/track/artist-detail/list"):
+            recordings = local_recordings[:1] if settings["single"] else local_recordings
+            rows = [
+                {"guid": f"local-track-{index}", "title": title, "duration": 203000,
+                 "artists": [{"guid": local_guid, "name": artist_name}],
+                 "album": {"guid": album_guid, "name": album}, "createdAt": index,
+                 **({"isrc": "HKH090112503"} if settings["single"] else {})}
+                for index, (title, album_guid, album) in enumerate(recordings)
+            ]
+        elif path.endswith("/album/artist-detail/list"):
+            rows = [{"guid": guid, "name": name, "trackCount": count}
+                    for guid, name, count in local_album_specs]
+        else:
+            return httpx.Response(404)
+        return httpx.Response(200, json={"code": 0, "data": {"list": paged(rows, request), "total": len(rows)}})
+
+    def netease(request):
+        path = request.url.path
+        provider_calls.append(path)
+        if path.endswith("/search"):
+            return httpx.Response(200, json={"data": [
+                {"id": 6000, "name": artist_name, "musicSize": settings["extras"] + 4, "albumSize": 3},
+                {"id": 6001, "name": artist_name, "musicSize": 1, "albumSize": 1},
+            ]})
+        artist_id = int(path.split("/")[4])
+        if path.endswith("/tracks"):
+            spec = [
+                ("曲目甲", 900, "第一张"), ("曲目乙", 900, "第一张"),
+                ("曲目丙", 901, "第二张"), ("曲目丙 (Live)", 901, "第二张"),
+            ]
+            if artist_id == 6000:
+                spec.extend((f"仅在线-{index}", 902, "在线专辑") for index in range(settings["extras"]))
+            elif settings["mode"] != "ambiguous":
+                spec = spec[:1]
+            rows = [
+                {"song_id": index + 1, "name": title, "duration_ms": 202000,
+                 "artists": [{"id": artist_id, "name": artist_name}],
+                 "album_id": album_id, "album_name": album}
+                for index, (title, album_id, album) in enumerate(spec)
+            ]
+            if settings["mode"] == "invalid-page" and request.url.params["page"] == "2":
+                return httpx.Response(200, json={"data": rows[:100], "total": len(rows)})
+            if settings["mode"] == "different-credit":
+                for row in rows:
+                    row["artists"].append({"id": 6500, "name": "合作歌手"})
+            return httpx.Response(200, json={"data": paged(rows, request, online=True), "total": len(rows)})
+        if path.endswith("/albums"):
+            specs = [(900, "第一张", 2), (901, "第二张", 2), (902, "在线专辑", settings["extras"])]
+            rows = [{"id": album_id, "name": name, "size": count,
+                     "artists": [{"id": artist_id, "name": artist_name}]}
+                    for album_id, name, count in specs if count]
+            return httpx.Response(200, json={"data": paged(rows, request, online=True), "total": len(rows)})
+        return httpx.Response(200, json={"artist": {"id": artist_id, "name": artist_name,
+                                                  "musicSize": settings["extras"] + 4, "albumSize": 3}})
+
+    def lx(request):
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200, json={"items": [{
+                "lx_source": "wy", "id": "6000", "name": artist_name,
+                "track_count": settings["extras"] + 4, "album_count": 3,
+            }]})
+        return httpx.Response(502)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(official), base_url="http://official")
+    app.state.musicbox_client = httpx.AsyncClient(transport=httpx.MockTransport(netease), base_url="http://netease")
+    app.state.lx_client = httpx.AsyncClient(transport=httpx.MockTransport(lx), base_url="http://lx")
+    return artist_guid, settings, provider_calls
+
+
+def test_artist_search_merges_complete_catalog_preserving_homonym_and_pages(merged_artist_services):
+    artist_guid, _, calls = merged_artist_services
+    with TestClient(app) as client:
+        params = {"q": "陈奕迅", "page": 1, "size": 1}
+        first = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert first["total"] == 2
+        assert first["list"] == [{"guid": artist_guid, "name": "陈奕迅", "trackCount": 1205,
+                                  "albumCount": 5, "coverId": "local-cover"}]
+        assert calls.count("/api/v1/artist/6000/tracks") == 13
+        assert calls.count("/api/v1/artist/6001/tracks") == 1
+        page_two = client.get("/music/api/v1/search/artist", params={**params, "page": 2}).json()["data"]
+        assert page_two["total"] == 2 and len(page_two["list"]) == 1
+        assert resolve_fake_artist(page_two["list"][0]["guid"])["artist_id"] == "6001"
+        assert calls.count("/api/v1/artist/6000/tracks") == 13
+
+        detail = client.get("/music/api/v1/artist/detail", params={"guid": artist_guid}).json()["data"]
+        assert (detail["guid"], detail["trackCount"], detail["extra"]) == (artist_guid, 1205, "official")
+        track_path = "/music/api/v1/track/artist-detail/list"
+        tracks = client.get(track_path, params={"artistGUID": artist_guid, "size": 3, "page": 2}).json()["data"]
+        assert tracks["total"] == 1205
+        assert [row["title"] for row in tracks["list"]] == ["仅本地", "曲目丙 (Live)", "仅在线-0"]
+        tail = client.get(track_path, params={"artistGUID": artist_guid, "size": 200, "page": 7}).json()["data"]
+        assert tail["total"] == 1205 and len(tail["list"]) == 5
+        assert tail["list"][-1]["title"] == "仅在线-1199"
+        albums = client.get("/music/api/v1/album/artist-detail/list", params={"artistGUID": artist_guid}).json()["data"]
+        assert albums["total"] == 5
+        assert [row["name"] for row in albums["list"]] == ["第一张", "第二张", "本地专辑", "第二张", "在线专辑"]
+
+
+def test_artist_search_shares_netease_and_lx_wy_identity(monkeypatch, merged_artist_services):
+    artist_guid, settings, _ = merged_artist_services
+    settings["extras"] = 2
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    with TestClient(app) as client:
+        result = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+        assert result["total"] == 2
+        assert result["list"][0]["guid"] == artist_guid
+        assert result["list"][0]["trackCount"] == 7
+        assert resolve_fake_artist(result["list"][1]["guid"])["artist_id"] == "6001"
+
+
+@pytest.mark.parametrize("public_id,expected_total", [("6000", 2), ("7777", 3), (None, 3)])
+def test_one_local_track_requires_public_id_and_recording_match(
+    monkeypatch, merged_artist_services, public_id, expected_total,
+):
+    artist_guid, settings, _ = merged_artist_services
+    settings.update(single=True, extras=1)
+    received = []
+
+    async def lookup(isrc):
+        received.append(isrc)
+        return ("曲目甲", frozenset({("wy", public_id)})) if public_id else None
+
+    monkeypatch.setattr(app_mod.artist_identity, "public_artist_ids", lookup)
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+        assert data["total"] == expected_total
+        assert data["list"][0]["guid"] == artist_guid
+        assert data["list"][0]["trackCount"] == (5 if expected_total == 2 else 1)
+    assert received == ["HKH090112503"]
+
+
+@pytest.mark.parametrize("backlink,expected", [(True, {("wy", "2116"), ("tx", "qqMID")}), (False, set())])
+def test_public_artist_identity_requires_matching_independent_backlink(monkeypatch, backlink, expected):
+    artist_mbid = "86119d30-d930-4e65-a97a-e31e22388166"
+    requested = []
+
+    def claim(value):
+        return [{"mainsnak": {"datavalue": {"value": value}}}]
+
+    async def public_json(client, url, params=None):
+        requested.append(url)
+        if "/isrc/" in url:
+            return {"recordings": [{"title": "Shall We Talk", "artist-credit": [{"artist": {"id": artist_mbid}}]}]}
+        if "/artist/" in url:
+            return {"id": artist_mbid, "relations": [{"type": "wikidata",
+                                                      "url": {"resource": "https://www.wikidata.org/wiki/Q704041"}}]}
+        return {"entities": {"Q704041": {"claims": {
+            "P434": claim(artist_mbid if backlink else "another-artist"),
+            "P10445": claim("2116"), "P10410": claim("qqMID"),
+        }}}}
+
+    monkeypatch.setattr(app_mod.artist_identity, "_public_json", public_json)
+    result = asyncio.run(app_mod.artist_identity._find_public_artist(None, "HKH090112503"))
+    assert (result[1] if result else set()) == expected
+    assert len(requested) == 3
+
+
+def test_public_lookup_pauses_after_unreachable_host(monkeypatch):
+    identity = app_mod.artist_identity
+    requested = []
+
+    async def unreachable(client, url, params=None):
+        requested.append(url)
+        raise httpx.ConnectTimeout("blocked", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(identity, "_public_json", unreachable)
+
+    async def run():
+        return [await identity.public_artist_ids(code) for code in ("USA2P2459596", "HKH090112503")]
+
+    assert asyncio.run(run()) == [None, None]
+    assert len(requested) == 1
+    assert identity._unreachable_until > time.monotonic()
+
+
+@pytest.mark.parametrize("answer,minimum_ttl,breaker", [
+    ({}, 3000, False),
+    (httpx.ReadTimeout("slow"), 30, False),
+    (httpx.ConnectError("blocked"), 30, True),
+])
+def test_public_lookup_failure_ttl_and_breaker(monkeypatch, answer, minimum_ttl, breaker):
+    identity = app_mod.artist_identity
+
+    async def respond(client, url, params=None):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(identity, "_public_json", respond)
+
+    assert asyncio.run(identity.public_artist_ids("USA2P2459596")) is None
+    expires, result = identity._CACHE["USA2P2459596"]
+    assert result is None and expires - time.monotonic() > minimum_ttl
+    assert (identity._unreachable_until > time.monotonic()) is breaker
+
+
+@pytest.mark.parametrize("mode", ["ambiguous", "two_locals", "different-credit", "invalid-page"])
+def test_artist_search_does_not_merge_ambiguous_or_incomplete_catalogs(merged_artist_services, mode):
+    artist_guid, settings, _ = merged_artist_services
+    settings["mode"] = mode
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+        assert cards["total"] == (4 if mode == "two_locals" else 3)
+        assert cards["list"][0]["guid"] == artist_guid
+        assert cards["list"][0]["trackCount"] == 4
+        assert not app_mod._artist_catalogs
+
+
+def test_artist_binding_reauthenticates_and_restores_after_restart(monkeypatch, merged_artist_services):
+    artist_guid, settings, _ = merged_artist_services
+    settings["extras"] = 2
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+        assert cards["list"][0]["trackCount"] == 7
+        app_mod._artist_catalogs.clear()
+        monkeypatch.setattr(app_mod, "_artist_merge_bindings", None)
+        path = "/music/api/v1/track/artist-detail/list"
+        params = {"artistGUID": artist_guid}
+        assert client.get(path, params=params, headers={"cookie": "second-user"}).json()["data"]["total"] == 4
+        assert client.get(path, params=params).json()["data"]["total"] == 7
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    assert client.get(path, params=params).json()["data"]["total"] == 4
+
+
+def test_search_does_not_wait_for_slow_public_lookup(monkeypatch, merged_artist_services):
+    artist_guid, settings, _ = merged_artist_services
+    settings.update(single=True, extras=1)
+    state = {"calls": 0, "finished": False}
+
+    async def lookup(isrc):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            await asyncio.sleep(2.0)
+            state["finished"] = True
+        return "曲目甲", frozenset({("wy", "6000")})
+
+    monkeypatch.setattr(app_mod.artist_identity, "public_artist_ids", lookup)
+    monkeypatch.setattr(app_mod, "_ARTIST_PUBLIC_WAIT_S", 0.05)
+    params = {"q": "陈奕迅"}
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert state["finished"] is False
+        assert first["total"] == 3 and first["list"][0]["guid"] == artist_guid
+        assert first["list"][0]["trackCount"] == 1
+        deadline = time.monotonic() + 10
+        while not state["finished"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert state["finished"] is True
+        app_mod._artist_pool_cache.clear()
+        merged = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert merged["total"] == 2 and merged["list"][0]["trackCount"] == 5
+        assert state["calls"] == 2
+
+
+def test_search_returns_before_slow_merge_and_uses_it_afterwards(monkeypatch, merged_artist_services):
+    artist_guid, _, _ = merged_artist_services
+    prepare = app_mod._prepare_artist_search
+    # 等待上限不得超过加入合并核验之前的取值：最坏情况下搜索不比以前慢。
+    assert app_mod._ARTIST_POOL_WAIT_S <= 8.0
+
+    async def slow_prepare(*args):
+        await asyncio.sleep(0.3)
+        return await prepare(*args)
+
+    monkeypatch.setattr(app_mod, "_prepare_artist_search", slow_prepare)
+    monkeypatch.setattr(app_mod, "_ARTIST_POOL_WAIT_S", 0.05)
+    params = {"q": "陈奕迅"}
+    with TestClient(app) as client:
+        first = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert first["total"] == 3 and first["list"][0]["guid"] == artist_guid
+        assert first["list"][0]["trackCount"] == 0
+        assert [resolve_fake_artist(row["guid"])["artist_id"] for row in first["list"][1:]] == ["6000", "6001"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(entry.get("task") is None and entry.get("items")
+                   for entry in list(app_mod._artist_pool_cache.values())):
+                break
+            time.sleep(0.05)
+        merged = client.get("/music/api/v1/search/artist", params=params).json()["data"]
+        assert merged["total"] == 2 and merged["list"][0]["trackCount"] == 1205
+
+
+def test_search_keeps_online_results_when_identity_verification_crashes(monkeypatch, merged_artist_services):
+    artist_guid, _, _ = merged_artist_services
+
+    async def crash(*args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_mod, "_verify_artist_search", crash)
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+    assert data["total"] == 3
+    assert data["list"][0]["guid"] == artist_guid and data["list"][0]["trackCount"] == 4
+    assert [resolve_fake_artist(row["guid"])["artist_id"] for row in data["list"][1:]] == ["6000", "6001"]
+    assert not app_mod._artist_catalogs
+
+
+def test_artist_page_falls_back_when_merged_view_restore_crashes(monkeypatch, merged_artist_services):
+    artist_guid, settings, _ = merged_artist_services
+    settings["extras"] = 2
+    path = "/music/api/v1/track/artist-detail/list"
+    params = {"artistGUID": artist_guid}
+
+    async def crash(*args):
+        raise RuntimeError("boom")
+
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/search/artist", params={"q": "陈奕迅"}).json()["data"]
+        assert cards["list"][0]["trackCount"] == 7
+        assert app_mod._artist_catalogs[next(iter(app_mod._artist_catalogs))][0] - time.monotonic() > 1500
+        monkeypatch.setattr(app_mod, "_restore_artist_catalog", crash)
+        app_mod._artist_catalogs.clear()
+        app_mod._artist_merge_bindings = None
+        response = client.get(path, params=params)
+    assert response.status_code == 200 and response.json()["data"]["total"] == 4
 
 
 @pytest.mark.parametrize("source", ["netease", "lx"])
