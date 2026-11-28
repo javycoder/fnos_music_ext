@@ -1,9 +1,9 @@
 {
-  "extension_version": "3.2.3-0",
+  "extension_version": "3.3.0-0",
   "music_versions": [
     "1.0.10",
     "1.1.19"
   ],
-  "checked_at": "2026-11-26",
-  "notes": "1.0.10 为既有适配基线。2026-11-26 通过局域网只读核对 NAS 的 /var/apps/trim.music/manifest：appname=trim.music，version=1.1.19；官方 /music/api/v1/sys/config 的 serverVersion 同为 1.1.19。NAS 隔离实例复核了在线歌手搜索，以及本地与在线合并后的歌手详情、歌曲与专辑请求（在线侧为真实网易/洛雪数据）；此记录不控制运行时行为。"
+  "checked_at": "2026-11-28",
+  "notes": "1.0.10 为既有适配基线。已在飞牛音乐官方应用清单核对 1.1.19。此记录用于说明适配范围，不控制运行时行为。"
 }
