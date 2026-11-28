@@ -205,7 +205,8 @@ async def test_get_second_wait_reuses_first_resolution_without_fresh(monkeypatch
             refreshes.append(refresh)
             url = await proxy.resolve_netease_url(client, "56", refresh=refresh)
             assert url
-            return (None, None, "flac", None, None, b"audio")
+            partial = httpx.Response(206, content=b"audio", headers={"Content-Range": "bytes 100-104/105"})
+            return (partial, None, "flac", None, None, b"audio")
 
         monkeypatch.setattr(proxy.asyncio, "wait_for", scaled_wait)
         monkeypatch.setattr(proxy, "_open_online_stream", open_stream)

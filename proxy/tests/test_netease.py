@@ -487,6 +487,7 @@ async def test_fetch_musicbox_search_row_cover_used_without_detail():
 def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
     audio_content = b"FLAC_MAGIC_HEADER_TEST_AUDIO_CONTENT" * 40
     content_len = str(len(audio_content))
+    remote_ranges = []
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="Should not hit upstream")
@@ -524,6 +525,12 @@ def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
             # issue #56：网易 CDN 对无 UA 请求 403——播放请求必须带 UA（首播跳歌根因）
             if request.headers.get("user-agent") != _MEDIA_UA_PC:
                 return httpx.Response(403)
+            range_header = request.headers.get("range")
+            remote_ranges.append(range_header)
+            if range_header == "bytes=0-9":
+                return httpx.Response(206, content=audio_content[:10], headers={
+                    "Content-Type": "audio/flac", "Content-Range": f"bytes 0-9/{content_len}",
+                })
             return httpx.Response(
                 200,
                 content=audio_content,
@@ -566,13 +573,18 @@ def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
         with open(saved_file, "rb") as f:
             assert f.read() == audio_content
 
-        # 缓存命中测试：第二次播放直接读本地文件，不请求上游
+        # 续播仍取在线原始表示；不带 Range 的新起播才读已保存文件。
         resp2 = client.get(
             "/music/api/v1/track/stream?guid=online:netease:186016",
             headers={"Range": "bytes=0-9"},
         )
         assert resp2.status_code == 206
         assert resp2.content == audio_content[:10]
+        assert remote_ranges[-1] == "bytes=0-9"
+        request_count = len(remote_ranges)
+        restarted = client.get("/music/api/v1/track/stream?guid=online:netease:186016")
+        assert restarted.status_code == 200 and restarted.content == audio_content
+        assert len(remote_ranges) == request_count
 
 
 def test_stream_track_early_disconnect_background_tee(tmp_path, monkeypatch):

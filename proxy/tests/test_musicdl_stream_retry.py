@@ -7,6 +7,7 @@ URL 与探针结果，第二次尝试即可出流。
 """
 import asyncio
 
+import httpx
 import pytest
 from starlette.requests import Request
 
@@ -38,7 +39,7 @@ async def test_musicdl_timeout_retries_once_then_streams(monkeypatch):
             raise asyncio.TimeoutError
         async def chunks():
             yield b"audio-bytes"
-        return (None, None, "mp3", None, chunks(), b"audio-bytes")
+        return (httpx.Response(200, content=b"audio-bytes"), None, "mp3", None, chunks(), b"audio-bytes")
 
     _patch_common(monkeypatch, opener)
     response = await proxy.stream_track(_request("online:kuwo:123"))

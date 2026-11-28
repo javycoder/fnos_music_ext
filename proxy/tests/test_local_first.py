@@ -176,6 +176,12 @@ def env(tmp_path, monkeypatch):
                 "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
                 "duration_s": 269, "ext": "mp3", "lyric": ""})
         if request.url.path == "/stream":
+            range_header = request.headers.get("range")
+            if range_header:
+                start, end = appmod.parse_http_range(range_header, len(ONLINE_MP3))
+                return httpx.Response(206, content=ONLINE_MP3[start:end + 1], headers={
+                    "Content-Type": "audio/mpeg", "Content-Range": f"bytes {start}-{end}/{len(ONLINE_MP3)}",
+                })
             return httpx.Response(200, content=ONLINE_MP3,
                                   headers={"Content-Type": "audio/mpeg"})
         return httpx.Response(404)
@@ -878,6 +884,7 @@ def test_local_layout_range_reset_when_library_becomes_unavailable(env, failure)
         env["musicdl"].clear()
         seek = client.get("/music/api/v1/track/stream", params={"guid": GUID_KUWO},
                           headers={"Range": "bytes=50-"})
-        # A completed online tee may serve the seek from its cache.
+        # Once playback falls back online, subsequent seeks keep that representation.
         assert seek.status_code == 206 and seek.content == ONLINE_MP3[50:]
+        assert [c["range"] for c in env["musicdl"] if c["path"] == "/stream"] == ["bytes=50-"]
         assert appmod._sanitize_stale_local_range(GUID_KUWO, "bytes=50-") == "bytes=50-"

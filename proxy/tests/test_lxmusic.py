@@ -563,6 +563,7 @@ def test_search_merge_lx_items():
 def test_stream_track_lx_direct_stream_and_cache(monkeypatch, tmp_path):
     audio_content = b"KG_TRACKERCDN_FLAC_TEST_PAYLOAD_" * 80
     content_len = str(len(audio_content))
+    remote_ranges = []
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="Should not hit upstream")
@@ -570,6 +571,12 @@ def test_stream_track_lx_direct_stream_and_cache(monkeypatch, tmp_path):
     def direct_stream_handler(request: httpx.Request) -> httpx.Response:
         if "audio.test" in str(request.url):
             assert request.headers.get("user-agent") == "Mozilla/5.0"
+            range_header = request.headers.get("range")
+            remote_ranges.append(range_header)
+            if range_header == "bytes=0-9":
+                return httpx.Response(206, content=audio_content[:10], headers={
+                    "Content-Type": "audio/mpeg", "Content-Range": f"bytes 0-9/{content_len}",
+                })
             return httpx.Response(
                 200,
                 content=audio_content,
@@ -610,10 +617,15 @@ def test_stream_track_lx_direct_stream_and_cache(monkeypatch, tmp_path):
         with open(saved_file, "rb") as f:
             assert f.read() == audio_content
 
-        # 二次播放：缓存命中 206 Range 回放，不再请求远端
+        # 续播走在线原始表示；无区间的新起播仍优先读取本地文件。
         resp2 = client.get(f"/music/api/v1/track/stream?guid={guid}", headers={"Range": "bytes=0-9"})
         assert resp2.status_code == 206
         assert resp2.content == audio_content[:10]
+        assert remote_ranges[-1] == "bytes=0-9"
+        request_count = len(remote_ranges)
+        restarted = client.get(f"/music/api/v1/track/stream?guid={guid}")
+        assert restarted.status_code == 200 and restarted.content == audio_content
+        assert len(remote_ranges) == request_count
 
 
 def test_stream_track_lx_unavailable_404():
