@@ -96,6 +96,7 @@ def setup_nm_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "netease_my_playlists", True)
+    monkeypatch.setitem(CONF, "netease_playlist_user_guids", ("user-nm-1", "user-a", "user-b"))
     # 关闭推荐注入，聚焦 nm 歌单行为（注入位置断言不依赖推荐构建链）
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "recommend_daily", False)
@@ -365,6 +366,44 @@ def test_track_list_favorite_state_is_user_scoped_and_refreshes(monkeypatch):
     assert all(track["isFavorite"] is False for track in nmpl.cached_tracks(111))
 
 
+def test_revoked_recipients_cannot_read_cached_playlist(tmp_path, monkeypatch):
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    current_user = {"guid": "user-b"}
+    key = "FNMUSIC_NETEASE_PLAYLIST_USER_GUIDS"
+    monkeypatch.setenv(key, "[]")
+    env_file = tmp_path / ".env"
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: _auth_upstream(current_user["guid"])(request)),
+        base_url="http://unix",
+    )
+    base = "/music/api/v1"
+    real = "online:playlist:nm:111"
+    with TestClient(app) as client:
+        assert real in {row["guid"] for row in client.get(base + "/playlist/list").json()["data"]["list"]}
+        fake = fake_official_guid(real)
+        assert client.get(base + "/playlist/detail", params={"guid": fake}).json()["code"] == 0
+        env_file.write_text(f"{key}='[\"user-a\"]'\n", encoding="utf-8")
+        assert proxy_app.apply_env_hot_reload(str(env_file)) == ["netease_playlist_user_guids"]
+        for excluded in ("user-b", "new", "shared"):
+            current_user["guid"] = excluded
+            listing = client.get(base + "/playlist/list").json()["data"]
+            assert [row["guid"] for row in listing["list"]] == ["localpl"]
+            assert listing["total"] == 1
+            for guid in (real, fake):
+                assert client.get(base + "/playlist/detail", params={"guid": guid}).json()["data"] is None
+                assert client.get(base + "/track/playlist-detail/list",
+                                  params={"playlistGUID": guid}).json()["data"] is None
+            batch = client.get(base + "/playlist/batch-detail", params={"guids": f"{fake},localpl"})
+            assert [row["guid"] for row in batch.json()["data"]["list"]] == ["localpl"]
+            cover = client.head(base + "/static/cover", params={"coverId": f"track_{fake}"})
+            assert cover.status_code == 404
+            assert cover.headers["cache-control"] == "private, no-store"
+        current_user["guid"] = "user-a"
+        assert client.get(base + "/playlist/detail", params={"guid": fake}).json()["code"] == 0
+        monkeypatch.setitem(CONF, "netease_playlist_user_guids", ())
+        assert client.get(base + "/playlist/detail", params={"guid": fake}).json()["data"] is None
+
+
 def test_cover_redirect(monkeypatch):
     _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
     # 封面同源直出（issue #48）：App 不跟随跨域 302
@@ -377,6 +416,7 @@ def test_cover_redirect(monkeypatch):
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("image/jpeg")
         assert resp.content == b"\xFF\xD8\xFFnm"
+        assert resp.headers["cache-control"] == "private, no-store"
         # 无歌单封面直链时仍可使用已缓存的曲目封面
         fake333 = fake_official_guid("online:playlist:nm:333")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake333}"}, follow_redirects=False)

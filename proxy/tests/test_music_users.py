@@ -15,6 +15,43 @@ music = importlib.import_module("proxy.app")
 SELECTION = [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
 
 
+def test_netease_recipients_snapshot_once_after_roster_recovers(tmp_path, monkeypatch):
+    path = tmp_path / ".env"
+    original = "FNMUSIC_NETEASE_MY_PLAYLISTS='false'\nCUSTOM='keep'\n"
+    path.write_text(original)
+    key = "FNMUSIC_NETEASE_PLAYLIST_USER_GUIDS"
+    monkeypatch.setattr(music, "_env_watch_path", lambda: str(path))
+    monkeypatch.setitem(music.CONF, "netease_playlist_user_guids", None)
+    monkeypatch.setitem(music.CONF, "netease_my_playlists", False)
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "false")
+    monkeypatch.setenv(key, "[]")
+    monkeypatch.setattr(music, "list_music_users", lambda: (_ for _ in ()).throw(ValueError("unavailable")))
+    with pytest.raises(ValueError, match="unavailable"):
+        music.initialize_netease_playlist_users()
+    assert path.read_text() == original
+
+    users = [{"guid": "b"}, {"guid": "a"}, {"guid": "a"}]
+    monkeypatch.setattr(music, "list_music_users", lambda: users)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: music.initialize_netease_playlist_users(), range(2)))
+    values = dict(parse_env_file(path)[0])
+    assert values == {"FNMUSIC_NETEASE_MY_PLAYLISTS": "false", "CUSTOM": "keep", key: '["a","b"]'}
+    users.append({"guid": "new"})
+    music.initialize_netease_playlist_users()
+    assert dict(parse_env_file(path)[0]) == values
+
+    music.apply_env_hot_reload()
+    assert music.CONF["netease_playlist_user_guids"] == ("a", "b")
+    path.write_text(original + f"{key}='malformed'\n")
+    music.initialize_netease_playlist_users()
+    music.apply_env_hot_reload()
+    assert music.CONF["netease_playlist_user_guids"] == ()
+    assert dict(parse_env_file(path)[0])[key] == "malformed"
+    path.write_text(original + f"{key}='[]'\n")
+    music.initialize_netease_playlist_users()
+    assert dict(parse_env_file(path)[0])[key] == "[]"
+
+
 def test_roster_excludes_deleted_and_reports_failure(tmp_path):
     db = tmp_path / "music.db"
     with sqlite3.connect(db) as con:

@@ -681,7 +681,8 @@ def test_install_callback_migrates_data_from_old_deployment(sb, tmp_path):
 
 def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
     """调用方 cwd 有 .env.bak* 时，tar 不得按 cwd 展开导致备份失败。"""
-    repo = sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED=true\n")
+    original_env = "FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_NETEASE_PLAYLIST_USER_GUIDS='[\"user-a\"]'\n"
+    repo = sb.make_repo(env_text=original_env)
     (repo / ".env.bak.20260101000000").write_text("X=0\n", encoding="utf-8")
     sb.add_data(repo)
     state_dirs = ('playlist_tracks', 'recommend_cache', 'nm_playlists_cache',
@@ -726,7 +727,7 @@ def test_upgrade_init_backup_ignores_caller_cwd_env_bak(sb, tmp_path):
         (repo / name).unlink()
     restored = sb.run("upgrade_callback")
     assert restored.returncode == 0, restored.stderr
-    assert (repo / ".env").read_text(encoding="utf-8") == "FNMUSIC_MUSICDL_ENABLED=true\n"
+    assert (repo / ".env").read_text(encoding="utf-8") == original_env
     assert (repo / "sources-data" / "keep.txt").read_text(encoding="utf-8") == "data"
     assert (repo / "play_history" / "u.json").read_text(encoding="utf-8") == "[]"
     for name in state_dirs:

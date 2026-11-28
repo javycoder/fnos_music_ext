@@ -146,10 +146,19 @@
               <span id="qr-check" class="muted"></span>
             </div>
           </div>
-          <div class="card">
-            <div class="card-title"><span>网易账号歌单</span><button class="help-btn" type="button" data-help="netease-playlists" aria-label="网易账号歌单帮助">?</button></div>
-            <label class="switch-row"><span>同步「我创建的歌单」<span class="sub">在飞牛音乐首页展示你本人创建的网易云歌单（只读，不会写回账号）</span></span><input type="checkbox" id="netease-my-playlists"></label>
-            <label class="switch-row"><span>切换其它音源时仍保留网易歌单<span class="sub">后台保持网易服务常驻，切到聚合或洛雪时也能听网易歌单</span></span><input type="checkbox" id="netease-playlist-resident"></label>
+        </div>
+        <div class="card" id="netease-playlists-card" hidden>
+          <div class="card-title"><span>网易账号歌单</span><button class="help-btn" type="button" data-help="netease-playlists" aria-label="网易账号歌单帮助">?</button></div>
+          <label class="switch-row"><span>同步「我创建的歌单」<span class="sub">在飞牛音乐首页展示你本人创建的网易云歌单（只读，不会写回账号）</span></span><input type="checkbox" id="netease-my-playlists"></label>
+          <label class="switch-row"><span>切换其它音源时仍保留网易歌单<span class="sub">后台保持网易服务常驻，切到聚合或洛雪时也能听网易歌单</span></span><input type="checkbox" id="netease-playlist-resident"></label>
+          <div class="stack" id="netease-users-panel" hidden>
+            <div class="btn-row">
+              <button class="btn" type="button" id="netease-users-select-all">全选当前用户</button>
+              <button class="btn" type="button" id="netease-users-clear">取消全选</button>
+              <button class="btn" type="button" id="netease-users-retry">刷新用户</button>
+            </div>
+            <p class="hint" id="netease-users-note" role="status"></p>
+            <div id="netease-users-list" class="stack" role="group" aria-label="网易账号歌单接收用户"></div>
           </div>
         </div>
 
@@ -778,6 +787,7 @@
   </template>
   <template data-help-id="netease-playlists">
     <p><b>同步「我创建的歌单」：</b>登录后，你自建的歌单会显示在飞牛音乐首页（收藏他人的歌单暂不显示）。歌单为只读，不会写回你的网易账号。</p>
+    <p><b>接收用户：</b>只向勾选的飞牛音乐用户同步。首次安装或从旧版本升级时默认选中已有用户，之后新增的用户需手动勾选。</p>
     <p><b>切换其它音源时仍保留：</b>开启后即使主音源切到聚合或洛雪，后台仍保持网易服务常驻，歌单继续可看可播。</p>
   </template>
   <template data-help-id="musicdl-platforms">

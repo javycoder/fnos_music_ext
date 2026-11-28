@@ -17,6 +17,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -28,6 +29,21 @@ from pathlib import Path
 
 _LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 _ENV_LOCK = threading.RLock()
+NETEASE_PLAYLIST_RECIPIENTS_KEY = "FNMUSIC_NETEASE_PLAYLIST_USER_GUIDS"
+
+
+def parse_netease_playlist_recipient_guids(raw: object) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        try:
+            guids = json.loads(raw)
+            if isinstance(guids, list) and all(
+                isinstance(guid, str) and guid and guid.isprintable()
+                and guid == guid.strip() and guid != "shared" for guid in guids
+            ):
+                return tuple(sorted(set(guids)))
+        except (ValueError, RecursionError):
+            pass
+    raise ValueError("网易账号歌单接收用户必须是有效用户 GUID 的 JSON 数组")
 
 
 @contextmanager

@@ -2945,6 +2945,51 @@ test("已选歌单拖动：详情重绘保留会话，条目被移除时取消�
   assert.deepStrictEqual(vm.runInThisContext("publicSelection.map(({id})=>id)"), ["b"]);
 });
 
+test("网易账号歌单：只勾选已保存用户，允许全选当前用户和保存空名单", async () => {
+  reset();
+  const key = "FNMUSIC_NETEASE_PLAYLIST_USER_GUIDS";
+  const roster = { ok: true, users: [{ guid: "a", name: "甲" }, { guid: "b", name: "乙" }, { guid: "new", name: "新增" }] };
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { [key]: {} },
+    values: {
+      FNMUSIC_MUSICDL_ENABLED: "true",
+      FNMUSIC_NETEASE_MY_PLAYLISTS: "true",
+      FNMUSIC_NETEASE_PLAYLIST_RESIDENT: "true",
+      [key]: '["a","b"]',
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", roster);
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-playlists-card").hidden, false);
+  const list = els.get("#netease-users-list");
+  assert.deepStrictEqual(list._children.map((row) => row._children[0].checked), [true, true, false]);
+  assert.strictEqual(global.collectConfig()[key], undefined);
+  const first = list._children[0]._children[0];
+  first.checked = false;
+  await first.dispatch("change");
+  assert.strictEqual(global.collectConfig()[key], '["b"]');
+  await els.get("#netease-users-select-all").dispatch("click");
+  assert.strictEqual(global.collectConfig()[key], '["a","b","new"]');
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    ...roster, users: [...roster.users, { guid: "later", name: "之后新增" }],
+  });
+  await els.get("#netease-users-retry").dispatch("click");
+  assert.strictEqual(list._children.at(-1)._children[0].checked, false);
+  assert.strictEqual(global.collectConfig()[key], '["a","b","new"]');
+  await els.get("#netease-users-clear").dispatch("click");
+  assert.strictEqual(global.collectConfig()[key], "[]");
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", {
+    __rawResponse: true,
+    resp: { ok: false, status: 501, json: async () => ({ detail: "直连模式不支持读取飞牛音乐用户" }) },
+  });
+  await els.get("#netease-users-retry").dispatch("click");
+  assert.strictEqual(global.collectConfig()[key], undefined);
+  assert.ok(els.get("#netease-users-note").textContent.includes("飞牛桌面"));
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", roster);
+  await els.get("#netease-users-retry").dispatch("click");
+  assert.strictEqual(global.collectConfig()[key], "[]");
+});
+
 test("公共歌单：全部用户与个人配置独立记忆并同时提交", async () => {
   reset();
   const shared = [{ provider: "musicbox", source: "netease", kind: "chart", id: "all-1" }];

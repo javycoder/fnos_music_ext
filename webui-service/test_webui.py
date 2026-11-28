@@ -1750,6 +1750,26 @@ def test_netease_my_playlists_defaults_and_saves(env_file):
         assert again.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "true"
 
 
+def test_netease_playlist_recipients_save_replace_and_validate(env_file):
+    key = "FNMUSIC_NETEASE_PLAYLIST_USER_GUIDS"
+    with authed_client() as client:
+        view = client.get("/api/config").json()
+        assert view["values"][key] == "" and key not in view["presence"]
+        assert view["schema"][key]["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {key: '["b","a","b"]'}})
+        assert saved.status_code == 200
+        assert saved.json()["values"][key] == '["a","b"]'
+        assert saved.json()["actions"] == []
+        original = env_file.read_bytes()
+        for invalid in ('', 'null', '{}', '["shared"]', '[" a"]', '[1]', '"a"', []):
+            assert client.put("/api/config", json={"values": {key: invalid}}).status_code == 400
+            assert env_file.read_bytes() == original
+        assert client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_MY_PLAYLISTS": True}}).status_code == 200
+        assert client.get("/api/config").json()["values"][key] == '["a","b"]'
+        assert client.put("/api/config", json={"values": {key: "[]"}}).status_code == 200
+        assert client.get("/api/config").json()["values"][key] == "[]"
+
+
 # ------------------------------------------------------------- 网易云歌单常驻 ---
 
 def _musicdl_env(env_file) -> None:

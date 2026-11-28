@@ -41,8 +41,10 @@ from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
 from proxy.env_merge import (  # noqa: E402
+    NETEASE_PLAYLIST_RECIPIENTS_KEY,
     env_file_lock,
     parse_env_file,
+    parse_netease_playlist_recipient_guids,
     preserve_user_comments,
     render_env,
     resolve_musicdl_official_search,
@@ -256,6 +258,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_WEB_SEARCH_RESULT_LIMIT": {"kind": "int", "default": "50", "min": 1, "max": 200, "strict": True, "group": "search", "reload": "hot", "label": "Web 搜索结果数量"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
+    NETEASE_PLAYLIST_RECIPIENTS_KEY: {"kind": "str", "default": "", "group": "source", "reload": "hot", "label": "网易账号歌单接收用户"},
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易云歌单常驻"},
 }
 
@@ -1096,6 +1099,8 @@ def _normalize_lx_source_order(raw) -> str:
 
 
 def _normalize_value(key: str, raw) -> str:
+    if key == NETEASE_PLAYLIST_RECIPIENTS_KEY:
+        return json.dumps(parse_netease_playlist_recipient_guids(raw), ensure_ascii=False, separators=(",", ":"))
     if key == "LX_SOURCE_LIST":
         return _normalize_lx_source_list(raw)
     if key == "FNMUSIC_LX_SOURCE_ORDER":

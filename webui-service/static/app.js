@@ -61,6 +61,11 @@ let publicSelection = [];
 let publicUsers = [];
 let publicUsersReady = false;
 let publicUsersSeq = 0;
+let musicUsersLoading = false;
+let musicUsersError = "";
+const NETEASE_RECIPIENTS_KEY = "FNMUSIC_NETEASE_PLAYLIST_USER_GUIDS";
+let neteaseRecipients = new Set();
+let neteaseRecipientsEdited = false;
 let publicUserGuid = "";
 let publicSelectionMap = {};
 const publicUserChanges = new Set();
@@ -689,7 +694,7 @@ async function loadConfig(timeoutMs = 0) {
   $("#webui-build-mismatch").hidden = !mismatch;
   applyConfigToForm();
   clearDirty();
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || configSchema[NETEASE_RECIPIENTS_KEY]) {
     try { await loadMusicUsers(); } catch (err) { console.warn("加载歌单用户列表异常", err); }
   }
   try { await loadUserStorage(); } catch (err) { console.warn("加载用户目录异常", err); }
@@ -811,6 +816,9 @@ function applyConfigToForm() {
   webLimitEl.value = v.FNMUSIC_WEB_SEARCH_RESULT_LIMIT || "50";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
   $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
+  neteaseRecipients = new Set(readNeteaseRecipients() || []);
+  neteaseRecipientsEdited = false;
+  renderNeteaseRecipients(provider);
   $("#lx-url").value = "";
   lxVerifiedUrl = null;
   $("#lx-resolver-timeout").value = v.LX_RESOLVER_TIMEOUT || "8.0";
@@ -942,6 +950,10 @@ function collectConfig() {
     values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
       publicSelectionPayload(publicSelection)
     );
+  }
+  if (configSchema[NETEASE_RECIPIENTS_KEY] && publicUsersReady && !musicUsersLoading && neteaseRecipientsEdited
+      && neteaseRecipientsChanged()) {
+    values[NETEASE_RECIPIENTS_KEY] = JSON.stringify([...neteaseRecipients].sort());
   }
   Object.assign(values, userStorageConfigPatch());
   const dlDir = values.FNMUSIC_TEE_SAVE_DIR;
@@ -1155,6 +1167,7 @@ function syncProviderPanels(provider) {
   $("#panel-musicbox").hidden = provider !== "musicbox";
   $("#panel-musicdl").hidden = provider !== "musicdl";
   $("#panel-lxmusic").hidden = provider !== "lxmusic";
+  renderNeteaseRecipients(provider);
 }
 $$("input[name=provider]").forEach((el) =>
   el.addEventListener("change", async () => {
@@ -1453,6 +1466,85 @@ function stashPublicUser(changed = false) {
   if (changed) publicUserChanges.add(publicUserGuid);
 }
 
+function readNeteaseRecipients() {
+  try {
+    const value = JSON.parse(configValues[NETEASE_RECIPIENTS_KEY]);
+    return Array.isArray(value) && value.every((guid) =>
+      typeof guid === "string" && guid && guid === guid.trim() && guid !== "shared") ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function neteaseRecipientsChanged() {
+  const previous = readNeteaseRecipients();
+  if (previous === null) return true;
+  const saved = new Set(previous);
+  return saved.size !== neteaseRecipients.size || [...neteaseRecipients].some((guid) => !saved.has(guid));
+}
+
+function neteaseRoster() {
+  return publicUsers.filter((user) =>
+    typeof user.guid === "string" && user.guid && user.guid === user.guid.trim() && user.guid !== "shared");
+}
+
+function renderNeteaseRecipients(provider) {
+  const card = $("#netease-playlists-card");
+  if (!card) return;
+  const resident = $("#netease-playlist-resident").checked;
+  const useNetease = provider === undefined ? !$("#panel-musicbox").hidden : provider === "musicbox";
+  card.hidden = !useNetease && !resident;
+  const panel = $("#netease-users-panel");
+  panel.hidden = !configSchema[NETEASE_RECIPIENTS_KEY] || !$("#netease-my-playlists").checked;
+  if (panel.hidden || card.hidden) return;
+  const pending = !Object.hasOwn(configPresence, NETEASE_RECIPIENTS_KEY)
+    && !configValues[NETEASE_RECIPIENTS_KEY];
+  const editable = publicUsersReady && !musicUsersLoading && !pending;
+  const users = publicUsersReady ? neteaseRoster() : [];
+  $("#netease-users-retry").disabled = musicUsersLoading;
+  $("#netease-users-select-all").disabled = !editable || !users.length;
+  $("#netease-users-clear").disabled = !editable || (!neteaseRecipients.size && readNeteaseRecipients() !== null);
+  $("#netease-users-note").textContent = musicUsersLoading ? "正在读取飞牛音乐用户…"
+    : musicUsersError || (pending ? "正在初始化接收名单，请稍后刷新管理台。"
+      : users.length ? "只向勾选的用户同步。以后新增的用户默认不勾选。"
+        : "没有有效的飞牛音乐用户。请先登录飞牛音乐，再刷新用户。");
+  $("#netease-users-list").replaceChildren(...users.map((user) => {
+    const row = document.createElement("label");
+    row.className = "public-item";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = neteaseRecipients.has(user.guid);
+    checkbox.disabled = !editable;
+    const name = document.createElement("span");
+    name.textContent = (user.name || user.guid) + (user.role === "admin" ? "（管理员）" : "");
+    checkbox.addEventListener("change", () => {
+      if (checkbox.disabled || musicUsersLoading || !publicUsersReady) return;
+      if (checkbox.checked) neteaseRecipients.add(user.guid);
+      else neteaseRecipients.delete(user.guid);
+      neteaseRecipientsEdited = true;
+      $("#netease-users-clear").disabled = !neteaseRecipients.size;
+      markDirty("网易账号歌单接收用户需保存后生效");
+    });
+    row.appendChild(checkbox);
+    row.appendChild(name);
+    return row;
+  }));
+}
+
+function setAllNeteaseRecipients(selectAll) {
+  if ($("#netease-users-panel").hidden || $("#netease-playlists-card").hidden) return;
+  const button = $(selectAll ? "#netease-users-select-all" : "#netease-users-clear");
+  if (button.disabled) return;
+  neteaseRecipients = new Set(selectAll ? neteaseRoster().map((user) => user.guid) : []);
+  neteaseRecipientsEdited = true;
+  renderNeteaseRecipients();
+  markDirty("网易账号歌单接收用户需保存后生效");
+}
+
+$("#netease-users-select-all").addEventListener("click", () => setAllNeteaseRecipients(true));
+$("#netease-users-clear").addEventListener("click", () => setAllNeteaseRecipients(false));
+$("#netease-users-retry").addEventListener("click", () => loadMusicUsers());
+
 function renderMusicUsers() {
   const panel = $("#public-users-panel");
   if (!panel) return;
@@ -1480,6 +1572,9 @@ function renderMusicUsers() {
 
 async function loadMusicUsers() {
   const seq = ++publicUsersSeq;
+  musicUsersLoading = true;
+  musicUsersError = "";
+  renderNeteaseRecipients();
   $("#public-users-retry").disabled = true;
   $("#public-users-note").textContent = "正在读取飞牛音乐用户…";
   try {
@@ -1508,13 +1603,16 @@ async function loadMusicUsers() {
       || String(exc && exc.message || "").includes("安全架构")
       || String(exc && exc.message || "").includes("管理员");
     if (isDirectRestricted) {
-      $("#public-users-note").textContent = "安全架构限制：直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台。";
+      musicUsersError = "安全架构限制：直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台。";
     } else {
-      $("#public-users-note").textContent = "读取用户失败：" + exc.message + "。请点击刷新用户重试。";
+      musicUsersError = "读取用户失败：" + exc.message + "。请点击刷新用户重试。";
     }
+    $("#public-users-note").textContent = musicUsersError;
   } finally {
     if (seq === publicUsersSeq) {
+      musicUsersLoading = false;
       $("#public-users-retry").disabled = false;
+      renderNeteaseRecipients();
       renderMusicUsers();
       renderPublicSelected();
       if (publicSelectionEditable()) void ensurePublicSelectionDetails();
@@ -2960,7 +3058,9 @@ $("#netease-playlist-resident").addEventListener("change", () => {
   if ($("#netease-playlist-resident").checked && !$("#netease-my-playlists").checked && !publicNeedsMusicbox) {
     $("#netease-my-playlists").checked = true;
   }
+  renderNeteaseRecipients();
 });
+$("#netease-my-playlists").addEventListener("change", () => renderNeteaseRecipients());
 
 /* -------------------------------------------------------------- lx 源测试 */
 function escapeHtml(str) {

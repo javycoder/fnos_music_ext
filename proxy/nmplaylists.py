@@ -11,8 +11,8 @@
 （{"playlist": ..., "tracks": [...]} / {"items": [...]}），重启后由
 ensure_registry_warm 扫描 nm_playlists_cache 顺带重建 fake→real 反查映射。
 
-网易登录是实例级账号：所有 fnOS 用户看到同一批歌单（同热门推荐，无按用户
-隔离）；在音乐页对这类歌单加歌 / 移歌 / 删除均被 proxy 只读吸收，不回写网易。
+网易登录和缓存由实例共享；proxy 按飞牛音乐用户名单决定是否展示。
+在音乐页对这类歌单加歌 / 移歌 / 删除均被 proxy 只读吸收，不回写网易。
 """
 from __future__ import annotations
 

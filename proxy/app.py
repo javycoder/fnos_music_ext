@@ -75,7 +75,10 @@ try:
     from . import transcode as tc
     from . import quality_policy as qp
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
-    from .env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search
+    from .env_merge import (
+        NETEASE_PLAYLIST_RECIPIENTS_KEY, env_file_lock, parse_env_file, parse_netease_playlist_recipient_guids,
+        render_env, resolve_musicdl_official_search, write_env_atomic,
+    )
     from .fnlog import diag as fn_diag
     from .fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot
     from .fscheck import probe_dir_writable as _probe_dir_writable
@@ -101,7 +104,10 @@ except ImportError:  # uvicorn --app-dir proxy
     import transcode as tc  # type: ignore
     import quality_policy as qp  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
-    from env_merge import parse_env_file, env_file_lock, render_env, write_env_atomic, resolve_musicdl_official_search  # type: ignore
+    from env_merge import (  # type: ignore
+        NETEASE_PLAYLIST_RECIPIENTS_KEY, env_file_lock, parse_env_file, parse_netease_playlist_recipient_guids,
+        render_env, resolve_musicdl_official_search, write_env_atomic,
+    )
     from fnlog import diag as fn_diag  # type: ignore
     from fnlog import env_snapshot_lines, purge_stale, redact, setup_logging, write_env_snapshot  # type: ignore
     from fscheck import probe_dir_writable as _probe_dir_writable  # type: ignore
@@ -204,6 +210,15 @@ def _initial_musicdl_official_search() -> bool:
             env[key] = os.environ[key]
     return resolve_musicdl_official_search(
         env, env_file_exists=file_ok or "FNMUSIC_MUSICDL_ENABLED" in os.environ)
+
+
+def _netease_recipient_guids_from_config(raw: str | None) -> tuple[str, ...] | None:
+    if raw is None:
+        return None
+    try:
+        return parse_netease_playlist_recipient_guids(raw)
+    except ValueError:
+        return ()
 
 
 CONF = {
@@ -351,6 +366,8 @@ CONF = {
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
+    "netease_playlist_user_guids": _netease_recipient_guids_from_config(
+        os.environ.get(NETEASE_PLAYLIST_RECIPIENTS_KEY)),
     # 网易云歌单常驻（issue #38）：默认关；勾选后即使当前音源不是网易盒子，
     # 网易账号歌单仍注入且其曲目可播放（musicbox 进程由 webui 对账常驻保活）。
     # 只放宽歌单/播放链路；搜索仍仅在网易盒子为当前音源时使用网易结果
@@ -719,6 +736,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
+    NETEASE_PLAYLIST_RECIPIENTS_KEY: ("netease_playlist_user_guids", "netease_playlist_guids"),
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": ("netease_playlist_resident", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
@@ -764,6 +782,8 @@ def _env_watch_path() -> str:
 
 
 def _env_watch_parse(raw: str, kind: str):
+    if kind == "netease_playlist_guids":
+        return _netease_recipient_guids_from_config(raw)
     raw = str(raw or "").strip()
     if kind == "direct_bool":
         return raw.lower() in ("true", "1", "yes", "on")
@@ -1308,9 +1328,16 @@ def _refresh_recommend_config(changed: list[str] | set[str]) -> None:
 async def _env_watch_loop() -> None:
     last = _env_watch_stat()
     migration_retry_at = 0.0
+    netease_init_retry_at = 0.0
     while True:
         try:
             await asyncio.sleep(_ENV_WATCH_INTERVAL_S)
+            if CONF.get("netease_playlist_user_guids") is None and time.monotonic() >= netease_init_retry_at:
+                netease_init_retry_at = time.monotonic() + 30
+                try:
+                    await asyncio.to_thread(initialize_netease_playlist_users)
+                except (ValueError, OSError):
+                    logger.warning("网易账号歌单用户名单未初始化，将重试")
             if not CONF.get("public_playlists_by_user") and time.monotonic() >= migration_retry_at:
                 migration_retry_at = time.monotonic() + 30
                 try:
@@ -1341,7 +1368,7 @@ async def _env_watch_loop() -> None:
                 _refresh_recommend_config(changed)
                 logger.info(".env 热重载生效: %s", ",".join(sorted(changed)))
                 for key in sorted(changed):
-                    logger.info("[cfg] %s", redact(f"{key}={CONF.get(key)}"))
+                    logger.info("[cfg] %s", redact(f"{key}={_conf_log_value(key, CONF.get(key))}"))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -5702,6 +5729,8 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
 
 
 def _conf_log_value(key: str, value: Any) -> Any:
+    if key == "netease_playlist_user_guids":
+        return "未初始化" if value is None else f"{len(value)} 位用户"
     lowered = key.lower()
     if any(part in lowered for part in _REDACT_KEY_PARTS):
         return "***" if value else ""
@@ -5778,6 +5807,25 @@ def list_music_users(db_path: str = "") -> list[dict]:
         for row in rows
     ]
     return users
+
+
+def initialize_netease_playlist_users() -> None:
+    path = _env_watch_path()
+    if not os.path.isfile(path):
+        return
+    key = NETEASE_PLAYLIST_RECIPIENTS_KEY
+    if key in dict(parse_env_file(path, strict=True)[0]):
+        return
+    users = list_music_users()
+    guids = parse_netease_playlist_recipient_guids(json.dumps(
+        [user["guid"] for user in users if user["guid"] != "shared"], ensure_ascii=False))
+    with env_file_lock(path):
+        existing, comments = parse_env_file(path, strict=True)
+        # 用户查询在锁外执行；不能覆盖查询期间已保存的名单（包括空名单）。
+        if not os.path.isfile(path) or key in dict(existing):
+            return
+        raw = json.dumps(guids, ensure_ascii=False, separators=(",", ":"))
+        write_env_atomic(path, render_env([*existing, (key, raw)], trailing=comments))
 
 
 def migrate_public_playlist_users(users: list[dict] | None = None) -> None:
@@ -6143,6 +6191,11 @@ async def lifespan(fastapi_app: FastAPI):
     # songInfo 反查全冷，重建才能进持久层，不留"第二天才好"的空窗
     _sync_recommend_version_marker()
     if _background_jobs_enabled():
+        try:
+            await asyncio.to_thread(initialize_netease_playlist_users)
+            _refresh_recommend_config(apply_env_hot_reload())
+        except (ValueError, OSError):
+            logger.warning("网易账号歌单用户名单未初始化，将重试")
         await _try_migrate_public_playlist_users()
 
     sweeper_task = None
@@ -12457,11 +12510,16 @@ async def static_cover(request: Request, subpath: str = ""):
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
         upstream_client = get_upstream_client(request.app)
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
+            auth_resp.headers["Cache-Control"] = "private, no-store"
             return auth_resp
-        return await _playlist_cover_response(
+        if not is_authed or not _netease_account_playlist_allowed(user_guid):
+            return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
+        response = await _playlist_cover_response(
             request, guid, nmpl.cached_tracks(nm_pl_id) or [], nmpl.cover_url_for(nm_pl_id))
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
@@ -13189,6 +13247,15 @@ def _is_shared_user_guid(user_guid: str) -> bool:
     return str(user_guid or "").strip() in ("", "shared")
 
 
+def _netease_account_playlist_allowed(user_guid: str) -> bool:
+    return (
+        bool(CONF.get("netease_my_playlists"))
+        and _netease_runtime_usable()
+        and not _is_shared_user_guid(user_guid)
+        and user_guid in (CONF.get("netease_playlist_user_guids") or ())
+    )
+
+
 def _recommend_injectable_kinds(user_guid: str) -> list[str]:
     """按用户身份返回可注入（可构建）的推荐歌单类型，注入/生成侧统一判定。
 
@@ -13722,9 +13789,7 @@ async def playlist_list(request: Request):
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
     kinds = _recommend_injectable_kinds(user_guid)
-    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见；
-    # 网易云歌单常驻生效时即使当前音源不是网易盒子也注入（issue #38）
-    nm_on = bool(CONF.get("netease_my_playlists")) and _netease_runtime_usable()
+    nm_on = _netease_account_playlist_allowed(user_guid)
     public_on = bool(CONF.get("public_playlists_enabled"))
     if not kinds and not nm_on and not public_on:
         # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
@@ -13841,8 +13906,11 @@ async def playlist_detail(request: Request):
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
     if nm_pl_id:
-        # 网易账号歌单：只读虚拟歌单，卡片从摘要（内存→磁盘）取；trackCount 用
-        # 已缓存曲目数更准（可播过滤后可能少于网易侧计数）
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        if not is_authed or not _netease_account_playlist_allowed(user_guid):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         card = nmpl.card_for(nm_pl_id)
         if card is None:
             return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
@@ -13960,14 +14028,15 @@ async def playlist_batch_detail(request: Request):
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
         recs.append(_align_playlist_card_guid(rec, requested_by_real.get(g, g)))
-    for pid in nm_ids:
-        card = nmpl.card_for(pid)
-        if card is not None:
-            tracks = nmpl.cached_tracks(pid)
-            if tracks is not None:
-                card = {**card, "trackCount": len(tracks)}
-            real_g = str(card.get("guid") or "")
-            recs.append(_align_playlist_card_guid(card, requested_by_real.get(real_g, real_g)))
+    if nm_ids and is_authed and _netease_account_playlist_allowed(user_guid):
+        for pid in nm_ids:
+            card = nmpl.card_for(pid)
+            if card is not None:
+                tracks = nmpl.cached_tracks(pid)
+                if tracks is not None:
+                    card = {**card, "trackCount": len(tracks)}
+                real_g = str(card.get("guid") or "")
+                recs.append(_align_playlist_card_guid(card, requested_by_real.get(real_g, real_g)))
     for g in public_ids:
         entry = pubpl.entry_from_guid(g)
         if entry is None or not _public_playlist_allowed(user_guid, entry):
@@ -14045,6 +14114,8 @@ async def playlist_track_list(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
+        if not is_authed or not _netease_account_playlist_allowed(user_guid):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
         tracks = dailyrec.stamp_playlist_tracks(
             await nmpl.load_tracks(get_netease_client(request.app), nm_pl_id, build_online_track)
         )

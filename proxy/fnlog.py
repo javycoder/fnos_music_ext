@@ -30,10 +30,10 @@ from pathlib import Path
 from urllib.parse import unquote
 
 try:
-    from .env_merge import parse_env_file
+    from .env_merge import NETEASE_PLAYLIST_RECIPIENTS_KEY, parse_env_file
     from .version import get_version
 except ImportError:  # 独立/容器内以 --app-dir 方式加载
-    from env_merge import parse_env_file  # type: ignore
+    from env_merge import NETEASE_PLAYLIST_RECIPIENTS_KEY, parse_env_file  # type: ignore
     from version import get_version  # type: ignore
 
 RETENTION_DAYS = 3
@@ -425,7 +425,7 @@ def _env_summary() -> str:
         return ""
     items = []
     for k, v in kv_list:
-        if _SECRET_ENV_KEYS.search(k):
+        if k == NETEASE_PLAYLIST_RECIPIENTS_KEY or _SECRET_ENV_KEYS.search(k):
             continue
         value = str(v).strip()
         if value:
