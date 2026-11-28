@@ -11,8 +11,13 @@ import pytest
 
 from proxy import app as runtime
 from proxy import organize
+from proxy import userstorage
 from proxy.userstorage import (
+    auto_user_dir_name,
+    auto_user_root,
     effective_user_root,
+    is_auto_user_dir_name,
+    load_user_dir_names,
     merge_user_map,
     parse_user_map,
     user_ref_name,
@@ -256,3 +261,52 @@ def test_official_track_match_uses_path_when_tags_are_identical(tmp_path, monkey
     missing = runtime._lookup_official_track_guid(
         "晴天", "周杰伦", "叶惠美", "/music/missing.flac", allow_tag_fallback=False)
     assert missing[0] is None
+
+
+def test_user_dir_names_use_username_and_owner_code(monkeypatch):
+    """目录名 = 用户名.归属码；用户名只给人看，归属码取 GUID 摘要前 8 位。"""
+    code = user_storage_key
+    assert load_user_dir_names([
+        {"guid": "user-a", "name": "张三", "role": "admin"},
+        {"guid": "user-b", "name": "李 四", "role": "user"},
+        {"guid": "user-c", "name": "", "role": "user"},
+        {"guid": "user-d", "name": "../坏/名字", "role": "user"},
+        {"guid": "shared", "name": "公共", "role": "user"},
+    ], organize.safe_part) == {
+        "user-a": f"张三.{code('user-a')[:8]}", "user-b": f"李 四.{code('user-b')[:8]}",
+        "user-c": f"user.{code('user-c')[:8]}", "user-d": f"_坏_名字.{code('user-d')[:8]}",
+    }
+    # 两个在用用户的 8 位归属码相同：双方一起加长到 12 位，目录名仍不相同
+    real = userstorage.user_dir_code
+    monkeypatch.setattr(userstorage, "user_dir_code",
+                        lambda guid, length=8: "deadbeef" if length == 8 else real(guid, length))
+    assert load_user_dir_names([{"guid": "user-a", "name": "甲"}, {"guid": "user-b", "name": "乙"}],
+                               organize.safe_part) == {
+        "user-a": f"甲.{real('user-a', 12)}", "user-b": f"乙.{real('user-b', 12)}",
+    }
+
+
+def test_auto_user_root_reuses_owned_dir_until_named_dir_exists(tmp_path):
+    """期望名目录存在就用它；否则按归属码沿用旧摘要目录；都没有才返回期望名。"""
+    library = tmp_path / "library"
+    users_dir = library / "users"
+    digest = user_storage_key("user-a")
+    named = users_dir / f"张三.{digest[:8]}"
+    # 表里没有该用户：回退「user.归属码」，仍能按码找回旧摘要目录
+    assert auto_user_dir_name("user-a") == f"user.{digest[:8]}"
+    assert auto_user_root("user-a", str(library)) == str(users_dir / f"user.{digest[:8]}")
+    legacy = users_dir / digest
+    legacy.mkdir(parents=True)
+    assert auto_user_root("user-a", str(library)) == str(legacy)
+    userstorage.set_user_dir_names({"user-a": named.name})
+    assert auto_user_dir_name("user-a") == named.name
+    assert auto_user_root("user-a", str(library)) == str(legacy)
+    legacy.rename(named)
+    assert auto_user_root("user-a", str(library)) == str(named)
+    code_b = user_storage_key("user-b")[:8]
+    (users_dir / f"李四.{code_b}").symlink_to(named)
+    # 符号链接不算归属目录：user-b 找不到自己的目录，返回期望名
+    assert auto_user_root("user-b", str(library)) == str(users_dir / f"user.{code_b}")
+    assert is_auto_user_dir_name(digest) and is_auto_user_dir_name(named.name)
+    assert is_auto_user_dir_name(f"李四.{digest[:12]}") and is_auto_user_dir_name("a." + digest)
+    assert not is_auto_user_dir_name("张三") and not is_auto_user_dir_name("a.1234567")

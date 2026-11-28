@@ -150,3 +150,11 @@ def _isolate_llm_usage_state(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_usage, "_STATUS_MSG", "正常")
     # no_provider 冷却窗口是进程内状态：不隔离会让先跑用例的 503 抑制后续用例的请求。
     monkeypatch.setattr(recommend, "_NO_PROVIDER_UNTIL", {})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_dir_names(monkeypatch):
+    """隔离自动用户目录名表（模块级状态），避免用例之间互相串扰。"""
+    from proxy import userstorage
+
+    monkeypatch.setattr(userstorage, "_USER_DIR_NAMES", {})
