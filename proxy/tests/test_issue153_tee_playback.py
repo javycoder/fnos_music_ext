@@ -224,6 +224,18 @@ async def test_pinned_range_rejects_incompatible_upstream(monkeypatch, status, c
     assert replies[-1].is_closed
 
 
+def test_pinned_bounded_range_rejects_truncated_unknown_total():
+    first = httpx.Response(206, headers={"content-range": "bytes 0-100/*"})
+    playback = proxy._online_playback_identity(first)
+    truncated = httpx.Response(206, headers={"content-range": "bytes 100-150/*"})
+    complete = httpx.Response(206, headers={"content-range": "bytes 100-200/*"})
+    final = httpx.Response(206, headers={"content-range": "bytes 100-150/151"})
+
+    assert not proxy._matches_online_playback(truncated, "bytes=100-200", playback)
+    assert proxy._matches_online_playback(complete, "bytes=100-200", playback)
+    assert proxy._matches_online_playback(final, "bytes=100-200", playback)
+
+
 def test_direct_does_not_publish_before_cover_embedding(audio, cover, isolated, tmp_path, monkeypatch):
     part = tmp_path / "original.part"
     part.write_bytes(audio)

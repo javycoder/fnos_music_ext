@@ -10732,8 +10732,9 @@ def _matches_online_playback(response: httpx.Response, range_header: str | None,
     start, end, total = delivered
     if total is not None:
         return (start, end) == parse_http_range(f"bytes={requested[1]}-{requested[2]}", total)
+    # 没有总长时不能证明较短的响应已到文件末尾；有明确终点就要求完全匹配。
     return bool(requested[1] and start == int(requested[1])
-                and (not requested[2] or end <= int(requested[2])))
+                and (not requested[2] or end == int(requested[2])))
 
 
 async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None,
