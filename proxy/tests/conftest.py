@@ -3,6 +3,7 @@
 需要验证转码路径的用例自行 monkeypatch transcode.FFMPEG_BIN 指向假实现
 （tests 内置 fake_ffmpeg 脚本），其余用例一律走无 ffmpeg 的回落分支。
 """
+from collections import OrderedDict
 import os
 import shutil
 import ssl
@@ -11,9 +12,34 @@ import sys
 import tempfile
 from pathlib import Path
 
+import anyio
 import pytest
 
 from proxy import transcode as tc
+
+
+@pytest.fixture
+def asgi_audio():
+    async def read(response):
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        await response({"type": "http", "method": "GET", "asgi": {"spec_version": "2.4"}},
+                       anyio.sleep_forever, send)
+        assert messages[-1]["type"] == "http.response.body"
+        assert not messages[-1].get("more_body", False)
+        return b"".join(message.get("body", b"") for message in messages)
+
+    return read
+
+
+@pytest.fixture(autouse=True)
+def _isolate_online_playback(monkeypatch):
+    from proxy import app as pa
+
+    monkeypatch.setattr(pa, "_ONLINE_PLAYBACK", OrderedDict())
 
 
 @pytest.fixture(scope="session", autouse=True)

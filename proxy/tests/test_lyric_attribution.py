@@ -41,14 +41,14 @@ class Audio(httpx.AsyncByteStream):
         pass
 
 
-async def listen(guid, title="晴天", artist="周杰伦", ext="flac", range_header=None):
-    """完整试听一首歌并消费完整个响应体，触发 stream_tee_response 落盘转正。"""
+async def listen(asgi_audio, guid, title="晴天", artist="周杰伦", ext="flac", range_header=None):
+    """完整试听并等待 ASGI 响应结束后的入库。"""
     info = {"title": title, "artist": artist, "album": "叶惠美", "lyric": "[00:00.00]新词"}
     response = p.stream_tee_response(
         httpx.Response(200, stream=Audio()), guid, range_header,
         pre_info=info, resolved_ext=ext,
     )
-    body = b"".join([chunk async for chunk in response.body_iterator])
+    body = await asgi_audio(response)
     assert body == b"A" * 4096
 
 
@@ -99,14 +99,14 @@ def test_find_lyric_file_prefers_recorded_library_sidecar():
 # === 影子提升 ===
 
 @pytest.mark.anyio
-async def test_tee_promotes_shadow_lyric():
+async def test_tee_promotes_shadow_lyric(asgi_audio):
     """先听出 cache 影子歌词，整轨落曲库后词曲贴身：曲库 sidecar 就位、影子清除。"""
     guid = "online:netease:186016"
     p.write_lyric_cache(guid, "[00:00.00]旧词", title="晴天", artist="周杰伦")  # 无音频 → 影子
     shadow = os.path.join(p.CONF["cache_dir"], "online_netease_186016.lrc")
     assert os.path.isfile(shadow)
 
-    await listen(guid)
+    await listen(asgi_audio, guid)
 
     library_dir = p.CONF["library_dir"]
     assert os.path.isfile(os.path.join(library_dir, "周杰伦 - 晴天.flac"))

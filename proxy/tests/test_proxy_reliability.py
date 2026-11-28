@@ -561,11 +561,11 @@ def test_stream_attempt_budget_keeps_production_floor():
 
 
 @pytest.mark.anyio
-async def test_clean_unknown_length_eof_finalizes(tmp_path):
+async def test_clean_unknown_length_eof_finalizes(tmp_path, asgi_audio):
     audio = Audio()
     response = p.stream_tee_response(httpx.Response(200, stream=audio, headers={"content-type": "audio/mpeg"}),
                                     "online:kuwo:1", None, pre_info=song("kuwo:1"))
-    data = b"".join([chunk async for chunk in response.body_iterator])
+    data = await asgi_audio(response)
     assert len(data) == 4096 and audio.closed
     cached = p.find_cache_file("online:kuwo:1")
     assert cached and open(cached, "rb").read() == data
@@ -618,14 +618,14 @@ async def test_late_priority_cannot_replace_published_first_page(monkeypatch):
     ("bytes 0-4095/4096", "", True),
     ("bytes 0-4095/4096", "8192", False),
 ])
-async def test_only_full_resource_206_can_finalize(content_range, length, cached, tmp_path):
+async def test_only_full_resource_206_can_finalize(content_range, length, cached, tmp_path, asgi_audio):
     audio = Audio()
     headers = {"content-type": "audio/mpeg", "content-range": content_range}
     if length:
         headers["content-length"] = length
     response = p.stream_tee_response(httpx.Response(206, stream=audio, headers=headers),
                                     "online:kuwo:1", "bytes=0-", pre_info=song("kuwo:1"))
-    assert len(b"".join([chunk async for chunk in response.body_iterator])) == 4096
+    assert len(await asgi_audio(response)) == 4096
     assert bool(p.find_cache_file("online:kuwo:1")) == cached
     assert not list(tmp_path.rglob("*.part"))
 
@@ -643,7 +643,9 @@ async def test_only_full_resource_206_can_finalize(content_range, length, cached
     # 非零起点 Range (bytes=100-4095)：绝不缓存
     ("bytes=100-4095", 206, "bytes 100-4095/4096", "3996", False),
 ])
-async def test_bounded_range_full_resource_caching(range_header, status_code, content_range, content_length, cached, tmp_path, monkeypatch):
+async def test_bounded_range_full_resource_caching(
+    range_header, status_code, content_range, content_length, cached, tmp_path, monkeypatch, asgi_audio,
+):
     """Issue #128 核心回归：只要单次响应返回整轨资源（完整 206 或完整 200），即应落盘转正；不完整切片严禁落盘。"""
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
     audio = Audio()
@@ -657,7 +659,7 @@ async def test_bounded_range_full_resource_caching(range_header, status_code, co
         httpx.Response(status_code, stream=audio, headers=headers),
         guid, range_header, pre_info=song("kuwo:test")
     )
-    payload = b"".join([chunk async for chunk in response.body_iterator])
+    payload = await asgi_audio(response)
     assert len(payload) == 4096
     assert bool(p.find_cache_file(guid)) == cached
     assert not list(tmp_path.rglob("*.part"))

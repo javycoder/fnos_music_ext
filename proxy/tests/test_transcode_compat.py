@@ -1352,7 +1352,7 @@ def test_open_stream_blacklisted_guid_lx_requests_320k_mp3(env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_corrupt_stream_tee_retries_only_after_writer_released(env, monkeypatch):
+async def test_corrupt_stream_tee_retries_only_after_writer_released(env, monkeypatch, asgi_audio):
     guid = "online:kuwo:99009"
     monkeypatch.setitem(CONF, "tee_save_enabled", True)
     monkeypatch.setattr(appmod, "_check_audio_file", lambda path: (False, "decode_error"))
@@ -1367,7 +1367,7 @@ async def test_corrupt_stream_tee_retries_only_after_writer_released(env, monkey
         "content-type": "audio/flac", "content-length": str(len(data))})
     streamed = appmod.stream_tee_response(response, guid, None, resolved_ext="flac",
                                           pre_info={"title": "t", "artist": "a"})
-    body = b"".join([part async for part in streamed.body_iterator])
+    body = await asgi_audio(streamed)
     assert body == data
     assert appmod._lossless_is_blacklisted(guid)
     assert registrations == [(guid, False, "tee_save_enabled")]
@@ -1423,7 +1423,7 @@ progress=end
     ("00:00:12.000000", False),
 ], ids=["trailing-error", "midstream-error"])
 async def test_lx_stream_tee_decode_error_preserves_only_complete_audio(
-    env, monkeypatch, tmp_path, decoded_time, keep_flac,
+    env, monkeypatch, tmp_path, decoded_time, keep_flac, asgi_audio,
 ):
     import subprocess
 
@@ -1471,7 +1471,7 @@ progress=end
         first_chunk=first_chunk, chunks=response.aiter_bytes(chunk_size=1024),
         post_finalize=post_finalize,
     )
-    body = b"".join([part async for part in streamed.body_iterator])
+    body = await asgi_audio(streamed)
 
     assert body == data
     assert response.is_closed

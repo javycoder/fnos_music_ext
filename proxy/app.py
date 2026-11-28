@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import glob
 import hashlib
 import math
@@ -19,6 +20,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,7 +31,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, closing
 from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, AsyncGenerator, Callable, Coroutine
+from typing import Any, AsyncGenerator, Callable, Coroutine, NamedTuple
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
@@ -7259,12 +7261,12 @@ class _StagedSaveError(OSError):
     """上传失败；调用方仍拥有完整的原始下载，可保留缓存后重试。"""
 
 
-def _upload_staged_file(src_path: str, dest: str) -> bool:
+def _upload_staged_file(src_path: str, dest: str, *, create_mode: int | None = None) -> bool:
     """把本地已加工完的文件整体写入目标目录；网络挂载时即一次完整上传。
 
     网络文件系统没有「以终名原子写入」能力，写入中断可能在目标目录留下同名
     截断文件，因此写完必须核对大小，不符立即删残件。目标已存在且大小一致时
-    按既有语义复用，绝不覆盖用户文件。
+    按既有语义复用，绝不覆盖用户文件。直写回退传入 create_mode 时由调用方处理重名。
     """
     try:
         size = os.path.getsize(src_path)
@@ -7272,7 +7274,7 @@ def _upload_staged_file(src_path: str, dest: str) -> bool:
         logger.warning("staged: source missing %s: %s", src_path, e)
         return False
 
-    if os.path.exists(dest):
+    if create_mode is None and os.path.exists(dest):
         try:
             if os.path.getsize(dest) == size:
                 return True
@@ -7292,12 +7294,16 @@ def _upload_staged_file(src_path: str, dest: str) -> bool:
         with open(src_path, "rb") as source, open(dest, "xb") as target:
             created = True
             shutil.copyfileobj(source, target)
+            if create_mode is not None:
+                os.fchmod(target.fileno(), create_mode)
         if os.path.getsize(dest) != size:
             logger.warning("staged: size mismatch after upload: %s", dest)
             return False
         complete = True
         return True
     except OSError as e:
+        if create_mode is not None and isinstance(e, FileExistsError) and not created:
+            raise
         logger.warning("staged: upload failed for %s: %s", dest, e)
         return False
     finally:
@@ -7345,6 +7351,18 @@ def _staged_write_lyric(dest_audio: str, text: str) -> bool:
     return False
 
 
+def _prepare_library_audio(path: str, guid: str, title: str, artist: str, album: str, src: dict) -> None:
+    write_audio_tags(path, title, artist, album)
+    cover_url = _cover_url_of(src)
+    if cover_url and CONF.get("auto_cover", True):
+        try:
+            fetched = download_cover_bytes(cover_url)
+            if fetched and embed_audio_cover(path, fetched[0], fetched[1]):
+                logger.info("cover embedded for %s: %s", guid, path)
+        except Exception as exc:
+            logger.debug("cover embed step skipped for %s: %s", guid, type(exc).__name__)
+
+
 def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
                                   artist: str, album: str, src: dict, dest: str,
                                   *, user_guid: str = ""):
@@ -7360,15 +7378,7 @@ def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
     os.close(fd)
     try:
         shutil.copyfile(part, staged)
-        write_audio_tags(staged, title, artist, album)
-        cover_url = _cover_url_of(src)
-        if cover_url and CONF.get("auto_cover", True):
-            try:
-                fetched = download_cover_bytes(cover_url)
-                if fetched and embed_audio_cover(staged, fetched[0], fetched[1]):
-                    logger.info("cover embedded for %s: %s", guid, staged)
-            except Exception as e:
-                logger.debug("cover embed step skipped for %s: %s", guid, e)
+        _prepare_library_audio(staged, guid, title, artist, album, src)
         if not _upload_staged_file(staged, dest):
             raise _StagedSaveError(f"staged upload failed: {dest}")
     finally:
@@ -7384,13 +7394,43 @@ def _install_library_audio_staged(part: str, guid: str, ext: str, title: str,
     return dest, False
 
 
+def _publish_library_audio_direct(part: str, dest: str, guid: str, title: str, artist: str,
+                                  album: str, src: dict) -> bool:
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, work = tempfile.mkstemp(prefix=".fnmusic-audio-", suffix=".part", dir=parent)
+    try:
+        os.close(fd)
+        shutil.copyfile(part, work)
+        _prepare_library_audio(work, guid, title, artist, album, src)
+        mode = stat.S_IMODE(os.stat(part).st_mode)
+        os.chmod(work, mode)
+        try:
+            try:
+                # link 在目标同目录一次发布正式名，且不会覆盖竞争者刚创建的文件。
+                os.link(work, dest)
+            except OSError as exc:
+                if exc.errno not in (errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS):
+                    raise
+                if not _upload_staged_file(work, dest, create_mode=mode):
+                    raise OSError(f"library audio publication failed: {dest}") from exc
+        except FileExistsError:
+            existing = os.stat(dest, follow_symlinks=False)
+            if not stat.S_ISREG(existing.st_mode) or existing.st_size <= 0:
+                raise
+            return True
+        return False
+    finally:
+        _remove_quiet(work)
+
+
 def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: str,
                            album: str, src: dict, *, user_guid: str = "") -> "tuple[str, bool]":
     """把已校验完整的音频转正进曲库：定名/落位/权限/标签/封面/影子歌词随迁。
 
     目标文件已存在（同 guid 重复落盘或同曲跨 guid，issue #52）一律复用已有文件：
     丢弃本次字节绝不覆盖（用户自有文件与已有标签都不动），只刷新 guid 引用让
-    后续播放命中本地。跨文件系统（缓存目录与曲库不同挂载点）退化为复制+删除。
+    后续播放命中本地。直写模式也先加工副本，再排他发布正式文件。
     staged/direct 按实际落点目录判定（use_staged_save 只看配置目录，旧引用把
     落点带离配置目录时会错配）。返回 (dest, reused)。
     """
@@ -7401,39 +7441,15 @@ def _install_library_audio(part: str, guid: str, ext: str, title: str, artist: s
         dest = library_media_path(guid, title, ext, artist=artist, album=album,
                                   directory=root, user_guid=user_guid)
         reused = os.path.exists(dest)
+        if not reused:
+            if user_guid or _staged_decision(os.path.dirname(dest) or "."):
+                return _install_library_audio_staged(
+                    part, guid, ext, title, artist, album, src, dest, user_guid=user_guid
+                )
+            reused = _publish_library_audio_direct(part, dest, guid, title, artist, album, src)
+        _remove_quiet(part)
         if reused:
-            # 复用判定先行（双模式共用）：不做标签改写、不下载封面——
-            # 用户自有文件的字节绝不动（issue #52）。
-            _remove_quiet(part)
             logger.info("library file already exists for %s, reuse %s", guid, dest)
-            remember_media_path(guid, dest, user_guid=user_guid)
-            # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
-            if CONF.get("lyric_auto_dl"):
-                promote_shadow_lyric(guid, dest)
-            return dest, reused
-        if user_guid or _staged_decision(os.path.dirname(dest) or "."):
-            return _install_library_audio_staged(
-                part, guid, ext, title, artist, album, src, dest, user_guid=user_guid
-            )
-        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-        try:
-            os.replace(part, dest)
-        except OSError:
-            tmp = f"{dest}.{uuid4().hex[:8]}.part"
-            shutil.copyfile(part, tmp)
-            os.replace(tmp, dest)
-            _remove_quiet(part)
-        write_audio_tags(dest, title, artist, album)
-        # 自动下载封面：音乐文件已完整落库才走到这里（下载失败根本进不了
-        # finalize），封面字节直接内嵌进音频——不产生独立封面文件，无孤儿
-        cover_url = _cover_url_of(src)
-        if cover_url and CONF.get("auto_cover", True):
-            try:
-                fetched = download_cover_bytes(cover_url)
-                if fetched and embed_audio_cover(dest, fetched[0], fetched[1]):
-                    logger.info("cover embedded for %s: %s", guid, dest)
-            except Exception as e:
-                logger.debug("cover embed step skipped for %s: %s", guid, e)
         remember_media_path(guid, dest, user_guid=user_guid)
         # 自动下载歌词开启时，无音频时代落在 cache 的影子歌词跟随音频进曲库，词曲贴身
         if CONF.get("lyric_auto_dl"):
@@ -8062,8 +8078,29 @@ def stream_tee_response(
         headers["content-type"] = media_type_for_ext(resolved_ext)
     full_resource, expected = _stream_cache_eligibility(resp)
     ext = resolved_ext or ext_from_content_type(resp.headers.get("content-type", ""))
+    pending_save: Callable[[], Coroutine[Any, Any, None]] | None = None
+    upstream_closed = False
+
+    async def close_upstream() -> None:
+        nonlocal upstream_closed
+        if upstream_closed:
+            return
+        upstream_closed = True
+        try:
+            await resp.aclose()
+        finally:
+            if client_to_close:
+                await client_to_close.aclose()
+
+    async def cancel_tee_tasks(*tasks: asyncio.Task | None) -> None:
+        pending = [task for task in tasks if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def body() -> AsyncGenerator[bytes, None]:
+        nonlocal pending_save
         started = time.monotonic()
         first_ms = None
         delivery_outcome = "complete"
@@ -8078,8 +8115,60 @@ def stream_tee_response(
         tee_active_token = False
         trigger_headers = scan_headers_factory() if scan_headers_factory is not None else {}
         save_scope = _storage_scope(trigger_headers) if CONF.get("tee_save_by_user") else ""
-        retry_corrupt_tee = False
         upstream_aborted = False
+
+        async def finish_save(path: str) -> None:
+            retry_corrupt = False
+            try:
+                info = pre_info
+                save_user = ""
+                if user_task is not None:
+                    try:
+                        save_user = await asyncio.wait_for(user_task, timeout=4.0) or ""
+                    except Exception:
+                        save_user = ""
+                if info is None and info_task is not None:
+                    try:
+                        info = await asyncio.wait_for(info_task, timeout=8.0)
+                    except Exception:
+                        info = None
+                retained = None
+                if retained_factory and (info is None or not _tag_fields(info)[0]):
+                    try:
+                        retained = retained_factory()
+                    except Exception:
+                        pass
+                tee_effective = tee_enabled or bool(_bind_pending.get(guid))
+                if CONF.get("tee_save_by_user"):
+                    meta = await asyncio.to_thread(
+                        _tee_finalize, path, guid, ext, info, tee_effective, retained,
+                        task_scope=save_scope, user_guid=save_user)
+                else:
+                    meta = await asyncio.to_thread(
+                        _tee_finalize, path, guid, ext, info, tee_effective, retained)
+                if not meta:
+                    retry_corrupt = tee_effective and _lossless_is_blacklisted(guid)
+                else:
+                    if post_finalize is not None:
+                        await post_finalize(meta)
+                    if not meta.get("deferred"):
+                        if trigger_headers:
+                            _schedule_library_scan(
+                                trigger_headers, user_guid=str(meta.get("user_guid") or ""))
+                        if tee_effective:
+                            _dispatch_official_binding(guid, trigger_headers or None, meta)
+            except Exception as exc:
+                logger.warning("tee finalize execution failed for %s: %s", guid, type(exc).__name__)
+                _remove_quiet(path)
+            finally:
+                if tee_active_token:
+                    _tee_active_release(guid, save_scope)
+                await cancel_tee_tasks(info_task, user_task)
+            if retry_corrupt:
+                if CONF.get("tee_save_by_user"):
+                    _ensure_user_saved(guid, trigger_headers, gate_key="tee_save_enabled")
+                else:
+                    _register_background_fetch(_synth_request(trigger_headers), guid, "tee_save_enabled")
 
         def _close_tee_file() -> None:
             nonlocal fp, part
@@ -8171,68 +8260,11 @@ def stream_tee_response(
                 raise
             eof = True
             _close_tee_file()
-            if part and eof and written >= 1024 and (expected is None or written == expected):
-                # 无论客户端连接此时是否已关闭（curl 接收完直接 EOF 退出，Starlette 会 aclose 生成器），
-                # 完整的音频已全部接收完毕，落盘与标签写入必须受 shield 保护完整执行完毕，
-                # 且立即解绑 part，绝不能被 GeneratorExit / CancelledError 提前打断导致 part 在 finally 中被误删。
+            if part and written >= 1024 and (expected is None or written == expected):
+                # 响应体只交接完整下载；发送结束消息后才等待元数据和入库。
                 to_finalize = part
+                pending_save = lambda: finish_save(to_finalize)
                 part = None
-                with anyio.CancelScope(shield=True):
-                    info = pre_info
-                    save_user = ""
-                    if user_task is not None:
-                        try:
-                            save_user = await asyncio.wait_for(user_task, timeout=4.0) or ""
-                        except Exception:
-                            save_user = ""
-                        user_task = None
-                    if info is None and info_task:
-                        try:
-                            info = await asyncio.wait_for(info_task, timeout=8.0)
-                        except Exception:
-                            info = None
-                    if info is None or not _tag_fields(info)[0]:
-                        # issue #52：源站 info 缺失/残缺时，内存搜索会话是零 IO 兜底
-                        # （播放时会话必在），作为元数据回查链最前面的一环传入
-                        try:
-                            retained = retained_factory() if retained_factory else None
-                        except Exception:
-                            retained = None
-                    else:
-                        retained = None
-                    try:
-                        # 播放期间已收藏/加歌单的 guid 按入库语义 finalize（issue #82）：
-                        # 边听边存关闭时也直接进曲库，否则收藏意图无人调度只能空等超时
-                        tee_effective = tee_enabled or bool(_bind_pending.get(guid))
-                        if CONF.get("tee_save_by_user"):
-                            meta = await asyncio.to_thread(
-                                _tee_finalize, to_finalize, guid, ext, info, tee_effective, retained,
-                                task_scope=save_scope, user_guid=save_user)
-                        else:
-                            meta = await asyncio.to_thread(
-                                _tee_finalize, to_finalize, guid, ext, info, tee_effective, retained)
-                        if not meta:
-                            retry_corrupt_tee = tee_effective and _lossless_is_blacklisted(guid)
-                        else:
-                            # 自动下载歌词：补拉必须在通知官方扫描之前完成（入库即带歌词）
-                            if post_finalize is not None:
-                                await post_finalize(meta)
-                            scan_headers = scan_headers_factory() if scan_headers_factory is not None else None
-                            if scan_headers and not meta.get("deferred"):
-                                # 元数据缺失暂存 cache 的曲目不触发曲库扫描/官方绑定，
-                                # 待转正后由 _promote_deferred_cache 统一调度
-                                _schedule_library_scan(
-                                    scan_headers, user_guid=str(meta.get("user_guid") or ""))
-                            if tee_effective and not meta.get("deferred"):
-                                # 官方绑定意图（收藏/歌单）统一在下载落库完成后调度
-                                _dispatch_official_binding(guid, scan_headers, meta)
-                    except Exception as exc:
-                        logger.warning("tee finalize execution failed for %s: %s", guid, type(exc).__name__)
-                        if os.path.exists(to_finalize):
-                            try:
-                                os.remove(to_finalize)
-                            except OSError:
-                                pass
         finally:
             _close_tee_file()
             resume_part = None
@@ -8251,17 +8283,11 @@ def stream_tee_response(
                         pass
                     part = None
             with anyio.CancelScope(shield=True):
-                if tee_active_token:
-                    _tee_active_release(guid, save_scope)
-                if info_task and not info_task.done():
-                    info_task.cancel()
-                    await asyncio.gather(info_task, return_exceptions=True)
-                if user_task is not None and not user_task.done():
-                    user_task.cancel()
-                    await asyncio.gather(user_task, return_exceptions=True)
-                await resp.aclose()
-                if client_to_close:
-                    await client_to_close.aclose()
+                if pending_save is None:
+                    if tee_active_token:
+                        _tee_active_release(guid, save_scope)
+                    await cancel_tee_tasks(info_task, user_task)
+                await close_upstream()
                 if resume_part:
                     if CONF.get("tee_save_by_user"):
                         _register_tee_handoff(guid, resume_part, written, expected, ext,
@@ -8269,13 +8295,6 @@ def stream_tee_response(
                     else:
                         _register_tee_handoff(
                             guid, resume_part, written, expected, ext, scan_headers_factory)
-                if retry_corrupt_tee:
-                    if CONF.get("tee_save_by_user"):
-                        _ensure_user_saved(guid, trigger_headers, gate_key="tee_save_enabled")
-                    else:
-                        _register_background_fetch(
-                            _synth_request(scan_headers_factory() if scan_headers_factory else {}),
-                            guid, "tee_save_enabled")
             if not eof and delivery_outcome == "complete":
                 delivery_outcome = "client_closed"
             _log_stream_delivery(
@@ -8283,7 +8302,24 @@ def stream_tee_response(
                 first_ms, int((time.monotonic() - started) * 1000),
             )
 
-    return StreamingResponse(body(), status_code=resp.status_code, headers=headers)
+    body_iterator = body()
+
+    class TeeResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            nonlocal pending_save
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await body_iterator.aclose()
+                        await close_upstream()
+                    finally:
+                        save, pending_save = pending_save, None
+                        if save is not None:
+                            await save()
+
+    return TeeResponse(body_iterator, status_code=resp.status_code, headers=headers)
 
 
 def _credential_scope(request: Request) -> str:
@@ -10306,7 +10342,86 @@ async def _maybe_retry_official_binds(request: Request, user_guid: str,
             _dispatch_official_binding(guid, headers, None)
 
 
-async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
+class _OnlinePlayback(NamedTuple):
+    total: int | None
+    etag: str | None
+
+
+_ONLINE_PLAYBACK_TTL_S = 300.0
+_ONLINE_PLAYBACK_MAX = 512
+_ONLINE_PLAYBACK: OrderedDict[str, tuple[float, _OnlinePlayback]] = OrderedDict()
+
+
+def _online_playback_key(request: Request, guid: str) -> str:
+    return _representation_key(
+        _credential_scope(request), request.client.host if request.client else "",
+        request.headers.get("user-agent", ""), guid, request.query_params.get("_ext_hls_stub") == "1",
+    )
+
+
+def _active_online_playback(key: str) -> _OnlinePlayback | None:
+    entry = _ONLINE_PLAYBACK.pop(key, None)
+    now = time.monotonic()
+    if entry is None or entry[0] <= now:
+        return None
+    _ONLINE_PLAYBACK[key] = (now + _ONLINE_PLAYBACK_TTL_S, entry[1])
+    return entry[1]
+
+
+def _online_content_range(response: httpx.Response) -> tuple[int, int, int | None] | None:
+    match = re.fullmatch(r"bytes\s+([0-9]{1,19})-([0-9]{1,19})/([0-9]{1,19}|\*)",
+                         response.headers.get("content-range", "").strip(), re.I)
+    if response.status_code != 206 or match is None:
+        return None
+    start, end = int(match[1]), int(match[2])
+    total = int(match[3]) if match[3] != "*" else None
+    if start > end or (total is not None and end >= total):
+        return None
+    length = response.headers.get("content-length")
+    if length is not None and length != str(end - start + 1):
+        return None
+    return start, end, total
+
+
+def _online_playback_identity(response: httpx.Response) -> _OnlinePlayback:
+    length = response.headers.get("content-length", "")
+    content_range = _online_content_range(response)
+    total = content_range[2] if content_range else None
+    if response.status_code == 200 and re.fullmatch(r"[0-9]{1,19}", length):
+        total = int(length)
+    etag = response.headers.get("etag", "").strip()
+    return _OnlinePlayback(total, _representation_key(etag) if re.fullmatch(r'"[^"]*"', etag) else None)
+
+
+def _remember_online_playback(key: str, response: httpx.Response) -> None:
+    _ONLINE_PLAYBACK.pop(key, None)
+    _ONLINE_PLAYBACK[key] = (time.monotonic() + _ONLINE_PLAYBACK_TTL_S, _online_playback_identity(response))
+    while len(_ONLINE_PLAYBACK) > _ONLINE_PLAYBACK_MAX:
+        _ONLINE_PLAYBACK.popitem(last=False)
+
+
+def _matches_online_playback(response: httpx.Response, range_header: str | None,
+                             playback: _OnlinePlayback) -> bool:
+    current = _online_playback_identity(response)
+    if playback.total is not None and playback.total != current.total:
+        return False
+    if playback.etag is not None and playback.etag != current.etag:
+        return False
+    if range_header is None:
+        return _stream_cache_eligibility(response)[0]
+    requested = re.fullmatch(r"bytes\s*=\s*([0-9]{0,19})-([0-9]{0,19})", range_header.strip(), re.I)
+    delivered = _online_content_range(response)
+    if requested is None or delivered is None:
+        return False
+    start, end, total = delivered
+    if total is not None:
+        return (start, end) == parse_http_range(f"bytes={requested[1]}-{requested[2]}", total)
+    return bool(requested[1] and start == int(requested[1])
+                and (not requested[2] or end <= int(requested[2])))
+
+
+async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None,
+                                online_playback: _OnlinePlayback | None = None) -> Response:
     """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源轻量试开一次即关。"""
     if cached:
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
@@ -10327,9 +10442,13 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         if val:
             headers[key] = val
     with anyio.CancelScope(shield=True):
-        await resp.aclose()
-        if owned:
-            await owned.aclose()
+        try:
+            await resp.aclose()
+        finally:
+            if owned:
+                await owned.aclose()
+    if online_playback is not None and not _matches_online_playback(resp, range_header, online_playback):
+        return _direct_error(409, "range_identity_unavailable")
     if ext:
         headers["content-type"] = media_type_for_ext(ext)
     length = headers.get("content-length", "")
@@ -10559,16 +10678,22 @@ async def stream_track(request: Request, subpath: str = ""):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
-    if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
+    playback_key = _online_playback_key(request, guid)
+    online_playback = (
+        _active_online_playback(playback_key) if range_header is not None or request.method == "HEAD" else None
+    )
+    if (online_playback is None and _nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
             and _DIRECT_TARGET_BINDINGS.known(_direct_scope(request), guid)):
         return await _direct_redirect_response(request, guid)
     source = source_from_online_guid(guid)
     provider = source if source in ("netease", "lx") else "musicdl"
-    if (_nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
+    if (online_playback is None and _nonzero_range(range_header) and request.query_params.get("_ext_hls_stub") != "1"
             and CONF.get(_DIRECT_PLAY_CONF_KEYS[provider])
             and not _DIRECT_FILE_BINDINGS.matches(_direct_scope(request), guid)):
         return _direct_error(409, "range_identity_unavailable")
     if request.method == "HEAD":
+        if online_playback is not None:
+            return await _stream_head_response(request, guid, None, range_header, online_playback)
         local_head = await resolve_local_play(request, guid)
         if local_head is not None:
             guarded = _direct_file_response_guard(request, guid, local_head["path"])
@@ -10591,18 +10716,22 @@ async def stream_track(request: Request, subpath: str = ""):
             return direct
         return await _stream_head_response(request, guid, cached, range_header)
     # 本地曲库命中优先于普通试听缓存（规格）：命中且可播则完全不触在线链路
-    local = await resolve_local_play(request, guid)
+    # Active online requests must keep their byte layout after a library file appears.
+    local = await resolve_local_play(request, guid) if online_playback is None else None
     if local is not None:
         guarded = _direct_file_response_guard(request, guid, local["path"])
         if guarded is not None:
             return guarded
         local_resp = await _serve_local_stream(guid, local, range_header)
         if local_resp is not None:
+            _ONLINE_PLAYBACK.pop(playback_key, None)
             fn_diag(logger, "direct_bypassed", guid=guid, reason="local_hit")
             return local_resp
     # 本地起播失败或因故障跳过：客户端续拉偏移可能指向本地布局，不能套到在线文件上
-    range_header = _sanitize_stale_local_range(guid, range_header)
-    cached = find_cache_file(guid, playback=True)
+    cached = None
+    if online_playback is None:
+        range_header = _sanitize_stale_local_range(guid, range_header)
+        cached = find_cache_file(guid, playback=True)
     log_stream_probe(request.method, guid, range_header, bool(cached))
     if cached:
         guarded = _direct_file_response_guard(request, guid, cached)
@@ -10619,15 +10748,20 @@ async def stream_track(request: Request, subpath: str = ""):
             asyncio.create_task(_promote_deferred_cache(promote_headers, guid, cached, promote_retained))
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         localmatch.clear_served(guid)
+        _ONLINE_PLAYBACK.pop(playback_key, None)
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext),
                                      delivery_kind="cached", delivery_guid=guid)
-    direct = await _direct_redirect_response(request, guid)
-    if direct is not None:
-        return direct
+    if online_playback is None:
+        direct = await _direct_redirect_response(request, guid)
+        if direct is not None:
+            if direct.status_code == 302:
+                _ONLINE_PLAYBACK.pop(playback_key, None)
+            return direct
     item, entry = _retained_track(request, guid)
     candidates = [guid]
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
-    if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
+    if (online_playback is None and should_cache(range_header) and item
+            and request.query_params.get("_ext_rendition") != "1"):
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
     deadline = asyncio.get_running_loop().time() + (
         _lx_stream_startup_timeout_s() if source_from_online_guid(guid) == "lx" else _STREAM_STARTUP_S)
@@ -10698,6 +10832,17 @@ async def stream_track(request: Request, subpath: str = ""):
                     target = request.url.include_query_params(guid=candidate, _ext_rendition="1")
                     location = target.path + (f"?{target.query}" if target.query else "")
                     return RedirectResponse(location, status_code=307, headers={"Cache-Control": "no-store"})
+                if online_playback is not None:
+                    if not _matches_online_playback(resp, range_header, online_playback):
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                await resp.aclose()
+                            finally:
+                                if owned:
+                                    await owned.aclose()
+                        return _direct_error(409, "range_identity_unavailable")
+                elif not re.fullmatch(r"bytes\s*=\s*0-[01]", (range_header or "").strip(), re.I):
+                    _remember_online_playback(playback_key, resp)
                 # Cache the selected source's bytes under its own GUID, never
                 # splice a failed stream or alias different encodings for seeks.
                 if not should_cache(range_header) and not _stream_cache_eligibility(resp)[0]:

@@ -61,20 +61,23 @@ class Audio(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def listen(guid, title="晴天", artist="周杰伦", ext="flac", range_header=None,
-                 info=None, post_finalize=None, response=None, retained_factory=None):
-    """完整试听一首歌并消费完整个响应体，触发 stream_tee_response 落盘转正。"""
-    if info is None:
-        info = {"title": title, "artist": artist, "album": "叶惠美", "lyric": "[00:00.00]测试歌词"}
-    if response is None:
-        response = httpx.Response(200, stream=Audio())
-    tee_response = p.stream_tee_response(
-        response, guid, range_header,
-        pre_info=info, resolved_ext=ext, post_finalize=post_finalize,
-        retained_factory=retained_factory,
-    )
-    body = b"".join([chunk async for chunk in tee_response.body_iterator])
-    assert body == getattr(response.stream, "payload", b"A" * 4096)
+@pytest.fixture
+def listen(asgi_audio):
+    async def play(guid, title="晴天", artist="周杰伦", ext="flac", range_header=None,
+                   info=None, post_finalize=None, response=None, retained_factory=None):
+        """完整试听并等待 ASGI 响应结束后的入库。"""
+        if info is None:
+            info = {"title": title, "artist": artist, "album": "叶惠美", "lyric": "[00:00.00]测试歌词"}
+        if response is None:
+            response = httpx.Response(200, stream=Audio())
+        tee_response = p.stream_tee_response(
+            response, guid, range_header,
+            pre_info=info, resolved_ext=ext, post_finalize=post_finalize,
+            retained_factory=retained_factory,
+        )
+        assert await asgi_audio(tee_response) == getattr(response.stream, "payload", b"A" * 4096)
+
+    return play
 
 
 def audio_files(directory):
@@ -87,7 +90,7 @@ def audio_files(directory):
 
 
 @pytest.mark.anyio
-async def test_tee_off_only_caches_into_cache_dir(monkeypatch):
+async def test_tee_off_only_caches_into_cache_dir(monkeypatch, listen):
     """开关关：文件以 online_源_id 命名落 cache 目录，不进曲库，回放可命中；
     滚动缓存不属于"自动下载音乐"，无论歌词开关如何都不写歌词。"""
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
@@ -103,7 +106,7 @@ async def test_tee_off_only_caches_into_cache_dir(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_tee_off_keeps_latest_n_rolling(monkeypatch):
+async def test_tee_off_keeps_latest_n_rolling(monkeypatch, listen):
     """开关关：滚动保留最新 tee_cache_max 首，最旧的音频/ref 一并淘汰。"""
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
     for i, guid in enumerate(["online:kuwo:1", "online:kuwo:2", "online:kuwo:3"]):
@@ -120,7 +123,7 @@ async def test_tee_off_keeps_latest_n_rolling(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_tee_on_ignores_cache_max(monkeypatch):
+async def test_tee_on_ignores_cache_max(monkeypatch, listen):
     """开关开：tee_cache_max 不生效，全部永久保存且不滚动清理。"""
     monkeypatch.setitem(p.CONF, "tee_cache_max", 2)
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
@@ -139,7 +142,7 @@ async def test_tee_on_ignores_cache_max(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_tee_save_dir_custom_path_used(monkeypatch, tmp_path):
+async def test_tee_save_dir_custom_path_used(monkeypatch, tmp_path, listen):
     """配置可用保存路径：文件落配置目录并写标签/歌词，ref 指向该文件。"""
     custom = str(tmp_path / "my-music")
     monkeypatch.setitem(p.CONF, "tee_save_dir", custom)
@@ -153,7 +156,7 @@ async def test_tee_save_dir_custom_path_used(monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_tee_save_dir_unusable_falls_back(monkeypatch, tmp_path, caplog):
+async def test_tee_save_dir_unusable_falls_back(monkeypatch, tmp_path, caplog, listen):
     """配置路径不可用（被同名文件占位）：回退默认曲库目录并告警。"""
     blocked = str(tmp_path / "blocked")
     with open(blocked, "w") as f:
@@ -167,7 +170,7 @@ async def test_tee_save_dir_unusable_falls_back(monkeypatch, tmp_path, caplog):
 
 
 @pytest.mark.anyio
-async def test_rolling_ref_does_not_trap_library_promotion(monkeypatch):
+async def test_rolling_ref_does_not_trap_library_promotion(monkeypatch, listen):
     """开关关→开的切换：滚动缓存留下的 ref 不得把后续保存困在 cache 目录。"""
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
     await listen("online:kuwo:1")
@@ -184,7 +187,7 @@ async def test_rolling_ref_does_not_trap_library_promotion(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_lyric_auto_dl_off_no_lrc(monkeypatch):
+async def test_lyric_auto_dl_off_no_lrc(monkeypatch, listen):
     """开关关（默认）：即使源返回了歌词也不落 .lrc，下载即完成、无歌词文件。"""
     assert p.CONF["lyric_auto_dl"] is False
     await listen("online:netease:186016")
@@ -194,7 +197,7 @@ async def test_lyric_auto_dl_off_no_lrc(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_lyric_auto_dl_on_writes_sidecar(monkeypatch):
+async def test_lyric_auto_dl_on_writes_sidecar(monkeypatch, listen):
     """开关开：音乐完整落库成功后，info 里的歌词写到音频旁同名 .lrc。"""
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
     await listen("online:netease:186016")
@@ -238,7 +241,7 @@ async def test_lyric_auto_dl_on_download_failure_no_pollution(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_auto_lyric_after_finalize_fetches_when_missing(monkeypatch):
+async def test_auto_lyric_after_finalize_fetches_when_missing(monkeypatch, listen):
     """开关开 + info 未带歌词：finalize 后补拉源站歌词并落音频旁。"""
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
     calls = []
@@ -477,7 +480,7 @@ async def test_full_fetch_skips_when_cached_or_tee_off(monkeypatch):
     (206, "bytes 0-1023/4096", "1024", False, True),
 ])
 async def test_stream_track_bounded_range_caching_and_full_fetch_coordination(
-    status_code, content_range, content_length, expect_cached, expect_bg_task, monkeypatch
+    status_code, content_range, content_length, expect_cached, expect_bg_task, monkeypatch, asgi_audio
 ):
     """带定长 Range 访问 stream_track：若单次响应已为整轨，直接入库且不重复触发后台下载；切片则交由后台兜底。"""
     guid = f"online:kuwo:coord_{status_code}_{expect_cached}"
@@ -507,7 +510,7 @@ async def test_stream_track_bounded_range_caching_and_full_fetch_coordination(
     })
     resp = await p.stream_track(req)
     assert resp.status_code == status_code
-    body = b"".join([chunk async for chunk in resp.body_iterator])
+    body = await asgi_audio(resp)
     assert len(body) == (4096 if expect_cached else 1024)
     assert bool(p.find_cache_file(guid)) == expect_cached
     if expect_bg_task:
@@ -579,7 +582,7 @@ async def test_first_library_scan_does_not_wait_for_cooldown_after_boot(monkeypa
 
 
 @pytest.mark.anyio
-async def test_tee_metadata_fallback_from_retained_session(monkeypatch):
+async def test_tee_metadata_fallback_from_retained_session(monkeypatch, listen):
     """源站 info 缺失/残缺时，内存搜索会话（retained_factory）兜底命名落库，
     不再以 unknown 进曲库；标签照常写入。"""
     tag_calls = []
@@ -596,7 +599,7 @@ async def test_tee_metadata_fallback_from_retained_session(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_tee_all_metadata_missing_stays_out_of_library(monkeypatch, caplog):
+async def test_tee_all_metadata_missing_stays_out_of_library(monkeypatch, caplog, listen):
     """元数据全缺（无 info、无会话、无快照）：绝不以 unknown 进曲库，
     暂存 cache 可秒开重播（.ref 指向暂存文件），并留档告警。"""
     with caplog.at_level(logging.WARNING, logger="fnmusic_proxy"):
@@ -612,7 +615,7 @@ async def test_tee_all_metadata_missing_stays_out_of_library(monkeypatch, caplog
 
 
 @pytest.mark.anyio
-async def test_cross_guid_same_song_reuses_existing_file(monkeypatch):
+async def test_cross_guid_same_song_reuses_existing_file(monkeypatch, listen):
     """issue #52 重复曲目：同曲跨 guid（聚合多源条目）二次落盘复用已有文件，
     不产生「歌手 - 歌名 (2)」或跨格式重复，两个 guid 都命中本地同一文件。"""
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
@@ -631,7 +634,7 @@ async def test_cross_guid_same_song_reuses_existing_file(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_finalize_reused_skips_tag_rewrite(monkeypatch):
+async def test_finalize_reused_skips_tag_rewrite(monkeypatch, listen):
     """复用已有曲库文件（含用户自有同名文件）时不改写标签/封面，字节不动。"""
     library_dir = p.CONF["library_dir"]
     dest = os.path.join(library_dir, "周杰伦 - 晴天.flac")
@@ -649,7 +652,7 @@ async def test_finalize_reused_skips_tag_rewrite(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_deferred_cache_promoted_on_replay(monkeypatch):
+async def test_deferred_cache_promoted_on_replay(monkeypatch, listen):
     """暂存的元数据缺失曲目：重播时元数据可补齐（内存会话/快照）即转正进曲库，
     cache 暂存文件移走、.ref 改指曲库、歌词随迁、不再识别为暂存形态。"""
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", True)
@@ -680,7 +683,7 @@ async def test_deferred_cache_promoted_on_replay(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_deferred_cache_promotion_skipped_while_metadata_missing(monkeypatch):
+async def test_deferred_cache_promotion_skipped_while_metadata_missing(monkeypatch, listen):
     """重播时元数据仍缺：保持暂存原样（文件留在 cache、不进曲库）。"""
     guid = "online:netease:186016"
     await listen(guid, info={})
@@ -692,7 +695,7 @@ async def test_deferred_cache_promotion_skipped_while_metadata_missing(monkeypat
 
 
 @pytest.mark.anyio
-async def test_deferred_promotion_yields_before_moving_file(monkeypatch):
+async def test_deferred_promotion_yields_before_moving_file(monkeypatch, listen):
     """转正任务先让渡再动文件（issue #52 出流竞态回归锁）。
 
     stream_track 缓存命中出流时，响应体生成器在本任务启动之后才 open(cached)。
@@ -889,7 +892,7 @@ def test_lyric_judgment_uses_lyric_target_dir_not_tee_dir(tmp_path, monkeypatch)
 
 
 @pytest.mark.anyio
-async def test_staged_stream_downloads_only_into_local_staging(monkeypatch):
+async def test_staged_stream_downloads_only_into_local_staging(monkeypatch, listen):
     monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
     guid = "online:kuwo:staged-stream"
 
@@ -942,7 +945,7 @@ def test_staged_upload_never_overwrites_racing_user_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_staged_failure_retains_cache_and_retries_without_false_success(monkeypatch):
+async def test_staged_failure_retains_cache_and_retries_without_false_success(monkeypatch, listen):
     monkeypatch.setitem(p.CONF, "tee_save_mode", "staged")
     guid = "online:kuwo:retry-staged"
     metadata = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}

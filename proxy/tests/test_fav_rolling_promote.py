@@ -65,13 +65,13 @@ class Audio(httpx.AsyncByteStream):
         yield self.payload
 
 
-async def listen(guid, title="晴天", artist="周杰伦", ext="flac"):
-    """完整试听一首歌并消费完整个响应体，触发 stream_tee_response 落盘。"""
+async def listen(asgi_audio, guid, title="晴天", artist="周杰伦", ext="flac"):
+    """完整试听并等待 ASGI 响应结束后的入库。"""
     info = {"title": title, "artist": artist, "album": "叶惠美"}
     response = httpx.Response(200, stream=Audio())
     tee_response = p.stream_tee_response(
         response, guid, None, pre_info=info, resolved_ext=ext)
-    body = b"".join([chunk async for chunk in tee_response.body_iterator])
+    body = await asgi_audio(tee_response)
     assert body == Audio.payload
 
 
@@ -110,12 +110,12 @@ def audio_files(directory):
 
 
 @pytest.mark.anyio
-async def test_favorite_during_playback_lands_in_library(monkeypatch):
+async def test_favorite_during_playback_lands_in_library(monkeypatch, asgi_audio):
     """播放中收藏（tee 关）：流完成按入库语义 finalize，文件进曲库而非滚动缓存。"""
     guid = "online:netease:186016"
     p._register_bind_intent(guid, "user-a", {"cookie": "sid=test"}, None)
     calls = _record_dispatch(monkeypatch)
-    await listen(guid)
+    await listen(asgi_audio, guid)
     assert audio_files(p.CONF["library_dir"]) == ["周杰伦 - 晴天.flac"]
     assert audio_files(p.CONF["cache_dir"]) == []
     assert len(calls) == 1
@@ -126,10 +126,10 @@ async def test_favorite_during_playback_lands_in_library(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_favorite_after_complete_promotes_rolling_cache(monkeypatch):
+async def test_favorite_after_complete_promotes_rolling_cache(monkeypatch, asgi_audio):
     """先播完落滚动缓存再收藏：缓存转存进曲库，cache 不留副本，绑定带 meta 调度。"""
     guid = "online:netease:186016"
-    await listen(guid)
+    await listen(asgi_audio, guid)
     cache_dir, library_dir = p.CONF["cache_dir"], p.CONF["library_dir"]
     cached = os.path.join(cache_dir, "online_netease_186016.flac")
     assert os.path.isfile(cached)
@@ -148,10 +148,10 @@ async def test_favorite_after_complete_promotes_rolling_cache(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_list_self_heal_promotes_rolling_cache(monkeypatch):
+async def test_list_self_heal_promotes_rolling_cache(monkeypatch, asgi_audio):
     """列表读取自愈：pending 收藏命中滚动缓存时先转存再绑定，不再空等官方收录。"""
     guid = "online:kuwo:228908"
-    await listen(guid, title="歌一")
+    await listen(asgi_audio, guid, title="歌一")
     _save_favorite_snapshot("user-a", guid, "歌一")
     calls = _record_dispatch(monkeypatch)
     await p._maybe_retry_official_binds(
@@ -178,10 +178,10 @@ async def test_promote_keeps_cache_when_metadata_missing(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_promote_dedup_concurrent_schedules(monkeypatch):
+async def test_promote_dedup_concurrent_schedules(monkeypatch, asgi_audio):
     """同 guid 在途去重：重复收藏/自愈并发触发只转存一次。"""
     guid = "online:netease:186016"
-    await listen(guid)
+    await listen(asgi_audio, guid)
     _save_favorite_snapshot("user-a", guid, "晴天")
     installs = []
     real_install = p._install_library_audio
