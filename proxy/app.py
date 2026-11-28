@@ -2786,7 +2786,7 @@ def iter_cleanup_media_dirs() -> list[str]:
     except ValueError:
         pass
     users_dir = os.path.join(global_root, "users")
-    if os.path.isdir(users_dir):
+    if not os.path.islink(users_dir) and os.path.isdir(users_dir):
         try:
             names = os.listdir(users_dir)
         except OSError:
@@ -2795,7 +2795,7 @@ def iter_cleanup_media_dirs() -> list[str]:
             # 旧版的完整摘要目录与新版「用户名.归属码」目录都是可确认的用户根
             if is_auto_user_dir_name(name):
                 path = os.path.join(users_dir, name)
-                if path not in dirs:
+                if not os.path.islink(path) and os.path.isdir(path) and path not in dirs:
                     dirs.append(path)
     return dirs
 
@@ -6098,12 +6098,11 @@ def _organize_target(user_guid: str = "") -> tuple[str, str]:
         root = os.path.realpath(effective_user_root(CONF, user_guid, global_root))
         users_container = os.path.join(global_root, "users")
         # 与 effective_user_root 用同一规则取「自己的自动目录」，两者才始终一致
-        own_auto = auto_user_root(user_guid, global_root)
         inside_auto_container = (
             root == users_container or _path_is_within(root, users_container)
             or _path_is_within(users_container, root))
         if root == global_root or _path_is_within(global_root, root) or (
-                inside_auto_container and root != os.path.realpath(own_auto)):
+                inside_auto_container and root != os.path.realpath(auto_user_root(user_guid, global_root))):
             raise ValueError("不能从公共目录整理全部用户")
     else:
         if user_guid:

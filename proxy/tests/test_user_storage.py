@@ -314,6 +314,34 @@ def test_auto_user_root_reuses_owned_dir_until_named_dir_exists(tmp_path):
     assert not is_auto_user_dir_name("张三") and not is_auto_user_dir_name("a.1234567")
 
 
+def test_expected_user_directory_cannot_redirect_saves_or_references(tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    users_dir = library / "users"
+    digest = user_storage_key("user-a")
+    legacy = users_dir / digest
+    legacy.mkdir(parents=True)
+    named = users_dir / f"张三.{digest[:8]}"
+    other = users_dir / user_storage_key("user-b")
+    other.mkdir()
+    named.symlink_to(other, target_is_directory=True)
+    userstorage.set_user_dir_names({"user-a": named.name})
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    ref = cache / f"u_{digest}__song.ref"
+    ref.write_text(str(legacy / "song"), encoding="utf-8")
+    monkeypatch.setitem(runtime.CONF, "tee_save_by_user", True)
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir", str(library))
+    monkeypatch.setitem(runtime.CONF, "tee_save_dir_by_user", "{}")
+
+    assert auto_user_root("user-a", str(library)) == str(legacy)
+    assert str(named) not in runtime.iter_cleanup_media_dirs()
+    assert userstorage.repair_user_refs(str(cache), str(library), [{"guid": "user-a"}]) == 0
+    assert ref.read_text(encoding="utf-8") == str(legacy / "song")
+    legacy.rmdir()
+    with pytest.raises(ValueError, match="符号链接"):
+        auto_user_root("user-a", str(library))
+
+
 def test_effective_user_root_prefers_custom_mapping_then_auto_root(tmp_path):
     """保存入口取目录：有自定义目录用自定义；否则走 auto_user_root（期望名目录或归属目录）。"""
     library = tmp_path / "library"

@@ -151,6 +151,8 @@ def is_auto_user_dir_name(name: str) -> bool:
 def owned_user_dirs(users_dir: str, user_guid: str, code: str) -> list[str]:
     """users 容器下归属该用户的现存目录；符号链接不算，避免把链接当成目录。"""
     digest = user_storage_key(user_guid)
+    if os.path.islink(users_dir):
+        return []
     try:
         names = os.listdir(users_dir)
     except OSError:
@@ -172,11 +174,19 @@ def auto_user_root(user_guid: str, global_root: str) -> str:
     或用户改名后），已保存的歌曲不会失联；都没有才返回期望名，交调用方创建。
     """
     users_dir = os.path.join(_absolute_path(global_root, "下载目录"), "users")
+    if os.path.islink(users_dir):
+        raise ValueError("自动用户目录的父目录不能是符号链接")
     expected = auto_user_dir_name(user_guid)
-    if os.path.isdir(os.path.join(users_dir, expected)):
-        return os.path.join(users_dir, expected)
+    target = os.path.join(users_dir, expected)
+    linked = os.path.islink(target)
+    if not linked and os.path.isdir(target):
+        return target
     existing = owned_user_dirs(users_dir, user_guid, expected.rpartition(".")[2])
-    return existing[0] if len(existing) == 1 else os.path.join(users_dir, expected)
+    if len(existing) == 1:
+        return existing[0]
+    if linked:
+        raise ValueError("自动用户目录不能是符号链接")
+    return target
 
 
 def _remove_quiet(path: str) -> None:
@@ -213,7 +223,8 @@ def _current_dir_name(owner: str, users: list[dict], users_dir: str) -> str:
         except ValueError:
             continue
         if belongs:
-            return named if os.path.isdir(os.path.join(users_dir, named)) else ""
+            target = os.path.join(users_dir, named)
+            return named if not os.path.islink(target) and os.path.isdir(target) else ""
     return ""
 
 
@@ -228,6 +239,8 @@ def repair_user_refs(cache_dir: str, global_root: str, users: list[dict]) -> int
         return 0
     try:
         users_dir = os.path.join(_absolute_path(global_root, "下载目录"), "users")
+        if os.path.islink(users_dir):
+            return 0
         names = os.listdir(cache_dir)
     except (OSError, ValueError):
         return 0
@@ -288,7 +301,7 @@ def migrate_user_dirs(global_root: str, cache_dir: str, users: list[dict], offic
         users_dir = os.path.join(_absolute_path(global_root, "下载目录"), "users")
     except ValueError:
         return result
-    if not os.path.isdir(users_dir):
+    if os.path.islink(users_dir) or not os.path.isdir(users_dir):
         return result
     for user in users or []:
         try:
