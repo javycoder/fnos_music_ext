@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -64,8 +65,9 @@ try:
     from . import music_compat
     from .organize import target_dir as layout_target_dir, safe_part as safe_layout_part
     from .userstorage import (
-        effective_user_root, merge_user_map, parse_user_map, user_ref_name,
-        user_storage_key, validate_effective_roots,
+        auto_user_root, effective_user_root, is_auto_user_dir_name, load_user_dir_names,
+        merge_user_map, migrate_user_dirs, parse_user_map, set_user_dir_names,
+        user_ref_name, validate_effective_roots,
     )
     from .organize import _ensure_target_dir as ensure_layout_dir
     from .media_url import hostname_for_log, validate_media_url
@@ -93,8 +95,9 @@ except ImportError:  # uvicorn --app-dir proxy
     import music_compat  # type: ignore
     from organize import target_dir as layout_target_dir, safe_part as safe_layout_part
     from userstorage import (  # type: ignore
-        effective_user_root, merge_user_map, parse_user_map, user_ref_name,
-        user_storage_key, validate_effective_roots,
+        auto_user_root, effective_user_root, is_auto_user_dir_name, load_user_dir_names,
+        merge_user_map, migrate_user_dirs, parse_user_map, set_user_dir_names,
+        user_ref_name, validate_effective_roots,
     )
     from organize import _ensure_target_dir as ensure_layout_dir
     from media_url import hostname_for_log, validate_media_url  # type: ignore
@@ -2789,7 +2792,8 @@ def iter_cleanup_media_dirs() -> list[str]:
         except OSError:
             names = []
         for name in names:
-            if len(name) == 64 and all(char in "0123456789abcdef" for char in name):
+            # 旧版的完整摘要目录与新版「用户名.归属码」目录都是可确认的用户根
+            if is_auto_user_dir_name(name):
                 path = os.path.join(users_dir, name)
                 if path not in dirs:
                     dirs.append(path)
@@ -5850,6 +5854,221 @@ def migrate_public_playlist_users(users: list[dict] | None = None) -> None:
         write_env_atomic(path, render_env(updated, trailing=comments))
 
 
+# 最近一次启动时的用户目录改名结果，供管理页展示；每次启动覆盖。
+_USER_DIR_MIGRATION: dict = {}
+
+
+def _user_dir_migration_log_path() -> str:
+    """迁移记录文件：与歌单、收藏同在扩展主目录，不随缓存目录被清理。"""
+    return os.path.join(_HOME, "user_dir_migration.json")
+
+
+def _save_user_dir_migration(result: dict) -> None:
+    """把本次改名记录追加到主目录记录文件；本次没有冲突时清空冲突清单。
+
+    记录只用于事后核对哪些目录被改了名，读取或写入失败只记日志，不影响已完成的改名。
+    """
+    path = _user_dir_migration_log_path()
+    data: dict = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        data = {}
+    records = [item for item in data.get("records") or [] if isinstance(item, dict)][-200:]
+    now = time.time()
+    records.extend(dict(item, at=now) for item in result.get("migrated") or [])
+    payload = {
+        "records": records,
+        "conflicts": [{"at": now, "path": item} for item in result.get("conflicts") or []],
+        "deferred": [{"at": now, "path": item} for item in result.get("deferred") or []],
+        "rewritten_refs": int(result.get("rewritten_refs") or 0),
+        "updated_at": now,
+    }
+    temporary = f"{path}.{uuid4().hex[:8]}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    except (OSError, ValueError) as exc:
+        _remove_quiet(temporary)
+        logger.warning("用户目录改名记录未能写入: %s", type(exc).__name__)
+
+
+def _official_music_reachable() -> bool:
+    """飞牛音乐服务此刻是否在监听。
+
+    扩展转发请求用的就是这个套接字，连得上说明服务在运行。目录改名后由飞牛音乐的
+    目录监听更新曲库登记；服务没运行时改名，登记会留在旧路径。
+    """
+    sock_path = str(CONF.get("upstream_sock") or "").strip()
+    if not sock_path:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2.0)
+            sock.connect(sock_path)
+    except OSError:
+        return False
+    return True
+
+
+def _official_audio_file_count(old_name: str, new_name: str) -> "tuple[int, int]":
+    """飞牛音乐官方曲库在 users/<old_name>/ 与 users/<new_name>/ 下登记的歌曲数（未标记丢失）。
+
+    只读查询。官方库按文件路径登记歌曲，收藏、歌单再按曲目编号关联，所以「登记是否
+    换了目录」决定改名后收藏还在不在。路径用 instr 做子串匹配，不依赖下载根目录的
+    写法（符号链接、容器挂载点可能不同）；目录名带完整摘要或归属码，不会与别的目录
+    重名。读不了官方库时抛出异常，由调用方按无法确认处理。
+    """
+    path = str(CONF.get("music_db") or dailyrec.music_db_path())
+    if not path:
+        raise ValueError("飞牛音乐数据库不可用")
+    try:
+        from . import musicdb
+    except ImportError:
+        import musicdb
+    with musicdb.privileged_read():
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
+            row = con.execute(
+                "SELECT COALESCE(SUM(instr(path, '/users/' || ? || '/') > 0), 0),"
+                "       COALESCE(SUM(instr(path, '/users/' || ? || '/') > 0), 0) "
+                "FROM audio_file WHERE is_physical_file_deleted = 0",
+                (old_name, new_name or "")).fetchone()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+class _OfficialLibraryBindings:
+    """改名前后核对飞牛音乐官方曲库，保护收藏、歌单与曲目的关联。
+
+    旧目录的歌在官方曲库里有登记时：飞牛音乐没运行就不改名，等服务运行后下次启动
+    再做；改名后等官方库把登记换到新路径，超时仍留在旧路径就把目录改回原名，并且
+    本次启动不再尝试其它有登记的目录。官方库读不了或查询出错时一律按无法确认处理，
+    宁可不改名。
+    """
+
+    def __init__(self, *, wait_s: float = 20.0) -> None:
+        self._wait_s = max(float(wait_s), 0.0)
+        self._following = True  # 本次启动里官方库是否一直跟随改名
+
+    def can_rename(self, old_path: str) -> bool:
+        """官方曲库没有这个目录的登记时随时可改；有登记时要求飞牛音乐正在运行且仍在跟随。"""
+        try:
+            if _official_audio_file_count(os.path.basename(old_path), "")[0] == 0:
+                return True
+        except Exception:
+            return False
+        return self._following and _official_music_reachable()
+
+    def followed(self, old_path: str, new_path: str) -> bool:
+        """等待官方库把登记从旧目录换到新目录，返回是否换完。"""
+        old_name = os.path.basename(old_path)
+        new_name = os.path.basename(new_path)
+        try:
+            before = _official_audio_file_count(old_name, new_name)[0]
+        except Exception:
+            return False
+        if before == 0:
+            return True
+        deadline = time.monotonic() + self._wait_s
+        while True:
+            try:
+                remaining, moved = _official_audio_file_count(old_name, new_name)
+            except Exception:
+                return False
+            if remaining == 0 and moved >= before:
+                return True
+            if time.monotonic() >= deadline:
+                self._following = False
+                return False
+            time.sleep(0.5)
+
+
+def _run_user_dir_migration(users: list[dict]) -> dict:
+    """在线程里执行的改名主体：与热重载共用文件锁，避免同时改写引用文件。"""
+    with _LIBRARY_FILE_LOCK:
+        explicit = str(CONF.get("tee_save_dir") or "").strip()
+        global_root = explicit or detect_library_dir()
+        result = migrate_user_dirs(global_root, CONF["cache_dir"], users,
+                                   official=_OfficialLibraryBindings())
+    _save_user_dir_migration(result)
+    return result
+
+
+async def _migrate_user_dirs_on_startup(users: list[dict]) -> None:
+    """启动时把旧的自动用户目录改名为「用户名.归属码」，并同步歌曲引用。
+
+    只在启动阶段、服务开始处理请求之前执行一次，改名不会与下载写入并发。
+    官方库读不到（users 为空）时无事可做。旧目录的歌在飞牛音乐里有登记时，
+    由 _OfficialLibraryBindings 保证官方库跟着更新路径；没跟上的目录改回原名，
+    留到下次启动再试。
+    """
+    global _USER_DIR_MIGRATION
+    if not users:
+        return
+    try:
+        result = await asyncio.to_thread(_run_user_dir_migration, users)
+    except Exception as exc:  # 改名是启动的附属步骤，任何失败都不能挡住服务启动
+        logger.warning("用户目录改名未完成，保留原目录: %s", type(exc).__name__)
+        return
+    migrated = list(result.get("migrated") or [])
+    conflicts = list(result.get("conflicts") or [])
+    deferred = list(result.get("deferred") or [])
+    rewritten = int(result.get("rewritten_refs") or 0)
+    _USER_DIR_MIGRATION = {"at": time.time(), "migrated": migrated, "conflicts": conflicts,
+                           "deferred": deferred, "rewritten_refs": rewritten, "scan_requested": False}
+    if migrated:
+        logger.info("用户目录已改为「用户名.标识」命名: %d 个，更新歌曲引用 %d 条", len(migrated), rewritten)
+    if deferred:
+        logger.info("有 %d 个用户目录本次未改名（飞牛音乐未运行或曲库未能确认），下次启动再试", len(deferred))
+    if conflicts:
+        logger.warning("有 %d 个用户目录未能自动改名，文件原样保留，请在管理页查看", len(conflicts))
+    try:
+        _request_scan_for_migrated_users(migrated)
+    except Exception as exc:  # 扫描只是通知官方，失败不影响已完成的改名
+        logger.warning("用户目录已改名，但请求曲库扫描失败，请手动扫描: %s", type(exc).__name__)
+
+
+def _request_scan_for_migrated_users(migrated: list[dict]) -> None:
+    """为改名过的用户请求官方曲库重扫，并记录是否真的排入了扫描。
+
+    同一套扫描配置只请求一次：管理员扫描接口一次扫描整个曲库，与触发用户无关。
+    需要用户凭证的扫描路径在启动时发不出去，标记为未排入，管理页据此提示手动扫描。
+    """
+    requested_configs = set()
+    scan_requested = False
+    for item in migrated:
+        guid = str(item.get("guid") or "")
+        scan_path, scan_body = _scan_config(guid)
+        if not scan_path or (scan_path, scan_body) in requested_configs:
+            continue
+        requested_configs.add((scan_path, scan_body))
+        if not _scan_runs_without_credentials(scan_path):
+            continue
+        scan_requested = True
+        _schedule_library_scan(None, user_guid=guid)
+    _USER_DIR_MIGRATION["scan_requested"] = scan_requested
+
+
+async def _load_user_dir_names_on_startup() -> list[dict]:
+    """启动时读取官方库用户名并冻结自动用户目录名表，返回在用用户列表。
+
+    只在启动时读一次：读库会阻塞，所以放到线程里；运行期间用户改名不影响目录名，
+    下次启动再由迁移跟随改名。读取失败时返回空列表，目录名表也为空，自动目录回退
+    「user.归属码」并按归属码沿用已有目录，保存不中断。
+    """
+    try:
+        users = await asyncio.to_thread(list_music_users)
+    except Exception as exc:  # 官方库读不到只是少了用户名，不能挡住服务启动
+        logger.warning("读取飞牛音乐用户失败，自动用户目录暂用回退名: %s", type(exc).__name__)
+        return []
+    set_user_dir_names(load_user_dir_names(users, safe_layout_part))
+    return users
+
+
 async def _try_migrate_public_playlist_users() -> None:
     try:
         await asyncio.to_thread(migrate_public_playlist_users)
@@ -5867,7 +6086,8 @@ def _organize_target(user_guid: str = "") -> tuple[str, str]:
             raise ValueError("多用户模式必须选择要整理的用户")
         root = os.path.realpath(effective_user_root(CONF, user_guid, global_root))
         users_container = os.path.join(global_root, "users")
-        own_auto = os.path.join(global_root, "users", user_storage_key(user_guid))
+        # 与 effective_user_root 用同一规则取「自己的自动目录」，两者才始终一致
+        own_auto = auto_user_root(user_guid, global_root)
         inside_auto_container = (
             root == users_container or _path_is_within(root, users_container)
             or _path_is_within(users_container, root))
@@ -5976,6 +6196,8 @@ def _user_storage_status(users: list[dict]) -> dict:
         "admin_configured": bool(CONF.get("scan_admin_username") and CONF.get("scan_admin_password")),
         "users": entries,
         "stale_user_guids": sorted((set(directory_map) | set(scan_map)) - active),
+        # 最近一次启动的用户目录改名结果，供管理页提示重扫与人工处理冲突
+        "dir_migration": dict(_USER_DIR_MIGRATION),
     }
 
 
@@ -6270,6 +6492,10 @@ async def lifespan(fastapi_app: FastAPI):
 
     # 后台任务在降权之后创建，避免首个 await 期间以 root 写用户目录。
     if _background_jobs_enabled():
+        # 目录名表在降权后读取：读库会临时提权，写下载目录仍用运行身份；此时尚无请求
+        users = await _load_user_dir_names_on_startup()
+        # 旧目录改名同样放在服务开始处理请求之前，不会与下载写入并发
+        await _migrate_user_dirs_on_startup(users)
         sweeper_task = asyncio.create_task(_lyric_orphan_sweeper())
         log_task = asyncio.create_task(_log_retention_loop())
         if CONF.get("env_watch", True):
@@ -7876,6 +8102,16 @@ def _scan_config(user_guid: str = "") -> "tuple[str, str]":
     return _parse_scan_raw(str(CONF.get("library_scan_path") or ""))
 
 
+def _scan_runs_without_credentials(scan_path: str) -> bool:
+    """该扫描路径不需要用户凭证就能触发：仅管理员扫描路径，且已配置管理员账号。
+
+    管理员扫描由扩展自己登录管理员会话，触发者是谁无关紧要；其它扫描路径要把
+    触发请求的用户凭证透传给官方接口，启动时没有这样的凭证。
+    """
+    return scan_path == _ADMIN_SCAN_PATH and bool(
+        CONF.get("scan_admin_username") and CONF.get("scan_admin_password"))
+
+
 def _clean_scan_headers(headers: dict | None) -> dict:
     """提取扫描请求所需的会话凭据，过滤跨路径无效或危险的头部。
 
@@ -8052,11 +8288,13 @@ def _schedule_library_scan(headers: dict | None, user_guid: str = "") -> None:
     冷却期内若有新文件落盘，记录待扫任务，冷却结束后自动补扫，防止漏扫。
     """
     scan_path, _scan_body = _scan_config(user_guid)
-    if not scan_path or not headers:
+    # 管理员扫描路径不需要用户凭证：启动时的目录改名没有用户请求，也能触发扫描。
+    admin_only = _scan_runs_without_credentials(scan_path)
+    if not scan_path or (not headers and not admin_only):
         return
 
     safe_headers = _clean_scan_headers(headers)
-    if not safe_headers:
+    if not safe_headers and not admin_only:
         return
 
     cooldown_cfg = CONF.get("scan_cooldown_s")

@@ -4592,6 +4592,34 @@ function scanStatusLine(user) {
   return `扫描失败：${text}${time}`;
 }
 
+// 升级后启动时自动改名的结果（#154）。本次启动没有改名、冲突或推迟时返回空串。
+// 路径来自服务端记录，按文本转义后再拼进页面。
+function renderUserDirMigration(migration) {
+  if (!migration || typeof migration !== "object") return "";
+  const migrated = Array.isArray(migration.migrated) ? migration.migrated : [];
+  const conflicts = Array.isArray(migration.conflicts) ? migration.conflicts : [];
+  const deferred = Array.isArray(migration.deferred) ? migration.deferred : [];
+  if (!migrated.length && !conflicts.length && !deferred.length) return "";
+  let html = "";
+  if (migrated.length) {
+    // 目录改名后飞牛音乐登记的旧路径会失效，必须重扫曲库；启动时只有管理员扫描能自动触发
+    const scan = migration.scan_requested
+      ? "已自动请求飞牛音乐重新扫描曲库。"
+      : "请手动在飞牛音乐中重新扫描曲库。";
+    html += `<p class="hint">升级后已把 ${migrated.length} 个用户目录改为「用户名.标识」命名，已保存的歌曲引用同步更新。${scan}</p>`;
+  }
+  if (deferred.length) {
+    // 飞牛音乐没运行或曲库未能确认时本次不改名，下次启动自动继续；目录照常可用
+    html += `<p class="hint">有 ${deferred.length} 个用户目录本次未改名：飞牛音乐未运行，或暂时无法确认曲库。飞牛音乐运行后重启本扩展，会自动继续；期间歌曲照常使用。</p>` +
+      `<p class="hint">${deferred.map((path) => escapeHtml(String(path))).join("<br>")}</p>`;
+  }
+  if (conflicts.length) {
+    html += `<p class="hint warning">有 ${conflicts.length} 个用户目录未能自动改名，文件原样保留。飞牛音乐运行时重启本扩展会再试一次；仍未改名的请人工处理：<br>` +
+      conflicts.map((path) => escapeHtml(String(path))).join("<br>") + "</p>";
+  }
+  return html;
+}
+
 function renderUserStorage() {
   const list = $("#user-storage-list");
   const staleBox = $("#user-storage-stale");
@@ -4617,9 +4645,11 @@ function renderUserStorage() {
       organizeUser.value = previous;
     }
   }
+  // 改名结果与开关状态无关：关闭按用户保存时，管理员同样需要看到重扫提示和未改名的目录
+  const migrationHtml = renderUserDirMigration(userStorageStatus.dir_migration);
   if (!enabled) {
     list.textContent = "";
-    staleBox.textContent = "";
+    staleBox.innerHTML = migrationHtml;
     return;
   }
   list.innerHTML = users.map((user) => {
@@ -4652,10 +4682,10 @@ function renderUserStorage() {
     </div>`;
   }).join("") || "没有读取到飞牛音乐用户。";
   const stale = Array.isArray(userStorageStatus.stale_user_guids) ? userStorageStatus.stale_user_guids : [];
-  staleBox.innerHTML = stale.length
+  staleBox.innerHTML = migrationHtml + (stale.length
     ? "以下配置对应的用户已不在飞牛音乐中。勾选后保存才会删除配置，不会删除已保存的歌曲。" +
       stale.map((guid) => `<label class="user-storage-stale-row"><input type="checkbox" data-stale-delete="${escapeHtml(guid)}">删除失效用户 ${escapeHtml(guid)} 的目录和扫描配置</label>`).join("")
-    : "";
+    : "");
 }
 
 async function loadUserStorage({ abortIfDirty = false } = {}) {

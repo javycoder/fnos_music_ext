@@ -563,8 +563,8 @@
         </div>
         <div class="card" id="user-storage-card">
           <div class="card-title"><span>按用户保存</span></div>
-          <label class="switch-row"><span>每个用户使用独立目录<span class="sub">默认关闭。未自定义的用户保存到下载根目录下按用户标识区分的子目录；关闭时仍使用上面的统一目录。</span></span><input type="checkbox" id="tee-save-by-user"></label>
-          <p class="hint">旧文件不会自动迁移或删除。目录权限以下载服务的实际检查为准。</p>
+          <label class="switch-row"><span>每个用户使用独立目录<span class="sub">默认关闭。未自定义的用户保存到下载根目录下以「用户名.标识」命名的子目录，标识用于区分同名用户；关闭时仍使用上面的统一目录。</span></span><input type="checkbox" id="tee-save-by-user"></label>
+          <p class="hint">升级后首次启动会把旧版命名的用户目录自动改为「用户名.标识」，歌曲和歌词原样保留，歌曲引用同步更新。歌曲已进入飞牛音乐曲库时，改名会等飞牛音乐运行后进行；目录改名后需重新扫描曲库。切换自定义目录不会迁移或删除已有文件。目录权限以下载服务的实际检查为准。</p>
           <div id="user-storage-list"></div>
           <div id="user-storage-stale"></div>
         </div>

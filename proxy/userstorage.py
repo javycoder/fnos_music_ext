@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 
 
 def _guid(value: object, label: str = "用户 GUID") -> str:
@@ -178,6 +179,161 @@ def auto_user_root(user_guid: str, global_root: str) -> str:
     return existing[0] if len(existing) == 1 else os.path.join(users_dir, expected)
 
 
+def _remove_quiet(path: str) -> None:
+    """尽力删除临时文件；失败不影响主流程。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _ref_owner(stem: str, users_dir: str) -> str:
+    """引用内容若指向 users 容器的下一级目录，返回该目录名；否则返回空串。"""
+    prefix = users_dir + os.sep
+    if not stem.startswith(prefix):
+        return ""
+    name, separator, _rest = stem[len(prefix):].partition(os.sep)
+    return name if separator else ""
+
+
+def _current_dir_name(owner: str, users: list[dict], users_dir: str) -> str:
+    """旧目录名 owner 属于哪个在用用户，返回该用户的当前目录名；判断不了返回空串。
+
+    当前目录必须真实存在：改名没有完成时，不能把引用指到不存在的路径。
+    """
+    tail = owner.rpartition(".")[2]
+    for user in users or []:
+        guid = str((user or {}).get("guid") or "")
+        named = _USER_DIR_NAMES.get(guid)
+        if not named or named == owner:
+            continue
+        try:
+            belongs = owner == user_storage_key(guid) or (
+                "." in owner and tail == named.rpartition(".")[2] and _is_code(tail))
+        except ValueError:
+            continue
+        if belongs:
+            return named if os.path.isdir(os.path.join(users_dir, named)) else ""
+    return ""
+
+
+def repair_user_refs(cache_dir: str, global_root: str, users: list[dict]) -> int:
+    """把指向用户旧目录的歌曲引用改写到该用户的当前目录，返回改写条数。
+
+    引用文件内容是歌曲词干的绝对路径。目录改名后不改写，扩展会认为这首歌没保存过
+    而重复下载。只改能证明归属的引用：内容以「users 容器/某目录名/」开头，且该目录名
+    属于一个在用用户。逐个原子写入并读回校验，单条失败只跳过该条，留到下次启动重试。
+    """
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return 0
+    try:
+        users_dir = os.path.join(_absolute_path(global_root, "下载目录"), "users")
+        names = os.listdir(cache_dir)
+    except (OSError, ValueError):
+        return 0
+    rewritten = 0
+    for name in names:
+        if not name.endswith(".ref"):
+            continue
+        ref = os.path.join(cache_dir, name)
+        try:
+            with open(ref, encoding="utf-8") as handle:
+                stem = handle.read(16384).strip()
+        except (OSError, ValueError):
+            continue
+        owner = _ref_owner(stem, users_dir)
+        current = _current_dir_name(owner, users, users_dir) if owner else ""
+        if not current:
+            continue
+        old_prefix = users_dir + os.sep + owner + os.sep
+        new_stem = users_dir + os.sep + current + os.sep + stem[len(old_prefix):]
+        temporary = f"{ref}.{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(new_stem)
+            os.replace(temporary, ref)
+            with open(ref, encoding="utf-8") as handle:
+                if handle.read(16384).strip() != new_stem:
+                    raise OSError("read-back mismatch")
+            rewritten += 1
+        except (OSError, ValueError):
+            _remove_quiet(temporary)
+    return rewritten
+
+
+def _confirmed(check) -> bool:
+    """调用官方曲库的确认回调；回调抛出异常时按未确认处理，宁可不改名。"""
+    try:
+        return bool(check())
+    except Exception:
+        return False
+
+
+def migrate_user_dirs(global_root: str, cache_dir: str, users: list[dict], official=None) -> dict:
+    """把用户的旧目录改名为当前期望名，再修复歌曲引用。幂等，可重复执行。
+
+    只改能确认归属的目录：目录名等于该用户的完整摘要，或以该用户的归属码结尾。
+    目标名已被占用、同一用户有多个归属目录、改名失败时一律不动文件，记入 conflicts
+    交管理员处理。已删除用户的目录找不到对应用户，保持原样。目录内的文件只随目录
+    整体改名，内容不变。
+
+    official 是可选的官方曲库保护对象，提供两个方法：
+    can_rename(旧路径) -> bool 为 False 时本次不改名，记入 deferred；
+    followed(旧路径, 新路径) -> bool 为 False 时把目录改回原名，记入 conflicts。
+    飞牛音乐按文件路径登记歌曲，收藏和歌单再按曲目关联。旧目录的歌有登记时，
+    改名必须让官方库跟着更新路径，否则收藏和歌单会对不上。
+    """
+    result: dict = {"migrated": [], "conflicts": [], "deferred": [], "rewritten_refs": 0}
+    try:
+        users_dir = os.path.join(_absolute_path(global_root, "下载目录"), "users")
+    except ValueError:
+        return result
+    if not os.path.isdir(users_dir):
+        return result
+    for user in users or []:
+        try:
+            guid = _guid(str((user or {}).get("guid") or ""))
+        except ValueError:
+            continue
+        target_name = _USER_DIR_NAMES.get(guid)
+        if not target_name:
+            continue
+        try:
+            # 排除当前名自身，剩下的才是需要处理的旧目录
+            owned = [path for path in owned_user_dirs(users_dir, guid, target_name.rpartition(".")[2])
+                     if os.path.basename(path) != target_name]
+        except ValueError:
+            continue
+        if not owned:
+            continue
+        target = os.path.join(users_dir, target_name)
+        if len(owned) > 1 or os.path.lexists(target):
+            result["conflicts"].extend(owned)
+            continue
+        if official is not None and not _confirmed(lambda: official.can_rename(owned[0])):
+            result["deferred"].append(owned[0])
+            continue
+        try:
+            os.rename(owned[0], target)
+        except OSError:
+            result["conflicts"].append(owned[0])
+            continue
+        if official is not None and not _confirmed(lambda: official.followed(owned[0], target)):
+            # 官方库没有跟着更新路径：立刻改回原名，歌曲与收藏保持原状，下次启动再试。
+            # 极少数情况下改不回去，目录留在新名，由后面的引用修复兜底，并记入冲突。
+            old_path = owned[0]
+            try:
+                os.rename(target, old_path)
+            except OSError:
+                pass
+            result["conflicts"].append(old_path)
+            continue
+        result["migrated"].append({"guid": guid, "from": owned[0], "to": target})
+    # 引用修复独立于改名：上次中途退出时目录已是新名而引用还指旧路径，这里补齐
+    result["rewritten_refs"] = repair_user_refs(cache_dir, global_root, users)
+    return result
+
+
 def user_storage_key(user_guid: str) -> str:
     return hashlib.sha256(_guid(user_guid).encode("utf-8")).hexdigest()
 
@@ -187,8 +343,7 @@ def effective_user_root(conf: dict, user_guid: str, global_root: str) -> str:
     configured = mapping.get(_guid(user_guid))
     if configured:
         return str(configured)
-    root = _absolute_path(global_root, "下载目录")
-    return os.path.join(root, "users", user_storage_key(user_guid))
+    return auto_user_root(user_guid, global_root)
 
 
 def user_ref_name(user_guid: str, safe_guid: str) -> str:

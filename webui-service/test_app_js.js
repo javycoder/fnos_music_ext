@@ -4149,6 +4149,87 @@ test("扫描状态展示：outcome 码映射与墙钟时间渲染", () => {
   assert.strictEqual(global.scanStatusLine({ scan_status: "ok", scan_last_at: 1e20 }), "扫描成功");
 });
 
+/* ------------------------------------------------ 按用户保存：目录改名提示 */
+const USER_STORAGE_PATH = "/app/fnmusic-ext/api/maintenance/user-storage";
+
+test("按用户保存：开关关闭也显示目录改名结果，冲突路径被转义", async () => {
+  reset();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}};");
+  els.get("#tee-save-by-user").checked = false;
+  enqueue(USER_STORAGE_PATH, {
+    ok: true, enabled: false, global_root: "/music", layout: "flat", admin_configured: true,
+    users: [{ guid: "u1", name: "张三", role: "admin", root: "/music/users/张三.1a2b3c4d" }],
+    stale_user_guids: [],
+    dir_migration: {
+      migrated: [{ guid: "u1", from: "/music/users/0f1e2d3c4b5a6978", to: "/music/users/张三.1a2b3c4d" }],
+      conflicts: ["/music/users/<img onerror=1>"], rewritten_refs: 3, scan_requested: true,
+    },
+  });
+  await global.loadUserStorage();
+
+  const html = els.get("#user-storage-stale").innerHTML;
+  assert.ok(html.includes("升级后已把 1 个用户目录改为「用户名.标识」命名"), html);
+  assert.ok(html.includes("已自动请求飞牛音乐重新扫描曲库"), html);
+  assert.ok(html.includes("未能自动改名"), html);
+  assert.ok(html.includes("&lt;img onerror=1&gt;") && !html.includes("<img onerror=1>"), html);
+});
+
+test("按用户保存：未排入扫描时提示手动重扫，且排在失效用户提示之前", async () => {
+  reset();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}};");
+  els.get("#tee-save-by-user").checked = true;
+  enqueue(USER_STORAGE_PATH, {
+    ok: true, enabled: true, global_root: "/music", layout: "flat", admin_configured: false,
+    users: [{ guid: "u1", name: "张三", role: "admin", root: "/music/users/张三.1a2b3c4d" }],
+    stale_user_guids: ["old-user"],
+    dir_migration: {
+      migrated: [{ guid: "u1", from: "/music/users/0f1e2d3c4b5a6978", to: "/music/users/张三.1a2b3c4d" }],
+      conflicts: [], rewritten_refs: 0, scan_requested: false,
+    },
+  });
+  await global.loadUserStorage();
+
+  const html = els.get("#user-storage-stale").innerHTML;
+  assert.ok(html.includes("请手动在飞牛音乐中重新扫描曲库"), html);
+  assert.ok(html.includes("以下配置对应的用户已不在飞牛音乐中"), html);
+  assert.ok(html.indexOf("升级后已把 1 个") < html.indexOf("以下配置对应的用户"), html);
+});
+
+test("按用户保存：本次未改名的目录单独提示，不算冲突", async () => {
+  reset();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}};");
+  els.get("#tee-save-by-user").checked = false;
+  enqueue(USER_STORAGE_PATH, {
+    ok: true, enabled: false, global_root: "/music", layout: "flat",
+    users: [{ guid: "u1", name: "张三", root: "/music/users/0f1e2d3c4b5a6978" }], stale_user_guids: [],
+    dir_migration: {
+      migrated: [], conflicts: [], deferred: ["/music/users/0f1e2d3c4b5a6978 <b>"],
+      rewritten_refs: 0, scan_requested: false,
+    },
+  });
+  await global.loadUserStorage();
+
+  const html = els.get("#user-storage-stale").innerHTML;
+  assert.ok(html.includes("有 1 个用户目录本次未改名"), html);
+  assert.ok(html.includes("飞牛音乐运行后重启本扩展"), html);
+  assert.ok(!html.includes("未能自动改名"), html);
+  assert.ok(html.includes("0f1e2d3c4b5a6978 &lt;b&gt;") && !html.includes("<b>"), html);
+});
+
+test("按用户保存：本次启动没有改名时不显示改名提示", async () => {
+  reset();
+  vm.runInThisContext("configSchema={FNMUSIC_TEE_SAVE_BY_USER:{}};");
+  els.get("#tee-save-by-user").checked = true;
+  enqueue(USER_STORAGE_PATH, {
+    ok: true, enabled: true, global_root: "/music", layout: "flat",
+    users: [{ guid: "u1", name: "张三", root: "/music/users/张三.1a2b3c4d" }], stale_user_guids: [],
+    dir_migration: { migrated: [], conflicts: [], deferred: [], rewritten_refs: 0, scan_requested: false },
+  });
+  await global.loadUserStorage();
+
+  assert.strictEqual(els.get("#user-storage-stale").innerHTML, "");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;
