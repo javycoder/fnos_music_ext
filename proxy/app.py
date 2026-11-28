@@ -5916,14 +5916,9 @@ def _official_music_reachable() -> bool:
     return True
 
 
-def _official_audio_file_count(old_name: str, new_name: str) -> "tuple[int, int]":
-    """飞牛音乐官方曲库在 users/<old_name>/ 与 users/<new_name>/ 下登记的歌曲数（未标记丢失）。
-
-    只读查询。官方库按文件路径登记歌曲，收藏、歌单再按曲目编号关联，所以「登记是否
-    换了目录」决定改名后收藏还在不在。路径用 instr 做子串匹配，不依赖下载根目录的
-    写法（符号链接、容器挂载点可能不同）；目录名带完整摘要或归属码，不会与别的目录
-    重名。读不了官方库时抛出异常，由调用方按无法确认处理。
-    """
+def _official_audio_bindings(old_name: str, new_name: str = "") -> tuple[
+        set[tuple[str, int, int | None]], set[tuple[str, int, int | None]]]:
+    """读取目录内的相对路径、文件编号和曲目编号；同一只读查询覆盖新旧位置。"""
     path = str(CONF.get("music_db") or dailyrec.music_db_path())
     if not path:
         raise ValueError("飞牛音乐数据库不可用")
@@ -5931,14 +5926,24 @@ def _official_audio_file_count(old_name: str, new_name: str) -> "tuple[int, int]
         from . import musicdb
     except ImportError:
         import musicdb
+    old_prefix = f"/users/{old_name}/"
+    new_prefix = f"/users/{new_name}/" if new_name else ""
     with musicdb.privileged_read():
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as con:
-            row = con.execute(
-                "SELECT COALESCE(SUM(instr(path, '/users/' || ? || '/') > 0), 0),"
-                "       COALESCE(SUM(instr(path, '/users/' || ? || '/') > 0), 0) "
-                "FROM audio_file WHERE is_physical_file_deleted = 0",
-                (old_name, new_name or "")).fetchone()
-    return int(row[0] or 0), int(row[1] or 0)
+            rows = con.execute(
+                """SELECT af.path, af.id, track.id
+                     FROM audio_file af
+                     LEFT JOIN track ON track.audio_file_id = af.id AND track.is_audio_file_deleted = 0
+                    WHERE af.is_physical_file_deleted = 0
+                      AND (instr(af.path, ?) > 0 OR (? != '' AND instr(af.path, ?) > 0))""",
+                (old_prefix, new_prefix, new_prefix)).fetchall()
+    old, new = set(), set()
+    for audio_path, file_id, track_id in rows:
+        if old_prefix in audio_path:
+            old.add((audio_path.split(old_prefix, 1)[1], file_id, track_id))
+        if new_prefix and new_prefix in audio_path:
+            new.add((audio_path.split(new_prefix, 1)[1], file_id, track_id))
+    return old, new
 
 
 class _OfficialLibraryBindings:
@@ -5953,33 +5958,39 @@ class _OfficialLibraryBindings:
     def __init__(self, *, wait_s: float = 20.0) -> None:
         self._wait_s = max(float(wait_s), 0.0)
         self._following = True  # 本次启动里官方库是否一直跟随改名
+        self._snapshot: tuple[str, set[tuple[str, int, int | None]]] | None = None
 
     def can_rename(self, old_path: str) -> bool:
         """官方曲库没有这个目录的登记时随时可改；有登记时要求飞牛音乐正在运行且仍在跟随。"""
+        self._snapshot = None
         try:
-            if _official_audio_file_count(os.path.basename(old_path), "")[0] == 0:
-                return True
+            old, _ = _official_audio_bindings(os.path.basename(old_path))
         except Exception:
             return False
-        return self._following and _official_music_reachable()
+        if old and not (self._following and _official_music_reachable()):
+            return False
+        self._snapshot = (old_path, old)
+        return True
 
     def followed(self, old_path: str, new_path: str) -> bool:
         """等待官方库把登记从旧目录换到新目录，返回是否换完。"""
         old_name = os.path.basename(old_path)
         new_name = os.path.basename(new_path)
-        try:
-            before = _official_audio_file_count(old_name, new_name)[0]
-        except Exception:
+        snapshot, self._snapshot = self._snapshot, None
+        if snapshot is None or snapshot[0] != old_path:
             return False
-        if before == 0:
+        before = snapshot[1]
+        if not before:
             return True
         deadline = time.monotonic() + self._wait_s
         while True:
             try:
-                remaining, moved = _official_audio_file_count(old_name, new_name)
+                remaining, moved = _official_audio_bindings(old_name, new_name)
             except Exception:
+                self._following = False
                 return False
-            if remaining == 0 and moved >= before:
+            # 必须是同一批原登记；仅数量相同可能是扫描新建的曲目。
+            if not remaining and moved == before:
                 return True
             if time.monotonic() >= deadline:
                 self._following = False

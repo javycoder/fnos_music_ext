@@ -523,7 +523,7 @@ async def test_startup_migration_records_result_and_requests_library_scan(tmp_pa
                         lambda headers, user_guid="": requested.append((headers, user_guid)))
     monkeypatch.setattr(runtime, "_USER_DIR_MIGRATION", {})
     # 官方曲库没有登记这两个目录下的歌曲：改名不需要飞牛音乐配合
-    monkeypatch.setattr(runtime, "_official_audio_file_count", lambda old_name, new_name="": (0, 0))
+    monkeypatch.setattr(runtime, "_official_audio_bindings", lambda old_name, new_name="": (set(), set()))
 
     await runtime._migrate_user_dirs_on_startup(await runtime._load_user_dir_names_on_startup())
 
@@ -560,7 +560,7 @@ async def test_startup_migration_reports_manual_scan_without_credentials(tmp_pat
     monkeypatch.setattr(runtime, "_schedule_library_scan",
                         lambda headers, user_guid="": requested.append((headers, user_guid)))
     monkeypatch.setattr(runtime, "_USER_DIR_MIGRATION", {})
-    monkeypatch.setattr(runtime, "_official_audio_file_count", lambda old_name, new_name="": (0, 0))
+    monkeypatch.setattr(runtime, "_official_audio_bindings", lambda old_name, new_name="": (set(), set()))
 
     await runtime._migrate_user_dirs_on_startup(await runtime._load_user_dir_names_on_startup())
 
@@ -627,6 +627,7 @@ def test_official_bindings_follow_rename_only_while_music_service_runs(tmp_path,
     fresh = library / "users" / user_storage_key("user-b")
     with sqlite3.connect(db_path) as con:
         con.execute("CREATE TABLE audio_file (id INTEGER PRIMARY KEY, path TEXT UNIQUE, is_physical_file_deleted INTEGER)")
+        con.execute("CREATE TABLE track (id INTEGER PRIMARY KEY, audio_file_id INTEGER, is_audio_file_deleted INTEGER)")
         con.executemany("INSERT INTO audio_file (path, is_physical_file_deleted) VALUES (?, ?)", [
             (str(legacy / "专辑" / "歌.flac"), 0), (str(legacy / "歌_2.flac"), 0),
             # 已标记丢失的登记、别的目录里的同名歌曲、别的用户目录：都不算这个目录的登记
@@ -639,7 +640,8 @@ def test_official_bindings_follow_rename_only_while_music_service_runs(tmp_path,
 
     bindings = runtime._OfficialLibraryBindings(wait_s=0)
     # 这个目录登记了 2 首歌
-    assert runtime._official_audio_file_count(legacy.name, named.name) == (2, 0)
+    assert runtime._official_audio_bindings(legacy.name, named.name) == (
+        {("专辑/歌.flac", 1, None), ("歌_2.flac", 2, None)}, set())
     assert bindings.can_rename(str(fresh)) is True       # 没有登记：不需要飞牛音乐配合
     assert bindings.can_rename(str(legacy)) is False     # 有登记、飞牛音乐没运行：推迟
     reachable["value"] = True
@@ -649,11 +651,12 @@ def test_official_bindings_follow_rename_only_while_music_service_runs(tmp_path,
     assert bindings.can_rename(str(legacy)) is False and bindings.can_rename(str(fresh)) is True
 
     # 官方库把登记换到新路径（目录监听的原位更新）：同一批歌曲，只是路径前缀变了
+    following = runtime._OfficialLibraryBindings(wait_s=0)
+    assert following.can_rename(str(legacy))
     with sqlite3.connect(db_path) as con:
         con.execute("UPDATE audio_file SET path = ? || substr(path, ?) WHERE is_physical_file_deleted = 0 AND path >= ? AND path < ?",
-                    (str(named) + "/", len(str(legacy)) + 1, str(legacy) + "/", str(legacy) + "0"))
-    assert runtime._official_audio_file_count(legacy.name, named.name) == (0, 2)
-    assert runtime._OfficialLibraryBindings(wait_s=0).followed(str(legacy), str(named)) is True
+                    (str(named) + "/", len(str(legacy)) + 2, str(legacy) + "/", str(legacy) + "0"))
+    assert following.followed(str(legacy), str(named)) is True
 
     # 官方库读不了：无法确认，按未确认处理
     monkeypatch.setitem(runtime.CONF, "music_db", str(tmp_path / "missing.db"))
@@ -684,7 +687,8 @@ async def test_startup_migration_rolls_back_when_official_library_does_not_follo
     # 官方曲库登记了 1 首歌，改名后仍留在旧路径；等待时间设为 0，用例不必真的等 20 秒
     real_bindings = runtime._OfficialLibraryBindings
     monkeypatch.setattr(runtime, "_OfficialLibraryBindings", lambda: real_bindings(wait_s=0))
-    monkeypatch.setattr(runtime, "_official_audio_file_count", lambda old_name, new_name="": (1, 0))
+    monkeypatch.setattr(runtime, "_official_audio_bindings",
+                        lambda old_name, new_name="": ({("song.flac", 1, 1)}, set()))
     requested = []
     monkeypatch.setattr(runtime, "_schedule_library_scan",
                         lambda headers, user_guid="": requested.append((headers, user_guid)))
@@ -699,6 +703,29 @@ async def test_startup_migration_rolls_back_when_official_library_does_not_follo
     assert status["migrated"] == [] and status["conflicts"] == [str(legacy)] and status["deferred"] == []
     saved = json.loads((home / "user_dir_migration.json").read_text(encoding="utf-8"))
     assert [item["path"] for item in saved["conflicts"]] == [str(legacy)]
+
+
+@pytest.mark.parametrize("recreated_track", [False, True])
+def test_migration_requires_same_file_and_track_ids_after_rename(tmp_path, monkeypatch, recreated_track):
+    db_path = tmp_path / "music.db"
+    users_dir = tmp_path / "library" / "users"
+    digest = user_storage_key("user-a")
+    legacy = users_dir / digest
+    named = users_dir / f"张三.{digest[:8]}"
+    with sqlite3.connect(db_path) as con:
+        con.execute("CREATE TABLE audio_file (id INTEGER PRIMARY KEY, path TEXT, is_physical_file_deleted INTEGER)")
+        con.execute("CREATE TABLE track (id INTEGER PRIMARY KEY, audio_file_id INTEGER, is_audio_file_deleted INTEGER)")
+        con.execute("INSERT INTO audio_file VALUES (3, ?, 0)", (str(legacy / "song.flac"),))
+        con.execute("INSERT INTO track VALUES (10, 3, 0)")
+    monkeypatch.setitem(runtime.CONF, "music_db", str(db_path))
+    monkeypatch.setattr(runtime, "_official_music_reachable", lambda: True)
+    bindings = runtime._OfficialLibraryBindings(wait_s=0)
+    assert bindings.can_rename(str(legacy))
+    with sqlite3.connect(db_path) as con:
+        con.execute("UPDATE audio_file SET path = ?", (str(named / "song.flac"),))
+        if recreated_track:
+            con.execute("UPDATE track SET id = 11")
+    assert bindings.followed(str(legacy), str(named)) is not recreated_track
 
 
 @pytest.mark.asyncio
