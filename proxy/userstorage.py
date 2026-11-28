@@ -255,7 +255,10 @@ def repair_user_refs(cache_dir: str, global_root: str, users: list[dict]) -> int
         except (OSError, ValueError):
             continue
         owner = _ref_owner(stem, users_dir)
-        current = _current_dir_name(owner, users, users_dir) if owner else ""
+        # 旧目录还在，说明改名没有发生或已回退；同名目标可能包含别的歌曲。
+        if not owner or os.path.lexists(os.path.join(users_dir, owner)):
+            continue
+        current = _current_dir_name(owner, users, users_dir)
         if not current:
             continue
         old_prefix = users_dir + os.sep + owner + os.sep

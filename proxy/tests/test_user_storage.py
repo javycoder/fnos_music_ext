@@ -499,6 +499,28 @@ def test_migration_leaves_conflicts_and_deleted_users_untouched(tmp_path):
         [str(legacy_a), str(users_dir / digest_c), str(users_dir / f"旧名.{code_c}")])
 
 
+def test_migration_leaves_reference_on_original_file_when_destination_is_occupied(tmp_path):
+    library = tmp_path / "library"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    digest = user_storage_key("user-a")
+    legacy = library / "users" / digest
+    named = library / "users" / f"张三.{digest[:8]}"
+    legacy.mkdir(parents=True)
+    named.mkdir()
+    (legacy / "song.flac").write_bytes(b"original song")
+    (named / "song.flac").write_bytes(b"different song")
+    ref = cache / f"u_{digest}__song.ref"
+    ref.write_text(str(legacy / "song"), encoding="utf-8")
+    userstorage.set_user_dir_names({"user-a": named.name})
+
+    result = userstorage.migrate_user_dirs(str(library), str(cache), [{"guid": "user-a"}])
+
+    assert result["conflicts"] == [str(legacy)]
+    assert result["rewritten_refs"] == 0
+    assert ref.read_text(encoding="utf-8") == str(legacy / "song")
+
+
 def test_migration_repairs_stale_refs_after_interrupted_run(tmp_path):
     """目录已是新名而引用还指旧路径（上次中途退出）：只修引用，不动文件。"""
     library = tmp_path / "library"
