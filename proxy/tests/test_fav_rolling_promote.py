@@ -9,6 +9,8 @@ import asyncio
 import importlib
 import os
 import time
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -28,6 +30,8 @@ def isolated(tmp_path, monkeypatch):
         monkeypatch.setitem(p.CONF, key, str(tmp_path / key))
     monkeypatch.setitem(p.CONF, "music_db", str(tmp_path / "missing.db"))
     monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
+    monkeypatch.setitem(p.CONF, "tee_save_by_user", False)
+    monkeypatch.setitem(p.CONF, "tee_save_dir_by_user", "{}")
     monkeypatch.setitem(p.CONF, "tee_save_dir", "")
     monkeypatch.setitem(p.CONF, "tee_cache_max", 2)
     monkeypatch.setitem(p.CONF, "lyric_auto_dl", False)
@@ -110,25 +114,95 @@ def audio_files(directory):
 
 
 @pytest.mark.anyio
-async def test_favorite_during_playback_lands_in_library(monkeypatch, asgi_audio):
+@pytest.mark.parametrize("per_user", [False, True])
+async def test_favorite_during_playback_lands_in_library(monkeypatch, asgi_audio, per_user):
     """播放中收藏（tee 关）：流完成按入库语义 finalize，文件进曲库而非滚动缓存。"""
     guid = "online:netease:186016"
-    p._register_bind_intent(guid, "user-a", {"cookie": "sid=test"}, None)
+    monkeypatch.setitem(p.CONF, "tee_save_by_user", per_user)
+    resolve_user = AsyncMock(return_value="user-a")
+    monkeypatch.setattr(p, "_resolve_storage_user", resolve_user)
+    scan = Mock()
+    monkeypatch.setattr(p, "_schedule_library_scan", scan)
     calls = _record_dispatch(monkeypatch)
-    await listen(asgi_audio, guid)
-    assert audio_files(p.CONF["library_dir"]) == ["周杰伦 - 晴天.flac"]
+    info = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=Audio()), guid, None, pre_info=info, resolved_ext="flac",
+        scan_headers_factory=lambda: {"cookie": "sid=playback"},
+    )
+    def favorite(chunk):
+        assert chunk == Audio.payload
+        _save_favorite_snapshot("user-a", guid, "晴天")
+        p._register_bind_intent(guid, "user-a", {"cookie": "sid=favorite"}, None)
+
+    assert await asgi_audio(response, on_audio=favorite) == Audio.payload
+    root = p.tee_save_dir(user_guid="user-a") if per_user else p.CONF["library_dir"]
+    assert audio_files(root) == ["周杰伦 - 晴天.flac"]
+    assert list(Path(p.CONF["library_dir"]).rglob("*.flac")) == [Path(root) / "周杰伦 - 晴天.flac"]
     assert audio_files(p.CONF["cache_dir"]) == []
+    scan.assert_called_once_with({"cookie": "sid=playback"}, user_guid="user-a" if per_user else "")
+    assert not p._full_fetch_tasks
+    assert resolve_user.await_count == int(per_user)
     assert len(calls) == 1
     disp_guid, headers, meta = calls[0]
     assert disp_guid == guid
+    assert headers is None
     assert meta and meta.get("title") == "晴天" and meta.get("artist") == "周杰伦"
-    assert os.path.dirname(meta["dest"]) == p.CONF["library_dir"]
+    assert os.path.dirname(meta["dest"]) == root
 
 
 @pytest.mark.anyio
-async def test_favorite_after_complete_promotes_rolling_cache(monkeypatch, asgi_audio):
-    """先播完落滚动缓存再收藏：缓存转存进曲库，cache 不留副本，绑定带 meta 调度。"""
+@pytest.mark.parametrize("intent_state", [
+    "disabled", "removed", "playlist", "other-user", "unverified", "lookup-error", "mode-changed",
+])
+async def test_tee_off_playback_rejects_invalid_save_intent(monkeypatch, asgi_audio, intent_state):
+    guid = "online:netease:issue156-save-intent"
+    user_guid = "user-a"
+    if intent_state != "removed":
+        _save_favorite_snapshot(user_guid, guid, "晴天")
+    playlist = "old-auto-queue" if intent_state == "playlist" else None
+    p._register_bind_intent(guid, user_guid, {"cookie": "sid=favorite"}, playlist)
+    monkeypatch.setitem(p.CONF, "fav_auto_bind", intent_state != "disabled")
+    per_user = intent_state in ("other-user", "unverified", "lookup-error", "mode-changed")
+    monkeypatch.setitem(p.CONF, "tee_save_by_user", per_user)
+
+    async def resolve_user(headers):
+        if intent_state == "lookup-error":
+            raise ValueError("invalid user response")
+        if intent_state == "mode-changed":
+            monkeypatch.setitem(p.CONF, "tee_save_by_user", False)
+            return user_guid
+        return "user-b" if intent_state == "other-user" else None
+
+    monkeypatch.setattr(p, "_resolve_storage_user", resolve_user)
+    scan = Mock()
+    monkeypatch.setattr(p, "_schedule_library_scan", scan)
+    calls = _record_dispatch(monkeypatch)
+    post_finalize = AsyncMock()
+    response = p.stream_tee_response(
+        httpx.Response(200, stream=Audio()), guid, None,
+        pre_info={"title": "晴天", "artist": "周杰伦"}, resolved_ext="mp3",
+        scan_headers_factory=lambda: {"cookie": "sid=playback"}, post_finalize=post_finalize,
+    )
+
+    assert await asgi_audio(response) == Audio.payload
+    assert not list(Path(p.CONF["library_dir"]).rglob("*.mp3"))
+    cached = Path(p.CONF["cache_dir"]) / f"{p.cache_safe_guid(guid)}.mp3"
+    assert cached.is_file()
+    assert cached.read_bytes() == Audio.payload
+    assert not p._full_fetch_tasks
+    post_finalize.assert_not_awaited()
+    scan.assert_not_called()
+    assert calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("per_user", [False, True])
+async def test_favorite_after_complete_promotes_rolling_cache(monkeypatch, asgi_audio, per_user):
+    """先播完再收藏：共享模式转存，按用户模式复制，均复用现有缓存。"""
     guid = "online:netease:186016"
+    monkeypatch.setitem(p.CONF, "tee_save_by_user", per_user)
+    monkeypatch.setattr(p, "_ensure_user_save_tasks", {})
+    monkeypatch.setattr(p, "_resolve_storage_user", AsyncMock(return_value="user-a"))
     await listen(asgi_audio, guid)
     cache_dir, library_dir = p.CONF["cache_dir"], p.CONF["library_dir"]
     cached = os.path.join(cache_dir, "online_netease_186016.flac")
@@ -137,9 +211,15 @@ async def test_favorite_after_complete_promotes_rolling_cache(monkeypatch, asgi_
     _save_favorite_snapshot("user-a", guid, "晴天")
     calls = _record_dispatch(monkeypatch)
     p._register_fav_autobind(_fake_request(), guid, "user-a")
+    if per_user:
+        tasks = tuple(p._ensure_user_save_tasks.values())
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+        library_dir = p.tee_save_dir(user_guid="user-a")
     dest = os.path.join(library_dir, "周杰伦 - 晴天.flac")
     await _wait_until(lambda: os.path.isfile(dest))
-    assert not os.path.exists(cached)
+    assert os.path.exists(cached) == per_user
+    assert not p._full_fetch_tasks
     assert len(calls) == 1
     disp_guid, headers, meta = calls[0]
     assert disp_guid == guid

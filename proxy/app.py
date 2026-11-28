@@ -7617,6 +7617,8 @@ async def _promote_deferred_cache(headers: dict, guid: str, cached: str,
     # 完成（fd 打开后 os.replace 不影响已打开句柄），再动文件；否则极端调度顺序
     # 下 replace 先于 open，当次响应体拿不到文件（重试可自愈，但没必要让它发生）。
     await asyncio.sleep(0.5)
+    if not CONF.get("tee_save_enabled"):
+        return
     try:
         src = dict(retained or {})
         title, artist, album = _tag_fields(src)
@@ -7627,7 +7629,7 @@ async def _promote_deferred_cache(headers: dict, guid: str, cached: str,
         ext = os.path.splitext(cached)[1].lstrip(".").lower() or "mp3"
         if CONF.get("tee_save_by_user"):
             user_guid = await _resolve_storage_user(headers)
-            if not user_guid:
+            if not user_guid or not CONF.get("tee_save_enabled") or not CONF.get("tee_save_by_user"):
                 return
             await _copy_saved_audio_for_user(
                 guid, user_guid, cached, headers,
@@ -8138,7 +8140,21 @@ def stream_tee_response(
                         retained = retained_factory()
                     except Exception:
                         pass
-                tee_effective = tee_enabled or bool(_bind_pending.get(guid))
+                tee_effective = tee_enabled
+                if not tee_effective and CONF.get("fav_auto_bind"):
+                    per_user = bool(CONF.get("tee_save_by_user"))
+                    if per_user and any(intent.get("fav") for intent in _bind_pending.get(guid, {}).values()):
+                        try:
+                            save_user = await _resolve_storage_user(trigger_headers) or ""
+                        except Exception:
+                            save_user = ""
+                    if CONF.get("fav_auto_bind") and per_user == bool(CONF.get("tee_save_by_user")):
+                        tee_effective = any(
+                            intent.get("fav")
+                            and (not per_user or user_guid == save_user)
+                            and _fav_bind_pending(guid, user_guid)
+                            for user_guid, intent in _bind_pending.get(guid, {}).items()
+                        )
                 if CONF.get("tee_save_by_user"):
                     meta = await asyncio.to_thread(
                         _tee_finalize, path, guid, ext, info, tee_effective, retained,
@@ -8148,15 +8164,12 @@ def stream_tee_response(
                         _tee_finalize, path, guid, ext, info, tee_effective, retained)
                 if not meta:
                     retry_corrupt = tee_effective and _lossless_is_blacklisted(guid)
-                else:
+                elif tee_effective and not meta.get("deferred"):
                     if post_finalize is not None:
                         await post_finalize(meta)
-                    if not meta.get("deferred"):
-                        if trigger_headers:
-                            _schedule_library_scan(
-                                trigger_headers, user_guid=str(meta.get("user_guid") or ""))
-                        if tee_effective:
-                            _dispatch_official_binding(guid, trigger_headers or None, meta)
+                    if trigger_headers:
+                        _schedule_library_scan(trigger_headers, user_guid=str(meta.get("user_guid") or ""))
+                    _dispatch_official_binding(guid, (trigger_headers or None) if tee_enabled else None, meta)
             except Exception as exc:
                 logger.warning("tee finalize execution failed for %s: %s", guid, type(exc).__name__)
                 _remove_quiet(path)
@@ -9040,7 +9053,7 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
     if time.monotonic() >= binding.expires_at:
         return _direct_error(409, "target_expired")
     background_save = False
-    if request.method == "GET":
+    if request.method == "GET" and CONF.get("tee_save_enabled"):
         if CONF.get("tee_save_by_user"):
             _ensure_user_saved(guid, copy_incoming_headers(request),
                                gate_key="tee_save_enabled", direct_target=binding.target)
@@ -9381,8 +9394,10 @@ async def _copy_saved_audio_for_user(guid: str, user_guid: str, source: str,
 async def _ensure_user_saved_task(guid: str, headers: dict, gate_key: str,
                                   direct_target: DirectMediaTarget | None = None) -> None:
     try:
+        if not CONF.get(gate_key) or not CONF.get("tee_save_by_user"):
+            return
         user_guid = await _resolve_storage_user(headers)
-        if not user_guid:
+        if not user_guid or not CONF.get(gate_key) or not CONF.get("tee_save_by_user"):
             return
         if find_saved_user_file(guid, user_guid):
             saved = find_saved_user_file(guid, user_guid)
@@ -9411,7 +9426,7 @@ async def _ensure_user_saved_task(guid: str, headers: dict, gate_key: str,
 
 def _ensure_user_saved(guid: str, headers: dict, *, gate_key: str = "tee_save_enabled",
                        direct_target: DirectMediaTarget | None = None) -> None:
-    if not CONF.get("tee_save_by_user") or not headers:
+    if not CONF.get(gate_key) or not CONF.get("tee_save_by_user") or not headers:
         return
     key = _save_task_key(guid, _storage_scope(headers))
     existing = _ensure_user_save_tasks.get(key)
@@ -10740,7 +10755,7 @@ async def stream_track(request: Request, subpath: str = ""):
         fn_diag(logger, "direct_bypassed", guid=guid, reason="cache_hit")
         if CONF.get("tee_save_by_user"):
             _ensure_user_saved(guid, copy_incoming_headers(request), gate_key="tee_save_enabled")
-        if request.method != "HEAD" and _is_deferred_cache_file(guid, cached):
+        if CONF.get("tee_save_enabled") and _is_deferred_cache_file(guid, cached):
             # 元数据缺失暂存 cache 的曲目（issue #52）：重播时补齐元数据转正进曲库。
             # retained/headers 在请求上下文内先取好，重活放后台任务不阻塞出流。
             promote_headers = copy_incoming_headers(request)

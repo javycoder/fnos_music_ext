@@ -1,9 +1,12 @@
 """Per-user directory, reference and organize isolation."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from proxy import app as runtime
@@ -105,6 +108,84 @@ def test_user_save_rejects_overlapping_mappings_before_creating_directories(tmp_
     with pytest.raises(runtime.UserStorageError):
         runtime.tee_save_dir(user_guid="user-a")
     assert not shared.exists()
+
+
+@pytest.fixture
+def isolated_playback_storage(tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    cache = tmp_path / "cache"
+    for key, value in {
+        "tee_save_enabled": False,
+        "tee_save_by_user": True,
+        "tee_save_dir": str(library),
+        "tee_save_dir_by_user": "{}",
+        "cache_dir": str(cache),
+        "music_db": str(tmp_path / "missing.db"),
+        "fav_auto_bind": True,
+        "netease_direct_play": False,
+        "lyric_auto_dl": False,
+    }.items():
+        monkeypatch.setitem(runtime.CONF, key, value)
+    monkeypatch.setattr(runtime, "_bind_pending", {})
+    monkeypatch.setattr(runtime, "_ensure_user_save_tasks", {})
+    monkeypatch.setattr(runtime, "_full_fetch_tasks", {})
+    monkeypatch.setattr(runtime, "_schedule_library_scan", Mock())
+    monkeypatch.setattr(runtime, "resolve_local_play", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_tee_metadata_fallback", lambda *args, **kwargs: ("晴天", "周杰伦", "叶惠美"))
+    return library, cache
+
+
+@pytest.mark.asyncio
+async def test_tee_off_user_storage_replays_rolling_cache_without_saving(
+        isolated_playback_storage, monkeypatch, asgi_audio):
+    library, cache = isolated_playback_storage
+    resolve_user = AsyncMock(return_value="user-a")
+    monkeypatch.setattr(runtime, "_resolve_storage_user", resolve_user)
+    guid = "online:netease:issue156-user-storage"
+    payload = b"M" * 4096
+    headers = {"cookie": "sid=test"}
+    initial = runtime.stream_tee_response(
+        httpx.Response(200, content=payload), guid, None, resolved_ext="mp3",
+        scan_headers_factory=lambda: headers,
+    )
+    assert await asgi_audio(initial) == payload
+    assert (cache / f"{runtime.cache_safe_guid(guid)}.mp3").read_bytes() == payload
+    assert not list(library.rglob("*.mp3"))
+    request = runtime.Request({
+        "type": "http", "method": "GET", "path": "/music/api/v1/track/stream",
+        "query_string": f"guid={guid}".encode(), "headers": [(b"cookie", b"sid=test")],
+        "app": runtime.app,
+    })
+    replay = await runtime.stream_track(request)
+    copy_tasks = tuple(runtime._ensure_user_save_tasks.values())
+    assert b"".join([chunk async for chunk in replay.body_iterator]) == payload
+    await asyncio.gather(*copy_tasks)
+    assert not list(library.rglob("*.mp3"))
+    assert not copy_tasks and not runtime._full_fetch_tasks
+    resolve_user.assert_not_awaited()
+    runtime._schedule_library_scan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_user_copy_rechecks_tee_after_identity_lookup(isolated_playback_storage, monkeypatch):
+    library, cache = isolated_playback_storage
+    guid = "online:netease:issue156-inflight-user"
+    cache.mkdir()
+    (cache / f"{runtime.cache_safe_guid(guid)}.mp3").write_bytes(b"M" * 4096)
+    monkeypatch.setitem(runtime.CONF, "tee_save_enabled", True)
+
+    async def resolve_user(headers):
+        monkeypatch.setitem(runtime.CONF, "tee_save_enabled", False)
+        return "user-a"
+
+    monkeypatch.setattr(runtime, "_resolve_storage_user", resolve_user)
+    runtime._ensure_user_saved(guid, {"cookie": "sid=test"})
+    tasks = tuple(runtime._ensure_user_save_tasks.values())
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)
+    assert not list(library.rglob("*.mp3"))
+    assert not runtime._full_fetch_tasks
+    runtime._schedule_library_scan.assert_not_called()
 
 
 def test_organize_selects_one_user_root_and_cleanup_skips_public_parent(tmp_path, monkeypatch):

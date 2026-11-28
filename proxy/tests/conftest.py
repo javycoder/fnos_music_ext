@@ -20,11 +20,13 @@ from proxy import transcode as tc
 
 @pytest.fixture
 def asgi_audio():
-    async def read(response):
+    async def read(response, on_audio=None):
         messages = []
 
         async def send(message):
             messages.append(message)
+            if on_audio is not None and message.get("body"):
+                on_audio(message["body"])
 
         await response({"type": "http", "method": "GET", "asgi": {"spec_version": "2.4"}},
                        anyio.sleep_forever, send)

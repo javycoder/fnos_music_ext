@@ -4,6 +4,8 @@ import importlib
 import logging
 import os
 import time
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -680,6 +682,77 @@ async def test_deferred_cache_promoted_on_replay(monkeypatch, listen):
     assert p.find_cache_file(guid) == dest
     with open(p.media_ref_path(guid), encoding="utf-8") as f:
         assert os.path.dirname(f.read().strip()) == library_dir
+
+
+@pytest.mark.anyio
+async def test_tee_off_replay_keeps_deferred_cache_and_reference(monkeypatch, listen):
+    guid = "online:netease:issue156-deferred"
+    await listen(guid, info={})
+    cached = Path(p.CONF["cache_dir"]) / f"{p.cache_safe_guid(guid)}.flac"
+    ref = Path(p.media_ref_path(guid))
+    original_ref = ref.read_bytes()
+    assert p._is_deferred_cache_file(guid, str(cached))
+    monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
+    monkeypatch.setitem(p.CONF, "tee_save_by_user", False)
+    monkeypatch.setitem(p.CONF, "fav_auto_bind", True)
+    monkeypatch.setitem(p.CONF, "netease_direct_play", False)
+    monkeypatch.setattr(p, "resolve_local_play", AsyncMock(return_value=None))
+    metadata = {"title": "晴天", "artist": "周杰伦", "album": "叶惠美"}
+    monkeypatch.setattr(p, "_retained_track", lambda *args: (metadata, None))
+    scan = Mock()
+    binding = Mock()
+    monkeypatch.setattr(p, "_schedule_library_scan", scan)
+    monkeypatch.setattr(p, "_dispatch_official_binding", binding)
+    request = p.Request({
+        "type": "http", "method": "GET", "path": "/music/api/v1/track/stream",
+        "query_string": f"guid={guid}".encode(), "headers": [(b"cookie", b"sid=test")], "app": p.app,
+    })
+    existing_tasks = asyncio.all_tasks()
+    response = await p.stream_track(request)
+    new_tasks = asyncio.all_tasks() - existing_tasks
+    assert b"".join([chunk async for chunk in response.body_iterator]) == b"A" * 4096
+    await asyncio.gather(*new_tasks)
+    assert cached.is_file()
+    assert ref.read_bytes() == original_ref
+    assert audio_files(p.CONF["library_dir"]) == []
+    assert not new_tasks
+    scan.assert_not_called()
+    binding.assert_not_called()
+
+    monkeypatch.setitem(p.CONF, "tee_save_enabled", True)
+    existing_tasks = asyncio.all_tasks()
+    response = await p.stream_track(request)
+    new_tasks = asyncio.all_tasks() - existing_tasks
+    assert b"".join([chunk async for chunk in response.body_iterator]) == b"A" * 4096
+    assert len(new_tasks) == 1
+    await asyncio.gather(*new_tasks)
+    assert not cached.exists()
+    assert audio_files(p.CONF["library_dir"]) == ["周杰伦 - 晴天.flac"]
+    scan.assert_called_once()
+    binding.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_queued_deferred_promotion_rechecks_tee_before_writing(monkeypatch, listen):
+    guid = "online:netease:issue156-queued-deferred"
+    await listen(guid, info={})
+    cached = p.find_cache_file(guid)
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def wait_to_promote(delay):
+        entered.set()
+        await resume.wait()
+
+    monkeypatch.setattr(p.asyncio, "sleep", wait_to_promote)
+    task = asyncio.create_task(p._promote_deferred_cache(
+        {"cookie": "sid=test"}, guid, cached, {"title": "晴天", "artist": "周杰伦"}))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    monkeypatch.setitem(p.CONF, "tee_save_enabled", False)
+    resume.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert os.path.isfile(cached)
+    assert p._is_deferred_cache_file(guid, cached)
+    assert audio_files(p.CONF["library_dir"]) == []
 
 
 @pytest.mark.anyio
